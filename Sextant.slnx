@@ -1,0 +1,19 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Sextant.Cli/Sextant.Cli.csproj" />
+    <Project Path="src/Sextant.Core/Sextant.Core.csproj" />
+    <Project Path="src/Sextant.Daemon/Sextant.Daemon.csproj" />
+    <Project Path="src/Sextant.Indexer/Sextant.Indexer.csproj" />
+    <Project Path="src/Sextant.Mcp/Sextant.Mcp.csproj" />
+    <Project Path="src/Sextant.Store/Sextant.Store.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Sextant.Cli.Tests/Sextant.Cli.Tests.csproj" />
+    <Project Path="tests/Sextant.Core.Tests/Sextant.Core.Tests.csproj" />
+    <Project Path="tests/Sextant.Daemon.Tests/Sextant.Daemon.Tests.csproj" />
+    <Project Path="tests/Sextant.Indexer.Tests/Sextant.Indexer.Tests.csproj" />
+    <Project Path="tests/Sextant.Mcp.Tests/Sextant.Mcp.Tests.csproj" />
+    <Project Path="tests/Sextant.Store.Tests/Sextant.Store.Tests.csproj" />
+    <Project Path="tests/Sextant.Integration.Tests/Sextant.Integration.Tests.csproj" />
+  </Folder>
+</Solution>

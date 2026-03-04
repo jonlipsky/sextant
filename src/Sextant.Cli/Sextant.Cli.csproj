@@ -1,0 +1,52 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>sextant</ToolCommandName>
+
+    <!-- NuGet package metadata -->
+    <PackageId>Sextant.Cli</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>Jon Lipsky</Authors>
+    <Description>Roslyn-based semantic code indexer for .NET. Extracts symbols, references, call graphs, and relationships into SQLite and exposes them via MCP for AI coding agents.</Description>
+    <PackageTags>roslyn;dotnet;code-analysis;mcp;semantic-index;ai-tools;code-graph;sqlite</PackageTags>
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
+    <PackageProjectUrl>https://github.com/jonlipsky/sextant</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/jonlipsky/sextant</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <Copyright>Copyright (c) 2026 Jon Lipsky</Copyright>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\LICENSE" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Sextant.Cli.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.CommandLine" Version="2.0.3" />
+    <PackageReference Include="Microsoft.Build.Locator" Version="1.11.2" />
+    <PackageReference Include="Microsoft.Build.Framework" Version="18.3.3" ExcludeAssets="runtime" PrivateAssets="all">
+      <IncludeAssets>compile; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Sextant.Daemon\Sextant.Daemon.csproj" />
+    <ProjectReference Include="..\Sextant.Indexer\Sextant.Indexer.csproj" />
+    <ProjectReference Include="..\Sextant.Mcp\Sextant.Mcp.csproj" />
+  </ItemGroup>
+
+</Project>
