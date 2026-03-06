@@ -102,50 +102,13 @@ Environment variables override the config file:
 
 ### LLM Assist Configuration
 
-Sextant can use an LLM to power the `research_codebase` tool. Run the interactive setup wizard:
+The `research_codebase` tool requires an LLM. Quick setup:
 
 ```bash
 sextant config llm
 ```
 
-This prompts for provider, model, API key, and other settings, then saves to `sextant.json`. You can also configure non-interactively:
-
-```bash
-# Set provider and model
-sextant config llm set --provider anthropic --model claude-sonnet-4-20250514
-
-# Set which env var holds your API key
-sextant config llm set --api-key-env ANTHROPIC_API_KEY
-
-# Or use an OpenAI-compatible provider
-sextant config llm set --provider openai-compatible --model gpt-4o --base-url https://api.openai.com/v1
-
-# Enable/disable
-sextant config llm set --enabled true
-```
-
-Or add the `llm_assist` section to `sextant.json` directly:
-
-```json
-{
-  "llm_assist": {
-    "provider": "anthropic",
-    "model": "claude-sonnet-4-20250514",
-    "api_key_env": "ANTHROPIC_API_KEY",
-    "max_tool_calls": 15,
-    "enabled": true
-  }
-}
-```
-
-| Variable | Description |
-|---|---|
-| `SEXTANT_LLM_API_KEY` | API key (highest priority, overrides all other key sources) |
-| `SEXTANT_LLM_API_KEY_ENV` | Name of env var containing the API key |
-| `SEXTANT_LLM_PROVIDER` | Provider override (`anthropic` or `openai-compatible`) |
-| `SEXTANT_LLM_MODEL` | Model override |
-| `SEXTANT_LLM_BASE_URL` | Base URL override |
-| `SEXTANT_LLM_MAX_CALLS` | Max tool calls override |
+This runs an interactive wizard to configure provider, model, and API key. See `sextant config llm --help` for non-interactive options.
 
 ## MCP Tools
 
@@ -194,217 +157,19 @@ These options are available on all commands:
 | `--db <path>` | Path to the SQLite database |
 | `--profile <name>`, `-p` | Named index profile (default: 'default') |
 
-### Query Examples
-
-```bash
-# Find a symbol by name (fuzzy)
-sextant query find-symbol UserService --fuzzy
-
-# Find all references to a method
-sextant query find-references "global::App.Services.UserService.GetById(int)"
-
-# Get call hierarchy
-sextant query get-call-hierarchy "global::App.Handlers.OrderHandler.Process()" --direction callees --depth 3
-
-# Get type hierarchy
-sextant query get-type-hierarchy "global::App.Models.BaseEntity" --direction down
-
-# Semantic search
-sextant query semantic-search "authentication" --kind method --max 10
-
-# Project dependencies
-sextant query get-dependencies abc123def456gh78 --transitive
-
-# API surface with breaking change detection
-sextant query get-api-surface abc123def456gh78 --diff oldcommitsha
-```
+See [docs/mcp-tools.md](docs/mcp-tools.md) for full tool parameters and query examples.
 
 ## Daemon
 
-The daemon watches your repository for file changes and incrementally re-indexes, keeping the SQLite database up to date without manual `sextant index` runs.
-
-### Starting the Daemon
+The daemon watches for file changes and incrementally re-indexes, keeping the SQLite database fresh without manual `sextant index` runs. The MCP server auto-spawns the daemon when needed, so most users don't need to manage it directly.
 
 ```bash
-# Start the daemon (auto-discovers .sln files in repo root)
-sextant daemon
-
-# With explicit database path
-sextant daemon --db /path/to/sextant.db
-
-# With explicit repo root
-sextant daemon --repo-root /path/to/repo
+sextant daemon                   # Start (auto-discovers .sln files)
+sextant daemon status            # Check if running
+sextant daemon stop              # Stop
 ```
 
-On first run (empty or missing database), the daemon performs a full index of all solutions. On subsequent starts, it checks file content hashes and only re-indexes changed files.
-
-### How It Works
-
-1. **Solution discovery** — uses `solutions` from `sextant.json`, or auto-discovers `*.sln` files in the repo root
-2. **Initial index** — full Roslyn-based extraction if the database is empty; incremental SHA256 hash comparison otherwise
-3. **File watching** — monitors `.cs` and `.csproj` files for changes using `FileSystemWatcher`
-4. **Debounced indexing** — batches rapid file changes with a 500ms debounce window before re-indexing
-5. **Cascade re-indexing** — when a symbol signature changes, dependent files are automatically queued for re-indexing
-
-### Status and Health
-
-The daemon runs a lightweight HTTP status server on a random port. Connection details are written to `.sextant/daemon.pid`:
-
-```
-<process-id>
-<status-port>
-```
-
-Check daemon health:
-
-```bash
-# Read the port from the PID file
-PORT=$(tail -1 .sextant/daemon.pid)
-
-# Health check
-curl http://localhost:$PORT/health
-# → OK
-
-# Detailed status
-curl http://localhost:$PORT/status
-# → {"state":"idle","queued_files":0,"background_tasks":0,"last_indexed_at":1709567890123}
-```
-
-### Checking Daemon Status
-
-```bash
-sextant daemon status
-# → Daemon is running (pid=12345, port=54321)
-# → {
-# →   "state": "idle",
-# →   "queued_files": 0,
-# →   "background_tasks": 0,
-# →   "last_indexed_at": 1709567890123
-# → }
-```
-
-Returns exit code 1 if the daemon is not running.
-
-### Stopping the Daemon
-
-```bash
-# Using the CLI
-sextant daemon stop
-
-# If running in the foreground, press Ctrl+C
-
-# Or manually via the PID file
-kill $(head -1 .sextant/daemon.pid)
-```
-
-The daemon cleans up its PID file on graceful shutdown.
-
-### Log Files
-
-Daemon logs are written to `.sextant/logs/daemon.log` with automatic size-based rotation at 10MB. Logs include indexing progress, file change events, and errors.
-
-### MCP Server Auto-Spawn
-
-When the MCP server starts (`sextant serve`), it automatically checks for a running daemon and spawns one if needed. This means AI tools using Sextant via MCP get live, incrementally-updated data without any manual setup.
-
-The auto-spawn behavior:
-- Reads `.sextant/daemon.pid` to find an existing daemon
-- Verifies the process is alive and the health endpoint responds
-- If no daemon is found, spawns `sextant daemon` as a background process
-- Logs actions to stderr (safe for stdio transport)
-
-To disable auto-spawn:
-
-```bash
-# Via environment variable
-SEXTANT_AUTO_SPAWN_DAEMON=false sextant serve --stdio
-
-# Via sextant.json
-# { "auto_spawn_daemon": false }
-```
-
-### Daemon vs MCP Server
-
-The MCP server and daemon are independent processes:
-
-- **MCP server** (`sextant serve`) — reads the SQLite database and responds to tool calls from AI agents. Works without the daemon, but data may be stale.
-- **Daemon** (`sextant daemon`) — watches files and writes to the SQLite database. Keeps data fresh for the MCP server (or any other consumer of the database).
-
-Both can run simultaneously — the daemon writes, the MCP server reads. SQLite WAL mode ensures concurrent access works correctly.
-
-### Auto-Start with launchd (macOS)
-
-Create `~/Library/LaunchAgents/com.sextant.daemon.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.sextant.daemon</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/path/to/sextant</string>
-        <string>daemon</string>
-        <string>--repo-root</string>
-        <string>/path/to/your/repo</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>/path/to/your/repo</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/sextant-daemon.out.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/sextant-daemon.err.log</string>
-</dict>
-</plist>
-```
-
-```bash
-# Load (start now and on login)
-launchctl load ~/Library/LaunchAgents/com.sextant.daemon.plist
-
-# Unload (stop and remove from login)
-launchctl unload ~/Library/LaunchAgents/com.sextant.daemon.plist
-```
-
-### Auto-Start with systemd (Linux)
-
-Create `~/.config/systemd/user/sextant-daemon.service`:
-
-```ini
-[Unit]
-Description=Sextant Daemon
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/path/to/sextant daemon --repo-root /path/to/your/repo
-WorkingDirectory=/path/to/your/repo
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=default.target
-```
-
-```bash
-# Enable and start
-systemctl --user daemon-reload
-systemctl --user enable sextant-daemon
-systemctl --user start sextant-daemon
-
-# Check status
-systemctl --user status sextant-daemon
-
-# Stop and disable
-systemctl --user stop sextant-daemon
-systemctl --user disable sextant-daemon
-```
+See [docs/daemon.md](docs/daemon.md) for details on how it works, status endpoints, auto-spawn behavior, and launchd/systemd setup.
 
 ## Architecture
 
@@ -416,6 +181,8 @@ Sextant.Daemon     File watcher, incremental indexing
 Sextant.Mcp        MCP server, tool implementations
 Sextant.Cli        CLI entry point
 ```
+
+See [docs/architecture.md](docs/architecture.md) for data flow, design principles, and technology stack details.
 
 ## Development
 
