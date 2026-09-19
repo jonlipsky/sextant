@@ -86,6 +86,16 @@ When loading a solution and resolving `ProjectReference` items:
 
 For projects with inbound dependencies, captures public/protected symbol signature hashes into `api_surface_snapshots` with the current git HEAD commit.
 
+## Progress, Cancellation, and Metrics
+
+The pipeline is instrumented so callers can observe, cancel, and measure a run without changing extraction behaviour.
+
+- **Structured progress.** `IndexOrchestrator.IndexSolutionAsync` accepts an `IProgress<IndexingProgress>`. Each phase reports its name (`registering_projects`, `extracting_symbols`, `extracting_relationships`, `extracting_references`, `extracting_comments`, `extracting_call_graph`, `recording_dependencies`, `capturing_api_surface`), the current project, and project counts.
+- **Cancellation.** Both the orchestrator and `IncrementalIndexer` take a `CancellationToken` and call `ThrowIfCancellationRequested()` at every phase boundary and per project/file. `SolutionLoader.LoadSolutionAsync` also honours the token. Cancellation surfaces as `OperationCanceledException`; the existing parameterless/overload signatures are preserved for backward compatibility.
+- **Metrics collection.** Passing an optional `IndexingMetrics` collector records per-phase durations, project counts, row counts, and the terminal status. The collector is mutated **in place** and each `PhaseMetric` is appended when its phase starts, so partial results survive a cancellation or failure. Run status begins as `Running` and only becomes `Completed` on success; a caught cancellation/failure leaves it non-`Completed` (the harness marks it `Cancelled`/`Failed`).
+
+Row and duplication counts come from `IndexMetricsStore`, which counts total reference rows versus semantically-distinct occurrences keyed by `(symbol_id, file_path, line, reference_kind)`. Storage sizing distinguishes the **final** database size (measured after a WAL checkpoint) from the **peak** database-plus-WAL size sampled during the run — see [benchmarks.md](benchmarks.md).
+
 ## Incremental Indexing
 
 When invoked with a set of changed files (by the daemon or CLI):
