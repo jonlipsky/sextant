@@ -515,6 +515,12 @@ public sealed class IndexOrchestrator
                 ProjectCount = totalProjects
             });
             var deps = DependencyExtractor.ExtractDependencies(solution, projectRoslynToId, submodules, repoRoot);
+            // Replace the entire dependency set rather than only upserting: the extractor recomputes
+            // every edge in the solution each run and registration covers every project, so clearing
+            // each consumer's edges first purges any that were removed since the last run (e.g. a
+            // dropped project reference) instead of leaving a stale project_dependencies row behind.
+            foreach (var pid in projectRoslynToId.Values)
+                dependencyStore.DeleteByConsumer(pid);
             foreach (var dep in deps)
             {
                 if (dep.DependencyProjectId == 0)
@@ -538,26 +544,31 @@ public sealed class IndexOrchestrator
         var gitCommit = GetHeadCommit(repoRoot);
         if (gitCommit != null)
         {
+            // Partition the projects this run rebuilt into those that still have inbound dependencies
+            // and those that don't. Every rebuilt project's current-commit snapshot is purged first so
+            // a project that lost its last consumer since the previous run does not keep a stale
+            // current-commit snapshot (a fresh full index would not create one); snapshots captured at
+            // other commits are historical and left untouched (criterion 7).
+            var rebuiltProjectIds = new List<long>();
             var projectsWithConsumers = new HashSet<long>();
             foreach (var project in solution.Projects)
             {
-                // Only refresh snapshots for projects this run actually rebuilt; a consumer-bearing
-                // project outside the incremental closure keeps its existing snapshot untouched.
                 if (!processSet.Contains(project.Id))
                     continue;
                 if (projectRoslynToId.TryGetValue(project.Id, out var pid))
                 {
+                    rebuiltProjectIds.Add(pid);
                     var consumers = dependencyStore.GetByDependency(pid);
                     if (consumers.Count > 0)
                         projectsWithConsumers.Add(pid);
                 }
             }
 
+            foreach (var pid in rebuiltProjectIds)
+                apiSurfaceStore.DeleteByProjectAndCommit(pid, gitCommit);
+
             foreach (var projectId in projectsWithConsumers)
             {
-                // Delete existing snapshot for this commit (idempotent)
-                apiSurfaceStore.DeleteByProjectAndCommit(projectId, gitCommit);
-
                 // Get all public/protected symbols for this project
                 var publicSymbols = symbolStore.GetByProjectAndAccessibility(projectId, ["public", "protected"]);
                 foreach (var sym in publicSymbols)

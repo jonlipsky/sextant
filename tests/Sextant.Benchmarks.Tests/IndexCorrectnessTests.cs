@@ -254,6 +254,88 @@ public sealed class IndexCorrectnessTests
         }
     }
 
+    // === Criterion 4/6: removing a project reference converges with a fresh full index ===
+
+    [TestMethod]
+    public async Task RemovedProjectReference_IncrementalConvergesWithFullReindex()
+    {
+        var root = NewTempDir("refdrop");
+        try
+        {
+            var slnx = CorpusGenerator.GenerateCorrectnessCorpus(root);
+            Restore(slnx);
+
+            var incrDir = NewTempDir("refdrop-incr");
+            var fullDir = NewTempDir("refdrop-full");
+            try
+            {
+                // Path B (incremental): full-index the original App -> Lib state, then drop the reference.
+                using var incrDb = new IndexDatabase(Path.Combine(incrDir, "index.db"));
+                incrDb.RunMigrations();
+                var solution0 = await SolutionLoader.LoadSolutionAsync(slnx);
+                await new IndexOrchestrator(incrDb).IndexSolutionAsync(solution0);
+
+                Assert.IsTrue(CrossProjectReferenceExists(incrDb.GetConnection(), "App", "Lib"),
+                    "precondition: App must have cross-project references into Lib before the edit.");
+
+                // Remove App's project reference to Lib AND its use of Lib types (so it still compiles).
+                // Only App's fingerprint/source change, so the new-graph closure would rebuild App alone
+                // and leave Lib's inbound reference rows (owned by Lib's symbols) stale — the union with
+                // the previous index's cross-project connectivity is what pulls Lib back in.
+                var appCsproj = Path.Combine(root, "App", "App.csproj");
+                await File.WriteAllTextAsync(appCsproj, """
+                    <Project Sdk="Microsoft.NET.Sdk">
+                      <PropertyGroup>
+                        <TargetFramework>net10.0</TargetFramework>
+                        <LangVersion>latest</LangVersion>
+                        <Nullable>enable</Nullable>
+                        <ImplicitUsings>enable</ImplicitUsings>
+                        <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+                      </PropertyGroup>
+                    </Project>
+                    """.ReplaceLineEndings("\n"));
+                var appRunner = Path.Combine(root, "App", "Runner.cs");
+                await File.WriteAllTextAsync(appRunner, """
+                    namespace App;
+
+                    public class Runner
+                    {
+                        public int Run() => 42;
+                    }
+                    """.ReplaceLineEndings("\n"));
+
+                Restore(slnx);
+                var solution1 = await SolutionLoader.LoadSolutionAsync(slnx);
+                await new IncrementalIndexer(incrDb).IndexChangedFilesAsync(solution1, [appCsproj, appRunner]);
+
+                // Path A (full): index the final on-disk state from scratch.
+                using var fullDb = new IndexDatabase(Path.Combine(fullDir, "index.db"));
+                fullDb.RunMigrations();
+                await new IndexOrchestrator(fullDb).IndexSolutionAsync(solution1);
+
+                // The now-removed cross-project references must be gone in BOTH databases.
+                Assert.IsFalse(CrossProjectReferenceExists(fullDb.GetConnection(), "App", "Lib"),
+                    "a fresh full index of the post-edit state has no App -> Lib references (baseline).");
+                Assert.IsFalse(CrossProjectReferenceExists(incrDb.GetConnection(), "App", "Lib"),
+                    "the incremental rebuild must purge App's removed cross-project references into Lib.");
+
+                var fullDump = CanonicalIndexDump.Dump(fullDb.GetConnection());
+                var incrDump = CanonicalIndexDump.Dump(incrDb.GetConnection());
+                Assert.AreEqual(fullDump, incrDump,
+                    "Removing a project reference incrementally must converge with a fresh full index.");
+            }
+            finally
+            {
+                SqliteTestDatabase.DeleteDirectory(incrDir);
+                SqliteTestDatabase.DeleteDirectory(fullDir);
+            }
+        }
+        finally
+        {
+            SqliteTestDatabase.DeleteDirectory(root);
+        }
+    }
+
     // === Multi-TFM: incremental edit preserves per-TFM variants (no data loss) ============
 
     [TestMethod]
@@ -408,6 +490,23 @@ public sealed class IndexCorrectnessTests
     private static bool SymbolExistsInProject(SqliteConnection conn, long projectId, string displayName) =>
         Scalar(conn, "SELECT COUNT(*) FROM symbols WHERE project_id = $p AND display_name = $n",
             ("$p", projectId), ("$n", displayName)) > 0;
+
+    /// <summary>
+    /// True when a cross-project reference (usage site in a different project than the referenced
+    /// symbol's owning project) exists from the consumer project to the dependency project, matched by
+    /// repo-relative-path fragment. Used to prove a removed project reference purges its stale rows.
+    /// </summary>
+    private static bool CrossProjectReferenceExists(SqliteConnection conn, string consumerFrag, string dependencyFrag) =>
+        Scalar(conn, """
+            SELECT COUNT(*)
+            FROM "references" r
+            JOIN symbols s ON s.id = r.symbol_id
+            JOIN projects pc ON pc.id = r.in_project_id
+            JOIN projects pd ON pd.id = s.project_id
+            WHERE r.in_project_id != s.project_id
+              AND pc.repo_relative_path LIKE $c
+              AND pd.repo_relative_path LIKE $d
+            """, ("$c", "%" + consumerFrag + "%"), ("$d", "%" + dependencyFrag + "%")) > 0;
 
     private static long Scalar(SqliteConnection conn, string sql, params (string name, object value)[] args)
     {

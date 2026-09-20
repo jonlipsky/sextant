@@ -18,6 +18,7 @@ public static class EvaluationFingerprint
         "Directory.Build.targets",
         "global.json",
         ".editorconfig",
+        ".globalconfig",
     ];
 
     /// <summary>

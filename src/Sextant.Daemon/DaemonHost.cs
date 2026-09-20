@@ -160,7 +160,23 @@ public sealed class DaemonHost : IDisposable
                     liveCanonicalIds.Add(identity.CanonicalId);
 
                     var existing = projectStore.GetByCanonicalId(identity.CanonicalId);
-                    if (existing == null) continue;
+                    if (existing == null)
+                    {
+                        // A project added (or a new target framework) while the daemon was stopped has
+                        // no DB row yet. Catch-up runs an incremental pass, not a full index, so mark
+                        // all of the project's on-disk source files changed: IncrementalIndexer then
+                        // registers the new per-TFM logical project and indexes it from scratch (its
+                        // fingerprints are absent, so every file reads as stale).
+                        foreach (var document in project.Documents)
+                        {
+                            var docPath = document.FilePath;
+                            if (!string.IsNullOrEmpty(docPath)
+                                && !SymbolExtractor.IsGeneratedFile(docPath)
+                                && File.Exists(docPath))
+                                changedPaths.Add(docPath);
+                        }
+                        continue;
+                    }
                     var projectId = existing.Value.id;
 
                     // Changed / new source files: on-disk hash differs from the recorded fingerprint.

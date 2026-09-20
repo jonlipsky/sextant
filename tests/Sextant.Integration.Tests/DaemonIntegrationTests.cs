@@ -219,6 +219,96 @@ public class DaemonIntegrationTests : IDisposable
         }
     }
 
+    [TestMethod]
+    public async Task Daemon_CatchUp_IndexesProjectAddedWhileStopped()
+    {
+        var root = Path.Combine(_tempDir, "catchup");
+        Directory.CreateDirectory(root);
+        // A .git marker so the daemon resolves this dir as the repo root (matches other daemon tests).
+        Directory.CreateDirectory(Path.Combine(root, ".git"));
+
+        WriteSdkProject(root, "ProjA", "namespace ProjA;\npublic class TypeA { public int A() => 1; }\n");
+        var slnx = Path.Combine(root, "Sln.slnx");
+        await File.WriteAllTextAsync(slnx,
+            "<Solution>\n  <Project Path=\"ProjA/ProjA.csproj\" />\n</Solution>\n");
+        RestoreSolution(slnx);
+
+        var dbPath = Path.Combine(_tempDir, "catchup.db");
+
+        // First run: full initial index of the one-project solution. StartAsync awaits the index, so
+        // it is complete when the call returns.
+        using (var daemon = new DaemonHost(root, dbPath, [slnx], msg => { }))
+        using (var cts = new CancellationTokenSource())
+        {
+            await daemon.StartAsync(cts.Token);
+            await daemon.StopAsync();
+        }
+
+        // Add a brand-new project (with no DB row) while the daemon is stopped.
+        WriteSdkProject(root, "ProjB", "namespace ProjB;\npublic class TypeB { public int B() => 2; }\n");
+        await File.WriteAllTextAsync(slnx,
+            "<Solution>\n  <Project Path=\"ProjA/ProjA.csproj\" />\n  <Project Path=\"ProjB/ProjB.csproj\" />\n</Solution>\n");
+        RestoreSolution(slnx);
+
+        // Second run: the non-empty DB routes through incremental catch-up (not a full index). Catch-up
+        // must still index the newly-added project even though it has no prior fingerprint rows.
+        using (var daemon = new DaemonHost(root, dbPath, [slnx], msg => { }))
+        using (var cts = new CancellationTokenSource())
+        {
+            await daemon.StartAsync(cts.Token);
+            await daemon.StopAsync();
+        }
+
+        using var db = new IndexDatabase(dbPath);
+        var conn = db.GetConnection();
+        Assert.IsTrue(SymbolDisplayNameExists(conn, "TypeB"),
+            "Catch-up must index a project added while the daemon was stopped.");
+        Assert.IsTrue(SymbolDisplayNameExists(conn, "TypeA"),
+            "The pre-existing project must remain indexed after catch-up.");
+    }
+
+    private static void WriteSdkProject(string root, string name, string classBody)
+    {
+        var dir = Path.Combine(root, name);
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, $"{name}.csproj"), """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup>
+                <TargetFramework>net10.0</TargetFramework>
+                <Nullable>enable</Nullable>
+                <ImplicitUsings>enable</ImplicitUsings>
+                <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+              </PropertyGroup>
+            </Project>
+            """);
+        File.WriteAllText(Path.Combine(dir, $"{name}.cs"), classBody);
+    }
+
+    private static void RestoreSolution(string solutionPath)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo("dotnet", $"restore \"{solutionPath}\"")
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        using var process = System.Diagnostics.Process.Start(psi)!;
+        var stderr = process.StandardError.ReadToEnd();
+        process.StandardOutput.ReadToEnd();
+        process.WaitForExit();
+        if (process.ExitCode != 0)
+            Assert.Inconclusive($"restore of the generated solution failed (exit {process.ExitCode}): {stderr}");
+    }
+
+    private static bool SymbolDisplayNameExists(Microsoft.Data.Sqlite.SqliteConnection conn, string displayName)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT COUNT(*) FROM symbols WHERE display_name = $n";
+        cmd.Parameters.AddWithValue("$n", displayName);
+        return Convert.ToInt64(cmd.ExecuteScalar()) > 0;
+    }
+
     private static async Task WaitForIdleAsync(int statusPort, TimeSpan timeout)
     {
         using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };

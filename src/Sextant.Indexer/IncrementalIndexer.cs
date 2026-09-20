@@ -130,9 +130,22 @@ public sealed class IncrementalIndexer
             return [];
         }
 
-        // Expand to the undirected connected closure over the current solution's project references.
-        var adjacency = ProjectClosure.BuildUndirectedAdjacency(
-            BuildDependencyEdges(solution, projectCanonicalById), StringComparer.Ordinal);
+        // Expand to the undirected connected closure over the solution's project references, UNIONED
+        // with the previous index's persisted cross-project connectivity. Unioning the old edges is
+        // what lets a removed project reference (or a deleted cross-project usage) still pull the
+        // now-detached neighbour into the closure: its symbols still own the stale inbound reference
+        // rows, and only reprocessing it rebuilds them away. Old edges are read from persisted
+        // references (always recorded), so this holds even when project_dependencies is not populated.
+        var edges = new List<(string Consumer, string Dependency)>(
+            BuildDependencyEdges(solution, projectCanonicalById));
+        var referenceStore = new ReferenceStore(conn);
+        foreach (var (consumerDbId, dependencyDbId) in referenceStore.GetCrossProjectPairs())
+        {
+            if (canonicalByDbId.TryGetValue(consumerDbId, out var consumer)
+                && canonicalByDbId.TryGetValue(dependencyDbId, out var dependency))
+                edges.Add((consumer, dependency));
+        }
+        var adjacency = ProjectClosure.BuildUndirectedAdjacency(edges, StringComparer.Ordinal);
         var closure = ProjectClosure.Expand(affected, adjacency, StringComparer.Ordinal);
 
         _log?.Invoke($"Incremental: {affected.Count} changed project(s), rebuilding closure of {closure.Count}.");
