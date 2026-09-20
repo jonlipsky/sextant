@@ -118,6 +118,18 @@ public sealed class SymbolStore(SqliteConnection connection)
         return ReadAll(cmd);
     }
 
+    // Project-scoped variant: a source file that is shared across the evaluated target frameworks of a
+    // multi-targeted project appears once per logical (per-TFM) project, so callers that re-index or
+    // resolve within one framework must restrict to that project rather than matching every variant.
+    public List<SymbolInfo> GetByFile(string filePath, long projectId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT * FROM symbols WHERE file_path = @file_path AND project_id = @project_id;";
+        cmd.Parameters.AddWithValue("@file_path", filePath);
+        cmd.Parameters.AddWithValue("@project_id", projectId);
+        return ReadAll(cmd);
+    }
+
     public List<SymbolInfo> GetByProjectAndAccessibility(long projectId, string accessibility)
     {
         using var cmd = connection.CreateCommand();
@@ -248,6 +260,18 @@ public sealed class SymbolStore(SqliteConnection connection)
         using var cmd = connection.CreateCommand();
         cmd.CommandText = "DELETE FROM symbols WHERE file_path = @file_path;";
         cmd.Parameters.AddWithValue("@file_path", filePath);
+        cmd.ExecuteNonQuery();
+    }
+
+    // Project-scoped delete: only clears this logical (per-TFM) project's symbols for the file, so
+    // re-indexing one framework of a multi-targeted project does not delete the sibling framework's
+    // symbols declared in the same shared source file.
+    public void DeleteByFile(string filePath, long projectId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "DELETE FROM symbols WHERE file_path = @file_path AND project_id = @project_id;";
+        cmd.Parameters.AddWithValue("@file_path", filePath);
+        cmd.Parameters.AddWithValue("@project_id", projectId);
         cmd.ExecuteNonQuery();
     }
 

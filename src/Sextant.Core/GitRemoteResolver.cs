@@ -6,6 +6,9 @@ public static class GitRemoteResolver
 {
     public static string? ResolveGitRoot(string startPath)
     {
+        if (string.IsNullOrEmpty(startPath))
+            return null;
+
         var dir = Directory.Exists(startPath)
             ? new DirectoryInfo(startPath)
             : new FileInfo(startPath).Directory;
@@ -52,7 +55,7 @@ public static class GitRemoteResolver
         }
     }
 
-    public static ProjectIdentity Resolve(string csprojPath)
+    public static ProjectIdentity Resolve(string csprojPath, string targetFramework)
     {
         var fullPath = Path.GetFullPath(csprojPath);
         var gitRoot = ResolveGitRoot(fullPath);
@@ -76,13 +79,14 @@ public static class GitRemoteResolver
             repoRelativePath = Path.GetFileName(fullPath);
         }
 
-        var canonicalId = CanonicalIdGenerator.Generate(gitRemoteUrl, repoRelativePath);
+        var canonicalId = CanonicalIdGenerator.Generate(gitRemoteUrl, repoRelativePath, targetFramework);
 
         return new ProjectIdentity
         {
             CanonicalId = canonicalId,
             GitRemoteUrl = gitRemoteUrl,
             RepoRelativePath = repoRelativePath,
+            TargetFramework = targetFramework,
             DiskPath = fullPath
         };
     }
@@ -91,7 +95,7 @@ public static class GitRemoteResolver
     /// Resolves project identity for a project inside a submodule, using the submodule's own remote URL.
     /// The repo_relative_path is relative to the submodule root, not the parent repo root.
     /// </summary>
-    public static ProjectIdentity ResolveForSubmodule(string csprojPath, string submoduleRemoteUrl, string submoduleRootPath)
+    public static ProjectIdentity ResolveForSubmodule(string csprojPath, string submoduleRemoteUrl, string submoduleRootPath, string targetFramework)
     {
         var fullPath = Path.GetFullPath(csprojPath);
         var subRoot = Path.GetFullPath(submoduleRootPath);
@@ -99,13 +103,14 @@ public static class GitRemoteResolver
         var repoRelativePath = Path.GetRelativePath(subRoot, fullPath)
             .Replace('\\', '/');
 
-        var canonicalId = CanonicalIdGenerator.Generate(submoduleRemoteUrl, repoRelativePath);
+        var canonicalId = CanonicalIdGenerator.Generate(submoduleRemoteUrl, repoRelativePath, targetFramework);
 
         return new ProjectIdentity
         {
             CanonicalId = canonicalId,
             GitRemoteUrl = submoduleRemoteUrl,
             RepoRelativePath = repoRelativePath,
+            TargetFramework = targetFramework,
             DiskPath = fullPath
         };
     }

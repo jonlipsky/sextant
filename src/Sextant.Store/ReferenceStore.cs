@@ -51,6 +51,18 @@ public sealed class ReferenceStore(SqliteConnection connection)
         cmd.ExecuteNonQuery();
     }
 
+    // Project-scoped delete: references carry the project they occur in (in_project_id), so clearing
+    // one logical (per-TFM) project's references for a shared source file leaves the sibling
+    // framework's references for that same file intact.
+    public void DeleteByFile(string filePath, long projectId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """DELETE FROM "references" WHERE file_path = @file_path AND in_project_id = @project_id;""";
+        cmd.Parameters.AddWithValue("@file_path", filePath);
+        cmd.Parameters.AddWithValue("@project_id", projectId);
+        cmd.ExecuteNonQuery();
+    }
+
     private static List<ReferenceInfo> ReadAll(SqliteCommand cmd)
     {
         var results = new List<ReferenceInfo>();

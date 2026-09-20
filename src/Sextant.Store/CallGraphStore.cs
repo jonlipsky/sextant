@@ -46,6 +46,22 @@ public sealed class CallGraphStore(SqliteConnection connection)
         cmd.ExecuteNonQuery();
     }
 
+    // Project-scoped delete: call_graph rows have no project column, so scope through the caller
+    // symbol's project. This clears only the calls made from one logical (per-TFM) project's code in
+    // the shared source file, leaving the sibling framework's call edges for that file intact.
+    public void DeleteByFile(string filePath, long projectId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            DELETE FROM call_graph
+            WHERE call_site_file = @file
+              AND caller_symbol_id IN (SELECT id FROM symbols WHERE project_id = @project_id);
+            """;
+        cmd.Parameters.AddWithValue("@file", filePath);
+        cmd.Parameters.AddWithValue("@project_id", projectId);
+        cmd.ExecuteNonQuery();
+    }
+
     private static List<CallGraphEdge> ReadAll(SqliteCommand cmd)
     {
         var results = new List<CallGraphEdge>();

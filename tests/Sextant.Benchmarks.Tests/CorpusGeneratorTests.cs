@@ -16,6 +16,12 @@ public sealed class CorpusGeneratorTests
             var multiTarget = File.ReadAllText(Path.Combine(root, "MultiTarget", "MultiTarget.csproj"));
             StringAssert.Contains(multiTarget, "net10.0;netstandard2.0");
 
+            // Multi-target source carries a shared member plus a #if NET10_0-gated conditional member.
+            var formatter = File.ReadAllText(Path.Combine(root, "MultiTarget", "Formatter.cs"));
+            StringAssert.Contains(formatter, "public string Join(");
+            StringAssert.Contains(formatter, "#if NET10_0");
+            StringAssert.Contains(formatter, "public string JoinModern(");
+
             var app = File.ReadAllText(Path.Combine(root, "App", "App.csproj"));
             StringAssert.Contains(app, "../Lib/Lib.csproj");
 

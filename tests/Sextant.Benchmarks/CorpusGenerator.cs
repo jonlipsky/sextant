@@ -141,6 +141,7 @@ public static class CorpusGenerator
 
                 public class Formatter
                 {
+                    // Shared member: present under every target framework.
                     public string Join(string a, string b)
                     {
                         var sb = new StringBuilder();
@@ -149,6 +150,13 @@ public static class CorpusGenerator
                         sb.Append(b);
                         return sb.ToString();
                     }
+
+                #if NET10_0
+                    // Conditional member: compiled only for net10.0 and absent under netstandard2.0.
+                    // Proves that processing one evaluated target framework does not delete the other
+                    // framework's #if-gated symbols (each TFM is a distinct logical project).
+                    public string JoinModern(string a, string b) => string.Join('/', a, b);
+                #endif
                 }
                 """,
         });

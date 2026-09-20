@@ -15,7 +15,11 @@ namespace Sextant.Core;
 /// </remarks>
 public sealed record SemanticSymbolKey
 {
-    /// <summary>The logical project canonical ID (git remote + repo-relative path).</summary>
+    /// <summary>
+    /// The logical project canonical ID. Each evaluated target framework of a multi-targeted project
+    /// is a distinct logical project, so this id folds in the git remote, the repo-relative path, and
+    /// the evaluated target framework.
+    /// </summary>
     public required string ProjectCanonicalId { get; init; }
 
     /// <summary>The evaluated target framework moniker, when known.</summary>
@@ -33,11 +37,11 @@ public sealed record SemanticSymbolKey
     /// in-memory catalogs, diagnostics, and equality assertions. It is intentionally distinct from
     /// the stored identity: the database realizes the same logical key in normalized form as
     /// <c>(project_id, symbol_key)</c>, where <c>symbol_key</c> holds only <see cref="DeclarationKey"/>
-    /// and the project dimension is the <c>project_id</c> foreign key. Per the project-identity rule
-    /// (git remote + repo-relative path), the target framework is deliberately not part of project
-    /// identity, so a multi-target project is a single project row; <see cref="TargetFramework"/> is
-    /// carried here only as a forward-looking dimension for the versioned <c>symbol_definition_id</c>
-    /// model and is not persisted in the current stored key.
+    /// and the project dimension is the <c>project_id</c> foreign key. Because each evaluated target
+    /// framework is its own logical project — the <c>project_id</c> already encodes the target
+    /// framework via the canonical id — the framework does not need to be repeated inside
+    /// <c>symbol_key</c>; <see cref="TargetFramework"/> is carried here for the flattened logical
+    /// identity and the forward-looking versioned <c>symbol_definition_id</c> model.
     /// </summary>
     public string Value => $"{ProjectCanonicalId}|{TargetFramework ?? string.Empty}|{DeclarationKey}";
 

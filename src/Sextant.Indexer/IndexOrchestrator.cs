@@ -89,7 +89,11 @@ public sealed class IndexOrchestrator
 
         var solutionStore = new SolutionStore(conn);
 
-        var projectPathToId = new Dictionary<string, long>();
+        // Map each Roslyn project instance to its stored logical-project row. Keyed by the Roslyn
+        // ProjectId (unique per instance) rather than the csproj file path, so the multiple
+        // evaluated-TFM instances of one multi-targeted csproj map to distinct logical projects
+        // instead of collapsing onto a single id (which would make DeleteByProject cross-TFM).
+        var projectRoslynToId = new Dictionary<ProjectId, long>();
         var catalog = new SymbolCatalog();
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
@@ -128,44 +132,18 @@ public sealed class IndexOrchestrator
             EnterProject();
             if (project.FilePath == null) continue;
 
-            ProjectIdentity identity;
-            if (repoRoot != null)
-            {
-                var submodule = SubmoduleDiscovery.FindContainingSubmodule(
-                    project.FilePath, submodules, repoRoot);
-                if (submodule != null)
-                {
-                    var submoduleFullPath = Path.GetFullPath(Path.Combine(repoRoot, submodule.Path));
-                    identity = GitRemoteResolver.ResolveForSubmodule(
-                        project.FilePath, submodule.RemoteUrl, submoduleFullPath);
-                }
-                else
-                {
-                    identity = GitRemoteResolver.Resolve(project.FilePath);
-                }
-            }
-            else
-            {
-                identity = GitRemoteResolver.Resolve(project.FilePath);
-            }
-
-            identity = identity with
-            {
-                AssemblyName = project.AssemblyName,
-                TargetFramework = ReadTargetFramework(project.FilePath),
-                IsTestProject = TestProjectDetector.IsTestProject(project)
-            };
+            var identity = ProjectIdentityFactory.Create(project, submodules, repoRoot);
 
             var projectId = projectStore.Insert(identity, now);
-            projectPathToId[project.FilePath] = projectId;
-            _log?.Invoke($"  Project: {project.Name} (id={projectId}, test={identity.IsTestProject})");
+            projectRoslynToId[project.Id] = projectId;
+            _log?.Invoke($"  Project: {project.Name} (id={projectId}, tfm={identity.TargetFramework}, test={identity.IsTestProject})");
         }
 
         // Record solution → project mappings
         if (solution.FilePath != null)
         {
             var solutionId = solutionStore.Upsert(solution.FilePath, Path.GetFileNameWithoutExtension(solution.FilePath), now);
-            foreach (var pid in projectPathToId.Values)
+            foreach (var pid in projectRoslynToId.Values)
                 solutionStore.AddProjectMapping(solutionId, pid);
         }
 
@@ -175,7 +153,7 @@ public sealed class IndexOrchestrator
         projectIndex = 0;
         foreach (var project in solution.Projects)
         {
-            if (project.FilePath == null || !projectPathToId.TryGetValue(project.FilePath, out var projectId))
+            if (project.FilePath == null || !projectRoslynToId.TryGetValue(project.Id, out var projectId))
                 continue;
 
             EnterProject();
@@ -229,7 +207,7 @@ public sealed class IndexOrchestrator
             var compilation = await project.GetCompilationAsync(cancellationToken);
             if (compilation == null) continue;
 
-            long? relProjectId = project.FilePath != null && projectPathToId.TryGetValue(project.FilePath, out var relPid)
+            long? relProjectId = projectRoslynToId.TryGetValue(project.Id, out var relPid)
                 ? relPid
                 : null;
 
@@ -249,8 +227,8 @@ public sealed class IndexOrchestrator
                         var instantiates = RelationshipExtractor.ExtractInstantiates(typeSymbol, compilation);
                         foreach (var (fromKey, toKey, kind) in rels.Concat(instantiates))
                         {
-                            if (catalog.TryResolve(fromKey, relProjectId, out var fromId) &&
-                                catalog.TryResolve(toKey, relProjectId, out var toId))
+                            if (catalog.TryResolveEdge(fromKey, relProjectId, out var fromId) &&
+                                catalog.TryResolveEdge(toKey, relProjectId, out var toId))
                             {
                                 relationshipStore.Insert(new RelationshipInfo
                                 {
@@ -285,17 +263,18 @@ public sealed class IndexOrchestrator
             var compilation = await project.GetCompilationAsync(cancellationToken);
             if (compilation == null) continue;
 
-            long? refProjectId = project.FilePath != null && projectPathToId.TryGetValue(project.FilePath, out var refPid)
+            long? refProjectId = projectRoslynToId.TryGetValue(project.Id, out var refPid)
                 ? refPid
                 : null;
 
-            if (project.FilePath != null && projectPathToId.ContainsKey(project.FilePath))
+            if (refProjectId is { } refClearId)
             {
-                // Clear existing references for files in this project
+                // Clear existing references for files in THIS logical (per-TFM) project only, so a
+                // sibling framework's references for a shared source file survive this phase.
                 foreach (var syntaxTree in compilation.SyntaxTrees)
                 {
                     if (!string.IsNullOrEmpty(syntaxTree.FilePath))
-                        referenceStore.DeleteByFile(syntaxTree.FilePath);
+                        referenceStore.DeleteByFile(syntaxTree.FilePath, refClearId);
                 }
             }
 
@@ -320,11 +299,11 @@ public sealed class IndexOrchestrator
                         continue;
 
                     var declKey = SemanticSymbolKeyFactory.DeclarationKey(declaredSymbol);
-                    if (!catalog.TryResolve(declKey, refProjectId, out var symbolId))
+                    if (!catalog.TryResolveEdge(declKey, refProjectId, out var symbolId))
                         continue;
 
                     var refs = await ReferenceExtractor.ExtractReferencesAsync(
-                        declaredSymbol, symbolId, solution, projectPathToId);
+                        declaredSymbol, symbolId, solution, projectRoslynToId);
 
                     foreach (var refInfo in refs)
                     {
@@ -356,7 +335,7 @@ public sealed class IndexOrchestrator
             var compilation = await project.GetCompilationAsync(cancellationToken);
             if (compilation == null) continue;
 
-            if (project.FilePath == null || !projectPathToId.TryGetValue(project.FilePath, out var commentProjectId))
+            if (project.FilePath == null || !projectRoslynToId.TryGetValue(project.Id, out var commentProjectId))
                 continue;
 
             foreach (var syntaxTree in compilation.SyntaxTrees)
@@ -365,12 +344,12 @@ public sealed class IndexOrchestrator
                 if (SymbolExtractor.IsGeneratedFile(syntaxTree.FilePath))
                     continue;
 
-                commentStore.DeleteByFile(syntaxTree.FilePath);
+                commentStore.DeleteByFile(syntaxTree.FilePath, commentProjectId);
 
                 var comments = CommentExtractor.ExtractComments(syntaxTree);
                 foreach (var comment in comments)
                 {
-                    var enclosingSymbolId = ResolveEnclosingSymbol(comment.Line, comment.FilePath, symbolStore);
+                    var enclosingSymbolId = ResolveEnclosingSymbol(comment.Line, comment.FilePath, commentProjectId, symbolStore);
                     commentStore.Insert(commentProjectId, comment.FilePath, comment.Line, comment.Tag,
                                        comment.Text, enclosingSymbolId, now);
                 }
@@ -400,16 +379,18 @@ public sealed class IndexOrchestrator
             var compilation = await project.GetCompilationAsync(cancellationToken);
             if (compilation == null) continue;
 
-            long? callProjectId = project.FilePath != null && projectPathToId.TryGetValue(project.FilePath, out var callPid)
+            long? callProjectId = projectRoslynToId.TryGetValue(project.Id, out var callPid)
                 ? callPid
                 : null;
 
-            if (project.FilePath != null && projectPathToId.ContainsKey(project.FilePath))
+            if (callProjectId is { } callClearId)
             {
+                // Clear existing call edges made from THIS logical (per-TFM) project's code only, so a
+                // sibling framework's call edges for a shared source file survive this phase.
                 foreach (var syntaxTree in compilation.SyntaxTrees)
                 {
                     if (!string.IsNullOrEmpty(syntaxTree.FilePath))
-                        callGraphStore.DeleteByFile(syntaxTree.FilePath);
+                        callGraphStore.DeleteByFile(syntaxTree.FilePath, callClearId);
                 }
             }
 
@@ -429,14 +410,14 @@ public sealed class IndexOrchestrator
                         continue;
 
                     var callerKey = SemanticSymbolKeyFactory.DeclarationKey(methodSymbol);
-                    if (!catalog.TryResolve(callerKey, callProjectId, out var callerSymbolId))
+                    if (!catalog.TryResolveEdge(callerKey, callProjectId, out var callerSymbolId))
                         continue;
 
                     var edges = await CallGraphBuilder.BuildCallGraphAsync(methodSymbol, project);
 
                     foreach (var edge in edges)
                     {
-                        if (catalog.TryResolve(edge.CalleeKey, callProjectId, out var calleeSymbolId))
+                        if (catalog.TryResolveEdge(edge.CalleeKey, callProjectId, out var calleeSymbolId))
                         {
                             var edgeId = callGraphStore.Insert(new CallGraphEdge
                             {
@@ -486,7 +467,7 @@ public sealed class IndexOrchestrator
                 ProjectIndex = totalProjects,
                 ProjectCount = totalProjects
             });
-            var deps = DependencyExtractor.ExtractDependencies(solution, projectPathToId, submodules, repoRoot);
+            var deps = DependencyExtractor.ExtractDependencies(solution, projectRoslynToId, submodules, repoRoot);
             foreach (var dep in deps)
             {
                 if (dep.DependencyProjectId == 0)
@@ -512,7 +493,7 @@ public sealed class IndexOrchestrator
             var projectsWithConsumers = new HashSet<long>();
             foreach (var project in solution.Projects)
             {
-                if (project.FilePath != null && projectPathToId.TryGetValue(project.FilePath, out var pid))
+                if (projectRoslynToId.TryGetValue(project.Id, out var pid))
                 {
                     var consumers = dependencyStore.GetByDependency(pid);
                     if (consumers.Count > 0)
@@ -555,6 +536,13 @@ public sealed class IndexOrchestrator
             metrics.Status = IndexRunStatus.Completed;
         }
 
+        if (catalog.AmbiguousEdgeBindings > 0)
+        {
+            _log?.Invoke($"  {catalog.AmbiguousEdgeBindings} cross-project edge(s) bound to a " +
+                         "deterministic pick due to a key defined in multiple projects; exact " +
+                         "per-project resolution deferred to the document-oriented extractor phase.");
+        }
+
         _log?.Invoke("Indexing complete.");
         progress?.Report(new IndexingProgress
         {
@@ -563,18 +551,6 @@ public sealed class IndexOrchestrator
             ProjectIndex = totalProjects,
             ProjectCount = totalProjects
         });
-    }
-
-    private static string? ReadTargetFramework(string? projectFilePath)
-    {
-        if (projectFilePath == null || !File.Exists(projectFilePath)) return null;
-        try
-        {
-            var xml = System.Xml.Linq.XDocument.Load(projectFilePath);
-            return xml.Descendants("TargetFramework").FirstOrDefault()?.Value
-                ?? xml.Descendants("TargetFrameworks").FirstOrDefault()?.Value?.Split(';').FirstOrDefault();
-        }
-        catch { return null; }
     }
 
     private static string? GetHeadCommit(string? repoRoot)
@@ -605,9 +581,11 @@ public sealed class IndexOrchestrator
         return Convert.ToHexStringLower(hashBytes);
     }
 
-    private static long? ResolveEnclosingSymbol(int line, string filePath, SymbolStore symbolStore)
+    private static long? ResolveEnclosingSymbol(int line, string filePath, long projectId, SymbolStore symbolStore)
     {
-        var fileSymbols = symbolStore.GetByFile(filePath);
+        // Scope to the comment's own logical (per-TFM) project so a shared source file does not attach
+        // the comment to the sibling framework's identically-positioned symbol.
+        var fileSymbols = symbolStore.GetByFile(filePath, projectId);
         var enclosing = fileSymbols
             .Where(s => s.LineStart <= line && s.LineEnd >= line)
             .OrderByDescending(s => s.LineStart)

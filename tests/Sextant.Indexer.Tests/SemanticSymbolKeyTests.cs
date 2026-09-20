@@ -225,6 +225,72 @@ public class SemanticSymbolKeyTests
     }
 
     [TestMethod]
+    public async Task SourceFallbackKey_IsRepoRelativeAndDeterministic()
+    {
+        const string source = """
+            namespace F
+            {
+                public class Box<T>
+                {
+                    public T? Value { get; set; }
+                }
+            }
+            """;
+
+        var keyFirst = await TypeParameterKey(source);
+        var keySecond = await TypeParameterKey(source);
+
+        StringAssert.StartsWith(keyFirst, "src:",
+            "A doc-ID-less type parameter must use the versioned source-declaration fallback.");
+        StringAssert.Contains(keyFirst, "Fallback.cs", "The fallback key embeds the declaring source file.");
+        StringAssert.EndsWith(keyFirst, ":T", "The fallback key embeds the metadata name.");
+        Assert.IsFalse(Path.IsPathRooted(keyFirst.Split(':')[2]),
+            "The file component must be repo-relative, not an absolute path.");
+        Assert.AreEqual(keyFirst, keySecond,
+            "The source-declaration fallback key must be deterministic across extractions.");
+    }
+
+    private static async Task<string> TypeParameterKey(string source)
+    {
+        var project = CreateProject(("Fallback.cs", source));
+        var compilation = await project.GetCompilationAsync();
+        var tree = compilation!.SyntaxTrees.Single();
+        var model = compilation.GetSemanticModel(tree);
+        var typeParam = (await tree.GetRootAsync())
+            .DescendantNodes()
+            .OfType<Microsoft.CodeAnalysis.CSharp.Syntax.TypeParameterSyntax>()
+            .Single();
+        var symbol = model.GetDeclaredSymbol(typeParam)!;
+        return SemanticSymbolKeyFactory.DeclarationKey(symbol);
+    }
+
+    [TestMethod]
+    public async Task RefOverload_GetsDistinctKeyFromByValue()
+    {
+        // ref/out cannot be overloaded together in C#, but by-value vs. by-ref is a legal overload
+        // pair whose keys must differ. (A doc ID encodes by-ref as '@'; the metadata fallback encodes
+        // the RefKind explicitly — see SemanticSymbolKeyFactory.ParameterSignature.)
+        const string source = """
+            namespace R
+            {
+                public class Mutator
+                {
+                    public void Apply(int value) { }
+                    public void Apply(ref int value) { value++; }
+                }
+            }
+            """;
+
+        var project = CreateProject(("Ref.cs", source));
+        var symbols = await SymbolExtractor.ExtractFromProjectAsync(project, 1);
+
+        var applies = symbols.Where(s => s.DisplayName == "Apply").Select(s => s.SymbolKey).ToList();
+        Assert.AreEqual(2, applies.Count, "Both overloads should be indexed.");
+        CollectionAssert.AllItemsAreUnique(applies,
+            "An overload differing by ref must get a distinct key from the by-value overload.");
+    }
+
+    [TestMethod]
     public async Task PartialType_ResolvesToOneStableKey()
     {
         var part1 = """
@@ -336,5 +402,34 @@ public class SymbolCatalogTests
 
         Assert.IsTrue(catalog.TryResolve("T:Ns.Type", 1, out var id));
         Assert.AreEqual(2, id, "A re-added (project, key) mirrors the DB upsert and keeps one row.");
+    }
+
+    [TestMethod]
+    public void TryResolveEdge_BindsAmbiguousDeterministicallyAndCounts()
+    {
+        var catalog = new SymbolCatalog();
+        catalog.Add(projectId: 3, "M:Ns.Type.M", symbolId: 30);
+        catalog.Add(projectId: 5, "M:Ns.Type.M", symbolId: 50);
+
+        // Requesting project has no match and the key is defined in two others: the edge is bound to
+        // the deterministic pick (lowest project id) so the graph stays complete, and the ambiguous
+        // binding is counted for diagnostics.
+        Assert.IsTrue(catalog.TryResolveEdge("M:Ns.Type.M", preferProjectId: 99, out var id));
+        Assert.AreEqual(30, id, "The deterministic pick is the lowest project id.");
+        Assert.AreEqual(1, catalog.AmbiguousEdgeBindings);
+    }
+
+    [TestMethod]
+    public void TryResolveEdge_ResolvesSameProjectEdgeWithoutCounting()
+    {
+        var catalog = new SymbolCatalog();
+        catalog.Add(projectId: 3, "M:Ns.Type.M", symbolId: 30);
+        catalog.Add(projectId: 5, "M:Ns.Type.M", symbolId: 50);
+
+        // A same-project target (the common case, e.g. an intra-compilation call) resolves exactly
+        // even when the key also exists elsewhere, and never counts as an ambiguous binding.
+        Assert.IsTrue(catalog.TryResolveEdge("M:Ns.Type.M", preferProjectId: 5, out var id));
+        Assert.AreEqual(50, id);
+        Assert.AreEqual(0, catalog.AmbiguousEdgeBindings);
     }
 }
