@@ -14,6 +14,10 @@ public static class GetIndexStatusTool
         if (db == null)
             return ResponseBuilder.BuildEmpty("No index database found.");
 
+        var readiness = db.CheckReadiness();
+        if (!readiness.Ready)
+            return ResponseBuilder.BuildEmpty(readiness.Message!);
+
         var conn = db.GetConnection();
 
         var results = new List<object>();
@@ -24,7 +28,7 @@ public static class GetIndexStatusTool
             SELECT p.canonical_id, p.git_remote_url, p.repo_relative_path,
                    p.assembly_name, p.is_test_project, p.last_indexed_at,
                    (SELECT COUNT(*) FROM symbols WHERE project_id = p.id) as symbol_count,
-                   (SELECT COUNT(*) FROM "references" WHERE in_project_id = p.id) as reference_count
+                   (SELECT COUNT(*) FROM occurrences WHERE in_project_id = p.id AND source_symbol_id IS NULL) as reference_count
             FROM projects p
             ORDER BY p.last_indexed_at DESC;
             """;

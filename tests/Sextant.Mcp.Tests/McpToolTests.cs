@@ -113,7 +113,9 @@ public class McpToolTests
 
         var refs = doc.RootElement.GetProperty("results");
         Assert.AreEqual("invocation", refs[0].GetProperty("reference_kind").GetString());
-        Assert.AreEqual("obj.DoWork(\"hello\");", refs[0].GetProperty("context_snippet").GetString());
+        // Phase 7: snippets are reproduced at query time from the exact on-disk source version. This
+        // fixture's source file is synthetic (not on disk), so the hash gate yields no snippet.
+        Assert.AreEqual(JsonValueKind.Null, refs[0].GetProperty("context_snippet").ValueKind);
     }
 
     [TestMethod]

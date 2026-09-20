@@ -74,7 +74,7 @@ public class IndexDatabaseTests
         db.RunMigrations();
         var conn = db.GetConnection();
 
-        var tables = new[] { "projects", "symbols", "references", "relationships", "call_graph", "file_index", "schema_version", "project_dependencies", "api_surface_snapshots", "solutions", "solution_projects", "comments", "argument_flow", "return_flow", "index_runs" };
+        var tables = new[] { "projects", "symbols", "occurrences", "relationships", "files", "file_versions", "schema_version", "project_dependencies", "api_surface_snapshots", "solutions", "solution_projects", "comments", "argument_flow", "return_flow", "index_runs" };
         foreach (var table in tables)
         {
             using var cmd = conn.CreateCommand();
@@ -97,11 +97,12 @@ public class IndexDatabaseTests
         var fk = Convert.ToInt32(cmd.ExecuteScalar());
         Assert.AreEqual(1, fk);
 
-        // Try inserting a symbol with invalid project_id
+        // Try inserting a symbol with invalid project_id (valid Phase-7 shape, so the throw is the FK
+        // violation on project_id — not an unknown-column error).
         using var insert = conn.CreateCommand();
         insert.CommandText = """
-            INSERT INTO symbols (project_id, fully_qualified_name, display_name, kind, accessibility, file_path, line_start, line_end, last_indexed_at)
-            VALUES (99999, 'test', 'test', 'class', 'public', 'test.cs', 1, 1, 0);
+            INSERT INTO symbols (project_id, symbol_key, fully_qualified_name, display_name, kind, accessibility, file_version_id, line_start, line_end, last_indexed_at)
+            VALUES (99999, 'T:Test', 'test', 'test', 0, 0, NULL, 1, 1, 0);
             """;
         Assert.ThrowsExactly<SqliteException>(() => insert.ExecuteNonQuery());
     }

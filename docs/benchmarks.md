@@ -76,7 +76,8 @@ dotnet run --project tests/Sextant.Benchmarks -- --corpus external --path /path/
 ### Rows and duplication
 - `projects`, `symbols`, `references`, `relationships`, `call_graph_edges`, `comments`.
 - `distinct_reference_occurrences` — reference rows deduplicated by the occurrence key
-  **`(symbol_id, file_path, line, reference_kind)`**.
+  **`(target_symbol_id, file_version_id, line, kind)`** (Phase 7; pre-Phase-7 this was
+  `(symbol_id, file_path, line, reference_kind)`).
 - `duplicate_reference_rows` = `references − distinct_reference_occurrences`.
 - `duplicate_reference_ratio` — duplicates as a fraction of all reference rows.
 
@@ -213,7 +214,66 @@ for P in 1 2 4 8 0; do
 done
 ```
 
-## Redaction guarantees
+## Phase 7 result — normalize files and compact occurrence storage
+
+Phase 7 is the database-size phase. It stores each source path **once** (`files.repo_relative_path`)
+plus a versioned content hash (`file_versions.content_hash`, a raw SHA-256 BLOB), rebuilds `symbols`
+to reference a `file_version_id` with **integer** `kind`/`accessibility`, and replaces the separate
+`references` and `call_graph` tables with one compact `occurrences` table (integer `kind`,
+bit-packed `flags`, `file_version_id` + `line`/`col`, no stored snippet). Context snippets are
+reproduced at query time from the exact matching source version (hash-gated), so they cost **zero**
+persistent bytes.
+
+Measured with `--corpus self` on the same machine, **legacy extractor** (to match the recorded
+baseline's extraction path), comparing the pre-Phase-7 schema at the base tip `610010a` against this
+branch. The `self` corpus is now 15 projects; this branch's tree carries a few extra Phase-7 source
+files, so it produces **slightly more** semantic evidence — which makes the size win conservative.
+
+| Metric | Phase 6 (old schema) | Phase 7 (compact) | Change |
+|---|--:|--:|--:|
+| Symbols | 1,964 | 2,040 | +3.9% |
+| Reference occurrences | 17,260 | 18,185 | +5.4% |
+| Relationships | 811 | 827 | +2.0% |
+| Call edges | 2,388 | 2,505 | +4.9% |
+| **Final database** | **11.71 MB** (12,283,904 B) | **3.46 MB** (3,624,960 B) | **−70.5%** |
+| Peak DB + WAL (transient) | 16.23 MB (17,015,760 B) | 6.94 MB (7,275,632 B) | −57.2% |
+| Peak staged artifacts | 16.26 MB (17,048,528 B) | 6.97 MB (7,308,400 B) | −57.1% |
+| Bytes per reference occurrence | ~712 B | ~199 B | −72% |
+
+The final database shrinks **70%** even though it holds *more* symbols, references, relationships,
+and call edges — the compaction is per-row, not from dropping data. **Write volume** tracks the same
+win: the durable artifact is 70% smaller and the peak staged footprint a new generation must write is
+**57% lower**, because every occurrence row shed its absolute path (→ integer `file_version_id`),
+its ~120-char snippet (→ query-time reproduction), and its text `kind`/`accessibility` (→ integer
+ordinals), and hashes are stored as 32-byte BLOBs instead of 64-char hex.
+
+Against the original **Phase-1 recorded baseline** (8.8 MB final, ~293 MB peak DB+WAL): the final
+database is **60.7% smaller** and peak DB+WAL is **97.6% lower** — though the peak reduction is
+cumulative (Phase 3 bounded the WAL; Phase 7 adds the schema compaction). Peak WAL alone is
+essentially unchanged from Phase 6 (~4.2 MB vs ~4.85 MB) because it was already batch-bounded.
+
+Reproduce (base tip vs this branch, same corpus and extractor):
+
+```bash
+dotnet run --project tests/Sextant.Benchmarks -c Release -- --corpus self --out ./benchmark-results
+```
+
+### Index consolidation (`EXPLAIN QUERY PLAN`-driven)
+
+The four occurrence indexes were kept — not added blindly — because each backs a foreign-key column
+(so `ON DELETE CASCADE` on a replaced project/symbol/file-version is index-driven) **and** a hot read
+path, verified with `EXPLAIN QUERY PLAN`:
+
+| Query | Plan (verified) |
+|---|---|
+| Cross-project closure pairs (`source_symbol_id IS NULL`) | `SEARCH o USING INDEX ix_occ_source` |
+| References to a declaration (`GetBySymbolId`) | `SEARCH … USING INDEX ix_occ_target` |
+| FQN lookup | `SEARCH s USING INDEX ix_symbols_fqn_lookup` |
+| Project + accessibility (API surface) | `SEARCH s USING INDEX ix_symbols_project_access` |
+| FTS symbol search | `SCAN fts VIRTUAL TABLE` + `SEARCH s USING INTEGER PRIMARY KEY` |
+
+`PerformanceTests` now asserts these plans directly (deterministic) instead of wall-clock thresholds
+(closes the intermittent-timing flake, issue #33).
 
 For the opt-in `external` corpus (and any run with `--redact`), the report is structurally scrubbed
 before it is written:

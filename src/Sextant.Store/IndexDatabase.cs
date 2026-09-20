@@ -159,6 +159,63 @@ public sealed class IndexDatabase : IDisposable
         Recover();
     }
 
+    /// <summary>The highest migration version embedded in this build.</summary>
+    public static int LatestSchemaVersion => LoadMigrations().Max(m => m.version);
+
+    /// <summary>The schema version currently recorded in the database file (0 if none).</summary>
+    public int CurrentSchemaVersion
+    {
+        get
+        {
+            var conn = GetConnection();
+            EnsureSchemaVersionTable(conn);
+            return GetSchemaVersion(conn);
+        }
+    }
+
+    /// <summary>
+    /// Reports whether this database can be served as a complete index, or must be rebuilt first.
+    /// Criterion 6 (Phase 7): opening an index built at an older, incompatible schema — or one whose
+    /// compact schema has been applied but never re-populated by a full run — must surface an
+    /// actionable rebuild message and never be mistaken for a complete new-generation index. The two
+    /// signals are the <c>schema_version</c> and the <c>index_runs</c> last-complete pointer.
+    /// </summary>
+    public IndexReadiness CheckReadiness()
+    {
+        var conn = GetConnection();
+        EnsureSchemaVersionTable(conn);
+        var current = GetSchemaVersion(conn);
+        var expected = LatestSchemaVersion;
+
+        if (current < expected)
+            return IndexReadiness.NotReady(
+                $"This index was built with an older Sextant schema (v{current}) and is incompatible with this build (v{expected}). " +
+                "The Phase 7 compaction changed the on-disk format, so the old data cannot be reused. " +
+                $"Rebuild it with a full index (e.g. `sextant index`) at '{_dbPath}'.");
+
+        if (current > expected)
+            return IndexReadiness.NotReady(
+                $"This index was built with a newer Sextant schema (v{current}) than this build supports (v{expected}). Upgrade Sextant.");
+
+        // Schema is current. A freshly-migrated compact index has no symbols and no complete run in the
+        // ledger; treat that as "must rebuild" rather than an empty-but-complete index.
+        var hasComplete = TableExists(conn, "index_runs") && new IndexRunStore(conn).GetLastCompleteRun() != null;
+        var hasSymbols = TableExists(conn, "symbols") && CountRows(conn, "symbols") > 0;
+        if (!hasComplete && !hasSymbols)
+            return IndexReadiness.NotReady(
+                $"The index schema is current (v{expected}) but no complete index generation exists yet — the compact schema requires a full rebuild. " +
+                $"Run a full index (e.g. `sextant index`) at '{_dbPath}'.");
+
+        return IndexReadiness.ReadyIndex;
+    }
+
+    private static long CountRows(SqliteConnection conn, string table)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = $"SELECT COUNT(*) FROM \"{table}\";";
+        return Convert.ToInt64(cmd.ExecuteScalar());
+    }
+
     /// <summary>
     /// Startup recovery. Folds a valid write-ahead log into the main database (recovering a WAL left
     /// by a prior process and truncating it), then abandons any staging generations that a dead

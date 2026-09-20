@@ -6,9 +6,9 @@ namespace Sextant.Store;
 public sealed class ReturnFlowStore(SqliteConnection connection)
 {
     private const string InsertSql = """
-        INSERT INTO return_flow (call_graph_id, destination_kind, destination_variable,
+        INSERT INTO return_flow (occurrence_id, destination_kind, destination_variable,
             destination_symbol_fqn, last_indexed_at)
-        VALUES (@call_graph_id, @kind, @variable, @symbol_fqn, @last_indexed_at)
+        VALUES (@occurrence_id, @kind, @variable, @symbol_fqn, @last_indexed_at)
         RETURNING id;
         """;
 
@@ -29,7 +29,7 @@ public sealed class ReturnFlowStore(SqliteConnection connection)
     public long Insert(SqliteCommand cmd, long callGraphId, string destinationKind, string? destinationVariable,
                        string? destinationSymbolFqn, long lastIndexedAt)
     {
-        SqlParam.Set(cmd, "@call_graph_id", callGraphId);
+        SqlParam.Set(cmd, "@occurrence_id", callGraphId);
         SqlParam.Set(cmd, "@kind", destinationKind);
         SqlParam.Set(cmd, "@variable", destinationVariable);
         SqlParam.Set(cmd, "@symbol_fqn", destinationSymbolFqn);
@@ -40,7 +40,7 @@ public sealed class ReturnFlowStore(SqliteConnection connection)
     public List<ReturnFlowInfo> GetByCallGraphId(long callGraphId)
     {
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = "SELECT * FROM return_flow WHERE call_graph_id = @id;";
+        cmd.CommandText = "SELECT * FROM return_flow WHERE occurrence_id = @id;";
         cmd.Parameters.AddWithValue("@id", callGraphId);
         return ReadAll(cmd);
     }
@@ -52,7 +52,7 @@ public sealed class ReturnFlowStore(SqliteConnection connection)
 
         using var cmd = connection.CreateCommand();
         var placeholders = string.Join(",", ids.Select((_, i) => $"@id{i}"));
-        cmd.CommandText = $"SELECT * FROM return_flow WHERE call_graph_id IN ({placeholders});";
+        cmd.CommandText = $"SELECT * FROM return_flow WHERE occurrence_id IN ({placeholders});";
         for (var i = 0; i < ids.Count; i++)
             cmd.Parameters.AddWithValue($"@id{i}", ids[i]);
         return ReadAll(cmd);
@@ -61,7 +61,7 @@ public sealed class ReturnFlowStore(SqliteConnection connection)
     public void DeleteByCallGraphId(long callGraphId)
     {
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = "DELETE FROM return_flow WHERE call_graph_id = @id;";
+        cmd.CommandText = "DELETE FROM return_flow WHERE occurrence_id = @id;";
         cmd.Parameters.AddWithValue("@id", callGraphId);
         cmd.ExecuteNonQuery();
     }
@@ -75,7 +75,7 @@ public sealed class ReturnFlowStore(SqliteConnection connection)
             results.Add(new ReturnFlowInfo
             {
                 Id = reader.GetInt64(reader.GetOrdinal("id")),
-                CallGraphId = reader.GetInt64(reader.GetOrdinal("call_graph_id")),
+                CallGraphId = reader.GetInt64(reader.GetOrdinal("occurrence_id")),
                 DestinationKind = reader.GetString(reader.GetOrdinal("destination_kind")),
                 DestinationVariable = reader.IsDBNull(reader.GetOrdinal("destination_variable")) ? null : reader.GetString(reader.GetOrdinal("destination_variable")),
                 DestinationSymbolFqn = reader.IsDBNull(reader.GetOrdinal("destination_symbol_fqn")) ? null : reader.GetString(reader.GetOrdinal("destination_symbol_fqn")),
