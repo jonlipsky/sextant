@@ -197,11 +197,18 @@ public sealed class IndexDatabase : IDisposable
             return IndexReadiness.NotReady(
                 $"This index was built with a newer Sextant schema (v{current}) than this build supports (v{expected}). Upgrade Sextant.");
 
-        // Schema is current. A freshly-migrated compact index has no symbols and no complete run in the
-        // ledger; treat that as "must rebuild" rather than an empty-but-complete index.
-        var hasComplete = TableExists(conn, "index_runs") && new IndexRunStore(conn).GetLastCompleteRun() != null;
+        // Schema is current. Decide whether a complete generation is actually available.
+        var hasRunLedger = TableExists(conn, "index_runs");
+        var hasComplete = hasRunLedger && new IndexRunStore(conn).GetLastCompleteRun() != null;
+        var hasAnyRun = hasRunLedger && CountRows(conn, "index_runs") > 0;
         var hasSymbols = TableExists(conn, "symbols") && CountRows(conn, "symbols") > 0;
-        if (!hasComplete && !hasSymbols)
+
+        // Ready when a complete generation is published, OR — for a directly-populated database with no
+        // run-ledger entries at all (e.g. a seeded test) — when symbols are present. A database that has
+        // run entries but no COMPLETE one is a partial or abandoned rebuild (the first post-migration
+        // run committed some batches, then crashed before publishing): it has symbols but must NOT be
+        // served as a finished index. A freshly-migrated compact index has neither symbols nor runs.
+        if (!hasComplete && !(hasSymbols && !hasAnyRun))
             return IndexReadiness.NotReady(
                 $"The index schema is current (v{expected}) but no complete index generation exists yet — the compact schema requires a full rebuild. " +
                 $"Run a full index (e.g. `sextant index`) at '{_dbPath}'.");

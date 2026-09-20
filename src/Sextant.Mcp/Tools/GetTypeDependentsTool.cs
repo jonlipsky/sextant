@@ -16,9 +16,9 @@ public static class GetTypeDependentsTool
         [Description("Filter by dependency kind: 'inherits', 'implements', 'returns', 'parameter_of', 'instantiates', or 'all' (default)")]
         string dependency_kind = "all")
     {
-        var db = dbProvider.GetDatabase();
+        var db = dbProvider.GetReadyDatabase(out var notReady);
         if (db == null)
-            return ResponseBuilder.BuildEmpty("No index database found.");
+            return ResponseBuilder.BuildEmpty(notReady);
 
         var conn = db.GetConnection();
         var symbolStore = new SymbolStore(conn);

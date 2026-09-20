@@ -14,9 +14,9 @@ public static class FindUnreferencedTool
         [Description("Exclude symbols defined in test projects (default: true)")] bool exclude_test_projects = true,
         [Description("Optional accessibility filter (public, internal, etc.)")] string? accessibility = null)
     {
-        var db = dbProvider.GetDatabase();
+        var db = dbProvider.GetReadyDatabase(out var notReady);
         if (db == null)
-            return ResponseBuilder.BuildEmpty("No index database found.");
+            return ResponseBuilder.BuildEmpty(notReady);
 
         var conn = db.GetConnection();
         var projectStore = new ProjectStore(conn);

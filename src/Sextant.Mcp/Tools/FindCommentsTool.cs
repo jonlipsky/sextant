@@ -21,9 +21,9 @@ public static class FindCommentsTool
         [Description("Maximum results (default 50)")]
         int max_results = 50)
     {
-        var db = dbProvider.GetDatabase();
+        var db = dbProvider.GetReadyDatabase(out var notReady);
         if (db == null)
-            return ResponseBuilder.BuildEmpty("No index database found.");
+            return ResponseBuilder.BuildEmpty(notReady);
 
         var conn = db.GetConnection();
         var commentStore = new CommentStore(conn);

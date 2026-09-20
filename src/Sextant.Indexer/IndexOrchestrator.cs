@@ -418,6 +418,7 @@ public sealed class IndexOrchestrator
                         CalleeSymbolId = calleeId,
                         CallSiteFile = call.CallSiteFile,
                         CallSiteLine = call.CallSiteLine,
+                        CallSiteColumn = call.CallSiteColumn,
                         LastIndexedAt = now
                     }, ownerProjectId);
                     session.RowsWritten();

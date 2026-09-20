@@ -69,6 +69,46 @@ public class RebuildGateTests
     }
 
     [TestMethod]
+    public void PartialRebuildIndex_WithSymbolsButNoCompleteRun_IsNotReady()
+    {
+        // Simulate a crashed rebuild: the post-migration full run opened a staging generation and
+        // committed some batches (symbols are present) but died before publishing the last-complete
+        // pointer. Symbols alone must NOT be mistaken for a finished index when a run ledger entry
+        // exists without a complete generation.
+        var conn = _db.GetConnection();
+        var projectStore = new ProjectStore(conn);
+        var projectId = projectStore.Insert(new ProjectIdentity
+        {
+            CanonicalId = "partialproj123456",
+            GitRemoteUrl = "https://github.com/test/repo",
+            RepoRelativePath = "src/Test/Test.csproj"
+        }, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+
+        new SymbolStore(conn).Insert(new SymbolInfo
+        {
+            ProjectId = projectId,
+            SymbolKey = "global::Test.Partial",
+            FullyQualifiedName = "global::Test.Partial",
+            DisplayName = "Partial",
+            Kind = SymbolKind.Class,
+            Accessibility = Accessibility.Public,
+            FilePath = "src/Partial.cs",
+            LineStart = 1,
+            LineEnd = 10,
+            LastIndexedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+        });
+
+        // A staging run that never reaches MarkComplete — the ledger has an entry but no complete pointer.
+        new IndexRunStore(conn).BeginRun("full", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+
+        var readiness = _db.CheckReadiness();
+
+        Assert.IsFalse(readiness.Ready, "symbols present with only a staging run is a partial rebuild, not a servable index");
+        Assert.IsNotNull(readiness.Message);
+        StringAssert.Contains(readiness.Message!, "full index", StringComparison.OrdinalIgnoreCase);
+    }
+
+    [TestMethod]
     public void OlderSchemaIndex_SurfacesRebuildMessage()
     {
         // Simulate opening an index built before the latest migration: roll the recorded schema

@@ -69,26 +69,30 @@ public sealed class SourceContextRetriever(FileStore files)
         if (stored == null)
             return null;
 
-        byte[] actual;
+        byte[] bytes;
         try
         {
-            actual = SHA256.HashData(File.ReadAllBytes(filePath));
+            bytes = File.ReadAllBytes(filePath);
         }
         catch
         {
             return null;
         }
 
-        if (!CryptographicOperations.FixedTimeEquals(actual, stored))
+        // Hash and decode the SAME buffer: a second File.ReadAllLines could observe a concurrent edit
+        // whose bytes were never verified, returning source that does not match the gated hash.
+        if (!CryptographicOperations.FixedTimeEquals(SHA256.HashData(bytes), stored))
             return null;
 
-        try
-        {
-            return File.ReadAllLines(filePath);
-        }
-        catch
-        {
-            return null;
-        }
+        return DecodeLines(bytes);
+    }
+
+    private static string[] DecodeLines(byte[] bytes)
+    {
+        using var reader = new StreamReader(new MemoryStream(bytes), detectEncodingFromByteOrderMarks: true);
+        var lines = new List<string>();
+        while (reader.ReadLine() is { } line)
+            lines.Add(line);
+        return [.. lines];
     }
 }

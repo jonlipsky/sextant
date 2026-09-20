@@ -13,9 +13,9 @@ public static class GetProjectDependenciesTool
         [Description("Canonical ID of the project")] string project_id,
         [Description("Include transitive dependencies (default: false)")] bool transitive = false)
     {
-        var db = dbProvider.GetDatabase();
+        var db = dbProvider.GetReadyDatabase(out var notReady);
         if (db == null)
-            return ResponseBuilder.BuildEmpty("No index database found.");
+            return ResponseBuilder.BuildEmpty(notReady);
 
         var conn = db.GetConnection();
         var projectStore = new ProjectStore(conn);

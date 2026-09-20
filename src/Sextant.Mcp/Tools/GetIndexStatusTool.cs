@@ -10,13 +10,9 @@ public static class GetIndexStatusTool
     [McpServerTool(Name = "get_index_status"), Description("Check what projects are indexed, symbol/reference counts, and index freshness. Call this first to see what data is available.")]
     public static string GetIndexStatus(DatabaseProvider dbProvider)
     {
-        var db = dbProvider.GetDatabase();
+        var db = dbProvider.GetReadyDatabase(out var notReady);
         if (db == null)
-            return ResponseBuilder.BuildEmpty("No index database found.");
-
-        var readiness = db.CheckReadiness();
-        if (!readiness.Ready)
-            return ResponseBuilder.BuildEmpty(readiness.Message!);
+            return ResponseBuilder.BuildEmpty(notReady);
 
         var conn = db.GetConnection();
 
