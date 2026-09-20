@@ -17,8 +17,10 @@ public sealed class IndexCorrectnessTests
 {
     // === Criterion 3/4/5: full == full-then-incremental ==================================
 
-    [TestMethod]
-    public async Task FullAndIncremental_ConvergeToEquivalentCanonicalState()
+    [DataTestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task FullAndIncremental_ConvergeToEquivalentCanonicalState(bool useDocumentExtractor)
     {
         var root = NewTempDir("diff");
         try
@@ -34,7 +36,7 @@ public sealed class IndexCorrectnessTests
                 using var incrDb = new IndexDatabase(Path.Combine(incrDir, "index.db"));
                 incrDb.RunMigrations();
                 var solution0 = await SolutionLoader.LoadSolutionAsync(slnx);
-                await new IndexOrchestrator(incrDb).IndexSolutionAsync(solution0);
+                await new IndexOrchestrator(incrDb, useDocumentExtractor: useDocumentExtractor).IndexSolutionAsync(solution0);
 
                 // Sentinel-stamp the independent projects (Lib2, MultiTarget) so that if the
                 // incremental rebuild wrongly reprocessed them, their fresh last_indexed_at would
@@ -50,7 +52,7 @@ public sealed class IndexCorrectnessTests
                 // The daemon reloads the workspace before reindexing; mirror that so the compilation
                 // reflects the edit on disk.
                 var solution1 = await SolutionLoader.LoadSolutionAsync(slnx);
-                var followUps = await new IncrementalIndexer(incrDb).IndexChangedFilesAsync(solution1, [edited]);
+                var followUps = await new IncrementalIndexer(incrDb, useDocumentExtractor: useDocumentExtractor).IndexChangedFilesAsync(solution1, [edited]);
                 Assert.AreEqual(0, followUps.Count, "the closure rebuild leaves no re-enqueue set");
 
                 // Narrowing: the independent projects must still carry the sentinel (untouched).
@@ -62,7 +64,7 @@ public sealed class IndexCorrectnessTests
                 // Path A (full): index the final on-disk state from scratch.
                 using var fullDb = new IndexDatabase(Path.Combine(fullDir, "index.db"));
                 fullDb.RunMigrations();
-                await new IndexOrchestrator(fullDb).IndexSolutionAsync(solution1);
+                await new IndexOrchestrator(fullDb, useDocumentExtractor: useDocumentExtractor).IndexSolutionAsync(solution1);
 
                 var fullDump = CanonicalIndexDump.Dump(fullDb.GetConnection());
                 var incrDump = CanonicalIndexDump.Dump(incrDb.GetConnection());
@@ -131,8 +133,10 @@ public sealed class IndexCorrectnessTests
 
     // === Criterion 2: unchanged restart schedules no reindex work ========================
 
-    [TestMethod]
-    public async Task UnchangedRestart_SchedulesNoSemanticReindexWork()
+    [DataTestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task UnchangedRestart_SchedulesNoSemanticReindexWork(bool useDocumentExtractor)
     {
         var root = NewTempDir("noop");
         var dbDir = NewTempDir("noop-db");
@@ -144,7 +148,7 @@ public sealed class IndexCorrectnessTests
             using var db = new IndexDatabase(Path.Combine(dbDir, "index.db"));
             db.RunMigrations();
             var solution = await SolutionLoader.LoadSolutionAsync(slnx);
-            await new IndexOrchestrator(db).IndexSolutionAsync(solution);
+            await new IndexOrchestrator(db, useDocumentExtractor: useDocumentExtractor).IndexSolutionAsync(solution);
 
             var conn = db.GetConnection();
             var runsBefore = Scalar(conn, "SELECT COUNT(*) FROM index_runs");
@@ -157,7 +161,7 @@ public sealed class IndexCorrectnessTests
                             && !p.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}"))
                 .ToList();
             var solution2 = await SolutionLoader.LoadSolutionAsync(slnx);
-            await new IncrementalIndexer(db).IndexChangedFilesAsync(solution2, allFiles);
+            await new IncrementalIndexer(db, useDocumentExtractor: useDocumentExtractor).IndexChangedFilesAsync(solution2, allFiles);
 
             var runsAfter = Scalar(conn, "SELECT COUNT(*) FROM index_runs");
             var after = CanonicalIndexDump.Dump(conn);
@@ -256,8 +260,10 @@ public sealed class IndexCorrectnessTests
 
     // === Criterion 4/6: removing a project reference converges with a fresh full index ===
 
-    [TestMethod]
-    public async Task RemovedProjectReference_IncrementalConvergesWithFullReindex()
+    [DataTestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task RemovedProjectReference_IncrementalConvergesWithFullReindex(bool useDocumentExtractor)
     {
         var root = NewTempDir("refdrop");
         try
@@ -273,7 +279,7 @@ public sealed class IndexCorrectnessTests
                 using var incrDb = new IndexDatabase(Path.Combine(incrDir, "index.db"));
                 incrDb.RunMigrations();
                 var solution0 = await SolutionLoader.LoadSolutionAsync(slnx);
-                await new IndexOrchestrator(incrDb).IndexSolutionAsync(solution0);
+                await new IndexOrchestrator(incrDb, useDocumentExtractor: useDocumentExtractor).IndexSolutionAsync(solution0);
 
                 Assert.IsTrue(CrossProjectReferenceExists(incrDb.GetConnection(), "App", "Lib"),
                     "precondition: App must have cross-project references into Lib before the edit.");
@@ -306,12 +312,12 @@ public sealed class IndexCorrectnessTests
 
                 Restore(slnx);
                 var solution1 = await SolutionLoader.LoadSolutionAsync(slnx);
-                await new IncrementalIndexer(incrDb).IndexChangedFilesAsync(solution1, [appCsproj, appRunner]);
+                await new IncrementalIndexer(incrDb, useDocumentExtractor: useDocumentExtractor).IndexChangedFilesAsync(solution1, [appCsproj, appRunner]);
 
                 // Path A (full): index the final on-disk state from scratch.
                 using var fullDb = new IndexDatabase(Path.Combine(fullDir, "index.db"));
                 fullDb.RunMigrations();
-                await new IndexOrchestrator(fullDb).IndexSolutionAsync(solution1);
+                await new IndexOrchestrator(fullDb, useDocumentExtractor: useDocumentExtractor).IndexSolutionAsync(solution1);
 
                 // The now-removed cross-project references must be gone in BOTH databases.
                 Assert.IsFalse(CrossProjectReferenceExists(fullDb.GetConnection(), "App", "Lib"),
@@ -338,8 +344,10 @@ public sealed class IndexCorrectnessTests
 
     // === Multi-TFM: incremental edit preserves per-TFM variants (no data loss) ============
 
-    [TestMethod]
-    public async Task MultiTargetProject_IncrementalEdit_PreservesPerTfmVariantsWithNoDataLoss()
+    [DataTestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task MultiTargetProject_IncrementalEdit_PreservesPerTfmVariantsWithNoDataLoss(bool useDocumentExtractor)
     {
         var root = NewTempDir("mtfm");
         var dbDir = NewTempDir("mtfm-db");
@@ -351,7 +359,7 @@ public sealed class IndexCorrectnessTests
             using var db = new IndexDatabase(Path.Combine(dbDir, "index.db"));
             db.RunMigrations();
             var solution = await SolutionLoader.LoadSolutionAsync(slnx);
-            await new IndexOrchestrator(db).IndexSolutionAsync(solution);
+            await new IndexOrchestrator(db, useDocumentExtractor: useDocumentExtractor).IndexSolutionAsync(solution);
 
             var conn = db.GetConnection();
             var (net10, netStd) = MultiTargetProjectIds(conn);
@@ -366,7 +374,7 @@ public sealed class IndexCorrectnessTests
             InsertBeforeLastBrace(formatter, "    public string JoinReverse(string a, string b) => Join(b, a);\n");
 
             var solution2 = await SolutionLoader.LoadSolutionAsync(slnx);
-            await new IncrementalIndexer(db).IndexChangedFilesAsync(solution2, [formatter]);
+            await new IncrementalIndexer(db, useDocumentExtractor: useDocumentExtractor).IndexChangedFilesAsync(solution2, [formatter]);
 
             // Re-resolve ids (a rebuild re-inserts project rows, so ids may change).
             (net10, netStd) = MultiTargetProjectIds(conn);

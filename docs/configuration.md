@@ -10,11 +10,14 @@ Create a `sextant.json` file at your repository root to customize behavior:
   "max_call_hierarchy_depth": 5,
   "fts_max_results": 20,
   "solutions": ["src/App.sln"],
-  "auto_spawn_daemon": true
+  "auto_spawn_daemon": true,
+  "document_extractor": false
 }
 ```
 
 All fields are optional — Sextant uses sensible defaults.
+
+`document_extractor` (default `false`) selects the extraction engine. When `true`, indexing uses the Phase 5 **document-oriented** extractor (a single usage-site pass per document) instead of the legacy declaration-driven `FindReferencesAsync` path. It is off by default until parity is established across all corpora; see [indexing.md](indexing.md#document-oriented-extractor-phase-5-feature-flagged).
 
 ### Environment Variable Overrides
 
@@ -26,6 +29,7 @@ Environment variables take precedence over `sextant.json`:
 | `SEXTANT_MAX_DEPTH` | Max call hierarchy depth | `5` |
 | `SEXTANT_FTS_MAX` | Max FTS search results | `20` |
 | `SEXTANT_AUTO_SPAWN_DAEMON` | Auto-spawn daemon from MCP server | `true` (set `false` or `0` to disable) |
+| `SEXTANT_DOCUMENT_EXTRACTOR` | Use the Phase 5 document-oriented extractor | `false` (set `true`/`1` to enable; `false`/`0` to disable) |
 
 ### Runtime Output
 
