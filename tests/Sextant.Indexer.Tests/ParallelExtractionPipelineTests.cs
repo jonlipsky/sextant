@@ -28,7 +28,7 @@ public sealed class ParallelExtractionPipelineTests
             return Task.FromResult(new ProjectExtraction<TestDoc>(project, $"P{project}", docs));
         };
 
-    private static DocumentContributionSet Extract(TestDoc doc)
+    private static DocumentContributionSet Extract(TestDoc doc, CancellationToken _)
     {
         if (doc.DelayMs > 0)
             Thread.Sleep(doc.DelayMs);
@@ -102,6 +102,52 @@ public sealed class ParallelExtractionPipelineTests
 
         CollectionAssert.AreEqual(await Run(1), await Run(8),
             "parallel extraction must produce the identical contribution order as the sequential path");
+    }
+
+    [TestMethod]
+    [DataRow(1)]
+    [DataRow(8)]
+    public async Task CrossDocumentRelationship_DedupsFirstWins_InDocumentOrdinalOrder(int maxParallelism)
+    {
+        // A relationship is the only contribution kind that can dedup ACROSS documents (reference and
+        // call keys include the file), so this exercises the cross-document first-wins fold directly.
+        // Docs 0 and 2 emit the SAME relationship; doc 1 a distinct one. Doc 2 finishes first (no
+        // delay) while doc 0 is slow, so completion order != ordinal order. The merged output must
+        // still collapse the later duplicate and keep ascending-document-ordinal order: [shared, mid].
+        var docs = new List<TestDoc>
+        {
+            new(0, 0, DelayMs: 30, Throw: false), // shared -> base (slow)
+            new(0, 1, DelayMs: 15, Throw: false), // mid -> base
+            new(0, 2, DelayMs: 0, Throw: false),  // shared -> base (duplicate, finishes first)
+        };
+        var projects = new List<Func<CancellationToken, Task<ProjectExtraction<TestDoc>>>>
+        {
+            _ => Task.FromResult(new ProjectExtraction<TestDoc>(0, "P0", docs)),
+        };
+
+        static DocumentContributionSet ExtractRel(TestDoc doc, CancellationToken _)
+        {
+            if (doc.DelayMs > 0) Thread.Sleep(doc.DelayMs);
+            var set = new DocumentContributionSet();
+            var from = doc.Doc == 1 ? "mid" : "shared";
+            set.AddRelationship(new RelationshipContribution(from, "base", RelationshipKind.Inherits));
+            return set;
+        }
+
+        var recorded = new List<string>();
+        await ParallelExtractionPipeline.RunAsync(
+            projects, ExtractRel,
+            (project, _) =>
+            {
+                foreach (var rel in project.Contributions.Relationships) recorded.Add(rel.FromKey);
+                return Task.CompletedTask;
+            },
+            new ExtractionParallelismOptions { MaxParallelism = maxParallelism, QueueCapacity = 2 },
+            CancellationToken.None);
+
+        CollectionAssert.AreEqual(new[] { "shared", "mid" }, recorded,
+            "the duplicate relationship from the later document must collapse (first-wins) and the " +
+            "merged order must follow ascending document ordinal, not worker completion order");
     }
 
     [TestMethod]

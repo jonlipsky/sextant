@@ -37,12 +37,15 @@ public static class ParallelExtractionPipeline
     /// <param name="projects">Project descriptors in deterministic order. Each is invoked once, in
     /// order, to materialize that project's compilation and documents just before extraction.</param>
     /// <param name="extractDocument">Pure, CPU-bound per-document extraction (run in parallel). Must
-    /// not touch SQLite or any shared mutable state that is not itself thread-safe.</param>
+    /// not touch SQLite or any shared mutable state that is not itself thread-safe. Receives the
+    /// pipeline's linked token so in-flight analysis observes cancellation caused by a consumer/worker
+    /// fault, not only external cancellation.</param>
     /// <param name="persist">Persists one project's contributions on the single consumer thread, in
-    /// project order. The only stage permitted to touch the SQLite writer.</param>
+    /// project order. The only stage permitted to touch the SQLite writer. Receives the linked token
+    /// and should honour it so a large project's persist loop tears down promptly on cancellation.</param>
     public static async Task RunAsync<TDoc>(
         IReadOnlyList<Func<CancellationToken, Task<ProjectExtraction<TDoc>>>> projects,
-        Func<TDoc, DocumentContributionSet> extractDocument,
+        Func<TDoc, CancellationToken, DocumentContributionSet> extractDocument,
         Func<ProjectContributions, CancellationToken, Task> persist,
         ExtractionParallelismOptions options,
         CancellationToken cancellationToken)
@@ -84,7 +87,7 @@ public static class ParallelExtractionPipeline
 
     private static async Task ProduceAsync<TDoc>(
         IReadOnlyList<Func<CancellationToken, Task<ProjectExtraction<TDoc>>>> projects,
-        Func<TDoc, DocumentContributionSet> extractDocument,
+        Func<TDoc, CancellationToken, DocumentContributionSet> extractDocument,
         ExtractionParallelismOptions options,
         ChannelWriter<ProjectContributions> writer,
         CancellationToken token)
@@ -114,19 +117,19 @@ public static class ParallelExtractionPipeline
 
     private static async Task<DocumentContributionSet> ExtractProjectAsync<TDoc>(
         ProjectExtraction<TDoc> project,
-        Func<TDoc, DocumentContributionSet> extractDocument,
+        Func<TDoc, CancellationToken, DocumentContributionSet> extractDocument,
         ExtractionParallelismOptions options,
         CancellationToken token)
     {
         var documents = project.Documents;
-        var perDocument = new DocumentContributionSet[documents.Count];
+        var perDocument = new DocumentContributionSet?[documents.Count];
 
         if (options.MaxParallelism <= 1 || documents.Count <= 1)
         {
             for (var i = 0; i < documents.Count; i++)
             {
                 token.ThrowIfCancellationRequested();
-                perDocument[i] = extractDocument(documents[i]);
+                perDocument[i] = extractDocument(documents[i], token);
             }
         }
         else
@@ -137,16 +140,21 @@ public static class ParallelExtractionPipeline
                 (i, ct) =>
                 {
                     ct.ThrowIfCancellationRequested();
-                    perDocument[i] = extractDocument(documents[i]);
+                    perDocument[i] = extractDocument(documents[i], ct);
                     return ValueTask.CompletedTask;
                 }).ConfigureAwait(false);
         }
 
         // Fold per-document sets into one project set in ascending document ordinal — this is what
-        // makes the merged output independent of the order the parallel workers finished.
+        // makes the merged output independent of the order the parallel workers finished. Release each
+        // source set immediately after folding so only the growing merged set (plus not-yet-folded
+        // sets) is retained: transient peak stays ~one project's payload, not two copies of it.
         var merged = new DocumentContributionSet();
-        foreach (var set in perDocument)
-            merged.MergeFrom(set);
+        for (var i = 0; i < perDocument.Length; i++)
+        {
+            merged.MergeFrom(perDocument[i]!);
+            perDocument[i] = null;
+        }
         return merged;
     }
 

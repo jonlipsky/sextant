@@ -267,6 +267,10 @@ public sealed class IndexOrchestrator
             // factory — Solution.GetProject over the immutable solution plus a read-only
             // projectRoslynToId lookup — is deterministic and side-effect-free, so a benign racing
             // double-computation yields the identical value: thread-safe and determinism-preserving.
+            // It is cleared at each project boundary (below) so it only ever retains assembly symbols
+            // referenced by the current project — all of which are already rooted by that project's
+            // live compilation — keeping the "one compilation live at a time" memory bound intact
+            // (criteria 2 & 6) rather than accumulating every processed project's assemblies.
             var assemblyProjectCache = new ConcurrentDictionary<IAssemblySymbol, long?>(SymbolEqualityComparer.Default);
             long? ResolveTargetProject(IAssemblySymbol assembly) =>
                 assemblyProjectCache.GetOrAdd(assembly, a =>
@@ -277,12 +281,14 @@ public sealed class IndexOrchestrator
 
             // Pure, CPU-bound per-document extraction run in parallel. Builds the document's semantic
             // model on the calling worker thread (one model per thread) and walks it once into a
-            // fresh per-document contribution set; the catalog and SQLite are never touched here.
-            DocumentContributionSet ExtractOne(OccurrenceDoc doc)
+            // fresh per-document contribution set; the catalog and SQLite are never touched here. The
+            // linked token (not the outer request token) is threaded through so a consumer/worker
+            // fault cancels in-flight analysis, not just externally-requested cancellation.
+            DocumentContributionSet ExtractOne(OccurrenceDoc doc, CancellationToken ct)
             {
                 var model = doc.Compilation.GetSemanticModel(doc.Tree);
-                var root = doc.Tree.GetRoot(cancellationToken);
-                var text = doc.Tree.GetText(cancellationToken);
+                var root = doc.Tree.GetRoot(ct);
+                var text = doc.Tree.GetText(ct);
                 var set = new DocumentContributionSet();
                 DocumentSemanticExtractor.ExtractDocument(
                     root, model, doc.Tree.FilePath, text, set, ResolveTargetProject);
@@ -303,6 +309,12 @@ public sealed class IndexOrchestrator
                 var owner = ownerProjectId;
                 projectDescriptors.Add(async ct =>
                 {
+                    // Release the previous project's cached assembly symbols before extracting this
+                    // one. The producer invokes descriptors sequentially with no worker active (the
+                    // prior project's Parallel.ForEachAsync has completed and this project's has not
+                    // started), and the consumer never calls ResolveTargetProject (targets are already
+                    // stamped into the contribution records), so clearing here races nothing.
+                    assemblyProjectCache.Clear();
                     var compilation = await captured.GetCompilationAsync(ct);
                     var docs = new List<OccurrenceDoc>();
                     if (compilation != null)
@@ -323,8 +335,9 @@ public sealed class IndexOrchestrator
             // them, so target resolution (and AmbiguousEdgeBindings counting) and rowid assignment stay
             // single-threaded and deterministic.
             var occurrenceProjectIndex = 0;
-            Task PersistProject(ProjectContributions project, CancellationToken _)
+            Task PersistProject(ProjectContributions project, CancellationToken persistToken)
             {
+                persistToken.ThrowIfCancellationRequested();
                 EnterProject();
                 occurrenceProjectIndex++;
                 progress?.Report(new IndexingProgress
@@ -419,6 +432,9 @@ public sealed class IndexOrchestrator
                                  "region(s) (extraction completeness diagnostic)");
 
                 _log?.Invoke($"  {project.Name}: occurrences extracted");
+                // Honour cancellation before publishing this project's batch so a mid-run cancel drops
+                // the uncommitted rows (rolled back on session dispose) instead of committing them.
+                persistToken.ThrowIfCancellationRequested();
                 session.CommitBatch();
                 return Task.CompletedTask;
             }

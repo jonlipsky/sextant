@@ -28,21 +28,31 @@ public sealed class ParallelDeterminismTests
             Restore(slnx);
 
             // Sequential: one document at a time (MaxParallelism = 1).
-            var sequentialDump = await IndexAndDumpAsync(
+            var sequential = await IndexAndDumpAsync(
                 slnx, Path.Combine(seqDir, "index.db"), ExtractionParallelismOptions.Sequential);
 
             // Parallel: force the bounded pipeline's parallel per-document path regardless of the host
             // core count so the comparison is meaningful even on a small CI box.
             var parallelOptions = new ExtractionParallelismOptions { MaxParallelism = 8, QueueCapacity = 4 };
-            var parallelDump = await IndexAndDumpAsync(
+            var parallel = await IndexAndDumpAsync(
                 slnx, Path.Combine(parDir, "index.db"), parallelOptions);
 
-            TestContext.WriteLine($"canonical dump length: sequential={sequentialDump.Length} parallel={parallelDump.Length}");
-            Assert.IsTrue(sequentialDump.Length > 0, "the corpus produced an empty canonical dump");
+            TestContext.WriteLine($"canonical dump length: sequential={sequential.Canonical.Length} parallel={parallel.Canonical.Length}");
+            Assert.IsTrue(sequential.Canonical.Length > 0, "the corpus produced an empty canonical dump");
 
-            if (!string.Equals(sequentialDump, parallelDump, StringComparison.Ordinal))
-                Assert.Fail("parallel extraction diverged from sequential extraction:\n" +
-                            FirstDifference(sequentialDump, parallelDump));
+            // (a) Semantic multiset equivalence: the order-normalized canonical graph is identical.
+            if (!string.Equals(sequential.Canonical, parallel.Canonical, StringComparison.Ordinal))
+                Assert.Fail("parallel extraction diverged from sequential extraction (canonical):\n" +
+                            FirstDifference(sequential.Canonical, parallel.Canonical));
+
+            // (b) The hard bar (criterion 1): actual persisted ROW ORDER is byte-for-byte identical.
+            // This dump orders by rowid (insertion order) and includes access_kind, so it catches both
+            // a task-completion-order leak into persistence and any access-classification divergence
+            // that the order-normalized canonical dump (which also omits access_kind) would hide.
+            Assert.IsTrue(sequential.Ordered.Length > 0, "the corpus produced an empty ordered dump");
+            if (!string.Equals(sequential.Ordered, parallel.Ordered, StringComparison.Ordinal))
+                Assert.Fail("parallel extraction diverged from sequential extraction (row order):\n" +
+                            FirstDifference(sequential.Ordered, parallel.Ordered));
         }
         finally
         {
@@ -98,7 +108,7 @@ public sealed class ParallelDeterminismTests
         }
     }
 
-    private static async Task<string> IndexAndDumpAsync(
+    private static async Task<(string Canonical, string Ordered)> IndexAndDumpAsync(
         string slnx, string dbPath, ExtractionParallelismOptions parallelism)
     {
         using var db = new IndexDatabase(dbPath);
@@ -106,7 +116,76 @@ public sealed class ParallelDeterminismTests
         var solution = await SolutionLoader.LoadSolutionAsync(slnx);
         await new IndexOrchestrator(db, useDocumentExtractor: true, parallelism: parallelism)
             .IndexSolutionAsync(solution);
-        return CanonicalIndexDump.Dump(db.GetConnection());
+        var conn = db.GetConnection();
+        return (CanonicalIndexDump.Dump(conn), RawOrderedDump(conn));
+    }
+
+    /// <summary>
+    /// A row-order-sensitive dump of the occurrence tables (references, call_graph, relationships)
+    /// ordered by <c>rowid</c> — i.e. the actual persistence order — with each foreign key projected to
+    /// its stable semantic identity so two databases are comparable. Unlike the order-normalized
+    /// <see cref="CanonicalIndexDump"/>, equality here proves the persisted ROW ORDER (not just the
+    /// row set) is identical, and it includes <c>access_kind</c> so a read/write-classification
+    /// divergence under parallelism cannot slip through. This is the byte-equivalence bar of
+    /// criterion 1 for the parallel-vs-sequential comparison (both sides are the same extractor, so it
+    /// carries no legacy-parity risk).
+    /// </summary>
+    private static string RawOrderedDump(SqliteConnection conn)
+    {
+        var sb = new System.Text.StringBuilder();
+
+        AppendOrdered(sb, conn, "references", """
+            SELECT tp.canonical_id, ts.symbol_key, ip.canonical_id, r.file_path, r.line,
+                   r.reference_kind, COALESCE(r.access_kind,''), COALESCE(r.context_snippet,'')
+            FROM "references" r
+            JOIN symbols ts ON r.symbol_id = ts.id
+            JOIN projects tp ON ts.project_id = tp.id
+            JOIN projects ip ON r.in_project_id = ip.id
+            ORDER BY r.rowid
+            """);
+
+        AppendOrdered(sb, conn, "call_graph", """
+            SELECT cp.canonical_id, cs.symbol_key, ep.canonical_id, es.symbol_key,
+                   cg.call_site_file, cg.call_site_line
+            FROM call_graph cg
+            JOIN symbols cs ON cg.caller_symbol_id = cs.id
+            JOIN projects cp ON cs.project_id = cp.id
+            JOIN symbols es ON cg.callee_symbol_id = es.id
+            JOIN projects ep ON es.project_id = ep.id
+            ORDER BY cg.rowid
+            """);
+
+        AppendOrdered(sb, conn, "relationships", """
+            SELECT fp.canonical_id, fs.symbol_key, tp.canonical_id, ts.symbol_key, rel.kind
+            FROM relationships rel
+            JOIN symbols fs ON rel.from_symbol_id = fs.id
+            JOIN projects fp ON fs.project_id = fp.id
+            JOIN symbols ts ON rel.to_symbol_id = ts.id
+            JOIN projects tp ON ts.project_id = tp.id
+            ORDER BY rel.rowid
+            """);
+
+        return sb.ToString();
+    }
+
+    private static void AppendOrdered(System.Text.StringBuilder sb, SqliteConnection conn, string table, string sql)
+    {
+        sb.Append("=== ").Append(table).Append(" (by rowid) ===\n");
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = sql;
+        using var reader = cmd.ExecuteReader();
+        var count = 0;
+        while (reader.Read())
+        {
+            for (var i = 0; i < reader.FieldCount; i++)
+            {
+                if (i > 0) sb.Append('\u001f');
+                sb.Append(reader.IsDBNull(i) ? "\u2205" : reader.GetValue(i)?.ToString() ?? "\u2205");
+            }
+            sb.Append('\n');
+            count++;
+        }
+        sb.Append("(rows: ").Append(count).Append(")\n\n");
     }
 
     /// <summary>An <see cref="IProgress{T}"/> that invokes its callback synchronously on the reporting
