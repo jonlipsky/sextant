@@ -15,6 +15,11 @@ namespace Sextant.Mcp;
 /// </summary>
 public sealed class SourceContextRetriever(FileStore files)
 {
+    // Per-instance memo of verified source lines keyed by (project, file). A SourceContextRetriever is
+    // created per query, so this caches for the lifetime of ONE request: a symbol referenced N times in
+    // one file costs a single File.Exists + hash + read instead of N. A null value caches a miss.
+    private readonly Dictionary<(long ProjectId, string FilePath), string[]?> _verifiedLines = [];
+
     /// <summary>The single trimmed source line at <paramref name="line"/>, or null when unavailable.</summary>
     public string? GetLineSnippet(long projectId, string filePath, int line)
     {
@@ -40,17 +45,29 @@ public sealed class SourceContextRetriever(FileStore files)
 
     private bool TryReadVerifiedLines(long projectId, string filePath, out string[] lines)
     {
-        lines = [];
+        if (_verifiedLines.TryGetValue((projectId, filePath), out var cached))
+        {
+            lines = cached ?? [];
+            return cached != null;
+        }
 
+        var verified = ReadVerifiedLines(projectId, filePath);
+        _verifiedLines[(projectId, filePath)] = verified;
+        lines = verified ?? [];
+        return verified != null;
+    }
+
+    private string[]? ReadVerifiedLines(long projectId, string filePath)
+    {
         // File.Exists first: a file missing at index time stores a placeholder hash that a still-missing
         // file would re-derive to; checking existence up front means the gate can never pass for a file
         // that is not physically present and readable.
         if (!File.Exists(filePath))
-            return false;
+            return null;
 
         var stored = files.TryGetStoredContentHash(projectId, filePath);
         if (stored == null)
-            return false;
+            return null;
 
         byte[] actual;
         try
@@ -59,20 +76,19 @@ public sealed class SourceContextRetriever(FileStore files)
         }
         catch
         {
-            return false;
+            return null;
         }
 
         if (!CryptographicOperations.FixedTimeEquals(actual, stored))
-            return false;
+            return null;
 
         try
         {
-            lines = File.ReadAllLines(filePath);
+            return File.ReadAllLines(filePath);
         }
         catch
         {
-            return false;
+            return null;
         }
-        return true;
     }
 }

@@ -258,7 +258,7 @@ public sealed class SymbolStore(SqliteConnection connection)
     public List<SymbolInfo> GetByAttribute(string attributeFqn)
     {
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = SelectPrefix + " WHERE s.attributes LIKE '%' || @attr || '%';";
+        cmd.CommandText = SelectPrefix + " WHERE s.attributes LIKE '%' || @attr || '%' ORDER BY s.fully_qualified_name, s.id;";
         cmd.Parameters.AddWithValue("@attr", attributeFqn);
         var results = ReadAll(cmd);
         // Verify exact match in JSON array
