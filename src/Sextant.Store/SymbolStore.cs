@@ -9,13 +9,14 @@ public sealed class SymbolStore(SqliteConnection connection)
     {
         using var cmd = connection.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO symbols (project_id, fully_qualified_name, display_name, kind, accessibility,
+            INSERT INTO symbols (project_id, symbol_key, fully_qualified_name, display_name, kind, accessibility,
                 is_static, is_abstract, is_virtual, is_override, signature, signature_hash,
                 doc_comment, file_path, line_start, line_end, attributes, last_indexed_at)
-            VALUES (@project_id, @fqn, @display_name, @kind, @accessibility,
+            VALUES (@project_id, @symbol_key, @fqn, @display_name, @kind, @accessibility,
                 @is_static, @is_abstract, @is_virtual, @is_override, @signature, @signature_hash,
                 @doc_comment, @file_path, @line_start, @line_end, @attributes, @last_indexed_at)
-            ON CONFLICT(fully_qualified_name, project_id) DO UPDATE SET
+            ON CONFLICT(project_id, symbol_key) DO UPDATE SET
+                fully_qualified_name = excluded.fully_qualified_name,
                 display_name = excluded.display_name,
                 kind = excluded.kind,
                 accessibility = excluded.accessibility,
@@ -34,6 +35,7 @@ public sealed class SymbolStore(SqliteConnection connection)
             RETURNING id;
             """;
         cmd.Parameters.AddWithValue("@project_id", symbol.ProjectId);
+        cmd.Parameters.AddWithValue("@symbol_key", symbol.SymbolKey);
         cmd.Parameters.AddWithValue("@fqn", symbol.FullyQualifiedName);
         cmd.Parameters.AddWithValue("@display_name", symbol.DisplayName);
         cmd.Parameters.AddWithValue("@kind", symbol.Kind.ToString().ToLowerInvariant());
@@ -75,6 +77,37 @@ public sealed class SymbolStore(SqliteConnection connection)
 
         using var reader = cmd.ExecuteReader();
         return reader.Read() ? ReadSymbol(reader) : null;
+    }
+
+    /// <summary>Looks up a definition by its stable semantic key within a project.</summary>
+    public SymbolInfo? GetBySymbolKey(string symbolKey, long projectId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT * FROM symbols WHERE symbol_key = @symbol_key AND project_id = @project_id;";
+        cmd.Parameters.AddWithValue("@symbol_key", symbolKey);
+        cmd.Parameters.AddWithValue("@project_id", projectId);
+        using var reader = cmd.ExecuteReader();
+        return reader.Read() ? ReadSymbol(reader) : null;
+    }
+
+    /// <summary>
+    /// Resolves a display fully-qualified name to every matching definition. Because the FQN is no
+    /// longer a unique identity (overloads share one, and the same FQN can exist in several
+    /// projects), callers get all candidates and decide how to report ambiguity rather than
+    /// silently selecting one row. Results are ordered deterministically (project_id, then the stable
+    /// symbol_key, then id) so a best-match pick is content-stable across rebuilds even though the
+    /// underlying row ids are reassigned on every full re-index.
+    /// </summary>
+    public List<SymbolInfo> ResolveByFqn(string fullyQualifiedName, long? projectId = null)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = projectId.HasValue
+            ? "SELECT * FROM symbols WHERE fully_qualified_name = @fqn AND project_id = @project_id ORDER BY project_id, symbol_key, id;"
+            : "SELECT * FROM symbols WHERE fully_qualified_name = @fqn ORDER BY project_id, symbol_key, id;";
+        cmd.Parameters.AddWithValue("@fqn", fullyQualifiedName);
+        if (projectId.HasValue)
+            cmd.Parameters.AddWithValue("@project_id", projectId.Value);
+        return ReadAll(cmd);
     }
 
     public List<SymbolInfo> GetByFile(string filePath)
@@ -241,6 +274,7 @@ public sealed class SymbolStore(SqliteConnection connection)
         {
             Id = reader.GetInt64(reader.GetOrdinal("id")),
             ProjectId = reader.GetInt64(reader.GetOrdinal("project_id")),
+            SymbolKey = reader.GetString(reader.GetOrdinal("symbol_key")),
             FullyQualifiedName = reader.GetString(reader.GetOrdinal("fully_qualified_name")),
             DisplayName = reader.GetString(reader.GetOrdinal("display_name")),
             Kind = Enum.Parse<SymbolKind>(reader.GetString(reader.GetOrdinal("kind")), ignoreCase: true),

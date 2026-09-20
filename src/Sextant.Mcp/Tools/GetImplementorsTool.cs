@@ -20,10 +20,12 @@ public static class GetImplementorsTool
         var conn = db.GetConnection();
         var symbolStore = new SymbolStore(conn);
         var relationshipStore = new RelationshipStore(conn);
+        var projectStore = new ProjectStore(conn);
 
-        var targetSymbol = symbolStore.GetByFqn(symbol_fqn);
-        if (targetSymbol == null)
+        var resolution = SymbolResolver.Resolve(symbolStore, projectStore, symbol_fqn);
+        if (resolution.Symbol == null)
             return ResponseBuilder.BuildEmpty("Symbol not found.");
+        var targetSymbol = resolution.Symbol;
 
         // Find types that implement this interface or override this member
         var implementsRels = relationshipStore.GetByToSymbol(targetSymbol.Id, RelationshipKind.Implements);
@@ -49,6 +51,6 @@ public static class GetImplementorsTool
         }
 
         var freshness = results.Count > 0 ? targetSymbol.LastIndexedAt : 0;
-        return ResponseBuilder.Build(results, freshness);
+        return ResponseBuilder.Build(results, freshness, resolution.Ambiguity);
     }
 }

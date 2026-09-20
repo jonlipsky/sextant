@@ -38,7 +38,7 @@ public class McpToolTests
         symbolStore.Insert(new SymbolInfo
         {
             ProjectId = _projectId,
-            FullyQualifiedName = "global::TestNamespace.TestClass",
+            SymbolKey = "global::TestNamespace.TestClass", FullyQualifiedName = "global::TestNamespace.TestClass",
             DisplayName = "TestClass",
             Kind = SymbolKind.Class,
             Accessibility = Accessibility.Public,
@@ -52,7 +52,7 @@ public class McpToolTests
         var methodId = symbolStore.Insert(new SymbolInfo
         {
             ProjectId = _projectId,
-            FullyQualifiedName = "global::TestNamespace.TestClass.DoWork(string)",
+            SymbolKey = "global::TestNamespace.TestClass.DoWork(string)", FullyQualifiedName = "global::TestNamespace.TestClass.DoWork(string)",
             DisplayName = "DoWork",
             Kind = SymbolKind.Method,
             Accessibility = Accessibility.Public,
@@ -184,7 +184,7 @@ public class McpToolTests
         var methodAId = symbolStore.Insert(new SymbolInfo
         {
             ProjectId = _projectId,
-            FullyQualifiedName = "global::Test.MethodA()",
+            SymbolKey = "global::Test.MethodA()", FullyQualifiedName = "global::Test.MethodA()",
             DisplayName = "MethodA",
             Kind = SymbolKind.Method,
             Accessibility = Accessibility.Public,
@@ -196,7 +196,7 @@ public class McpToolTests
         var methodBId = symbolStore.Insert(new SymbolInfo
         {
             ProjectId = _projectId,
-            FullyQualifiedName = "global::Test.MethodB()",
+            SymbolKey = "global::Test.MethodB()", FullyQualifiedName = "global::Test.MethodB()",
             DisplayName = "MethodB",
             Kind = SymbolKind.Method,
             Accessibility = Accessibility.Public,
@@ -208,7 +208,7 @@ public class McpToolTests
         var methodCId = symbolStore.Insert(new SymbolInfo
         {
             ProjectId = _projectId,
-            FullyQualifiedName = "global::Test.MethodC()",
+            SymbolKey = "global::Test.MethodC()", FullyQualifiedName = "global::Test.MethodC()",
             DisplayName = "MethodC",
             Kind = SymbolKind.Method,
             Accessibility = Accessibility.Public,
@@ -245,7 +245,7 @@ public class McpToolTests
         var interfaceId = symbolStore.Insert(new SymbolInfo
         {
             ProjectId = _projectId,
-            FullyQualifiedName = "global::Test.IService",
+            SymbolKey = "global::Test.IService", FullyQualifiedName = "global::Test.IService",
             DisplayName = "IService",
             Kind = SymbolKind.Interface,
             Accessibility = Accessibility.Public,
@@ -257,7 +257,7 @@ public class McpToolTests
         var implId = symbolStore.Insert(new SymbolInfo
         {
             ProjectId = _projectId,
-            FullyQualifiedName = "global::Test.MyService",
+            SymbolKey = "global::Test.MyService", FullyQualifiedName = "global::Test.MyService",
             DisplayName = "MyService",
             Kind = SymbolKind.Class,
             Accessibility = Accessibility.Public,
@@ -291,7 +291,7 @@ public class McpToolTests
         var baseId = symbolStore.Insert(new SymbolInfo
         {
             ProjectId = _projectId,
-            FullyQualifiedName = "global::Test.BaseClass",
+            SymbolKey = "global::Test.BaseClass", FullyQualifiedName = "global::Test.BaseClass",
             DisplayName = "BaseClass",
             Kind = SymbolKind.Class,
             Accessibility = Accessibility.Public,
@@ -303,7 +303,7 @@ public class McpToolTests
         var midId = symbolStore.Insert(new SymbolInfo
         {
             ProjectId = _projectId,
-            FullyQualifiedName = "global::Test.MiddleClass",
+            SymbolKey = "global::Test.MiddleClass", FullyQualifiedName = "global::Test.MiddleClass",
             DisplayName = "MiddleClass",
             Kind = SymbolKind.Class,
             Accessibility = Accessibility.Public,
@@ -315,7 +315,7 @@ public class McpToolTests
         var derivedId = symbolStore.Insert(new SymbolInfo
         {
             ProjectId = _projectId,
-            FullyQualifiedName = "global::Test.DerivedClass",
+            SymbolKey = "global::Test.DerivedClass", FullyQualifiedName = "global::Test.DerivedClass",
             DisplayName = "DerivedClass",
             Kind = SymbolKind.Class,
             Accessibility = Accessibility.Public,
@@ -398,7 +398,7 @@ public class McpToolTests
         var protectedMethodId = symbolStore.Insert(new SymbolInfo
         {
             ProjectId = _projectId,
-            FullyQualifiedName = "global::TestNamespace.TestClass.OnInit()",
+            SymbolKey = "global::TestNamespace.TestClass.OnInit()", FullyQualifiedName = "global::TestNamespace.TestClass.OnInit()",
             DisplayName = "OnInit",
             Kind = SymbolKind.Method,
             Accessibility = Accessibility.Protected,
@@ -498,7 +498,7 @@ public class McpToolTests
         symbolStore.Insert(new SymbolInfo
         {
             ProjectId = _projectId,
-            FullyQualifiedName = "global::TestNamespace.MyController",
+            SymbolKey = "global::TestNamespace.MyController", FullyQualifiedName = "global::TestNamespace.MyController",
             DisplayName = "MyController",
             Kind = SymbolKind.Class,
             Accessibility = Accessibility.Public,
@@ -563,7 +563,7 @@ public class McpToolTests
         symbolStore.Insert(new SymbolInfo
         {
             ProjectId = _projectId,
-            FullyQualifiedName = "global::TestNamespace.TestClass.UnusedMethod()",
+            SymbolKey = "global::TestNamespace.TestClass.UnusedMethod()", FullyQualifiedName = "global::TestNamespace.TestClass.UnusedMethod()",
             DisplayName = "UnusedMethod",
             Kind = SymbolKind.Method,
             Accessibility = Accessibility.Public,
@@ -610,7 +610,7 @@ public class McpToolTests
         symbolStore.Insert(new SymbolInfo
         {
             ProjectId = testProjectId,
-            FullyQualifiedName = "global::Tests.TestHelper",
+            SymbolKey = "global::Tests.TestHelper", FullyQualifiedName = "global::Tests.TestHelper",
             DisplayName = "TestHelper",
             Kind = SymbolKind.Class,
             Accessibility = Accessibility.Public,
@@ -644,5 +644,64 @@ public class McpToolTests
         var results = doc.RootElement.GetProperty("results");
         var projectId = results[0].GetProperty("project_id").GetString();
         Assert.AreEqual("test0123456789ab", projectId);
+    }
+
+    [TestMethod]
+    public void UnambiguousLookup_OmitsAmbiguityMetadata()
+    {
+        var result = FindSymbolTool.FindSymbol(_dbProvider, "global::TestNamespace.TestClass");
+        var doc = JsonDocument.Parse(result);
+        var meta = doc.RootElement.GetProperty("meta");
+
+        // Unambiguous responses must stay byte-identical to before: no ambiguity keys emitted.
+        Assert.IsFalse(meta.TryGetProperty("ambiguous", out _));
+        Assert.IsFalse(meta.TryGetProperty("candidates", out _));
+        Assert.IsFalse(meta.TryGetProperty("selected_symbol_key", out _));
+    }
+
+    [TestMethod]
+    public void AmbiguousFqn_ReturnsBestMatchPlusCandidateMetadata()
+    {
+        var conn = _db.GetConnection();
+        var symbolStore = new SymbolStore(conn);
+
+        // Two overloads collapse to the same display FQN but keep distinct semantic keys.
+        symbolStore.Insert(new SymbolInfo
+        {
+            ProjectId = _projectId,
+            SymbolKey = "M:TestNamespace.TestClass.Run(System.Int32)",
+            FullyQualifiedName = "global::TestNamespace.TestClass.Run",
+            DisplayName = "Run",
+            Kind = SymbolKind.Method,
+            Accessibility = Accessibility.Public,
+            FilePath = "src/TestClass.cs",
+            LineStart = 60, LineEnd = 61,
+            LastIndexedAt = 1000
+        });
+        symbolStore.Insert(new SymbolInfo
+        {
+            ProjectId = _projectId,
+            SymbolKey = "M:TestNamespace.TestClass.Run(System.String)",
+            FullyQualifiedName = "global::TestNamespace.TestClass.Run",
+            DisplayName = "Run",
+            Kind = SymbolKind.Method,
+            Accessibility = Accessibility.Public,
+            FilePath = "src/TestClass.cs",
+            LineStart = 62, LineEnd = 63,
+            LastIndexedAt = 1000
+        });
+
+        var result = FindSymbolTool.FindSymbol(_dbProvider, "global::TestNamespace.TestClass.Run");
+        var doc = JsonDocument.Parse(result);
+        var meta = doc.RootElement.GetProperty("meta");
+
+        // A deterministic best match is still returned...
+        Assert.AreEqual(1, meta.GetProperty("result_count").GetInt32());
+        // ...but the ambiguity is disclosed rather than hidden.
+        Assert.IsTrue(meta.GetProperty("ambiguous").GetBoolean());
+        Assert.AreEqual(2, meta.GetProperty("ambiguous_match_count").GetInt32());
+        Assert.AreEqual(2, meta.GetProperty("candidates").GetArrayLength());
+        Assert.IsTrue(meta.TryGetProperty("selected_symbol_key", out var selected));
+        StringAssert.StartsWith(selected.GetString(), "M:TestNamespace.TestClass.Run");
     }
 }

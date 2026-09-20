@@ -6,40 +6,40 @@ namespace Sextant.Indexer;
 
 public static class RelationshipExtractor
 {
-    public static List<(string fromFqn, string toFqn, RelationshipKind kind)> ExtractRelationships(INamedTypeSymbol type)
+    public static List<(string fromKey, string toKey, RelationshipKind kind)> ExtractRelationships(INamedTypeSymbol type)
     {
         var relationships = new List<(string, string, RelationshipKind)>();
-        var fqnFormat = SymbolDisplayFormat.FullyQualifiedFormat;
-        var typeFqn = type.ToDisplayString(fqnFormat);
+        var typeKey = SemanticSymbolKeyFactory.DeclarationKey(type);
 
         // Inherits
         if (type.BaseType != null &&
             type.BaseType.SpecialType != SpecialType.System_Object &&
             type.BaseType.SpecialType != SpecialType.System_ValueType)
         {
-            relationships.Add((typeFqn, type.BaseType.ToDisplayString(fqnFormat), RelationshipKind.Inherits));
+            relationships.Add((typeKey, SemanticSymbolKeyFactory.DeclarationKey(type.BaseType), RelationshipKind.Inherits));
         }
 
         // Implements (direct only)
         foreach (var iface in type.Interfaces)
         {
-            relationships.Add((typeFqn, iface.ToDisplayString(fqnFormat), RelationshipKind.Implements));
+            relationships.Add((typeKey, SemanticSymbolKeyFactory.DeclarationKey(iface), RelationshipKind.Implements));
         }
 
         // Overrides, Returns, ParameterOf
         foreach (var member in type.GetMembers())
         {
-            string? overriddenFqn = member switch
+            ISymbol? overridden = member switch
             {
-                IMethodSymbol m when m.OverriddenMethod != null => m.OverriddenMethod.ToDisplayString(fqnFormat),
-                IPropertySymbol p when p.OverriddenProperty != null => p.OverriddenProperty.ToDisplayString(fqnFormat),
-                IEventSymbol e when e.OverriddenEvent != null => e.OverriddenEvent.ToDisplayString(fqnFormat),
+                IMethodSymbol m when m.OverriddenMethod != null => m.OverriddenMethod,
+                IPropertySymbol p when p.OverriddenProperty != null => p.OverriddenProperty,
+                IEventSymbol e when e.OverriddenEvent != null => e.OverriddenEvent,
                 _ => null
             };
 
-            if (overriddenFqn != null)
+            if (overridden != null)
             {
-                relationships.Add((member.ToDisplayString(fqnFormat), overriddenFqn, RelationshipKind.Overrides));
+                relationships.Add((SemanticSymbolKeyFactory.DeclarationKey(member),
+                    SemanticSymbolKeyFactory.DeclarationKey(overridden), RelationshipKind.Overrides));
             }
 
             // Returns — for methods with named return types
@@ -49,7 +49,8 @@ public static class RelationshipExtractor
                 returnType.SpecialType == SpecialType.None &&
                 returnType.TypeKind != TypeKind.Error)
             {
-                relationships.Add((method.ToDisplayString(fqnFormat), returnType.ToDisplayString(fqnFormat), RelationshipKind.Returns));
+                relationships.Add((SemanticSymbolKeyFactory.DeclarationKey(method),
+                    SemanticSymbolKeyFactory.DeclarationKey(returnType), RelationshipKind.Returns));
             }
 
             // ParameterOf — for method parameters with named types
@@ -61,7 +62,8 @@ public static class RelationshipExtractor
                         paramType.SpecialType == SpecialType.None &&
                         paramType.TypeKind != TypeKind.Error)
                     {
-                        relationships.Add((paramType.ToDisplayString(fqnFormat), paramMethod.ToDisplayString(fqnFormat), RelationshipKind.ParameterOf));
+                        relationships.Add((SemanticSymbolKeyFactory.DeclarationKey(paramType),
+                            SemanticSymbolKeyFactory.DeclarationKey(paramMethod), RelationshipKind.ParameterOf));
                     }
                 }
             }
@@ -74,11 +76,10 @@ public static class RelationshipExtractor
     /// Extract Instantiates relationships by walking method bodies for object creation expressions.
     /// Requires a semantic model for the syntax trees containing the type's methods.
     /// </summary>
-    public static List<(string fromFqn, string toFqn, RelationshipKind kind)> ExtractInstantiates(
+    public static List<(string fromKey, string toKey, RelationshipKind kind)> ExtractInstantiates(
         INamedTypeSymbol type, Compilation compilation)
     {
         var relationships = new List<(string, string, RelationshipKind)>();
-        var fqnFormat = SymbolDisplayFormat.FullyQualifiedFormat;
 
         foreach (var member in type.GetMembers())
         {
@@ -107,11 +108,12 @@ public static class RelationshipExtractor
 
                     if (createdType != null &&
                         createdType.SpecialType == SpecialType.None &&
-                        createdType.TypeKind != TypeKind.Error)
+                        createdType.TypeKind != TypeKind.Error &&
+                        !SemanticSymbolKeyFactory.IsExcludedArtifact(createdType))
                     {
                         relationships.Add((
-                            method.ToDisplayString(fqnFormat),
-                            createdType.ToDisplayString(fqnFormat),
+                            SemanticSymbolKeyFactory.DeclarationKey(method),
+                            SemanticSymbolKeyFactory.DeclarationKey(createdType),
                             RelationshipKind.Instantiates));
                     }
                 }

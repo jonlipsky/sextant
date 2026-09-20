@@ -40,6 +40,9 @@ public static partial class SymbolExtractor
                 if (declaredSymbol.IsImplicitlyDeclared)
                     continue;
 
+                if (SemanticSymbolKeyFactory.IsExcludedArtifact(declaredSymbol))
+                    continue;
+
                 var kind = MapSymbolKind(declaredSymbol);
                 if (kind == null)
                     continue;
@@ -54,6 +57,7 @@ public static partial class SymbolExtractor
                 symbols.Add(new Sextant.Core.SymbolInfo
                 {
                     ProjectId = projectId,
+                    SymbolKey = SemanticSymbolKeyFactory.DeclarationKey(declaredSymbol),
                     FullyQualifiedName = declaredSymbol.ToDisplayString(FqnFormat),
                     DisplayName = declaredSymbol.Name,
                     Kind = kind.Value,
@@ -79,6 +83,9 @@ public static partial class SymbolExtractor
 
     public static Sextant.Core.SymbolInfo? ExtractSymbolInfo(ISymbol declaredSymbol, long projectId)
     {
+        if (SemanticSymbolKeyFactory.IsExcludedArtifact(declaredSymbol))
+            return null;
+
         var kind = MapSymbolKind(declaredSymbol);
         if (kind == null) return null;
 
@@ -91,6 +98,7 @@ public static partial class SymbolExtractor
         return new Sextant.Core.SymbolInfo
         {
             ProjectId = projectId,
+            SymbolKey = SemanticSymbolKeyFactory.DeclarationKey(declaredSymbol),
             FullyQualifiedName = declaredSymbol.ToDisplayString(FqnFormat),
             DisplayName = declaredSymbol.Name,
             Kind = kind.Value,

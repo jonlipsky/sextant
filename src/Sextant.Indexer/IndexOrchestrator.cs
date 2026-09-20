@@ -90,7 +90,7 @@ public sealed class IndexOrchestrator
         var solutionStore = new SolutionStore(conn);
 
         var projectPathToId = new Dictionary<string, long>();
-        var symbolFqnToId = new Dictionary<string, long>();
+        var catalog = new SymbolCatalog();
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
         // Discover submodules from the repo root
@@ -197,7 +197,7 @@ public sealed class IndexOrchestrator
             foreach (var symbol in symbols)
             {
                 var id = symbolStore.Insert(symbol);
-                symbolFqnToId[symbol.FullyQualifiedName] = id;
+                catalog.Add(projectId, symbol.SymbolKey, id);
             }
 
             _log?.Invoke($"    {symbols.Count} symbols extracted");
@@ -229,6 +229,10 @@ public sealed class IndexOrchestrator
             var compilation = await project.GetCompilationAsync(cancellationToken);
             if (compilation == null) continue;
 
+            long? relProjectId = project.FilePath != null && projectPathToId.TryGetValue(project.FilePath, out var relPid)
+                ? relPid
+                : null;
+
             foreach (var syntaxTree in compilation.SyntaxTrees)
             {
                 ThrowIfCancelled();
@@ -237,14 +241,16 @@ public sealed class IndexOrchestrator
 
                 foreach (var node in root.DescendantNodes())
                 {
-                    if (semanticModel.GetDeclaredSymbol(node) is INamedTypeSymbol typeSymbol && !typeSymbol.IsImplicitlyDeclared)
+                    if (semanticModel.GetDeclaredSymbol(node) is INamedTypeSymbol typeSymbol &&
+                        !typeSymbol.IsImplicitlyDeclared &&
+                        !SemanticSymbolKeyFactory.IsExcludedArtifact(typeSymbol))
                     {
                         var rels = RelationshipExtractor.ExtractRelationships(typeSymbol);
                         var instantiates = RelationshipExtractor.ExtractInstantiates(typeSymbol, compilation);
-                        foreach (var (fromFqn, toFqn, kind) in rels.Concat(instantiates))
+                        foreach (var (fromKey, toKey, kind) in rels.Concat(instantiates))
                         {
-                            if (symbolFqnToId.TryGetValue(fromFqn, out var fromId) &&
-                                symbolFqnToId.TryGetValue(toFqn, out var toId))
+                            if (catalog.TryResolve(fromKey, relProjectId, out var fromId) &&
+                                catalog.TryResolve(toKey, relProjectId, out var toId))
                             {
                                 relationshipStore.Insert(new RelationshipInfo
                                 {
@@ -279,6 +285,10 @@ public sealed class IndexOrchestrator
             var compilation = await project.GetCompilationAsync(cancellationToken);
             if (compilation == null) continue;
 
+            long? refProjectId = project.FilePath != null && projectPathToId.TryGetValue(project.FilePath, out var refPid)
+                ? refPid
+                : null;
+
             if (project.FilePath != null && projectPathToId.ContainsKey(project.FilePath))
             {
                 // Clear existing references for files in this project
@@ -304,12 +314,13 @@ public sealed class IndexOrchestrator
                     if (declaredSymbol == null || declaredSymbol.IsImplicitlyDeclared)
                         continue;
 
-                    var fqn = declaredSymbol.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
-                    if (!symbolFqnToId.TryGetValue(fqn, out var symbolId))
+                    // Only extract references for types and type members
+                    if (SymbolExtractor.MapSymbolKind(declaredSymbol) == null ||
+                        SemanticSymbolKeyFactory.IsExcludedArtifact(declaredSymbol))
                         continue;
 
-                    // Only extract references for types and type members
-                    if (SymbolExtractor.MapSymbolKind(declaredSymbol) == null)
+                    var declKey = SemanticSymbolKeyFactory.DeclarationKey(declaredSymbol);
+                    if (!catalog.TryResolve(declKey, refProjectId, out var symbolId))
                         continue;
 
                     var refs = await ReferenceExtractor.ExtractReferencesAsync(
@@ -389,6 +400,10 @@ public sealed class IndexOrchestrator
             var compilation = await project.GetCompilationAsync(cancellationToken);
             if (compilation == null) continue;
 
+            long? callProjectId = project.FilePath != null && projectPathToId.TryGetValue(project.FilePath, out var callPid)
+                ? callPid
+                : null;
+
             if (project.FilePath != null && projectPathToId.ContainsKey(project.FilePath))
             {
                 foreach (var syntaxTree in compilation.SyntaxTrees)
@@ -413,15 +428,15 @@ public sealed class IndexOrchestrator
                     if (declaredSymbol is not IMethodSymbol methodSymbol || declaredSymbol.IsImplicitlyDeclared)
                         continue;
 
-                    var callerFqn = methodSymbol.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
-                    if (!symbolFqnToId.TryGetValue(callerFqn, out var callerSymbolId))
+                    var callerKey = SemanticSymbolKeyFactory.DeclarationKey(methodSymbol);
+                    if (!catalog.TryResolve(callerKey, callProjectId, out var callerSymbolId))
                         continue;
 
                     var edges = await CallGraphBuilder.BuildCallGraphAsync(methodSymbol, project);
 
                     foreach (var edge in edges)
                     {
-                        if (symbolFqnToId.TryGetValue(edge.CalleeFqn, out var calleeSymbolId))
+                        if (catalog.TryResolve(edge.CalleeKey, callProjectId, out var calleeSymbolId))
                         {
                             var edgeId = callGraphStore.Insert(new CallGraphEdge
                             {

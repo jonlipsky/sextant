@@ -59,7 +59,7 @@ public class IndexDatabaseTests
         using var cmd = conn.CreateCommand();
         cmd.CommandText = "SELECT COUNT(*) FROM schema_version;";
         var count = Convert.ToInt32(cmd.ExecuteScalar());
-        Assert.AreEqual(6, count); // One row per migration
+        Assert.AreEqual(7, count); // One row per migration
     }
 
     [TestMethod]

@@ -55,8 +55,8 @@ public sealed class IncrementalIndexer
                 projectPathToId[project.FilePath] = existing.Value.id;
         }
 
-        // Build symbol FQN → ID map for the whole solution (needed for relationships/references)
-        var symbolFqnToId = new Dictionary<string, long>();
+        // Build a project-aware symbol catalog for the whole solution (needed for relationships/calls).
+        var catalog = new SymbolCatalog();
         foreach (var project in solution.Projects)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -72,12 +72,13 @@ public sealed class IncrementalIndexer
                 {
                     var declared = sm.GetDeclaredSymbol(node);
                     if (declared == null || declared.IsImplicitlyDeclared) continue;
+                    if (SemanticSymbolKeyFactory.IsExcludedArtifact(declared)) continue;
                     if (SymbolExtractor.MapSymbolKind(declared) == null) continue;
-                    var fqn = declared.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+                    var declKey = SemanticSymbolKeyFactory.DeclarationKey(declared);
                     // Try to get existing ID from DB
-                    var existing = symbolStore.GetByFqn(fqn, pid);
+                    var existing = symbolStore.GetBySymbolKey(declKey, pid);
                     if (existing != null)
-                        symbolFqnToId[fqn] = existing.Id;
+                        catalog.Add(pid, declKey, existing.Id);
                 }
             }
         }
@@ -119,7 +120,8 @@ public sealed class IncrementalIndexer
                 var oldSymbols = symbolStore.GetByFile(filePath);
                 var oldSignatures = oldSymbols
                     .Where(s => s.SignatureHash != null)
-                    .ToDictionary(s => s.FullyQualifiedName, s => s.SignatureHash!);
+                    .GroupBy(s => s.SymbolKey)
+                    .ToDictionary(g => g.Key, g => g.First().SignatureHash!);
 
                 // Delete stale data for this file
                 relationshipStore.DeleteByFile(filePath);
@@ -144,7 +146,7 @@ public sealed class IncrementalIndexer
                     if (symbolInfo == null) continue;
 
                     var id = symbolStore.Insert(symbolInfo);
-                    symbolFqnToId[symbolInfo.FullyQualifiedName] = id;
+                    catalog.Add(projectId, symbolInfo.SymbolKey, id);
                     symbolInfo.Id = id;
                     newSymbols.Add(symbolInfo);
                 }
@@ -153,7 +155,7 @@ public sealed class IncrementalIndexer
                 foreach (var newSym in newSymbols)
                 {
                     if (newSym.SignatureHash != null &&
-                        oldSignatures.TryGetValue(newSym.FullyQualifiedName, out var oldHash) &&
+                        oldSignatures.TryGetValue(newSym.SymbolKey, out var oldHash) &&
                         oldHash != newSym.SignatureHash)
                     {
                         signatureChangedFiles.Add(filePath);
@@ -164,14 +166,16 @@ public sealed class IncrementalIndexer
                 // Re-extract relationships for types in this file
                 foreach (var node in root.DescendantNodes())
                 {
-                    if (semanticModel.GetDeclaredSymbol(node) is INamedTypeSymbol typeSymbol && !typeSymbol.IsImplicitlyDeclared)
+                    if (semanticModel.GetDeclaredSymbol(node) is INamedTypeSymbol typeSymbol &&
+                        !typeSymbol.IsImplicitlyDeclared &&
+                        !SemanticSymbolKeyFactory.IsExcludedArtifact(typeSymbol))
                     {
                         var rels = RelationshipExtractor.ExtractRelationships(typeSymbol);
                         var instantiates = RelationshipExtractor.ExtractInstantiates(typeSymbol, compilation);
-                        foreach (var (fromFqn, toFqn, relKind) in rels.Concat(instantiates))
+                        foreach (var (fromKey, toKey, relKind) in rels.Concat(instantiates))
                         {
-                            if (symbolFqnToId.TryGetValue(fromFqn, out var fromId) &&
-                                symbolFqnToId.TryGetValue(toFqn, out var toId))
+                            if (catalog.TryResolve(fromKey, projectId, out var fromId) &&
+                                catalog.TryResolve(toKey, projectId, out var toId))
                             {
                                 relationshipStore.Insert(new RelationshipInfo
                                 {
@@ -192,14 +196,14 @@ public sealed class IncrementalIndexer
                     if (declared is not IMethodSymbol methodSymbol || declared.IsImplicitlyDeclared)
                         continue;
 
-                    var callerFqn = methodSymbol.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
-                    if (!symbolFqnToId.TryGetValue(callerFqn, out var callerSymbolId))
+                    var callerKey = SemanticSymbolKeyFactory.DeclarationKey(methodSymbol);
+                    if (!catalog.TryResolve(callerKey, projectId, out var callerSymbolId))
                         continue;
 
                     var edges = await CallGraphBuilder.BuildCallGraphAsync(methodSymbol, project);
                     foreach (var edge in edges)
                     {
-                        if (symbolFqnToId.TryGetValue(edge.CalleeFqn, out var calleeSymbolId))
+                        if (catalog.TryResolve(edge.CalleeKey, projectId, out var calleeSymbolId))
                         {
                             callGraphStore.Insert(new CallGraphEdge
                             {

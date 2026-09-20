@@ -21,6 +21,31 @@ Every tool response includes a `meta` object:
 - `index_freshness` — oldest `last_indexed_at` among all results (worst-case staleness)
 - `result_count` — number of results returned
 
+### Ambiguous FQN lookups
+
+Because the display FQN is no longer unique, tools that accept an FQN resolve it through a shared resolver. When the FQN matches exactly one definition the response is unchanged. When it matches **several** definitions (overloads, or the same FQN in multiple projects) the resolver still returns a deterministic best match, but adds ambiguity fields to `meta` so callers can see the collision instead of silently getting one row:
+
+```json
+{
+  "meta": {
+    "queried_at": 1709568000000,
+    "index_freshness": 1709567990000,
+    "result_count": 3,
+    "ambiguous": true,
+    "ambiguous_match_count": 2,
+    "selected_project_id": "a1b2c3d4e5f6g7h8",
+    "selected_symbol_key": "M:MyNamespace.MyClass.MyMethod(System.String)",
+    "candidates": [
+      { "project_id": "a1b2c3d4e5f6g7h8", "symbol_key": "M:MyNamespace.MyClass.MyMethod(System.String)", "fully_qualified_name": "global::MyNamespace.MyClass.MyMethod(string)", "kind": "method", "file_path": "src/A/MyClass.cs", "line_start": 42 },
+      { "project_id": "99887766aabbccdd", "symbol_key": "M:MyNamespace.MyClass.MyMethod(System.String)", "fully_qualified_name": "global::MyNamespace.MyClass.MyMethod(string)", "kind": "method", "file_path": "src/B/MyClass.cs", "line_start": 42 }
+    ]
+  },
+  "results": [...]
+}
+```
+
+These fields are omitted entirely for unambiguous lookups, so existing callers see byte-identical responses. To pin a specific definition, re-issue the lookup with a narrowing `project_id`; `selected_project_id` and each candidate's `project_id` identify which projects collided. The `symbol_key` on each candidate is the stable semantic identity you can record and compare across runs (tools resolve by FQN scoped with `project_id`; there is no query-by-key tool in this phase).
+
 ## Symbol Result Object
 
 When a tool returns symbols, each includes at minimum:
@@ -38,6 +63,8 @@ When a tool returns symbols, each includes at minimum:
   "signature": "public string MyMethod(string input)"
 }
 ```
+
+The `fully_qualified_name` is display/query data and is **not** unique — overloads and same-named members share one. The stable per-definition identity (`symbol_key`, a Roslyn documentation ID or a version-scoped fallback) is surfaced in the ambiguity `candidates` above when an FQN collides, so callers can tell the definitions apart.
 
 ## Tools
 

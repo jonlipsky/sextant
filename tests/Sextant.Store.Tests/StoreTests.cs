@@ -59,7 +59,7 @@ public class StoreTests
         var symbol = new SymbolInfo
         {
             ProjectId = projectId,
-            FullyQualifiedName = "global::MyNamespace.MyClass",
+            SymbolKey = "global::MyNamespace.MyClass", FullyQualifiedName = "global::MyNamespace.MyClass",
             DisplayName = "MyClass",
             Kind = SymbolKind.Class,
             Accessibility = Accessibility.Public,
@@ -86,7 +86,7 @@ public class StoreTests
         _symbolStore.Insert(new SymbolInfo
         {
             ProjectId = projectId,
-            FullyQualifiedName = "global::MyNamespace.CustomerService",
+            SymbolKey = "global::MyNamespace.CustomerService", FullyQualifiedName = "global::MyNamespace.CustomerService",
             DisplayName = "CustomerService",
             Kind = SymbolKind.Class,
             Accessibility = Accessibility.Public,
@@ -100,7 +100,7 @@ public class StoreTests
         _symbolStore.Insert(new SymbolInfo
         {
             ProjectId = projectId,
-            FullyQualifiedName = "global::MyNamespace.OrderService",
+            SymbolKey = "global::MyNamespace.OrderService", FullyQualifiedName = "global::MyNamespace.OrderService",
             DisplayName = "OrderService",
             Kind = SymbolKind.Class,
             Accessibility = Accessibility.Public,
@@ -123,7 +123,7 @@ public class StoreTests
         var symbolId = _symbolStore.Insert(new SymbolInfo
         {
             ProjectId = projectId,
-            FullyQualifiedName = "global::MyNamespace.MyClass.MyMethod",
+            SymbolKey = "global::MyNamespace.MyClass.MyMethod", FullyQualifiedName = "global::MyNamespace.MyClass.MyMethod",
             DisplayName = "MyMethod",
             Kind = SymbolKind.Method,
             Accessibility = Accessibility.Public,
@@ -160,7 +160,7 @@ public class StoreTests
         var fromSymbolId = _symbolStore.Insert(new SymbolInfo
         {
             ProjectId = projectId,
-            FullyQualifiedName = "global::MyNamespace.IService",
+            SymbolKey = "global::MyNamespace.IService", FullyQualifiedName = "global::MyNamespace.IService",
             DisplayName = "IService",
             Kind = SymbolKind.Interface,
             Accessibility = Accessibility.Public,
@@ -173,7 +173,7 @@ public class StoreTests
         var toSymbolId = _symbolStore.Insert(new SymbolInfo
         {
             ProjectId = projectId,
-            FullyQualifiedName = "global::MyNamespace.ServiceImpl",
+            SymbolKey = "global::MyNamespace.ServiceImpl", FullyQualifiedName = "global::MyNamespace.ServiceImpl",
             DisplayName = "ServiceImpl",
             Kind = SymbolKind.Class,
             Accessibility = Accessibility.Public,
@@ -216,7 +216,7 @@ public class StoreTests
         var symbolA = _symbolStore.Insert(new SymbolInfo
         {
             ProjectId = projectId,
-            FullyQualifiedName = "global::NS.ClassA",
+            SymbolKey = "global::NS.ClassA", FullyQualifiedName = "global::NS.ClassA",
             DisplayName = "ClassA",
             Kind = SymbolKind.Class,
             Accessibility = Accessibility.Public,
@@ -229,7 +229,7 @@ public class StoreTests
         var symbolB = _symbolStore.Insert(new SymbolInfo
         {
             ProjectId = projectId,
-            FullyQualifiedName = "global::NS.ClassB",
+            SymbolKey = "global::NS.ClassB", FullyQualifiedName = "global::NS.ClassB",
             DisplayName = "ClassB",
             Kind = SymbolKind.Class,
             Accessibility = Accessibility.Public,
@@ -265,7 +265,7 @@ public class StoreTests
         var callerId = _symbolStore.Insert(new SymbolInfo
         {
             ProjectId = projectId,
-            FullyQualifiedName = "global::NS.Caller.DoWork",
+            SymbolKey = "global::NS.Caller.DoWork", FullyQualifiedName = "global::NS.Caller.DoWork",
             DisplayName = "DoWork",
             Kind = SymbolKind.Method,
             Accessibility = Accessibility.Public,
@@ -278,7 +278,7 @@ public class StoreTests
         var calleeId = _symbolStore.Insert(new SymbolInfo
         {
             ProjectId = projectId,
-            FullyQualifiedName = "global::NS.Service.Execute",
+            SymbolKey = "global::NS.Service.Execute", FullyQualifiedName = "global::NS.Service.Execute",
             DisplayName = "Execute",
             Kind = SymbolKind.Method,
             Accessibility = Accessibility.Public,
@@ -315,7 +315,7 @@ public class StoreTests
         var callerId = _symbolStore.Insert(new SymbolInfo
         {
             ProjectId = projectId,
-            FullyQualifiedName = "global::NS.CallerDel.Run",
+            SymbolKey = "global::NS.CallerDel.Run", FullyQualifiedName = "global::NS.CallerDel.Run",
             DisplayName = "Run",
             Kind = SymbolKind.Method,
             Accessibility = Accessibility.Public,
@@ -328,7 +328,7 @@ public class StoreTests
         var calleeId = _symbolStore.Insert(new SymbolInfo
         {
             ProjectId = projectId,
-            FullyQualifiedName = "global::NS.TargetDel.Process",
+            SymbolKey = "global::NS.TargetDel.Process", FullyQualifiedName = "global::NS.TargetDel.Process",
             DisplayName = "Process",
             Kind = SymbolKind.Method,
             Accessibility = Accessibility.Public,
@@ -364,7 +364,7 @@ public class StoreTests
         var symbolId = _symbolStore.Insert(new SymbolInfo
         {
             ProjectId = projectId,
-            FullyQualifiedName = "global::NS.RefTarget.Method",
+            SymbolKey = "global::NS.RefTarget.Method", FullyQualifiedName = "global::NS.RefTarget.Method",
             DisplayName = "Method",
             Kind = SymbolKind.Method,
             Accessibility = Accessibility.Public,
@@ -415,7 +415,7 @@ public class StoreTests
         var symbolId = _symbolStore.Insert(new SymbolInfo
         {
             ProjectId = projectId,
-            FullyQualifiedName = "global::NS.ApiClass",
+            SymbolKey = "global::NS.ApiClass", FullyQualifiedName = "global::NS.ApiClass",
             DisplayName = "ApiClass",
             Kind = SymbolKind.Class,
             Accessibility = Accessibility.Public,
@@ -484,7 +484,7 @@ public class StoreTests
         var symbolId = _symbolStore.Insert(new SymbolInfo
         {
             ProjectId = projectId,
-            FullyQualifiedName = "global::UniqueNS.ZebraManager",
+            SymbolKey = "global::UniqueNS.ZebraManager", FullyQualifiedName = "global::UniqueNS.ZebraManager",
             DisplayName = "ZebraManager",
             Kind = SymbolKind.Class,
             Accessibility = Accessibility.Public,
