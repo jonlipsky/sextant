@@ -24,15 +24,7 @@ public class SymbolKeyStoreTests
     [TestCleanup]
     public void TestCleanup()
     {
-        _db.Dispose();
-        // On Windows the pooled SQLite handle can briefly keep the WAL file open; clear the pool and
-        // delete best-effort so this environment-only lock never fails the test.
-        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
-        foreach (var path in new[] { _dbPath, _dbPath + "-wal", _dbPath + "-shm" })
-        {
-            try { if (File.Exists(path)) File.Delete(path); }
-            catch (IOException) { /* environment-only file lock; ignore */ }
-        }
+        SqliteTestDatabase.Delete(_dbPath, _db);
     }
 
     private long InsertProject(string suffix)

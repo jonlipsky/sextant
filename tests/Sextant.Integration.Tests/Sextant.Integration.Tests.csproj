@@ -34,4 +34,9 @@
     <ProjectReference Include="..\..\src\Sextant.Daemon\Sextant.Daemon.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Include="..\Shared\SqliteTestDatabase.cs" Link="Shared\SqliteTestDatabase.cs" />
+    <Using Include="Sextant.TestSupport" />
+  </ItemGroup>
+
 </Project>

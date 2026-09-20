@@ -42,6 +42,23 @@ public sealed class FileIndexStore(SqliteConnection connection)
         return ReadAll(cmd);
     }
 
+    /// <summary>
+    /// Returns the distinct logical-project ids that have an indexed row for the given file path.
+    /// Used by the incremental path to map a deleted file (no longer on disk, so no Roslyn document)
+    /// back to the per-TFM projects that must be rebuilt to purge its stale contributions.
+    /// </summary>
+    public List<long> GetProjectIdsByFile(string filePath)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT DISTINCT project_id FROM file_index WHERE file_path = @file_path;";
+        cmd.Parameters.AddWithValue("@file_path", filePath);
+        var results = new List<long>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            results.Add(reader.GetInt64(0));
+        return results;
+    }
+
     public void DeleteByProjectAndFile(long projectId, string filePath)
     {
         using var cmd = connection.CreateCommand();

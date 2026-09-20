@@ -82,7 +82,23 @@ public sealed class ApiSurfaceSnapshot
 {
     public long Id { get; set; }
     public long ProjectId { get; set; }
-    public long SymbolId { get; set; }
+
+    /// <summary>
+    /// Soft back-pointer to the current generation's symbol row. Nulled (not cascade-deleted) when the
+    /// working symbols are rebuilt, so a historical snapshot survives a re-index. Do not use it to
+    /// recover a snapshot's identity across rebuilds — use <see cref="SymbolKey"/> instead.
+    /// </summary>
+    public long? SymbolId { get; set; }
+
+    /// <summary>Stable semantic declaration key captured at snapshot time (rebuild-invariant identity).</summary>
+    public string SymbolKey { get; set; } = "";
+
+    /// <summary>Display fully-qualified name captured at snapshot time.</summary>
+    public string FullyQualifiedName { get; set; } = "";
+
+    /// <summary>Accessibility captured at snapshot time (stored form, e.g. "public").</summary>
+    public string Accessibility { get; set; } = "";
+
     public required string SignatureHash { get; init; }
     public long CapturedAt { get; init; }
     public required string GitCommit { get; init; }

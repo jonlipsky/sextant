@@ -25,8 +25,7 @@ public class DaemonIntegrationTests : IDisposable
 
     public void Dispose()
     {
-        if (Directory.Exists(_tempDir))
-            Directory.Delete(_tempDir, true);
+        Sextant.TestSupport.SqliteTestDatabase.DeleteDirectory(_tempDir);
     }
 
     [TestMethod]
@@ -165,7 +164,7 @@ public class DaemonIntegrationTests : IDisposable
         await WaitForIdleAsync(daemon.StatusPort, TimeSpan.FromSeconds(120));
 
         // Verify initial symbol was indexed
-        var db = new IndexDatabase(dbPath);
+        using var db = new IndexDatabase(dbPath);
         var conn = db.GetConnection();
         var symbolStore = new SymbolStore(conn);
         var initialSymbols = symbolStore.SearchFts("Class1", 10);

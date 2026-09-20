@@ -30,11 +30,7 @@ public class WriteSessionTests
     [TestCleanup]
     public void TestCleanup()
     {
-        _db.Dispose();
-        SqliteConnection.ClearAllPools();
-        TryDelete(_dbPath);
-        TryDelete(_dbPath + "-wal");
-        TryDelete(_dbPath + "-shm");
+        SqliteTestDatabase.Delete(_dbPath, _db);
     }
 
     // ---- Write session ----
@@ -374,10 +370,4 @@ public class WriteSessionTests
     }
 
     private static long Now() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-
-    private static void TryDelete(string path)
-    {
-        try { if (File.Exists(path)) File.Delete(path); }
-        catch (IOException) { /* best-effort cleanup */ }
-    }
 }

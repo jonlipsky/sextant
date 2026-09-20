@@ -110,6 +110,19 @@ public sealed class CommentStore(SqliteConnection connection)
         cmd.ExecuteNonQuery();
     }
 
+    // Project-scoped delete: clears every comment owned by one logical (per-TFM) project, used by the
+    // project-version replacement path so a rebuild removes comments for files that no longer exist
+    // (deleted/renamed) as well as the current ones. Comments are not cascade-deleted by a symbol
+    // rebuild (they reference the project, and enclosing_symbol_id is ON DELETE SET NULL), so the
+    // project reset must clear them explicitly.
+    public void DeleteByProject(long projectId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "DELETE FROM comments WHERE project_id = @projectId;";
+        cmd.Parameters.AddWithValue("@projectId", projectId);
+        cmd.ExecuteNonQuery();
+    }
+
     private static List<CommentInfo> ReadAll(SqliteCommand cmd)
     {
         var results = new List<CommentInfo>();
