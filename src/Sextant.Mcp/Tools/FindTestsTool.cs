@@ -5,6 +5,7 @@ using ModelContextProtocol.Server;
 
 namespace Sextant.Mcp.Tools;
 
+[McpServerToolType]
 public static class FindTestsTool
 {
     [McpServerTool(Name = "find_tests"),
@@ -21,6 +22,9 @@ public static class FindTestsTool
         var db = dbProvider.GetReadyDatabase(out var notReady);
         if (db == null)
             return ResponseBuilder.BuildEmpty(notReady);
+
+        if (!CapabilityGate.Ensure(db, IndexFeature.TestIndexing, "test_indexing", out var unavailable))
+            return unavailable;
 
         var conn = db.GetConnection();
         var symbolStore = new SymbolStore(conn);

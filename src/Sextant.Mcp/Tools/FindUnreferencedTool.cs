@@ -4,6 +4,7 @@ using ModelContextProtocol.Server;
 
 namespace Sextant.Mcp.Tools;
 
+[McpServerToolType]
 public static class FindUnreferencedTool
 {
     [McpServerTool(Name = "find_unreferenced"), Description("Find symbols that have zero references — useful for dead-code detection.")]

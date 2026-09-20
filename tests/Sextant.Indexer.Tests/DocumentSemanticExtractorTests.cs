@@ -13,7 +13,8 @@ namespace Sextant.Indexer.Tests;
 [TestClass]
 public class DocumentSemanticExtractorTests
 {
-    private static DocumentContributionSet Extract(string source, string fileName = "Test.cs")
+    private static DocumentContributionSet Extract(string source, string fileName = "Test.cs",
+        bool includeDataflow = true)
     {
         var syntaxTree = CSharpSyntaxTree.ParseText(source, path: fileName);
         var runtimeDir = System.Runtime.InteropServices.RuntimeEnvironment.GetRuntimeDirectory();
@@ -31,7 +32,8 @@ public class DocumentSemanticExtractorTests
         var text = syntaxTree.GetText();
 
         var sink = new DocumentContributionSet();
-        DocumentSemanticExtractor.ExtractDocument(root, model, fileName, text, sink);
+        DocumentSemanticExtractor.ExtractDocument(
+            root, model, fileName, text, sink, includeDataflow: includeDataflow);
         return sink;
     }
 
@@ -455,6 +457,41 @@ public class DocumentSemanticExtractorTests
         Assert.IsTrue(catalog.TryResolveEdge(fooRef.TargetKey, preferProjectId: 3, out var ambiguousRow));
         Assert.AreEqual(100L, ambiguousRow, "key-only resolution would have picked DepA (lowest id)");
         Assert.AreEqual(1, catalog.AmbiguousEdgeBindings);
+    }
+
+    [TestMethod]
+    public void Call_DataflowGate_SkipsAnalysisWhenDisabled()
+    {
+        // A call to a stored (source) method carrying an argument — dataflow would normally produce
+        // one ArgumentFlowEntry. Phase 8 (criterion 2): a non-deep profile must not merely drop the
+        // dataflow rows at persistence, it must never perform the analysis. The call occurrence itself
+        // (a core feature) must still be emitted regardless.
+        const string source = """
+            namespace N
+            {
+                public class C
+                {
+                    public void Handle(int x) { }
+                    public void Run()
+                    {
+                        var v = 42;
+                        Handle(v);
+                    }
+                }
+            }
+            """;
+
+        var withFlow = Extract(source, includeDataflow: true);
+        var withoutFlow = Extract(source, includeDataflow: false);
+
+        var callWith = withFlow.Calls.Single(c => c.CalleeKey.Contains("Handle"));
+        var callWithout = withoutFlow.Calls.Single(c => c.CalleeKey.Contains("Handle"));
+
+        Assert.IsTrue(callWith.Dataflow.Arguments.Count > 0,
+            "deep profile computes the argument flow for the call");
+        Assert.AreEqual(0, callWithout.Dataflow.Arguments.Count,
+            "a non-deep profile skips the dataflow analysis entirely");
+        Assert.IsNull(callWithout.Dataflow.ReturnDestination);
     }
 }
 

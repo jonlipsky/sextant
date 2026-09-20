@@ -5,6 +5,7 @@ using ModelContextProtocol.Server;
 
 namespace Sextant.Mcp.Tools;
 
+[McpServerToolType]
 public static class GetTypeDependentsTool
 {
     [McpServerTool(Name = "get_type_dependents"),

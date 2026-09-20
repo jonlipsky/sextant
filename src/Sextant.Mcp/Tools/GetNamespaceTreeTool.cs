@@ -4,6 +4,7 @@ using ModelContextProtocol.Server;
 
 namespace Sextant.Mcp.Tools;
 
+[McpServerToolType]
 public static class GetNamespaceTreeTool
 {
     [McpServerTool(Name = "get_namespace_tree"),

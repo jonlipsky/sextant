@@ -4,6 +4,7 @@ using ModelContextProtocol.Server;
 
 namespace Sextant.Mcp.Tools;
 
+[McpServerToolType]
 public static class FindByAttributeTool
 {
     [McpServerTool(Name = "find_by_attribute"), Description("Find symbols decorated with a given attribute.")]

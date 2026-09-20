@@ -45,6 +45,14 @@ public sealed class BenchmarkOptions
     public string? MachineDescription { get; init; }
     public Action<string>? Log { get; init; }
 
+    /// <summary>
+    /// The indexing profile (Phase 8) the run indexes under — <c>core</c>, <c>standard</c>, or
+    /// <c>deep</c>. Selects which optional features (documentation FTS, comments, dataflow, test
+    /// indexing) are built, so the per-profile sweep can report size and speed at each depth. Defaults
+    /// to <c>deep</c> (everything on), matching the harness's pre-profile behavior.
+    /// </summary>
+    public string Profile { get; set; } = IndexProfiles.Deep;
+
     /// <summary>Maximum diagnostic messages retained in the report (the full count is always kept).</summary>
     public int MaxDiagnostics { get; init; } = 100;
 }
@@ -75,6 +83,7 @@ public sealed class BenchmarkRunner
             CorpusName = options.Corpus,
             SchemaVersion = BenchmarkReport.CurrentSchemaVersion,
             Environment = BuildEnvironment(options, solutionPath),
+            IndexingProfile = IndexProfiles.Normalize(options.Profile),
             ExtractorMode = options.UseDocumentExtractor ? "document" : "legacy",
             ExtractionParallelism = options.UseDocumentExtractor
                 ? ExtractionParallelismOptions.Resolve(options.MaxParallelism, 0).MaxParallelism
@@ -112,7 +121,8 @@ public sealed class BenchmarkRunner
             metrics.SolutionLoadMs = loadSw.ElapsedMilliseconds;
 
             var orchestrator = new IndexOrchestrator(db, log, options.UseDocumentExtractor,
-                ExtractionParallelismOptions.Resolve(options.MaxParallelism, 0));
+                ExtractionParallelismOptions.Resolve(options.MaxParallelism, 0),
+                IndexProfileDescriptor.For(options.Profile));
             await orchestrator.IndexSolutionAsync(solution, progress: null, metrics, ct);
         }
         catch (OperationCanceledException)
@@ -167,7 +177,8 @@ public sealed class BenchmarkRunner
             phase.ProjectsProcessed = metrics.ProjectCount;
 
             var incremental = new IncrementalIndexer(db, log, options.UseDocumentExtractor,
-                ExtractionParallelismOptions.Resolve(options.MaxParallelism, 0));
+                ExtractionParallelismOptions.Resolve(options.MaxParallelism, 0),
+                IndexProfileDescriptor.For(options.Profile));
             // total_duration_ms excludes solution load, so time only the reindex.
             var indexSw = Stopwatch.StartNew();
             await incremental.IndexChangedFilesAsync(solution, [changedFile], ct);
