@@ -21,21 +21,24 @@ public static class GetTypeDependentsTool
         if (db == null)
             return ResponseBuilder.BuildEmpty(notReady);
 
+        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+            return authError;
+
         var conn = db.GetConnection();
-        var symbolStore = new SymbolStore(conn) { Scope = SnapshotReadScope.ForSelected(conn) };
+        var symbolStore = new SymbolStore(conn) { Scope = readContext.Scope };
         var relationshipStore = new RelationshipStore(conn);
-        var projectStore = new ProjectStore(conn);
+        var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
 
         var resolution = SymbolResolver.Resolve(symbolStore, projectStore, symbol_fqn);
         if (resolution.Symbol == null)
-            return ResponseBuilder.BuildEmpty("Symbol not found.");
+            return ResponseBuilder.BuildEmpty("Symbol not found.", readContext.Provenance);
         var targetSymbol = resolution.Symbol;
 
         RelationshipKind? kindFilter = null;
         if (dependency_kind != "all")
         {
             if (!Enum.TryParse<RelationshipKind>(dependency_kind, ignoreCase: true, out var parsed))
-                return ResponseBuilder.BuildEmpty($"Invalid dependency_kind: {dependency_kind}");
+                return ResponseBuilder.BuildEmpty($"Invalid dependency_kind: {dependency_kind}", readContext.Provenance);
             kindFilter = parsed;
         }
 
@@ -93,7 +96,7 @@ public static class GetTypeDependentsTool
             relationships = d.Relationships
         }).ToList();
 
-        return ResponseBuilder.Build(results, targetSymbol.LastIndexedAt, resolution.Ambiguity);
+        return ResponseBuilder.Build(results, targetSymbol.LastIndexedAt, resolution.Ambiguity, readContext.Provenance);
     }
 
     private static string GetContainingTypeFqn(SymbolInfo symbol)

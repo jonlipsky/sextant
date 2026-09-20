@@ -31,6 +31,16 @@ public sealed class SnapshotReadScope
     public static readonly SnapshotReadScope LegacyPinned = new(null, legacyPinned: true);
 
     /// <summary>
+    /// A fail-CLOSED scope that matches NO rows (Phase 11, criterion 6). Returned by the read planner when
+    /// a read is not authorized, so a caller that reads the scope without first consulting the
+    /// authorization verdict still leaks nothing — it reads empty rather than, as an unscoped scope would,
+    /// reading the entire index. The gate (<c>ReadContextGate</c>) turns the denial into a structured
+    /// <c>meta.error</c>; this scope is the belt-and-suspenders that makes fail-open impossible by
+    /// construction for any future call site.
+    /// </summary>
+    public static readonly SnapshotReadScope DenyAll = new(null, legacyPinned: false, denyAll: true);
+
+    /// <summary>
     /// The read scope for the current selected snapshot on <paramref name="connection"/> — the MCP
     /// default so a scope-less query transparently targets the current snapshot (criterion 6). Resolves
     /// to <see cref="LegacyPinned"/> for a single-repo database that has snapshot rows but no selected
@@ -51,21 +61,54 @@ public sealed class SnapshotReadScope
         return store.HasUnselectedSnapshotProjectRows() ? LegacyPinned : Unscoped;
     }
 
-    private SnapshotReadScope(long? snapshotId, bool legacyPinned)
+    /// <summary>
+    /// A <b>base-only</b> diagnostic scope (Phase-11 federation mode): restricts reads to the committed
+    /// base snapshot's project versions. Given the selected overlay's <c>base_snapshot_id</c>, it reads
+    /// exactly the rows the overlay layers on (the pre-edit state), which is how a differential test proves
+    /// that a federated read shadows a touched base row (criteria 1/2). Equivalent to a plain snapshot
+    /// scope on the base id; a null base (a clean base is its own selected snapshot) yields <see
+    /// cref="Unscoped"/>.
+    /// </summary>
+    public static SnapshotReadScope ForBaseOf(long? baseSnapshotId) =>
+        baseSnapshotId.HasValue ? new SnapshotReadScope(baseSnapshotId, legacyPinned: false) : Unscoped;
+
+    /// <summary>
+    /// An <b>overlay-local-only</b> diagnostic scope (Phase-11 federation mode): restricts reads to the
+    /// project versions FRESHLY re-extracted into the overlay generation (<c>projects.snapshot_id =
+    /// overlayId</c>), EXCLUDING the unchanged base project-versions the overlay shares via
+    /// <c>snapshot_projects</c>. This is the "just my working-tree changes" view — the complement of <see
+    /// cref="ForBaseOf"/> within a federated result.
+    /// </summary>
+    public static SnapshotReadScope ForOverlayLocalOnly(long overlayId) =>
+        new(overlayId, legacyPinned: false, overlayLocalOnly: true);
+
+    private SnapshotReadScope(long? snapshotId, bool legacyPinned, bool overlayLocalOnly = false, bool denyAll = false)
     {
         SnapshotId = snapshotId;
         _legacyPinned = legacyPinned;
+        _overlayLocalOnly = overlayLocalOnly;
+        _denyAll = denyAll;
     }
 
     public SnapshotReadScope(long? snapshotId) : this(snapshotId, legacyPinned: false) { }
 
     private readonly bool _legacyPinned;
 
+    /// <summary>When true, every scoped fragment matches NO rows (fail-closed, see <see cref="DenyAll"/>).</summary>
+    private readonly bool _denyAll;
+
+    /// <summary>
+    /// When true, a snapshot-scoped read filters by the OWNING project-version's <c>projects.snapshot_id</c>
+    /// (only rows freshly extracted into this generation) instead of <c>snapshot_projects</c> membership
+    /// (which also includes shared base rows). Set by <see cref="ForOverlayLocalOnly"/>.
+    /// </summary>
+    private readonly bool _overlayLocalOnly;
+
     /// <summary>The selected snapshot id, or null when the scope is a no-op or legacy-pinned.</summary>
     public long? SnapshotId { get; }
 
-    /// <summary>Whether this scope actually restricts rows (a selected snapshot or the legacy pin).</summary>
-    public bool IsScoped => SnapshotId.HasValue || _legacyPinned;
+    /// <summary>Whether this scope actually restricts rows (a selected snapshot, the legacy pin, or a deny-all).</summary>
+    public bool IsScoped => SnapshotId.HasValue || _legacyPinned || _denyAll;
 
     /// <summary>
     /// A SQL JOIN fragment restricting a query's rows to the scoped snapshot's project versions (or, when
@@ -77,8 +120,12 @@ public sealed class SnapshotReadScope
     /// </summary>
     public string Join(string projectColumn)
     {
+        if (_denyAll)
+            return " JOIN (SELECT 1) __deny ON 1 = 0";
         if (SnapshotId.HasValue)
-            return $" JOIN snapshot_projects __sp ON __sp.project_id = {projectColumn} AND __sp.snapshot_id = @__snap";
+            return _overlayLocalOnly
+                ? $" JOIN projects __olp ON __olp.id = {projectColumn} AND __olp.snapshot_id = @__snap"
+                : $" JOIN snapshot_projects __sp ON __sp.project_id = {projectColumn} AND __sp.snapshot_id = @__snap";
         if (_legacyPinned)
             return $" JOIN projects __lp ON __lp.id = {projectColumn} AND __lp.snapshot_id IS NULL";
         return string.Empty;
@@ -92,8 +139,12 @@ public sealed class SnapshotReadScope
     /// </summary>
     public string And(string projectColumn)
     {
+        if (_denyAll)
+            return " AND 1 = 0";
         if (SnapshotId.HasValue)
-            return $" AND {projectColumn} IN (SELECT project_id FROM snapshot_projects WHERE snapshot_id = @__snap)";
+            return _overlayLocalOnly
+                ? $" AND {projectColumn} IN (SELECT id FROM projects WHERE snapshot_id = @__snap)"
+                : $" AND {projectColumn} IN (SELECT project_id FROM snapshot_projects WHERE snapshot_id = @__snap)";
         if (_legacyPinned)
             return $" AND {projectColumn} IN (SELECT id FROM projects WHERE snapshot_id IS NULL)";
         return string.Empty;
@@ -106,8 +157,12 @@ public sealed class SnapshotReadScope
     /// </summary>
     public string Where(string projectColumn)
     {
+        if (_denyAll)
+            return " WHERE 1 = 0";
         if (SnapshotId.HasValue)
-            return $" WHERE {projectColumn} IN (SELECT project_id FROM snapshot_projects WHERE snapshot_id = @__snap)";
+            return _overlayLocalOnly
+                ? $" WHERE {projectColumn} IN (SELECT id FROM projects WHERE snapshot_id = @__snap)"
+                : $" WHERE {projectColumn} IN (SELECT project_id FROM snapshot_projects WHERE snapshot_id = @__snap)";
         if (_legacyPinned)
             return $" WHERE {projectColumn} IN (SELECT id FROM projects WHERE snapshot_id IS NULL)";
         return string.Empty;

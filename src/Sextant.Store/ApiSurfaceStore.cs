@@ -43,11 +43,18 @@ public sealed class ApiSurfaceStore(SqliteConnection connection)
     public List<ApiSurfaceSnapshot> GetByProjectAndCommit(long projectId, string gitCommit)
     {
         using var cmd = connection.CreateCommand();
+        // ORDER BY captured_at, id is load-bearing, not cosmetic: LogicalProjectGroup can return rows from
+        // MORE THAN ONE physical project-version of the same logical project at one commit (e.g. a base
+        // snapshot plus a later re-index, both stamped with the same git_commit). BreakingChangeDetector
+        // folds this list into a symbol_key-keyed dictionary last-writer-wins (issue #29), so a stable
+        // order is what makes the winner — and therefore the breaking-change classification —
+        // deterministic. Ascending (captured_at, id) means the newest capture of a symbol_key wins.
         cmd.CommandText = $"""
             SELECT a.id, a.project_id, a.symbol_id, a.symbol_key, a.fully_qualified_name, a.accessibility,
                    a.signature_hash, a.captured_at, a.git_commit
             FROM api_surface_snapshots a
-            WHERE a.project_id IN {LogicalProjectGroup} AND a.git_commit = @git_commit;
+            WHERE a.project_id IN {LogicalProjectGroup} AND a.git_commit = @git_commit
+            ORDER BY a.captured_at, a.id;
             """;
         cmd.Parameters.AddWithValue("@project_id", projectId);
         cmd.Parameters.AddWithValue("@git_commit", gitCommit);

@@ -561,6 +561,43 @@ public class SnapshotStoreTests
         Assert.AreEqual("h_b", latest[0].SignatureHash, "latest resolves to the most recently captured api surface");
     }
 
+    [TestMethod]
+    public void ApiSurface_MultipleProjectVersionsSameCommit_ResolveInDeterministicOrder()
+    {
+        // Rubber-duck follow-up to issue #29: when two physical project-versions of ONE logical project
+        // carry api-surface rows stamped with the SAME git_commit (a base snapshot plus a re-index),
+        // GetByProjectAndCommit returns BOTH via the logical-project group. BreakingChangeDetector folds
+        // them into a symbol_key-keyed dictionary last-writer-wins, so the query MUST impose a stable
+        // order or the resulting breaking-change classification is nondeterministic. This asserts the
+        // ORDER BY (captured_at, id) so the newest capture of a symbol_key is deterministically last.
+        var repoId = EnsureRepo("https://github.com/org/repo");
+        var a = SeedCompleteSnapshot(repoId, "commit_aaaa", LogicalCanonical, Fqn, symbolKey: "S_A");
+        var b = SeedCompleteSnapshot(repoId, "commit_bbbb", LogicalCanonical, Fqn, symbolKey: "S_B");
+        Assert.AreNotEqual(a.projectId, b.projectId, "two distinct physical project-versions of one logical project");
+
+        var api = new ApiSurfaceStore(_conn);
+        // Both rows share one symbol_key AND one git_commit but live under different project-versions,
+        // with the OLDER capture inserted last so insertion order alone would NOT yield ascending order.
+        api.Insert(new ApiSurfaceSnapshot
+        {
+            ProjectId = b.projectId, SymbolKey = "KEY", FullyQualifiedName = Fqn,
+            Accessibility = "public", SignatureHash = "h_new", CapturedAt = 20, GitCommit = "commit_shared"
+        });
+        api.Insert(new ApiSurfaceSnapshot
+        {
+            ProjectId = a.projectId, SymbolKey = "KEY", FullyQualifiedName = Fqn,
+            Accessibility = "public", SignatureHash = "h_old", CapturedAt = 10, GitCommit = "commit_shared"
+        });
+
+        var rows = api.GetByProjectAndCommit(b.projectId, "commit_shared");
+        Assert.AreEqual(2, rows.Count, "both project-versions' rows for the shared commit resolve");
+        CollectionAssert.AreEqual(
+            new[] { "h_old", "h_new" }, rows.Select(r => r.SignatureHash).ToList(),
+            "rows come back in ascending (captured_at, id) order regardless of insertion order");
+        Assert.AreEqual("h_new", rows[^1].SignatureHash,
+            "the newest capture is deterministically last, so last-writer-wins picks it every run");
+    }
+
     // ==== helpers ================================================================================
 
     private const string LogicalCanonical = "logical_app_0123456789";

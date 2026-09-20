@@ -16,22 +16,27 @@ public static class FindReferencesTool
         [Description("Group results by: 'project', 'file', 'kind', or comma-separated combination (e.g. 'project,file'). Default: flat list.")] string? group_by = null,
         [Description("Include source code lines around each reference")] bool include_source = false,
         [Description("Scope filter: 'file:/path', 'project:canonical_id', 'solution:/path', or 'all'")] string? scope = null,
-        [Description("Filter by access kind: 'read', 'write', 'readwrite', or null for all")] string? access_kind = null)
+        [Description("Filter by access kind: 'read', 'write', 'readwrite', or null for all")] string? access_kind = null,
+        [Description("Federation partition (Phase 11 diagnostic): 'federated' (default, overlay over base), 'base_only', or 'overlay_only'")] string? federation = null)
     {
         var db = dbProvider.GetReadyDatabase(out var notReady);
         if (db == null)
             return ResponseBuilder.BuildEmpty(notReady);
 
+        var mode = FederationModes.Parse(federation);
+        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError, mode))
+            return authError;
+
         var conn = db.GetConnection();
-        var snapshotScope = SnapshotReadScope.ForSelected(conn);
+        var snapshotScope = readContext.Scope;
         var symbolStore = new SymbolStore(conn) { Scope = snapshotScope };
         var referenceStore = new ReferenceStore(conn) { Scope = snapshotScope };
-        var projectStore = new ProjectStore(conn);
+        var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
         var contextRetriever = new SourceContextRetriever(new FileStore(conn));
 
         var resolution = SymbolResolver.Resolve(symbolStore, projectStore, symbol_fqn);
         if (resolution.Symbol == null)
-            return ResponseBuilder.BuildEmpty("Symbol not found.");
+            return ResponseBuilder.BuildEmpty("Symbol not found.", readContext.Provenance);
         var symbol = resolution.Symbol;
 
         var refs = referenceStore.GetBySymbolId(symbol.Id);
@@ -50,7 +55,7 @@ public static class FindReferencesTool
         }
 
         // Apply scope filter
-        var scopeFilter = ScopeResolver.Resolve(scope, conn);
+        var scopeFilter = ScopeResolver.Resolve(scope, conn, readContext.Scope);
         if (!scopeFilter.IsEmpty)
         {
             if (scopeFilter.FilePath != null)
@@ -89,10 +94,10 @@ public static class FindReferencesTool
         {
             var groups = group_by.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
             var grouped = GroupReferences(mapped, groups);
-            return ResponseBuilder.Build(grouped, symbol.LastIndexedAt, resolution.Ambiguity);
+            return ResponseBuilder.Build(grouped, symbol.LastIndexedAt, resolution.Ambiguity, readContext.Provenance);
         }
 
-        return ResponseBuilder.Build(mapped, symbol.LastIndexedAt, resolution.Ambiguity);
+        return ResponseBuilder.Build(mapped, symbol.LastIndexedAt, resolution.Ambiguity, readContext.Provenance);
     }
 
     private static List<object> GroupReferences(List<object> refs, string[] groupKeys)

@@ -5,7 +5,7 @@ namespace Sextant.Mcp;
 
 internal static class ScopeResolver
 {
-    public static ScopeFilter Resolve(string? scope, SqliteConnection conn)
+    public static ScopeFilter Resolve(string? scope, SqliteConnection conn, SnapshotReadScope? pinnedScope = null)
     {
         if (string.IsNullOrEmpty(scope) || scope == "all")
             return ScopeFilter.None;
@@ -15,7 +15,7 @@ internal static class ScopeResolver
 
         if (scope.StartsWith("project:"))
         {
-            var projectStore = new ProjectStore(conn);
+            var projectStore = new ProjectStore(conn) { Scope = pinnedScope };
             var proj = projectStore.GetByCanonicalId(scope[8..]);
             if (proj == null) return ScopeFilter.None;
             return new ScopeFilter { ProjectIds = new HashSet<long> { proj.Value.id } };

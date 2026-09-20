@@ -294,28 +294,29 @@ public class StressTests
     public void StressTest_BreakingChangeDetection_LargeApiSurface()
     {
         // Simulate breaking change detection on 200 symbol API surface
-        var oldSurface = new List<(string fqn, string signatureHash, string accessibility)>();
-        var newSurface = new List<(string fqn, string signatureHash, string accessibility)>();
+        var oldSurface = new List<(string symbolKey, string fqn, string signatureHash, string accessibility)>();
+        var newSurface = new List<(string symbolKey, string fqn, string signatureHash, string accessibility)>();
 
         for (var i = 0; i < 200; i++)
         {
             var fqn = $"global::Api.Class{i}";
-            oldSurface.Add((fqn, $"hash_v1_{i}", "public"));
+            var key = $"K:{fqn}";
+            oldSurface.Add((key, fqn, $"hash_v1_{i}", "public"));
 
             if (i < 190) // 10 symbols removed
             {
                 if (i == 50) // 1 signature changed
-                    newSurface.Add((fqn, $"hash_v2_{i}", "public"));
+                    newSurface.Add((key, fqn, $"hash_v2_{i}", "public"));
                 else if (i == 100) // 1 accessibility reduced
-                    newSurface.Add((fqn, $"hash_v1_{i}", "internal"));
+                    newSurface.Add((key, fqn, $"hash_v1_{i}", "internal"));
                 else
-                    newSurface.Add((fqn, $"hash_v1_{i}", "public"));
+                    newSurface.Add((key, fqn, $"hash_v1_{i}", "public"));
             }
         }
 
         // Add 5 new symbols
         for (var i = 200; i < 205; i++)
-            newSurface.Add(($"global::Api.Class{i}", $"hash_v1_{i}", "public"));
+            newSurface.Add(($"K:global::Api.Class{i}", $"global::Api.Class{i}", $"hash_v1_{i}", "public"));
 
         var sw = Stopwatch.StartNew();
         var changes = BreakingChangeDetector.DetectChanges(oldSurface, newSurface);

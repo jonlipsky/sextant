@@ -22,14 +22,17 @@ public static class FindSymbolTool
         if (db == null)
             return ResponseBuilder.BuildEmpty(notReady);
 
+        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+            return authError;
+
         var conn = db.GetConnection();
-        var symbolStore = new SymbolStore(conn) { Scope = SnapshotReadScope.ForSelected(conn) };
-        var projectStore = new ProjectStore(conn);
+        var symbolStore = new SymbolStore(conn) { Scope = readContext.Scope };
+        var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
 
         var canonicalIdCache = BuildCanonicalIdCache(projectStore);
 
         // Resolve scope to project filter
-        var scopeFilter = ScopeResolver.Resolve(scope, conn);
+        var scopeFilter = ScopeResolver.Resolve(scope, conn, readContext.Scope);
 
         if (fuzzy)
         {
@@ -46,7 +49,7 @@ public static class FindSymbolTool
 
             var mapped = results.Select(s => MapSymbol(s, ResolveCanonicalId(s.ProjectId, canonicalIdCache), include_source)).ToList();
             var freshness = results.Count > 0 ? results.Min(s => s.LastIndexedAt) : 0;
-            return ResponseBuilder.Build(mapped, freshness);
+            return ResponseBuilder.Build(mapped, freshness, provenance: readContext.Provenance);
         }
         else
         {
@@ -55,25 +58,25 @@ public static class FindSymbolTool
             {
                 var proj = projectStore.GetByCanonicalId(project_id);
                 if (proj == null)
-                    return ResponseBuilder.BuildEmpty("Project not found.");
+                    return ResponseBuilder.BuildEmpty("Project not found.", readContext.Provenance);
                 projectDbId = proj.Value.id;
             }
 
             var resolution = SymbolResolver.Resolve(symbolStore, projectStore, name, projectDbId);
             if (resolution.Symbol == null)
-                return ResponseBuilder.BuildEmpty("Symbol not found.");
+                return ResponseBuilder.BuildEmpty("Symbol not found.", readContext.Provenance);
             var symbol = resolution.Symbol;
 
             if (!scopeFilter.IsEmpty)
             {
                 if (scopeFilter.FilePath != null && symbol.FilePath != scopeFilter.FilePath)
-                    return ResponseBuilder.BuildEmpty("Symbol not in scope.");
+                    return ResponseBuilder.BuildEmpty("Symbol not in scope.", readContext.Provenance);
                 if (scopeFilter.ProjectIds != null && !scopeFilter.ProjectIds.Contains(symbol.ProjectId))
-                    return ResponseBuilder.BuildEmpty("Symbol not in scope.");
+                    return ResponseBuilder.BuildEmpty("Symbol not in scope.", readContext.Provenance);
             }
 
             var mapped = new List<object> { MapSymbol(symbol, ResolveCanonicalId(symbol.ProjectId, canonicalIdCache), include_source) };
-            return ResponseBuilder.Build(mapped, symbol.LastIndexedAt, resolution.Ambiguity);
+            return ResponseBuilder.Build(mapped, symbol.LastIndexedAt, resolution.Ambiguity, readContext.Provenance);
         }
     }
 

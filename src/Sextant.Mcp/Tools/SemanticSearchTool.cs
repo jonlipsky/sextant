@@ -20,19 +20,22 @@ public static class SemanticSearchTool
         if (db == null)
             return ResponseBuilder.BuildEmpty(notReady);
 
+        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+            return authError;
+
         if (!CapabilityGate.Ensure(db, IndexFeature.DocumentationSearch, "documentation_search", out var unavailable))
             return unavailable;
 
         var conn = db.GetConnection();
-        var symbolStore = new SymbolStore(conn) { Scope = SnapshotReadScope.ForSelected(conn) };
-        var projectStore = new ProjectStore(conn);
+        var symbolStore = new SymbolStore(conn) { Scope = readContext.Scope };
+        var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
         var config = SextantConfiguration.FromEnvironment();
         var canonicalIdCache = FindSymbolTool.BuildCanonicalIdCache(projectStore);
 
         max_results = Math.Min(max_results, config.FtsMaxResults);
         var results = symbolStore.SearchFts(query, max_results, kind);
 
-        var scopeFilter = ScopeResolver.Resolve(scope, conn);
+        var scopeFilter = ScopeResolver.Resolve(scope, conn, readContext.Scope);
         if (!scopeFilter.IsEmpty)
         {
             if (scopeFilter.FilePath != null)
@@ -43,6 +46,6 @@ public static class SemanticSearchTool
 
         var mapped = results.Select(s => FindSymbolTool.MapSymbol(s, FindSymbolTool.ResolveCanonicalId(s.ProjectId, canonicalIdCache))).ToList<object>();
         var freshness = results.Count > 0 ? results.Min(s => s.LastIndexedAt) : 0;
-        return ResponseBuilder.Build(mapped, freshness);
+        return ResponseBuilder.Build(mapped, freshness, provenance: readContext.Provenance);
     }
 }
