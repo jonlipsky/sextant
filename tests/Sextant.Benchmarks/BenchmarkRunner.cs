@@ -185,9 +185,13 @@ public sealed class BenchmarkRunner
         sampler.Sample();
 
         metrics.Storage.FinalWalBytes = db.WalBytes;
+        metrics.Storage.FinalShmBytes = db.ShmBytes;
         db.Checkpoint();
         metrics.Storage.FinalDbBytes = db.MainDbBytes;
         metrics.Storage.PeakDbPlusWalBytes = Math.Max(sampler.PeakDbPlusWalBytes, metrics.Storage.FinalDbBytes);
+        metrics.Storage.PeakWalBytes = sampler.PeakWalBytes;
+        metrics.Storage.PeakShmBytes = sampler.PeakShmBytes;
+        metrics.Storage.PeakStagedArtifactBytes = Math.Max(sampler.PeakStagedArtifactBytes, metrics.Storage.FinalDbBytes);
 
         metrics.Memory.PeakManagedBytes = sampler.PeakManagedBytes;
         metrics.Memory.PeakWorkingSetBytes = sampler.PeakWorkingSetBytes;

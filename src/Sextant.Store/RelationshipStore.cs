@@ -5,19 +5,31 @@ namespace Sextant.Store;
 
 public sealed class RelationshipStore(SqliteConnection connection)
 {
+    private const string InsertSql = """
+        INSERT INTO relationships (from_symbol_id, to_symbol_id, kind, last_indexed_at)
+        VALUES (@from, @to, @kind, @last_indexed_at)
+        RETURNING id;
+        """;
+
+    public SqliteCommand CreateInsertCommand()
+    {
+        var cmd = connection.CreateCommand();
+        cmd.CommandText = InsertSql;
+        return cmd;
+    }
+
     public long Insert(RelationshipInfo relationship)
     {
-        using var cmd = connection.CreateCommand();
-        cmd.CommandText = """
-            INSERT INTO relationships (from_symbol_id, to_symbol_id, kind, last_indexed_at)
-            VALUES (@from, @to, @kind, @last_indexed_at)
-            RETURNING id;
-            """;
-        cmd.Parameters.AddWithValue("@from", relationship.FromSymbolId);
-        cmd.Parameters.AddWithValue("@to", relationship.ToSymbolId);
-        cmd.Parameters.AddWithValue("@kind", relationship.Kind.ToString().ToLowerInvariant());
-        cmd.Parameters.AddWithValue("@last_indexed_at", relationship.LastIndexedAt);
+        using var cmd = CreateInsertCommand();
+        return Insert(cmd, relationship);
+    }
 
+    public long Insert(SqliteCommand cmd, RelationshipInfo relationship)
+    {
+        SqlParam.Set(cmd, "@from", relationship.FromSymbolId);
+        SqlParam.Set(cmd, "@to", relationship.ToSymbolId);
+        SqlParam.Set(cmd, "@kind", relationship.Kind.ToString().ToLowerInvariant());
+        SqlParam.Set(cmd, "@last_indexed_at", relationship.LastIndexedAt);
         return (long)cmd.ExecuteScalar()!;
     }
 

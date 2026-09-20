@@ -16,6 +16,9 @@ public sealed class ResourceSampler : IDisposable
     private readonly Timer _timer;
 
     private long _peakDbPlusWal;
+    private long _peakWal;
+    private long _peakShm;
+    private long _peakStaged;
     private long _peakManaged;
     private long _peakWorkingSet;
 
@@ -28,6 +31,14 @@ public sealed class ResourceSampler : IDisposable
     }
 
     public long PeakDbPlusWalBytes => Interlocked.Read(ref _peakDbPlusWal);
+    public long PeakWalBytes => Interlocked.Read(ref _peakWal);
+    public long PeakShmBytes => Interlocked.Read(ref _peakShm);
+
+    /// <summary>
+    /// Peak transient footprint of the staging generation: main database plus WAL plus SHM. With the
+    /// in-file generation model this is the not-yet-published on-disk cost that later phases reduce.
+    /// </summary>
+    public long PeakStagedArtifactBytes => Interlocked.Read(ref _peakStaged);
     public long PeakManagedBytes => Interlocked.Read(ref _peakManaged);
     public long PeakWorkingSetBytes => Interlocked.Read(ref _peakWorkingSet);
 
@@ -36,7 +47,13 @@ public sealed class ResourceSampler : IDisposable
     {
         try
         {
-            UpdatePeak(ref _peakDbPlusWal, _db.MainDbBytes + _db.WalBytes);
+            var dbBytes = _db.MainDbBytes;
+            var walBytes = _db.WalBytes;
+            var shmBytes = _db.ShmBytes;
+            UpdatePeak(ref _peakDbPlusWal, dbBytes + walBytes);
+            UpdatePeak(ref _peakWal, walBytes);
+            UpdatePeak(ref _peakShm, shmBytes);
+            UpdatePeak(ref _peakStaged, dbBytes + walBytes + shmBytes);
             UpdatePeak(ref _peakManaged, GC.GetTotalMemory(forceFullCollection: false));
             _process.Refresh();
             UpdatePeak(ref _peakWorkingSet, _process.WorkingSet64);

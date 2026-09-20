@@ -14,6 +14,18 @@ public sealed class SextantConfiguration
     public string? DaemonSocket { get; set; }
     public bool AutoSpawnDaemon { get; set; } = true;
 
+    /// <summary>
+    /// Row count that forces a mid-project commit so one abnormally large project cannot build an
+    /// unbounded transaction (and WAL). Normal projects commit at their project boundary first.
+    /// </summary>
+    public int WriteBatchSize { get; set; } = 10_000;
+
+    /// <summary><c>PRAGMA wal_autocheckpoint</c> in pages — bounds the write-ahead log during a run.</summary>
+    public int WalAutocheckpointPages { get; set; } = 1_000;
+
+    /// <summary><c>PRAGMA journal_size_limit</c> in bytes — caps the WAL file left on disk after a checkpoint.</summary>
+    public long JournalSizeLimitBytes { get; set; } = 64L * 1024 * 1024;
+
     private static readonly Regex ValidProfileName = new(@"^[a-zA-Z0-9_-]+$", RegexOptions.Compiled);
 
     public string LogsPath => Path.Combine(
@@ -109,6 +121,12 @@ public sealed class SextantConfiguration
                             config.DaemonSocket = fileConfig.DaemonSocket;
                         if (fileConfig.AutoSpawnDaemon.HasValue)
                             config.AutoSpawnDaemon = fileConfig.AutoSpawnDaemon.Value;
+                        if (fileConfig.WriteBatchSize.HasValue)
+                            config.WriteBatchSize = fileConfig.WriteBatchSize.Value;
+                        if (fileConfig.WalAutocheckpointPages.HasValue)
+                            config.WalAutocheckpointPages = fileConfig.WalAutocheckpointPages.Value;
+                        if (fileConfig.JournalSizeLimitBytes.HasValue)
+                            config.JournalSizeLimitBytes = fileConfig.JournalSizeLimitBytes.Value;
                     }
                 }
                 catch (JsonException)
@@ -159,6 +177,18 @@ public sealed class SextantConfiguration
         var autoSpawn = Environment.GetEnvironmentVariable("SEXTANT_AUTO_SPAWN_DAEMON");
         if (!string.IsNullOrEmpty(autoSpawn))
             config.AutoSpawnDaemon = !(autoSpawn == "false" || autoSpawn == "0");
+
+        var writeBatch = Environment.GetEnvironmentVariable("SEXTANT_WRITE_BATCH_SIZE");
+        if (int.TryParse(writeBatch, out var batch))
+            config.WriteBatchSize = batch;
+
+        var walAutocheckpoint = Environment.GetEnvironmentVariable("SEXTANT_WAL_AUTOCHECKPOINT");
+        if (int.TryParse(walAutocheckpoint, out var walPages))
+            config.WalAutocheckpointPages = walPages;
+
+        var journalLimit = Environment.GetEnvironmentVariable("SEXTANT_JOURNAL_SIZE_LIMIT");
+        if (long.TryParse(journalLimit, out var journalBytes))
+            config.JournalSizeLimitBytes = journalBytes;
     }
 
     public static string? FindRepoRoot(string startDir)
@@ -199,5 +229,14 @@ public sealed class SextantConfiguration
 
         [JsonPropertyName("auto_spawn_daemon")]
         public bool? AutoSpawnDaemon { get; set; }
+
+        [JsonPropertyName("write_batch_size")]
+        public int? WriteBatchSize { get; set; }
+
+        [JsonPropertyName("wal_autocheckpoint_pages")]
+        public int? WalAutocheckpointPages { get; set; }
+
+        [JsonPropertyName("journal_size_limit_bytes")]
+        public long? JournalSizeLimitBytes { get; set; }
     }
 }

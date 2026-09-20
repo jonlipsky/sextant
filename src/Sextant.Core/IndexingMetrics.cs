@@ -77,8 +77,24 @@ public sealed class StorageMetrics
     /// <summary>Size of the write-ahead log after the run (before checkpoint truncation), in bytes.</summary>
     public long FinalWalBytes { get; set; }
 
+    /// <summary>Size of the shared-memory (-shm) index file after the run, in bytes.</summary>
+    public long FinalShmBytes { get; set; }
+
     /// <summary>Peak observed size of main database plus WAL during the run, in bytes.</summary>
     public long PeakDbPlusWalBytes { get; set; }
+
+    /// <summary>Peak observed size of the write-ahead log during the run, in bytes.</summary>
+    public long PeakWalBytes { get; set; }
+
+    /// <summary>Peak observed size of the shared-memory (-shm) index file during the run, in bytes.</summary>
+    public long PeakShmBytes { get; set; }
+
+    /// <summary>
+    /// Peak observed size of staged (not-yet-published) index artifacts during the run, in bytes.
+    /// With the in-file generation model this is the transient main-DB + WAL + SHM footprint while a
+    /// staging generation is being built.
+    /// </summary>
+    public long PeakStagedArtifactBytes { get; set; }
 }
 
 /// <summary>
