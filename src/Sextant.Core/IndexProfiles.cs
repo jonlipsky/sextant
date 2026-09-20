@@ -123,15 +123,22 @@ public sealed record IndexProfileDescriptor
     /// <summary>The generated-source policy (see <see cref="GeneratedSourcePolicies"/>).</summary>
     public required string GeneratedSourcePolicy { get; init; }
 
-    /// <summary>The stable configuration hash for this profile/feature/policy combination.</summary>
+    /// <summary>
+    /// The Phase-5 document-oriented extractor toggle (<c>document_extractor</c>, default ON). Folded
+    /// into <see cref="ConfigurationHash"/> so flipping it forces a rebuild (issue #39). Defaults to
+    /// <c>true</c> so a descriptor constructed without specifying it hashes as the default-ON extractor.
+    /// </summary>
+    public bool DocumentExtractor { get; init; } = true;
+
+    /// <summary>The stable configuration hash for this profile/feature/policy/extractor combination.</summary>
     public string ConfigurationHash =>
-        IndexConfigurationHash.Compute(Profile, Features, GeneratedSourcePolicy);
+        IndexConfigurationHash.Compute(Profile, Features, GeneratedSourcePolicy, DocumentExtractor);
 
     /// <summary>Whether every bit in <paramref name="feature"/> is enabled.</summary>
     public bool Has(IndexFeature feature) => (Features & feature) == feature;
 
     /// <summary>Builds a descriptor for a profile name and (optional) generated-source policy.</summary>
-    public static IndexProfileDescriptor For(string? profile, string? generatedSourcePolicy = null)
+    public static IndexProfileDescriptor For(string? profile, string? generatedSourcePolicy = null, bool documentExtractor = true)
     {
         var name = IndexProfiles.Normalize(profile);
         return new IndexProfileDescriptor
@@ -140,13 +147,14 @@ public sealed record IndexProfileDescriptor
             Features = IndexProfiles.ResolveFeatures(name),
             GeneratedSourcePolicy = string.IsNullOrWhiteSpace(generatedSourcePolicy)
                 ? GeneratedSourcePolicies.Default
-                : generatedSourcePolicy.Trim().ToLowerInvariant()
+                : generatedSourcePolicy.Trim().ToLowerInvariant(),
+            DocumentExtractor = documentExtractor
         };
     }
 
     /// <summary>Resolves the descriptor from repository configuration (json + env precedence).</summary>
     public static IndexProfileDescriptor FromConfiguration(SextantConfiguration config)
-        => For(config.IndexingProfile, config.GeneratedSourcePolicy);
+        => For(config.IndexingProfile, config.GeneratedSourcePolicy, config.DocumentExtractor);
 
     /// <summary>
     /// The "everything on" descriptor (profile <c>deep</c>). Used as the indexer's default so a

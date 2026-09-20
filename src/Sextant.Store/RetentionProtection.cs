@@ -127,3 +127,47 @@ public sealed class BranchPointerProtection : IRetentionProtectionProvider
         return cmd.ExecuteScalar() is not null;
     }
 }
+
+/// <summary>
+/// Protects the committed BASE snapshot of every branch-pointed overlay (Phase 10, issue #44). A live
+/// overlay SHARES its base snapshot's unchanged project-version rows — they are mapped into the overlay
+/// via <c>snapshot_projects</c> but physically belong to the base's generation — so GC'ing the base
+/// generation would delete rows the selected overlay still reads. For each branch-pointed overlay this
+/// pins the base's generation (<c>run_id</c>) and the base commit's API history, keeping the base alive
+/// for as long as any branch points at an overlay layered on it. Forward/backward-safe: contributes
+/// nothing when the <c>snapshots</c> table lacks the Phase-10 overlay columns (pre-migration DB).
+/// </summary>
+public sealed class OverlayBaseProtection : IRetentionProtectionProvider
+{
+    public string Name => "overlay-base";
+
+    public void Contribute(SqliteConnection connection, RetentionProtectionBuilder builder)
+    {
+        if (!TableExists(connection, "snapshots") || !ColumnExists(connection, "snapshots", "is_overlay"))
+            return;
+
+        foreach (var (runId, commitSha) in new SnapshotStore(connection).GetOverlayBaseProtectionTargets())
+        {
+            if (runId.HasValue)
+                builder.ProtectGeneration(runId.Value, "base generation shared by a branch-pointed overlay");
+            if (!string.IsNullOrEmpty(commitSha))
+                builder.ProtectCommit(commitSha!, "API history for an overlay's base commit");
+        }
+    }
+
+    private static bool TableExists(SqliteConnection connection, string table)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = @name LIMIT 1;";
+        cmd.Parameters.AddWithValue("@name", table);
+        return cmd.ExecuteScalar() is not null;
+    }
+
+    private static bool ColumnExists(SqliteConnection connection, string table, string column)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = $"SELECT 1 FROM pragma_table_info('{table}') WHERE name = @col LIMIT 1;";
+        cmd.Parameters.AddWithValue("@col", column);
+        return cmd.ExecuteScalar() is not null;
+    }
+}

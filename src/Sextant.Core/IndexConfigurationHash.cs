@@ -41,10 +41,23 @@ public static class IndexConfigurationHash
     /// across machines, cultures, and runs.
     /// </summary>
     public static string Compute(string profile, IndexFeature features, string generatedSourcePolicy)
+        => Compute(profile, features, generatedSourcePolicy, documentExtractor: true);
+
+    /// <summary>
+    /// Computes the configuration hash for a resolved profile, including the Phase-5
+    /// <paramref name="documentExtractor"/> toggle. The extractor selection shapes stored output (the
+    /// document-oriented extractor and the legacy declaration-driven path are not row-identical), so it
+    /// belongs in the hash: flipping <c>document_extractor</c> now changes the configuration hash, which
+    /// the daemon treats as a generation-invalidating change and rebuilds for (issue #39). The canonical
+    /// pre-image is a fixed, ordered <c>key=value;</c> string over invariant-formatted components so the
+    /// result is stable across machines, cultures, and runs.
+    /// </summary>
+    public static string Compute(string profile, IndexFeature features, string generatedSourcePolicy, bool documentExtractor)
     {
         var canonical =
             $"v=1;profile={IndexProfiles.Normalize(profile)};features={(long)features};" +
-            $"generated={generatedSourcePolicy};analyzer={AnalyzerVersion}";
+            $"generated={generatedSourcePolicy};extractor={(documentExtractor ? "document" : "legacy")};" +
+            $"analyzer={AnalyzerVersion}";
         var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(canonical));
         return Convert.ToHexStringLower(bytes);
     }
