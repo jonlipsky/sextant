@@ -59,7 +59,13 @@ public class IndexDatabaseTests
         using var cmd = conn.CreateCommand();
         cmd.CommandText = "SELECT COUNT(*) FROM schema_version;";
         var count = Convert.ToInt32(cmd.ExecuteScalar());
-        Assert.AreEqual(8, count); // One row per migration
+
+        // One row per shipped migration, derived from the embedded migration set so adding or
+        // renumbering a migration never requires updating a magic number here.
+        var expectedMigrations = typeof(IndexDatabase).Assembly
+            .GetManifestResourceNames()
+            .Count(n => n.StartsWith("Sextant.Store.Migrations.") && n.EndsWith(".sql"));
+        Assert.AreEqual(expectedMigrations, count);
     }
 
     [TestMethod]
