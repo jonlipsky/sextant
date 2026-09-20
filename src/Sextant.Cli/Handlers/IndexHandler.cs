@@ -93,7 +93,9 @@ internal static class IndexHandler
                 }
             });
 
-            var orchestrator = new Indexer.IndexOrchestrator(indexDb, logCallback, config.DocumentExtractor);
+            var orchestrator = new Indexer.IndexOrchestrator(
+                indexDb, logCallback, config.DocumentExtractor,
+                Indexer.ExtractionParallelismOptions.FromConfiguration(config));
             await orchestrator.IndexSolutionAsync(solution, progress);
 
             if (isInteractive)

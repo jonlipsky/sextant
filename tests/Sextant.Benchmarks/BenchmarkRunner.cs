@@ -34,6 +34,14 @@ public sealed class BenchmarkOptions
     /// </summary>
     public bool UseDocumentExtractor { get; init; }
 
+    /// <summary>
+    /// Degree of parallelism for the document-oriented extractor's bounded pipeline (Phase 6). 0 =
+    /// auto-resolve for the machine; a positive value forces that many analysis workers (clamped to
+    /// the processor count). Only meaningful together with <see cref="UseDocumentExtractor"/>. The
+    /// parallelism sweep drives this at 1/2/4/8/auto to measure throughput and peak-memory impact.
+    /// </summary>
+    public int MaxParallelism { get; init; }
+
     public string? MachineDescription { get; init; }
     public Action<string>? Log { get; init; }
 
@@ -66,7 +74,11 @@ public sealed class BenchmarkRunner
         {
             CorpusName = options.Corpus,
             SchemaVersion = BenchmarkReport.CurrentSchemaVersion,
-            Environment = BuildEnvironment(options, solutionPath)
+            Environment = BuildEnvironment(options, solutionPath),
+            ExtractorMode = options.UseDocumentExtractor ? "document" : "legacy",
+            ExtractionParallelism = options.UseDocumentExtractor
+                ? ExtractionParallelismOptions.Resolve(options.MaxParallelism, 0).MaxParallelism
+                : null
         };
 
         using var db = new IndexDatabase(dbPath);
@@ -99,7 +111,8 @@ public sealed class BenchmarkRunner
             loadSw.Stop();
             metrics.SolutionLoadMs = loadSw.ElapsedMilliseconds;
 
-            var orchestrator = new IndexOrchestrator(db, log, options.UseDocumentExtractor);
+            var orchestrator = new IndexOrchestrator(db, log, options.UseDocumentExtractor,
+                ExtractionParallelismOptions.Resolve(options.MaxParallelism, 0));
             await orchestrator.IndexSolutionAsync(solution, progress: null, metrics, ct);
         }
         catch (OperationCanceledException)
@@ -153,7 +166,8 @@ public sealed class BenchmarkRunner
             metrics.ProjectCount = solution.Projects.Count();
             phase.ProjectsProcessed = metrics.ProjectCount;
 
-            var incremental = new IncrementalIndexer(db, log, options.UseDocumentExtractor);
+            var incremental = new IncrementalIndexer(db, log, options.UseDocumentExtractor,
+                ExtractionParallelismOptions.Resolve(options.MaxParallelism, 0));
             // total_duration_ms excludes solution load, so time only the reindex.
             var indexSw = Stopwatch.StartNew();
             await incremental.IndexChangedFilesAsync(solution, [changedFile], ct);

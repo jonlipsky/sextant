@@ -46,6 +46,14 @@ public sealed class BenchmarkReport
     public bool Redacted { get; set; }
     public required BenchmarkEnvironment Environment { get; init; }
     public ReductionTargets Targets { get; set; } = new();
+
+    /// <summary>Which extractor produced this report — <c>document</c> (Phase 5) or <c>legacy</c>.</summary>
+    public string? ExtractorMode { get; set; }
+
+    /// <summary>Effective document-extractor analysis parallelism for this run (resolved from the
+    /// requested value against the host), recorded so a parallelism sweep is self-describing.</summary>
+    public int? ExtractionParallelism { get; set; }
+
     public IndexingMetrics? FullIndex { get; set; }
     public IndexingMetrics? IncrementalIndex { get; set; }
 
@@ -76,6 +84,9 @@ public sealed class BenchmarkReport
         if (Environment.MachineDescription != null) sb.AppendLine($"- Machine: {Environment.MachineDescription}");
         if (Environment.GitCommit != null) sb.AppendLine($"- Commit: {Environment.GitCommit}");
         sb.AppendLine($"- Targets: {Targets.RuntimeSpeedupFactor:0.#}x runtime, {Targets.PeakDiskReductionFraction:P0} peak-disk reduction");
+        if (ExtractorMode != null)
+            sb.AppendLine($"- Extractor: {ExtractorMode}" +
+                          (ExtractionParallelism != null ? $" (parallelism {ExtractionParallelism})" : string.Empty));
         sb.AppendLine();
 
         AppendRun(sb, "Full index", FullIndex);
