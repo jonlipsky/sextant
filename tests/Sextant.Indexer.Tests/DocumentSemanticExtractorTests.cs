@@ -245,6 +245,25 @@ public class DocumentSemanticExtractorTests
     }
 
     [TestMethod]
+    public void Reference_SameLineDifferentTargetProjectsDoNotCollapse()
+    {
+        // Compilation-scoped exact resolution can bind two same-line mentions of the SAME declaration
+        // key to different projects (an `extern alias`-duplicated assembly, or a multi-TFM dependency).
+        // Those persist different symbol_id rows, so the dedup key must keep them separate; collapsing
+        // them would silently drop one exact edge.
+        var sink = new DocumentContributionSet();
+        var a = new ReferenceContribution("K", "F.cs", 10, ReferenceKind.TypeRef, null, "T", TargetProjectId: 1);
+        var b = a with { TargetProjectId = 2 };
+        var dupOfA = a with { Snippet = "different-snippet" };
+
+        Assert.IsTrue(sink.AddReference(a), "first occurrence is accepted");
+        Assert.IsTrue(sink.AddReference(b), "same key/location but a different exact target project is a distinct edge");
+        Assert.IsFalse(sink.AddReference(dupOfA), "same target project collapses regardless of snippet");
+        Assert.AreEqual(2, sink.References.Count);
+        CollectionAssert.AreEquivalent(new long?[] { 1, 2 }, sink.References.Select(r => r.TargetProjectId).ToArray());
+    }
+
+    [TestMethod]
     public void Access_ClassifiesReadWriteReadWriteOnFields()
     {
         var source = """
@@ -362,6 +381,80 @@ public class DocumentSemanticExtractorTests
             .ToList();
         CollectionAssert.AreEqual(new[] { "1", "2" }, argExprs,
             "each same-line call must retain its own argument dataflow");
+    }
+
+    [TestMethod]
+    public async Task Reference_ResolvesExactBoundTfmProject_NotLowestId()
+    {
+        // Two projects produce the SAME assembly "Dep" with an identical Foo — a multi-targeted
+        // dependency whose two TFMs are both indexed. The consumer references ONLY the second one, so
+        // its usage of Foo binds to DepB's assembly. The extractor must resolve the target to DepB's
+        // exact project (compilation-scoped), NOT to the lowest-id catalog pick (DepA) that key-only
+        // resolution would choose. This is the multi-TFM regression the exact resolution closes.
+        const string depSource = "namespace Dep { public class Foo { } }";
+        const string consumerSource = "namespace App { public class Bar { public Dep.Foo F; } }";
+
+        var runtimeDir = System.Runtime.InteropServices.RuntimeEnvironment.GetRuntimeDirectory();
+        MetadataReference[] references =
+        [
+            MetadataReference.CreateFromFile(typeof(object).Assembly.Location),
+            MetadataReference.CreateFromFile(Path.Combine(runtimeDir, "System.Runtime.dll")),
+        ];
+        var options = new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary);
+
+        using var workspace = new AdhocWorkspace();
+        var depAId = ProjectId.CreateNewId();
+        var depBId = ProjectId.CreateNewId();
+        var consumerId = ProjectId.CreateNewId();
+
+        var solution = workspace.CurrentSolution
+            .AddProject(depAId, "Dep(net8)", "Dep", LanguageNames.CSharp)
+            .WithProjectCompilationOptions(depAId, options)
+            .WithProjectMetadataReferences(depAId, references)
+            .AddDocument(DocumentId.CreateNewId(depAId), "FooA.cs", depSource)
+            .AddProject(depBId, "Dep(net9)", "Dep", LanguageNames.CSharp)
+            .WithProjectCompilationOptions(depBId, options)
+            .WithProjectMetadataReferences(depBId, references)
+            .AddDocument(DocumentId.CreateNewId(depBId), "FooB.cs", depSource)
+            .AddProject(consumerId, "App", "App", LanguageNames.CSharp)
+            .WithProjectCompilationOptions(consumerId, options)
+            .WithProjectMetadataReferences(consumerId, references)
+            .AddProjectReference(consumerId, new ProjectReference(depBId))
+            .AddDocument(DocumentId.CreateNewId(consumerId), "Bar.cs", consumerSource);
+
+        // Numeric ids mirror the orchestrator's projectRoslynToId map. DepA is the LOWEST id, so if
+        // resolution were ambiguous it would wrongly pick DepA (1); the bound TFM is DepB (2).
+        var projMap = new Dictionary<ProjectId, long> { [depAId] = 1, [depBId] = 2, [consumerId] = 3 };
+        long? ResolveTargetProject(IAssemblySymbol assembly)
+            => solution.GetProject(assembly) is { } p && projMap.TryGetValue(p.Id, out var id) ? id : null;
+
+        var consumer = solution.GetProject(consumerId)!;
+        var compilation = await consumer.GetCompilationAsync();
+        var tree = compilation!.SyntaxTrees.First();
+        var model = compilation.GetSemanticModel(tree);
+        var root = await tree.GetRootAsync();
+        var text = await tree.GetTextAsync();
+
+        var sink = new DocumentContributionSet();
+        DocumentSemanticExtractor.ExtractDocument(root, model, "Bar.cs", text, sink, ResolveTargetProject);
+
+        var fooRef = sink.References.Single(r => r.TargetKey.Contains("Foo") && r.Kind == ReferenceKind.TypeRef);
+        Assert.AreEqual(2L, fooRef.TargetProjectId,
+            "the reference must resolve to the exact bound TFM (DepB=2), not the lowest-id project (DepA=1)");
+
+        // Full chain: exact resolution through the catalog returns DepB's row and counts no ambiguity,
+        // whereas key-only resolution from the consumer would have mis-picked DepA and flagged it.
+        var catalog = new SymbolCatalog();
+        catalog.Add(projectId: 1, fooRef.TargetKey, symbolId: 100);
+        catalog.Add(projectId: 2, fooRef.TargetKey, symbolId: 200);
+
+        Assert.IsTrue(catalog.TryResolveExact(fooRef.TargetKey, fooRef.TargetProjectId!.Value, out var exactRow));
+        Assert.AreEqual(200L, exactRow, "exact resolution binds DepB's row");
+        Assert.AreEqual(0, catalog.AmbiguousEdgeBindings);
+
+        Assert.IsTrue(catalog.TryResolveEdge(fooRef.TargetKey, preferProjectId: 3, out var ambiguousRow));
+        Assert.AreEqual(100L, ambiguousRow, "key-only resolution would have picked DepA (lowest id)");
+        Assert.AreEqual(1, catalog.AmbiguousEdgeBindings);
     }
 }
 

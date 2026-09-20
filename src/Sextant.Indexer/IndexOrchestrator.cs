@@ -239,6 +239,29 @@ public sealed class IndexOrchestrator
         {
             StartPhase("extracting_occurrences");
             _log?.Invoke("Extracting occurrences (document-oriented)...");
+
+            // Compilation-scoped exact resolution: map a bound occurrence target's containing assembly
+            // to its exact indexed (per-TFM) project id. This restores parity with the legacy
+            // declaration-anchored reference path — which bound each reference to the exact declared
+            // symbol — for keys that are ambiguous across projects (a multi-targeted dependency several
+            // of whose TFMs are indexed, or an extern-alias-duplicated assembly). Solution.GetProject
+            // maps a source assembly symbol back to its originating project; results are memoized since
+            // one assembly is the target of many occurrences. A null result (metadata / out-of-solution
+            // assembly, or a project outside the indexed map) leaves the contribution to fall back to
+            // key-only resolution in the persistence loops below.
+            var assemblyProjectCache = new Dictionary<IAssemblySymbol, long?>(SymbolEqualityComparer.Default);
+            long? ResolveTargetProject(IAssemblySymbol assembly)
+            {
+                if (assemblyProjectCache.TryGetValue(assembly, out var cached))
+                    return cached;
+                long? resolved = solution.GetProject(assembly) is { } targetProject
+                                 && projectRoslynToId.TryGetValue(targetProject.Id, out var targetPid)
+                    ? targetPid
+                    : null;
+                assemblyProjectCache[assembly] = resolved;
+                return resolved;
+            }
+
             projectIndex = 0;
             foreach (var project in solution.Projects)
             {
@@ -276,7 +299,7 @@ public sealed class IndexOrchestrator
                     var root = await syntaxTree.GetRootAsync(cancellationToken);
                     var text = await syntaxTree.GetTextAsync(cancellationToken);
                     DocumentSemanticExtractor.ExtractDocument(
-                        root, semanticModel, syntaxTree.FilePath, text, contributions);
+                        root, semanticModel, syntaxTree.FilePath, text, contributions, ResolveTargetProject);
                 }
 
                 foreach (var rel in contributions.Relationships)
@@ -297,7 +320,12 @@ public sealed class IndexOrchestrator
 
                 foreach (var reference in contributions.References)
                 {
-                    if (!catalog.TryResolveEdge(reference.TargetKey, ownerProjectId, out var targetId))
+                    // Prefer the exact per-TFM target row when the extractor resolved the target's real
+                    // owning project (compilation-scoped); fall back to key-only resolution (which
+                    // deterministically picks and counts an ambiguity) only for targets outside the
+                    // indexed set.
+                    if (!TryResolveTarget(catalog, reference.TargetKey, reference.TargetProjectId,
+                            ownerProjectId, out var targetId))
                         continue;
 
                     referenceStore.Insert(referenceInsert, new ReferenceInfo
@@ -315,8 +343,11 @@ public sealed class IndexOrchestrator
 
                 foreach (var call in contributions.Calls)
                 {
+                    // The caller is the enclosing member of this document, so it resolves exactly in the
+                    // owner project; the callee uses compilation-scoped exact resolution with key-only
+                    // fallback (parity with the legacy call path for in-solution unique targets).
                     if (!catalog.TryResolveEdge(call.CallerKey, ownerProjectId, out var callerId) ||
-                        !catalog.TryResolveEdge(call.CalleeKey, ownerProjectId, out var calleeId))
+                        !TryResolveTarget(catalog, call.CalleeKey, call.CalleeProjectId, ownerProjectId, out var calleeId))
                         continue;
 
                     var edgeId = callGraphStore.Insert(callGraphInsert, new CallGraphEdge
@@ -769,9 +800,10 @@ public sealed class IndexOrchestrator
 
         if (catalog.AmbiguousEdgeBindings > 0)
         {
-            _log?.Invoke($"  {catalog.AmbiguousEdgeBindings} cross-project edge(s) bound to a " +
-                         "deterministic pick due to a key defined in multiple projects; exact " +
-                         "per-project resolution deferred to the document-oriented extractor phase.");
+            _log?.Invoke($"  {catalog.AmbiguousEdgeBindings} edge(s) bound to a deterministic pick " +
+                         "due to a key defined in multiple projects. References and call callees use " +
+                         "compilation-scoped exact resolution, so these are residual key-only bindings: " +
+                         "relationship endpoints, or a target that mapped to no indexed project.");
         }
 
         _log?.Invoke("Indexing complete.");
@@ -848,6 +880,21 @@ public sealed class IndexOrchestrator
     {
         var hashBytes = SHA256.HashData(Encoding.UTF8.GetBytes(signature));
         return Convert.ToHexStringLower(hashBytes);
+    }
+
+    /// <summary>
+    /// Resolves an occurrence target (reference/call) to a stored symbol row. Prefers compilation-scoped
+    /// exact resolution when the document extractor supplied the target's exact owning project
+    /// (<paramref name="exactProjectId"/>) — restoring parity with the legacy declaration-anchored path
+    /// and never counting an ambiguity — and falls back to key-only resolution (<see cref="SymbolCatalog.TryResolveEdge"/>,
+    /// a deterministic pick that counts the ambiguity) for targets outside the indexed set.
+    /// </summary>
+    private static bool TryResolveTarget(SymbolCatalog catalog, string targetKey, long? exactProjectId,
+        long? ownerProjectId, out long symbolId)
+    {
+        if (exactProjectId is { } exact && catalog.TryResolveExact(targetKey, exact, out symbolId))
+            return true;
+        return catalog.TryResolveEdge(targetKey, ownerProjectId, out symbolId);
     }
 
     private static long? ResolveEnclosingSymbol(int line, string filePath, long projectId, SymbolStore symbolStore)

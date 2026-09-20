@@ -27,13 +27,14 @@ public sealed class SextantConfiguration
     public long JournalSizeLimitBytes { get; set; } = 64L * 1024 * 1024;
 
     /// <summary>
-    /// Feature flag for the Phase 5 document-oriented semantic extractor. When false (default) the
-    /// indexer uses the legacy declaration-driven extractor (whole-solution <c>FindReferencesAsync</c>
-    /// per declaration). When true it uses the single-pass, per-document usage-site extractor. Kept
-    /// off by default until parity with the legacy extractor is established. Overridable via
+    /// Feature flag for the document-oriented semantic extractor. When true (default) the indexer uses
+    /// the single-pass, per-document usage-site extractor with compilation-scoped exact target
+    /// resolution. When false it falls back to the legacy declaration-driven extractor (whole-solution
+    /// <c>FindReferencesAsync</c> per declaration), retained as an emergency fallback. Defaulted on now
+    /// that the new extractor is proven at parity with the legacy path. Overridable via
     /// <c>document_extractor</c> in <c>sextant.json</c> or the <c>SEXTANT_DOCUMENT_EXTRACTOR</c> env var.
     /// </summary>
-    public bool DocumentExtractor { get; set; } = false;
+    public bool DocumentExtractor { get; set; } = true;
 
     private static readonly Regex ValidProfileName = new(@"^[a-zA-Z0-9_-]+$", RegexOptions.Compiled);
 

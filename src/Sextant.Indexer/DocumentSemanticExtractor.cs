@@ -11,7 +11,10 @@ namespace Sextant.Indexer;
 /// A usage-site occurrence contribution: a reference from a using document to a target declaration.
 /// The target is identified by its stable declaration key (resolved to a stored symbol id later by
 /// the orchestrator via <see cref="SymbolCatalog"/>); <see cref="FilePath"/> and <see cref="Line"/>
-/// locate the usage in the owning (consumer) document.
+/// locate the usage in the owning (consumer) document. <see cref="TargetProjectId"/> carries the
+/// target's exact owning project (from the bound symbol's containing assembly) when it maps to an
+/// indexed project, so the orchestrator resolves the exact per-TFM row rather than a deterministic
+/// pick among same-key rows; it is null for targets outside the indexed set (key-only fallback).
 /// </summary>
 public sealed record ReferenceContribution(
     string TargetKey,
@@ -19,13 +22,16 @@ public sealed record ReferenceContribution(
     int Line,
     ReferenceKind Kind,
     AccessKind? Access,
-    string? Snippet);
+    string? Snippet,
+    long? TargetProjectId = null);
 
 /// <summary>
 /// A call-graph edge contributed at a usage site: an invocation inside <see cref="CallerKey"/>'s body
 /// that targets <see cref="CalleeKey"/>. Carries the already-extracted argument/return
 /// <see cref="Dataflow"/> (computed during the document walk) rather than the live invocation syntax
 /// or semantic model, so a project's per-document models are not pinned in memory until persistence.
+/// <see cref="CalleeProjectId"/> carries the callee's exact owning project (from its containing
+/// assembly) for compilation-scoped resolution, or null for a callee outside the indexed set.
 /// </summary>
 public sealed record CallContribution(
     string CallerKey,
@@ -33,7 +39,8 @@ public sealed record CallContribution(
     string CallSiteFile,
     int CallSiteLine,
     int CallSiteColumn,
-    DataflowResult Dataflow);
+    DataflowResult Dataflow,
+    long? CalleeProjectId = null);
 
 /// <summary>
 /// A type relationship contributed from a document (inherits/implements/overrides/returns/parameterOf
@@ -57,14 +64,17 @@ public sealed class DocumentContributionSet
     private readonly List<RelationshipContribution> _relationships = [];
 
     // Occurrence keys exclude the derived snippet text: two mentions with the same target/location/
-    // kind/access are the same occurrence and coalesce (the snippet is display data, not identity).
-    // For references the position is line-granular: two same-line occurrences of the same target with
-    // the same kind/access persist as byte-identical rows (no column is stored), so coalescing them
-    // discards no information — an intentional, information-preserving difference from the legacy
-    // per-occurrence path. Calls also carry per-occurrence dataflow, so their key includes the
-    // call-site column: two distinct same-line calls to the same callee (e.g. `F(a); F(b);`) are
-    // separate occurrences whose arguments differ and must not collapse.
-    private readonly HashSet<(string, string, int, ReferenceKind, AccessKind?)> _refKeys = [];
+    // kind/access/target-project are the same occurrence and coalesce (the snippet is display data,
+    // not identity). The key includes the resolved target project because compilation-scoped exact
+    // resolution can bind two same-line mentions of the *same declaration key* to different projects
+    // (a multi-TFM dependency, or an `extern alias`-duplicated assembly), which persist different
+    // `symbol_id` rows — so they are distinct occurrences and must not collapse. Two same-line
+    // occurrences that bind the *same* target row persist as byte-identical rows (no column is
+    // stored), so coalescing them discards no information — an intentional, information-preserving
+    // difference from the legacy per-occurrence path. Calls also carry per-occurrence dataflow, so
+    // their key includes the call-site column: two distinct same-line calls to the same callee (e.g.
+    // `F(a); F(b);`) are separate occurrences whose arguments differ and must not collapse.
+    private readonly HashSet<(string, string, int, ReferenceKind, AccessKind?, long?)> _refKeys = [];
     private readonly HashSet<(string, string, string, int, int)> _callKeys = [];
     private readonly HashSet<(string, string, RelationshipKind)> _relKeys = [];
 
@@ -80,7 +90,7 @@ public sealed class DocumentContributionSet
 
     public bool AddReference(ReferenceContribution r)
     {
-        if (!_refKeys.Add((r.TargetKey, r.FilePath, r.Line, r.Kind, r.Access)))
+        if (!_refKeys.Add((r.TargetKey, r.FilePath, r.Line, r.Kind, r.Access, r.TargetProjectId)))
             return false;
         _references.Add(r);
         return true;
@@ -133,13 +143,19 @@ public static class DocumentSemanticExtractor
     /// Walks one document once and appends its contributions to <paramref name="sink"/>. The caller
     /// supplies the cached <paramref name="root"/> + <paramref name="model"/> (one per document per run,
     /// acceptance criterion 2) and the document's <paramref name="text"/> for snippet extraction.
+    /// <paramref name="resolveTargetProject"/> maps a bound target's containing assembly to its exact
+    /// indexed project id (compilation-scoped resolution); pass null to skip it (the orchestrator then
+    /// falls back to key-only resolution, and unit tests that don't exercise cross-project identity omit
+    /// it). The delegate keeps the extractor database-free: it only maps a Roslyn assembly symbol the
+    /// orchestrator already knows how to resolve against the solution.
     /// </summary>
     public static void ExtractDocument(
         SyntaxNode root,
         SemanticModel model,
         string filePath,
         SourceText text,
-        DocumentContributionSet sink)
+        DocumentContributionSet sink,
+        Func<IAssemblySymbol, long?>? resolveTargetProject = null)
     {
         foreach (var node in root.DescendantNodes())
         {
@@ -151,11 +167,11 @@ public static class DocumentSemanticExtractor
                     break;
 
                 case SimpleNameSyntax name:
-                    EmitReference(name, model, filePath, text, sink);
+                    EmitReference(name, model, filePath, text, sink, resolveTargetProject);
                     break;
 
                 case InvocationExpressionSyntax invocation:
-                    EmitCall(invocation, model, filePath, sink);
+                    EmitCall(invocation, model, filePath, sink, resolveTargetProject);
                     break;
 
                 case ObjectCreationExpressionSyntax objectCreation:
@@ -168,11 +184,18 @@ public static class DocumentSemanticExtractor
                     // Target-typed `new()` has no type-name syntax, so emit both the ObjectCreation
                     // reference and the Instantiates relationship from the creation node itself.
                     EmitInstantiation(implicitCreation, model, sink);
-                    EmitImplicitCreationReference(implicitCreation, model, filePath, text, sink);
+                    EmitImplicitCreationReference(implicitCreation, model, filePath, text, sink, resolveTargetProject);
                     break;
             }
         }
     }
+
+    /// <summary>Maps a resolved target symbol to its exact indexed project id, or null when no resolver
+    /// is supplied or the symbol has no assembly that maps to an indexed project (key-only fallback).</summary>
+    private static long? ExactTargetProject(ISymbol target, Func<IAssemblySymbol, long?>? resolveTargetProject)
+        => resolveTargetProject != null && target.ContainingAssembly is { } assembly
+            ? resolveTargetProject(assembly)
+            : null;
 
     private static void EmitTypeRelationships(SyntaxNode declaration, SemanticModel model, DocumentContributionSet sink)
     {
@@ -190,7 +213,8 @@ public static class DocumentSemanticExtractor
         SemanticModel model,
         string filePath,
         SourceText text,
-        DocumentContributionSet sink)
+        DocumentContributionSet sink,
+        Func<IAssemblySymbol, long?>? resolveTargetProject)
     {
         // Only a symbol Roslyn resolved unambiguously (info.Symbol) becomes a stored occurrence.
         // Candidate symbols arise from ambiguous/overload-error binds in temporarily-uncompilable
@@ -238,14 +262,16 @@ public static class DocumentSemanticExtractor
             line,
             kind,
             access,
-            Snippet(text, name.Span)));
+            Snippet(text, name.Span),
+            ExactTargetProject(target, resolveTargetProject)));
     }
 
     private static void EmitCall(
         InvocationExpressionSyntax invocation,
         SemanticModel model,
         string filePath,
-        DocumentContributionSet sink)
+        DocumentContributionSet sink,
+        Func<IAssemblySymbol, long?>? resolveTargetProject)
     {
         var callee = (model.GetOperation(invocation) as IInvocationOperation)?.TargetMethod
                      ?? model.GetSymbolInfo(invocation).Symbol as IMethodSymbol;
@@ -275,7 +301,8 @@ public static class DocumentSemanticExtractor
             filePath,
             line,
             startPos.Character,
-            dataflow));
+            dataflow,
+            ExactTargetProject(canonicalCallee, resolveTargetProject)));
     }
 
     private static void EmitInstantiation(SyntaxNode creationNode, SemanticModel model, DocumentContributionSet sink)
@@ -304,7 +331,8 @@ public static class DocumentSemanticExtractor
         SemanticModel model,
         string filePath,
         SourceText text,
-        DocumentContributionSet sink)
+        DocumentContributionSet sink,
+        Func<IAssemblySymbol, long?>? resolveTargetProject)
     {
         var createdType = (model.GetOperation(creation) as IObjectCreationOperation)?.Constructor?.ContainingType
                           ?? (model.GetSymbolInfo(creation).Symbol as IMethodSymbol)?.ContainingType;
@@ -322,7 +350,8 @@ public static class DocumentSemanticExtractor
             line,
             ReferenceKind.ObjectCreation,
             null,
-            Snippet(text, creation.Span)));
+            Snippet(text, creation.Span),
+            ExactTargetProject(createdType, resolveTargetProject)));
     }
 
     /// <summary>
