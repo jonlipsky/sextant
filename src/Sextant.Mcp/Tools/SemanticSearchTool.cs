@@ -24,7 +24,7 @@ public static class SemanticSearchTool
             return unavailable;
 
         var conn = db.GetConnection();
-        var symbolStore = new SymbolStore(conn);
+        var symbolStore = new SymbolStore(conn) { Scope = SnapshotReadScope.ForSelected(conn) };
         var projectStore = new ProjectStore(conn);
         var config = SextantConfiguration.FromEnvironment();
         var canonicalIdCache = FindSymbolTool.BuildCanonicalIdCache(projectStore);

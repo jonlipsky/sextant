@@ -30,8 +30,9 @@ public static class FindCommentsTool
             return unavailable;
 
         var conn = db.GetConnection();
-        var commentStore = new CommentStore(conn);
-        var symbolStore = new SymbolStore(conn);
+        var snapshotScope = SnapshotReadScope.ForSelected(conn);
+        var commentStore = new CommentStore(conn) { Scope = snapshotScope };
+        var symbolStore = new SymbolStore(conn) { Scope = snapshotScope };
         var projectStore = new ProjectStore(conn);
 
         long? projectDbId = null;

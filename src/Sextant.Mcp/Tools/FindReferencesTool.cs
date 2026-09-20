@@ -23,8 +23,9 @@ public static class FindReferencesTool
             return ResponseBuilder.BuildEmpty(notReady);
 
         var conn = db.GetConnection();
-        var symbolStore = new SymbolStore(conn);
-        var referenceStore = new ReferenceStore(conn);
+        var snapshotScope = SnapshotReadScope.ForSelected(conn);
+        var symbolStore = new SymbolStore(conn) { Scope = snapshotScope };
+        var referenceStore = new ReferenceStore(conn) { Scope = snapshotScope };
         var projectStore = new ProjectStore(conn);
         var contextRetriever = new SourceContextRetriever(new FileStore(conn));
 

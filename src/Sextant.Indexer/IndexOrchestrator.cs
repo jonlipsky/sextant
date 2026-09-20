@@ -44,7 +44,9 @@ public sealed class IndexOrchestrator
         IProgress<IndexingProgress>? progress = null,
         IndexingMetrics? metrics = null,
         CancellationToken cancellationToken = default,
-        IReadOnlySet<string>? projectCanonicalFilter = null)
+        IReadOnlySet<string>? projectCanonicalFilter = null,
+        SnapshotContext? snapshotContext = null,
+        bool enableSnapshots = true)
     {
         var totalStopwatch = Stopwatch.StartNew();
         var phaseStopwatch = new Stopwatch();
@@ -176,6 +178,72 @@ public sealed class IndexOrchestrator
             }
         }
 
+        // Phase 9 snapshot coordination. Resolve the repository/commit coordinates (git, or injected for
+        // tests); when none can be resolved this stays the pre-Phase-9 mutable-row path (legacy DB, or a
+        // no-git temp workspace), so existing behavior and the temp-dir test suite are unchanged.
+        // enableSnapshots is a caller override: a multi-solution repo shares ONE snapshot identity across
+        // its solutions (commit+tree+schema+analyzer+config+toolchain — no solution component), so the
+        // daemon disables snapshots there to avoid solution 2+ idempotently attaching to solution 1's
+        // snapshot and silently skipping its own indexing. An explicitly injected snapshotContext always
+        // wins (tests), so this only gates the auto-resolved git path.
+        var isFullIndex = projectCanonicalFilter == null;
+        var effectiveCtx = snapshotContext ?? (enableSnapshots ? TryResolveSnapshotContext(repoRoot) : null);
+        SnapshotStore? snapshotStore = null;
+        long? repositoryId = null;
+        long? commitId = null;
+        long? activeSnapshotId = null;
+        if (effectiveCtx != null)
+        {
+            snapshotStore = new SnapshotStore(conn);
+            repositoryId = snapshotStore.EnsureRepository(effectiveCtx.RepositoryRemoteUrl, now);
+            commitId = snapshotStore.EnsureCommit(repositoryId.Value, effectiveCtx.CommitSha, effectiveCtx.TreeSha, now);
+
+            if (isFullIndex)
+            {
+                var identity = new SnapshotIdentity
+                {
+                    RepositoryRemoteUrl = effectiveCtx.RepositoryRemoteUrl,
+                    CommitSha = effectiveCtx.CommitSha,
+                    TreeSha = effectiveCtx.TreeSha,
+                    SchemaVersion = IndexDatabase.LatestSchemaVersion,
+                    AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
+                    ConfigHash = _profile.ConfigurationHash,
+                    ToolchainFingerprint = ToolchainFingerprint.Current
+                };
+                var (snapId, existed, status) = snapshotStore.BeginPending(
+                    identity, repositoryId.Value, commitId, runScope.RunId, now);
+                if (existed && (status == SnapshotStatus.Complete || status == SnapshotStatus.Superseded))
+                {
+                    // A snapshot for this exact identity (commit + tree + schema + analyzer + config +
+                    // toolchain) already holds valid, immutable data. NEVER rebuild it: for a Complete one
+                    // this is the idempotent duplicate-publish case (criterion 3); for a Superseded one this
+                    // is a branch rollback / re-checkout of an older commit (criterion 2), where rebuilding
+                    // would both mutate an immutable snapshot AND fail the guarded pending→complete publish.
+                    // Instead re-select it — (re)point the branch at it and restore Complete status — inside
+                    // this still-open write transaction, commit, and abandon the (empty) staging run on
+                    // dispose so the reused snapshot keeps its original generation.
+                    SelectExistingSnapshot(snapshotStore, repositoryId.Value, effectiveCtx, snapId, now);
+                    session.Complete();
+                    _log?.Invoke($"Snapshot {snapId} for commit {effectiveCtx.CommitSha} already indexed; " +
+                                 $"re-selected for branch '{effectiveCtx.BranchName}' without rebuild (idempotent).");
+                    return;
+                }
+                activeSnapshotId = snapId;
+                // A retried snapshot that exists but is NOT complete/superseded (a prior Partial or Failed
+                // generation for this exact identity, or a Pending one abandoned by a crash) is about to be
+                // rebuilt from scratch below. Reset it to pending so the guarded pending→complete publish
+                // succeeds instead of tripping the "was not pending at publish" guard.
+                if (existed && status != SnapshotStatus.Pending)
+                    snapshotStore.MarkStatus(snapId, SnapshotStatus.Pending);
+            }
+            else
+            {
+                // Incremental: mutate the selected working-head snapshot in place. Its own project rows
+                // are the only ones touched, so every other snapshot stays byte-identical (criterion C).
+                activeSnapshotId = snapshotStore.GetSelectedSnapshotId();
+            }
+        }
+
         // Phase 1: Register all projects (using submodule remote URL when applicable)
         var projectList = solution.Projects.ToList();
         var totalProjects = projectList.Count;
@@ -198,7 +266,21 @@ public sealed class IndexOrchestrator
 
             var identity = ProjectIdentityFactory.Create(project, submodules, repoRoot);
 
-            var projectId = projectStore.Insert(identity, now);
+            long projectId;
+            if (activeSnapshotId is long snapId && snapshotStore != null && repositoryId is long repoId)
+            {
+                // Snapshot-tagged project version: a fresh (per-snapshot) row keyed by the commit-invariant
+                // logical identity, so distinct commits' versions coexist without overwriting (criterion 1)
+                // and the branch pointer stays out of the row key (criterion 2).
+                var logicalId = snapshotStore.EnsureLogicalProject(
+                    repoId, identity.CanonicalId, identity.RepoRelativePath, identity.TargetFramework, now);
+                projectId = projectStore.UpsertSnapshotProject(identity, snapId, logicalId, now);
+                snapshotStore.MapProject(snapId, projectId);
+            }
+            else
+            {
+                projectId = projectStore.Insert(identity, now);
+            }
             projectRoslynToId[project.Id] = projectId;
             if (projectCanonicalFilter == null || projectCanonicalFilter.Contains(identity.CanonicalId))
                 processSet.Add(project.Id);
@@ -218,6 +300,11 @@ public sealed class IndexOrchestrator
         StartPhase("extracting_symbols");
         _log?.Invoke("Extracting symbols...");
         projectIndex = 0;
+        // Completeness gate (criterion 3): count processed projects whose Roslyn compilation could not be
+        // produced (missing SDK/reference, broken evaluation). Such a project silently contributes zero
+        // rows; publishing that as a complete branch head would serve an incomplete API surface. A full
+        // index that hits any such failure is marked partial (diagnosable) and NOT selected below.
+        var compilationFailures = 0;
         foreach (var project in solution.Projects)
         {
             if (project.FilePath == null || !projectRoslynToId.TryGetValue(project.Id, out var projectId)
@@ -247,8 +334,13 @@ public sealed class IndexOrchestrator
             symbolStore.DeleteByProject(projectId);
             fileStore.DeleteByProject(projectId);
 
-            var symbols = await SymbolExtractor.ExtractFromProjectAsync(
+            var (symbols, compilationAvailable) = await SymbolExtractor.ExtractFromProjectWithStatusAsync(
                 project, projectId, includeDocComments: _profile.Has(IndexFeature.DocumentationSearch));
+            if (!compilationAvailable)
+            {
+                compilationFailures++;
+                _log?.Invoke($"    WARNING: {project.Name} produced no compilation; generation will be marked partial.");
+            }
             foreach (var symbol in symbols)
             {
                 var id = symbolStore.Insert(symbolInsert, symbol);
@@ -864,9 +956,61 @@ public sealed class IndexOrchestrator
         // publishes no row (e.g. recovery abandoned this run under an unsupported second writer), abort
         // before committing so disposal rolls back the final batch and leaves the ledger consistent.
         var completedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        // Completeness gate (criterion 3): if any processed project failed to produce a compilation, this
+        // full-index generation is incomplete. Persist it as a diagnosable PARTIAL snapshot but do NOT
+        // publish the run pointer or advance the branch — the previous complete generation stays selected
+        // and readable, so a failed/partial snapshot is never served as a branch head. The (unpublished)
+        // staging run is abandoned on dispose; a later re-index of the same commit resets the snapshot to
+        // pending and retries. Only the snapshot path gates here; the legacy mutable-row path is unchanged.
+        if (isFullIndex && compilationFailures > 0 && activeSnapshotId is long partialId && snapshotStore != null)
+        {
+            snapshotStore.MarkStatus(partialId, SnapshotStatus.Partial);
+            session.Complete();
+            if (metrics != null)
+            {
+                totalStopwatch.Stop();
+                metrics.TotalDurationMs = totalStopwatch.ElapsedMilliseconds;
+                metrics.Status = IndexRunStatus.Failed;
+            }
+            _log?.Invoke($"Index produced a PARTIAL snapshot: {compilationFailures} project(s) failed to compile. " +
+                         "It is retained for diagnosis but was NOT selected; the previous complete generation " +
+                         "remains the current head (criterion 3).");
+            progress?.Report(new IndexingProgress
+            {
+                Phase = "partial",
+                Description = "Index incomplete — partial snapshot not selected",
+                ProjectIndex = totalProjects,
+                ProjectCount = totalProjects
+            });
+            return;
+        }
+
         if (runStore.MarkComplete(runScope.RunId, completedAt, projectRoslynToId.Count) != 1)
             throw new InvalidOperationException(
                 $"Index run {runScope.RunId} was not in staging state at publish; aborting to avoid a false completion.");
+
+        // Publish + select the snapshot in the SAME transaction as the data and the run pointer (full
+        // index only; incremental mutates the working head in place). The branch pointer is advanced to
+        // the snapshot ONLY after its status flips to complete, and both happen inside this still-open
+        // write transaction, so a concurrent reader resolving the default branch sees exactly one
+        // complete, selected snapshot — the previous one until this commit lands, then this one — never a
+        // half-built pending generation and never a torn mix (criterion 7 / whole-generation isolation).
+        if (isFullIndex && activeSnapshotId is long publishId && snapshotStore != null && repositoryId is long publishRepoId
+            && effectiveCtx != null)
+        {
+            if (snapshotStore.MarkComplete(publishId, completedAt) != 1)
+                throw new InvalidOperationException(
+                    $"Snapshot {publishId} was not pending at publish; aborting to avoid a false completion.");
+
+            AdvanceBranchToSnapshot(snapshotStore, publishRepoId, effectiveCtx, publishId, completedAt);
+
+            // Reclaim the now-superseded pre-Phase-9 mutable rows (snapshot_id IS NULL) so the database
+            // returns to ~1x, first re-pointing their historical api-surface snapshots onto the new
+            // snapshot's project rows so those comparisons survive the sweep (criterion 5 + Condition E).
+            ReconcileLegacyRows(conn, publishId);
+        }
+
         session.Complete();
         runScope.Detach();
 
@@ -968,6 +1112,133 @@ public sealed class IndexOrchestrator
             return process.ExitCode == 0 ? output : null;
         }
         catch { return null; }
+    }
+
+    private static string? RunGit(string repoRoot, string args)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo("git", args)
+            {
+                WorkingDirectory = repoRoot,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using var process = Process.Start(psi);
+            if (process == null) return null;
+            var output = process.StandardOutput.ReadToEnd().Trim();
+            process.WaitForExit();
+            return process.ExitCode == 0 && output.Length > 0 ? output : null;
+        }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// Resolves the repository/commit coordinates for the indexed working tree from git. Returns null
+    /// when there is no git root or no HEAD commit (a legacy/no-git workspace), which keeps the
+    /// orchestrator on the pre-Phase-9 mutable-row path.
+    /// </summary>
+    /// <summary>
+    /// Advances a branch pointer to a just-published snapshot inside the caller's write transaction. The
+    /// just-indexed branch is the working head, so when it is the default it becomes the SOLE default
+    /// (demoting any sibling a prior full index left marked default; otherwise two is_default=1 rows would
+    /// coexist and a scope-less query would resolve the older branch — criterion 6). Whatever the branch
+    /// previously pointed at is superseded (never mutated — criterion 2), leaving exactly one complete,
+    /// selected snapshot for the branch.
+    /// </summary>
+    private static void AdvanceBranchToSnapshot(
+        SnapshotStore snapshotStore, long repositoryId, SnapshotContext ctx, long snapshotId, long completedAt)
+    {
+        var branchId = snapshotStore.EnsureBranch(repositoryId, ctx.BranchName, ctx.IsDefaultBranch, completedAt);
+        if (ctx.IsDefaultBranch)
+            snapshotStore.PromoteSoleDefaultBranch(repositoryId, branchId);
+        var previousSnapshot = snapshotStore.GetBranchSnapshotId(branchId);
+        snapshotStore.SetBranchPointer(branchId, snapshotId, completedAt);
+        if (previousSnapshot is long prev && prev != snapshotId)
+            snapshotStore.MarkStatus(prev, SnapshotStatus.Superseded);
+    }
+
+    /// <summary>
+    /// Re-selects an existing, already-built immutable snapshot for a branch without rebuilding it — the
+    /// idempotent duplicate-publish path (a Complete snapshot) and the branch-rollback / older-commit
+    /// re-checkout path (a Superseded snapshot). Restores the snapshot to Complete (un-supersedes it) and
+    /// (re)points the branch at it via <see cref="AdvanceBranchToSnapshot"/>. Never touches the snapshot's
+    /// data rows, so the immutable snapshot stays byte-identical (criteria 1 &amp; 2).
+    /// </summary>
+    private static void SelectExistingSnapshot(
+        SnapshotStore snapshotStore, long repositoryId, SnapshotContext ctx, long snapshotId, long completedAt)
+    {
+        snapshotStore.MarkStatus(snapshotId, SnapshotStatus.Complete);
+        AdvanceBranchToSnapshot(snapshotStore, repositoryId, ctx, snapshotId, completedAt);
+    }
+
+    private static SnapshotContext? TryResolveSnapshotContext(string? repoRoot)
+    {
+        if (repoRoot == null) return null;
+        var commit = GetHeadCommit(repoRoot);
+        if (commit == null) return null;
+
+        var rawRemote = GitRemoteResolver.ReadOriginRemote(repoRoot);
+        var remote = rawRemote != null
+            ? GitRemoteNormalizer.Normalize(rawRemote)
+            : $"local://{Environment.MachineName}";
+        var branch = RunGit(repoRoot, "rev-parse --abbrev-ref HEAD");
+        if (string.IsNullOrEmpty(branch) || branch == "HEAD")
+            branch = "HEAD"; // detached: a stable pointer name for the current checkout.
+
+        return new SnapshotContext
+        {
+            RepositoryRemoteUrl = remote,
+            CommitSha = commit,
+            TreeSha = RunGit(repoRoot, "rev-parse HEAD^{tree}"),
+            BranchName = branch,
+            IsDefaultBranch = true
+        };
+    }
+
+    /// <summary>
+    /// One-time transition maintenance run inside the first snapshot's publish transaction: the
+    /// pre-Phase-9 mutable rows (<c>snapshot_id IS NULL</c>) are now superseded by immutable snapshot
+    /// rows, so reclaim them to keep the database at ~1x (Condition E). Their historical
+    /// <c>api_surface_snapshots</c> are first re-pointed onto the newly-published snapshot's project rows
+    /// (matched by logical canonical id) so API/semantic history survives the sweep (criterion 5); a
+    /// legacy row still referenced by an un-re-pointable api snapshot is intentionally left in place
+    /// rather than cascade-deleting that history. Idempotent: a no-op once no legacy rows remain.
+    /// </summary>
+    private static void ReconcileLegacyRows(SqliteConnection conn, long publishedSnapshotId)
+    {
+        using (var repoint = conn.CreateCommand())
+        {
+            repoint.CommandText = """
+                UPDATE api_surface_snapshots
+                   SET project_id = (
+                       SELECT np.id FROM projects np
+                       JOIN logical_projects lp ON lp.id = np.logical_project_id
+                       WHERE np.snapshot_id = @snap
+                         AND lp.canonical_id = (SELECT lg.canonical_id FROM projects lg
+                                                 WHERE lg.id = api_surface_snapshots.project_id)
+                       LIMIT 1)
+                 WHERE project_id IN (SELECT id FROM projects WHERE snapshot_id IS NULL)
+                   AND EXISTS (
+                       SELECT 1 FROM projects np
+                       JOIN logical_projects lp ON lp.id = np.logical_project_id
+                       WHERE np.snapshot_id = @snap
+                         AND lp.canonical_id = (SELECT lg.canonical_id FROM projects lg
+                                                 WHERE lg.id = api_surface_snapshots.project_id));
+                """;
+            repoint.Parameters.AddWithValue("@snap", publishedSnapshotId);
+            repoint.ExecuteNonQuery();
+        }
+
+        using var sweep = conn.CreateCommand();
+        sweep.CommandText = """
+            DELETE FROM projects
+             WHERE snapshot_id IS NULL
+               AND id NOT IN (SELECT project_id FROM api_surface_snapshots);
+            """;
+        sweep.ExecuteNonQuery();
     }
 
     private static string ComputeSignatureHash(string signature)

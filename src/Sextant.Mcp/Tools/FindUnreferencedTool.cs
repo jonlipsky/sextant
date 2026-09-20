@@ -21,7 +21,7 @@ public static class FindUnreferencedTool
 
         var conn = db.GetConnection();
         var projectStore = new ProjectStore(conn);
-        var symbolStore = new SymbolStore(conn);
+        var symbolStore = new SymbolStore(conn) { Scope = SnapshotReadScope.ForSelected(conn) };
 
         // Resolve project canonical ID to DB ID if provided
         long? projectDbId = null;
