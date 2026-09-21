@@ -16,11 +16,17 @@ namespace Sextant.Service.Contributions;
 /// checkout located through the same repo-url → directory mapping the indexing worker uses
 /// (<see cref="ServicePaths.RepoDirectoryName"/>), so the two never disagree about where a repo lives.
 ///
-/// HASH-DOMAIN RECONCILIATION (#68 point 2): a manifest fingerprint records EITHER the git blob OID
+/// HASH-DOMAIN RECONCILIATION (#68 point 2 / #13): a manifest fingerprint records EITHER the git blob OID
 /// (<c>file_versions.git_blob_hash</c>) OR — the common case today — the raw SHA-256 of the file content
-/// (<c>file_versions.content_hash</c>). This provider reads the blob's CONTENT at the commit and matches the
-/// declared hash against BOTH the raw SHA-256 of that content and the git blob OID, so verification is
-/// correct regardless of which domain the payload carried and no client change is required.
+/// (<c>file_versions.content_hash</c>). Sextant computes <c>content_hash</c> over the bytes it reads off
+/// disk with NO normalization (<see cref="Sextant.Store.FileStore.ComputeContentHash"/>), i.e. the
+/// WORKING-TREE representation, so under <c>core.autocrlf</c> or a <c>.gitattributes</c> eol/filter those
+/// bytes differ from git's canonical stored blob. This provider therefore accepts a declared hash that
+/// matches ANY of the real repository's representations at the exact commit: the git blob OID
+/// (<c>rev-parse</c>, filter-independent), the raw SHA-256 of the canonical blob (<c>cat-file blob</c>),
+/// or the raw SHA-256 of the smudged working-tree content (<c>cat-file --filters</c>) — so an honest
+/// contribution is never false-rejected merely because a filter was in effect, while a genuinely tampered
+/// blob (matching none of them) is still rejected. No client change is required.
 /// </summary>
 public sealed class GitCliContentProvider : IGitContentProvider
 {
@@ -87,21 +93,33 @@ public sealed class GitCliContentProvider : IGitContentProvider
         var gitPath = repoRelativePath.Replace('\\', '/');
         var spec = $"{commitSha}:{gitPath}";
 
-        // Read the blob CONTENT at the commit. A path absent at the commit means the declared file is not
-        // part of the repository at that commit — an untrusted extra input — so it is a Mismatch, not
-        // Unavailable (the commit WAS resolvable, the content simply is not there).
-        if (!TryRunBytes(checkoutDir, out var content, "cat-file", "blob", "--end-of-options", spec))
+        // Read the canonical blob CONTENT at the commit (git's stored bytes). A path absent at the commit
+        // means the declared file is not part of the repository at that commit — an untrusted extra input —
+        // so it is a Mismatch, not Unavailable (the commit WAS resolvable, the content simply is not there).
+        if (!TryRunBytes(checkoutDir, out var canonical, "cat-file", "blob", "--end-of-options", spec))
             return GitContentCheck.Mismatch;
 
         var expected = expectedBlobHash.Trim();
 
-        var rawSha256 = Convert.ToHexStringLower(SHA256.HashData(content));
-        if (HashEquals(expected, rawSha256))
+        // Domain A — raw SHA-256 of the canonical blob bytes (a payload that hashed git's stored content).
+        if (HashEquals(expected, Convert.ToHexStringLower(SHA256.HashData(canonical))))
             return GitContentCheck.Match;
 
-        // Fall back to the git blob OID domain (populated when the payload recorded git_blob_hash).
+        // Domain B — the git blob OID (populated when the payload recorded git_blob_hash). Canonical and
+        // filter/autocrlf-independent, so it is the robust cross-environment identity.
         if (TryRun(checkoutDir, out var oid, out _, "rev-parse", "--verify", "--end-of-options", spec)
             && HashEquals(expected, oid.Trim()))
+            return GitContentCheck.Match;
+
+        // Domain C — raw SHA-256 of the WORKING-TREE bytes. Sextant's content_hash is SHA-256 of the bytes
+        // it reads off disk with NO normalization, so under core.autocrlf / a .gitattributes eol|filter the
+        // working-tree bytes differ from the canonical blob (domain A) and an HONEST content_hash
+        // contribution would be false-rejected (#13). Read the smudged (working-tree) representation with
+        // `cat-file --filters` and match that too. Only consulted when A/B miss AND a filter actually
+        // changed the bytes (otherwise the working tree equals the canonical blob, already covered by A).
+        if (TryRunBytes(checkoutDir, out var worktree, "cat-file", "--filters", "--end-of-options", spec)
+            && !worktree.AsSpan().SequenceEqual(canonical)
+            && HashEquals(expected, Convert.ToHexStringLower(SHA256.HashData(worktree))))
             return GitContentCheck.Match;
 
         return GitContentCheck.Mismatch;

@@ -123,6 +123,42 @@ public class GitCliContentProviderTests
                 $"non-hex commit '{evil}' must be rejected before any git call");
     }
 
+    [TestMethod]
+    public void VerifyBlob_ContentHashOverWorkingTreeBytes_VerifiesUnderEolFilter()
+    {
+        // #13: Sextant's content_hash is SHA-256 of the bytes it reads off DISK with no normalization (the
+        // working-tree representation). Under an eol filter (here a checked-in `.gitattributes eol=crlf`,
+        // deterministically standing in for core.autocrlf) the working tree is CRLF while the canonical
+        // blob stays LF, so a raw-SHA-256 over the canonical blob would FALSE-REJECT an honest
+        // contribution. The provider must also match the smudged (`cat-file --filters`) representation.
+        File.WriteAllBytes(Path.Combine(_repoDir, ".gitattributes"), "*.cs text eol=crlf\n"u8.ToArray());
+        Git("add", "-A");
+        Git("commit", "-q", "-m", "attrs");
+
+        var lf = "class W { }\nns X { }\n"u8.ToArray();          // canonical blob (LF)
+        var commit = CommitFile("src/Widget.cs", lf);
+        var crlf = "class W { }\r\nns X { }\r\n"u8.ToArray();     // working-tree representation (CRLF)
+
+        var canonicalHash = Convert.ToHexStringLower(SHA256.HashData(lf));
+        var worktreeHash = Convert.ToHexStringLower(SHA256.HashData(crlf));
+        Assert.AreNotEqual(canonicalHash, worktreeHash,
+            "precondition: the eol filter really diverges the canonical blob and working-tree representations");
+
+        var provider = new GitCliContentProvider(_ => _repoDir);
+
+        Assert.AreEqual(GitContentCheck.Match,
+            provider.VerifyBlob("https://example/repo", commit, "src/Widget.cs", worktreeHash),
+            "an honest content_hash over the smudged working-tree bytes must verify under an eol filter (#13)");
+        Assert.AreEqual(GitContentCheck.Match,
+            provider.VerifyBlob("https://example/repo", commit, "src/Widget.cs", canonicalHash),
+            "the canonical-blob domain must still verify (base case not regressed)");
+
+        var tampered = Convert.ToHexStringLower(SHA256.HashData("class W { }\r\nEVIL\r\n"u8.ToArray()));
+        Assert.AreEqual(GitContentCheck.Mismatch,
+            provider.VerifyBlob("https://example/repo", commit, "src/Widget.cs", tampered),
+            "a hash matching NEITHER representation is still a Mismatch");
+    }
+
     private string CommitFile(string repoRelativePath, byte[] content)
     {
         var full = Path.Combine(_repoDir, repoRelativePath.Replace('/', Path.DirectorySeparatorChar));
