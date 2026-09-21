@@ -564,12 +564,28 @@ public sealed class SnapshotService : IDisposable
         }
 
         // Publish is guarded on status = pending inside MarkComplete; a zero-row result means the snapshot was
-        // NOT pending at publish time (concurrent completion / immutability). Never advance the branch or mark
-        // the job complete against a snapshot we did not ourselves transition to complete.
+        // NOT pending at publish time. That is only safe to report Complete when the snapshot is ALREADY
+        // complete (a concurrent finalize won the pending→complete race / immutability). "Not pending" also
+        // covers PARTIAL (an earlier topology/contribution gate marked it) and other non-complete states —
+        // reporting Complete for a partial snapshot would silently publish a materially-incomplete assembly,
+        // so we re-read the real status and never claim Complete for a snapshot we did not complete
+        // (criterion 3). Never advance the branch against a snapshot we did not transition to complete.
         if (snapshots.MarkComplete(snapshotId, now) != 1)
         {
-            jobs.MarkResult(job.Id, SnapshotJobStatus.Complete, snapshotId);
-            return Accepted(ContributionIngestStatus.Complete, job.Id, snapshotId, contentHash, identityHash);
+            // Not pending at publish time. A COMPLETE or SUPERSEDED snapshot is fully-published immutable
+            // data — safe to report Complete (a concurrent finalize won the pending→complete race, or a
+            // branch has since moved past it). But "not pending" ALSO covers PARTIAL (an earlier
+            // topology/contribution gate marked it): reporting Complete for a partial snapshot would
+            // silently publish a materially-incomplete assembly, so we re-read the real status and report
+            // the true terminal state, never claiming Complete for a snapshot we did not complete
+            // (criterion 3).
+            if (snapshots.GetById(snapshotId) is { Status: SnapshotStatus.Complete or SnapshotStatus.Superseded })
+            {
+                jobs.MarkResult(job.Id, SnapshotJobStatus.Complete, snapshotId);
+                return Accepted(ContributionIngestStatus.Complete, job.Id, snapshotId, contentHash, identityHash);
+            }
+            jobs.MarkResult(job.Id, SnapshotJobStatus.Partial, snapshotId, "assembly not complete at finalize");
+            return Accepted(ContributionIngestStatus.Assembling, job.Id, snapshotId, contentHash, identityHash);
         }
         if (!string.IsNullOrWhiteSpace(request.BranchName))
             AdvanceBranch(snapshots, repoId, request.BranchName, request.IsDefaultBranch, snapshotId, now);
@@ -738,13 +754,27 @@ public sealed class SnapshotService : IDisposable
             if (snapshots.GetRepositoryId(repositoryRemoteUrl) is not long repoId)
                 return false;
 
-            var resolvedSnapshotId = snapshotId
-                ?? snapshots.ResolveCompleteSnapshotByCommit(repoId, headCommitSha);
-            if (resolvedSnapshotId is null)
+            long? resolved;
+            if (snapshotId is long supplied)
+            {
+                // A caller-supplied id must be a COMPLETE snapshot that belongs to THIS repository and was
+                // indexed at the PR head commit — otherwise the "protection" would pin the wrong (or a
+                // partial) snapshot while the real open-PR head goes unprotected. Validate, else fail closed.
+                if (snapshots.GetById(supplied) is not { Status: SnapshotStatus.Complete } row
+                    || row.RepositoryId != repoId
+                    || snapshots.GetCommitSha(row.CommitId) != headCommitSha)
+                    return false;
+                resolved = supplied;
+            }
+            else
+            {
+                resolved = snapshots.ResolveCompleteSnapshotByCommit(repoId, headCommitSha);
+            }
+            if (resolved is null)
                 return false;
 
             var prStore = new PullRequestSnapshotStore(_conn);
-            prStore.Register(repoId, prNumber, resolvedSnapshotId, headCommitSha,
+            prStore.Register(repoId, prNumber, resolved, headCommitSha,
                 DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
             return true;
         });

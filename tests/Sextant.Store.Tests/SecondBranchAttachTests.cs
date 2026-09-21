@@ -71,6 +71,25 @@ public class SecondBranchAttachTests
         Assert.AreEqual(main, _snapshots.GetDefaultBranchId(_repo), "attach never demotes an existing default branch (#62)");
     }
 
+    [TestMethod]
+    public void LateAttachForOlderSnapshot_NeverRollsBackAnAdvancedBranch()
+    {
+        var run = CompleteRun();
+        var older = Snapshot(run, "commit-A");
+        var newer = Snapshot(run, "commit-B");
+
+        // 'main' has already advanced to the newer snapshot B.
+        var main = _snapshots.EnsureBranch(_repo, "main", isDefault: true, _now);
+        _snapshots.SetBranchPointer(main, newer, _now);
+
+        // A delayed/duplicate ensure for the OLDER identity A takes the terminal-attach path and attaches
+        // its branch pointer for 'main'. It must NOT roll 'main' back off B (criterion 4 / #62).
+        _snapshots.AttachBranchPointer(_repo, "main", older, _now + 1);
+
+        Assert.AreEqual(newer, BranchSnapshot(main),
+            "a late attach for an older snapshot never supersedes a branch's newer target (#62)");
+    }
+
     private long CompleteRun()
     {
         var runStore = new IndexRunStore(_conn);

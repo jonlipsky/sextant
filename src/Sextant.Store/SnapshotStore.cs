@@ -384,8 +384,10 @@ public sealed class SnapshotStore(SqliteConnection connection)
     /// branch that merely ATTACHES (no re-index) would otherwise have no pointer — so it neither resolves
     /// via <c>ResolveBranch</c> nor protects the snapshot from retention. This inserts the branch as
     /// NON-default when absent (<c>ON CONFLICT DO NOTHING</c> preserves any existing <c>is_default</c> and
-    /// never demotes the real default) and points it at the snapshot only when it has no pointer yet or
-    /// points elsewhere — it never supersedes another branch's target. Returns the branch id.
+    /// never demotes the real default) and points it at the snapshot only when it has no pointer yet — it
+    /// never supersedes an EXISTING pointer, so a late/duplicate attach for an older snapshot can never roll
+    /// a branch (e.g. the default) back off a newer target it already advanced to (branch advancement is the
+    /// exclusive job of the publish path, <c>AdvanceBranch</c>). Returns the branch id.
     /// </summary>
     public long AttachBranchPointer(long repositoryId, string branchName, long snapshotId, long now)
     {
@@ -403,7 +405,7 @@ public sealed class SnapshotStore(SqliteConnection connection)
         }
 
         var branchId = GetBranchId(repositoryId, branchName)!.Value;
-        if (GetBranchSnapshotId(branchId) != snapshotId)
+        if (GetBranchSnapshotId(branchId) is null)
             SetBranchPointer(branchId, snapshotId, now);
         return branchId;
     }
