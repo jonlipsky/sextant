@@ -2,6 +2,7 @@ using Sextant.Core;
 using Sextant.Core.Platform;
 using Sextant.Indexer;
 using Sextant.Service.Contributions;
+using Sextant.Service.Sandbox;
 
 namespace Sextant.Service;
 
@@ -99,6 +100,14 @@ public sealed record ServiceOptions
     /// </summary>
     public ContributionPolicy Contribution { get; init; } = ContributionPolicy.Default;
 
+    /// <summary>
+    /// The enforced evaluation-sandbox limits for the service worker (Phase 17, criterion 2). MSBuild
+    /// evaluation of a checkout is an UNTRUSTED execution boundary even for a private repo, so the worker
+    /// always evaluates under this policy. Defaults to <see cref="SandboxPolicy.Enforced"/>; the single-node
+    /// local CLI/daemon path does not run the service worker, so local operation stays byte-identical.
+    /// </summary>
+    public SandboxPolicy Sandbox { get; init; } = SandboxPolicy.Enforced;
+
     private const string EnvPrefix = "SEXTANT_SERVICE_";
 
     /// <summary>
@@ -150,6 +159,19 @@ public sealed record ServiceOptions
                 RequireGitContentVerification = EnvBool("CONTRIB_REQUIRE_GIT_VERIFY") ?? false,
                 MaxArtifactBytes = EnvLong("CONTRIB_MAX_ARTIFACT_BYTES") is long max and > 0
                     ? max : ContributionPolicy.Default.MaxArtifactBytes
+            },
+            // Evaluation sandbox (criterion 2). Enforced by default; a deployment can widen the budgets or
+            // (rarely, e.g. a fully trusted single-tenant node) allow network. Secrets are always scrubbed
+            // unless explicitly disabled.
+            Sandbox = new SandboxPolicy
+            {
+                Enabled = EnvBool("SANDBOX_ENABLED") ?? true,
+                TimeBudget = EnvInt("SANDBOX_TIME_BUDGET_SECONDS") is int secs and > 0
+                    ? TimeSpan.FromSeconds(secs) : SandboxPolicy.Enforced.TimeBudget,
+                MemoryBudgetBytes = EnvLong("SANDBOX_MEMORY_BUDGET_BYTES") is long mem and > 0
+                    ? mem : SandboxPolicy.Enforced.MemoryBudgetBytes,
+                AllowNetwork = EnvBool("SANDBOX_ALLOW_NETWORK") ?? false,
+                ScrubSecrets = EnvBool("SANDBOX_SCRUB_SECRETS") ?? true
             }
         };
     }

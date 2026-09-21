@@ -92,6 +92,14 @@ public sealed class ServicePaths
         return IsUnder(full, _checkoutRoot) || IsUnder(full, _artifactRoot) || IsUnder(full, _cacheRoot);
     }
 
+    /// <summary>
+    /// True when <paramref name="path"/> lies inside the ephemeral worker-scratch root. The evaluation
+    /// sandbox (Phase 17, criterion 2) uses this as a fail-closed guard: untrusted repository evaluation may
+    /// only be allowed to WRITE into scratch, which is separate from and unreachable by the persistent
+    /// volumes, so a botched or hostile evaluation can never corrupt a published snapshot.
+    /// </summary>
+    public bool IsScratch(string path) => IsUnder(NormalizeFull(path), _scratchRoot);
+
     private static void AssertSeparate(string aName, string a, string bName, string b)
     {
         if (IsUnder(a, b) || IsUnder(b, a))

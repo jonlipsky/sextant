@@ -7,6 +7,7 @@ using Sextant.Core.Platform;
 using Sextant.Service;
 using Sextant.Service.Contributions;
 using Sextant.Service.Placement;
+using Sextant.Service.Sandbox;
 using Sextant.Store;
 
 namespace Sextant.Service.Host;
@@ -36,8 +37,12 @@ public static class ServiceHostRunner
         // Windows/macOS placements are wired by ProcessStack in Phase 14 behind this same seam.
         var nodeCapability = WorkerCapability.LocalDefault;
         var checkoutProvider = new PersistentVolumeCheckoutProvider(paths);
+        // Criterion 2: the service worker evaluates UNTRUSTED checkouts, so wrap its MSBuild evaluation in
+        // the enforced sandbox (time/memory/secret/filesystem isolation) — applied to private and public
+        // repos alike. The local CLI/daemon path does not construct this worker, so it stays byte-identical.
+        var sandbox = new EvaluationSandbox(options.Sandbox, paths, Console.Error.WriteLine);
         var localWorker = new LocalIndexerSnapshotWorker(
-            database, config, checkoutProvider, Console.Error.WriteLine, nodeCapability);
+            database, config, checkoutProvider, Console.Error.WriteLine, nodeCapability, sandbox);
         var defaultPlacement = new LocalPlacement(nodeCapability, localWorker);
         var worker = new CapabilityRoutingSnapshotWorker(
             defaultPlacement,
