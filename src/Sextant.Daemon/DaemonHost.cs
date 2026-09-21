@@ -70,6 +70,8 @@ public sealed class DaemonHost : IDisposable
         _db.RunMigrations(recover: false);
         _lease = WriterLease.AcquireOrThrow(
             _db.DbPath, $"sextant-daemon@{Environment.MachineName}#{Environment.ProcessId}");
+        // Abort any in-flight index between batches if the lease is ever stolen (issue #38 / criterion 3).
+        _db.SetWriterLostProbe(() => _lease.IsLost);
         _db.Recover();
         _queue = new IndexingQueue();
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);

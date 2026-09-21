@@ -207,3 +207,38 @@ public sealed class SubmoduleProviderProtection : IRetentionProtectionProvider
         return cmd.ExecuteScalar() is not null;
     }
 }
+
+/// <summary>
+/// Protects the snapshot every OPEN pull request currently resolves to (Phase 17 slice 2, criterion 4).
+/// A PR head resolves to an immutable snapshot that must survive a retention/quota GC for as long as the
+/// PR is open, even when that snapshot's generation has fallen out of the keep window and its head commit
+/// is not a branch pointer. For every open <c>pull_request_snapshots</c> root this pins the pointed
+/// snapshot's generation (<c>run_id</c>) and its commit's API history. Closing the PR (releasing the
+/// root) drops this protection so the snapshot becomes eligible for ordinary GC. Forward/backward-safe:
+/// contributes nothing when the migration-019 <c>pull_request_snapshots</c> table is absent.
+/// </summary>
+public sealed class PullRequestSnapshotProtection : IRetentionProtectionProvider
+{
+    public string Name => "open-pull-request";
+
+    public void Contribute(SqliteConnection connection, RetentionProtectionBuilder builder)
+    {
+        if (!TableExists(connection, "pull_request_snapshots")) return;
+
+        foreach (var (runId, commitSha) in new SnapshotStore(connection).GetOpenPullRequestProtectionTargets())
+        {
+            if (runId.HasValue)
+                builder.ProtectGeneration(runId.Value, "generation pinned by an open pull request");
+            if (!string.IsNullOrEmpty(commitSha))
+                builder.ProtectCommit(commitSha!, "API history for an open pull request's head commit");
+        }
+    }
+
+    private static bool TableExists(SqliteConnection connection, string table)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = @name LIMIT 1;";
+        cmd.Parameters.AddWithValue("@name", table);
+        return cmd.ExecuteScalar() is not null;
+    }
+}

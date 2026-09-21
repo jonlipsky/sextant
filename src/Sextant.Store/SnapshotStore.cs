@@ -556,6 +556,61 @@ public sealed class SnapshotStore(SqliteConnection connection)
         return rows;
     }
 
+    /// <summary>
+    /// The (run id, commit SHA) targets an open-pull-request retention protection must spare (Phase 17,
+    /// criterion 4): for every snapshot an OPEN pull request root points at, its generation
+    /// (<c>run_id</c>) and the git commit whose API history belongs to it. This keeps a PR-head snapshot
+    /// alive for as long as the PR is open even when its generation has fallen out of the keep window and
+    /// its head commit is not itself a branch pointer. Contributes nothing when the migration-019
+    /// <c>pull_request_snapshots</c> table is absent (pre-migration DB).
+    /// </summary>
+    public IReadOnlyList<(long? runId, string? commitSha)> GetOpenPullRequestProtectionTargets()
+    {
+        if (!TableExists("pull_request_snapshots")) return [];
+
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT DISTINCT s.run_id, c.commit_sha
+            FROM pull_request_snapshots pr
+            JOIN snapshots s ON s.id = pr.snapshot_id
+            LEFT JOIN commits c ON c.id = s.commit_id
+            WHERE pr.state = 'open' AND pr.snapshot_id IS NOT NULL;
+            """;
+        var rows = new List<(long?, string?)>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            rows.Add((
+                reader.IsDBNull(0) ? null : reader.GetInt64(0),
+                reader.IsDBNull(1) ? null : reader.GetString(1)));
+        return rows;
+    }
+
+    /// <summary>
+    /// The snapshot ids currently pinned by an OPEN pull request (never data-GC eligible). Feeds the
+    /// retained-snapshot closure in retention/quota GC alongside branch-pointed heads. Empty when the
+    /// migration-019 <c>pull_request_snapshots</c> table is absent.
+    /// </summary>
+    public IReadOnlyList<long> GetOpenPullRequestSnapshotIds()
+    {
+        if (!TableExists("pull_request_snapshots")) return [];
+
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText =
+            "SELECT DISTINCT snapshot_id FROM pull_request_snapshots WHERE state = 'open' AND snapshot_id IS NOT NULL;";
+        var ids = new List<long>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read()) ids.Add(reader.GetInt64(0));
+        return ids;
+    }
+
+    private bool TableExists(string table)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = @name LIMIT 1;";
+        cmd.Parameters.AddWithValue("@name", table);
+        return cmd.ExecuteScalar() is not null;
+    }
+
     // ---- helpers -------------------------------------------------------------------------------
 
     /// <summary>
@@ -588,25 +643,28 @@ public sealed class SnapshotStore(SqliteConnection connection)
     }
 
     /// <summary>
-    /// Every snapshot row a retention pass needs to classify data ownership: its id, owning generation
-    /// (<c>run_id</c>), status, base snapshot (overlay sharing), and provider flag. Used to compute the
-    /// retained-snapshot closure so orphaned snapshot DATA can be GC'd (issue #46) while providers shared
-    /// by any retained consumer are spared (issue #54).
+    /// Every snapshot row a retention pass needs to classify data ownership: its id, owning repository,
+    /// owning generation (<c>run_id</c>), status, base snapshot (overlay sharing), provider flag, and
+    /// creation timestamp (recency for the per-repository quota). Used to compute the retained-snapshot
+    /// closure so orphaned snapshot DATA can be GC'd (issue #46) while providers shared by any retained
+    /// consumer are spared (issue #54) and the per-repository quota evicts oldest-first (Phase 17).
     /// </summary>
-    public IReadOnlyList<(long id, long? runId, string status, long? baseSnapshotId, bool isProvider)> GetSnapshotsForRetention()
+    public IReadOnlyList<(long id, long repositoryId, long? runId, string status, long? baseSnapshotId, bool isProvider, long createdAt)> GetSnapshotsForRetention()
     {
         using var cmd = connection.CreateCommand();
         cmd.CommandText =
-            "SELECT id, run_id, status, base_snapshot_id, is_provider FROM snapshots;";
-        var rows = new List<(long, long?, string, long?, bool)>();
+            "SELECT id, repository_id, run_id, status, base_snapshot_id, is_provider, created_at FROM snapshots;";
+        var rows = new List<(long, long, long?, string, long?, bool, long)>();
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
             rows.Add((
                 reader.GetInt64(0),
-                reader.IsDBNull(1) ? null : reader.GetInt64(1),
-                reader.GetString(2),
-                reader.IsDBNull(3) ? null : reader.GetInt64(3),
-                !reader.IsDBNull(4) && reader.GetInt64(4) != 0));
+                reader.GetInt64(1),
+                reader.IsDBNull(2) ? null : reader.GetInt64(2),
+                reader.GetString(3),
+                reader.IsDBNull(4) ? null : reader.GetInt64(4),
+                !reader.IsDBNull(5) && reader.GetInt64(5) != 0,
+                reader.GetInt64(6)));
         return rows;
     }
 

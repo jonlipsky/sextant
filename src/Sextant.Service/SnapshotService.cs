@@ -98,6 +98,10 @@ public sealed class SnapshotService : IDisposable
 
             try
             {
+                // Once the lease is held, make every write session abort between batches if it is ever
+                // stolen (issue #38 / criterion 3): a long worker index run consults this probe at each
+                // batch boundary and rolls back rather than racing the new owner into a corrupt publish.
+                db.SetWriterLostProbe(() => lease.IsLost);
                 db.Recover();
                 var service = new SnapshotService(
                     options, worker ?? new UnavailableSnapshotWorker(), paths, db, lease, ownsDatabase,
@@ -119,16 +123,29 @@ public sealed class SnapshotService : IDisposable
     }
 
     /// <summary>
-    /// Reconciles jobs a previous worker left <c>running</c> (criterion 2). This service holds a fresh lease
-    /// token, so every <c>running</c> job not owned by THIS token is reset to <c>queued</c> for re-attempt.
+    /// Reconciles state a previous worker/service instance left orphaned by a crash (Phase 17 criterion 3),
+    /// so worker/service loss at every stage resolves to retryable/failed/complete and NEVER a corrupt
+    /// publish. This service holds a fresh lease token, so it: (1) resets every <c>running</c> job not owned
+    /// by THIS token to <c>queued</c> for re-attempt; (2) resets any PHANTOM terminal job — <c>complete</c>/
+    /// <c>partial</c> with a now-NULL <c>snapshot_id</c> (crash between the status write and the publish
+    /// commit, or the snapshot later reclaimed) — back to <c>queued</c> so a later ensure regenerates it
+    /// rather than reporting a phantom-complete forever; and (3) sweeps orphaned per-job scratch left by a
+    /// crash. Returns the number of jobs reconciled.
     /// </summary>
     public int ReconcileOnStartup()
     {
-        return WithWrite(() =>
+        var reconciled = WithWrite(() =>
         {
             var jobs = new SnapshotJobStore(_conn);
-            return jobs.ReconcileOrphanedJobs(_lease.OwnerToken);
+            return jobs.ReconcileOrphanedJobs(_lease.OwnerToken)
+                 + jobs.ReconcilePhantomTerminalJobs();
         });
+
+        // Best-effort scratch sweep OUTSIDE the write transaction (filesystem, not catalog state); confined
+        // to the scratch root so it can never touch a persistent volume.
+        _paths.SweepOrphanedScratch();
+
+        return reconciled;
     }
 
     /// <summary>
@@ -611,9 +628,50 @@ public sealed class SnapshotService : IDisposable
         });
     }
 
+    /// <summary>
+    /// Registers (or updates) an OPEN pull-request snapshot retention root (Phase 17 criterion 4): the
+    /// snapshot indexed for a PR head must not be reclaimed by retention while the PR is open, so an open-PR
+    /// reviewer's cross-repo/find-references queries keep resolving. Idempotent per <c>(repository, pr)</c>;
+    /// resolving the branch pointer for the PR head commit when a snapshot id is not supplied. Returns false
+    /// when the repository/commit is unknown to the catalog.
+    /// </summary>
+    public bool RegisterPullRequestSnapshot(
+        string repositoryRemoteUrl, int prNumber, string headCommitSha, long? snapshotId = null)
+    {
+        return WithWrite(() =>
+        {
+            var snapshots = new SnapshotStore(_conn);
+            if (snapshots.GetRepositoryId(repositoryRemoteUrl) is not long repoId)
+                return false;
+
+            var prStore = new PullRequestSnapshotStore(_conn);
+            prStore.Register(repoId, prNumber, snapshotId, headCommitSha,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            return true;
+        });
+    }
+
+    /// <summary>
+    /// Marks a pull-request retention root CLOSED (Phase 17 criterion 4): once closed the snapshot is no
+    /// longer protected as an open-PR root and becomes eligible for the normal retention window/quota.
+    /// Idempotent; returns false when the repository is unknown.
+    /// </summary>
+    public bool ClosePullRequestSnapshot(string repositoryRemoteUrl, int prNumber)
+    {
+        return WithWrite(() =>
+        {
+            var snapshots = new SnapshotStore(_conn);
+            if (snapshots.GetRepositoryId(repositoryRemoteUrl) is not long repoId)
+                return false;
+
+            var prStore = new PullRequestSnapshotStore(_conn);
+            prStore.Close(repoId, prNumber, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            return true;
+        });
+    }
+
     /// <summary>Service AVAILABILITY: the catalog is reachable and this instance holds the writer lease.</summary>
     public bool IsAvailable => !_disposed;
-
     /// <summary>
     /// Worker CAPACITY, distinct from availability (health vs readiness): whether this node can currently
     /// accept production work. A node whose worker is the unavailable placeholder is available for QUERIES
