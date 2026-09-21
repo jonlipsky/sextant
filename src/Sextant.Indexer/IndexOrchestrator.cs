@@ -413,10 +413,17 @@ public sealed class IndexOrchestrator
                 }
                 else
                 {
-                    // Stage the provider project version under the PROVIDER snapshot and extract it this
-                    // run (the first parent to pin this commit, or a provider gaining a project a prior
-                    // parent did not reference). Additive: extracting a new provider project version never
-                    // mutates an existing published one.
+                    // The complete provider snapshot does NOT already hold this project version — a parent
+                    // is referencing a submodule project no prior parent pinned (issue #53). Growing a
+                    // PUBLISHED provider in place would let a concurrent reader observe a half-added
+                    // project on a COMPLETE snapshot. Instead re-open the provider as a pending staging
+                    // generation for THIS run and republish it atomically (the guarded pending->complete
+                    // flip runs in the final write transaction, exactly like a rebuilt parent/overlay), so
+                    // the provider is never mutated while complete and a crash leaves it recoverable rather
+                    // than half-grown. Adding the new project version is additive: the provider's existing
+                    // (published) project rows are never touched.
+                    if (providerComplete && providerSnapshotsToPublish.Add(providerSnapId))
+                        snapshotStore.MarkStatus(providerSnapId, SnapshotStatus.Pending);
                     projectId = projectStore.UpsertSnapshotProject(identity, providerSnapId, providerLogicalId, now);
                     snapshotStore.MapProject(providerSnapId, projectId);
                     extractThisProject = inFilter;

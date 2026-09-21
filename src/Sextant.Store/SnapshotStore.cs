@@ -330,6 +330,25 @@ public sealed class SnapshotStore(SqliteConnection connection)
         return cmd.ExecuteScalar() is long id ? id : null;
     }
 
+    /// <summary>The repository id for a remote url, or null when it has never been indexed (read-only lookup).</summary>
+    public long? GetRepositoryId(string remoteUrl)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT id FROM repositories WHERE remote_url = @url LIMIT 1;";
+        cmd.Parameters.AddWithValue("@url", remoteUrl);
+        return cmd.ExecuteScalar() is long id ? id : null;
+    }
+
+    /// <summary>The branch id for a (repository, name) pair, or null when absent (read-only lookup).</summary>
+    public long? GetBranchId(long repositoryId, string name)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT id FROM branches WHERE repository_id = @repo AND name = @name LIMIT 1;";
+        cmd.Parameters.AddWithValue("@repo", repositoryId);
+        cmd.Parameters.AddWithValue("@name", name);
+        return cmd.ExecuteScalar() is long id ? id : null;
+    }
+
     /// <summary>The snapshot a branch currently points at (null if the branch has no pointer).</summary>
     public long? GetBranchSnapshotId(long branchId)
     {
@@ -518,6 +537,65 @@ public sealed class SnapshotStore(SqliteConnection connection)
                 reader.IsDBNull(0) ? null : reader.GetInt64(0),
                 reader.IsDBNull(1) ? null : reader.GetString(1)));
         return rows;
+    }
+
+    /// <summary>
+    /// Every snapshot row a retention pass needs to classify data ownership: its id, owning generation
+    /// (<c>run_id</c>), status, base snapshot (overlay sharing), and provider flag. Used to compute the
+    /// retained-snapshot closure so orphaned snapshot DATA can be GC'd (issue #46) while providers shared
+    /// by any retained consumer are spared (issue #54).
+    /// </summary>
+    public IReadOnlyList<(long id, long? runId, string status, long? baseSnapshotId, bool isProvider)> GetSnapshotsForRetention()
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText =
+            "SELECT id, run_id, status, base_snapshot_id, is_provider FROM snapshots;";
+        var rows = new List<(long, long?, string, long?, bool)>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            rows.Add((
+                reader.GetInt64(0),
+                reader.IsDBNull(1) ? null : reader.GetInt64(1),
+                reader.GetString(2),
+                reader.IsDBNull(3) ? null : reader.GetInt64(3),
+                !reader.IsDBNull(4) && reader.GetInt64(4) != 0));
+        return rows;
+    }
+
+    /// <summary>
+    /// Every submodule-dedup edge (consumer snapshot -&gt; provider snapshot). Feeds the retained-snapshot
+    /// closure: a provider whose consumer is retained must itself be retained (issue #54). Empty when the
+    /// Phase-12 <c>snapshot_dependencies</c> table is absent (pre-migration DB).
+    /// </summary>
+    public IReadOnlyList<(long consumerSnapshotId, long providerSnapshotId)> GetSnapshotDependencyEdges()
+    {
+        using (var check = connection.CreateCommand())
+        {
+            check.CommandText =
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'snapshot_dependencies' LIMIT 1;";
+            if (check.ExecuteScalar() is null) return [];
+        }
+
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText =
+            "SELECT consumer_snapshot_id, provider_snapshot_id FROM snapshot_dependencies;";
+        var rows = new List<(long, long)>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            rows.Add((reader.GetInt64(0), reader.GetInt64(1)));
+        return rows;
+    }
+
+    /// <summary>The snapshot ids currently referenced by a branch pointer (never data-GC eligible).</summary>
+    public IReadOnlyList<long> GetBranchPointedSnapshotIds()
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText =
+            "SELECT DISTINCT snapshot_id FROM branches WHERE snapshot_id IS NOT NULL;";
+        var ids = new List<long>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read()) ids.Add(reader.GetInt64(0));
+        return ids;
     }
 
     private const string SelectSnapshot = """
