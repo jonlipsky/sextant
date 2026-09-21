@@ -69,6 +69,11 @@ public static class ServiceApp
             var path = context.Request.Path;
             if (path.StartsWithSegments("/control"))
             {
+                // Bind isolation (issue #61): when a distinct query port is configured, the control plane is
+                // reachable ONLY on the control port. A control request arriving on the public query port is
+                // a uniform 404 — it must not even reveal that the control plane exists on that port.
+                if (WrongPlanePort(context, options, controlPath: true)) { await NotFound(context); return; }
+
                 // Least-privilege contributor token (issue #71): /control/contribute additionally accepts a
                 // dedicated ContributeToken so a CI/client contributor never needs the full control token.
                 // Every OTHER control endpoint still requires the control token, so a contributor token
@@ -81,6 +86,9 @@ public static class ServiceApp
             }
             else if (path.StartsWithSegments("/mcp") || path.StartsWithSegments("/query"))
             {
+                // Bind isolation (issue #61): the query plane is reachable ONLY on the query port when one is
+                // configured; a query request on the internal control port is a uniform 404.
+                if (WrongPlanePort(context, options, controlPath: false)) { await NotFound(context); return; }
                 if (!AuthorizedForQuery(context, options)) { await Deny(context); return; }
             }
             await next();
@@ -330,6 +338,42 @@ public static class ServiceApp
         context.Response.StatusCode = StatusCodes.Status401Unauthorized;
         context.Response.Headers.WWWAuthenticate = "Bearer";
         return context.Response.WriteAsync("Unauthorized");
+    }
+
+    /// <summary>
+    /// Control/query bind isolation (issue #61). Returns true when a request has reached the WRONG plane's
+    /// port and must be refused: when a distinct query port is configured, control endpoints are served ONLY
+    /// on the control port and query endpoints ONLY on the query port, so an operator can expose just the
+    /// query port publicly while keeping the control plane on an internal interface (criterion 1 surface
+    /// hardening). It is a NO-OP when no separate query port is configured (planes share a port, the
+    /// pre-Phase-17 behavior) or under the in-memory TestServer, whose connection reports port 0.
+    /// </summary>
+    private static bool WrongPlanePort(HttpContext context, ServiceOptions options, bool controlPath)
+    {
+        var port = context.Connection.LocalPort;
+        if (port == 0)
+            return false; // TestServer / no real socket → isolation not applicable.
+        return IsWrongPlanePort(port, options.ControlPort, options.QueryPort, controlPath);
+    }
+
+    /// <summary>
+    /// The pure bind-isolation decision (issue #61), split out for unit testing. Returns true when a request
+    /// on <paramref name="localPort"/> has reached the wrong plane. No-op (false) when no distinct query
+    /// port is configured. When a distinct query port is set, control endpoints belong on the control port
+    /// and query endpoints on the query port; anything else is refused.
+    /// </summary>
+    internal static bool IsWrongPlanePort(int localPort, int controlPort, int? queryPort, bool controlPath)
+    {
+        if (queryPort is not int qp || qp == controlPort)
+            return false;
+        return controlPath ? localPort != controlPort : localPort != qp;
+    }
+
+    /// <summary>Uniform 404 used to HIDE a plane that exists on a different port (no cross-plane oracle).</summary>
+    private static Task NotFound(HttpContext context)
+    {
+        context.Response.StatusCode = StatusCodes.Status404NotFound;
+        return context.Response.WriteAsync("Not Found");
     }
 
     // Constant-time comparison so a token check does not leak length/content via timing.
