@@ -1,4 +1,5 @@
 using Microsoft.Data.Sqlite;
+using Sextant.Service.Contributions;
 using Sextant.Store;
 
 namespace Sextant.Service;
@@ -28,11 +29,15 @@ public sealed class SnapshotService : IDisposable
     private readonly WriterLease _lease;
     private readonly SemaphoreSlim _writeGate = new(1, 1);
     private readonly bool _ownsDatabase;
+    private readonly IContributionAuthorizer _authorizer;
+    private readonly IGitContentProvider _gitContent;
+    private readonly ContributionPolicy _contributionPolicy;
     private bool _disposed;
 
     private SnapshotService(
         ServiceOptions options, ISnapshotWorker worker, ServicePaths paths,
-        IndexDatabase db, WriterLease lease, bool ownsDatabase)
+        IndexDatabase db, WriterLease lease, bool ownsDatabase,
+        IContributionAuthorizer authorizer, IGitContentProvider gitContent, ContributionPolicy contributionPolicy)
     {
         _options = options;
         _worker = worker;
@@ -41,6 +46,9 @@ public sealed class SnapshotService : IDisposable
         _conn = db.GetConnection();
         _lease = lease;
         _ownsDatabase = ownsDatabase;
+        _authorizer = authorizer;
+        _gitContent = gitContent;
+        _contributionPolicy = contributionPolicy;
     }
 
     public ServicePaths Paths => _paths;
@@ -54,8 +62,28 @@ public sealed class SnapshotService : IDisposable
     /// WAL / sweeps abandoned staging generations and reconciles orphaned jobs. Ordering matters: migrate
     /// then lease then recover, so recovery never abandons a live writer's staging generation (issue #38).
     /// </summary>
-    public static SnapshotService Start(ServiceOptions options, ISnapshotWorker? worker = null, IndexDatabase? database = null)
+    public static SnapshotService Start(
+        ServiceOptions options, ISnapshotWorker? worker = null, IndexDatabase? database = null,
+        IContributionAuthorizer? authorizer = null, IGitContentProvider? gitContent = null,
+        ContributionPolicy? contributionPolicy = null)
     {
+        var effectivePolicy = contributionPolicy ?? options.Contribution;
+        var effectiveAuthorizer = authorizer ?? OpenContributionAuthorizer.Instance;
+        var effectiveGitContent = gitContent ?? UnavailableGitContentProvider.Instance;
+
+        // Fail-closed startup guard (CRITICAL 1): a deployment that OPTED INTO required authorization or
+        // required Git-content verification MUST have a real provider wired. Refusing to start — rather than
+        // silently running with the dev-open default — prevents a fail-OPEN supply-chain posture where
+        // RequireAuthorization is set but every contribution is waved through by the open dev authorizer.
+        if (effectivePolicy.RequireAuthorization && effectiveAuthorizer is OpenContributionAuthorizer)
+            throw new InvalidOperationException(
+                "ContributionPolicy.RequireAuthorization is set but no real IContributionAuthorizer is wired; " +
+                "refusing to start with the dev-open authorizer (fail-closed).");
+        if (effectivePolicy.RequireGitContentVerification && effectiveGitContent is UnavailableGitContentProvider)
+            throw new InvalidOperationException(
+                "ContributionPolicy.RequireGitContentVerification is set but no real IGitContentProvider is wired; " +
+                "refusing to start with the unavailable provider (fail-closed).");
+
         var paths = new ServicePaths(options.Volumes);
         var ownsDatabase = database is null;
         var db = database ?? new IndexDatabase(options.CatalogDbPath, IndexWriteOptions.Default);
@@ -72,7 +100,8 @@ public sealed class SnapshotService : IDisposable
             {
                 db.Recover();
                 var service = new SnapshotService(
-                    options, worker ?? new UnavailableSnapshotWorker(), paths, db, lease, ownsDatabase);
+                    options, worker ?? new UnavailableSnapshotWorker(), paths, db, lease, ownsDatabase,
+                    effectiveAuthorizer, effectiveGitContent, effectivePolicy);
                 service.ReconcileOnStartup();
                 return service;
             }
@@ -192,6 +221,333 @@ public sealed class SnapshotService : IDisposable
         {
             _writeGate.Release();
         }
+    }
+
+    /// <summary>
+    /// Ingests a client/CI contribution artifact (Phase 16). This is the SUPPLY-CHAIN entrypoint: the
+    /// artifact is an UNTRUSTED external input, so it is size-bounded, authenticated, authorized, and
+    /// hash/capability-verified BEFORE a single row is imported or published (CRITICAL 1). It is
+    /// content-addressed — re-uploading the same artifact is a no-op (acceptance criterion 2) — and attaches
+    /// to the ONE capability-less assembly snapshot for the committed state, so multiple capability-specific
+    /// contributions (Windows + macOS) assemble into one repository snapshot (criterion 4). A validation
+    /// failure records structured per-project diagnostics and is NEVER published (criterion 3). This path is
+    /// entirely OPT-IN: a service with no contributor never calls it, and a normal local build is unaffected
+    /// (CRITICAL 2 / criterion 5).
+    /// </summary>
+    public async Task<IngestContributionResult> IngestContributionAsync(
+        IngestContributionRequest request, CancellationToken cancellationToken = default)
+    {
+        // Parse + size-bound the artifact OUTSIDE the write gate (cheap, and rejects an oversized/garbage
+        // upload without touching the catalog).
+        Contributions.ContributionArtifact artifact;
+        try
+        {
+            artifact = Contributions.ContributionArtifact.ReadFrom(request.Artifact, _contributionPolicy.MaxArtifactBytes);
+        }
+        catch (Contributions.ContributionTooLargeException ex)
+        {
+            return Reject(Contributions.ContributionRejectionCode.SizeLimit, ex.Message, null, string.Empty);
+        }
+        catch (Contributions.ContributionFormatException ex)
+        {
+            return Reject(Contributions.ContributionRejectionCode.MalformedArtifact, ex.Message, null, string.Empty);
+        }
+
+        return await IngestParsedAsync(artifact, request, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Streaming ingest entry: enforces <see cref="ContributionPolicy.MaxArtifactBytes"/> INCREMENTALLY as
+    /// the artifact is read, so an oversized upload is rejected without ever buffering it whole. The HTTP host
+    /// uses this so the SERVICE's own artifact-size cap governs the untrusted upload (not the transport's
+    /// default request-body limit), keeping memory bounded on the supply-chain boundary.
+    /// </summary>
+    public async Task<IngestContributionResult> IngestContributionAsync(
+        Stream artifactStream, string? token, bool finalize, string? branchName, bool isDefaultBranch,
+        CancellationToken cancellationToken = default)
+    {
+        Contributions.ContributionArtifact artifact;
+        try
+        {
+            artifact = await Contributions.ContributionArtifact
+                .ReadFromAsync(artifactStream, _contributionPolicy.MaxArtifactBytes, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Contributions.ContributionTooLargeException ex)
+        {
+            return Reject(Contributions.ContributionRejectionCode.SizeLimit, ex.Message, null, string.Empty);
+        }
+        catch (Contributions.ContributionFormatException ex)
+        {
+            return Reject(Contributions.ContributionRejectionCode.MalformedArtifact, ex.Message, null, string.Empty);
+        }
+
+        var request = new IngestContributionRequest
+        {
+            Artifact = [],
+            Token = token,
+            Finalize = finalize,
+            BranchName = branchName,
+            IsDefaultBranch = isDefaultBranch
+        };
+        return await IngestParsedAsync(artifact, request, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<IngestContributionResult> IngestParsedAsync(
+        Contributions.ContributionArtifact artifact, IngestContributionRequest request, CancellationToken cancellationToken)
+    {
+        var manifest = artifact.Manifest;
+        var assemblyIdentity = manifest.ToSnapshotIdentity();
+        var identityHash = assemblyIdentity.Hash;
+        var contentHash = artifact.ContentAddress;
+
+        // Materialize the payload catalog to scratch (quarantined from persistent volumes) and open it
+        // READ-ONLY so the importer/validator can never mutate the untrusted payload. The scratch handle is
+        // allocated BEFORE the try so the finally always releases it, and the payload write is INSIDE the try
+        // so a write fault or cancellation (disk-full, client disconnect) cannot leak the scratch directory.
+        var scratch = _paths.AllocateScratch($"contrib-{Guid.NewGuid():N}");
+
+        SqliteConnection? payloadConn = null;
+        try
+        {
+            var payloadPath = Path.Combine(scratch, "payload.db");
+            await File.WriteAllBytesAsync(payloadPath, artifact.Payload.ToArray(), cancellationToken).ConfigureAwait(false);
+            payloadConn = OpenReadOnly(payloadPath);
+
+            return await WithWriteAsync(() =>
+                Task.FromResult(IngestUnderWriteLock(artifact, manifest, assemblyIdentity, identityHash, contentHash, payloadConn, request)))
+                .ConfigureAwait(false);
+        }
+        catch (SqliteException ex)
+        {
+            return Reject(Contributions.ContributionRejectionCode.MalformedArtifact,
+                $"the contribution payload is not a readable catalog: {ex.Message}", null, identityHash);
+        }
+        catch (Exception ex) when (!_lease.IsLost &&
+            ex is ArgumentException or InvalidOperationException or InvalidCastException or FormatException or OverflowException)
+        {
+            // Defense-in-depth on the UNTRUSTED boundary: a crafted payload can make a typed column read or a
+            // structural assumption (e.g. a NULL where a value is required) throw a non-Sqlite exception. The
+            // write transaction has already rolled back cleanly (IngestUnderWriteLock's ROLLBACK), so translate
+            // it into a structured MalformedArtifact rejection instead of surfacing an opaque 500 (criterion 3).
+            // The !_lease.IsLost guard deliberately lets a lost-writer-lease InvalidOperationException (issue
+            // #38) propagate as a server fault rather than be mislabeled a client error.
+            return Reject(Contributions.ContributionRejectionCode.MalformedArtifact,
+                $"the contribution payload is malformed: {ex.Message}", null, identityHash);
+        }
+        finally
+        {
+            payloadConn?.Dispose();
+            _paths.ReleaseScratch(scratch);
+        }
+    }
+
+    // Wraps the ingest in ONE atomic transaction (raw BEGIN IMMEDIATE / COMMIT so existing store commands
+    // enrol in the connection's ambient transaction — do NOT use SqliteConnection.BeginTransaction()), so a
+    // contribution is imported + published + job-recorded atomically or rolled back entirely (no half-imported
+    // pending snapshot survives a mid-ingest fault).
+    private IngestContributionResult IngestUnderWriteLock(
+        Contributions.ContributionArtifact artifact, Core.Platform.ContributionManifest manifest,
+        Core.SnapshotIdentity assemblyIdentity, string identityHash, string contentHash,
+        SqliteConnection payloadConn, IngestContributionRequest request)
+    {
+        EnsureLeaseHeld();
+        ExecRaw("BEGIN IMMEDIATE;");
+        try
+        {
+            var result = IngestBody(artifact, manifest, assemblyIdentity, identityHash, contentHash, payloadConn, request);
+            ExecRaw("COMMIT;");
+            return result;
+        }
+        catch
+        {
+            ExecRaw("ROLLBACK;");
+            throw;
+        }
+    }
+
+    // The full ingest critical section, serialized on the writer gate. Ordered: idempotency → job attach →
+    // validate → begin/attach pending assembly snapshot → import → record provenance → finalize/publish.
+    private IngestContributionResult IngestBody(
+        Contributions.ContributionArtifact artifact, Core.Platform.ContributionManifest manifest,
+        Core.SnapshotIdentity assemblyIdentity, string identityHash, string contentHash,
+        SqliteConnection payloadConn, IngestContributionRequest request)
+    {
+        var jobs = new SnapshotJobStore(_conn);
+        var snapshots = new SnapshotStore(_conn);
+        var contributions = new ContributionStore(_conn);
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        // (2) Content-addressed idempotency: an identical artifact already accepted is a NO-OP (criterion 2).
+        if (contributions.GetByContentHash(contentHash) is { } already)
+        {
+            var priorJob = jobs.GetJobByIdentity(identityHash);
+            return new IngestContributionResult
+            {
+                Accepted = true,
+                Status = ContributionIngestStatus.Duplicate,
+                JobId = priorJob?.Id,
+                SnapshotId = already.SnapshotId,
+                ContentHash = contentHash,
+                IdentityHash = identityHash
+            };
+        }
+
+        // Attach to the ONE durable job for this assembly identity (criterion 1), and take it running under
+        // this instance's lease. A stale terminal job is requeued first so MarkRunning's guard advances it.
+        var (job, _) = jobs.EnsureJob(identityHash, manifest.RepositoryRemoteUrl, manifest.CommitSha, request.BranchName);
+        if (SnapshotJobStatus.IsTerminal(job.Status))
+            jobs.Requeue(job.Id);
+        jobs.MarkRunning(job.Id, _lease.OwnerToken);
+
+        // (3) SUPPLY-CHAIN validation — authz + schema/analyzer + payload + capability + git-content + graph.
+        var validator = Contributions.ContributionValidator.ForService(_contributionPolicy, _gitContent, _authorizer);
+        var validation = validator.Validate(artifact, payloadConn, request.Token);
+        if (!validation.Ok)
+        {
+            jobs.ReplaceDiagnostics(job.Id, validation.Diagnostics.Select(d => d.ToDiagnostic(job.Id)));
+            jobs.MarkResult(job.Id, SnapshotJobStatus.Failed, null, $"{validation.Code}: {validation.Message}");
+            return new IngestContributionResult
+            {
+                Accepted = false,
+                Status = ContributionIngestStatus.Rejected,
+                RejectionCode = validation.Code,
+                Message = validation.Message,
+                JobId = job.Id,
+                IdentityHash = identityHash,
+                ContentHash = contentHash,
+                Diagnostics = jobs.GetDiagnostics(job.Id)
+            };
+        }
+
+        // (4) Begin (or attach to) the PENDING assembly snapshot for this committed state. Idempotent by
+        // identity hash, so a second (compatible) contribution accumulates into the SAME pending snapshot.
+        var repoId = snapshots.EnsureRepository(manifest.RepositoryRemoteUrl, now);
+        var commitId = snapshots.EnsureCommit(repoId, manifest.CommitSha, manifest.TreeSha, now);
+        var (snapshotId, _, status) = snapshots.BeginPending(assemblyIdentity, repoId, commitId, runId: null, now);
+
+        // Immutability: if the assembly snapshot is NOT pending it is already published (complete) — or was
+        // published and later superseded on a branch. Either way it is IMMUTABLE: never import into it and
+        // never re-complete it. Record this distinct contribution's provenance only and no-op (the committed
+        // state's data already exists). A Superseded snapshot must NOT be resurrected or re-advanced here.
+        if (status != SnapshotStatus.Pending)
+        {
+            contributions.Record(snapshotId, contentHash, manifest.Tenant, manifest.RepositoryRemoteUrl,
+                manifest.CommitSha, manifest.CapabilityFingerprint, manifest.Producer,
+                manifest.ToolchainFingerprint, manifest.ManifestHash);
+            jobs.MarkResult(job.Id, SnapshotJobStatus.Complete, snapshotId);
+            return Accepted(ContributionIngestStatus.Complete, job.Id, snapshotId, contentHash, identityHash);
+        }
+
+        var importer = new Contributions.ContributionImporter(_conn);
+
+        // (5-pre) Disjoint-assembly guard: a second contribution accumulating into the SAME pending snapshot
+        // must import project versions DISJOINT from those already assembled (each environment contributes its
+        // own capability-specific projects — criterion 4). Re-importing an already-mapped logical project is
+        // rejected with a structured reason rather than silently reusing/overwriting the earlier row.
+        var conflicts = importer.FindConflictingLogicalProjects(payloadConn, validation.PayloadSnapshotId!.Value, snapshotId);
+        if (conflicts.Count > 0)
+        {
+            var overlapDiagnostics = conflicts.Select(c => new ProjectOutcome
+            {
+                ProjectCanonicalId = c,
+                Severity = JobDiagnosticSeverity.Error,
+                Code = Contributions.ContributionRejectionCode.ProjectGraphMismatch,
+                Message = $"logical project '{c}' is already assembled into this pending snapshot; contributions must be disjoint."
+            }.ToDiagnostic(job.Id));
+            jobs.ReplaceDiagnostics(job.Id, overlapDiagnostics);
+            jobs.MarkResult(job.Id, SnapshotJobStatus.Failed, null,
+                $"{Contributions.ContributionRejectionCode.ProjectGraphMismatch}: overlapping contribution");
+            return new IngestContributionResult
+            {
+                Accepted = false,
+                Status = ContributionIngestStatus.Rejected,
+                RejectionCode = Contributions.ContributionRejectionCode.ProjectGraphMismatch,
+                Message = "the contribution overlaps project versions already assembled into this snapshot; contributions must be disjoint.",
+                JobId = job.Id,
+                IdentityHash = identityHash,
+                ContentHash = contentHash,
+                Diagnostics = jobs.GetDiagnostics(job.Id)
+            };
+        }
+
+        // (5) Import the validated payload's project versions + compact rows into the pending snapshot,
+        // stamping each project's producing capability (migration 018).
+        importer.Import(payloadConn, validation.PayloadSnapshotId!.Value, snapshotId, repoId, manifest, now);
+
+        // (6) Record contribution provenance keyed by content address (idempotency + assembled-snapshot lineage).
+        contributions.Record(snapshotId, contentHash, manifest.Tenant, manifest.RepositoryRemoteUrl,
+            manifest.CommitSha, manifest.CapabilityFingerprint, manifest.Producer,
+            manifest.ToolchainFingerprint, manifest.ManifestHash);
+
+        // (7) Finalize → publish + advance branch, or leave assembling (pending) for more contributions.
+        if (!request.Finalize)
+            return Accepted(ContributionIngestStatus.Assembling, job.Id, snapshotId, contentHash, identityHash);
+
+        // Publish is guarded on status = pending inside MarkComplete; a zero-row result means the snapshot was
+        // NOT pending at publish time (concurrent completion / immutability). Never advance the branch or mark
+        // the job complete against a snapshot we did not ourselves transition to complete.
+        if (snapshots.MarkComplete(snapshotId, now) != 1)
+        {
+            jobs.MarkResult(job.Id, SnapshotJobStatus.Complete, snapshotId);
+            return Accepted(ContributionIngestStatus.Complete, job.Id, snapshotId, contentHash, identityHash);
+        }
+        if (!string.IsNullOrWhiteSpace(request.BranchName))
+            AdvanceBranch(snapshots, repoId, request.BranchName, request.IsDefaultBranch, snapshotId, now);
+        jobs.MarkResult(job.Id, SnapshotJobStatus.Complete, snapshotId);
+        return Accepted(ContributionIngestStatus.Complete, job.Id, snapshotId, contentHash, identityHash);
+    }
+
+    private static IngestContributionResult Accepted(string status, long jobId, long snapshotId, string contentHash, string identityHash) => new()
+    {
+        Accepted = true,
+        Status = status,
+        JobId = jobId,
+        SnapshotId = snapshotId,
+        ContentHash = contentHash,
+        IdentityHash = identityHash
+    };
+
+    private static IngestContributionResult Reject(string code, string message, long? jobId, string identityHash) => new()
+    {
+        Accepted = false,
+        Status = ContributionIngestStatus.Rejected,
+        RejectionCode = code,
+        Message = message,
+        JobId = jobId,
+        IdentityHash = identityHash
+    };
+
+    // Advances a branch pointer to a published snapshot and supersedes the previous target — the same
+    // atomic branch advance the orchestrator performs, run inside the ingest write transaction.
+    private static void AdvanceBranch(
+        SnapshotStore snapshots, long repositoryId, string branchName, bool isDefaultBranch, long snapshotId, long now)
+    {
+        var branchId = snapshots.EnsureBranch(repositoryId, branchName, isDefaultBranch, now);
+        if (isDefaultBranch)
+            snapshots.PromoteSoleDefaultBranch(repositoryId, branchId);
+        var previous = snapshots.GetBranchSnapshotId(branchId);
+        snapshots.SetBranchPointer(branchId, snapshotId, now);
+        if (previous is long prev && prev != snapshotId)
+            snapshots.MarkStatus(prev, SnapshotStatus.Superseded);
+    }
+
+    private void ExecRaw(string sql)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = sql;
+        cmd.ExecuteNonQuery();
+    }
+
+    private static SqliteConnection OpenReadOnly(string path)
+    {
+        var conn = new SqliteConnection(new SqliteConnectionStringBuilder
+        {
+            DataSource = path,
+            Mode = SqliteOpenMode.ReadOnly,
+            Pooling = false
+        }.ToString());
+        conn.Open();
+        return conn;
     }
 
     /// <summary>The full status of a job (with diagnostics) by durable job id — null when unknown.</summary>

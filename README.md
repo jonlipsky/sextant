@@ -77,6 +77,7 @@ Source Files → [Daemon] → [Indexer] → [SQLite] → [MCP Server] → AI Age
 | [Architecture](docs/architecture.md) | System design, data flow, technology stack |
 | [Indexing](docs/indexing.md) | Roslyn extraction pipeline, incremental indexing, project identity |
 | [Schema](docs/schema.md) | SQLite tables, migrations, FTS5 |
+| [Contributions](docs/contributions.md) | Client/CI-assisted index contributions, supply-chain validation |
 
 ## Development
 
