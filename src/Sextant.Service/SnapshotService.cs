@@ -1,4 +1,5 @@
 using Microsoft.Data.Sqlite;
+using Sextant.Core.Platform;
 using Sextant.Service.Contributions;
 using Sextant.Store;
 
@@ -174,7 +175,10 @@ public sealed class SnapshotService : IDisposable
         }).ConfigureAwait(false);
 
         if (SnapshotJobStatus.IsTerminal(job.Status) && terminalUsable)
+        {
+            WithWrite(() => { EnsureAttachBranchPointer(request, job.SnapshotId); return 0; });
             return Attach(job, existed);
+        }
 
         // Serialize production so only ONE worker runs per identity; concurrent callers attach.
         await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -186,7 +190,10 @@ public sealed class SnapshotService : IDisposable
 
             var current = jobs.GetJob(job.Id)!;
             if (SnapshotJobStatus.IsTerminal(current.Status) && TerminalResultUsable(current, hash, snapshots))
+            {
+                EnsureAttachBranchPointer(request, current.SnapshotId);
                 return Attach(current, existed);
+            }
 
             // A complete snapshot may already be published for this identity (produced by an earlier run
             // whose job row predates migration 016, or a race we lost). Attach to it without re-indexing.
@@ -194,6 +201,7 @@ public sealed class SnapshotService : IDisposable
             if (published is { Status: SnapshotStatus.Complete })
             {
                 jobs.MarkResult(job.Id, SnapshotJobStatus.Complete, published.Id);
+                EnsureAttachBranchPointer(request, published.Id);
                 return Attach(jobs.GetJob(job.Id)!, existed);
             }
 
@@ -488,17 +496,72 @@ public sealed class SnapshotService : IDisposable
         }
 
         // (5) Import the validated payload's project versions + compact rows into the pending snapshot,
-        // stamping each project's producing capability (migration 018).
-        importer.Import(payloadConn, validation.PayloadSnapshotId!.Value, snapshotId, repoId, manifest, now);
+        // stamping each project's producing capability (migration 018). A payload whose logical-project
+        // tuple diverges from shared catalog metadata is rejected here rather than perturbing shared state
+        // (issue #69) — EnsureLogicalProject verifies instead of overwriting.
+        try
+        {
+            importer.Import(payloadConn, validation.PayloadSnapshotId!.Value, snapshotId, repoId, manifest, now);
+        }
+        catch (LogicalProjectConflictException ex)
+        {
+            jobs.ReplaceDiagnostics(job.Id, [new ProjectOutcome
+            {
+                Severity = JobDiagnosticSeverity.Error,
+                Code = Contributions.ContributionRejectionCode.ProjectGraphMismatch,
+                Message = ex.Message
+            }.ToDiagnostic(job.Id)]);
+            jobs.MarkResult(job.Id, SnapshotJobStatus.Failed, null,
+                $"{Contributions.ContributionRejectionCode.ProjectGraphMismatch}: {ex.Message}");
+            return new IngestContributionResult
+            {
+                Accepted = false,
+                Status = ContributionIngestStatus.Rejected,
+                RejectionCode = Contributions.ContributionRejectionCode.ProjectGraphMismatch,
+                Message = ex.Message,
+                JobId = job.Id,
+                IdentityHash = identityHash,
+                ContentHash = contentHash,
+                Diagnostics = jobs.GetDiagnostics(job.Id)
+            };
+        }
 
         // (6) Record contribution provenance keyed by content address (idempotency + assembled-snapshot lineage).
+        // The contribution's declared completeness is recorded durably so the finalize gate can publish the
+        // assembled snapshot Partial if ANY contribution that fed it was non-complete (issue #70).
         contributions.Record(snapshotId, contentHash, manifest.Tenant, manifest.RepositoryRemoteUrl,
             manifest.CommitSha, manifest.CapabilityFingerprint, manifest.Producer,
-            manifest.ToolchainFingerprint, manifest.ManifestHash);
+            manifest.ToolchainFingerprint, manifest.ManifestHash, ManifestCompleteness(manifest));
 
         // (7) Finalize → publish + advance branch, or leave assembling (pending) for more contributions.
         if (!request.Finalize)
             return Accepted(ContributionIngestStatus.Assembling, job.Id, snapshotId, contentHash, identityHash);
+
+        // (7a) Completeness/topology gate (issue #70): an assembled snapshot may only publish COMPLETE when
+        // it is provably complete for its identity. If any contribution declared itself non-complete, or the
+        // assembled graph is missing an intra-repository project version it references, publish PARTIAL — a
+        // materially-incomplete assembly is NEVER silently Complete (criterion 3). Cross-repo provider
+        // references are resolved via snapshot_dependencies (#72) and are not counted as incompleteness.
+        var gate = Contributions.AssemblyFinalizeGate.Evaluate(
+            manifest,
+            contributions.HasIncompleteContribution(snapshotId),
+            snapshots.GetSnapshotLogicalCanonicalIds(snapshotId),
+            snapshots.GetKnownLogicalCanonicalIds(repoId));
+        if (!gate.IsComplete)
+        {
+            var reason = string.Join(" ", gate.Reasons);
+            if (snapshots.MarkPartial(snapshotId, now) == 1)
+            {
+                jobs.ReplaceDiagnostics(job.Id, gate.Reasons.Select(r => new ProjectOutcome
+                {
+                    Severity = JobDiagnosticSeverity.Error,
+                    Code = "assembly_incomplete",
+                    Message = r
+                }.ToDiagnostic(job.Id)));
+                jobs.MarkResult(job.Id, SnapshotJobStatus.Partial, snapshotId, $"assembly incomplete: {reason}");
+            }
+            return Accepted(ContributionIngestStatus.Assembling, job.Id, snapshotId, contentHash, identityHash);
+        }
 
         // Publish is guarded on status = pending inside MarkComplete; a zero-row result means the snapshot was
         // NOT pending at publish time (concurrent completion / immutability). Never advance the branch or mark
@@ -512,6 +575,21 @@ public sealed class SnapshotService : IDisposable
             AdvanceBranch(snapshots, repoId, request.BranchName, request.IsDefaultBranch, snapshotId, now);
         jobs.MarkResult(job.Id, SnapshotJobStatus.Complete, snapshotId);
         return Accepted(ContributionIngestStatus.Complete, job.Id, snapshotId, contentHash, identityHash);
+    }
+
+    // Reduces a contribution's per-project declared completeness to one contribution-level value: unsupported
+    // dominates partial, which dominates complete (issue #70).
+    private static string ManifestCompleteness(ContributionManifest manifest)
+    {
+        var worst = "complete";
+        foreach (var p in manifest.Projects)
+        {
+            if (string.Equals(p.Completeness, "unsupported", StringComparison.OrdinalIgnoreCase))
+                return "unsupported";
+            if (string.Equals(p.Completeness, "partial", StringComparison.OrdinalIgnoreCase))
+                worst = "partial";
+        }
+        return worst;
     }
 
     private static IngestContributionResult Accepted(string status, long jobId, long snapshotId, string contentHash, string identityHash) => new()
@@ -533,6 +611,20 @@ public sealed class SnapshotService : IDisposable
         JobId = jobId,
         IdentityHash = identityHash
     };
+
+    // Ensures the requesting branch owns a pointer to the snapshot it attached to (issue #62), so a second
+    // branch at the same commit both resolves and protects the shared snapshot. Raw DB write — callers must
+    // already hold the write gate. No-op when the request carries no branch, no resolved snapshot, or an
+    // unknown repository.
+    private void EnsureAttachBranchPointer(EnsureSnapshotRequest request, long? snapshotId)
+    {
+        if (request.BranchName is not { Length: > 0 } branch || snapshotId is not long sid)
+            return;
+        var snapshots = new SnapshotStore(_conn);
+        if (snapshots.GetRepositoryId(request.RepositoryRemoteUrl) is not long repoId)
+            return;
+        snapshots.AttachBranchPointer(repoId, branch, sid, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+    }
 
     // Advances a branch pointer to a published snapshot and supersedes the previous target — the same
     // atomic branch advance the orchestrator performs, run inside the ingest write transaction.

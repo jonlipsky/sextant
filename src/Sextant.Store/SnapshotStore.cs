@@ -71,6 +71,14 @@ public sealed record SnapshotRow
 }
 
 /// <summary>
+/// Thrown when a producer/contribution supplies a logical-project tuple (repo-relative path + target
+/// framework) that DIVERGES from the metadata already stored for the same <c>canonical_id</c> (issue #69).
+/// A contribution must never silently mutate another producer's shared logical-project row, so the write
+/// is rejected rather than overwriting shared state.
+/// </summary>
+public sealed class LogicalProjectConflictException(string message) : Exception(message);
+
+/// <summary>
 /// Reads and writes the Phase-9 immutable-snapshot tables (<c>repositories</c>, <c>commits</c>,
 /// <c>logical_projects</c>, <c>snapshots</c>, <c>branches</c>, <c>snapshot_projects</c>). The store is
 /// a thin adapter over parameterized SQL; it runs on the caller's connection so its publish statements
@@ -134,27 +142,52 @@ public sealed class SnapshotStore(SqliteConnection connection)
     }
 
     /// <summary>
-    /// Get-or-create the commit-invariant logical project identity. <paramref name="canonicalId"/> is the
-    /// existing logical hash (git-remote|repo-relative-path|tfm); it is the identity surfaced to clients
-    /// and correlated across snapshots — never the per-snapshot-suffixed storage value on the row.
+    /// Get-or-verify the commit-invariant logical project identity WITHOUT perturbing shared state (issue
+    /// #69). <paramref name="canonicalId"/> is the existing logical hash (git-remote|repo-relative-path|tfm);
+    /// it is the identity surfaced to clients and correlated across snapshots — never the
+    /// per-snapshot-suffixed storage value on the row. The row is inserted when absent; on conflict the
+    /// EXISTING metadata is kept, never overwritten — a contribution or a second producer must not silently
+    /// mutate another producer's logical-project tuple. If the supplied <paramref name="repoRelativePath"/>/
+    /// <paramref name="targetFramework"/> DIVERGE from the stored tuple, this throws
+    /// <see cref="LogicalProjectConflictException"/> rather than corrupting shared metadata. (canonical_id
+    /// deterministically derives from the path/tfm, so an honest producer never diverges.)
     /// </summary>
     public long EnsureLogicalProject(long repositoryId, string canonicalId, string repoRelativePath, string? targetFramework, long now)
     {
-        using var cmd = connection.CreateCommand();
-        cmd.CommandText = """
-            INSERT INTO logical_projects (repository_id, canonical_id, repo_relative_path, target_framework, created_at)
-            VALUES (@repo, @canon, @rel, @tfm, @now)
-            ON CONFLICT(repository_id, canonical_id) DO UPDATE SET
-                repo_relative_path = excluded.repo_relative_path,
-                target_framework = excluded.target_framework
-            RETURNING id;
+        using (var insert = connection.CreateCommand())
+        {
+            insert.CommandText = """
+                INSERT INTO logical_projects (repository_id, canonical_id, repo_relative_path, target_framework, created_at)
+                VALUES (@repo, @canon, @rel, @tfm, @now)
+                ON CONFLICT(repository_id, canonical_id) DO NOTHING;
+                """;
+            insert.Parameters.AddWithValue("@repo", repositoryId);
+            insert.Parameters.AddWithValue("@canon", canonicalId);
+            insert.Parameters.AddWithValue("@rel", repoRelativePath);
+            insert.Parameters.AddWithValue("@tfm", (object?)targetFramework ?? DBNull.Value);
+            insert.Parameters.AddWithValue("@now", now);
+            insert.ExecuteNonQuery();
+        }
+
+        using var read = connection.CreateCommand();
+        read.CommandText = """
+            SELECT id, repo_relative_path, target_framework
+            FROM logical_projects WHERE repository_id = @repo AND canonical_id = @canon;
             """;
-        cmd.Parameters.AddWithValue("@repo", repositoryId);
-        cmd.Parameters.AddWithValue("@canon", canonicalId);
-        cmd.Parameters.AddWithValue("@rel", repoRelativePath);
-        cmd.Parameters.AddWithValue("@tfm", (object?)targetFramework ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@now", now);
-        return (long)cmd.ExecuteScalar()!;
+        read.Parameters.AddWithValue("@repo", repositoryId);
+        read.Parameters.AddWithValue("@canon", canonicalId);
+        using var reader = read.ExecuteReader();
+        if (!reader.Read())
+            throw new InvalidOperationException($"logical_projects row for canonical_id '{canonicalId}' vanished after upsert.");
+
+        var id = reader.GetInt64(0);
+        var storedPath = reader.IsDBNull(1) ? null : reader.GetString(1);
+        var storedTfm = reader.IsDBNull(2) ? null : reader.GetString(2);
+        if (storedPath != repoRelativePath || storedTfm != targetFramework)
+            throw new LogicalProjectConflictException(
+                $"contribution project tuple diverges from the shared logical project '{canonicalId}': " +
+                $"stored ({storedPath}, {storedTfm ?? "<null>"}) vs supplied ({repoRelativePath}, {targetFramework ?? "<null>"}).");
+        return id;
     }
 
     public long EnsureBranch(long repositoryId, string name, bool isDefault, long now)
@@ -255,6 +288,27 @@ public sealed class SnapshotStore(SqliteConnection connection)
         return cmd.ExecuteNonQuery();
     }
 
+    /// <summary>
+    /// Guarded pending→partial transition for the finalize completeness gate (issue #70). Like
+    /// <see cref="MarkComplete"/> it advances ONLY a still-pending snapshot, so it can never downgrade an
+    /// already-published (immutable) complete snapshot. A partial snapshot is diagnosable but is NEVER
+    /// selected by a branch pointer, so a materially-incomplete assembly is retained for inspection yet
+    /// never served as if it were complete. Returns the number of rows updated (1 = transitioned).
+    /// </summary>
+    public int MarkPartial(long snapshotId, long publishedAt)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            UPDATE snapshots SET status = @partial, published_at = @at
+             WHERE id = @id AND status = @pending;
+            """;
+        cmd.Parameters.AddWithValue("@partial", SnapshotStatus.Partial);
+        cmd.Parameters.AddWithValue("@at", publishedAt);
+        cmd.Parameters.AddWithValue("@id", snapshotId);
+        cmd.Parameters.AddWithValue("@pending", SnapshotStatus.Pending);
+        return cmd.ExecuteNonQuery();
+    }
+
     /// <summary>Sets a snapshot's status (e.g. to partial/failed/unsupported/superseded for diagnosis).</summary>
     public void MarkStatus(long snapshotId, string status)
     {
@@ -300,6 +354,37 @@ public sealed class SnapshotStore(SqliteConnection connection)
     // ---- branch pointers -----------------------------------------------------------------------
 
     /// <summary>
+    /// Ensures the requesting branch has its OWN pointer to a snapshot it resolves to on ATTACH, without
+    /// perturbing shared state (issue #62). Because snapshot identity excludes the branch name, two
+    /// branches at the same commit share ONE snapshot; the first indexes and points at it, but a second
+    /// branch that merely ATTACHES (no re-index) would otherwise have no pointer — so it neither resolves
+    /// via <c>ResolveBranch</c> nor protects the snapshot from retention. This inserts the branch as
+    /// NON-default when absent (<c>ON CONFLICT DO NOTHING</c> preserves any existing <c>is_default</c> and
+    /// never demotes the real default) and points it at the snapshot only when it has no pointer yet or
+    /// points elsewhere — it never supersedes another branch's target. Returns the branch id.
+    /// </summary>
+    public long AttachBranchPointer(long repositoryId, string branchName, long snapshotId, long now)
+    {
+        using (var insert = connection.CreateCommand())
+        {
+            insert.CommandText = """
+                INSERT INTO branches (repository_id, name, snapshot_id, is_default, updated_at)
+                VALUES (@repo, @name, NULL, 0, @now)
+                ON CONFLICT(repository_id, name) DO NOTHING;
+                """;
+            insert.Parameters.AddWithValue("@repo", repositoryId);
+            insert.Parameters.AddWithValue("@name", branchName);
+            insert.Parameters.AddWithValue("@now", now);
+            insert.ExecuteNonQuery();
+        }
+
+        var branchId = GetBranchId(repositoryId, branchName)!.Value;
+        if (GetBranchSnapshotId(branchId) != snapshotId)
+            SetBranchPointer(branchId, snapshotId, now);
+        return branchId;
+    }
+
+    /// <summary>
     /// Points a branch at a snapshot (advance or rollback). Mutating only this pointer row leaves every
     /// snapshot's semantic rows byte-identical (criterion 2). Runs on the caller's connection so a full
     /// index can advance the default branch inside the same transaction that publishes the snapshot.
@@ -331,9 +416,48 @@ public sealed class SnapshotStore(SqliteConnection connection)
         cmd.ExecuteNonQuery();
     }
 
-    public long? GetDefaultBranchId(long repositoryId)
+    /// <summary>
+    /// The set of logical project canonical ids present in an assembled/native snapshot (issue #70 finalize
+    /// gate). COALESCEs the logical-project canonical id with the physical project canonical id — the same
+    /// identity the importer/validator map under — so it can be compared to a manifest's declared graph.
+    /// </summary>
+    public HashSet<string> GetSnapshotLogicalCanonicalIds(long snapshotId)
     {
         using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT DISTINCT COALESCE(lp.canonical_id, p.canonical_id)
+            FROM snapshot_projects sp
+            JOIN projects p ON p.id = sp.project_id
+            LEFT JOIN logical_projects lp ON lp.id = p.logical_project_id
+            WHERE sp.snapshot_id = @s;
+            """;
+        cmd.Parameters.AddWithValue("@s", snapshotId);
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            if (!reader.IsDBNull(0)) ids.Add(reader.GetString(0));
+        return ids;
+    }
+
+    /// <summary>
+    /// Every logical project canonical id the catalog has ever recorded for a repository (issue #70). Used
+    /// by the finalize gate to classify a referenced project-version key as intra-repo (must be assembled)
+    /// vs a cross-repo provider reference (resolved via snapshot_dependencies; #72 deferred).
+    /// </summary>
+    public HashSet<string> GetKnownLogicalCanonicalIds(long repositoryId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT DISTINCT canonical_id FROM logical_projects WHERE repository_id = @repo;";
+        cmd.Parameters.AddWithValue("@repo", repositoryId);
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            if (!reader.IsDBNull(0)) ids.Add(reader.GetString(0));
+        return ids;
+    }
+
+    public long? GetDefaultBranchId(long repositoryId)
+    {        using var cmd = connection.CreateCommand();
         cmd.CommandText = "SELECT id FROM branches WHERE repository_id = @repo AND is_default = 1 ORDER BY id LIMIT 1;";
         cmd.Parameters.AddWithValue("@repo", repositoryId);
         return cmd.ExecuteScalar() is long id ? id : null;

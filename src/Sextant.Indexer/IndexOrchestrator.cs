@@ -434,7 +434,13 @@ public sealed class IndexOrchestrator
                         snapshotStore.MarkStatus(providerSnapId, SnapshotStatus.Pending);
                     projectId = projectStore.UpsertSnapshotProject(identity, providerSnapId, providerLogicalId, now);
                     snapshotStore.MapProject(providerSnapId, projectId);
-                    extractThisProject = inFilter;
+                    // Empty-grown-project guard (issue #58): a provider project pulled in ONLY as a late
+                    // cross-repo reference may be OUTSIDE this run's project filter (incremental run), so
+                    // `inFilter` would be false and the grown provider would republish with a mapped-but-
+                    // never-extracted (empty) project version — a materially-incomplete provider silently
+                    // marked complete. Growing the provider REQUIRES extracting the added project version,
+                    // so force extraction here regardless of the filter.
+                    extractThisProject = true;
                 }
 
                 providerProjectInfo[projectId] = (providerSnapId, providerRepoId, containingSubmodule.CommitSha, containingSubmodule.IsDirty);

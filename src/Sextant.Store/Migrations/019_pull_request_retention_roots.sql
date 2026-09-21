@@ -39,3 +39,15 @@ CREATE TABLE pull_request_snapshots (
 
 CREATE INDEX ix_pull_request_snapshots_state ON pull_request_snapshots(state);
 CREATE INDEX ix_pull_request_snapshots_snapshot ON pull_request_snapshots(snapshot_id);
+
+-- Phase 17 (slice 2, issue #70): per-contribution assembly completeness.
+--
+-- Phase 16 assembles a repository snapshot from multiple client/CI contributions across several ingest
+-- calls, then FINALIZE publishes it. Before slice 2, finalize published Complete without a
+-- topological-completeness gate — so an assembly missing project versions, or one where a contributor
+-- declared its own project versions partial/unsupported (ContributionManifest project Completeness),
+-- was silently published Complete. Recording each accepted contribution's declared completeness makes
+-- the finalize gate durable across the multi-call assembly: if ANY contribution that fed the snapshot
+-- was non-complete, the assembled snapshot is published Partial (never silently Complete). Default
+-- 'complete' preserves the historical behaviour for every existing row.
+ALTER TABLE snapshot_contributions ADD COLUMN completeness TEXT NOT NULL DEFAULT 'complete';
