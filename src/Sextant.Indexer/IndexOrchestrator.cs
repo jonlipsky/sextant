@@ -16,13 +16,15 @@ public sealed class IndexOrchestrator
     private readonly bool _useDocumentExtractor;
     private readonly ExtractionParallelismOptions _parallelism;
     private readonly IndexProfileDescriptor _profile;
+    private readonly IGitStateProbe _gitStateProbe;
 
     public IndexOrchestrator(
         IndexDatabase db,
         Action<string>? log = null,
         bool useDocumentExtractor = false,
         ExtractionParallelismOptions? parallelism = null,
-        IndexProfileDescriptor? profile = null)
+        IndexProfileDescriptor? profile = null,
+        IGitStateProbe? gitStateProbe = null)
     {
         _db = db;
         _log = log;
@@ -32,6 +34,9 @@ public sealed class IndexOrchestrator
         // pre-profile behavior of building every optional feature (behavior-preserving for tests and
         // any direct caller). Production entry points pass the configured profile explicitly.
         _profile = profile ?? IndexProfileDescriptor.Full;
+        // The git-state probe (issue #49) pins HEAD/tree/status for a pass and re-verifies it before
+        // publish. Defaults to the real git-backed probe; tests inject a fake to simulate a mid-pass move.
+        _gitStateProbe = gitStateProbe ?? GitStateProbe.Default;
     }
 
     /// <summary>One non-generated document paired with its project's compilation, the unit of parallel
@@ -49,7 +54,8 @@ public sealed class IndexOrchestrator
         bool enableSnapshots = true,
         OverlayContext? overlay = null,
         string? workingTreeDelta = null,
-        string? fallbackReason = null)
+        string? fallbackReason = null,
+        GitStatePin? gitStatePin = null)
     {
         var totalStopwatch = Stopwatch.StartNew();
         var phaseStopwatch = new Stopwatch();
@@ -192,6 +198,18 @@ public sealed class IndexOrchestrator
         // wins (tests), so this only gates the auto-resolved git path.
         var isFullIndex = projectCanonicalFilter == null;
         var effectiveCtx = snapshotContext ?? (enableSnapshots ? TryResolveSnapshotContext(repoRoot) : null);
+
+        // Issue #49: pin the git state (HEAD/tree/working-tree status) this pass is bound to and
+        // re-verify it right before the atomic publish, so a mid-pass HEAD or working-tree move aborts
+        // the pass instead of publishing a torn generation. A baseline threaded in by the reconciler
+        // (captured before ITS status read) is authoritative; otherwise, on the auto-resolved git path
+        // (no injected snapshotContext, a real repo root), capture the baseline here BEFORE the
+        // extraction phases read any source bytes. When a snapshotContext is injected (tests) with no
+        // pin, verification is skipped so the snapshot test suite stays byte-identical.
+        var gitStateBaseline = gitStatePin;
+        if (gitStateBaseline == null && effectiveCtx != null && snapshotContext == null && repoRoot != null)
+            gitStateBaseline = _gitStateProbe.Capture(repoRoot);
+
         SnapshotStore? snapshotStore = null;
         long? repositoryId = null;
         long? commitId = null;
@@ -1227,6 +1245,35 @@ public sealed class IndexOrchestrator
         }
 
         FinishPhase();
+
+        // Issue #49: re-verify the pinned git state NOW — after every source byte has been read during
+        // extraction and BEFORE any generation/snapshot pointer is flipped. If HEAD or the working tree
+        // moved since the baseline capture (a mid-pass commit/checkout/rebase/stash/edit), abort the pass
+        // WITHOUT publishing: throwing here unwinds before MarkComplete, so the write session rolls back
+        // its open batch and the run scope abandons the staging generation on dispose (swept by
+        // Recover()) — exactly like a crashed pass. No mixed-state generation is ever published; a
+        // subsequent stable pass (bounded retry, else the periodic reconcile) publishes the correct
+        // single-state snapshot. Only guards the snapshot path (a baseline is captured only when a
+        // git-backed snapshot context is in play); the legacy mutable-row path is unaffected. A failed
+        // re-capture (null) is treated fail-closed: the state cannot be proven stable, so the pass aborts.
+        if (gitStateBaseline != null && effectiveCtx != null && repoRoot != null)
+        {
+            var gitStateNow = _gitStateProbe.Capture(repoRoot);
+            if (gitStateNow == null || !gitStateBaseline.Matches(gitStateNow))
+            {
+                if (metrics != null)
+                {
+                    totalStopwatch.Stop();
+                    metrics.TotalDurationMs = totalStopwatch.ElapsedMilliseconds;
+                    metrics.Status = IndexRunStatus.Cancelled;
+                    metrics.FailureReason = "git state moved mid-pass; index aborted without publishing (issue #49)";
+                }
+                throw new GitStateMovedException(
+                    "The git HEAD or working tree moved during indexing; the pass was aborted before publishing " +
+                    "so no mixed-state generation is committed. A subsequent pass over the stable tree will " +
+                    "publish the correct snapshot (issue #49).");
+            }
+        }
 
         // Publish the generation atomically with the final batch of data: the completion pointer flip
         // enrols in the still-open write transaction, so a reader either sees the previous complete run
