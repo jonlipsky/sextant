@@ -45,17 +45,44 @@ public sealed class ServicePaths
     /// directory to verify blobs), so the two can never disagree. It strips a trailing <c>.git</c>, replaces
     /// invalid filename characters, and trims separators/dots so <c>.</c>/<c>..</c> traversal collapses to a
     /// safe default.
+    /// <para>
+    /// Cross-tenant isolation (issue #7): the basename alone is NOT unique — <c>org-a/common</c> and
+    /// <c>org-b/common</c> are DIFFERENT repositories that share a basename. Mapping both to the same
+    /// directory would let one tenant's checkout satisfy another tenant's request (a cross-tenant
+    /// isolation bug, criterion 1). So the segment is suffixed with a short stable hash of the FULL
+    /// normalized remote URL: distinct URLs get distinct directories while the human-readable basename is
+    /// preserved. Trivially-equivalent spellings (trailing <c>/</c> or <c>.git</c>) normalize to the SAME
+    /// hash so the same repo always maps to the same directory.
+    /// </para>
     /// </summary>
     public static string RepoDirectoryName(string repositoryRemoteUrl)
     {
-        var trimmed = (repositoryRemoteUrl ?? string.Empty).TrimEnd('/');
+        var url = repositoryRemoteUrl ?? string.Empty;
+        var trimmed = url.TrimEnd('/');
         var lastSlash = trimmed.LastIndexOf('/');
         var name = lastSlash >= 0 ? trimmed[(lastSlash + 1)..] : trimmed;
         if (name.EndsWith(".git", StringComparison.OrdinalIgnoreCase))
             name = name[..^4];
         var chars = name.Select(c => Array.IndexOf(Path.GetInvalidFileNameChars(), c) >= 0 ? '_' : c).ToArray();
         var safe = new string(chars).Trim('_', '.');
-        return safe.Length == 0 ? "repo" : safe;
+        if (safe.Length == 0)
+            safe = "repo";
+        return $"{safe}-{ShortUrlHash(url)}";
+    }
+
+    /// <summary>
+    /// A short, stable, collision-resistant hash of the identity-bearing part of a remote URL. Only the
+    /// identity-neutral trailing <c>/</c> and <c>.git</c> are normalized away (mirroring the basename
+    /// derivation) so equivalent spellings of one repo share a directory; everything else — host, owner,
+    /// path, case — is significant, so two genuinely-distinct repositories never collide.
+    /// </summary>
+    private static string ShortUrlHash(string repositoryRemoteUrl)
+    {
+        var normalized = (repositoryRemoteUrl ?? string.Empty).Trim().TrimEnd('/');
+        if (normalized.EndsWith(".git", StringComparison.OrdinalIgnoreCase))
+            normalized = normalized[..^4];
+        var digest = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(normalized));
+        return Convert.ToHexString(digest, 0, 6).ToLowerInvariant();
     }
 
     /// <summary>Allocates a fresh, empty per-job scratch directory under the scratch root.</summary>

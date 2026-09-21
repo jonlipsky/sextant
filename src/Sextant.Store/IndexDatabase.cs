@@ -218,7 +218,11 @@ public sealed class IndexDatabase : IDisposable
     /// </summary>
     public IndexReadiness CheckReadiness()
     {
-        var conn = GetConnection();
+        // Use a fresh per-call connection, NOT the shared memoized GetConnection(): every MCP tool invocation
+        // runs this readiness check, and concurrent /mcp requests would otherwise execute these commands
+        // simultaneously on the single non-thread-safe shared connection (issue #57 residual / #15). A pooled
+        // read connection gives each caller its own handle so readiness is concurrency-safe like the queries.
+        using var conn = OpenReadConnection();
         EnsureSchemaVersionTable(conn);
         var current = GetSchemaVersion(conn);
         var expected = LatestSchemaVersion;

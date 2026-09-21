@@ -369,11 +369,16 @@ public static class ServiceApp
         return controlPath ? localPort != controlPort : localPort != qp;
     }
 
-    /// <summary>Uniform 404 used to HIDE a plane that exists on a different port (no cross-plane oracle).</summary>
+    /// <summary>
+    /// Uniform 404 used to HIDE a plane that exists on a different port (no cross-plane oracle). It emits the
+    /// SAME response an unmapped route produces — status 404 with an empty body and no extra headers — so a
+    /// wrong-plane request is byte-for-byte indistinguishable from a route that does not exist at all
+    /// (issue #61 / criterion 1). Writing any body here (e.g. "Not Found") would itself be the oracle.
+    /// </summary>
     private static Task NotFound(HttpContext context)
     {
         context.Response.StatusCode = StatusCodes.Status404NotFound;
-        return context.Response.WriteAsync("Not Found");
+        return Task.CompletedTask;
     }
 
     // Constant-time comparison so a token check does not leak length/content via timing.
