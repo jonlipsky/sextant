@@ -228,12 +228,13 @@ Migration `011_normalize_files_and_occurrences.sql` is the Phase-7 compaction. I
 
 ### Later additive migrations (`012`–`016`)
 
-Migrations `012` through `016` are all **additive / forward-only** (new tables + indices only; nothing is dropped and `index_runs` is never cleared), so they are *not* rebuild-required in the destructive sense of `007`/`011`. Each still advances `schema_version`, and because the Phase-9 snapshot-identity hash folds the schema version in, an existing lower-schema base is treated as schema-incompatible and rebuilt into the current schema on the next full run (the safe, expected upgrade path via `IndexDatabase.CheckReadiness`). `LatestSchemaVersion` auto-derives from `LoadMigrations().Max()` and is currently **16**.
+Migrations `012` through `017` are all **additive / forward-only** (new tables, indices, or columns only; nothing is dropped and `index_runs` is never cleared), so they are *not* rebuild-required in the destructive sense of `007`/`011`. Each still advances `schema_version`, and because the Phase-9 snapshot-identity hash folds the schema version in, an existing lower-schema base is treated as schema-incompatible and rebuilt into the current schema on the next full run (the safe, expected upgrade path via `IndexDatabase.CheckReadiness`). `LatestSchemaVersion` auto-derives from `LoadMigrations().Max()` and is currently **17**.
 
 - `012_index_run_configuration.sql` — per-run indexing profile + configuration hash (Phase 8).
 - `013_immutable_snapshots.sql` — the Phase-9 immutable snapshot catalog: `snapshots` (identity-hashed generations), `branches`, `commits`, branch/commit pointers.
 - `014_local_overlay.sql` — Phase-10 git-aware local overlay bookkeeping.
 - `015_snapshot_dependencies.sql` — Phase-12 cross-repository `snapshot_dependencies` (consumer→provider) edges + `snapshot_projects` mapping.
+- `017_snapshot_capability_fingerprint.sql` — Phase-15 worker-capability fingerprint: adds the nullable `snapshots.capability_fingerprint` column (the producing worker's `WorkerCapability.Fingerprint`), recorded in provenance and folded into the snapshot identity only when non-null so a snapshot built under one capability set is never silently reused under an incompatible one (a null value keeps a local/single-node snapshot byte-identical to pre-Phase-15).
 
 ### Standalone index service catalog (migration `016`)
 

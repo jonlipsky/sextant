@@ -122,6 +122,62 @@ capability meta) instead of a single opaque failure. A node with no configured w
 `UnavailableSnapshotWorker`: it is available for **queries** but reports no capacity, and any ensure
 resolves to an `unsupported` job rather than hanging queued forever.
 
+## Platform-specific routing by worker capability (Phase 15)
+
+The ProcessStack server runs on **Linux**, but a C# graph may target Windows (`net8.0-windows`) or Apple
+platforms (`net8.0-ios`, `-maccatalyst`, …). Linux evaluates *most* such projects fine with restored
+reference packs; only projects whose evaluation Linux genuinely **cannot** complete are routed to a native
+worker. Routing keys off **demonstrated evaluation success + policy, NEVER the TFM name alone** — a
+`net8.0-windows` class library that Linux loaded cleanly is never needlessly routed.
+
+**The capability model + routing decision are ProcessStack-agnostic and live in `Sextant.Core.Platform`:**
+
+- `WorkerCapability` — a stable, comparable advertisement of what a worker can faithfully evaluate (OS,
+  architecture, SDK bands, installed workloads, reference packs, target platforms, custom tools). Its
+  deterministic `Fingerprint` (SHA-256) is recorded in snapshot provenance and folded into the Phase-9
+  snapshot identity **only when non-null**, so a snapshot built under one capability set is never silently
+  reused under an incompatible one (extends the Phase-8 config-hash + Phase-11 read-time compat gate).
+- `CapabilityRequirement` — what a project graph needs; a *portable* requirement is satisfied by any
+  worker. A requirement derived from the TFM string is only a **hint** (`RequirementSource.Declared`);
+  routing escalates only on a `DemonstratedFailure`.
+- `CapabilityRouter` — the **pure** decision engine: given each project's discovered requirement, its
+  demonstrated Linux outcome, the available worker capabilities, and the policy, it decides per project to
+  keep it on Linux, escalate it to the least-specialized compatible native worker, or fail it closed. It
+  never executes anything.
+- `PlatformRoutingPolicy` — per-repo/profile policy (`platform_routing` in `sextant.json`, env
+  `SEXTANT_PLATFORM_ROUTING`): `auto` (default — escalate to any compatible native worker) or `linux_only`
+  (never escalate; a non-Linux-evaluable project is marked unsupported). An `allowed_native_operating_systems`
+  set can enable one OS while withholding another during capacity provisioning.
+
+**The execution seam is service-side (`Sextant.Service.Placement`), behind the same core contract:**
+
+- `IWorkerPlacement` — advertises a `Capability` and produces a snapshot when selected. `LocalPlacement`
+  (the Phase-13 in-process indexer) is the **default (Linux)** placement. The actual native Windows/macOS
+  worker EXECUTION is ProcessStack's trusted-placement job (**Phase 14, deferred**) — a Phase-14 placement
+  implements this same interface without the core routing contract ever depending on ProcessStack.
+- `IPlatformEvaluationProbe` — observes the demonstrated Linux outcome per project. The default
+  `AssumeLinuxCapableProbe` reports everything Linux-capable (correct zero-cost behaviour for the common
+  portable case); a deployment with native workers substitutes a real probe.
+- `CapabilityRoutingSnapshotWorker` — the `ISnapshotWorker` that ties probe → `RouteJob` → fail-closed
+  diagnostics **or** execute the selected placement. Routing is **job-granular** in Phase 15 (one worker
+  per job; per-project mixed production is a later phase).
+
+**Fail closed (criterion 4).** When no compatible worker exists (or no single worker covers the union of a
+job's escalated requirements), the job resolves to `unsupported` with a structured `no_compatible_worker`
+diagnostic per affected project (reusing `snapshot_job_diagnostics`) and **no** complete snapshot is
+published — never a silent empty success. A routed success additionally records a `routed_to_native_worker`
+info diagnostic in provenance.
+
+**Local operation is untouched (CRITICAL 2).** A plain single-node/local run leaves the snapshot
+capability null (identity byte-identical to pre-Phase-15) and, with only the default placement registered,
+the routing worker never escalates — so a local Linux/Windows/macOS dev box indexes its own platform
+exactly as before, with **zero** routing infrastructure required.
+
+Because the native placements are a substitutable seam, the routing **decision** + fail-closed + fingerprint
+logic are fully covered on a Linux CI with fake Windows/macOS placements (criterion 6). The env-gated
+`PlatformFixtureMatrixTests` (`SEXTANT_RUN_PLATFORM_MATRIX=1`, `[TestCategory("Performance")]`) sweeps the
+full fixture matrix without destabilizing the default suite on runners lacking a native toolchain.
+
 ## On-disk volumes — scratch is quarantined (criterion 3)
 
 `ServicePaths` materializes four roots and enforces the load-bearing invariant that **worker scratch is
@@ -179,8 +235,10 @@ that is already complete. `ProviderGrowthImmutabilityTests` is the regression.
 ## Migration & schema
 
 Migration `016_service_job_catalog.sql` adds `snapshot_jobs`, `snapshot_job_diagnostics`, and
-`writer_lease` — additive/forward-only, extending (not duplicating) the Phase-9 catalog. See
-[`schema.md`](schema.md) for the table definitions. `LatestSchemaVersion` is **16**.
+`writer_lease` — additive/forward-only, extending (not duplicating) the Phase-9 catalog. Migration
+`017_snapshot_capability_fingerprint.sql` adds the additive `snapshots.capability_fingerprint` column
+(Phase 15) — the worker-capability fingerprint folded into snapshot provenance/identity. See
+[`schema.md`](schema.md) for the table definitions. `LatestSchemaVersion` is **17**.
 
 ## Testing
 
@@ -199,3 +257,17 @@ catalog, and a `FakeSnapshotWorker`. The suite maps to the acceptance criteria:
 Plus store-level regressions: `RetentionSnapshotGcTests` (#46/#37/#54), `WriterLeaseTests` (#38),
 `ProviderGrowthImmutabilityTests` (#53), and `RemoteFederationTests` (#51 paging/caching/offline/timeout/
 auth).
+
+### Phase 15 — platform routing tests
+
+| Criterion | Test coverage |
+| --- | --- |
+| 1 — portable graphs stay on Linux | `CapabilityRouterTests`, `CapabilityRoutingWorkerTests` (default placement, no route) |
+| 2 — Windows project routes to a Windows worker | `CapabilityRoutingWorkerTests` (fake Windows placement publishes) |
+| 3 — Apple project routes to a macOS worker | `CapabilityRoutingWorkerTests` (fake macOS placement publishes) |
+| 4 — no compatible worker → fail closed | `CapabilityRouterTests`, `CapabilityRoutingWorkerTests` (`unsupported` + `no_compatible_worker`, no complete snapshot) |
+| 5 — capability fingerprint gates reuse | `SnapshotIdentityTests`, `SnapshotCapabilityStoreTests`, `FederatedReadContextTests` (identity fold + read-time compat) |
+| 6 — matrix validated / env-gated; core stays agnostic | `PlatformFixtureMatrixTests` (`SEXTANT_RUN_PLATFORM_MATRIX`), `ArchitectureBoundaryTests` (`WorkerCapability`/`CapabilityRouter` on the core side) |
+
+The demonstrated-not-TFM rule is unit-tested by `LinuxEvaluationAnalyzerTests`; criteria 2/3 native legs run
+through a substitutable fake placement on Linux (real native execution is Phase 14).

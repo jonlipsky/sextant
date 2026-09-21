@@ -16,6 +16,8 @@ public class ArchitectureBoundaryTests
 
     [DataTestMethod]
     [DataRow(typeof(Sextant.Core.SnapshotIdentity))]
+    [DataRow(typeof(Sextant.Core.Platform.WorkerCapability))]
+    [DataRow(typeof(Sextant.Core.Platform.CapabilityRouter))]
     [DataRow(typeof(Sextant.Store.IndexDatabase))]
     [DataRow(typeof(Sextant.Indexer.IndexOrchestrator))]
     [DataRow(typeof(Sextant.Daemon.DaemonHost))]

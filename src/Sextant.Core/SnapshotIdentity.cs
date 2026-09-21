@@ -58,6 +58,18 @@ public sealed record SnapshotIdentity
     public bool IsOverlay { get; init; }
 
     /// <summary>
+    /// The Phase-15 worker-capability fingerprint (<see cref="Platform.WorkerCapability.Fingerprint"/>) of
+    /// the worker that produced this snapshot: its OS, SDK bands, installed workloads, and reference packs.
+    /// It is folded into <see cref="Hash"/> ONLY when non-null, so a snapshot built under one capability
+    /// set is never silently reused under an incompatible one (acceptance criterion 5), while every
+    /// local/single-node run — which does not route and leaves this null — keeps a snapshot identity
+    /// byte-identical to before this field existed (CRITICAL 2: zero-dependency local operation). The
+    /// producing NODE's default capability is used (not a post-routing per-project one), so a client's
+    /// request identity matches the published identity and Phase-13 idempotent attachment is preserved.
+    /// </summary>
+    public string? CapabilityFingerprint { get; init; }
+
+    /// <summary>
     /// The stable idempotency/compatibility hash over the identity tuple. Deterministic across
     /// machines and runs: a fixed, ordered <c>key=value;</c> pre-image hashed with SHA-256 (hex).
     /// </summary>
@@ -73,6 +85,10 @@ public sealed record SnapshotIdentity
             // pre-image is unchanged, so its identity_hash is byte-identical to before this field existed.
             if (WorkingTreeDelta != null)
                 canonical += $";kind={(IsOverlay ? "overlay" : "full")}";
+            // Fold the capability fingerprint ONLY when set (Phase 15): local/single-node runs leave it
+            // null, keeping their identity byte-identical to before this field existed (CRITICAL 2).
+            if (CapabilityFingerprint != null)
+                canonical += $";capability={CapabilityFingerprint}";
             var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(canonical));
             return Convert.ToHexStringLower(bytes);
         }

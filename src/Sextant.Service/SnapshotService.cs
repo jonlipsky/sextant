@@ -112,7 +112,7 @@ public sealed class SnapshotService : IDisposable
     public async Task<EnsureSnapshotResult> EnsureSnapshotAsync(
         EnsureSnapshotRequest request, CancellationToken cancellationToken = default)
     {
-        var identity = request.ToIdentity(_options.DefaultConfigHash);
+        var identity = request.ToIdentity(_options.DefaultConfigHash, _options.DefaultCapabilityFingerprint);
         var hash = identity.Hash;
 
         // Idempotent attach: create-or-return the ONE durable job for this identity (criterion 1), and in

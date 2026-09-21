@@ -1,4 +1,5 @@
 using Sextant.Core;
+using Sextant.Core.Platform;
 using Sextant.Indexer;
 using Sextant.Store;
 
@@ -84,7 +85,8 @@ public sealed class LocalIndexerSnapshotWorker(
     IndexDatabase database,
     SextantConfiguration configuration,
     ICheckoutProvider checkoutProvider,
-    Action<string>? log = null) : ISnapshotWorker
+    Action<string>? log = null,
+    WorkerCapability? capability = null) : ISnapshotWorker
 {
     public async Task<SnapshotWorkResult> ProduceAsync(
         EnsureSnapshotRequest request, string identityHash, string scratchDir, CancellationToken cancellationToken)
@@ -102,7 +104,11 @@ public sealed class LocalIndexerSnapshotWorker(
             CommitSha = request.CommitSha,
             TreeSha = request.TreeSha,
             BranchName = request.BranchName ?? "main",
-            IsDefaultBranch = request.BranchName is null
+            IsDefaultBranch = request.BranchName is null,
+            // Stamp the producing node's capability fingerprint (Phase 15) so the published snapshot's
+            // identity + provenance record what evaluated it. Null when unset — an ordinary local index
+            // that never routes — keeping the identity byte-identical to the pre-Phase-15 path (CRITICAL 2).
+            CapabilityFingerprint = capability?.Fingerprint
         };
 
         try

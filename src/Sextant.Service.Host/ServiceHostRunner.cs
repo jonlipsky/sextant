@@ -3,7 +3,9 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Sextant.Core;
+using Sextant.Core.Platform;
 using Sextant.Service;
+using Sextant.Service.Placement;
 using Sextant.Store;
 
 namespace Sextant.Service.Host;
@@ -27,8 +29,21 @@ public static class ServiceHostRunner
         var paths = new ServicePaths(options.Volumes);
         var database = new IndexDatabase(options.CatalogDbPath, IndexWriteOptions.FromConfiguration(config));
 
-        var worker = new LocalIndexerSnapshotWorker(
-            database, config, new PersistentVolumeCheckoutProvider(paths), Console.Error.WriteLine);
+        // Phase 15: the default (Linux, in-process) placement — the node's own capability — behind the
+        // routing seam. With no native placements registered this behaves exactly like the Phase-13 direct
+        // worker (single-node/local operation needs zero routing infrastructure — CRITICAL 2). Real native
+        // Windows/macOS placements are wired by ProcessStack in Phase 14 behind this same seam.
+        var nodeCapability = WorkerCapability.LocalDefault;
+        var checkoutProvider = new PersistentVolumeCheckoutProvider(paths);
+        var localWorker = new LocalIndexerSnapshotWorker(
+            database, config, checkoutProvider, Console.Error.WriteLine, nodeCapability);
+        var defaultPlacement = new LocalPlacement(nodeCapability, localWorker);
+        var worker = new CapabilityRoutingSnapshotWorker(
+            defaultPlacement,
+            nativePlacements: [],
+            probe: new AssumeLinuxCapableProbe(),
+            policy: options.PlatformRouting,
+            log: Console.Error.WriteLine);
 
         SnapshotService service;
         try

@@ -218,6 +218,10 @@ public sealed class IndexOrchestrator
                     // carries the working-tree delta so it never claims identity with the clean base
                     // commit's snapshot (issue #43). Null for a genuine clean-HEAD full index.
                     WorkingTreeDelta = workingTreeDelta,
+                    // Phase-15 worker-capability fingerprint: null in local/single-node runs (identity
+                    // unchanged), set by the routing service so a snapshot built under one capability set
+                    // is never silently reused under an incompatible one.
+                    CapabilityFingerprint = effectiveCtx.CapabilityFingerprint,
                     // A full index is never an overlay; for a dirty fallback this keeps its identity
                     // distinct from an overlay of the same dirty tree (issue #47). Ignored when the tree
                     // is clean (delta null → discriminator not folded).
@@ -268,7 +272,9 @@ public sealed class IndexOrchestrator
                         ToolchainFingerprint = ToolchainFingerprint.Current,
                         WorkingTreeDelta = overlay.WorkingTreeDelta,
                         // An overlay is distinct from a full-local fallback for the same dirty tree (#47).
-                        IsOverlay = true
+                        IsOverlay = true,
+                        // Phase-15 worker-capability fingerprint (null in local/single-node runs).
+                        CapabilityFingerprint = effectiveCtx.CapabilityFingerprint
                     };
                     var (overlayId, overlayExisted, overlayStatus) = snapshotStore.BeginPending(
                         overlayIdentity, repositoryId.Value, commitId, runScope.RunId, now,
@@ -355,7 +361,9 @@ public sealed class IndexOrchestrator
                 // A dirty submodule tree is never the clean pinned commit (issue #48): fold a delta marker
                 // so the provider identity_hash differs from the clean pin's and the two never collide.
                 WorkingTreeDelta = sub.IsDirty ? "submodule-dirty" : null,
-                IsOverlay = false
+                IsOverlay = false,
+                // Phase-15 worker-capability fingerprint (null in local/single-node runs).
+                CapabilityFingerprint = effectiveCtx.CapabilityFingerprint
             };
             var (provId, provExisted, provStatus) = snapshotStore.BeginPending(
                 providerIdentity, providerRepoId, providerCommitId, runScope.RunId, now, isProvider: true);

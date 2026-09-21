@@ -23,4 +23,13 @@ public sealed record SnapshotContext
 
     /// <summary>Whether <see cref="BranchName"/> is the repository's default/current-selected branch.</summary>
     public bool IsDefaultBranch { get; init; } = true;
+
+    /// <summary>
+    /// The Phase-15 worker-capability fingerprint of the worker producing this snapshot, or <c>null</c>
+    /// for a local/single-node run that does not route. When set it is folded into
+    /// <see cref="SnapshotIdentity.CapabilityFingerprint"/> and recorded in provenance; when null the
+    /// snapshot identity stays byte-identical to the pre-Phase-15 path (CRITICAL 2: the local stdio/MCP
+    /// and single-node paths require zero routing infrastructure).
+    /// </summary>
+    public string? CapabilityFingerprint { get; init; }
 }

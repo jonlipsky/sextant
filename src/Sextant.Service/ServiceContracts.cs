@@ -27,8 +27,12 @@ public sealed record EnsureSnapshotRequest
     /// node's own profile/feature hash) is folded in instead, so the identity matches the hash the live
     /// worker's orchestrator publishes under (<c>IndexProfileDescriptor.ConfigurationHash</c>) — otherwise
     /// the service's idempotent lookup would never find the worker's published snapshot.
+    /// <paramref name="fallbackCapability"/> is the producing NODE's default worker-capability fingerprint
+    /// (Phase 15): the client cannot know the post-routing capability, so the request identity uses the
+    /// node's default capability — the SAME value the worker stamps into the published snapshot — keeping
+    /// request identity == published identity so idempotent attachment is preserved. Null in tests/local.
     /// </summary>
-    public SnapshotIdentity ToIdentity(string? fallbackConfigHash = null) => new()
+    public SnapshotIdentity ToIdentity(string? fallbackConfigHash = null, string? fallbackCapability = null) => new()
     {
         RepositoryRemoteUrl = RepositoryRemoteUrl,
         CommitSha = CommitSha,
@@ -36,7 +40,8 @@ public sealed record EnsureSnapshotRequest
         SchemaVersion = IndexDatabase.LatestSchemaVersion,
         AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
         ConfigHash = ConfigHash ?? fallbackConfigHash,
-        ToolchainFingerprint = ToolchainFingerprint.Current
+        ToolchainFingerprint = ToolchainFingerprint.Current,
+        CapabilityFingerprint = fallbackCapability
     };
 }
 

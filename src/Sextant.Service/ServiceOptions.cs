@@ -1,4 +1,5 @@
 using Sextant.Core;
+using Sextant.Core.Platform;
 using Sextant.Indexer;
 
 namespace Sextant.Service;
@@ -55,6 +56,23 @@ public sealed record ServiceOptions
     /// </summary>
     public string? DefaultConfigHash { get; init; }
 
+    /// <summary>
+    /// The producing NODE's default worker-capability fingerprint (Phase 15), folded into a request's
+    /// snapshot identity (and stamped into the published snapshot) so request identity == published
+    /// identity and an incompatible-capability reuse is blocked (criterion 5). Defaults to this host's
+    /// <see cref="WorkerCapability.LocalDefault"/> fingerprint. Null for tests whose fake worker publishes
+    /// under the request's own (capability-less) identity — keeping their identity byte-identical to
+    /// before Phase 15.
+    /// </summary>
+    public string? DefaultCapabilityFingerprint { get; init; }
+
+    /// <summary>
+    /// The per-repository/profile platform-routing policy (Phase 15): whether the service may escalate a
+    /// project off the default (Linux) worker to a native one, and to which OS families. Defaults to
+    /// <see cref="PlatformRoutingPolicy.Default"/> (auto-escalate to any compatible native worker).
+    /// </summary>
+    public PlatformRoutingPolicy PlatformRouting { get; init; } = PlatformRoutingPolicy.Default;
+
     private const string EnvPrefix = "SEXTANT_SERVICE_";
 
     /// <summary>
@@ -90,7 +108,12 @@ public sealed record ServiceOptions
             // Fold the node's own profile hash into request identities by default, so an ensure request that
             // omits ConfigHash resolves to the SAME identity_hash the local worker's orchestrator publishes
             // under (IndexProfileDescriptor.ConfigurationHash) — without it the idempotency lookup misses.
-            DefaultConfigHash = IndexProfileDescriptor.FromConfiguration(config).ConfigurationHash
+            DefaultConfigHash = IndexProfileDescriptor.FromConfiguration(config).ConfigurationHash,
+            // The producing node's default capability (Phase 15). Folded into request identity and stamped
+            // into published snapshots so request identity == published identity and cross-node reuse under
+            // an incompatible capability is blocked (criterion 5).
+            DefaultCapabilityFingerprint = WorkerCapability.LocalDefault.Fingerprint,
+            PlatformRouting = PlatformRoutingPolicy.Parse(config.PlatformRouting)
         };
     }
 

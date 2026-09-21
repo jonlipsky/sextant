@@ -148,6 +148,54 @@ public class FederatedReadContextTests
         Assert.IsNull(ctx.Provenance.Incompatibilities);
     }
 
+    // ==== Phase 15 / criterion 5: worker-capability drift gates cache reuse ========================
+
+    [TestMethod]
+    public void Capability_DriftBetweenSnapshotAndRunningNode_IsFlaggedIncompatible()
+    {
+        // A snapshot built under a macOS/Apple worker capability must NOT be silently reused under a
+        // Linux running node — the capability dimension flags the drift so the read annotates it.
+        var running = CompatibilityInputs.Current with { CapabilityFingerprint = "cap-linux" };
+        var appleBuilt = CompatRow(capability: "cap-macos-apple");
+
+        var issues = ReadCompatibility.Evaluate(appleBuilt, running);
+
+        var capability = issues.Single(i => i.Dimension == "capability");
+        Assert.AreEqual("cap-linux", capability.Expected, "the running node's capability is named");
+        Assert.AreEqual("cap-macos-apple", capability.Actual, "the snapshot's producing capability is named");
+    }
+
+    [TestMethod]
+    public void Capability_NullOnEitherSide_IsUnknownNotMismatch()
+    {
+        // A local snapshot leaves capability null; that must read as "unknown", never a false mismatch,
+        // so pre-Phase-15 and local generations keep serving (CRITICAL 2 / no crying wolf).
+        var running = CompatibilityInputs.Current with { CapabilityFingerprint = "cap-linux" };
+
+        Assert.IsFalse(ReadCompatibility.Evaluate(CompatRow(capability: null), running).Any(i => i.Dimension == "capability"),
+            "a null snapshot capability is unknown, not a mismatch");
+        Assert.IsFalse(ReadCompatibility.Evaluate(CompatRow(capability: "cap-linux"),
+            CompatibilityInputs.Current with { CapabilityFingerprint = null }).Any(i => i.Dimension == "capability"),
+            "a null running capability is unknown, not a mismatch");
+    }
+
+    [TestMethod]
+    public void Capability_SameFingerprint_IsCompatible()
+    {
+        var running = CompatibilityInputs.Current with { CapabilityFingerprint = "cap-linux" };
+        Assert.IsFalse(ReadCompatibility.Evaluate(CompatRow(capability: "cap-linux"), running).Any(i => i.Dimension == "capability"),
+            "identical capability fingerprints are compatible");
+    }
+
+    private static SnapshotRow CompatRow(string? capability) => new()
+    {
+        Id = 1, RepositoryId = 1, IdentityHash = "h", Status = "complete", CreatedAt = 1,
+        SchemaVersion = IndexDatabase.LatestSchemaVersion,
+        AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
+        ToolchainFingerprint = Sextant.Core.ToolchainFingerprint.Current,
+        CapabilityFingerprint = capability
+    };
+
     // ==== Criterion 6: authorization fails CLOSED, never an empty success ===========================
 
     [TestMethod]

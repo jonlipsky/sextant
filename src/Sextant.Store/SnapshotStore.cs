@@ -42,6 +42,13 @@ public sealed record SnapshotRow
     public required long CreatedAt { get; init; }
     public long? PublishedAt { get; init; }
 
+    /// <summary>
+    /// The Phase-15 worker-capability fingerprint of the worker that produced this snapshot, or null for
+    /// a local/single-node run that did not route. Recorded in provenance and folded into the snapshot
+    /// identity only when non-null, so an incompatible-capability reuse is blocked (criterion 5).
+    /// </summary>
+    public string? CapabilityFingerprint { get; init; }
+
     /// <summary>The committed base snapshot this overlay layers on, or null for a base/full snapshot (Phase 10).</summary>
     public long? BaseSnapshotId { get; init; }
 
@@ -188,9 +195,10 @@ public sealed class SnapshotStore(SqliteConnection connection)
             INSERT INTO snapshots
                 (repository_id, commit_id, run_id, identity_hash, tree_sha, schema_version,
                  analyzer_version, config_hash, toolchain_fingerprint, status, created_at,
-                 base_snapshot_id, is_overlay, working_tree_delta, fallback_reason, is_provider)
+                 base_snapshot_id, is_overlay, working_tree_delta, fallback_reason, is_provider,
+                 capability_fingerprint)
             VALUES (@repo, @commit, @run, @hash, @tree, @schema, @analyzer, @config, @toolchain, @status, @now,
-                    @base, @is_overlay, @delta, @fallback, @is_provider)
+                    @base, @is_overlay, @delta, @fallback, @is_provider, @capability)
             RETURNING id;
             """;
         cmd.Parameters.AddWithValue("@repo", repositoryId);
@@ -209,6 +217,7 @@ public sealed class SnapshotStore(SqliteConnection connection)
         cmd.Parameters.AddWithValue("@delta", (object?)identity.WorkingTreeDelta ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@fallback", (object?)fallbackReason ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@is_provider", isProvider ? 1 : 0);
+        cmd.Parameters.AddWithValue("@capability", (object?)identity.CapabilityFingerprint ?? DBNull.Value);
         return ((long)cmd.ExecuteScalar()!, false, SnapshotStatus.Pending);
     }
 
@@ -601,7 +610,8 @@ public sealed class SnapshotStore(SqliteConnection connection)
     private const string SelectSnapshot = """
         SELECT id, repository_id, commit_id, run_id, identity_hash, tree_sha, schema_version,
                analyzer_version, config_hash, toolchain_fingerprint, status, created_at, published_at,
-               base_snapshot_id, is_overlay, working_tree_delta, fallback_reason, is_provider
+               base_snapshot_id, is_overlay, working_tree_delta, fallback_reason, is_provider,
+               capability_fingerprint
         FROM snapshots
         """;
 
@@ -624,6 +634,7 @@ public sealed class SnapshotStore(SqliteConnection connection)
         IsOverlay = !reader.IsDBNull(14) && reader.GetInt64(14) != 0,
         WorkingTreeDelta = reader.IsDBNull(15) ? null : reader.GetString(15),
         FallbackReason = reader.IsDBNull(16) ? null : reader.GetString(16),
-        IsProvider = !reader.IsDBNull(17) && reader.GetInt64(17) != 0
+        IsProvider = !reader.IsDBNull(17) && reader.GetInt64(17) != 0,
+        CapabilityFingerprint = reader.IsDBNull(18) ? null : reader.GetString(18)
     };
 }
