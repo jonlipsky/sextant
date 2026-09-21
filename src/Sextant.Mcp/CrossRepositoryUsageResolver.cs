@@ -109,10 +109,11 @@ public static class CrossRepositoryUsageResolver
         IReadAuthorizer authorizer)
     {
         var store = new SnapshotDependencyStore(conn);
-        var rows = store.GetConsumersByProviderRepository(providerRepositoryUrl, providerCommitSha, scope);
 
-        // Provider-repository authorization (Phase 17, criterion 1), IsEnforcing-gated so the local path is
-        // byte-identical: a caller with no access to the provider must not learn its consumers exist.
+        // Provider-repository authorization (Phase 17, criterion 1) FIRST, before enumerating any consumer
+        // rows: a caller with no access to the provider must learn nothing about it — not that it exists,
+        // and not (via query latency) how many consumers it has. IsEnforcing-gated so the local path is
+        // byte-identical. An unknown/denied provider returns empty, indistinguishable from "no consumers".
         if (authorizer.IsEnforcing)
         {
             var providerRepoId = new SnapshotStore(conn).GetRepositoryId(providerRepositoryUrl);
@@ -120,6 +121,8 @@ public static class CrossRepositoryUsageResolver
                 !authorizer.AuthorizeRepository(pid, providerRepositoryUrl).Allowed)
                 return [];
         }
+
+        var rows = store.GetConsumersByProviderRepository(providerRepositoryUrl, providerCommitSha, scope);
 
         var authorizationMemo = new Dictionary<long, bool>();
         var authorized = new List<SubmoduleConsumer>();

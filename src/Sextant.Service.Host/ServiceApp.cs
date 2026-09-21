@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.DependencyInjection;
 using Sextant.Mcp;
+using Sextant.Mcp.Tools;
 using Sextant.Service;
 using Sextant.Store;
 
@@ -67,10 +68,36 @@ public static class ServiceApp
 
             return provider;
         });
+        // Explicit ALLOWLIST for the remote HTTP MCP surface (hardening review, criterion 1): register ONLY
+        // the index-query tools that route through DatabaseProvider.TryBeginRead and thus enforce the
+        // fail-closed read authorizer + per-repository scope. Assembly-wide registration would also expose
+        // local-only tools that bypass the gate — get_source_context (reads an ARBITRARY absolute path off
+        // disk) and get_daemon_status (probes a local daemon) — which on a multi-tenant service is an
+        // arbitrary-file-read / cross-tenant leak. A default-deny allowlist also means a newly added tool is
+        // NOT silently exposed remotely until it is vetted and added here. The local stdio server
+        // (McpServerSetup) keeps the full assembly-wide set — it is the zero-policy single-node path.
         builder.Services.AddMcpServer()
             .WithHttpTransport()
-            .WithToolsFromAssembly(typeof(DatabaseProvider).Assembly);
+            .WithTools(RemoteQueryTools);
     }
+
+    /// <summary>
+    /// The vetted tool types exposed over the remote HTTP MCP surface. Every one takes a
+    /// <see cref="DatabaseProvider"/> and enters through <c>TryBeginRead</c> (fail-closed authz + scope).
+    /// Local-only tools that bypass that gate (<c>get_source_context</c>, <c>get_daemon_status</c>) are
+    /// deliberately EXCLUDED so they are never reachable by a remote principal.
+    /// </summary>
+    internal static readonly IReadOnlyList<Type> RemoteQueryTools =
+    [
+        typeof(FindSymbolTool), typeof(FindReferencesTool), typeof(FindByAttributeTool),
+        typeof(FindBySignatureTool), typeof(FindCommentsTool), typeof(FindTestsTool),
+        typeof(FindUnreferencedTool), typeof(FindCrossRepositoryUsagesTool), typeof(FindSubmoduleConsumersTool),
+        typeof(GetApiSurfaceTool), typeof(GetCallHierarchyTool), typeof(GetFileSymbolsTool),
+        typeof(GetImpactTool), typeof(GetImplementorsTool), typeof(GetIndexStatusTool),
+        typeof(GetNamespaceTreeTool), typeof(GetProjectDependenciesTool), typeof(GetTypeDependentsTool),
+        typeof(GetTypeHierarchyTool), typeof(GetTypeMembersTool), typeof(SemanticSearchTool),
+        typeof(TraceValueTool), typeof(ResearchCodebaseTool)
+    ];
 
     /// <summary>Wires the auth middleware and maps the control/query/health endpoints onto a built app.</summary>
     public static void MapEndpoints(WebApplication app, ServiceOptions options)

@@ -185,8 +185,27 @@ public sealed record ServiceOptions
     private static long? EnvLong(string name) =>
         long.TryParse(Env(name), out var v) ? v : null;
 
-    private static bool? EnvBool(string name) =>
-        Env(name) is { } v ? v is "1" or "true" or "TRUE" or "True" or "yes" or "on" : null;
+    /// <summary>
+    /// Parses a boolean env var, recognizing common true/false spellings case-insensitively. Returns null
+    /// when unset (the caller's secure default then applies) and THROWS on any other nonempty value rather
+    /// than silently returning false — a typo in a security-relevant toggle (e.g. SANDBOX_ENABLED=tru) must
+    /// fail startup loudly, never quietly disable the control (fail closed; hardening review finding).
+    /// </summary>
+    private static bool? EnvBool(string name)
+    {
+        var v = Env(name);
+        if (v is null)
+            return null;
+        return v.Trim().ToLowerInvariant() switch
+        {
+            "1" or "true" or "yes" or "on" => true,
+            "0" or "false" or "no" or "off" => false,
+            _ => throw new InvalidOperationException(
+                $"Environment variable {EnvPrefix + name} has an invalid boolean value '{v}'. Use one of " +
+                "1/0, true/false, yes/no, on/off. Refusing to start with an ambiguous security-relevant " +
+                "setting (fail closed).")
+        };
+    }
 }
 
 /// <summary>

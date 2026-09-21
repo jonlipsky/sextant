@@ -71,7 +71,21 @@ public static class GetIndexStatusTool
     private static object BuildIndexInfo(
         Microsoft.Data.Sqlite.SqliteConnection conn, long? selectedSnapshotId, bool policyEnforced)
     {
-        var run = new IndexRunStore(conn).GetLastCompleteRun();
+        // Under an enforced multi-tenant policy, scope run metadata (profile / config_hash / features) to
+        // the caller's SELECTED snapshot's own index run instead of the DB-wide latest complete run, which
+        // would leak another tenant's indexing profile and config hash (Phase 17, criterion 1). The
+        // zero-policy local path keeps using the last-complete run (byte-identical to pre-Phase-17).
+        var runStore = new IndexRunStore(conn);
+        IndexRun? run;
+        if (policyEnforced)
+        {
+            var snapRunId = selectedSnapshotId is long sid ? new SnapshotStore(conn).GetById(sid)?.RunId : null;
+            run = snapRunId is long rid ? runStore.GetById(rid) : null;
+        }
+        else
+        {
+            run = runStore.GetLastCompleteRun();
+        }
 
         // A generation with no recorded features (pre-Phase-8 index) is served with every capability.
         var features = run?.Features is { } f ? (IndexFeature)f : IndexFeature.Deep;
