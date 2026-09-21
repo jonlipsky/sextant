@@ -107,6 +107,22 @@ public class GitCliContentProviderTests
             provider.VerifyBlob("https://example/repo", new string('0', 40), "src/Widget.cs", anyHash));
     }
 
+    [TestMethod]
+    public void VerifyBlob_NonHexCommit_IsUnavailable_NoArgumentInjection()
+    {
+        // An untrusted manifest commit value that is not a hex object id (here an option-looking string) must
+        // be rejected up front as Unavailable — it can never be handed to git where it could be parsed as an
+        // option/flag (argument-injection hardening).
+        CommitFile("src/Widget.cs", "public class Widget { }\n"u8.ToArray());
+        var provider = new GitCliContentProvider(_ => _repoDir);
+        var anyHash = Convert.ToHexStringLower(SHA256.HashData("x"u8.ToArray()));
+
+        foreach (var evil in new[] { "--output=/tmp/pwn", "-t", "HEAD; rm -rf /", "not-a-sha" })
+            Assert.AreEqual(GitContentCheck.Unavailable,
+                provider.VerifyBlob("https://example/repo", evil, "src/Widget.cs", anyHash),
+                $"non-hex commit '{evil}' must be rejected before any git call");
+    }
+
     private string CommitFile(string repoRelativePath, byte[] content)
     {
         var full = Path.Combine(_repoDir, repoRelativePath.Replace('/', Path.DirectorySeparatorChar));

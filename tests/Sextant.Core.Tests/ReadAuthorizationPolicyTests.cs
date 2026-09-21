@@ -49,16 +49,24 @@ public class ReadAuthorizationPolicyTests
     }
 
     [TestMethod]
-    public void Parse_MalformedEntries_AreSkipped()
+    public void Parse_MalformedEntries_AreSkippedWithinAnEnforcedPolicy()
     {
-        // No '=' or no repositories → skipped; a spec with only junk collapses to disabled.
-        Assert.IsFalse(ReadAuthorizationPolicy.Parse("garbage-no-equals").Enabled);
-        Assert.IsFalse(ReadAuthorizationPolicy.Parse("=onlyrepos").Enabled);
-        Assert.IsFalse(ReadAuthorizationPolicy.Parse("tok=").Enabled);
-
+        // A malformed entry ALONGSIDE a valid one is skipped (the dropped principal just has no token, which
+        // fails closed for that tenant); the policy still enforces on the valid principal.
         var mixed = ReadAuthorizationPolicy.Parse("bad;tok-a=https://github.com/org/a");
         Assert.IsTrue(mixed.Enabled);
         Assert.AreEqual(1, mixed.Principals.Count);
+    }
+
+    [TestMethod]
+    public void Parse_NonBlankButNoValidPrincipals_FailsClosed()
+    {
+        // A NON-blank spec is an explicit request to enforce; if it parses to zero principals the operator
+        // mis-specified it. It must throw (fail closed), never silently collapse to the allow-all default —
+        // otherwise a policy typo would silently disable all read authorization (criterion 1).
+        Assert.ThrowsExactly<FormatException>(() => ReadAuthorizationPolicy.Parse("garbage-no-equals"));
+        Assert.ThrowsExactly<FormatException>(() => ReadAuthorizationPolicy.Parse("=onlyrepos"));
+        Assert.ThrowsExactly<FormatException>(() => ReadAuthorizationPolicy.Parse("tok="));
     }
 
     [TestMethod]

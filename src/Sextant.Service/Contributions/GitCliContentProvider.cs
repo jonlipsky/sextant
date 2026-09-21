@@ -27,6 +27,12 @@ public sealed class GitCliContentProvider : IGitContentProvider
     private readonly Func<string, string?> _checkoutResolver;
     private readonly string _gitExecutable;
 
+    /// <summary>Upper bound on any single git invocation; a local blob read is near-instant.</summary>
+    private static readonly TimeSpan GitTimeout = TimeSpan.FromSeconds(30);
+
+    /// <summary>Ceiling on a single verified blob so a pathological/huge object cannot exhaust worker memory.</summary>
+    private const long MaxBlobBytes = 512L * 1024 * 1024;
+
     /// <param name="checkoutResolver">
     /// Maps a repository remote URL to its local checkout directory, or null when none is provisioned.
     /// </param>
@@ -56,25 +62,35 @@ public sealed class GitCliContentProvider : IGitContentProvider
             || string.IsNullOrWhiteSpace(expectedBlobHash))
             return GitContentCheck.Unavailable;
 
+        // commitSha comes from an untrusted contribution manifest — the very supply-chain input this
+        // verifier defends against. A git object id is hex; reject anything else so an attacker-controlled
+        // value can never be parsed by git as an option/flag or an unexpected rev expression
+        // (argument-injection hardening). We cannot verify against a non-oid "commit", so treat it as
+        // Unavailable (the policy decides whether that is fatal).
+        if (!IsHexObjectId(commitSha))
+            return GitContentCheck.Unavailable;
+
         var checkoutDir = _checkoutResolver(repositoryRemoteUrl);
         if (string.IsNullOrEmpty(checkoutDir) || !Directory.Exists(checkoutDir))
             return GitContentCheck.Unavailable;
 
         // The commit itself must be present in this checkout; if it is not, we genuinely cannot verify
         // (Unavailable → the policy decides whether that is fatal), which is DIFFERENT from a commit we can
-        // see but whose content disagrees (Mismatch → always fatal).
-        if (!TryRun(checkoutDir, out var commitType, out _, "cat-file", "-t", commitSha)
+        // see but whose content disagrees (Mismatch → always fatal). '--end-of-options' guarantees the
+        // (already hex-validated) commit id is never treated as an option (defense in depth).
+        if (!TryRun(checkoutDir, out var commitType, out _, "cat-file", "-t", "--end-of-options", commitSha)
             || !string.Equals(commitType.Trim(), "commit", StringComparison.Ordinal))
             return GitContentCheck.Unavailable;
 
         // Repo paths are stored repo-relative with forward slashes; normalize defensively for git rev syntax.
+        // The spec begins with the hex-validated commit id, so the whole token can never begin with '-'.
         var gitPath = repoRelativePath.Replace('\\', '/');
         var spec = $"{commitSha}:{gitPath}";
 
         // Read the blob CONTENT at the commit. A path absent at the commit means the declared file is not
         // part of the repository at that commit — an untrusted extra input — so it is a Mismatch, not
         // Unavailable (the commit WAS resolvable, the content simply is not there).
-        if (!TryRunBytes(checkoutDir, out var content, "cat-file", "blob", spec))
+        if (!TryRunBytes(checkoutDir, out var content, "cat-file", "blob", "--end-of-options", spec))
             return GitContentCheck.Mismatch;
 
         var expected = expectedBlobHash.Trim();
@@ -84,11 +100,22 @@ public sealed class GitCliContentProvider : IGitContentProvider
             return GitContentCheck.Match;
 
         // Fall back to the git blob OID domain (populated when the payload recorded git_blob_hash).
-        if (TryRun(checkoutDir, out var oid, out _, "rev-parse", "--verify", spec)
+        if (TryRun(checkoutDir, out var oid, out _, "rev-parse", "--verify", "--end-of-options", spec)
             && HashEquals(expected, oid.Trim()))
             return GitContentCheck.Match;
 
         return GitContentCheck.Mismatch;
+    }
+
+    /// <summary>A git object id is 7–64 hexadecimal characters (abbreviated/full SHA-1 or SHA-256).</summary>
+    private static bool IsHexObjectId(string value)
+    {
+        if (value.Length is < 7 or > 64)
+            return false;
+        foreach (var c in value)
+            if (!Uri.IsHexDigit(c))
+                return false;
+        return true;
     }
 
     private static bool HashEquals(string a, string b) =>
@@ -112,11 +139,13 @@ public sealed class GitCliContentProvider : IGitContentProvider
     {
         stdout = [];
         stderr = string.Empty;
+        Process? process = null;
         try
         {
             var psi = new ProcessStartInfo(_gitExecutable)
             {
                 WorkingDirectory = workingDir,
+                RedirectStandardInput = true,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
@@ -125,17 +154,46 @@ public sealed class GitCliContentProvider : IGitContentProvider
             foreach (var a in args)
                 psi.ArgumentList.Add(a);
 
-            using var process = Process.Start(psi);
+            process = Process.Start(psi);
             if (process is null)
                 return false;
 
-            // Drain stderr asynchronously so a large stdout blob can never deadlock against a full stderr
-            // pipe buffer, then copy the raw stdout bytes (blob content is binary — never decode it here).
-            var errorTask = process.StandardError.ReadToEndAsync();
+            // Close stdin immediately (EOF) so a git invocation that would otherwise read stdin — e.g. a
+            // '--batch' style mode — can never wedge the worker waiting for input it will never get.
+            process.StandardInput.Close();
+
+            // Drain BOTH pipes asynchronously (so neither a full stdout nor a full stderr buffer can deadlock)
+            // under a hard deadline, and cap stdout at MaxBlobBytes. Verifying a single blob in a local
+            // checkout is near-instant, so a process still draining/running at the deadline is wedged or
+            // pathological: cancel the drain, kill the whole process tree, and fail closed (Unavailable
+            // upstream) rather than blocking the worker or buffering unbounded memory. The earlier version
+            // copied stdout with a synchronous CopyTo BEFORE the timeout check, so a git process that left
+            // stdout open could block forever — the async race below is what actually bounds it.
+            using var cts = new CancellationTokenSource(GitTimeout);
             using var buffer = new MemoryStream();
-            process.StandardOutput.BaseStream.CopyTo(buffer);
-            stderr = errorTask.GetAwaiter().GetResult();
-            process.WaitForExit();
+            var stdoutTask = CopyBoundedAsync(process.StandardOutput.BaseStream, buffer, MaxBlobBytes, cts.Token);
+            var stderrTask = process.StandardError.ReadToEndAsync(cts.Token);
+
+            try
+            {
+                if (!process.WaitForExit((int)GitTimeout.TotalMilliseconds))
+                {
+                    cts.Cancel();
+                    KillTree(process);
+                    return false;
+                }
+
+                // The process has exited, so both pipes are at EOF and the drain tasks complete promptly.
+                stdoutTask.GetAwaiter().GetResult();
+                stderr = stderrTask.GetAwaiter().GetResult();
+            }
+            catch (Exception ex) when (ex is OperationCanceledException or InvalidOperationException or IOException)
+            {
+                // Deadline hit mid-drain, or the blob exceeded MaxBlobBytes: kill and fail closed.
+                cts.Cancel();
+                KillTree(process);
+                return false;
+            }
 
             if (process.ExitCode != 0)
                 return false;
@@ -147,6 +205,31 @@ public sealed class GitCliContentProvider : IGitContentProvider
         {
             // git missing / not a repo / spawn failure ⇒ the provider cannot answer (Unavailable upstream).
             return false;
+        }
+        finally
+        {
+            process?.Dispose();
+        }
+    }
+
+    private static void KillTree(Process process)
+    {
+        try { process.Kill(entireProcessTree: true); } catch { /* already gone */ }
+    }
+
+    /// <summary>Copies <paramref name="source"/> into <paramref name="dest"/>, throwing once more than
+    /// <paramref name="maxBytes"/> have been read so a pathological blob cannot exhaust memory.</summary>
+    private static async Task CopyBoundedAsync(Stream source, Stream dest, long maxBytes, CancellationToken ct)
+    {
+        var buf = new byte[81920];
+        long total = 0;
+        int read;
+        while ((read = await source.ReadAsync(buf, ct).ConfigureAwait(false)) > 0)
+        {
+            total += read;
+            if (total > maxBytes)
+                throw new InvalidOperationException("git blob exceeds the maximum verifiable size.");
+            await dest.WriteAsync(buf.AsMemory(0, read), ct).ConfigureAwait(false);
         }
     }
 }

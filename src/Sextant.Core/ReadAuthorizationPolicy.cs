@@ -74,9 +74,14 @@ public sealed record ReadAuthorizationPolicy
 
     /// <summary>
     /// Parses the compact wire form <c>token=url1|url2;token2=*</c> into a policy. An empty/blank spec is the
-    /// <see cref="Disabled"/> policy. Entries without a token or without any repository are skipped; a policy
-    /// that ends up with no valid principals is treated as disabled rather than a lock-everyone-out policy.
+    /// <see cref="Disabled"/> policy (no enforcement — the zero-friction local default). A NON-blank spec is
+    /// an explicit request to ENFORCE: individual malformed entries are skipped (a dropped principal simply
+    /// has no token, which fails closed for that tenant), but a non-blank spec that yields ZERO valid
+    /// principals is an operator misconfiguration and throws <see cref="FormatException"/> rather than
+    /// silently collapsing to allow-all — a configured-but-unparseable policy must fail closed, never open
+    /// (criterion 1).
     /// </summary>
+    /// <exception cref="FormatException">The spec is non-blank but no valid <c>token=repo</c> principal parses.</exception>
     public static ReadAuthorizationPolicy Parse(string? spec)
     {
         if (string.IsNullOrWhiteSpace(spec))
@@ -99,8 +104,12 @@ public sealed record ReadAuthorizationPolicy
             principals.Add(new ReadPrincipal { Token = token, Repositories = repos });
         }
 
-        return principals.Count == 0
-            ? Disabled
-            : new ReadAuthorizationPolicy { Enabled = true, Principals = principals };
+        if (principals.Count == 0)
+            throw new FormatException(
+                "A read-authorization policy was configured but no valid 'token=repo|repo' principals could be " +
+                "parsed. Fix the policy specification, or clear it entirely to run without read enforcement. " +
+                "(A malformed policy fails closed rather than silently granting open access.)");
+
+        return new ReadAuthorizationPolicy { Enabled = true, Principals = principals };
     }
 }
