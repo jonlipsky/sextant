@@ -67,7 +67,11 @@ public static class GetCallHierarchyTool
                     ["depth"] = currentDepth + 1
                 };
 
-                if (include_source)
+                // Raw host-filesystem read (no content-hash verification): suppress under an enforced
+                // multi-tenant policy so a reconstructed absolute call-site path cannot expose a file
+                // outside the caller's authorized repository. Location-only under enforcement; the
+                // zero-policy local path is byte-identical (hardening review, criteria 1 & 2).
+                if (include_source && !dbProvider.Authorizer.IsEnforcing)
                     entry["source_context"] = SourceReader.ReadContext(edge.CallSiteFile, edge.CallSiteLine, 2);
 
                 results.Add(entry);

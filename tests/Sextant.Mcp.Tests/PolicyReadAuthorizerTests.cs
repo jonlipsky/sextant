@@ -225,6 +225,69 @@ public class PolicyReadAuthorizerTests
         }
     }
 
+    // ==== criterion 1/2: raw host-source reads are suppressed under enforcement ======================
+
+    [TestMethod]
+    public void FindSymbol_IncludeSource_ServedLocally_ButSuppressedUnderEnforcement()
+    {
+        var sourceFile = Path.Combine(Path.GetTempPath(), $"sextant_src_{Guid.NewGuid():N}.cs");
+        File.WriteAllLines(sourceFile, ["public class Secret", "{", "    // sensitive host file", "}"]);
+        var (dbPath, db, repoId) = SeedRepoWithSourceFile(RepoA, sourceFile);
+        try
+        {
+            var policy = TwoTenant();
+            Func<long, string?> resolver = id => id == repoId ? RepoA : null;
+
+            // Zero-policy local path (AllowAll, IsEnforcing=false): the raw declaration IS read off disk,
+            // byte-identical to pre-Phase-17 behavior.
+            using var local = new DatabaseProvider(dbPath, AllowAllReadAuthorizer.Instance);
+            var localJson = FindSymbolTool.FindSymbol(local, "global::Secret", include_source: true);
+            StringAssert.Contains(localJson, "source_context", "the local path serves source declarations");
+            StringAssert.Contains(localJson, "public class Secret", "the on-disk declaration is returned locally");
+
+            // Enforced multi-tenant path (authorized principal): the raw, hash-UNverified host-file read is
+            // suppressed so a reconstructed absolute path can never expose service-host file contents. The
+            // authorized caller still gets the symbol metadata — just locations, no snippet (criteria 1 & 2).
+            using var enforced = new DatabaseProvider(dbPath, new PolicyReadAuthorizer(policy, () => "tok-a", resolver));
+            var enforcedJson = FindSymbolTool.FindSymbol(enforced, "global::Secret", include_source: true);
+            Assert.IsFalse(enforcedJson.Contains("source_context"), "source snippet is suppressed under enforcement");
+            Assert.IsFalse(enforcedJson.Contains("sensitive host file"), "no host-file contents leak under enforcement");
+            StringAssert.Contains(enforcedJson, "Secret", "the authorized caller still receives the symbol metadata");
+        }
+        finally
+        {
+            SqliteTestDatabase.Delete(dbPath, db);
+            File.Delete(sourceFile);
+        }
+    }
+
+    private static (string dbPath, IndexDatabase db, long repoId) SeedRepoWithSourceFile(string repoUrl, string absoluteFilePath)
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"sextant_polauthz_{Guid.NewGuid():N}.db");
+        var db = new IndexDatabase(dbPath);
+        db.RunMigrations();
+        var conn = db.GetConnection();
+        var store = new SnapshotStore(conn);
+
+        var repoId = store.EnsureRepository(repoUrl, now: 1);
+        var commitId = store.EnsureCommit(repoId, "c1", "t1", now: 1);
+        var logical = store.EnsureLogicalProject(repoId, "logical_A", "src/A/A.csproj", "net10.0", now: 1);
+        var snapId = store.BeginPending(Identity(repoUrl), repoId, commitId, runId: null, now: 1).id;
+        var projId = new ProjectStore(conn).UpsertSnapshotProject(ProjOf(repoUrl), snapId, logical, 1);
+        store.MapProject(snapId, projId);
+        new SymbolStore(conn).Insert(new SymbolInfo
+        {
+            ProjectId = projId,
+            SymbolKey = "K:Secret", FullyQualifiedName = "global::Secret",
+            DisplayName = "Secret", Kind = SymbolKind.Class, Accessibility = Accessibility.Public,
+            FilePath = absoluteFilePath, LineStart = 1, LineEnd = 4, LastIndexedAt = 1
+        });
+        store.MarkComplete(snapId, publishedAt: 1);
+        var branch = store.EnsureBranch(repoId, "main", isDefault: true, now: 1);
+        store.SetBranchPointer(branch, snapId, now: 1);
+        return (dbPath, db, repoId);
+    }
+
     private static string StripQueriedAt(string json) =>
         System.Text.RegularExpressions.Regex.Replace(json, "\"queried_at\":\\s*\\d+", "\"queried_at\":0");
 

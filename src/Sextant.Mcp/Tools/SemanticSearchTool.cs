@@ -19,7 +19,8 @@ public static class SemanticSearchTool
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
 
-        if (!CapabilityGate.Ensure(db, IndexFeature.DocumentationSearch, "documentation_search", out var unavailable))
+        if (!CapabilityGate.Ensure(db, IndexFeature.DocumentationSearch, "documentation_search", out var unavailable,
+                readContext.SelectedSnapshotId, dbProvider.Authorizer.IsEnforcing))
             return unavailable;
 
         using var conn = db.OpenReadConnection();

@@ -53,9 +53,13 @@ public static class CrossRepositoryUsageResolver
         // "no stable identity" outcome as a symbol that genuinely does not exist — no existence leak.
         if (authorizer.IsEnforcing)
         {
+            // Authorize on the provider repository URL, INDEPENDENT of whether the provider exists (the
+            // policy decision is URL-based; the id is not consulted). An unknown provider (id null → 0) and
+            // an existing-but-denied provider therefore run the identical authorize-and-return path, so
+            // neither the result nor the work performed distinguishes "denied" from "does not exist"
+            // (criterion 1 — no timing/existence oracle).
             var providerRepoId = new SnapshotStore(conn).GetRepositoryId(providerRepositoryUrl);
-            if (providerRepoId is not { } pid ||
-                !authorizer.AuthorizeRepository(pid, providerRepositoryUrl).Allowed)
+            if (!authorizer.AuthorizeRepository(providerRepoId ?? 0, providerRepositoryUrl).Allowed)
                 return new CrossRepositoryUsageResult(StableIdentityResolved: false, ResolvedSymbolKeys: [], Usages: []);
         }
 
@@ -116,9 +120,11 @@ public static class CrossRepositoryUsageResolver
         // byte-identical. An unknown/denied provider returns empty, indistinguishable from "no consumers".
         if (authorizer.IsEnforcing)
         {
+            // URL-based authorization, INDEPENDENT of provider existence (see Resolve): unknown-and-denied
+            // is indistinguishable from unknown-and-authorized-with-no-consumers — both return empty after
+            // the same work, so query latency reveals neither existence nor consumer cardinality.
             var providerRepoId = new SnapshotStore(conn).GetRepositoryId(providerRepositoryUrl);
-            if (providerRepoId is not { } pid ||
-                !authorizer.AuthorizeRepository(pid, providerRepositoryUrl).Allowed)
+            if (!authorizer.AuthorizeRepository(providerRepoId ?? 0, providerRepositoryUrl).Allowed)
                 return [];
         }
 

@@ -25,6 +25,13 @@ public static class FindSymbolTool
         var symbolStore = new SymbolStore(conn) { Scope = readContext.Scope };
         var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
 
+        // Raw host-filesystem source reads (SourceReader, no content-hash verification) must not be served
+        // over an enforced multi-tenant surface: the reconstructed absolute path can point outside the
+        // caller's authorized repository (e.g. a crafted project with '..' in a source item, or another
+        // tenant's retained checkout). Under enforcement the caller gets locations only; the zero-policy
+        // local path is byte-identical (hardening review, criteria 1 & 2).
+        var serveSource = include_source && !dbProvider.Authorizer.IsEnforcing;
+
         var canonicalIdCache = BuildCanonicalIdCache(projectStore);
 
         // Resolve scope to project filter
@@ -43,7 +50,7 @@ public static class FindSymbolTool
                     results = results.Where(s => scopeFilter.ProjectIds.Contains(s.ProjectId)).ToList();
             }
 
-            var mapped = results.Select(s => MapSymbol(s, ResolveCanonicalId(s.ProjectId, canonicalIdCache), include_source)).ToList();
+            var mapped = results.Select(s => MapSymbol(s, ResolveCanonicalId(s.ProjectId, canonicalIdCache), serveSource)).ToList();
             var freshness = results.Count > 0 ? results.Min(s => s.LastIndexedAt) : 0;
             return ResponseBuilder.Build(mapped, freshness, provenance: readContext.Provenance);
         }
@@ -71,7 +78,7 @@ public static class FindSymbolTool
                     return ResponseBuilder.BuildEmpty("Symbol not in scope.", readContext.Provenance);
             }
 
-            var mapped = new List<object> { MapSymbol(symbol, ResolveCanonicalId(symbol.ProjectId, canonicalIdCache), include_source) };
+            var mapped = new List<object> { MapSymbol(symbol, ResolveCanonicalId(symbol.ProjectId, canonicalIdCache), serveSource) };
             return ResponseBuilder.Build(mapped, symbol.LastIndexedAt, resolution.Ambiguity, readContext.Provenance);
         }
     }

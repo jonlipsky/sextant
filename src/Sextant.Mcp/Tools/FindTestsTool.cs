@@ -22,7 +22,8 @@ public static class FindTestsTool
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
 
-        if (!CapabilityGate.Ensure(db, IndexFeature.TestIndexing, "test_indexing", out var unavailable))
+        if (!CapabilityGate.Ensure(db, IndexFeature.TestIndexing, "test_indexing", out var unavailable,
+                readContext.SelectedSnapshotId, dbProvider.Authorizer.IsEnforcing))
             return unavailable;
 
         using var conn = db.OpenReadConnection();
