@@ -38,6 +38,26 @@ public sealed class ServicePaths
         Directory.CreateDirectory(_scratchRoot);
     }
 
+    /// <summary>
+    /// The sanitized single-segment directory name a repository's checkout lives under, on the checkout
+    /// volume. This is the ONE canonical repo-url → directory mapping, shared by the checkout provider
+    /// (which locates the checkout to index) and the Git-content provider (#68, which must look in the SAME
+    /// directory to verify blobs), so the two can never disagree. It strips a trailing <c>.git</c>, replaces
+    /// invalid filename characters, and trims separators/dots so <c>.</c>/<c>..</c> traversal collapses to a
+    /// safe default.
+    /// </summary>
+    public static string RepoDirectoryName(string repositoryRemoteUrl)
+    {
+        var trimmed = (repositoryRemoteUrl ?? string.Empty).TrimEnd('/');
+        var lastSlash = trimmed.LastIndexOf('/');
+        var name = lastSlash >= 0 ? trimmed[(lastSlash + 1)..] : trimmed;
+        if (name.EndsWith(".git", StringComparison.OrdinalIgnoreCase))
+            name = name[..^4];
+        var chars = name.Select(c => Array.IndexOf(Path.GetInvalidFileNameChars(), c) >= 0 ? '_' : c).ToArray();
+        var safe = new string(chars).Trim('_', '.');
+        return safe.Length == 0 ? "repo" : safe;
+    }
+
     /// <summary>Allocates a fresh, empty per-job scratch directory under the scratch root.</summary>
     public string AllocateScratch(string jobLabel)
     {

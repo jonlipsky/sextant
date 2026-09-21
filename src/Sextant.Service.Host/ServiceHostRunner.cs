@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging;
 using Sextant.Core;
 using Sextant.Core.Platform;
 using Sextant.Service;
+using Sextant.Service.Contributions;
 using Sextant.Service.Placement;
 using Sextant.Store;
 
@@ -48,7 +49,15 @@ public static class ServiceHostRunner
         SnapshotService service;
         try
         {
-            service = SnapshotService.Start(options, worker, database);
+            // #68: when a deployment REQUIRES Git-content verification, wire the real git-CLI provider over
+            // the persistent checkout volume so declared blobs are verified against the repository's content
+            // at the exact commit. Left unset (dev default) the service uses the Unavailable provider and the
+            // fail-closed startup guard keeps required-verification deployments from silently running open.
+            IGitContentProvider? gitContent = options.Contribution.RequireGitContentVerification
+                ? GitCliContentProvider.ForVolume(paths)
+                : null;
+
+            service = SnapshotService.Start(options, worker, database, gitContent: gitContent);
         }
         catch (Exception ex)
         {

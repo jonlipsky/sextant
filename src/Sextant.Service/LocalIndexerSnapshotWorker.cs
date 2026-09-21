@@ -29,7 +29,7 @@ public sealed class PersistentVolumeCheckoutProvider(ServicePaths paths) : IChec
         checkoutDir = string.Empty;
         solutionPath = string.Empty;
 
-        var dirName = SanitizeRepo(request.RepositoryRemoteUrl);
+        var dirName = ServicePaths.RepoDirectoryName(request.RepositoryRemoteUrl);
         var root = Path.GetFullPath(paths.CheckoutRoot);
         var candidate = Path.GetFullPath(Path.Combine(root, dirName));
         // Containment guard (defense in depth with SanitizeRepo): a crafted repository URL must never
@@ -59,18 +59,7 @@ public sealed class PersistentVolumeCheckoutProvider(ServicePaths paths) : IChec
             && !Path.IsPathRooted(rel);
     }
 
-    private static string SanitizeRepo(string url)
-    {
-        var trimmed = url.TrimEnd('/');
-        var lastSlash = trimmed.LastIndexOf('/');
-        var name = lastSlash >= 0 ? trimmed[(lastSlash + 1)..] : trimmed;
-        if (name.EndsWith(".git", StringComparison.OrdinalIgnoreCase))
-            name = name[..^4];
-        var chars = name.Select(c => Array.IndexOf(Path.GetInvalidFileNameChars(), c) >= 0 ? '_' : c).ToArray();
-        // Trim separators AND leading/trailing dots so "." / ".." (traversal) collapse to the safe default.
-        var safe = new string(chars).Trim('_', '.');
-        return safe.Length == 0 ? "repo" : safe;
-    }
+    private static string SanitizeRepo(string url) => ServicePaths.RepoDirectoryName(url);
 }
 
 /// <summary>
