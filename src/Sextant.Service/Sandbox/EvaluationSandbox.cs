@@ -12,11 +12,24 @@ namespace Sextant.Service.Sandbox;
 ///   <item>SECRET isolation + FILESYSTEM redirection + OFFLINE toolchain via <see cref="SandboxedEnvironmentScope"/>;</item>
 ///   <item>FAIL-CLOSED filesystem confinement: the per-job scratch MUST be under the scratch root, else it refuses to run.</item>
 /// </list>
-/// Enforcement boundary (documented honestly): the untrusted work runs IN-PROCESS, so the memory ceiling is
-/// a cooperative abort, not an OS hard cap, and the offline posture is best-effort env, not a kernel network
-/// block. The OS-hard ceiling (job object / rlimit) and a true network namespace require an out-of-process
-/// evaluator and are a tracked hardening follow-up; this class bounds a runaway/hostile evaluation and denies
-/// secret access today without destabilizing the service or the byte-identical local path.
+/// Enforcement boundary — read this before hosting untrusted code. This sandbox is DEFENSE IN DEPTH, NOT a
+/// hard security boundary. The untrusted work (MSBuild evaluation: imported targets, SDK resolvers, inline
+/// <c>UsingTask</c>/<c>Exec</c> tasks) runs IN-PROCESS, so a hostile project CAN still: read/write arbitrary
+/// filesystem paths the worker user can reach, spawn child processes, open network sockets, and ignore the
+/// cooperative cancellation (a tight native loop never observes the token). The memory ceiling is a
+/// watchdog-driven cooperative abort, not an OS hard cap; the offline posture is best-effort environment,
+/// not a kernel network block. What it DOES buy: a bounded time/memory budget that stops a runaway or
+/// merely-greedy evaluation, secret scrubbing so credentials are not in the evaluation's environment, and
+/// fail-closed scratch confinement so a published snapshot can never be corrupted by evaluation.
+/// <para>
+/// Therefore: DO NOT host untrusted third-party repositories in multi-tenant production on this in-process
+/// tier. It is adequate for local/single-node use and for explicitly-onboarded, trusted PILOT repositories.
+/// True OS-hard isolation (job object / cgroup + rlimits + network namespace / sandbox-exec, over an
+/// out-of-process evaluator) is tracked as issue #76 and is a documented precondition for untrusted
+/// multi-tenant production (wired into the security runbook + pilot exit criteria). When the sandbox itself
+/// cannot honor its confinement invariant (scratch not under the scratch root) it FAILS CLOSED — it refuses
+/// to evaluate rather than silently running unconfined.
+/// </para>
 /// </summary>
 public sealed class EvaluationSandbox(SandboxPolicy policy, ServicePaths paths, Action<string>? log = null) : IEvaluationSandbox
 {

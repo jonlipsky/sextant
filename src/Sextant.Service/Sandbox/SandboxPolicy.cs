@@ -21,8 +21,9 @@ public sealed record SandboxPolicy
     /// <summary>
     /// Process working-set ceiling sampled by the watchdog; exceeding it aborts the evaluation cooperatively.
     /// Zero disables the memory watchdog. This is a cooperative abort (the untrusted work is in-process), not
-    /// an OS hard cap — the OS-enforced ceiling (job object / rlimit over an out-of-process evaluator) is a
-    /// tracked hardening follow-up; this bounds a runaway evaluation without taking the service down.
+    /// an OS hard cap — the OS-enforced ceiling (job object / rlimit over an out-of-process evaluator) is
+    /// tracked as issue #76; this bounds a runaway evaluation without taking the service down. See
+    /// <see cref="EvaluationSandbox"/> for the full defense-in-depth-not-a-hard-boundary caveat.
     /// </summary>
     public long MemoryBudgetBytes { get; init; } = 8L * 1024 * 1024 * 1024;
 
