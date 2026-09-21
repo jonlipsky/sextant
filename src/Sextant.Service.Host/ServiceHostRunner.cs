@@ -1,10 +1,12 @@
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Sextant.Core;
 using Sextant.Core.Platform;
 using Sextant.Service;
+using Sextant.Service.Backup;
 using Sextant.Service.Contributions;
 using Sextant.Service.Placement;
 using Sextant.Service.Sandbox;
@@ -100,6 +102,80 @@ public static class ServiceHostRunner
         {
             service.Dispose();
             database.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Offline DR backup (criterion 6): writes a consistent catalog + artifact backup into
+    /// <paramref name="destinationDir"/> without starting the HTTP surface. Uses SQLite's online backup API
+    /// over a read-only connection, so it is safe whether or not a service is running (WAL readers do not
+    /// block the writer). Configuration comes from the same <c>SEXTANT_SERVICE_*</c> environment as the
+    /// service itself, so the backup targets the operator's real catalog + artifact volume.
+    /// </summary>
+    public static Task<int> RunBackupAsync(string destinationDir, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var config = SextantConfiguration.Load();
+            var options = ServiceOptions.FromEnvironment(config);
+            var paths = new ServicePaths(options.Volumes);
+
+            var connectionString = new SqliteConnectionStringBuilder
+            {
+                DataSource = options.CatalogDbPath,
+                Mode = SqliteOpenMode.ReadOnly,
+                Pooling = false
+            }.ToString();
+            using var source = new SqliteConnection(connectionString);
+            source.Open();
+
+            var manifest = ServiceBackup.Create(
+                source, IndexDatabase.LatestSchemaVersion, paths, destinationDir,
+                configFingerprint: options.DefaultConfigHash ?? "none");
+
+            Console.WriteLine(
+                $"Backup written to {Path.GetFullPath(destinationDir)} (catalog schema v{manifest.SchemaVersion}).");
+            Console.WriteLine(
+                "  Credentials are NOT included; re-provide these environment variables on restore: " +
+                string.Join(", ", manifest.CredentialsBoundary));
+            return Task.FromResult(0);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Backup failed: {ex.Message}");
+            return Task.FromResult(1);
+        }
+    }
+
+    /// <summary>
+    /// Offline DR restore (criterion 6): lays a backup's catalog + immutable artifact volume back down into
+    /// the operator's configured locations, then instructs the operator to start the service. Starting the
+    /// restored service runs migrations, recovers the WAL, reconciles orphaned jobs, and RE-ENFORCES the
+    /// read-authorization policy from configuration — so a restored service is a queryable AUTHORIZED
+    /// service, never a policy-stripped one. Refuses a backup taken at a newer schema than this build.
+    /// </summary>
+    public static Task<int> RunRestoreAsync(string backupDir, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var config = SextantConfiguration.Load();
+            var options = ServiceOptions.FromEnvironment(config);
+            var paths = new ServicePaths(options.Volumes);
+
+            var manifest = ServiceBackup.Restore(backupDir, options.CatalogDbPath, paths);
+
+            Console.WriteLine(
+                $"Restored catalog + artifacts from {Path.GetFullPath(backupDir)} " +
+                $"(backup schema v{manifest.SchemaVersion}).");
+            Console.WriteLine(
+                "Start `sextant service` (or the host) to run migrations, recover, reconcile, and " +
+                "re-enforce authorization on the restored catalog.");
+            return Task.FromResult(0);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Restore failed: {ex.Message}");
+            return Task.FromResult(1);
         }
     }
 }

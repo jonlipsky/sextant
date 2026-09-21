@@ -75,6 +75,10 @@ The host deliberately **separates control endpoints from query endpoints**, and 
 | `GET /control/status/{jobId}` | control | control token | Job status + per-project diagnostics (criterion 5). |
 | `GET /control/resolve` | control | control token | Resolve a repository branch to its current complete snapshot. |
 | `POST /control/retention` | control | control token | Run the service-owned retention/GC pass (`?execute=true` to apply). |
+| `GET /control/metrics` | control | control token | Observability snapshot (criterion 5); `?format=prometheus` for text exposition, else JSON. |
+| `GET /control/audit` | control | control token | Durable audit log (criterion 5); optional `action`/`repository`/`limit` filters. **Operator-only.** |
+| `GET /control/pilot` | control | control token | Pilot-readiness gate (criterion 7); `?workload=trusted\|untrusted&hard_isolation=&recent_backup=`. |
+| `POST /control/backup` | control | control token | Write a consistent catalog + artifact backup to `?dir=` (criterion 6). |
 | `GET /query/snapshots/{identityHash}/symbols` | query | query token | One immutable page of a snapshot's symbols, cursor-paged (federation, issue #51). |
 | `POST /mcp` | query | query token | Authenticated HTTP MCP semantic queries (criterion 4). |
 
@@ -255,13 +259,62 @@ A provider snapshot that *gains* a project after publish must never mutate an al
 pending** provider generation and republishes atomically; `MarkComplete` is a guarded no-op on a snapshot
 that is already complete. `ProviderGrowthImmutabilityTests` is the regression.
 
+## Observability (criterion 5)
+
+The service exposes a **clean, dependency-free** observability surface on the **control plane only** — every
+signal is operator data, so none of it is reachable with a query token (criterion-1 leakage guard: audit
+rows and per-repository cost would otherwise reveal repository/snapshot existence and cross-tenant counts).
+
+- **`GET /control/metrics`** returns a point-in-time [`MetricsSnapshot`](../src/Sextant.Service/Observability/MetricsSnapshot.cs):
+  indexing latency (worker run time), queue delay (wait before a worker claimed a job), success &
+  completeness rates, worker capacity, storage (catalog + artifact + cache + checkout bytes), cache reuse
+  (idempotent-ensure attach rate + federation page-cache hit rate), and query latency (p50/p95/max). Add
+  `?format=prometheus` for text exposition a scraper/dashboard can ingest directly. Alerts are evaluated
+  over the snapshot (`queue_delay_high`, `low_success_rate`, `worker_exhaustion`, `storage_pressure`).
+- **`GET /control/audit`** serves the durable [`audit_log`](../src/Sextant.Store/Migrations/020_audit_log.sql)
+  (migration 020): who did what to which repository scope, with what outcome and at what worker cost.
+  The actor is stored as a **non-reversible hash**, never the raw token; the raw secret never touches the DB.
+- **`GET /control/pilot`** evaluates the pilot-readiness gate (see runbooks).
+- **Traces:** ensure / retention / backup emit `System.Diagnostics.Activity` spans on the
+  `Sextant.Service` `ActivitySource`, so an operator can wire OpenTelemetry without any code change.
+
+Observability is **optional** — the local stdio MCP path and standalone local indexing never construct any
+of this and stay byte-identical (criterion 6 / zero service dependency).
+
+## Backup, restore & disaster recovery (criterion 6)
+
+A backup captures the two durable, non-reconstructable stores and **nothing else**:
+
+- the **catalog** database, copied with SQLite's **online backup API** so it is a transactionally
+  consistent point-in-time image even while the writer is active (no torn WAL); and
+- the immutable **artifact** volume (published snapshot outputs).
+
+Worker scratch (ephemeral) and the checkout/cache volumes (reconstructable from Git / federation) are not
+backed up, and **secrets are never written** into a backup — the `manifest.json` records a *credentials
+boundary* listing the environment variables an operator re-provides on restore.
+
+```bash
+sextant service backup   /backups/2026-09-19   # consistent catalog + artifact copy
+sextant service restore  /backups/2026-09-19   # lay catalog + artifacts back down (offline)
+sextant service                                # start: migrate → recover → reconcile → RE-ENFORCE authz
+```
+
+Restore refuses a backup taken at a **newer** schema than the restoring build (same forward-only guard as
+`IndexDatabase.CheckReadiness`). Because a restored service goes through the normal `Start` flow — run
+migrations, recover the WAL, reconcile orphaned jobs, and load the read-authorization policy from
+configuration — a restored service is a **queryable AUTHORIZED** service, never a policy-stripped one, and
+the immutable snapshot it serves is byte-for-byte the one that was backed up. `POST /control/backup` writes
+a backup from a running service under its writer gate; restore is offline (it must precede startup). See
+[`runbooks.md`](runbooks.md) for the schema-upgrade rehearsal and DR drill.
+
 ## Migration & schema
 
 Migration `016_service_job_catalog.sql` adds `snapshot_jobs`, `snapshot_job_diagnostics`, and
-`writer_lease` — additive/forward-only, extending (not duplicating) the Phase-9 catalog. Migration
-`017_snapshot_capability_fingerprint.sql` adds the additive `snapshots.capability_fingerprint` column
-(Phase 15) — the worker-capability fingerprint folded into snapshot provenance/identity. See
-[`schema.md`](schema.md) for the table definitions. `LatestSchemaVersion` is **17**.
+`writer_lease`; `017_snapshot_capability_fingerprint.sql` adds `snapshots.capability_fingerprint`
+(Phase 15); `018_client_contributions.sql` and `019_pull_request_retention_roots.sql` are the Phase-17
+slice-1/2 additions; `020_audit_log.sql` adds the durable operational + security **audit log** (Phase 17
+slice 3, criterion 5). All are additive/forward-only. See [`schema.md`](schema.md) for the table
+definitions. `LatestSchemaVersion` auto-derives from the highest migration and is **20**.
 
 ## Testing
 

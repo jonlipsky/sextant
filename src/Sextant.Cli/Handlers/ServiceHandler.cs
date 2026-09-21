@@ -8,4 +8,10 @@ internal static class ServiceHandler
         // in-process local worker without re-registering it.
         return await Sextant.Service.Host.ServiceHostRunner.RunAsync([], cancellationToken);
     }
+
+    public static async Task<int> BackupAsync(string directory, CancellationToken cancellationToken) =>
+        await Sextant.Service.Host.ServiceHostRunner.RunBackupAsync(directory, cancellationToken);
+
+    public static async Task<int> RestoreAsync(string directory, CancellationToken cancellationToken) =>
+        await Sextant.Service.Host.ServiceHostRunner.RunRestoreAsync(directory, cancellationToken);
 }
