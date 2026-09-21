@@ -109,6 +109,26 @@ public class CapabilityRouterTests
     }
 
     [TestMethod]
+    public void UnattributableLinuxFailure_IsUnrouteable_FailsClosed()
+    {
+        // Linux demonstrably could not evaluate the project, but the failure carries NO concrete platform
+        // capability (a portable demonstrated requirement). No worker can be proven compatible, so the job
+        // must fail closed rather than route to an arbitrary native worker (criterion 4).
+        var reqs = new[] { Project("mystery") };
+        var outcomes = Outcomes(("mystery", LinuxEvaluationOutcome.Insufficient(
+            CapabilityRequirement.ForTargetPlatform(null, RequirementSource.DemonstratedFailure, "unattributed workspace failure"),
+            "unattributed workspace failure")));
+
+        var result = CapabilityRouter.RouteJob(reqs, outcomes, Linux, [Windows, Mac], PlatformRoutingPolicy.Default);
+
+        Assert.IsFalse(result.CanRun, "an unattributable Linux failure must not be routed to an arbitrary native worker");
+        Assert.IsNull(result.ExecutionWorker);
+        var unsupported = result.Plan.Unsupported.Single();
+        Assert.AreEqual("mystery", unsupported.ProjectId);
+        StringAssert.Contains(unsupported.Reason, "could not be attributed");
+    }
+
+    [TestMethod]
     public void LinuxOnlyPolicy_DoesNotEscalate_FailsClosed()
     {
         var reqs = new[] { Project("app", "windows") };

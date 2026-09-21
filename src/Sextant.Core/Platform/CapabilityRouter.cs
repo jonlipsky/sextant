@@ -134,7 +134,9 @@ public static class CapabilityRouter
     /// "Linux loaded it fine" default) stays on <paramref name="defaultWorker"/>. A project Linux could
     /// not evaluate escalates to the least-specialized worker in <paramref name="nativeWorkers"/> that
     /// <see cref="WorkerCapability.Satisfies"/> its demonstrated requirement and whose OS the
-    /// <paramref name="policy"/> permits; if none exists (or policy forbids escalation) it is unsupported.
+    /// <paramref name="policy"/> permits; if none exists (or policy forbids escalation, or the failure
+    /// cannot be attributed to any concrete capability constraint) it is unsupported and the job fails
+    /// closed.
     /// </summary>
     public static RoutingPlan Route(
         IReadOnlyList<ProjectCapabilityRequirement> requirements,
@@ -173,6 +175,21 @@ public static class CapabilityRouter
                 decisions.Add(Unsupported(project, requirement,
                     $"Linux evaluation was insufficient and native routing is disabled by policy ({policy.Mode}). " +
                     (outcome.Reason ?? requirement.Reason ?? "no compatible worker.")));
+                continue;
+            }
+
+            // A demonstrated Linux failure that reduces to a PORTABLE requirement is unclassifiable: Linux
+            // could not evaluate the project, yet we cannot attribute the failure to any concrete OS /
+            // platform / workload constraint, so no worker can be PROVEN compatible. Fail closed rather
+            // than routing to an arbitrary native worker (a Windows worker must never absorb an
+            // unattributed failure of, say, an Apple-target project). Escalation requires a concrete,
+            // demonstrated capability constraint (acceptance criterion 4).
+            if (requirement.IsPortable)
+            {
+                decisions.Add(Unsupported(project, requirement,
+                    ("Linux evaluation was insufficient but the failure could not be attributed to a concrete " +
+                     "platform capability, so no worker can be proven compatible. " +
+                     (outcome.Reason ?? requirement.Reason ?? string.Empty)).TrimEnd()));
                 continue;
             }
 

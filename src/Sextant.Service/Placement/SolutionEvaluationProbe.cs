@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Microsoft.CodeAnalysis;
 using Sextant.Indexer;
 
@@ -26,12 +27,14 @@ public sealed class SolutionEvaluationProbe(ICheckoutProvider checkoutProvider) 
             return ProbeResult.Unavailable(
                 $"No provisioned checkout with a solution found for '{request.RepositoryRemoteUrl}'.");
 
-        var diagnostics = new List<string>();
+        // WorkspaceFailed can be raised from multiple MSBuild worker threads during the load, so the
+        // diagnostic sink must be thread-safe.
+        var diagnostics = new ConcurrentQueue<string>();
         Solution solution;
         try
         {
             solution = await SolutionLoader.LoadSolutionAsync(
-                solutionPath, onDiagnostic: d => diagnostics.Add(d), cancellationToken).ConfigureAwait(false);
+                solutionPath, onDiagnostic: d => diagnostics.Enqueue(d), cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -44,14 +47,13 @@ public sealed class SolutionEvaluationProbe(ICheckoutProvider checkoutProvider) 
             return ProbeResult.Unavailable($"failed to load solution '{solutionPath}': {ex.Message}");
         }
 
+        // Snapshot the concurrent sink once the load has completed and no more diagnostics can arrive.
+        var loadDiagnostics = diagnostics.ToArray();
         var infos = new List<ProjectEvaluationInfo>();
         foreach (var project in solution.Projects)
         {
             var path = project.FilePath;
             var fileName = path is null ? null : Path.GetFileName(path);
-            var projectDiagnostics = fileName is null
-                ? []
-                : diagnostics.Where(d => d.Contains(fileName, StringComparison.OrdinalIgnoreCase)).ToArray();
 
             infos.Add(new ProjectEvaluationInfo
             {
@@ -59,22 +61,32 @@ public sealed class SolutionEvaluationProbe(ICheckoutProvider checkoutProvider) 
                 ProjectPath = path,
                 TargetPlatform = ParseTargetPlatform(project.Name),
                 Loaded = true,
-                MissingCapabilityDiagnostics = projectDiagnostics
+                MissingCapabilityDiagnostics = AttributeDiagnostics(fileName, loadDiagnostics)
             });
         }
 
         return LinuxEvaluationAnalyzer.ToProbeResult(infos);
     }
 
-    // Extracts a target-platform token (e.g. "windows", "ios") from a project display name whose TFM is
-    // rendered like "Foo (net8.0-windows)". Returns null when no platform suffix is present. This is a
-    // display-only hint that only NAMES the owning OS — it never by itself triggers routing; a demonstrated
-    // load failure does.
-    private static string? ParseTargetPlatform(string projectName)
+    // Selects the load diagnostics that mention a project's file name, attributing a solution-level
+    // failure to the project it names. Pure so it can be unit-tested without an MSBuild load.
+    internal static string[] AttributeDiagnostics(string? projectFileName, IEnumerable<string> diagnostics) =>
+        projectFileName is null
+            ? []
+            : diagnostics.Where(d => d.Contains(projectFileName, StringComparison.OrdinalIgnoreCase)).ToArray();
+
+    // Extracts a target-platform token (e.g. "windows", "ios") from the multi-TFM display suffix of a
+    // project name — "Foo (net8.0-windows)" → "windows". Returns null when the name carries no
+    // parenthesized TFM (a single-TFM/plain name like "Acme-Cli" must NOT be mis-parsed to a bogus
+    // platform "cli"). This is a display-only hint that only NAMES the owning OS — it never by itself
+    // triggers routing; a demonstrated load failure does.
+    internal static string? ParseTargetPlatform(string projectName)
     {
         var open = projectName.LastIndexOf('(');
         var close = projectName.LastIndexOf(')');
-        var tfm = open >= 0 && close > open ? projectName[(open + 1)..close] : projectName;
+        if (open < 0 || close <= open)
+            return null;
+        var tfm = projectName[(open + 1)..close];
         var dash = tfm.IndexOf('-');
         if (dash < 0 || dash + 1 >= tfm.Length)
             return null;
