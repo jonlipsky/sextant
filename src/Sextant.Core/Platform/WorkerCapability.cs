@@ -81,22 +81,53 @@ public sealed record WorkerCapability
     public required PlatformOperatingSystem OperatingSystem { get; init; }
 
     /// <summary>The process architecture (e.g. <c>x64</c>, <c>arm64</c>), lowercased.</summary>
-    public string Architecture { get; init; } = "unknown";
+    public string Architecture
+    {
+        get => _architecture;
+        init => _architecture = Normalize(value) is { Length: > 0 } a ? a : "unknown";
+    }
 
     /// <summary>Installed .NET SDK feature bands (e.g. <c>8.0.400</c>), normalized + sorted.</summary>
-    public IReadOnlyList<string> SdkFeatureBands { get; init; } = [];
+    public IReadOnlyList<string> SdkFeatureBands
+    {
+        get => _sdkFeatureBands;
+        init => _sdkFeatureBands = NormalizeSet(value);
+    }
 
     /// <summary>Installed optional workload ids (e.g. <c>android</c>, <c>ios</c>, <c>maui</c>), normalized + sorted.</summary>
-    public IReadOnlyList<string> InstalledWorkloads { get; init; } = [];
+    public IReadOnlyList<string> InstalledWorkloads
+    {
+        get => _installedWorkloads;
+        init => _installedWorkloads = NormalizeSet(value);
+    }
 
     /// <summary>Restorable targeting/reference pack ids (e.g. <c>Microsoft.WindowsDesktop.App</c>), normalized + sorted.</summary>
-    public IReadOnlyList<string> ReferencePacks { get; init; } = [];
+    public IReadOnlyList<string> ReferencePacks
+    {
+        get => _referencePacks;
+        init => _referencePacks = NormalizeSet(value);
+    }
 
     /// <summary>Target platforms this worker can faithfully evaluate (e.g. <c>windows</c>, <c>ios</c>), normalized + sorted.</summary>
-    public IReadOnlyList<string> TargetPlatforms { get; init; } = [];
+    public IReadOnlyList<string> TargetPlatforms
+    {
+        get => _targetPlatforms;
+        init => _targetPlatforms = NormalizeSet(value);
+    }
 
     /// <summary>Operator-attached custom tool labels (external toolchains / SDK resolvers), normalized + sorted.</summary>
-    public IReadOnlyList<string> CustomToolLabels { get; init; } = [];
+    public IReadOnlyList<string> CustomToolLabels
+    {
+        get => _customToolLabels;
+        init => _customToolLabels = NormalizeSet(value);
+    }
+
+    private readonly string _architecture = "unknown";
+    private readonly IReadOnlyList<string> _sdkFeatureBands = [];
+    private readonly IReadOnlyList<string> _installedWorkloads = [];
+    private readonly IReadOnlyList<string> _referencePacks = [];
+    private readonly IReadOnlyList<string> _targetPlatforms = [];
+    private readonly IReadOnlyList<string> _customToolLabels = [];
 
     /// <summary>
     /// Builds a capability with every collection normalized (trimmed, lowercased, de-duplicated, sorted)
