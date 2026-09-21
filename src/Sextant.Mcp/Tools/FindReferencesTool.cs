@@ -24,10 +24,10 @@ public static class FindReferencesTool
             return ResponseBuilder.BuildEmpty(notReady);
 
         var mode = FederationModes.Parse(federation);
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError, mode))
+        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError, mode, dbProvider.Authorizer))
             return authError;
 
-        var conn = db.GetConnection();
+        using var conn = db.OpenReadConnection();
         var snapshotScope = readContext.Scope;
         var symbolStore = new SymbolStore(conn) { Scope = snapshotScope };
         var referenceStore = new ReferenceStore(conn) { Scope = snapshotScope };

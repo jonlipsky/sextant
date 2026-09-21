@@ -30,14 +30,14 @@ public static class FindCrossRepositoryUsagesTool
 
         // Honour the Phase-11 fail-closed top-level read gate before touching any cross-repo data: a
         // denied read must surface a structured error, never an empty successful result.
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError, authorizer: dbProvider.Authorizer))
             return authError;
 
-        var conn = db.GetConnection();
+        using var conn = db.OpenReadConnection();
         var scope = new CrossRepoUsageScope { Branch = branch, ConsumerCommitSha = consumer_commit };
 
         var outcome = CrossRepositoryUsageResolver.Resolve(
-            conn, provider_repository_url, symbol_fqn, scope, AllowAllReadAuthorizer.Instance);
+            conn, provider_repository_url, symbol_fqn, scope, dbProvider.Authorizer);
 
         // FQN did not resolve to a stable provider symbol identity: an FQN-only cross-repo match is
         // prohibited, so say so explicitly instead of implying the symbol has zero usages.

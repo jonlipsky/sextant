@@ -174,7 +174,7 @@ public sealed class ResearchAgent
         {
             try
             {
-                var conn = db.GetConnection();
+                using var conn = db.OpenReadConnection();
                 using var cmd = conn.CreateCommand();
                 cmd.CommandText = "SELECT COUNT(*) FROM symbols";
                 var symbolCount = (long)(cmd.ExecuteScalar() ?? 0);
@@ -218,7 +218,7 @@ public sealed class ResearchAgent
         var fqnPattern = new Regex(@"global::[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+(?:\([^)]*\))?", RegexOptions.Compiled);
         var matches = fqnPattern.Matches(answer);
 
-        var conn = db.GetConnection();
+        using var conn = db.OpenReadConnection();
         // Fail closed (criterion 6): an unauthorized read cites no sources rather than reading unscoped.
         if (!ReadContextGate.TryResolve(db, out var readContext, out _))
             return sources;

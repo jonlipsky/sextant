@@ -20,13 +20,13 @@ public static class SemanticSearchTool
         if (db == null)
             return ResponseBuilder.BuildEmpty(notReady);
 
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError, authorizer: dbProvider.Authorizer))
             return authError;
 
         if (!CapabilityGate.Ensure(db, IndexFeature.DocumentationSearch, "documentation_search", out var unavailable))
             return unavailable;
 
-        var conn = db.GetConnection();
+        using var conn = db.OpenReadConnection();
         var symbolStore = new SymbolStore(conn) { Scope = readContext.Scope };
         var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
         var config = SextantConfiguration.FromEnvironment();

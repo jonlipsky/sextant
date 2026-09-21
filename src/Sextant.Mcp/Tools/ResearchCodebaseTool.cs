@@ -33,6 +33,12 @@ public static class ResearchCodebaseTool
         if (db == null)
             return ResponseBuilder.BuildEmpty(notReady);
 
+        // Fail closed (criterion 1) before doing ANY work: an unauthorized principal must not reach the
+        // research agent — otherwise the index's project/symbol counts would leak into the system prompt
+        // and its tool calls would run. A denied read returns the structured error, never an empty answer.
+        if (!ReadContextGate.TryResolve(db, out _, out var authError, authorizer: dbProvider.Authorizer))
+            return authError;
+
         LlmConfiguration config;
         try
         {

@@ -19,10 +19,10 @@ public static class FindUnreferencedTool
         if (db == null)
             return ResponseBuilder.BuildEmpty(notReady);
 
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError, authorizer: dbProvider.Authorizer))
             return authError;
 
-        var conn = db.GetConnection();
+        using var conn = db.OpenReadConnection();
         var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
         var symbolStore = new SymbolStore(conn) { Scope = readContext.Scope };
 

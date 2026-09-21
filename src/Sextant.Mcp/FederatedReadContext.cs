@@ -46,7 +46,10 @@ public sealed class FederatedReadContext
         IReadAuthorizer? authorizer = null,
         CompatibilityInputs? compatibility = null)
     {
-        var conn = db.GetConnection();
+        // Read through a PRIVATE short-lived reader, never the shared writer connection (issue #57): the
+        // read gate runs concurrently with other MCP tool invocations, so it must not share one
+        // SqliteConnection. Disposed once the plan (plain data) is built.
+        using var conn = db.OpenReadConnection();
         var snapshots = new SnapshotStore(conn);
 
         // ONE read of the selected generation pins this request (issue #42).

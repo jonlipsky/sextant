@@ -27,14 +27,14 @@ public static class FindSubmoduleConsumersTool
         if (db == null)
             return ResponseBuilder.BuildEmpty(notReady);
 
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError, authorizer: dbProvider.Authorizer))
             return authError;
 
-        var conn = db.GetConnection();
+        using var conn = db.OpenReadConnection();
         var scope = new CrossRepoUsageScope { Branch = branch, ConsumerCommitSha = consumer_commit };
 
         var consumers = CrossRepositoryUsageResolver.ResolveConsumers(
-            conn, provider_repository_url, provider_commit, scope, AllowAllReadAuthorizer.Instance);
+            conn, provider_repository_url, provider_commit, scope, dbProvider.Authorizer);
 
         var results = consumers.Select(c => (object)new
         {

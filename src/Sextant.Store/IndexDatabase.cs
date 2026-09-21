@@ -114,6 +114,32 @@ public sealed class IndexDatabase : IDisposable
         return conn;
     }
 
+    /// <summary>
+    /// Opens a FRESH, short-lived reader connection independent of the single writer connection, so
+    /// concurrent MCP/query reads never share one <see cref="SqliteConnection"/> (issue #57 —
+    /// <see cref="SqliteConnection"/> is not thread-safe, and a shared reader corrupts under parallel
+    /// <c>/mcp</c> tool invocations). WAL lets these readers run alongside the writer without blocking.
+    /// The connection is pooled (open/close is cheap) and PRIVATE-cache (true concurrent readers, unlike
+    /// shared-cache which serializes them); the CALLER owns disposal (wrap in <c>using</c>). Uses
+    /// ReadWrite mode deliberately: a read-only WAL connection can fail to open when the <c>-wal</c>/
+    /// <c>-shm</c> sidecars must be created. Mirrors the proven <c>/query</c> read-connection recipe.
+    /// </summary>
+    public SqliteConnection OpenReadConnection()
+    {
+        var csb = new SqliteConnectionStringBuilder
+        {
+            DataSource = _dbPath,
+            Mode = SqliteOpenMode.ReadWrite,
+            Pooling = true
+        };
+        var conn = new SqliteConnection(csb.ToString());
+        conn.Open();
+        using var pragma = conn.CreateCommand();
+        pragma.CommandText = "PRAGMA busy_timeout = 5000;";
+        pragma.ExecuteNonQuery();
+        return conn;
+    }
+
     private void ConfigurePragmas(SqliteConnection connection)
     {
         using var cmd = connection.CreateCommand();

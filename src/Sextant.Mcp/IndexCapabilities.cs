@@ -19,7 +19,8 @@ public static class IndexCapabilities
     {
         try
         {
-            var run = new IndexRunStore(db.GetConnection()).GetLastCompleteRun();
+            using var conn = db.OpenReadConnection();
+            var run = new IndexRunStore(conn).GetLastCompleteRun();
             if (run?.Features is { } features)
                 return (IndexFeature)features;
         }
@@ -35,7 +36,8 @@ public static class IndexCapabilities
     {
         try
         {
-            return new IndexRunStore(db.GetConnection()).GetLastCompleteRun()?.IndexingProfile;
+            using var conn = db.OpenReadConnection();
+            return new IndexRunStore(conn).GetLastCompleteRun()?.IndexingProfile;
         }
         catch
         {

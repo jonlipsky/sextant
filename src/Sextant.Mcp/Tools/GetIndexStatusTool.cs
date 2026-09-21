@@ -15,7 +15,13 @@ public static class GetIndexStatusTool
         if (db == null)
             return ResponseBuilder.BuildEmpty(notReady);
 
-        var conn = db.GetConnection();
+        // Fail closed (criterion 1): status reveals project names, git remotes, symbol/reference counts and
+        // storage — all existence/count signals. An unauthorized principal must get the structured error,
+        // never the status, so authorize BEFORE reading anything.
+        if (!ReadContextGate.TryResolve(db, out _, out var authError, authorizer: dbProvider.Authorizer))
+            return authError;
+
+        using var conn = db.OpenReadConnection();
 
         var results = new List<object>();
         long freshness = 0;

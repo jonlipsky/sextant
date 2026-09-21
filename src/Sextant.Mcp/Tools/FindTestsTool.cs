@@ -23,13 +23,13 @@ public static class FindTestsTool
         if (db == null)
             return ResponseBuilder.BuildEmpty(notReady);
 
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError, authorizer: dbProvider.Authorizer))
             return authError;
 
         if (!CapabilityGate.Ensure(db, IndexFeature.TestIndexing, "test_indexing", out var unavailable))
             return unavailable;
 
-        var conn = db.GetConnection();
+        using var conn = db.OpenReadConnection();
         var snapshotScope = readContext.Scope;
         var symbolStore = new SymbolStore(conn) { Scope = snapshotScope };
         var referenceStore = new ReferenceStore(conn) { Scope = snapshotScope };
