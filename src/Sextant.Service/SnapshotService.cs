@@ -723,9 +723,11 @@ public sealed class SnapshotService : IDisposable
     /// <summary>
     /// Registers (or updates) an OPEN pull-request snapshot retention root (Phase 17 criterion 4): the
     /// snapshot indexed for a PR head must not be reclaimed by retention while the PR is open, so an open-PR
-    /// reviewer's cross-repo/find-references queries keep resolving. Idempotent per <c>(repository, pr)</c>;
-    /// resolving the branch pointer for the PR head commit when a snapshot id is not supplied. Returns false
-    /// when the repository/commit is unknown to the catalog.
+    /// reviewer's cross-repo/find-references queries keep resolving. Idempotent per <c>(repository, pr)</c>.
+    /// When <paramref name="snapshotId"/> is omitted the PR head commit is resolved to its complete snapshot.
+    /// Fails closed — returns false without writing a root — when the repository is unknown OR (no snapshot id
+    /// supplied AND no complete snapshot exists for the head commit); a NULL-snapshot root protects nothing,
+    /// so it is never persisted.
     /// </summary>
     public bool RegisterPullRequestSnapshot(
         string repositoryRemoteUrl, int prNumber, string headCommitSha, long? snapshotId = null)
@@ -736,8 +738,13 @@ public sealed class SnapshotService : IDisposable
             if (snapshots.GetRepositoryId(repositoryRemoteUrl) is not long repoId)
                 return false;
 
+            var resolvedSnapshotId = snapshotId
+                ?? snapshots.ResolveCompleteSnapshotByCommit(repoId, headCommitSha);
+            if (resolvedSnapshotId is null)
+                return false;
+
             var prStore = new PullRequestSnapshotStore(_conn);
-            prStore.Register(repoId, prNumber, snapshotId, headCommitSha,
+            prStore.Register(repoId, prNumber, resolvedSnapshotId, headCommitSha,
                 DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
             return true;
         });

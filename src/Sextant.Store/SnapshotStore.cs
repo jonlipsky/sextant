@@ -338,6 +338,30 @@ public sealed class SnapshotStore(SqliteConnection connection)
     }
 
     /// <summary>
+    /// Resolves a repository + git head commit SHA to the id of a COMPLETE snapshot indexed at that commit,
+    /// or null when no such snapshot exists yet. Used by the Phase-17 open-PR retention root (criterion 4)
+    /// to bind a PR head to the snapshot it must protect when the caller supplies only the head commit. When
+    /// several complete snapshots share the commit (multiple generations) the most recent is returned, so
+    /// the protected root is the freshest complete index for that PR head.
+    /// </summary>
+    public long? ResolveCompleteSnapshotByCommit(long repositoryId, string commitSha)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT s.id
+            FROM snapshots s
+            JOIN commits c ON c.id = s.commit_id
+            WHERE s.repository_id = @repo AND c.commit_sha = @sha AND s.status = 'complete'
+            ORDER BY s.created_at DESC, s.id DESC
+            LIMIT 1;
+            """;
+        cmd.Parameters.AddWithValue("@repo", repositoryId);
+        cmd.Parameters.AddWithValue("@sha", commitSha);
+        var result = cmd.ExecuteScalar();
+        return result is null or DBNull ? null : Convert.ToInt64(result);
+    }
+
+    /// <summary>
     /// The git commit SHA for a <c>commits.id</c> (a snapshot's <see cref="SnapshotRow.CommitId"/>), or
     /// null when the id is null or unknown. Used by the Phase-11 federated read planner to stamp the base
     /// commit into a response's provenance metadata (criterion 4) without exposing internal row ids.
