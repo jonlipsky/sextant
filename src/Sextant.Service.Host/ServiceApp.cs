@@ -5,6 +5,7 @@ using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.DependencyInjection;
 using Sextant.Mcp;
 using Sextant.Service;
+using Sextant.Store;
 
 namespace Sextant.Service.Host;
 
@@ -40,8 +41,21 @@ public static class ServiceApp
                 System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull;
         });
         // A SEPARATE read connection for queries (Phase-9 WAL supports concurrent readers with the writer),
-        // so the /mcp + /query planes never block behind a running control-plane index.
-        builder.Services.AddSingleton(new DatabaseProvider(options.CatalogDbPath));
+        // so the /mcp + /query planes never block behind a running control-plane index. When a read policy
+        // is configured (Phase 17, criterion 1) the provider carries a real fail-closed PolicyReadAuthorizer
+        // resolved from the ambient HTTP principal; with no policy it stays the permissive local default so
+        // single-node operation is byte-identical.
+        builder.Services.AddHttpContextAccessor();
+        builder.Services.AddSingleton(sp =>
+        {
+            IReadAuthorizer authorizer = options.ReadPolicy.Enabled
+                ? new PolicyReadAuthorizer(
+                    options.ReadPolicy,
+                    PrincipalTokenAccessor(sp.GetRequiredService<IHttpContextAccessor>()),
+                    RepositoryUrlResolver(options.CatalogDbPath))
+                : AllowAllReadAuthorizer.Instance;
+            return new DatabaseProvider(options.CatalogDbPath, authorizer);
+        });
         builder.Services.AddMcpServer()
             .WithHttpTransport()
             .WithToolsFromAssembly(typeof(DatabaseProvider).Assembly);
@@ -55,11 +69,19 @@ public static class ServiceApp
             var path = context.Request.Path;
             if (path.StartsWithSegments("/control"))
             {
-                if (!Authorized(context, options.ControlToken)) { await Deny(context); return; }
+                // Least-privilege contributor token (issue #71): /control/contribute additionally accepts a
+                // dedicated ContributeToken so a CI/client contributor never needs the full control token.
+                // Every OTHER control endpoint still requires the control token, so a contributor token
+                // cannot reach ensure/status/resolve/retention.
+                if (path.StartsWithSegments("/control/contribute"))
+                {
+                    if (!AuthorizedForContribution(context, options)) { await Deny(context); return; }
+                }
+                else if (!Authorized(context, options.ControlToken)) { await Deny(context); return; }
             }
             else if (path.StartsWithSegments("/mcp") || path.StartsWithSegments("/query"))
             {
-                if (!Authorized(context, options.QueryToken)) { await Deny(context); return; }
+                if (!AuthorizedForQuery(context, options)) { await Deny(context); return; }
             }
             await next();
         });
@@ -166,9 +188,17 @@ public static class ServiceApp
         // portable identity hash, with a stable cursor. Uses a short-lived read connection per request so
         // it never contends with the writer or with concurrent queries on a shared connection.
         app.MapGet("/query/snapshots/{identityHash}/symbols",
-            async (string identityHash, long? cursor, int? limit, CancellationToken ct) =>
+            async (string identityHash, long? cursor, int? limit, HttpContext http, CancellationToken ct) =>
             {
                 await using var connection = OpenReadConnection(options.CatalogDbPath);
+
+                // Under an enabled read policy, a query-plane principal may only page a snapshot belonging to
+                // a repository it is authorized to read. An unauthorized OR unknown snapshot returns an
+                // IDENTICAL 404, so this artifact surface is not a cross-tenant existence/artifact oracle
+                // (criterion 1: reveal no artifact access). With no policy configured this is a no-op.
+                if (options.ReadPolicy.Enabled && !AuthorizedForSnapshot(connection, options, http, identityHash))
+                    return Results.NotFound();
+
                 var source = new LocalBaseSnapshotSource(connection);
                 var page = await source.FetchSymbolsAsync(new SnapshotPageRequest
                 {
@@ -196,19 +226,103 @@ public static class ServiceApp
         return connection;
     }
 
+    /// <summary>
+    /// Authorizes a federation snapshot-page request against the enabled read policy: the requesting
+    /// principal must be granted the snapshot's repository. An unknown snapshot is treated as unauthorized
+    /// so the caller cannot distinguish "forbidden" from "absent" (criterion 1, no artifact/existence
+    /// oracle). Only called when <see cref="ReadAuthorizationPolicy.Enabled"/>.
+    /// </summary>
+    private static bool AuthorizedForSnapshot(SqliteConnection conn, ServiceOptions options, HttpContext http, string identityHash)
+    {
+        var snapshot = new SnapshotStore(conn).GetByIdentityHash(identityHash);
+        if (snapshot is null)
+            return false;
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT remote_url FROM repositories WHERE id = @id;";
+        cmd.Parameters.AddWithValue("@id", snapshot.RepositoryId);
+        var url = cmd.ExecuteScalar() as string;
+        return url is not null && options.ReadPolicy.Allows(BearerToken(http), url);
+    }
+
     private static bool Authorized(HttpContext context, string? expectedToken)
     {
         if (string.IsNullOrEmpty(expectedToken))
             return true; // No token configured for this plane → open (local development default).
 
+        return Matches(context, expectedToken);
+    }
+
+    /// <summary>
+    /// Query-plane authentication. When a read policy is configured (Phase 17, criterion 1) the plane
+    /// authenticates KNOWN principals — the per-repository authorization then happens fail-closed inside
+    /// <see cref="PolicyReadAuthorizer"/>. With no policy it falls back to the single shared query token
+    /// (byte-identical to before).
+    /// </summary>
+    private static bool AuthorizedForQuery(HttpContext context, ServiceOptions options)
+    {
+        if (options.ReadPolicy.Enabled)
+            return options.ReadPolicy.IsKnownPrincipal(BearerToken(context));
+
+        return Authorized(context, options.QueryToken);
+    }
+
+    /// <summary>
+    /// Contribution-endpoint authentication (issue #71). The full control token is a superset and always
+    /// authorizes; a configured least-privilege contributor token also authorizes. When NEITHER token is
+    /// configured the endpoint is open (dev default) — matching the plane-open semantics elsewhere. A null
+    /// token is never treated as a credential to match, so a locked control plane is not silently opened by
+    /// an unset contributor token.
+    /// </summary>
+    private static bool AuthorizedForContribution(HttpContext context, ServiceOptions options)
+    {
+        if (string.IsNullOrEmpty(options.ControlToken) && string.IsNullOrEmpty(options.ContributeToken))
+            return true;
+
+        return Matches(context, options.ControlToken) || Matches(context, options.ContributeToken);
+    }
+
+    /// <summary>Extracts the raw bearer token from the Authorization header, or null when absent.</summary>
+    private static string? BearerToken(HttpContext context)
+    {
         var header = context.Request.Headers.Authorization.ToString();
         const string prefix = "Bearer ";
-        if (header.StartsWith(prefix, StringComparison.Ordinal))
+        return header.StartsWith(prefix, StringComparison.Ordinal) ? header[prefix.Length..].Trim() : null;
+    }
+
+    /// <summary>
+    /// Constant-time bearer-token match. Returns false for a null/empty expected token (an unset token is
+    /// NOT a credential), so it can be OR-combined for the contribution superset without an unset token
+    /// opening a locked plane.
+    /// </summary>
+    private static bool Matches(HttpContext context, string? expectedToken)
+    {
+        if (string.IsNullOrEmpty(expectedToken))
+            return false;
+
+        return BearerToken(context) is { } provided && CryptographicEquals(provided, expectedToken);
+    }
+
+    /// <summary>Resolves the ambient request principal's bearer token for <see cref="PolicyReadAuthorizer"/>.</summary>
+    private static Func<string?> PrincipalTokenAccessor(IHttpContextAccessor accessor) =>
+        () => accessor.HttpContext is { } ctx ? BearerToken(ctx) : null;
+
+    /// <summary>
+    /// Maps a repository row id to its remote URL for <see cref="PolicyReadAuthorizer"/>, caching results
+    /// (a repository's remote URL is immutable) so an authorization check does not re-open the catalog per
+    /// call. Uses an independent short-lived read connection so it never contends with the writer.
+    /// </summary>
+    private static Func<long, string?> RepositoryUrlResolver(string dbPath)
+    {
+        var cache = new System.Collections.Concurrent.ConcurrentDictionary<long, string?>();
+        return id => cache.GetOrAdd(id, key =>
         {
-            var provided = header[prefix.Length..].Trim();
-            return CryptographicEquals(provided, expectedToken);
-        }
-        return false;
+            using var conn = OpenReadConnection(dbPath);
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT remote_url FROM repositories WHERE id = @id;";
+            cmd.Parameters.AddWithValue("@id", key);
+            return cmd.ExecuteScalar() as string;
+        });
     }
 
     private static Task Deny(HttpContext context)

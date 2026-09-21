@@ -27,6 +27,23 @@ public sealed record ServiceOptions
     /// <summary>Bearer token required by the query endpoints (<c>/mcp</c>, <c>/query/*</c>). Null allows anonymous read (local default).</summary>
     public string? QueryToken { get; init; }
 
+    /// <summary>
+    /// A LEAST-PRIVILEGE contributor token for <c>/control/contribute</c>, SEPARATE from the control token
+    /// (issue #71). A contributor holding only this token can upload contributions but CANNOT reach the
+    /// other control-plane endpoints (ensure/status/resolve/retention). The full <see cref="ControlToken"/>
+    /// remains a superset that also authorizes contribution. Null → the contribute endpoint falls back to
+    /// the control token (or open, when neither is set — dev default).
+    /// </summary>
+    public string? ContributeToken { get; init; }
+
+    /// <summary>
+    /// The enforced read-authorization policy for the query plane (Phase 17, criterion 1). When
+    /// <see cref="ReadAuthorizationPolicy.Enabled"/> the query plane authenticates KNOWN principals and the
+    /// <c>PolicyReadAuthorizer</c> fails closed on any repository a principal is not granted. The default
+    /// <see cref="ReadAuthorizationPolicy.Disabled"/> keeps single-node local operation zero-friction.
+    /// </summary>
+    public ReadAuthorizationPolicy ReadPolicy { get; init; } = ReadAuthorizationPolicy.Disabled;
+
     /// <summary>Port for the control + query surface (one port hosts both when <see cref="QueryPort"/> matches or is null).</summary>
     public int ControlPort { get; init; } = 3011;
 
@@ -106,6 +123,8 @@ public sealed record ServiceOptions
                 scratchRoot: Env("SCRATCH_ROOT")),
             ControlToken = Env("CONTROL_TOKEN"),
             QueryToken = Env("QUERY_TOKEN"),
+            ContributeToken = Env("CONTRIBUTE_TOKEN"),
+            ReadPolicy = ReadAuthorizationPolicy.Parse(Env("READ_POLICY")),
             ControlPort = EnvInt("CONTROL_PORT") ?? 3011,
             QueryPort = EnvInt("QUERY_PORT"),
             LeaseTtl = EnvInt("LEASE_TTL_SECONDS") is int ttl and > 0 ? TimeSpan.FromSeconds(ttl) : TimeSpan.FromSeconds(30),
