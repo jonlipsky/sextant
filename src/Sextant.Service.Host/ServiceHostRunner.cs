@@ -107,9 +107,11 @@ public static class ServiceHostRunner
 
     /// <summary>
     /// Offline DR backup (criterion 6): writes a consistent catalog + artifact backup into
-    /// <paramref name="destinationDir"/> without starting the HTTP surface. Uses SQLite's online backup API
-    /// over a read-only connection, so it is safe whether or not a service is running (WAL readers do not
-    /// block the writer). Configuration comes from the same <c>SEXTANT_SERVICE_*</c> environment as the
+    /// <paramref name="destinationDir"/> without starting the HTTP surface. It uses SQLite's online backup
+    /// API for a point-in-time catalog image, but copies the immutable artifact volume separately, so it is
+    /// OFFLINE-ONLY: it refuses to run while a live writer lease is held (a running service could publish or
+    /// GC artifacts mid-copy). For a backup of a live service use the gated online path (POST
+    /// /control/backup). Configuration comes from the same <c>SEXTANT_SERVICE_*</c> environment as the
     /// service itself, so the backup targets the operator's real catalog + artifact volume.
     /// </summary>
     public static Task<int> RunBackupAsync(string destinationDir, CancellationToken cancellationToken = default)
@@ -128,6 +130,21 @@ public static class ServiceHostRunner
             }.ToString();
             using var source = new SqliteConnection(connectionString);
             source.Open();
+
+            // `sextant service backup` is OFFLINE: it copies the immutable artifact volume alongside the
+            // catalog without holding the writer lease, so a concurrently-running service could publish or
+            // GC artifacts mid-copy and produce a catalog/artifact mismatch. If a LIVE writer lease is held,
+            // refuse and direct the operator to the gated online path (POST /control/backup), which runs the
+            // copy under the writer gate. A stale/expired lease is fine (no live writer).
+            var lease = WriterLease.GetCurrent(source);
+            if (lease is not null && !lease.IsExpiredAt(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()))
+            {
+                Console.Error.WriteLine(
+                    "Backup refused: a live service holds the writer lease on this catalog. Offline `service " +
+                    "backup` cannot guarantee a consistent catalog+artifact image while a writer is active. " +
+                    "Use the gated online backup (POST /control/backup) or stop the service first.");
+                return Task.FromResult(1);
+            }
 
             var manifest = ServiceBackup.Create(
                 source, IndexDatabase.LatestSchemaVersion, paths, destinationDir,

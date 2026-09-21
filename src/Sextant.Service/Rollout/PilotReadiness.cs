@@ -21,6 +21,14 @@ public sealed record PilotReadinessInput
     /// <summary>Read-authorization policy is ENABLED (slice 1, criterion 1).</summary>
     public required bool AuthorizationEnabled { get; init; }
 
+    /// <summary>
+    /// The operator control plane is SECURED with a control token (not the dev-only anonymous-open mode).
+    /// A null/empty control token leaves the control plane — including the observability + audit surfaces
+    /// that aggregate cross-tenant scopes, counts, and cost — reachable anonymously, which is acceptable
+    /// only for single-node dev, never for a pilot (criterion-1 leakage guard).
+    /// </summary>
+    public required bool ControlPlaneSecured { get; init; }
+
     /// <summary>The evaluation sandbox is ENFORCED (slice 1, criterion 2).</summary>
     public required bool SandboxEnforced { get; init; }
 
@@ -99,6 +107,16 @@ public static class PilotReadiness
                 Message = input.AuthorizationEnabled
                     ? "Read-authorization policy is enforced."
                     : "Read-authorization policy is DISABLED — a pilot must enforce per-repository authorization (criterion 1)."
+            },
+            new()
+            {
+                Id = "control_plane_secured",
+                Passed = input.ControlPlaneSecured,
+                Blocking = true,
+                Message = input.ControlPlaneSecured
+                    ? "The operator control plane requires a control token."
+                    : "The control plane has NO control token — its observability/audit surfaces (cross-tenant scopes, "
+                      + "counts, cost) are anonymously reachable. Set a control token before pilot (criterion 1)."
             },
             new()
             {

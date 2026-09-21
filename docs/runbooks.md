@@ -86,7 +86,10 @@ Migrations are **additive/forward-only** from `011` onward; `LatestSchemaVersion
 highest migration file. A restored/older catalog is upgraded on next startup.
 
 **Rehearsal (do this before upgrading production).**
-1. Take a backup of the current production catalog: `sextant service backup /backups/pre-upgrade`.
+1. Take a backup of the current production catalog. Stop the service and run
+   `sextant service backup /backups/pre-upgrade` **offline**, or take it from the running service with the
+   gated `POST /control/backup?dir=/backups/pre-upgrade`. (Offline `service backup` refuses to run while a
+   live writer lease is held.)
 2. On a staging host running the **new** build, `sextant service restore /backups/pre-upgrade`, then start
    the service. Startup runs the pending migrations against the restored copy.
 3. Verify the service is **queryable and authorized**: an authorized query resolves; an unauthorized query
@@ -106,9 +109,11 @@ highest migration file. A restored/older catalog is upgraded on next startup.
 1. Stop the service.
 2. `sextant service restore /backups/<latest>` — lays the consistent catalog + immutable artifact volume
    back down (clears stale WAL/SHM sidecars first).
-3. **Re-provide credentials.** The backup contains **no secrets**; re-export the environment variables the
-   manifest's `credentials_boundary` lists (`SEXTANT_SERVICE_CONTROL_TOKEN`, `…_QUERY_TOKEN`,
-   `…_CONTRIBUTE_TOKEN`, `SEXTANT_LLM_API_KEY`).
+3. **Re-provide credentials + authorization config.** The backup contains **no secrets**; re-export the
+   environment variables the manifest's `credentials_boundary` lists (`SEXTANT_SERVICE_CONTROL_TOKEN`,
+   `…_QUERY_TOKEN`, `…_CONTRIBUTE_TOKEN`, `SEXTANT_SERVICE_READ_POLICY`, `SEXTANT_LLM_API_KEY`). The read
+   policy is on the boundary deliberately: a restore that forgot it would start an **anonymously readable**
+   service — restore must re-enforce slice-1 authz, so re-supply the policy alongside the tokens.
 4. Start the service. It runs migrations, recovers the WAL, reconciles orphaned jobs, and **re-enforces the
    read-authorization policy** — the restored service is a queryable *authorized* service, and the immutable
    snapshot is byte-for-byte the one that was backed up (restore never mutates it).
@@ -152,30 +157,54 @@ regression; both are explicitly carried here so operators size the risk before h
   investigate.
 - **In-process sandbox only (issue #76).** See "Security & isolation posture."
 - **Cached-heartbeat writer-lease abort probe (issue #80).** See "Security & isolation posture."
+- **Audit trail records accepted operator actions, not per-request query/denial decisions.** Audit rows
+  are written on the service **writer path** (under the single-writer lease), so the log captures accepted
+  operator control-plane actions (ensure/contribute/retention/backup) and their outcomes. A durable row
+  per *unauthenticated* request is deliberately **not** emitted from the auth-middleware hot path — it would
+  drive the single writer into contention (a DoS amplifier), and the uniform-not-found denial (slice 1)
+  already prevents an unauthorized caller from learning anything. The `query`/`denied` vocabulary in
+  migration 020 is reserved for a future **out-of-band** (non-writer-path) audit sink; that sink is a
+  tracked follow-up, not shipped here.
+- **Cache-reuse vs cost attribution edge (tracked follow-up).** Cache-reuse metrics and cost suppression
+  key off whether a snapshot *job row already existed* (`Attached`), not off whether the worker actually
+  re-ran. A job that existed but re-executed (e.g. a reclaimed/regenerated snapshot) is counted as reuse and
+  its index cost is not attributed. This under-counts cost in a rare regeneration path; it never over-reports
+  completeness or leaks cross-tenant data. A `WorkerRan` signal to separate the two is a follow-up.
+- **Offline CLI backup only.** `sextant service backup` copies the immutable artifact volume alongside the
+  catalog **without** holding the writer lease, so it is **offline-only** and refuses to run while a live
+  writer lease is held. To back up a **running** service use the gated online path `POST /control/backup`,
+  which runs the copy under the writer gate. Offline `sextant service restore` likewise refuses a target
+  catalog that a live service still owns.
 
 ---
 
 ## Pilot exit criteria (criterion 7)
 
 Promote from pilot to production **only** when all of the following hold for the target workload class.
-`GET /control/pilot?workload=<trusted|untrusted>&hard_isolation=<bool>&recent_backup=<bool>` evaluates them
-and returns a machine-readable go/no-go with the failing checks named.
+`GET /control/pilot?workload=<trusted|untrusted>` evaluates them and returns a machine-readable go/no-go
+with the failing checks named. The security-critical capabilities are derived from the service's **actual
+state**, never from request parameters — a caller cannot assert the #76 precondition (or a proven backup)
+into existence with a query flag.
 
 | # | Exit criterion | How it is checked |
 | --- | --- | --- |
 | 1 | Authorization enforced (read policy on) | `authorization_enabled` |
-| 2 | Evaluation sandbox enforced | `sandbox_enforced` |
-| 3 | **Untrusted/multi-tenant only:** OS-hard out-of-process isolation (#76) available | `hard_os_isolation` — **blocking** for `untrusted` |
-| 4 | A recent backup exists and DR restore was rehearsed | `restorable_backup` |
-| 5 | Catalog recovery completed cleanly on last start | `catalog_recovered` |
-| 6 | Worker capacity available | `worker_capacity` |
-| 7 | No active **critical** alerts | `no_critical_alerts` |
+| 2 | Control plane secured with a control token (no anonymous observability/audit) | `control_plane_secured` |
+| 3 | Evaluation sandbox enforced | `sandbox_enforced` |
+| 4 | **Untrusted/multi-tenant only:** OS-hard out-of-process isolation (#76) available | `hard_os_isolation` — **blocking** for `untrusted`, derived from the worker's real capability (always false until #76 ships) |
+| 5 | A recent backup exists and DR restore was rehearsed | `restorable_backup` — derived from a durable successful `backup` row in the audit log |
+| 6 | Catalog recovery completed cleanly on last start | `catalog_recovered` |
+| 7 | Worker capacity available | `worker_capacity` |
+| 8 | No active **critical** alerts | `no_critical_alerts` |
 
-- **Trusted single-tenant** pilots may exit with checks 1, 2, 4–7 green; #76 is informational (not blocking).
+- **Trusted single-tenant** pilots may exit with #76 informational (not blocking), but still require a
+  secured control plane (check 2) — a tokenless control plane exposes cross-tenant observability/audit and
+  is dev-only.
 - **Untrusted / multi-tenant** pilots **cannot** exit until #76 is green — the gate returns *not ready* and
   names `hard_os_isolation` as the blocker, no matter how healthy everything else is.
 
-The gate is exercised by `PilotReadinessTests` (untrusted blocked without #76; trusted allowed).
+The gate is exercised by `PilotReadinessTests` (untrusted blocked without #76; trusted allowed; tokenless
+control plane blocked) and `ObservabilityHttpTests` (the endpoint ignores request-supplied capability flags).
 
 ---
 

@@ -98,12 +98,27 @@ public class PilotReadinessTests
         Assert.IsTrue(report.Ready, "a warning alert is advisory, not a pilot blocker");
     }
 
+    [TestMethod]
+    public void ControlPlaneUnsecured_BlocksEvenTrusted()
+    {
+        var report = PilotReadiness.Evaluate(FullyGreen() with
+        {
+            WorkloadClass = PilotWorkloadClass.TrustedSingleTenant,
+            ControlPlaneSecured = false
+        });
+
+        Assert.IsFalse(report.Ready,
+            "an anonymous (tokenless) control plane exposes cross-tenant observability — blocked for pilot (criterion 1)");
+        Assert.IsTrue(report.Blockers.Any(c => c.Id == "control_plane_secured"));
+    }
+
     // A baseline input with every blocking precondition satisfied for a trusted pilot; individual tests
     // flip one field to prove that field's effect.
     private static PilotReadinessInput FullyGreen() => new()
     {
         WorkloadClass = PilotWorkloadClass.TrustedSingleTenant,
         AuthorizationEnabled = true,
+        ControlPlaneSecured = true,
         SandboxEnforced = true,
         HardOsIsolationAvailable = false,
         RecentBackupAvailable = true,

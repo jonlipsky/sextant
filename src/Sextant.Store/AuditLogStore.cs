@@ -10,8 +10,13 @@ public static class AuditAction
     public const string Ensure = "ensure";
     public const string Contribute = "contribute";
     public const string Retention = "retention";
+
+    /// <summary>RESERVED vocabulary (not emitted today — see <see cref="AuditOutcome.Denied"/>).</summary>
     public const string Resolve = "resolve";
+
+    /// <summary>RESERVED vocabulary (not emitted today — see <see cref="AuditOutcome.Denied"/>).</summary>
     public const string Query = "query";
+
     public const string Backup = "backup";
     public const string Restore = "restore";
     public const string Reconcile = "reconcile";
@@ -23,7 +28,13 @@ public static class AuditOutcome
     /// <summary>The request passed authorization and was accepted for processing.</summary>
     public const string Accepted = "accepted";
 
-    /// <summary>An authorization refusal — recorded WITHOUT confirming the target exists (criterion 1).</summary>
+    /// <summary>
+    /// RESERVED vocabulary for a future out-of-band (non-writer-path) audit sink. An authorization refusal
+    /// would be recorded here WITHOUT confirming the target exists (criterion 1). It is deliberately NOT
+    /// emitted from the auth-middleware hot path today: a durable write per unauthenticated request would
+    /// drive the single writer into contention (a DoS amplifier), and the uniform-not-found denial already
+    /// prevents an unauthorized caller from learning anything. See docs/runbooks.md.
+    /// </summary>
     public const string Denied = "denied";
 
     public const string Complete = "complete";
@@ -174,6 +185,28 @@ public sealed class AuditLogStore(SqliteConnection connection)
         using var cmd = connection.CreateCommand();
         cmd.CommandText = "SELECT COUNT(*) FROM audit_log;";
         return Convert.ToInt64(cmd.ExecuteScalar());
+    }
+
+    /// <summary>
+    /// True when at least one audit row exists for <paramref name="action"/> (optionally requiring a given
+    /// <paramref name="outcome"/> and a minimum timestamp). Used to derive durable operational facts from
+    /// the audit trail — e.g. whether a successful backup has been recorded — instead of trusting a caller-
+    /// supplied flag.
+    /// </summary>
+    public bool HasAction(string action, string? outcome = null, long? sinceTs = null)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT EXISTS(
+                SELECT 1 FROM audit_log
+                WHERE action = @action
+                  AND (@outcome IS NULL OR outcome = @outcome)
+                  AND (@since IS NULL OR ts >= @since));
+            """;
+        cmd.Parameters.AddWithValue("@action", action);
+        cmd.Parameters.AddWithValue("@outcome", (object?)outcome ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@since", (object?)sinceTs ?? DBNull.Value);
+        return Convert.ToInt64(cmd.ExecuteScalar()) != 0;
     }
 
     /// <summary>

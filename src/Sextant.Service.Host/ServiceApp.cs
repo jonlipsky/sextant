@@ -134,8 +134,11 @@ public static class ServiceApp
         });
 
         // Query-plane latency instrumentation (criterion 5, query latency): times /mcp + /query requests
-        // and feeds the live ServiceMetrics histogram. Records a failure for a 5xx. Runs only for the query
-        // planes so control-plane operator calls do not pollute the query-latency signal.
+        // and feeds the live ServiceMetrics histogram. Runs only for the query planes so control-plane
+        // operator calls do not pollute the query-latency signal. A request counts as FAILED when it
+        // returns a 5xx OR when the pipeline throws — an unhandled exception unwinds through this finally
+        // while the response status is still 200, so we must observe the throw explicitly rather than
+        // trusting the status code, otherwise server-side faults would be mis-recorded as successes.
         app.Use(async (context, next) =>
         {
             var path = context.Request.Path;
@@ -145,15 +148,21 @@ public static class ServiceApp
                 return;
             }
             var started = System.Diagnostics.Stopwatch.GetTimestamp();
+            var threw = false;
             try
             {
                 await next();
+            }
+            catch
+            {
+                threw = true;
+                throw;
             }
             finally
             {
                 var elapsedMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
                 var service = context.RequestServices.GetService<SnapshotService>();
-                service?.Metrics.RecordQuery(elapsedMs, failed: context.Response.StatusCode >= 500);
+                service?.Metrics.RecordQuery(elapsedMs, failed: threw || context.Response.StatusCode >= 500);
             }
         });
 
@@ -227,14 +236,16 @@ public static class ServiceApp
         });
 
         // Pilot readiness gate (criterion 7): evaluates the documented exit criteria for a workload class,
-        // including the issue-#76 hard precondition for untrusted multi-tenant pilots.
-        control.MapGet("/pilot", (string? workload, bool? hard_isolation, bool? recent_backup, SnapshotService service) =>
+        // including the issue-#76 hard precondition for untrusted multi-tenant pilots. The security-
+        // relevant capabilities (#76 hard isolation, a proven backup, a secured control plane) are derived
+        // from the SERVICE's actual state, never from request parameters — a caller must not be able to
+        // assert the #76 precondition into existence by passing a query flag.
+        control.MapGet("/pilot", (string? workload, SnapshotService service) =>
         {
             var workloadClass = string.Equals(workload, "untrusted", StringComparison.OrdinalIgnoreCase)
                 ? Rollout.PilotWorkloadClass.UntrustedMultiTenant
                 : Rollout.PilotWorkloadClass.TrustedSingleTenant;
-            var report = service.EvaluatePilotReadiness(
-                workloadClass, hard_isolation ?? false, recent_backup ?? false);
+            var report = service.EvaluatePilotReadiness(workloadClass);
             return Results.Json(report, ServiceJson.Options);
         });
 

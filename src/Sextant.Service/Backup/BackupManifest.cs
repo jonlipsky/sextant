@@ -21,15 +21,19 @@ public sealed record BackupManifest
     public required string ConfigFingerprint { get; init; }
 
     /// <summary>
-    /// The secret-bearing configuration this backup deliberately does NOT contain (criterion 6: back up
-    /// configuration + credentials as a documented BOUNDARY, not by dumping secrets). An operator must
-    /// re-provide these on the restored host; they are listed by NAME only, never value.
+    /// The secret-bearing AND authorization-critical configuration this backup deliberately does NOT
+    /// contain (criterion 6: back up configuration + credentials as a documented BOUNDARY, not by dumping
+    /// secrets). An operator must re-provide these on the restored host; they are listed by NAME only, never
+    /// value. <c>SEXTANT_SERVICE_READ_POLICY</c> is included because a restore that forgot it would start an
+    /// ANONYMOUSLY-READABLE service — restore must RE-ENFORCE slice-1 authz, so the operator is reminded to
+    /// re-supply the read policy (and control/query tokens) alongside the recovered catalog.
     /// </summary>
     public IReadOnlyList<string> CredentialsBoundary { get; init; } =
     [
         "SEXTANT_SERVICE_CONTROL_TOKEN",
         "SEXTANT_SERVICE_QUERY_TOKEN",
         "SEXTANT_SERVICE_CONTRIBUTE_TOKEN",
+        "SEXTANT_SERVICE_READ_POLICY",
         "SEXTANT_LLM_API_KEY"
     ];
 }

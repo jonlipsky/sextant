@@ -101,6 +101,20 @@ public static class ServiceBackup
         if (!File.Exists(catalogSource))
             throw new InvalidOperationException($"Backup is missing its catalog file '{catalogSource}'.");
 
+        // A backup always writes an artifacts/ directory (even when empty), so a missing one means the
+        // backup is incomplete/corrupt — refuse rather than silently restoring a catalog whose immutable
+        // artifact volume is gone (that would leave a queryable catalog pointing at absent snapshot data).
+        var artifactSource = Path.Combine(backupDir, manifest.ArtifactDir);
+        if (!Directory.Exists(artifactSource))
+            throw new InvalidOperationException(
+                $"Backup is missing its artifact volume '{artifactSource}' — the backup is incomplete.");
+
+        // Restore is OFFLINE by contract (it precedes service startup and replaces files wholesale). If the
+        // TARGET catalog already carries a LIVE (non-expired) writer lease, another service is running on
+        // it; replacing its files out from under it would corrupt a live writer and split-brain the index.
+        // Refuse rather than clobber. (A stale/expired lease is fine — that is exactly what recovery clears.)
+        RefuseIfTargetHasLiveLease(targetCatalogPath);
+
         var targetDir = Path.GetDirectoryName(Path.GetFullPath(targetCatalogPath));
         if (!string.IsNullOrEmpty(targetDir))
             Directory.CreateDirectory(targetDir);
@@ -116,11 +130,37 @@ public static class ServiceBackup
         ClearWriterLease(targetCatalogPath);
 
         // Restore the immutable artifact volume (replace target contents).
-        var artifactSource = Path.Combine(backupDir, manifest.ArtifactDir);
-        if (Directory.Exists(artifactSource))
-            CopyDirectory(artifactSource, targetPaths.ArtifactRoot, clearTarget: true);
+        CopyDirectory(artifactSource, targetPaths.ArtifactRoot, clearTarget: true);
 
         return manifest;
+    }
+
+    // Refuses an offline restore when the target catalog is owned by a live writer (see the call site). A
+    // missing target DB or an expired/absent lease is fine; only a non-expired lease blocks the restore.
+    private static void RefuseIfTargetHasLiveLease(string targetCatalogPath)
+    {
+        if (!File.Exists(targetCatalogPath))
+            return;
+        try
+        {
+            var connectionString = new SqliteConnectionStringBuilder
+            {
+                DataSource = targetCatalogPath,
+                Mode = SqliteOpenMode.ReadOnly,
+                Pooling = false
+            }.ToString();
+            using var conn = new SqliteConnection(connectionString);
+            conn.Open();
+            var lease = WriterLease.GetCurrent(conn);
+            if (lease is not null && !lease.IsExpiredAt(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()))
+                throw new InvalidOperationException(
+                    "The target catalog is held by a LIVE writer lease — a service is running on it. Stop the " +
+                    "service before restoring offline (restore replaces the catalog + artifact volume wholesale).");
+        }
+        catch (SqliteException)
+        {
+            // No writer_lease table (pre-016 target) or an unreadable/partial catalog — nothing live to guard.
+        }
     }
 
     // Removes a SQLite database file plus its -wal/-shm sidecars so a stale WAL never shadows a restored

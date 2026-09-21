@@ -111,12 +111,26 @@ public class ObservabilityHttpTests
     public async Task Pilot_WithControlToken_EvaluatesGate()
     {
         await using var host = await Harness.StartAsync();
-        var response = await Send(host, "/control/pilot?workload=untrusted&hard_isolation=false", ControlToken);
+        var response = await Send(host, "/control/pilot?workload=untrusted", ControlToken);
         Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
         var body = await response.Content.ReadAsStringAsync();
         StringAssert.Contains(body, "hard_os_isolation",
             "an untrusted pilot gate names the #76 hard-isolation precondition");
         StringAssert.Contains(body, "\"ready\":false", "untrusted is not pilot-ready without #76");
+    }
+
+    [TestMethod]
+    public async Task Pilot_IgnoresRequestSuppliedCapabilityFlags()
+    {
+        // The #76 hard-isolation precondition (and the DR/backup signal) are SERVICE capabilities, not
+        // request parameters — a caller must not be able to assert them into existence via query flags.
+        await using var host = await Harness.StartAsync();
+        var response = await Send(
+            host, "/control/pilot?workload=untrusted&hard_isolation=true&recent_backup=true", ControlToken);
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync();
+        StringAssert.Contains(body, "\"ready\":false",
+            "request-supplied hard_isolation/recent_backup flags are ignored — #76 is still not satisfied");
     }
 
     private static async Task EnsureViaControl(Harness host)

@@ -150,6 +150,66 @@ public class ServiceBackupRestoreTests
             "a backup from a newer schema is refused before it can half-land (forward-only guard)");
     }
 
+    [TestMethod]
+    public void Restore_RefusesWhenArtifactVolumeMissing()
+    {
+        var request = ServiceTestFixtures.Request(repo: RepoA);
+        var backupDir = ServiceTestFixtures.NewDataRoot();
+        var srcDbPath = ServiceTestFixtures.NewDbPath();
+        using (var srcDb = new IndexDatabase(srcDbPath))
+        {
+            srcDb.RunMigrations();
+            using var srcService = SnapshotService.Start(
+                ServiceTestFixtures.NewOptions(srcDbPath, controlToken: ControlToken),
+                new FakeSnapshotWorker(srcDb), srcDb);
+            srcService.EnsureSnapshotAsync(request, principal: ControlToken).GetAwaiter().GetResult();
+            srcService.CreateBackup(backupDir, principal: ControlToken);
+        }
+
+        // Corrupt the backup: remove the immutable artifact volume. Restore must refuse rather than land a
+        // catalog whose snapshot data is gone.
+        Directory.Delete(Path.Combine(backupDir, "artifacts"), recursive: true);
+
+        var restoredDbPath = ServiceTestFixtures.NewDbPath();
+        var restoredData = ServiceTestFixtures.NewDataRoot();
+        var ex = Assert.ThrowsExactly<InvalidOperationException>(() =>
+            ServiceBackup.Restore(backupDir, restoredDbPath, new ServicePaths(ServiceVolumes.Rooted(restoredData))));
+        StringAssert.Contains(ex.Message, "artifact volume",
+            "an incomplete backup (missing artifacts) is refused, not silently half-restored");
+    }
+
+    [TestMethod]
+    public void Restore_RefusesWhenTargetHasLiveWriterLease()
+    {
+        var request = ServiceTestFixtures.Request(repo: RepoA);
+        var backupDir = ServiceTestFixtures.NewDataRoot();
+        var srcDbPath = ServiceTestFixtures.NewDbPath();
+        using (var srcDb = new IndexDatabase(srcDbPath))
+        {
+            srcDb.RunMigrations();
+            using var srcService = SnapshotService.Start(
+                ServiceTestFixtures.NewOptions(srcDbPath, controlToken: ControlToken),
+                new FakeSnapshotWorker(srcDb), srcDb);
+            srcService.EnsureSnapshotAsync(request, principal: ControlToken).GetAwaiter().GetResult();
+            srcService.CreateBackup(backupDir, principal: ControlToken);
+        }
+
+        // A live service is running on the target catalog (holds the single-writer lease). An offline
+        // restore that replaced its files wholesale would corrupt the live writer — refuse.
+        var targetDbPath = ServiceTestFixtures.NewDbPath();
+        var targetData = ServiceTestFixtures.NewDataRoot();
+        using var targetDb = new IndexDatabase(targetDbPath);
+        targetDb.RunMigrations();
+        using var liveService = SnapshotService.Start(
+            ServiceTestFixtures.NewOptions(targetDbPath, dataRoot: targetData, controlToken: ControlToken),
+            new FakeSnapshotWorker(targetDb), targetDb);
+
+        var ex = Assert.ThrowsExactly<InvalidOperationException>(() =>
+            ServiceBackup.Restore(backupDir, targetDbPath, new ServicePaths(ServiceVolumes.Rooted(targetData))));
+        StringAssert.Contains(ex.Message, "LIVE writer lease",
+            "restore refuses to clobber a catalog owned by a running service");
+    }
+
     private static ReadAuthorizationPolicy TwoTenantPolicy() => new()
     {
         Enabled = true,

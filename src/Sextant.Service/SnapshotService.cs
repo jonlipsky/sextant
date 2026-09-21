@@ -67,6 +67,15 @@ public sealed class SnapshotService : IDisposable
     /// </summary>
     public bool RecoveryCompleted { get; private set; }
 
+    /// <summary>
+    /// Whether OS-hard, out-of-process worker isolation (issue #76) is available on this build. It is a
+    /// SERVICE capability, never a request parameter — the pilot gate reads it here so a caller cannot
+    /// assert the #76 hard precondition into existence. Currently always false: #76 is open and this build
+    /// ships only the in-process defense-in-depth sandbox. When #76 lands, this reflects the worker's real
+    /// isolation capability.
+    /// </summary>
+    public bool HardOsIsolationAvailable => false;
+
     /// <summary>The writer-lease token this service instance holds (identifies jobs it owns).</summary>
     public string OwnerToken => _lease.OwnerToken;
 
@@ -838,24 +847,27 @@ public sealed class SnapshotService : IDisposable
     /// <summary>
     /// Evaluates whether this service meets its documented pilot exit criteria + rollback preconditions for
     /// the given workload class (criterion 7), so the go/no-go decision is EXERCISED rather than only
-    /// written down. Encodes the issue-#76 hard precondition: an UNTRUSTED multi-tenant pilot is NOT ready
-    /// until out-of-process OS-hard worker isolation is available (the current sandbox is in-process
-    /// defense-in-depth). <paramref name="hardOsIsolationAvailable"/> reflects whether #76 has shipped;
-    /// <paramref name="recentBackupAvailable"/> reflects whether the DR path (criterion 6) has been proven.
+    /// written down. Every capability is derived from the service's ACTUAL state — never a request
+    /// parameter: the issue-#76 hard precondition (an UNTRUSTED multi-tenant pilot is not ready until
+    /// out-of-process OS-hard worker isolation exists — the current sandbox is in-process defense-in-depth)
+    /// reads <see cref="HardOsIsolationAvailable"/>; the DR-proven signal reads a durable successful backup
+    /// row from the audit log; the control-plane-secured signal reads whether a control token is configured.
     /// </summary>
-    public PilotReadinessReport EvaluatePilotReadiness(
-        PilotWorkloadClass workloadClass,
-        bool hardOsIsolationAvailable = false,
-        bool recentBackupAvailable = false)
+    public PilotReadinessReport EvaluatePilotReadiness(PilotWorkloadClass workloadClass)
     {
         var metrics = CollectMetrics();
+        bool recentBackup;
+        using (var conn = OpenReadConnection())
+            recentBackup = new AuditLogStore(conn).HasAction(AuditAction.Backup, AuditOutcome.Complete);
+
         return PilotReadiness.Evaluate(new PilotReadinessInput
         {
             WorkloadClass = workloadClass,
             AuthorizationEnabled = _options.ReadPolicy.Enabled,
+            ControlPlaneSecured = _options.ControlToken is { Length: > 0 },
             SandboxEnforced = _options.Sandbox.Enabled,
-            HardOsIsolationAvailable = hardOsIsolationAvailable,
-            RecentBackupAvailable = recentBackupAvailable,
+            HardOsIsolationAvailable = HardOsIsolationAvailable,
+            RecentBackupAvailable = recentBackup,
             CatalogRecovered = RecoveryCompleted,
             WorkerCapacityAvailable = HasWorkerCapacity,
             Alerts = metrics.Alerts
