@@ -196,10 +196,10 @@ public class FederatedReadContextTests
         CapabilityFingerprint = capability
     };
 
-    // ==== Criterion 6: authorization fails CLOSED, never an empty success ===========================
+    // ==== Criterion 6/1: authorization fails CLOSED as the UNIFORM not-found, never an empty success ===
 
     [TestMethod]
-    public void ReadContextGate_UnauthorizedRead_ReturnsStructuredErrorNotEmptySuccess()
+    public void ReadContextGate_UnauthorizedRead_ReturnsUniformNotFoundNotEmptySuccessNorAuthzOracle()
     {
         SeedBaseAndOverlay();
 
@@ -207,10 +207,18 @@ public class FederatedReadContextTests
             _db, out _, out var errorResponse, authorizer: new DenyingAuthorizer());
 
         Assert.IsFalse(denied, "an unauthorized read does not resolve");
+
+        // Phase 17, criterion 1 (revised from the Phase-11 `authorization_denied` structured error): a
+        // denial now returns the SINGLE uniform not-found — no error block, no code — so it is
+        // byte-indistinguishable from a nonexistent/unprovisioned index. The old distinct
+        // `authorization_denied` code was itself an existence/authorization oracle (it told an
+        // unauthorized caller "this exists but you may not see it"); the uniform not-found reveals nothing.
         var meta = JsonDocument.Parse(errorResponse).RootElement.GetProperty("meta");
-        Assert.IsTrue(meta.TryGetProperty("error", out var error), "the denial is a structured error, not empty success");
-        Assert.AreEqual("authorization_denied", error.GetProperty("code").GetString());
+        Assert.IsFalse(meta.TryGetProperty("error", out _),
+            "the denial must NOT carry a distinct error code — that would be an authz/existence oracle");
         Assert.AreEqual(0, meta.GetProperty("result_count").GetInt32());
+        Assert.IsFalse(meta.TryGetProperty("snapshot", out _),
+            "a denied read stamps no provenance (no existence/freshness signal leaks)");
     }
 
     [TestMethod]
@@ -378,6 +386,7 @@ public class FederatedReadContextTests
 
     private sealed class DenyingAuthorizer : IReadAuthorizer
     {
+        public bool IsEnforcing => true;
         public ReadAuthorization Authorize(SnapshotRow? selected) =>
             ReadAuthorization.Deny("test principal is not authorized");
         public ReadAuthorization AuthorizeRepository(long repositoryId, string remoteUrl) =>

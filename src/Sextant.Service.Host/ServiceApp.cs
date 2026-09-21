@@ -54,7 +54,18 @@ public static class ServiceApp
                     PrincipalTokenAccessor(sp.GetRequiredService<IHttpContextAccessor>()),
                     RepositoryUrlResolver(options.CatalogDbPath))
                 : AllowAllReadAuthorizer.Instance;
-            return new DatabaseProvider(options.CatalogDbPath, authorizer);
+            var provider = new DatabaseProvider(options.CatalogDbPath, authorizer);
+
+            // Under an enforced multi-tenant policy the request names its authorized repository via the
+            // X-Sextant-Repository header, so the read planner pins THAT repository's snapshot instead of
+            // deny-all (Phase 17, criterion 1). The accessor reads the ambient request at call time, so the
+            // singleton provider stays correct under concurrent requests. With no policy the default
+            // (() => null) keeps the single-repository local path byte-identical.
+            if (options.ReadPolicy.Enabled)
+                provider.RequestedRepository =
+                    RequestedRepositoryAccessor(sp.GetRequiredService<IHttpContextAccessor>());
+
+            return provider;
         });
         builder.Services.AddMcpServer()
             .WithHttpTransport()
@@ -314,6 +325,24 @@ public static class ServiceApp
     /// <summary>Resolves the ambient request principal's bearer token for <see cref="PolicyReadAuthorizer"/>.</summary>
     private static Func<string?> PrincipalTokenAccessor(IHttpContextAccessor accessor) =>
         () => accessor.HttpContext is { } ctx ? BearerToken(ctx) : null;
+
+    /// <summary>
+    /// Resolves the caller-declared authorized repository (its git remote URL) from the
+    /// <c>X-Sextant-Repository</c> request header for the Phase-17 multi-tenant read selector. Reads the
+    /// ambient request at call time so a singleton <see cref="DatabaseProvider"/> stays request-correct;
+    /// returns null when the header is absent/blank (the read planner then denies rather than guessing).
+    /// The header only NAMES the repository — authorization is still enforced by
+    /// <see cref="PolicyReadAuthorizer"/> against the principal's token, so a caller cannot read another
+    /// tenant merely by naming it.
+    /// </summary>
+    private static Func<string?> RequestedRepositoryAccessor(IHttpContextAccessor accessor) =>
+        () =>
+        {
+            if (accessor.HttpContext is not { } ctx)
+                return null;
+            var value = ctx.Request.Headers["X-Sextant-Repository"].ToString();
+            return string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+        };
 
     /// <summary>
     /// Maps a repository row id to its remote URL for <see cref="PolicyReadAuthorizer"/>, caching results

@@ -14,15 +14,25 @@ namespace Sextant.Mcp;
 public sealed class FederatedReadContext
 {
     private FederatedReadContext(
-        SnapshotReadScope scope, SnapshotProvenance? provenance, ReadAuthorization authorization)
+        SnapshotReadScope scope, SnapshotProvenance? provenance, ReadAuthorization authorization,
+        long? selectedSnapshotId)
     {
         Scope = scope;
         Provenance = provenance;
         Authorization = authorization;
+        SelectedSnapshotId = selectedSnapshotId;
     }
 
     /// <summary>The pinned read scope reused by every store in this request.</summary>
     public SnapshotReadScope Scope { get; }
+
+    /// <summary>
+    /// The id of the single snapshot generation this request pinned (Phase 11 issue #42), or null for a
+    /// legacy/pre-first-publish/unauthorized read. Tools that must re-derive the selected generation (e.g.
+    /// get_index_status) read it from here instead of re-querying, so they honour the Phase-17
+    /// request-level repository selector and stay consistent with <see cref="Scope"/>.
+    /// </summary>
+    public long? SelectedSnapshotId { get; }
 
     /// <summary>
     /// The provenance stamped into every response's <c>meta.snapshot</c> for this request, or null for a
@@ -39,12 +49,18 @@ public sealed class FederatedReadContext
     /// scope, provenance, and the compatibility verdict. <paramref name="mode"/> selects the federation
     /// partition (default transparent federation); <paramref name="authorizer"/> and
     /// <paramref name="compatibility"/> are injectable for tests and future remote enforcement.
+    /// <paramref name="requestedRepository"/> is the Phase-17 request-level repository selector (criterion
+    /// 1): when it yields a non-empty remote URL the request pins THAT repository's default-branch
+    /// snapshot (the multi-tenant path — the caller names its authorized repository), and when it yields
+    /// null the resolver falls back to the single-repository default (byte-identical to pre-Phase-17), so
+    /// the zero-policy local path is unchanged.
     /// </summary>
     public static FederatedReadContext Resolve(
         IndexDatabase db,
         FederationMode mode = FederationMode.Federated,
         IReadAuthorizer? authorizer = null,
-        CompatibilityInputs? compatibility = null)
+        CompatibilityInputs? compatibility = null,
+        Func<string?>? requestedRepository = null)
     {
         // Read through a PRIVATE short-lived reader, never the shared writer connection (issue #57): the
         // read gate runs concurrently with other MCP tool invocations, so it must not share one
@@ -52,19 +68,24 @@ public sealed class FederatedReadContext
         using var conn = db.OpenReadConnection();
         var snapshots = new SnapshotStore(conn);
 
-        // ONE read of the selected generation pins this request (issue #42).
-        var selected = snapshots.GetSelectedSnapshotRow();
+        // ONE read of the selected generation pins this request (issue #42). Under a request-level
+        // repository selector (Phase 17) the named repository's snapshot is pinned; otherwise the
+        // single-repository default resolves exactly as before.
+        var requested = requestedRepository?.Invoke();
+        var selected = string.IsNullOrEmpty(requested)
+            ? snapshots.GetSelectedSnapshotRow()
+            : snapshots.GetSelectedSnapshotRowForRepository(requested);
         var authorization = (authorizer ?? AllowAllReadAuthorizer.Instance).Authorize(selected);
 
         // Fail closed: on denial the read gets a DENY-ALL scope (matches no rows), so even a caller that
         // reads Scope without consulting Authorization leaks nothing; the gate additionally turns the
-        // denial into a structured meta.error. No provenance/scope work is done for a denied read.
+        // denial into the uniform not-found. No provenance/scope work is done for a denied read.
         if (!authorization.Allowed)
-            return new FederatedReadContext(SnapshotReadScope.DenyAll, provenance: null, authorization);
+            return new FederatedReadContext(SnapshotReadScope.DenyAll, provenance: null, authorization, selectedSnapshotId: null);
 
         var scope = ResolveScope(snapshots, selected, mode);
         var provenance = selected == null ? null : BuildProvenance(snapshots, selected, mode, compatibility);
-        return new FederatedReadContext(scope, provenance, authorization);
+        return new FederatedReadContext(scope, provenance, authorization, selected?.Id);
     }
 
     private static SnapshotReadScope ResolveScope(

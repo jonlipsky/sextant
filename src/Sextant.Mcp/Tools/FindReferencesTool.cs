@@ -19,12 +19,8 @@ public static class FindReferencesTool
         [Description("Filter by access kind: 'read', 'write', 'readwrite', or null for all")] string? access_kind = null,
         [Description("Federation partition (Phase 11 diagnostic): 'federated' (default, overlay over base), 'base_only', or 'overlay_only'")] string? federation = null)
     {
-        var db = dbProvider.GetReadyDatabase(out var notReady);
-        if (db == null)
-            return ResponseBuilder.BuildEmpty(notReady);
-
         var mode = FederationModes.Parse(federation);
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError, mode, dbProvider.Authorizer))
+        if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError, mode))
             return authError;
 
         using var conn = db.OpenReadConnection();

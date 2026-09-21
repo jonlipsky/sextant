@@ -20,11 +20,7 @@ public static class TraceValueTool
         [Description("Maximum depth of transitive tracing (default 2)")]
         int depth = 2)
     {
-        var db = dbProvider.GetReadyDatabase(out var notReady);
-        if (db == null)
-            return ResponseBuilder.BuildEmpty(notReady);
-
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError, authorizer: dbProvider.Authorizer))
+        if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
 
         if (!CapabilityGate.Ensure(db, Core.IndexFeature.Dataflow, "dataflow", out var unavailable))

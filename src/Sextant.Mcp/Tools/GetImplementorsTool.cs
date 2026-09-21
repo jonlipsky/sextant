@@ -13,11 +13,7 @@ public static class GetImplementorsTool
         DatabaseProvider dbProvider,
         [Description("The fully qualified name of the interface or member")] string symbol_fqn)
     {
-        var db = dbProvider.GetReadyDatabase(out var notReady);
-        if (db == null)
-            return ResponseBuilder.BuildEmpty(notReady);
-
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError, authorizer: dbProvider.Authorizer))
+        if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
 
         using var conn = db.OpenReadConnection();

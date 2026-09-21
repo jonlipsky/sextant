@@ -46,6 +46,19 @@ public static class CrossRepositoryUsageResolver
     {
         var store = new SnapshotDependencyStore(conn);
 
+        // Authorize the PROVIDER repository BEFORE resolving its symbol identity (Phase 17, criterion 1):
+        // otherwise StableIdentityResolved is a provider-symbol existence oracle for a caller with no
+        // access to the provider repo. Gated on IsEnforcing so the zero-policy local path is byte-identical
+        // (AllowAll resolves nothing here). An unauthorized OR unknown provider collapses to the SAME
+        // "no stable identity" outcome as a symbol that genuinely does not exist — no existence leak.
+        if (authorizer.IsEnforcing)
+        {
+            var providerRepoId = new SnapshotStore(conn).GetRepositoryId(providerRepositoryUrl);
+            if (providerRepoId is not { } pid ||
+                !authorizer.AuthorizeRepository(pid, providerRepositoryUrl).Allowed)
+                return new CrossRepositoryUsageResult(StableIdentityResolved: false, ResolvedSymbolKeys: [], Usages: []);
+        }
+
         // Bind the input FQN to the provider's STABLE symbol key(s). No key ⇒ no stable identity /
         // assembly lineage for this name in the provider repo, so a cross-repo match is prohibited: report
         // that explicitly rather than silently searching by FQN string (which could conflate two repos'
@@ -97,6 +110,16 @@ public static class CrossRepositoryUsageResolver
     {
         var store = new SnapshotDependencyStore(conn);
         var rows = store.GetConsumersByProviderRepository(providerRepositoryUrl, providerCommitSha, scope);
+
+        // Provider-repository authorization (Phase 17, criterion 1), IsEnforcing-gated so the local path is
+        // byte-identical: a caller with no access to the provider must not learn its consumers exist.
+        if (authorizer.IsEnforcing)
+        {
+            var providerRepoId = new SnapshotStore(conn).GetRepositoryId(providerRepositoryUrl);
+            if (providerRepoId is not { } pid ||
+                !authorizer.AuthorizeRepository(pid, providerRepositoryUrl).Allowed)
+                return [];
+        }
 
         var authorizationMemo = new Dictionary<long, bool>();
         var authorized = new List<SubmoduleConsumer>();

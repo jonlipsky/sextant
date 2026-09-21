@@ -23,11 +23,7 @@ public static class FindSubmoduleConsumersTool
         [Description("Optional: restrict to consumers at this exact commit (historical scope). Omit for branch-head scope.")]
         string? consumer_commit = null)
     {
-        var db = dbProvider.GetReadyDatabase(out var notReady);
-        if (db == null)
-            return ResponseBuilder.BuildEmpty(notReady);
-
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError, authorizer: dbProvider.Authorizer))
+        if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
 
         using var conn = db.OpenReadConnection();

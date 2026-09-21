@@ -124,6 +124,17 @@ public sealed record ReadAuthorization(bool Allowed, string? Reason)
 /// </summary>
 public interface IReadAuthorizer
 {
+    /// <summary>
+    /// True when this authorizer actively ENFORCES a configured policy (Phase 17, criterion 1). The
+    /// permissive local default (<see cref="AllowAllReadAuthorizer"/>) is false; a configured multi-tenant
+    /// <see cref="PolicyReadAuthorizer"/> is true iff its policy is enabled. Read paths use it to decide
+    /// whether to apply the fail-closed criterion-1 ordering — authorize BEFORE surfacing any
+    /// readiness/existence signal and collapse EVERY denial (unauthorized principal, cross-tenant
+    /// repository, unidentifiable/nonexistent repository, unprovisioned service) to ONE uniform not-found
+    /// response — or to stay byte-identical to the pre-Phase-17 zero-policy local path.
+    /// </summary>
+    bool IsEnforcing { get; }
+
     ReadAuthorization Authorize(SnapshotRow? selected);
 
     /// <summary>
@@ -143,6 +154,7 @@ public interface IReadAuthorizer
 public sealed class AllowAllReadAuthorizer : IReadAuthorizer
 {
     public static readonly AllowAllReadAuthorizer Instance = new();
+    public bool IsEnforcing => false;
     public ReadAuthorization Authorize(SnapshotRow? selected) => ReadAuthorization.Allow;
     public ReadAuthorization AuthorizeRepository(long repositoryId, string remoteUrl) => ReadAuthorization.Allow;
 }

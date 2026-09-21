@@ -135,8 +135,13 @@ public class PolicyReadAuthorizerTests
             var deniedJson = GetIndexStatusTool.GetIndexStatus(denied);
 
             var meta = JsonDocument.Parse(deniedJson).RootElement.GetProperty("meta");
-            Assert.AreEqual("authorization_denied", meta.GetProperty("error").GetProperty("code").GetString(),
-                "an unauthorized status read fails closed as a structured error, never an empty success");
+            // Phase 17, criterion 1 (revised from the Phase-11 `authorization_denied` code): an
+            // unauthorized status read now returns the UNIFORM not-found — no error block — so it is
+            // byte-indistinguishable from an unprovisioned/nonexistent index. A distinct code would itself
+            // be an existence/authz oracle.
+            Assert.IsFalse(meta.TryGetProperty("error", out _),
+                "an unauthorized status read must NOT carry a distinct error code (authz/existence oracle)");
+            Assert.AreEqual(0, meta.GetProperty("result_count").GetInt32(), "it reveals zero results");
             Assert.IsFalse(deniedJson.Contains(RepoA), "the repository remote URL does not leak");
             Assert.IsFalse(deniedJson.Contains("logical_A"), "the project canonical id does not leak");
             Assert.IsFalse(deniedJson.Contains("symbol_count"), "no symbol/reference counts leak");
@@ -151,6 +156,123 @@ public class PolicyReadAuthorizerTests
         {
             SqliteTestDatabase.Delete(dbPath, db);
         }
+    }
+
+    // ==== criterion 1: multi-tenant is queryable-and-scoped, NOT deny-all, and forbidden ≡ nonexistent ==
+
+    [TestMethod]
+    public void GetIndexStatus_MultiTenant_AuthorizedPrincipal_ReadsOwnRepoScoped_NotDenyAll()
+    {
+        var (dbPath, db, repoAId, repoBId) = SeedTwoSelectedRepos();
+        try
+        {
+            var policy = TwoTenant();
+            Func<long, string?> resolver = id => id == repoAId ? RepoA : id == repoBId ? RepoB : null;
+
+            // tok-b names its authorized repository B via the request selector: the read must resolve to
+            // B's snapshot (queryable), NOT collapse to deny-all just because the catalog is multi-tenant.
+            using var provider =
+                new DatabaseProvider(dbPath, new PolicyReadAuthorizer(policy, () => "tok-b", resolver))
+                { RequestedRepository = () => RepoB };
+            var json = GetIndexStatusTool.GetIndexStatus(provider);
+
+            var meta = JsonDocument.Parse(json).RootElement.GetProperty("meta");
+            Assert.IsFalse(meta.TryGetProperty("error", out _), "an authorized multi-tenant read is not deny-all");
+            Assert.IsTrue(meta.GetProperty("result_count").GetInt32() > 0, "the caller's own repository is queryable");
+            StringAssert.Contains(json, RepoB, "the authorized principal reads its own repository");
+            Assert.IsFalse(json.Contains(RepoA), "the OTHER tenant's repository is scoped OUT (no cross-tenant leak)");
+            Assert.IsFalse(json.Contains("logical_A"), "the other tenant's project canonical id does not leak");
+        }
+        finally
+        {
+            SqliteTestDatabase.Delete(dbPath, db);
+        }
+    }
+
+    [TestMethod]
+    public void GetIndexStatus_ForbiddenExistingRepo_ByteIndistinguishableFromNonexistent()
+    {
+        var (dbPath, db, repoAId, repoBId) = SeedTwoSelectedRepos();
+        try
+        {
+            var policy = TwoTenant();
+            Func<long, string?> resolver = id => id == repoAId ? RepoA : id == repoBId ? RepoB : null;
+
+            // (a) tok-b names repo A — it EXISTS in the catalog but the principal is not authorized for it.
+            using var forbidden =
+                new DatabaseProvider(dbPath, new PolicyReadAuthorizer(policy, () => "tok-b", resolver))
+                { RequestedRepository = () => RepoA };
+            var forbiddenJson = GetIndexStatusTool.GetIndexStatus(forbidden);
+
+            // (b) tok-b names a repository that does NOT exist in the catalog at all.
+            using var nonexistent =
+                new DatabaseProvider(dbPath, new PolicyReadAuthorizer(policy, () => "tok-b", resolver))
+                { RequestedRepository = () => "https://github.com/org/does-not-exist" };
+            var nonexistentJson = GetIndexStatusTool.GetIndexStatus(nonexistent);
+
+            // Criterion 1: the two responses are byte-identical (modulo the always-varying queried_at), so an
+            // unauthorized caller CANNOT tell a forbidden existing repository from a nonexistent one — no
+            // existence, name, count, or timing-sensitive signal leaks.
+            Assert.AreEqual(StripQueriedAt(forbiddenJson), StripQueriedAt(nonexistentJson),
+                "a forbidden existing repo must be byte-indistinguishable from a nonexistent one");
+            var meta = JsonDocument.Parse(forbiddenJson).RootElement.GetProperty("meta");
+            Assert.IsFalse(meta.TryGetProperty("error", out _), "neither carries an authz/existence oracle");
+            Assert.IsFalse(forbiddenJson.Contains(RepoA), "the forbidden repository name does not leak");
+        }
+        finally
+        {
+            SqliteTestDatabase.Delete(dbPath, db);
+        }
+    }
+
+    private static string StripQueriedAt(string json) =>
+        System.Text.RegularExpressions.Regex.Replace(json, "\"queried_at\":\\s*\\d+", "\"queried_at\":0");
+
+    private static (string dbPath, IndexDatabase db, long repoAId, long repoBId) SeedTwoSelectedRepos()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"sextant_polauthz_{Guid.NewGuid():N}.db");
+        var db = new IndexDatabase(dbPath);
+        db.RunMigrations();
+        var conn = db.GetConnection();
+        var store = new SnapshotStore(conn);
+        var repoAId = SeedOneSelectedRepo(conn, store, RepoA, "logical_A", "src/A/A.csproj", "K:A.T", "global::A.T");
+        var repoBId = SeedOneSelectedRepo(conn, store, RepoB, "logical_B", "src/B/B.csproj", "K:B.T", "global::B.T");
+        return (dbPath, db, repoAId, repoBId);
+    }
+
+    private static long SeedOneSelectedRepo(
+        Microsoft.Data.Sqlite.SqliteConnection conn, SnapshotStore store,
+        string url, string canonical, string projPath, string symbolKey, string fqn)
+    {
+        var repoId = store.EnsureRepository(url, now: 1);
+        var commitId = store.EnsureCommit(repoId, "c1", "t1", now: 1);
+        var logical = store.EnsureLogicalProject(repoId, canonical, projPath, "net10.0", now: 1);
+
+        var identity = new SnapshotIdentity
+        {
+            RepositoryRemoteUrl = url, CommitSha = "c1", TreeSha = "t1",
+            SchemaVersion = IndexDatabase.LatestSchemaVersion,
+            AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
+            ConfigHash = "cfg", ToolchainFingerprint = ToolchainFingerprint.Current
+        };
+        var snapId = store.BeginPending(identity, repoId, commitId, runId: null, now: 1).id;
+        var proj = new ProjectIdentity
+        {
+            CanonicalId = canonical, GitRemoteUrl = url, RepoRelativePath = projPath, TargetFramework = "net10.0"
+        };
+        var projId = new ProjectStore(conn).UpsertSnapshotProject(proj, snapId, logical, 1);
+        store.MapProject(snapId, projId);
+        new SymbolStore(conn).Insert(new SymbolInfo
+        {
+            ProjectId = projId,
+            SymbolKey = symbolKey, FullyQualifiedName = fqn,
+            DisplayName = "T", Kind = SymbolKind.Class, Accessibility = Accessibility.Public,
+            FilePath = projPath, LineStart = 1, LineEnd = 2, LastIndexedAt = 1
+        });
+        store.MarkComplete(snapId, publishedAt: 1);
+        var branch = store.EnsureBranch(repoId, "main", isDefault: true, now: 1);
+        store.SetBranchPointer(branch, snapId, now: 1);
+        return repoId;
     }
 
     private static (string dbPath, IndexDatabase db, long repoId) SeedSelectedRepo(string repoUrl)

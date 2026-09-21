@@ -20,11 +20,7 @@ public static class GetTypeMembersTool
         [Description("The fully qualified name of the type")] string symbol_fqn,
         [Description("Include inherited members")] bool include_inherited = false)
     {
-        var db = dbProvider.GetReadyDatabase(out var notReady);
-        if (db == null)
-            return ResponseBuilder.BuildEmpty(notReady);
-
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError, authorizer: dbProvider.Authorizer))
+        if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
 
         using var conn = db.OpenReadConnection();

@@ -24,13 +24,9 @@ public static class FindCrossRepositoryUsagesTool
         [Description("Optional: restrict to consumers at this exact commit (historical scope). Omit for branch-head scope.")]
         string? consumer_commit = null)
     {
-        var db = dbProvider.GetReadyDatabase(out var notReady);
-        if (db == null)
-            return ResponseBuilder.BuildEmpty(notReady);
-
-        // Honour the Phase-11 fail-closed top-level read gate before touching any cross-repo data: a
-        // denied read must surface a structured error, never an empty successful result.
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError, authorizer: dbProvider.Authorizer))
+        // Honour the Phase-17 fail-closed top-level read gate before touching any cross-repo data: a
+        // denied read surfaces the uniform not-found, never an empty successful result.
+        if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
 
         using var conn = db.OpenReadConnection();

@@ -16,11 +16,7 @@ public static class GetCallHierarchyTool
         [Description("Maximum depth to traverse")] int depth = 5,
         [Description("Include source code snippet at each call site")] bool include_source = false)
     {
-        var db = dbProvider.GetReadyDatabase(out var notReady);
-        if (db == null)
-            return ResponseBuilder.BuildEmpty(notReady);
-
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError, authorizer: dbProvider.Authorizer))
+        if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
 
         using var conn = db.OpenReadConnection();

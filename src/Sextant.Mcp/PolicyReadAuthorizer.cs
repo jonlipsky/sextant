@@ -42,6 +42,9 @@ public sealed class PolicyReadAuthorizer : IReadAuthorizer
         _repositoryUrl = repositoryUrlResolver;
     }
 
+    /// <summary>True iff the configured policy is enabled — see <see cref="IReadAuthorizer.IsEnforcing"/>.</summary>
+    public bool IsEnforcing => _policy.Enabled;
+
     public ReadAuthorization Authorize(SnapshotRow? selected)
     {
         if (!_policy.Enabled)

@@ -25,12 +25,17 @@ public sealed class ResearchAgent
         int? maxToolCalls,
         string detailLevel,
         IndexDatabase? db,
-        CancellationToken ct)
+        CancellationToken ct,
+        SnapshotReadScope? readScope = null)
     {
         var budget = maxToolCalls ?? _config.MaxToolCalls;
         var maxTokens = detailLevel == "detailed" ? 2048 : 1024;
 
-        var systemPrompt = BuildSystemPrompt(scope, projectId, detailLevel, db);
+        // The read scope the caller's tool already authorized and pinned (Phase 17, criterion 1). Every
+        // count and source citation is computed through it so an authorized multi-tenant caller never sees
+        // another repository's data; the local default (Unscoped) is byte-identical to pre-Phase-17.
+        var effectiveScope = readScope ?? SnapshotReadScope.Unscoped;
+        var systemPrompt = BuildSystemPrompt(scope, projectId, detailLevel, db, effectiveScope);
 
         var messages = new List<ChatMessage>
         {
@@ -77,7 +82,7 @@ public sealed class ResearchAgent
             {
                 // Final answer — extract text from the response
                 var answer = ExtractText(response) ?? "(No response from model)";
-                var sources = ExtractSources(answer, db);
+                var sources = ExtractSources(answer, db, effectiveScope);
                 return new ResearchResult(
                     answer,
                     sources,
@@ -121,7 +126,7 @@ public sealed class ResearchAgent
                 {
                     var finalResponse = await _chatClient.GetResponseAsync(messages, summaryOptions, ct);
                     var answer = ExtractText(finalResponse) ?? "(No response from model)";
-                    var sources = ExtractSources(answer, db);
+                    var sources = ExtractSources(answer, db, effectiveScope);
                     return new ResearchResult(
                         answer,
                         sources,
@@ -157,7 +162,8 @@ public sealed class ResearchAgent
         return texts.Count > 0 ? string.Join("\n", texts) : null;
     }
 
-    private static string BuildSystemPrompt(string? scope, string? projectId, string detailLevel, IndexDatabase? db)
+    private static string BuildSystemPrompt(
+        string? scope, string? projectId, string detailLevel, IndexDatabase? db, SnapshotReadScope readScope)
     {
         var scopeConstraint = "No scope constraint — search across the entire indexed codebase.";
         if (scope != null)
@@ -175,12 +181,19 @@ public sealed class ResearchAgent
             try
             {
                 using var conn = db.OpenReadConnection();
-                using var cmd = conn.CreateCommand();
-                cmd.CommandText = "SELECT COUNT(*) FROM symbols";
-                var symbolCount = (long)(cmd.ExecuteScalar() ?? 0);
-                var projectStore = new ProjectStore(conn);
-                var projectCount = projectStore.GetAll().Count;
-                contextInfo = $"\nAvailable context: The index covers {projectCount} projects with {symbolCount} symbols.";
+                // Count only within the authorized/pinned scope (criterion 1): a DB-wide count would leak
+                // other tenants' project/symbol totals into the prompt. Unscoped locally ⇒ same totals.
+                var projectStore = new ProjectStore(conn) { Scope = readScope };
+                var projectIds = projectStore.GetAll().Select(p => p.Item1).ToList();
+                long symbolCount = 0;
+                if (projectIds.Count > 0)
+                {
+                    using var cmd = conn.CreateCommand();
+                    cmd.CommandText =
+                        $"SELECT COUNT(*) FROM symbols WHERE project_id IN ({string.Join(",", projectIds)})";
+                    symbolCount = (long)(cmd.ExecuteScalar() ?? 0);
+                }
+                contextInfo = $"\nAvailable context: The index covers {projectIds.Count} projects with {symbolCount} symbols.";
             }
             catch
             {
@@ -207,7 +220,7 @@ public sealed class ResearchAgent
             """;
     }
 
-    internal static List<SourceReference> ExtractSources(string answer, IndexDatabase? db)
+    internal static List<SourceReference> ExtractSources(string answer, IndexDatabase? db, SnapshotReadScope readScope)
     {
         if (db == null)
             return [];
@@ -219,10 +232,9 @@ public sealed class ResearchAgent
         var matches = fqnPattern.Matches(answer);
 
         using var conn = db.OpenReadConnection();
-        // Fail closed (criterion 6): an unauthorized read cites no sources rather than reading unscoped.
-        if (!ReadContextGate.TryResolve(db, out var readContext, out _))
-            return sources;
-        var symbolStore = new SymbolStore(conn) { Scope = readContext.Scope };
+        // Resolve citations through the scope the caller's tool already authorized and pinned (criterion 1)
+        // so an authorized multi-tenant caller never cites another repository's symbol; Unscoped locally.
+        var symbolStore = new SymbolStore(conn) { Scope = readScope };
 
         foreach (Match match in matches)
         {

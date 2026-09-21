@@ -13,11 +13,7 @@ public static class GetApiSurfaceTool
         [Description("Canonical ID of the project")] string project_id,
         [Description("Git commit to compare against (optional, for diff mode)")] string? compare_to_commit = null)
     {
-        var db = dbProvider.GetReadyDatabase(out var notReady);
-        if (db == null)
-            return ResponseBuilder.BuildEmpty(notReady);
-
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError, authorizer: dbProvider.Authorizer))
+        if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
 
         using var conn = db.OpenReadConnection();
