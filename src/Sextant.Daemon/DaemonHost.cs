@@ -383,7 +383,12 @@ public sealed class DaemonHost : IDisposable
             _lastReconcileResult = result;
             var reasonSuffix = result!.FallbackReason is { } r ? $" — {r}" : string.Empty;
             _log?.Invoke($"Reconcile: {result.Kind} ({result.ChangeCount} change(s)){reasonSuffix}");
-            _lastIndexedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            // Only advance "last indexed" when the pass actually reconciled to a published state. An
+            // all-attempts-aborted pass (issue #49: the tree kept moving) publishes nothing, so stamping
+            // the timestamp would make a persistently-failing daemon look freshly indexed on the status
+            // endpoint. Leave the previous value; the next periodic pass self-heals once the tree settles.
+            if (result.Kind != OverlayReconcileKind.Aborted)
+                _lastIndexedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         }
         finally
         {

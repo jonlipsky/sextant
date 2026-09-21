@@ -210,6 +210,39 @@ public sealed class IndexOrchestrator
         if (gitStateBaseline == null && effectiveCtx != null && snapshotContext == null && repoRoot != null)
             gitStateBaseline = _gitStateProbe.Capture(repoRoot);
 
+        // The guard is active when a git-backed identity is in play AND a pin is expected for this pass:
+        // the reconciler threads one, and the auto git path (no injected context) captured one just above.
+        // An injected snapshotContext with NO pin (the snapshot unit-test path) is intentionally unguarded,
+        // so those runs stay byte-identical.
+        var gitStateGuardActive = effectiveCtx != null && repoRoot != null
+            && (gitStatePin != null || snapshotContext == null);
+
+        // Issue #49 (fail-closed anchoring): the baseline pin MUST exist and anchor to the EXACT commit/
+        // tree that feeds the snapshot identity (effectiveCtx). A null capture — or a HEAD/tree that
+        // disagrees with effectiveCtx — means git moved between context resolution and the pin capture, so
+        // the snapshot identity (commit X) would disagree with the state its sources are read at. Abort
+        // BEFORE any work rather than publish a torn generation; the bounded retry re-resolves both
+        // together over the settled tree. effectiveCtx.CommitSha/TreeSha come from the same `rev-parse`
+        // commands as the pin, so on a stable tree they are byte-equal and this never spuriously fires.
+        if (gitStateGuardActive
+            && (gitStateBaseline == null
+                || !string.Equals(gitStateBaseline.Head, effectiveCtx!.CommitSha, StringComparison.Ordinal)
+                || (effectiveCtx.TreeSha != null
+                    && !string.Equals(gitStateBaseline.Tree, effectiveCtx.TreeSha, StringComparison.Ordinal))))
+        {
+            if (metrics != null)
+            {
+                totalStopwatch.Stop();
+                metrics.TotalDurationMs = totalStopwatch.ElapsedMilliseconds;
+                metrics.Status = IndexRunStatus.Cancelled;
+                metrics.FailureReason = "git state moved before indexing began; aborted without publishing (issue #49)";
+            }
+            throw new GitStateMovedException(
+                "The git HEAD/tree could not be pinned to the resolved snapshot context before indexing " +
+                "(it moved or was unavailable); the pass was aborted before publishing. A subsequent pass " +
+                "over the stable tree will publish the correct snapshot (issue #49).");
+        }
+
         SnapshotStore? snapshotStore = null;
         long? repositoryId = null;
         long? commitId = null;
@@ -1256,10 +1289,10 @@ public sealed class IndexOrchestrator
         // single-state snapshot. Only guards the snapshot path (a baseline is captured only when a
         // git-backed snapshot context is in play); the legacy mutable-row path is unaffected. A failed
         // re-capture (null) is treated fail-closed: the state cannot be proven stable, so the pass aborts.
-        if (gitStateBaseline != null && effectiveCtx != null && repoRoot != null)
+        if (gitStateGuardActive)
         {
             var gitStateNow = _gitStateProbe.Capture(repoRoot);
-            if (gitStateNow == null || !gitStateBaseline.Matches(gitStateNow))
+            if (gitStateNow == null || !gitStateBaseline!.Matches(gitStateNow))
             {
                 if (metrics != null)
                 {

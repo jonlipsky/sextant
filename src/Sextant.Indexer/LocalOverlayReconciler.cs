@@ -117,6 +117,19 @@ public sealed class LocalOverlayReconciler
         // orchestrator re-verifies this pin immediately before publishing and throws GitStateMovedException
         // if HEAD/the working tree moved — we translate that into an Aborted result (no snapshot published).
         var pin = _gitStateProbe.Capture(repoRoot);
+        if (pin == null)
+        {
+            // Fail-closed (issue #49): a git-backed context resolved, but the git state could not be
+            // pinned, so we cannot prove HEAD/status/sources are one consistent state. Abort rather than
+            // publish an unverifiable generation; the next periodic pass self-heals once git is readable.
+            _log?.Invoke("Overlay reconcile aborted: git state could not be pinned for a git-backed context (issue #49).");
+            return new OverlayReconcileResult
+            {
+                Kind = OverlayReconcileKind.Aborted,
+                FallbackReason = "git state could not be pinned for a git-backed context",
+                ChangeCount = 0
+            };
+        }
         try
         {
             return await ReconcileWithContextAsync(solution, repoRoot, ctx, pin, cancellationToken);

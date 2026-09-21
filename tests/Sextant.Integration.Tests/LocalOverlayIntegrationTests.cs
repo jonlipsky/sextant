@@ -394,11 +394,76 @@ public class LocalOverlayIntegrationTests : IDisposable
     }
 
     /// <summary>
-    /// A test <see cref="IGitStateProbe"/> that returns the REAL git pin except that, starting with its
-    /// <c>moveOnCall</c>-th capture (1-based), it reports a different HEAD to simulate a mid-pass move.
-    /// <c>moveOnCall == 0</c> never moves (delegates fully to the real probe).
+    /// Regression for the anchoring window (issue #49): if the baseline pin disagrees with the snapshot
+    /// context that feeds identity (git moved between context resolution and the pin capture), the pass
+    /// aborts BEFORE indexing rather than publish a snapshot whose identity (commit X) disagrees with the
+    /// state its sources are read at. Simulated by a probe whose FIRST (baseline) capture reports a moved
+    /// HEAD, so it never matches the resolved context.
     /// </summary>
-    private sealed class ScriptedGitStateProbe(int moveOnCall) : IGitStateProbe
+    [TestMethod]
+    public async Task ContextPinSkew_AbortsBeforeIndexing()
+    {
+        var repo = CreateGitProject("Widget");
+        var dbPath = Path.Combine(_tempDir, "index.db");
+        using var db = new IndexDatabase(dbPath);
+        db.RunMigrations();
+        var conn = db.GetConnection();
+        var store = new SnapshotStore(conn);
+
+        await ReconcileAsync(db, repo.SolutionPath);
+        var baseId = store.GetSelectedSnapshotId();
+        var completeBefore = CountComplete(conn);
+
+        File.WriteAllText(repo.SourceFile,
+            "namespace App;\npublic class Widget { public int Value() => 1; public int Added() => 2; }\n");
+
+        // moveOnCall:1 → the baseline capture itself reports a HEAD that disagrees with the context.
+        var probe = new ScriptedGitStateProbe(moveOnCall: 1);
+        var result = await ReconcileWithProbeAsync(db, repo.SolutionPath, probe);
+
+        Assert.AreEqual(OverlayReconcileKind.Aborted, result.Kind, "a baseline pin that disagrees with the context aborts (issue #49 anchoring)");
+        Assert.AreEqual(baseId, store.GetSelectedSnapshotId(), "the aborted pass published nothing");
+        Assert.AreEqual(completeBefore, CountComplete(conn), "no torn generation was published on a context/pin skew");
+    }
+
+    /// <summary>
+    /// Fail-closed (issue #49): when a git-backed context resolved but the git state cannot be pinned
+    /// (the probe returns null), the pass aborts rather than publish an unverifiable generation.
+    /// </summary>
+    [TestMethod]
+    public async Task UnpinnableGitState_AbortsFailClosed()
+    {
+        var repo = CreateGitProject("Widget");
+        var dbPath = Path.Combine(_tempDir, "index.db");
+        using var db = new IndexDatabase(dbPath);
+        db.RunMigrations();
+        var conn = db.GetConnection();
+        var store = new SnapshotStore(conn);
+
+        await ReconcileAsync(db, repo.SolutionPath);
+        var baseId = store.GetSelectedSnapshotId();
+        var completeBefore = CountComplete(conn);
+
+        File.WriteAllText(repo.SourceFile,
+            "namespace App;\npublic class Widget { public int Value() => 1; public int Added() => 2; }\n");
+
+        // nullFromCall:1 → the baseline pin capture yields null (git unavailable): fail-closed abort.
+        var probe = new ScriptedGitStateProbe(moveOnCall: 0, nullFromCall: 1);
+        var result = await ReconcileWithProbeAsync(db, repo.SolutionPath, probe);
+
+        Assert.AreEqual(OverlayReconcileKind.Aborted, result.Kind, "an unpinnable git state aborts fail-closed (issue #49)");
+        Assert.AreEqual(baseId, store.GetSelectedSnapshotId(), "the fail-closed abort published nothing");
+        Assert.AreEqual(completeBefore, CountComplete(conn), "no unverifiable generation was published");
+    }
+
+    /// <summary>
+    /// A test <see cref="IGitStateProbe"/> that returns the REAL git pin except that, starting with its
+    /// <c>moveOnCall</c>-th capture (1-based), it reports a different HEAD to simulate a mid-pass move, and
+    /// (when <c>nullFromCall</c> &gt; 0) returns null from its <c>nullFromCall</c>-th capture onward to
+    /// simulate an unavailable git state. <c>moveOnCall == 0</c> never moves; <c>nullFromCall == 0</c>
+    /// never nulls.
+    /// </summary>
+    private sealed class ScriptedGitStateProbe(int moveOnCall, int nullFromCall = 0) : IGitStateProbe
     {
         private int _calls;
 
@@ -407,6 +472,8 @@ public class LocalOverlayIntegrationTests : IDisposable
         public GitStatePin? Capture(string repoRoot)
         {
             _calls++;
+            if (nullFromCall != 0 && _calls >= nullFromCall)
+                return null;
             var real = GitStateProbe.Default.Capture(repoRoot);
             if (real == null || moveOnCall == 0 || _calls < moveOnCall)
                 return real;
