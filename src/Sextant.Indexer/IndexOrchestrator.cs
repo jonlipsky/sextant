@@ -112,6 +112,7 @@ public sealed class IndexOrchestrator
         var callGraphStore = new CallGraphStore(conn);
         var relationshipStore = new RelationshipStore(conn);
         var dependencyStore = new ProjectDependencyStore(conn);
+        var snapshotDependencyStore = new SnapshotDependencyStore(conn);
         var apiSurfaceStore = new ApiSurfaceStore(conn);
 
         // One shared file/version engine for the whole run. All stores that resolve a source path to a
@@ -318,6 +319,60 @@ public sealed class IndexOrchestrator
             ProjectIndex = 0,
             ProjectCount = totalProjects
         });
+        // Phase 12: a git SUBMODULE shared across repositories is indexed ONCE into a deduplicated
+        // PROVIDER snapshot (keyed by submodule remote + pinned commit), and each parent records a
+        // dependency EDGE into it instead of copying the provider's semantic rows. These maps route
+        // submodule projects to their provider snapshot during registration and carry the information
+        // the publish/edge/catalog steps below need. All keyed by the pinned commit (+dirty) so the
+        // same pin used by two projects/parents resolves to one provider snapshot.
+        var providerSnapshotByPin = new Dictionary<string, (long snapshotId, long repoId, bool complete)>(StringComparer.Ordinal);
+        var providerSnapshotsToPublish = new HashSet<long>();
+        var providerProjectInfo = new Dictionary<long, (long snapshotId, long repoId, string commit, bool dirty)>();
+        var providerProjectsToLoadIntoCatalog = new List<long>();
+
+        // Get-or-create the deduplicated provider snapshot for a submodule pin (Phase 12). Reuses an
+        // already-complete provider generation (dedup — criterion 1); otherwise stages a fresh pending
+        // one this run publishes. A DIRTY submodule (its checked-out tree differs from the recorded pin,
+        // issue #48) folds a marker into the identity so it is never conflated with the clean pinned
+        // commit. Only meaningful when snapshots are active.
+        (long snapshotId, long repoId, bool complete) EnsureProviderSnapshot(SubmoduleInfo sub)
+        {
+            var pinKey = $"{sub.RemoteUrl}@{sub.CommitSha}{(sub.IsDirty ? "+dirty" : "")}";
+            if (providerSnapshotByPin.TryGetValue(pinKey, out var cached))
+                return cached;
+
+            var providerRepoId = snapshotStore!.EnsureProviderRepository(sub.RemoteUrl, now);
+            var providerCommitId = snapshotStore.EnsureCommit(providerRepoId, sub.CommitSha, null, now);
+            var providerIdentity = new SnapshotIdentity
+            {
+                RepositoryRemoteUrl = sub.RemoteUrl,
+                CommitSha = sub.CommitSha,
+                TreeSha = null,
+                SchemaVersion = IndexDatabase.LatestSchemaVersion,
+                AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
+                ConfigHash = _profile.ConfigurationHash,
+                ToolchainFingerprint = ToolchainFingerprint.Current,
+                // A dirty submodule tree is never the clean pinned commit (issue #48): fold a delta marker
+                // so the provider identity_hash differs from the clean pin's and the two never collide.
+                WorkingTreeDelta = sub.IsDirty ? "submodule-dirty" : null,
+                IsOverlay = false
+            };
+            var (provId, provExisted, provStatus) = snapshotStore.BeginPending(
+                providerIdentity, providerRepoId, providerCommitId, runScope.RunId, now, isProvider: true);
+            var complete = provExisted && (provStatus == SnapshotStatus.Complete || provStatus == SnapshotStatus.Superseded);
+            if (!complete)
+            {
+                // Newly staged, or a prior partial/failed/abandoned provider generation to rebuild: reset
+                // to pending so the guarded pending->complete publish succeeds, and publish it this run.
+                if (provExisted && provStatus != SnapshotStatus.Pending)
+                    snapshotStore.MarkStatus(provId, SnapshotStatus.Pending);
+                providerSnapshotsToPublish.Add(provId);
+            }
+            var result = (provId, providerRepoId, complete);
+            providerSnapshotByPin[pinKey] = result;
+            return result;
+        }
+
         foreach (var project in solution.Projects)
         {
             EnterProject();
@@ -328,6 +383,53 @@ public sealed class IndexOrchestrator
 
             long projectId;
             var extractThisProject = inFilter;
+
+            // Phase 12: a project that lives inside a git SUBMODULE is routed to a deduplicated PROVIDER
+            // snapshot (submodule remote + pinned commit), NOT mapped into this parent's snapshot. The
+            // first parent to pin a commit extracts the provider once; later parents REUSE it (skip
+            // re-extraction — criterion 1) and only re-load its stable symbol keys into the in-run
+            // catalog so their cross-repo occurrences still resolve. Each parent's pin becomes a
+            // snapshot_dependencies edge recorded after Phase 6.
+            var containingSubmodule = repoRoot != null && snapshotStore != null && activeSnapshotId != null
+                ? SubmoduleDiscovery.FindContainingSubmodule(project.FilePath, submodules, repoRoot)
+                : null;
+            if (containingSubmodule != null)
+            {
+                var (providerSnapId, providerRepoId, providerComplete) = EnsureProviderSnapshot(containingSubmodule);
+                var providerLogicalId = snapshotStore!.EnsureLogicalProject(
+                    providerRepoId, identity.CanonicalId, identity.RepoRelativePath, identity.TargetFramework, now);
+
+                if (providerComplete
+                    && projectStore.GetSnapshotProjectRow(providerSnapId, providerLogicalId) is long reuseRowId)
+                {
+                    // DEDUP: the provider generation already holds this project version. Reuse its row,
+                    // map it into the (already complete) provider snapshot idempotently, and DO NOT
+                    // re-extract — the provider's immutable rows are shared as-is. Its stable symbol keys
+                    // are loaded into the catalog below so this parent's occurrences into it still bind.
+                    projectId = reuseRowId;
+                    snapshotStore.MapProject(providerSnapId, projectId);
+                    providerProjectsToLoadIntoCatalog.Add(projectId);
+                    extractThisProject = false;
+                }
+                else
+                {
+                    // Stage the provider project version under the PROVIDER snapshot and extract it this
+                    // run (the first parent to pin this commit, or a provider gaining a project a prior
+                    // parent did not reference). Additive: extracting a new provider project version never
+                    // mutates an existing published one.
+                    projectId = projectStore.UpsertSnapshotProject(identity, providerSnapId, providerLogicalId, now);
+                    snapshotStore.MapProject(providerSnapId, projectId);
+                    extractThisProject = inFilter;
+                }
+
+                providerProjectInfo[projectId] = (providerSnapId, providerRepoId, containingSubmodule.CommitSha, containingSubmodule.IsDirty);
+                projectRoslynToId[project.Id] = projectId;
+                if (extractThisProject)
+                    processSet.Add(project.Id);
+                _log?.Invoke($"  Submodule project: {project.Name} (id={projectId}, provider_snapshot={providerSnapId}, pin={containingSubmodule.CommitSha[..Math.Min(8, containingSubmodule.CommitSha.Length)]}, dirty={containingSubmodule.IsDirty})");
+                continue;
+            }
+
             if (activeSnapshotId is long snapId && snapshotStore != null && repositoryId is long repoId)
             {
                 var logicalId = snapshotStore.EnsureLogicalProject(
@@ -451,6 +553,14 @@ public sealed class IndexOrchestrator
             _log?.Invoke($"    {symbols.Count} symbols extracted");
         }
 
+        // Phase 12: a REUSED submodule provider project version was not re-extracted this run (its
+        // immutable rows are shared from a prior generation), so its symbols are absent from the in-run
+        // catalog. Re-load their stable (symbol_key -> id) pairs so this parent's occurrences into the
+        // provider still resolve to the deduplicated provider symbols (usage-site cross-repo binding).
+        foreach (var providerProjectId in providerProjectsToLoadIntoCatalog)
+            foreach (var (symbolKey, symbolId) in symbolStore.GetKeyIdPairsByProject(providerProjectId))
+                catalog.Add(providerProjectId, symbolKey, symbolId);
+
         // Phase 3-5 (document-oriented): one pass over each processed project's documents emits
         // relationships, references, and call/dataflow contributions from a single cached semantic
         // model + root per document, replacing the legacy declaration-driven FindReferencesAsync
@@ -567,8 +677,14 @@ public sealed class IndexOrchestrator
 
                 foreach (var rel in contributions.Relationships)
                 {
-                    if (catalog.TryResolveEdge(rel.FromKey, ownerProjectId, out var fromId) &&
-                        catalog.TryResolveEdge(rel.ToKey, ownerProjectId, out var toId))
+                    // Compilation-scoped exact resolution for each endpoint that the extractor bound to a
+                    // real owning project (#32): a relationship whose target key exists in several
+                    // projects (two repos defining the same FQN, a multi-TFM dependency) binds the exact
+                    // per-project row rather than a key-only lowest-id pick that would conflate them.
+                    // Endpoints with no exact project (owner-local, or out-of-solution) fall back to
+                    // key-only resolution, preserving parity for single-definition keys.
+                    if (TryResolveTarget(catalog, rel.FromKey, rel.FromProjectId, ownerProjectId, out var fromId) &&
+                        TryResolveTarget(catalog, rel.ToKey, rel.ToProjectId, ownerProjectId, out var toId))
                     {
                         relationshipStore.Insert(relationshipInsert, new RelationshipInfo
                         {
@@ -987,6 +1103,45 @@ public sealed class IndexOrchestrator
                 dependencyStore.Insert(dep);
             }
             _log?.Invoke($"  {deps.Count} dependencies recorded");
+
+            // Phase 12: persist a snapshot_dependencies edge for each submodule reference so a
+            // cross-repository usage query can narrow to authorized consumers via this catalog before
+            // searching the provider symbol's occurrences. The edge carries the parent's own pin and
+            // dirty state (criterion 2: each parent retains its edge), keyed to a fresh per-snapshot
+            // consumer project row so updating one parent's pin never rewrites another's (criterion 6).
+            if (activeSnapshotId is long consumerSnapshotId)
+            {
+                foreach (var dep in deps)
+                {
+                    if (dep.ReferenceKind != "submodule_ref" || dep.DependencyProjectId == 0)
+                        continue;
+                    if (!processedProjectIds.Contains(dep.ConsumerProjectId))
+                        continue;
+                    // A submodule_ref whose CONSUMER is itself a provider project is an INTRA-submodule
+                    // project reference (one provider project referencing another in the same submodule),
+                    // not a parent -> provider cross-repo edge. Recording it would attribute a provider
+                    // project to THIS parent's snapshot and surface the provider's own internal reference
+                    // as a cross-repository usage under the parent's branch/commit — skip it.
+                    if (providerProjectInfo.ContainsKey(dep.ConsumerProjectId))
+                        continue;
+                    if (!providerProjectInfo.TryGetValue(dep.DependencyProjectId, out var prov))
+                        continue;
+                    snapshotDependencyStore.Insert(new SnapshotDependencyEdge
+                    {
+                        ConsumerSnapshotId = consumerSnapshotId,
+                        ConsumerProjectId = dep.ConsumerProjectId,
+                        ProviderSnapshotId = prov.snapshotId,
+                        ProviderProjectId = dep.DependencyProjectId,
+                        ProviderRepositoryId = prov.repoId,
+                        ProviderCommitSha = prov.commit,
+                        ReferenceKind = dep.ReferenceKind,
+                        SubmoduleDirty = prov.dirty,
+                        CreatedAt = now
+                    });
+                    session.RowsWritten();
+                }
+            }
+
             session.CommitBatch();
         }
 
@@ -1127,6 +1282,21 @@ public sealed class IndexOrchestrator
                     $"Overlay snapshot {overlayPublishId} was not pending at publish; aborting to avoid a false completion.");
 
             AdvanceBranchToOverlay(snapshotStore, overlayRepoId, effectiveCtx, overlayPublishId, completedAt);
+        }
+
+        // Phase 12: publish each deduplicated PROVIDER snapshot this run staged, in the SAME write
+        // transaction as the parent generation and the run pointer, so a reader either sees the provider
+        // fully committed or not at all. A provider that was already complete (reused via dedup) is never
+        // in this set. Unlike the parent gate we do not throw when the guarded flip writes no row: a
+        // provider generation is neutral shared infrastructure, and a concurrent/idempotent completion is
+        // tolerable (it stays complete either way) rather than a reason to abort the parent publish.
+        if (snapshotStore != null)
+        {
+            foreach (var providerSnapshotId in providerSnapshotsToPublish)
+            {
+                if (snapshotStore.MarkComplete(providerSnapshotId, completedAt) == 1)
+                    _log?.Invoke($"  Published provider snapshot {providerSnapshotId} (deduplicated submodule).");
+            }
         }
 
         session.Complete();

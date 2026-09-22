@@ -53,6 +53,14 @@ public sealed record SnapshotRow
 
     /// <summary>When Phase 10 fell back to a full local index for lack of a compatible base, the reason (criterion 5).</summary>
     public string? FallbackReason { get; init; }
+
+    /// <summary>
+    /// True for a Phase-12 PROVIDER snapshot: a deduplicated, shared submodule generation owned by no
+    /// parent, discovered/reused by identity and referenced through <c>snapshot_dependencies</c> edges.
+    /// A provider snapshot carries no branch pointer and is excluded from the scope-less single-repo
+    /// default. False for a normal parent/base/overlay snapshot.
+    /// </summary>
+    public bool IsProvider { get; init; }
 }
 
 /// <summary>
@@ -69,8 +77,31 @@ public sealed class SnapshotStore(SqliteConnection connection)
     public long EnsureRepository(string remoteUrl, long now)
     {
         using var cmd = connection.CreateCommand();
+        // A repository indexed in its own right is a PRIMARY/consumer repo: clear any is_provider flag
+        // left over from an earlier submodule-provider-only discovery so the scope-less single-repo local
+        // default counts it. For an ordinary consumer this stays 0 (no-op).
         cmd.CommandText = """
             INSERT INTO repositories (remote_url, created_at) VALUES (@url, @now)
+            ON CONFLICT(remote_url) DO UPDATE SET is_provider = 0
+            RETURNING id;
+            """;
+        cmd.Parameters.AddWithValue("@url", remoteUrl);
+        cmd.Parameters.AddWithValue("@now", now);
+        return (long)cmd.ExecuteScalar()!;
+    }
+
+    /// <summary>
+    /// Get-or-create the repository row for a submodule PROVIDER (Phase 12), flagged <c>is_provider = 1</c>
+    /// so the scope-less single-repo local default counts only primary/consumer repositories. If the
+    /// remote was already indexed as a PRIMARY repository (<c>is_provider = 0</c>) the flag is left as-is:
+    /// a repository genuinely indexed in its own right stays a consumer for default selection, and its
+    /// symbols are simply shared. Only a brand-new provider-only remote is marked a provider.
+    /// </summary>
+    public long EnsureProviderRepository(string remoteUrl, long now)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO repositories (remote_url, created_at, is_provider) VALUES (@url, @now, 1)
             ON CONFLICT(remote_url) DO UPDATE SET remote_url = excluded.remote_url
             RETURNING id;
             """;
@@ -146,7 +177,7 @@ public sealed class SnapshotStore(SqliteConnection connection)
     /// </summary>
     public (long id, bool existed, string status) BeginPending(
         SnapshotIdentity identity, long repositoryId, long? commitId, long? runId, long now,
-        long? baseSnapshotId = null, string? fallbackReason = null)
+        long? baseSnapshotId = null, string? fallbackReason = null, bool isProvider = false)
     {
         var existing = GetByIdentityHash(identity.Hash);
         if (existing is not null)
@@ -157,9 +188,9 @@ public sealed class SnapshotStore(SqliteConnection connection)
             INSERT INTO snapshots
                 (repository_id, commit_id, run_id, identity_hash, tree_sha, schema_version,
                  analyzer_version, config_hash, toolchain_fingerprint, status, created_at,
-                 base_snapshot_id, is_overlay, working_tree_delta, fallback_reason)
+                 base_snapshot_id, is_overlay, working_tree_delta, fallback_reason, is_provider)
             VALUES (@repo, @commit, @run, @hash, @tree, @schema, @analyzer, @config, @toolchain, @status, @now,
-                    @base, @is_overlay, @delta, @fallback)
+                    @base, @is_overlay, @delta, @fallback, @is_provider)
             RETURNING id;
             """;
         cmd.Parameters.AddWithValue("@repo", repositoryId);
@@ -177,6 +208,7 @@ public sealed class SnapshotStore(SqliteConnection connection)
         cmd.Parameters.AddWithValue("@is_overlay", baseSnapshotId.HasValue ? 1 : 0);
         cmd.Parameters.AddWithValue("@delta", (object?)identity.WorkingTreeDelta ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@fallback", (object?)fallbackReason ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@is_provider", isProvider ? 1 : 0);
         return ((long)cmd.ExecuteScalar()!, false, SnapshotStatus.Pending);
     }
 
@@ -309,10 +341,12 @@ public sealed class SnapshotStore(SqliteConnection connection)
 
     /// <summary>
     /// The single selected current snapshot for a scope-less local query (criterion 6). Resolves the
-    /// default branch's pointer only when exactly one repository is present (the single-repo local
-    /// default); returns null for a legacy database (no repositories), a multi-repo database (Phase 11
-    /// supplies explicit scope), or when the default branch has no complete snapshot yet. A null result
-    /// means "no snapshot filter" — the store reads behave exactly as before Phase 9.
+    /// default branch's pointer only when exactly one NON-PROVIDER (consumer) repository is present (the
+    /// single-repo local default; submodule providers added by Phase 12 are excluded from the count so a
+    /// parent repo that pulls in providers still resolves its own default branch); returns null for a
+    /// legacy database (no repositories), a multi-consumer database (Phase 11 supplies explicit scope),
+    /// or when the default branch has no complete snapshot yet. A null result means "no snapshot filter"
+    /// — the store reads behave exactly as before Phase 9.
     /// </summary>
     public long? GetSelectedSnapshotId()
     {
@@ -322,7 +356,7 @@ public sealed class SnapshotStore(SqliteConnection connection)
             FROM branches b
             JOIN snapshots s ON s.id = b.snapshot_id
             WHERE b.is_default = 1 AND s.status = @complete
-              AND (SELECT COUNT(*) FROM repositories) = 1
+              AND (SELECT COUNT(*) FROM repositories WHERE is_provider = 0) = 1
             ORDER BY b.updated_at DESC, b.id DESC
             LIMIT 1;
             """;
@@ -353,12 +387,13 @@ public sealed class SnapshotStore(SqliteConnection connection)
     /// (criterion 7, across the first/in-progress upgrade rebuild). A pure legacy database (no snapshot
     /// rows) returns false and reads stay unscoped, byte-for-byte as before Phase 9. Restricted to a
     /// single repository so multi-repo databases (Phase 11) fall through to explicit scope, never a pin.
+    /// Restricted to a single NON-PROVIDER repository so Phase-12 submodule providers do not defeat the pin.
     /// </summary>
     public bool HasUnselectedSnapshotProjectRows()
     {
         using var cmd = connection.CreateCommand();
         cmd.CommandText = """
-            SELECT (SELECT COUNT(*) FROM repositories) = 1
+            SELECT (SELECT COUNT(*) FROM repositories WHERE is_provider = 0) = 1
                AND EXISTS (SELECT 1 FROM projects WHERE snapshot_id IS NOT NULL);
             """;
         return cmd.ExecuteScalar() is long flag && flag == 1;
@@ -456,10 +491,39 @@ public sealed class SnapshotStore(SqliteConnection connection)
 
     // ---- helpers -------------------------------------------------------------------------------
 
+    /// <summary>
+    /// Retention targets for Phase-12 submodule PROVIDER snapshots (criterion 6). A consumer snapshot
+    /// that is currently branch-pointed SHARES a provider's deduplicated project-version rows through a
+    /// <c>snapshot_dependencies</c> edge; those rows physically belong to the provider snapshot's
+    /// generation, so GC'ing the provider generation would delete rows a live parent still reads (and
+    /// would let updating one parent's pin mutate another parent's usable data). Returns the provider
+    /// generation (<c>run_id</c>) and provider commit for every edge whose consumer snapshot is
+    /// branch-pointed, so a provider survives as long as any live parent pins it.
+    /// </summary>
+    public IReadOnlyList<(long? runId, string? commitSha)> GetSubmoduleProviderProtectionTargets()
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT DISTINCT provider.run_id, c.commit_sha
+            FROM snapshot_dependencies d
+            JOIN branches b ON b.snapshot_id = d.consumer_snapshot_id
+            JOIN snapshots provider ON provider.id = d.provider_snapshot_id
+            LEFT JOIN commits c ON c.id = provider.commit_id
+            WHERE b.snapshot_id IS NOT NULL;
+            """;
+        var rows = new List<(long?, string?)>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            rows.Add((
+                reader.IsDBNull(0) ? null : reader.GetInt64(0),
+                reader.IsDBNull(1) ? null : reader.GetString(1)));
+        return rows;
+    }
+
     private const string SelectSnapshot = """
         SELECT id, repository_id, commit_id, run_id, identity_hash, tree_sha, schema_version,
                analyzer_version, config_hash, toolchain_fingerprint, status, created_at, published_at,
-               base_snapshot_id, is_overlay, working_tree_delta, fallback_reason
+               base_snapshot_id, is_overlay, working_tree_delta, fallback_reason, is_provider
         FROM snapshots
         """;
 
@@ -481,6 +545,7 @@ public sealed class SnapshotStore(SqliteConnection connection)
         BaseSnapshotId = reader.IsDBNull(13) ? null : reader.GetInt64(13),
         IsOverlay = !reader.IsDBNull(14) && reader.GetInt64(14) != 0,
         WorkingTreeDelta = reader.IsDBNull(15) ? null : reader.GetString(15),
-        FallbackReason = reader.IsDBNull(16) ? null : reader.GetString(16)
+        FallbackReason = reader.IsDBNull(16) ? null : reader.GetString(16),
+        IsProvider = !reader.IsDBNull(17) && reader.GetInt64(17) != 0
     };
 }

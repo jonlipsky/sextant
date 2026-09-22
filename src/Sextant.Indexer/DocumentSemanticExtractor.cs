@@ -44,12 +44,18 @@ public sealed record CallContribution(
 
 /// <summary>
 /// A type relationship contributed from a document (inherits/implements/overrides/returns/parameterOf
-/// from the type's declaration, or instantiates from an object-creation usage site).
+/// from the type's declaration, or instantiates from an object-creation usage site). <see cref="FromProjectId"/>
+/// and <see cref="ToProjectId"/> carry each endpoint's exact owning project (from the bound symbol's
+/// containing assembly) when it maps to an indexed project, so the orchestrator binds the exact per-project
+/// row rather than a key-only lowest-id pick that could conflate two projects that share an FQN/key (#32);
+/// each is null for an endpoint outside the indexed set or one that is always owner-local (key-only fallback).
 /// </summary>
 public sealed record RelationshipContribution(
     string FromKey,
     string ToKey,
-    RelationshipKind Kind);
+    RelationshipKind Kind,
+    long? FromProjectId = null,
+    long? ToProjectId = null);
 
 /// <summary>
 /// Accumulates the occurrence contributions of one logical (per-TFM) project across all of its
@@ -76,7 +82,7 @@ public sealed class DocumentContributionSet
     // `F(a); F(b);`) are separate occurrences whose arguments differ and must not collapse.
     private readonly HashSet<(string, string, int, ReferenceKind, AccessKind?, long?)> _refKeys = [];
     private readonly HashSet<(string, string, string, int, int)> _callKeys = [];
-    private readonly HashSet<(string, string, RelationshipKind)> _relKeys = [];
+    private readonly HashSet<(string, string, RelationshipKind, long?, long?)> _relKeys = [];
 
     public IReadOnlyList<ReferenceContribution> References => _references;
     public IReadOnlyList<CallContribution> Calls => _calls;
@@ -106,7 +112,7 @@ public sealed class DocumentContributionSet
 
     public bool AddRelationship(RelationshipContribution r)
     {
-        if (!_relKeys.Add((r.FromKey, r.ToKey, r.Kind)))
+        if (!_relKeys.Add((r.FromKey, r.ToKey, r.Kind, r.FromProjectId, r.ToProjectId)))
             return false;
         _relationships.Add(r);
         return true;
@@ -187,7 +193,7 @@ public static class DocumentSemanticExtractor
             {
                 case BaseTypeDeclarationSyntax:
                 case DelegateDeclarationSyntax:
-                    EmitTypeRelationships(node, model, sink);
+                    EmitTypeRelationships(node, model, sink, resolveTargetProject);
                     break;
 
                 case SimpleNameSyntax name:
@@ -201,13 +207,13 @@ public static class DocumentSemanticExtractor
                 case ObjectCreationExpressionSyntax objectCreation:
                     // The explicit type name is a SimpleName handled by EmitReference (classified
                     // ObjectCreation); here we only add the Instantiates relationship.
-                    EmitInstantiation(objectCreation, model, sink);
+                    EmitInstantiation(objectCreation, model, sink, resolveTargetProject);
                     break;
 
                 case ImplicitObjectCreationExpressionSyntax implicitCreation:
                     // Target-typed `new()` has no type-name syntax, so emit both the ObjectCreation
                     // reference and the Instantiates relationship from the creation node itself.
-                    EmitInstantiation(implicitCreation, model, sink);
+                    EmitInstantiation(implicitCreation, model, sink, resolveTargetProject);
                     EmitImplicitCreationReference(implicitCreation, model, filePath, text, sink, resolveTargetProject);
                     break;
             }
@@ -221,15 +227,19 @@ public static class DocumentSemanticExtractor
             ? resolveTargetProject(assembly)
             : null;
 
-    private static void EmitTypeRelationships(SyntaxNode declaration, SemanticModel model, DocumentContributionSet sink)
+    private static void EmitTypeRelationships(
+        SyntaxNode declaration, SemanticModel model, DocumentContributionSet sink,
+        Func<IAssemblySymbol, long?>? resolveTargetProject)
     {
         if (model.GetDeclaredSymbol(declaration) is not INamedTypeSymbol type
             || type.IsImplicitlyDeclared
             || SemanticSymbolKeyFactory.IsExcludedArtifact(type))
             return;
 
-        foreach (var (fromKey, toKey, kind) in RelationshipExtractor.ExtractRelationships(type))
-            sink.AddRelationship(new RelationshipContribution(fromKey, toKey, kind));
+        foreach (var edge in RelationshipExtractor.ExtractRelationshipsWithTargets(type))
+            sink.AddRelationship(new RelationshipContribution(edge.FromKey, edge.ToKey, edge.Kind,
+                ExactTargetProject(edge.FromSymbol, resolveTargetProject),
+                ExactTargetProject(edge.ToSymbol, resolveTargetProject)));
     }
 
     private static void EmitReference(
@@ -334,7 +344,9 @@ public static class DocumentSemanticExtractor
             ExactTargetProject(canonicalCallee, resolveTargetProject)));
     }
 
-    private static void EmitInstantiation(SyntaxNode creationNode, SemanticModel model, DocumentContributionSet sink)
+    private static void EmitInstantiation(
+        SyntaxNode creationNode, SemanticModel model, DocumentContributionSet sink,
+        Func<IAssemblySymbol, long?>? resolveTargetProject)
     {
         var createdType = (model.GetOperation(creationNode) as IObjectCreationOperation)?.Constructor?.ContainingType
                           ?? (model.GetSymbolInfo(creationNode).Symbol as IMethodSymbol)?.ContainingType;
@@ -349,10 +361,14 @@ public static class DocumentSemanticExtractor
         if (enclosingKey == null)
             return;
 
+        // The enclosing member is always owner-local (key-only), so only the created type carries an
+        // exact target project for compilation-scoped resolution (#32).
         sink.AddRelationship(new RelationshipContribution(
             enclosingKey,
             SemanticSymbolKeyFactory.DeclarationKey(createdType),
-            RelationshipKind.Instantiates));
+            RelationshipKind.Instantiates,
+            null,
+            ExactTargetProject(createdType, resolveTargetProject)));
     }
 
     private static void EmitImplicitCreationReference(

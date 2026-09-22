@@ -208,6 +208,25 @@ public sealed class SymbolStore(SqliteConnection connection)
         return ReadAll(cmd);
     }
 
+    /// <summary>
+    /// The (symbol_key -> symbol id) pairs for every symbol owned by a project version. Phase 12 uses
+    /// this to re-populate the in-run <see cref="Sextant.Core.SymbolCatalog"/> when a later parent REUSES
+    /// an already-indexed submodule provider project version (its symbols are not re-extracted this run),
+    /// so the parent's occurrence resolution can still bind cross-repo targets to the provider's stable
+    /// keys. The declaration key is unique per (project, symbol_key), so each key maps to one id.
+    /// </summary>
+    public List<(string symbolKey, long id)> GetKeyIdPairsByProject(long projectId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT symbol_key, id FROM symbols WHERE project_id = @project_id;";
+        cmd.Parameters.AddWithValue("@project_id", projectId);
+        var pairs = new List<(string, long)>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            pairs.Add((reader.GetString(0), reader.GetInt64(1)));
+        return pairs;
+    }
+
     public List<SymbolInfo> GetByProjectAndAccessibility(long projectId, string[] accessibilities)
     {
         using var cmd = connection.CreateCommand();

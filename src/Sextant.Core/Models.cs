@@ -144,4 +144,67 @@ public sealed class SubmoduleInfo
     public required string Path { get; init; }
     public required string CommitSha { get; init; }
     public required string RemoteUrl { get; init; }
+
+    /// <summary>
+    /// True when <c>git submodule status</c> reported the submodule with a non-clean prefix — its
+    /// checked-out commit differs from the recorded pin (<c>+</c>), it is uninitialized (<c>-</c>), or it
+    /// has merge conflicts (<c>U</c>) — i.e. the parent's working tree does NOT match the clean pinned
+    /// commit (issue #48). A dirty submodule must never be identified as the clean pinned commit; Phase 12
+    /// folds this into the provider snapshot identity and records it on the dependency edge.
+    /// </summary>
+    public bool IsDirty { get; init; }
+}
+
+/// <summary>
+/// A Phase-12 snapshot dependency edge: one consumer project version's pinned reference into a
+/// deduplicated submodule PROVIDER project version. Immutable per consumer generation; the reverse index
+/// backing cross-repository usage queries and provider retention protection.
+/// </summary>
+public sealed class SnapshotDependencyEdge
+{
+    public long Id { get; set; }
+    public required long ConsumerSnapshotId { get; init; }
+    public required long ConsumerProjectId { get; init; }
+    public required long ProviderSnapshotId { get; init; }
+    public required long ProviderProjectId { get; init; }
+    public required long ProviderRepositoryId { get; init; }
+    public required string ProviderCommitSha { get; init; }
+    public required string ReferenceKind { get; init; }
+    public bool SubmoduleDirty { get; init; }
+    public long CreatedAt { get; init; }
+}
+
+/// <summary>
+/// One authorized cross-repository usage of a producer (submodule provider) symbol: where a consumer
+/// repository references the provider symbol, with the consumer's location and the exact pinned provider
+/// version. Returned by the Phase-12 reverse-usage query, narrowed to authorized consumer snapshots.
+/// </summary>
+public sealed class CrossRepositoryUsage
+{
+    public required string ConsumerRepositoryUrl { get; init; }
+    public required string ConsumerBranch { get; init; }
+    public string? ConsumerCommitSha { get; init; }
+    public required string ConsumerProjectCanonicalId { get; init; }
+    public required string FilePath { get; init; }
+    public int Line { get; init; }
+    public int Column { get; init; }
+    public required string OccurrenceKind { get; init; }
+    public required string ProviderCommitSha { get; init; }
+    public bool SubmoduleDirty { get; init; }
+}
+
+/// <summary>
+/// One authorized reverse-dependency of a shared submodule (provider) repository: a consumer repository /
+/// project that pins the provider at a specific commit. Returned by the Phase-12 reverse-dependency query
+/// ("which repositories consume this submodule, and at what pin"), narrowed to authorized consumers.
+/// </summary>
+public sealed class SubmoduleConsumer
+{
+    public required long ConsumerRepositoryId { get; init; }
+    public required string ConsumerRepositoryUrl { get; init; }
+    public required string ConsumerBranch { get; init; }
+    public string? ConsumerCommitSha { get; init; }
+    public required string ConsumerProjectCanonicalId { get; init; }
+    public required string ProviderCommitSha { get; init; }
+    public bool SubmoduleDirty { get; init; }
 }
