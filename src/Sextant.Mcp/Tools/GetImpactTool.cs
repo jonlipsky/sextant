@@ -17,9 +17,10 @@ public static class GetImpactTool
             return ResponseBuilder.BuildEmpty(notReady);
 
         var conn = db.GetConnection();
-        var symbolStore = new SymbolStore(conn);
+        var snapshotScope = SnapshotReadScope.ForSelected(conn);
+        var symbolStore = new SymbolStore(conn) { Scope = snapshotScope };
         var dependencyStore = new ProjectDependencyStore(conn);
-        var referenceStore = new ReferenceStore(conn);
+        var referenceStore = new ReferenceStore(conn) { Scope = snapshotScope };
         var apiSurfaceStore = new ApiSurfaceStore(conn);
         var projectStore = new ProjectStore(conn);
 

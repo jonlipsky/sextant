@@ -15,9 +15,17 @@ public sealed class SymbolStore(SqliteConnection connection)
 
     private FileStore FilesOrDefault => Files ??= new FileStore(connection);
 
+    /// <summary>
+    /// Optional Phase-9 snapshot read scope. Default <see cref="SnapshotReadScope.Unscoped"/> makes every
+    /// query byte-identical to the pre-Phase-9 behavior (no snapshot filter), so the write path and all
+    /// direct-seed/legacy readers are unchanged; the MCP layer sets it to the selected snapshot so a
+    /// scope-less query transparently defaults to the current snapshot (criterion 6).
+    /// </summary>
+    public SnapshotReadScope Scope { get; set; } = SnapshotReadScope.Unscoped;
+
     // Reads reconstruct the absolute FilePath from the file version's repo-relative path and the
     // owning project's disk path, so no absolute path is ever stored (acceptance criterion 1).
-    private const string SelectPrefix = """
+    private const string SelectBase = """
         SELECT s.id, s.project_id, s.symbol_key, s.fully_qualified_name, s.display_name, s.kind,
                s.accessibility, s.is_static, s.is_abstract, s.is_virtual, s.is_override, s.signature,
                s.signature_hash, s.doc_comment, s.line_start, s.line_end, s.attributes, s.last_indexed_at,
@@ -28,6 +36,10 @@ public sealed class SymbolStore(SqliteConnection connection)
         LEFT JOIN files f ON f.id = fv.file_id
         LEFT JOIN projects p ON p.id = s.project_id
         """;
+
+    // When scoped, an inner JOIN to snapshot_projects restricts every SelectBase-based read to the
+    // selected snapshot's project versions (criterion 6). Unscoped, it is exactly SelectBase.
+    private string SelectPrefix => SelectBase + Scope.Join("s.project_id");
 
     private const string InsertSql = """
         INSERT INTO symbols (project_id, symbol_key, fully_qualified_name, display_name, kind, accessibility,
@@ -109,6 +121,7 @@ public sealed class SymbolStore(SqliteConnection connection)
         using var cmd = connection.CreateCommand();
         cmd.CommandText = SelectPrefix + " WHERE s.id = @id;";
         cmd.Parameters.AddWithValue("@id", id);
+        Scope.Bind(cmd);
         using var reader = cmd.ExecuteReader();
         return reader.Read() ? ReadSymbol(reader) : null;
     }
@@ -122,6 +135,7 @@ public sealed class SymbolStore(SqliteConnection connection)
         cmd.Parameters.AddWithValue("@fqn", fullyQualifiedName);
         if (projectId.HasValue)
             cmd.Parameters.AddWithValue("@project_id", projectId.Value);
+        Scope.Bind(cmd);
 
         using var reader = cmd.ExecuteReader();
         return reader.Read() ? ReadSymbol(reader) : null;
@@ -134,6 +148,7 @@ public sealed class SymbolStore(SqliteConnection connection)
         cmd.CommandText = SelectPrefix + " WHERE s.symbol_key = @symbol_key AND s.project_id = @project_id;";
         cmd.Parameters.AddWithValue("@symbol_key", symbolKey);
         cmd.Parameters.AddWithValue("@project_id", projectId);
+        Scope.Bind(cmd);
         using var reader = cmd.ExecuteReader();
         return reader.Read() ? ReadSymbol(reader) : null;
     }
@@ -233,9 +248,10 @@ public sealed class SymbolStore(SqliteConnection connection)
         using var cmd = connection.CreateCommand();
         var projectClause = projectId.HasValue ? " AND project_id = @projectId" : "";
         var kindList = string.Join(",", TypeKindOrdinals);
-        cmd.CommandText = $"SELECT fully_qualified_name FROM symbols WHERE kind IN ({kindList}){projectClause};";
+        cmd.CommandText = $"SELECT fully_qualified_name FROM symbols WHERE kind IN ({kindList}){projectClause}{Scope.And("project_id")};";
         if (projectId.HasValue)
             cmd.Parameters.AddWithValue("@projectId", projectId.Value);
+        Scope.Bind(cmd);
 
         var results = new List<string>();
         using var reader = cmd.ExecuteReader();
@@ -394,8 +410,9 @@ public sealed class SymbolStore(SqliteConnection connection)
         cmd.ExecuteNonQuery();
     }
 
-    private static List<SymbolInfo> ReadAll(SqliteCommand cmd)
+    private List<SymbolInfo> ReadAll(SqliteCommand cmd)
     {
+        Scope.Bind(cmd);
         var results = new List<SymbolInfo>();
         using var reader = cmd.ExecuteReader();
         while (reader.Read())

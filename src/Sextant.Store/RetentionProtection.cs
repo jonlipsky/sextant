@@ -90,3 +90,40 @@ public sealed class LastCompleteRunProtection : IRetentionProtectionProvider
             builder.ProtectGeneration(servable.Id, "currently-servable last-complete generation");
     }
 }
+
+/// <summary>
+/// Protects every snapshot referenced by a branch pointer (Phase 9). A branch name is a mutable pointer
+/// to an immutable snapshot; the default/current-selected branch head — and any other branch pointer —
+/// must survive a retention pass even when its generation falls outside the keep window. For each
+/// branch-pointed snapshot this pins its generation (<c>run_id</c>) so the ledger row is never GC'd and
+/// its git commit so the commit's API history (<see cref="RetentionService"/> trims by commit) is
+/// preserved (criterion 5 under the snapshot model). The default protected set is thus "default branch +
+/// any live branch pointer"; PR-head, submodule-pin, and overlay providers are left to Phases 10/12/14.
+/// Forward/backward-safe: if the Phase-9 <c>branches</c> table is not present (pre-migration DB) the
+/// provider contributes nothing.
+/// </summary>
+public sealed class BranchPointerProtection : IRetentionProtectionProvider
+{
+    public string Name => "branch-pointer";
+
+    public void Contribute(SqliteConnection connection, RetentionProtectionBuilder builder)
+    {
+        if (!TableExists(connection, "branches")) return;
+
+        foreach (var (runId, commitSha) in new SnapshotStore(connection).GetBranchProtectionTargets())
+        {
+            if (runId.HasValue)
+                builder.ProtectGeneration(runId.Value, "generation referenced by a branch pointer");
+            if (!string.IsNullOrEmpty(commitSha))
+                builder.ProtectCommit(commitSha!, "API history for a branch-pointed commit");
+        }
+    }
+
+    private static bool TableExists(SqliteConnection connection, string table)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = @name LIMIT 1;";
+        cmd.Parameters.AddWithValue("@name", table);
+        return cmd.ExecuteScalar() is not null;
+    }
+}

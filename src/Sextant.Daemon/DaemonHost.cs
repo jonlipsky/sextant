@@ -141,7 +141,13 @@ public sealed class DaemonHost : IDisposable
                 _currentSolution = solution;
 
                 var orchestrator = new IndexOrchestrator(_db!, _log, _useDocumentExtractor, _parallelism, _profile);
-                await orchestrator.IndexSolutionAsync(solution, progressReporter);
+                // All solutions of one repo share ONE snapshot identity (commit+tree+schema+analyzer+
+                // config+toolchain — no per-solution component), so with 2+ solutions the second and later
+                // would idempotently attach to the first's snapshot and skip their own indexing. Until
+                // multi-solution→one-snapshot aggregation lands (tracked follow-up), a multi-solution repo
+                // stays on the legacy mutable-row path; a single-solution repo gets full Phase-9 snapshots.
+                await orchestrator.IndexSolutionAsync(
+                    solution, progressReporter, enableSnapshots: _solutionPaths.Length == 1);
             }
             _lastIndexedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         }
@@ -358,18 +364,31 @@ public sealed class DaemonHost : IDisposable
     }
 
     /// <summary>
-    /// True when the current indexing profile's configuration hash differs from the last complete
-    /// run's recorded hash (Phase 8). A difference means the feature set changed since the served
-    /// generation was built, so an incremental catch-up would leave optional tables unbuilt or stale;
-    /// the caller forces a full re-index instead. A null recorded hash (a pre-Phase-8 generation)
-    /// counts as changed. Never treats a missing/broken ledger as changed, so a fresh full-index
-    /// decision is left to <see cref="IsEmptyDatabase"/>.
+    /// True when the served generation was built with inputs incompatible with the current environment,
+    /// so an incremental catch-up would be unsafe and the caller forces a full re-index instead. Phase 9
+    /// compares the full snapshot fingerprint tuple of the selected snapshot — schema version, analyzer
+    /// version, configuration hash, and toolchain fingerprint — so a change to ANY of them prevents
+    /// unsafe reuse (criterion 4b) exactly as a config-hash change did in Phase 8. Falls back to the
+    /// Phase-8 config-hash-only comparison against the <c>index_runs</c> ledger for a pre-Phase-9
+    /// generation with no snapshot. A null recorded value counts as changed. Never treats a
+    /// missing/broken ledger as changed, so a fresh full-index decision is left to
+    /// <see cref="IsEmptyDatabase"/>.
     /// </summary>
     private bool ConfigurationChangedSinceLastRun()
     {
         try
         {
-            var lastComplete = new IndexRunStore(_db!.GetConnection()).GetLastCompleteRun();
+            var conn = _db!.GetConnection();
+            var snapshotStore = new SnapshotStore(conn);
+            if (snapshotStore.GetSelectedSnapshotId() is long id && snapshotStore.GetById(id) is { } snap)
+            {
+                return snap.SchemaVersion != IndexDatabase.LatestSchemaVersion
+                    || !string.Equals(snap.AnalyzerVersion, IndexConfigurationHash.AnalyzerVersion, StringComparison.Ordinal)
+                    || !string.Equals(snap.ConfigHash, _profile.ConfigurationHash, StringComparison.Ordinal)
+                    || !string.Equals(snap.ToolchainFingerprint, ToolchainFingerprint.Current, StringComparison.Ordinal);
+            }
+
+            var lastComplete = new IndexRunStore(conn).GetLastCompleteRun();
             if (lastComplete == null)
                 return false;
             return !string.Equals(lastComplete.ConfigHash, _profile.ConfigurationHash, StringComparison.Ordinal);

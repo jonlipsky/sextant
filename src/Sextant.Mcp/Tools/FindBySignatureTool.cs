@@ -29,7 +29,7 @@ public static class FindBySignatureTool
             return ResponseBuilder.BuildEmpty(notReady);
 
         var conn = db.GetConnection();
-        var symbolStore = new SymbolStore(conn);
+        var symbolStore = new SymbolStore(conn) { Scope = SnapshotReadScope.ForSelected(conn) };
         var projectStore = new ProjectStore(conn);
 
         long? projectDbId = null;

@@ -14,13 +14,19 @@ public sealed class CommentStore(SqliteConnection connection)
 
     private FileStore FilesOrDefault => Files ??= new FileStore(connection);
 
+    /// <summary>
+    /// Optional Phase-9 snapshot read scope. Default <see cref="SnapshotReadScope.Unscoped"/> keeps
+    /// reads byte-identical to pre-Phase-9 (no snapshot filter).
+    /// </summary>
+    public SnapshotReadScope Scope { get; set; } = SnapshotReadScope.Unscoped;
+
     private const string InsertSql = """
         INSERT INTO comments (project_id, file_version_id, line, tag, text, enclosing_symbol_id, last_indexed_at)
         VALUES (@project_id, @file_version_id, @line, @tag, @text, @enclosing_symbol_id, @last_indexed_at)
         RETURNING id;
         """;
 
-    private const string SelectPrefix = """
+    private const string SelectBase = """
         SELECT c.id, c.project_id, c.line, c.tag, c.text, c.enclosing_symbol_id, c.last_indexed_at,
                f.repo_relative_path AS repo_relative_path, p.disk_path AS disk_path,
                p.repo_relative_path AS project_repo_relative
@@ -29,6 +35,10 @@ public sealed class CommentStore(SqliteConnection connection)
         LEFT JOIN files f ON f.id = fv.file_id
         JOIN projects p ON p.id = c.project_id
         """;
+
+    // When scoped, an inner JOIN to snapshot_projects restricts reads to the selected snapshot's
+    // project versions (criteria 6/7). Unscoped, it is exactly SelectBase.
+    private string SelectPrefix => SelectBase + Scope.Join("c.project_id");
 
     public SqliteCommand CreateInsertCommand()
     {
@@ -173,8 +183,9 @@ public sealed class CommentStore(SqliteConnection connection)
         return candidates.ToList();
     }
 
-    private static List<CommentInfo> ReadAll(SqliteCommand cmd)
+    private List<CommentInfo> ReadAll(SqliteCommand cmd)
     {
+        Scope.Bind(cmd);
         var results = new List<CommentInfo>();
         using var reader = cmd.ExecuteReader();
         while (reader.Read())

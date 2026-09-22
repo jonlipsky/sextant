@@ -19,7 +19,7 @@ public static class FindByAttributeTool
             return ResponseBuilder.BuildEmpty(notReady);
 
         var conn = db.GetConnection();
-        var symbolStore = new SymbolStore(conn);
+        var symbolStore = new SymbolStore(conn) { Scope = SnapshotReadScope.ForSelected(conn) };
 
         // GetByAttribute does the substring pre-filter AND the exact JSON-array membership check.
         var matches = symbolStore.GetByAttribute(attribute_fqn);

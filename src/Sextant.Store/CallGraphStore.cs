@@ -23,6 +23,12 @@ public sealed class CallGraphStore(SqliteConnection connection)
 
     private FileStore FilesOrDefault => Files ??= new FileStore(connection);
 
+    /// <summary>
+    /// Optional Phase-9 snapshot read scope. Default <see cref="SnapshotReadScope.Unscoped"/> keeps
+    /// reads byte-identical to pre-Phase-9 (no snapshot filter).
+    /// </summary>
+    public SnapshotReadScope Scope { get; set; } = SnapshotReadScope.Unscoped;
+
     private const string InsertSql = """
         INSERT INTO occurrences (in_project_id, target_symbol_id, source_symbol_id, file_version_id, line, col, kind, flags, last_indexed_at)
         VALUES (@in_project_id, @callee, @caller, @file_version_id, @line, @col, @kind, 0, @last_indexed_at)
@@ -33,7 +39,7 @@ public sealed class CallGraphStore(SqliteConnection connection)
     // the absolute CallSiteFile from the caller project's disk path. `col` records the call site's 0-based
     // column so two distinct calls on one line (e.g. `F(a); F(b);`) stay distinguishable occurrences —
     // the discriminator the unified schema reserves for same-line disambiguation.
-    private const string SelectPrefix = """
+    private const string SelectBase = """
         SELECT o.id AS id, o.source_symbol_id, o.target_symbol_id, o.line, o.col, o.last_indexed_at,
                f.repo_relative_path AS repo_relative_path, p.disk_path AS disk_path,
                p.repo_relative_path AS project_repo_relative
@@ -42,6 +48,10 @@ public sealed class CallGraphStore(SqliteConnection connection)
         JOIN files f ON f.id = fv.file_id
         JOIN projects p ON p.id = o.in_project_id
         """;
+
+    // When scoped, an inner JOIN to snapshot_projects restricts reads to the selected snapshot's
+    // project versions (criteria 6/7). Unscoped, it is exactly SelectBase.
+    private string SelectPrefix => SelectBase + Scope.Join("o.in_project_id");
 
     public SqliteCommand CreateInsertCommand()
     {
@@ -153,8 +163,9 @@ public sealed class CallGraphStore(SqliteConnection connection)
         return candidates.ToList();
     }
 
-    private static List<CallGraphEdge> ReadAll(SqliteCommand cmd)
+    private List<CallGraphEdge> ReadAll(SqliteCommand cmd)
     {
+        Scope.Bind(cmd);
         var results = new List<CallGraphEdge>();
         using var reader = cmd.ExecuteReader();
         while (reader.Read())

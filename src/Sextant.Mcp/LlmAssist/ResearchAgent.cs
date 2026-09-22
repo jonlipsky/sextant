@@ -219,7 +219,7 @@ public sealed class ResearchAgent
         var matches = fqnPattern.Matches(answer);
 
         var conn = db.GetConnection();
-        var symbolStore = new SymbolStore(conn);
+        var symbolStore = new SymbolStore(conn) { Scope = SnapshotReadScope.ForSelected(conn) };
 
         foreach (Match match in matches)
         {

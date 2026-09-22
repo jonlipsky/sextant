@@ -20,15 +20,24 @@ public static class GetIndexStatusTool
         var results = new List<object>();
         long freshness = 0;
 
+        // Default to the selected snapshot's project versions (criterion 6): a scope-less status call
+        // lists exactly the current snapshot, surfaces the commit-invariant logical canonical id (never
+        // the per-snapshot-suffixed storage value), and never double-counts across coexisting snapshots.
+        // A legacy/pre-first-publish DB (no selected snapshot) lists the mutable rows exactly as before.
+        var selected = new SnapshotStore(conn).GetSelectedSnapshotId();
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = """
-            SELECT p.canonical_id, p.git_remote_url, p.repo_relative_path,
+        cmd.CommandText = $"""
+            SELECT COALESCE(lp.canonical_id, p.canonical_id) AS canonical_id, p.git_remote_url, p.repo_relative_path,
                    p.assembly_name, p.is_test_project, p.last_indexed_at,
                    (SELECT COUNT(*) FROM symbols WHERE project_id = p.id) as symbol_count,
                    (SELECT COUNT(*) FROM occurrences WHERE in_project_id = p.id AND source_symbol_id IS NULL) as reference_count
             FROM projects p
+            LEFT JOIN logical_projects lp ON lp.id = p.logical_project_id
+            WHERE {(selected is long ? "p.snapshot_id = @snap" : "p.snapshot_id IS NULL")}
             ORDER BY p.last_indexed_at DESC;
             """;
+        if (selected is long snap)
+            cmd.Parameters.AddWithValue("@snap", snap);
 
         using (var reader = cmd.ExecuteReader())
         {

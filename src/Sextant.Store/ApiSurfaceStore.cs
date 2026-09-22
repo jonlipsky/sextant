@@ -5,6 +5,20 @@ namespace Sextant.Store;
 
 public sealed class ApiSurfaceStore(SqliteConnection connection)
 {
+    // Phase 9: each immutable snapshot of a project gets its OWN physical project row (a new project_id),
+    // but every version of one logical project shares a logical_project_id. Historical api-surface rows
+    // for an older commit therefore live under a DIFFERENT physical project_id than the currently selected
+    // snapshot's row. To keep cross-commit API comparisons working across reindexing (criterion 5), every
+    // api-history lookup resolves a physical project_id to its whole logical-project group. The trailing
+    // UNION is the legacy fallback: a pre-Phase-9 row has logical_project_id IS NULL, so the group is just
+    // the row itself — byte-for-byte the original single-project behavior.
+    private const string LogicalProjectGroup = """
+        (SELECT p2.id FROM projects p1
+              JOIN projects p2 ON p2.logical_project_id = p1.logical_project_id
+              WHERE p1.id = @project_id AND p1.logical_project_id IS NOT NULL
+         UNION SELECT @project_id)
+        """;
+
     public long Insert(ApiSurfaceSnapshot snapshot)
     {
         using var cmd = connection.CreateCommand();
@@ -29,11 +43,11 @@ public sealed class ApiSurfaceStore(SqliteConnection connection)
     public List<ApiSurfaceSnapshot> GetByProjectAndCommit(long projectId, string gitCommit)
     {
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = """
+        cmd.CommandText = $"""
             SELECT a.id, a.project_id, a.symbol_id, a.symbol_key, a.fully_qualified_name, a.accessibility,
                    a.signature_hash, a.captured_at, a.git_commit
             FROM api_surface_snapshots a
-            WHERE a.project_id = @project_id AND a.git_commit = @git_commit;
+            WHERE a.project_id IN {LogicalProjectGroup} AND a.git_commit = @git_commit;
             """;
         cmd.Parameters.AddWithValue("@project_id", projectId);
         cmd.Parameters.AddWithValue("@git_commit", gitCommit);
@@ -44,13 +58,13 @@ public sealed class ApiSurfaceStore(SqliteConnection connection)
     public List<ApiSurfaceSnapshot> GetLatestByProject(long projectId)
     {
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = """
+        cmd.CommandText = $"""
             SELECT a.id, a.project_id, a.symbol_id, a.symbol_key, a.fully_qualified_name, a.accessibility,
                    a.signature_hash, a.captured_at, a.git_commit
             FROM api_surface_snapshots a
-            WHERE a.project_id = @project_id
+            WHERE a.project_id IN {LogicalProjectGroup}
               AND a.captured_at = (
-                  SELECT MAX(captured_at) FROM api_surface_snapshots WHERE project_id = @project_id
+                  SELECT MAX(captured_at) FROM api_surface_snapshots WHERE project_id IN {LogicalProjectGroup}
               );
             """;
         cmd.Parameters.AddWithValue("@project_id", projectId);
@@ -61,9 +75,9 @@ public sealed class ApiSurfaceStore(SqliteConnection connection)
     public string? GetPreviousCommit(long projectId, string currentCommit)
     {
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = """
+        cmd.CommandText = $"""
             SELECT DISTINCT git_commit FROM api_surface_snapshots
-            WHERE project_id = @project_id AND git_commit != @current_commit
+            WHERE project_id IN {LogicalProjectGroup} AND git_commit != @current_commit
             ORDER BY captured_at DESC LIMIT 1;
             """;
         cmd.Parameters.AddWithValue("@project_id", projectId);
@@ -74,6 +88,9 @@ public sealed class ApiSurfaceStore(SqliteConnection connection)
 
     public void DeleteByProjectAndCommit(long projectId, string gitCommit)
     {
+        // Deletion stays precise to the physical project row: a (commit, logical project) has its api rows
+        // under exactly one physical project version, so re-capture replaces only that snapshot's rows and
+        // never a sibling snapshot's committed history (criterion 5 — historical snapshots survive rebuilds).
         using var cmd = connection.CreateCommand();
         cmd.CommandText = "DELETE FROM api_surface_snapshots WHERE project_id = @project_id AND git_commit = @git_commit;";
         cmd.Parameters.AddWithValue("@project_id", projectId);
