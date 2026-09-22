@@ -16,17 +16,20 @@ public static class GetImpactTool
         if (db == null)
             return ResponseBuilder.BuildEmpty(notReady);
 
+        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+            return authError;
+
         var conn = db.GetConnection();
-        var snapshotScope = SnapshotReadScope.ForSelected(conn);
+        var snapshotScope = readContext.Scope;
         var symbolStore = new SymbolStore(conn) { Scope = snapshotScope };
         var dependencyStore = new ProjectDependencyStore(conn);
         var referenceStore = new ReferenceStore(conn) { Scope = snapshotScope };
         var apiSurfaceStore = new ApiSurfaceStore(conn);
-        var projectStore = new ProjectStore(conn);
+        var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
 
         var resolution = SymbolResolver.Resolve(symbolStore, projectStore, symbol_fqn);
         if (resolution.Symbol == null)
-            return ResponseBuilder.BuildEmpty($"Symbol not found: {symbol_fqn}");
+            return ResponseBuilder.BuildEmpty($"Symbol not found: {symbol_fqn}", readContext.Provenance);
         var symbol = resolution.Symbol;
 
         // Find all projects that depend on this symbol's project
@@ -99,19 +102,21 @@ public static class GetImpactTool
             }
         };
 
-        return ResponseBuilder.Build(result, symbol.LastIndexedAt, resolution.Ambiguity);
+        return ResponseBuilder.Build(result, symbol.LastIndexedAt, resolution.Ambiguity, readContext.Provenance);
     }
 
-    private static List<(string fqn, string signatureHash, string accessibility)> BuildSurface(
+    private static List<(string symbolKey, string fqn, string signatureHash, string accessibility)> BuildSurface(
         List<Sextant.Core.ApiSurfaceSnapshot> snapshots)
     {
         // Snapshots are self-contained: fqn/accessibility/signature come from the row itself, not from
         // the live symbol table, so a historical surface reconstructs correctly even after the working
-        // symbols were rebuilt (and their ids reassigned) since capture.
-        var surface = new List<(string, string, string)>();
+        // symbols were rebuilt (and their ids reassigned) since capture. Keyed by symbol_key so overloads
+        // sharing an FQN stay distinct (issue #29).
+        var surface = new List<(string, string, string, string)>();
         foreach (var snapshot in snapshots)
         {
             surface.Add((
+                snapshot.SymbolKey,
                 snapshot.FullyQualifiedName,
                 snapshot.SignatureHash,
                 snapshot.Accessibility

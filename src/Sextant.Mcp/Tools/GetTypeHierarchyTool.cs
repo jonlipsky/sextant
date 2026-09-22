@@ -18,14 +18,17 @@ public static class GetTypeHierarchyTool
         if (db == null)
             return ResponseBuilder.BuildEmpty(notReady);
 
+        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+            return authError;
+
         var conn = db.GetConnection();
-        var symbolStore = new SymbolStore(conn) { Scope = SnapshotReadScope.ForSelected(conn) };
+        var symbolStore = new SymbolStore(conn) { Scope = readContext.Scope };
         var relationshipStore = new RelationshipStore(conn);
-        var projectStore = new ProjectStore(conn);
+        var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
 
         var resolution = SymbolResolver.Resolve(symbolStore, projectStore, symbol_fqn);
         if (resolution.Symbol == null)
-            return ResponseBuilder.BuildEmpty("Symbol not found.");
+            return ResponseBuilder.BuildEmpty("Symbol not found.", readContext.Provenance);
         var rootSymbol = resolution.Symbol;
 
         var results = new List<object>();
@@ -41,7 +44,7 @@ public static class GetTypeHierarchyTool
         }
 
         var freshness = rootSymbol.LastIndexedAt;
-        return ResponseBuilder.Build(results, freshness, resolution.Ambiguity);
+        return ResponseBuilder.Build(results, freshness, resolution.Ambiguity, readContext.Provenance);
     }
 
     private static void CollectHierarchy(

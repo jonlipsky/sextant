@@ -19,21 +19,32 @@ public sealed class ChangeDetail
 public static class BreakingChangeDetector
 {
     /// <summary>
-    /// Compares two API surface snapshots to detect breaking changes.
+    /// Compares two API surface snapshots to detect breaking changes. Symbols are matched by their stable
+    /// Phase-2 <c>symbol_key</c>, NOT by fully-qualified name: public overloads share one FQN (e.g.
+    /// <c>Foo(int)</c> and <c>Foo(string)</c>), so keying by FQN threw a duplicate-key
+    /// <see cref="ArgumentException"/> the moment a project exposed an overloaded public member (issue
+    /// #29). The <c>symbol_key</c> distinguishes overloads, so each is compared independently; the FQN is
+    /// retained only for display in <see cref="ChangeDetail.SymbolFqn"/>.
     /// </summary>
     public static List<ChangeDetail> DetectChanges(
-        IReadOnlyList<(string fqn, string signatureHash, string accessibility)> oldSurface,
-        IReadOnlyList<(string fqn, string signatureHash, string accessibility)> newSurface)
+        IReadOnlyList<(string symbolKey, string fqn, string signatureHash, string accessibility)> oldSurface,
+        IReadOnlyList<(string symbolKey, string fqn, string signatureHash, string accessibility)> newSurface)
     {
         var changes = new List<ChangeDetail>();
 
-        var oldByFqn = oldSurface.ToDictionary(s => s.fqn, s => (s.signatureHash, s.accessibility));
-        var newByFqn = newSurface.ToDictionary(s => s.fqn, s => (s.signatureHash, s.accessibility));
+        // Key by the stable symbol_key so overloads sharing an FQN are distinct entries. A defensive
+        // last-writer-wins guards against a (malformed) duplicate key rather than throwing.
+        var oldByKey = new Dictionary<string, (string fqn, string signatureHash, string accessibility)>();
+        foreach (var s in oldSurface)
+            oldByKey[s.symbolKey] = (s.fqn, s.signatureHash, s.accessibility);
+        var newByKey = new Dictionary<string, (string fqn, string signatureHash, string accessibility)>();
+        foreach (var s in newSurface)
+            newByKey[s.symbolKey] = (s.fqn, s.signatureHash, s.accessibility);
 
         // Check for removals and modifications
-        foreach (var (fqn, (oldHash, oldAccess)) in oldByFqn)
+        foreach (var (key, (fqn, oldHash, oldAccess)) in oldByKey)
         {
-            if (!newByFqn.TryGetValue(fqn, out var newEntry))
+            if (!newByKey.TryGetValue(key, out var newEntry))
             {
                 changes.Add(new ChangeDetail
                 {
@@ -70,13 +81,13 @@ public static class BreakingChangeDetector
         }
 
         // Check for additions
-        foreach (var (fqn, _) in newByFqn)
+        foreach (var (key, entry) in newByKey)
         {
-            if (!oldByFqn.ContainsKey(fqn))
+            if (!oldByKey.ContainsKey(key))
             {
                 changes.Add(new ChangeDetail
                 {
-                    SymbolFqn = fqn,
+                    SymbolFqn = entry.fqn,
                     Classification = ChangeClassification.Additive,
                     Reason = "Symbol added"
                 });

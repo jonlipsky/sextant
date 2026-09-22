@@ -24,34 +24,37 @@ public static class TraceValueTool
         if (db == null)
             return ResponseBuilder.BuildEmpty(notReady);
 
+        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+            return authError;
+
         if (!CapabilityGate.Ensure(db, Core.IndexFeature.Dataflow, "dataflow", out var unavailable))
             return unavailable;
 
         var conn = db.GetConnection();
-        var snapshotScope = SnapshotReadScope.ForSelected(conn);
+        var snapshotScope = readContext.Scope;
         var symbolStore = new SymbolStore(conn) { Scope = snapshotScope };
         var callGraphStore = new CallGraphStore(conn) { Scope = snapshotScope };
         var argumentFlowStore = new ArgumentFlowStore(conn);
         var returnFlowStore = new ReturnFlowStore(conn);
-        var projectStore = new ProjectStore(conn);
+        var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
 
         var resolution = SymbolResolver.Resolve(symbolStore, projectStore, method_fqn);
         if (resolution.Symbol == null)
-            return ResponseBuilder.BuildEmpty("Method not found.");
+            return ResponseBuilder.BuildEmpty("Method not found.", readContext.Provenance);
         var methodSymbol = resolution.Symbol;
 
         if (direction == "origins")
-            return TraceOrigins(methodSymbol, parameter, depth, symbolStore, callGraphStore, argumentFlowStore, resolution.Ambiguity);
+            return TraceOrigins(methodSymbol, parameter, depth, symbolStore, callGraphStore, argumentFlowStore, resolution.Ambiguity, readContext.Provenance);
         else if (direction == "destinations")
-            return TraceDestinations(methodSymbol, depth, symbolStore, callGraphStore, returnFlowStore, resolution.Ambiguity);
+            return TraceDestinations(methodSymbol, depth, symbolStore, callGraphStore, returnFlowStore, resolution.Ambiguity, readContext.Provenance);
         else
-            return ResponseBuilder.BuildEmpty("Invalid direction. Use 'origins' or 'destinations'.");
+            return ResponseBuilder.BuildEmpty("Invalid direction. Use 'origins' or 'destinations'.", readContext.Provenance);
     }
 
     private static string TraceOrigins(
         Core.SymbolInfo method, string? parameter, int depth,
         SymbolStore symbolStore, CallGraphStore callGraphStore, ArgumentFlowStore argumentFlowStore,
-        SymbolAmbiguity? ambiguity)
+        SymbolAmbiguity? ambiguity, SnapshotProvenance? provenance)
     {
         // Find all call graph edges where this method is the callee
         var callerEdges = callGraphStore.GetByCallee(method.Id);
@@ -95,13 +98,13 @@ public static class TraceValueTool
             };
         }).ToList();
 
-        return ResponseBuilder.Build(results, method.LastIndexedAt, ambiguity);
+        return ResponseBuilder.Build(results, method.LastIndexedAt, ambiguity, provenance);
     }
 
     private static string TraceDestinations(
         Core.SymbolInfo method, int depth,
         SymbolStore symbolStore, CallGraphStore callGraphStore, ReturnFlowStore returnFlowStore,
-        SymbolAmbiguity? ambiguity)
+        SymbolAmbiguity? ambiguity, SnapshotProvenance? provenance)
     {
         // Find all call graph edges where this method is the callee
         var callerEdges = callGraphStore.GetByCallee(method.Id);
@@ -124,6 +127,6 @@ public static class TraceValueTool
             };
         }).ToList();
 
-        return ResponseBuilder.Build(results, method.LastIndexedAt, ambiguity);
+        return ResponseBuilder.Build(results, method.LastIndexedAt, ambiguity, provenance);
     }
 }

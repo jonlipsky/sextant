@@ -24,15 +24,18 @@ public static class GetTypeMembersTool
         if (db == null)
             return ResponseBuilder.BuildEmpty(notReady);
 
+        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+            return authError;
+
         var conn = db.GetConnection();
-        var symbolStore = new SymbolStore(conn) { Scope = SnapshotReadScope.ForSelected(conn) };
+        var symbolStore = new SymbolStore(conn) { Scope = readContext.Scope };
         var relationshipStore = new RelationshipStore(conn);
-        var projectStore = new ProjectStore(conn);
+        var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
         var canonicalIdCache = FindSymbolTool.BuildCanonicalIdCache(projectStore);
 
         var resolution = SymbolResolver.Resolve(symbolStore, projectStore, symbol_fqn);
         if (resolution.Symbol == null)
-            return ResponseBuilder.BuildEmpty("Type not found.");
+            return ResponseBuilder.BuildEmpty("Type not found.", readContext.Provenance);
         var typeSymbol = resolution.Symbol;
 
         // Get members from the same file that have the type's FQN as a prefix
@@ -54,7 +57,7 @@ public static class GetTypeMembersTool
 
         var mapped = members.Select(s => FindSymbolTool.MapSymbol(s, FindSymbolTool.ResolveCanonicalId(s.ProjectId, canonicalIdCache))).ToList<object>();
         var freshness = members.Count > 0 ? members.Min(s => s.LastIndexedAt) : typeSymbol.LastIndexedAt;
-        return ResponseBuilder.Build(mapped, freshness, resolution.Ambiguity);
+        return ResponseBuilder.Build(mapped, freshness, resolution.Ambiguity, readContext.Provenance);
     }
 
     private static List<SymbolInfo> GetMembersForSymbolId(SymbolStore store, long symbolId)

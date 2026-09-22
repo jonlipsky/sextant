@@ -124,11 +124,11 @@ public class Phase3StoreTests
     [TestMethod]
     public void BreakingChangeDetection_SymbolRemoved()
     {
-        var old = new List<(string fqn, string signatureHash, string accessibility)>
+        var old = new List<(string symbolKey, string fqn, string signatureHash, string accessibility)>
         {
-            ("A.Foo", "hash1", "public")
+            ("K:A.Foo", "A.Foo", "hash1", "public")
         };
-        var @new = new List<(string fqn, string signatureHash, string accessibility)>();
+        var @new = new List<(string symbolKey, string fqn, string signatureHash, string accessibility)>();
 
         var changes = BreakingChangeDetector.DetectChanges(old, @new);
         Assert.AreEqual(1, changes.Count);
@@ -139,13 +139,13 @@ public class Phase3StoreTests
     [TestMethod]
     public void BreakingChangeDetection_SignatureChanged()
     {
-        var old = new List<(string fqn, string signatureHash, string accessibility)>
+        var old = new List<(string symbolKey, string fqn, string signatureHash, string accessibility)>
         {
-            ("A.Foo", "hash1", "public")
+            ("K:A.Foo", "A.Foo", "hash1", "public")
         };
-        var @new = new List<(string fqn, string signatureHash, string accessibility)>
+        var @new = new List<(string symbolKey, string fqn, string signatureHash, string accessibility)>
         {
-            ("A.Foo", "hash2", "public")
+            ("K:A.Foo", "A.Foo", "hash2", "public")
         };
 
         var changes = BreakingChangeDetector.DetectChanges(old, @new);
@@ -157,13 +157,13 @@ public class Phase3StoreTests
     [TestMethod]
     public void BreakingChangeDetection_AccessibilityReduced()
     {
-        var old = new List<(string fqn, string signatureHash, string accessibility)>
+        var old = new List<(string symbolKey, string fqn, string signatureHash, string accessibility)>
         {
-            ("A.Foo", "hash1", "public")
+            ("K:A.Foo", "A.Foo", "hash1", "public")
         };
-        var @new = new List<(string fqn, string signatureHash, string accessibility)>
+        var @new = new List<(string symbolKey, string fqn, string signatureHash, string accessibility)>
         {
-            ("A.Foo", "hash1", "internal")
+            ("K:A.Foo", "A.Foo", "hash1", "internal")
         };
 
         var changes = BreakingChangeDetector.DetectChanges(old, @new);
@@ -175,14 +175,14 @@ public class Phase3StoreTests
     [TestMethod]
     public void BreakingChangeDetection_SymbolAdded_IsAdditive()
     {
-        var old = new List<(string fqn, string signatureHash, string accessibility)>
+        var old = new List<(string symbolKey, string fqn, string signatureHash, string accessibility)>
         {
-            ("A.Foo", "hash1", "public")
+            ("K:A.Foo", "A.Foo", "hash1", "public")
         };
-        var @new = new List<(string fqn, string signatureHash, string accessibility)>
+        var @new = new List<(string symbolKey, string fqn, string signatureHash, string accessibility)>
         {
-            ("A.Foo", "hash1", "public"),
-            ("A.Bar", "hash2", "public")
+            ("K:A.Foo", "A.Foo", "hash1", "public"),
+            ("K:A.Bar", "A.Bar", "hash2", "public")
         };
 
         var changes = BreakingChangeDetector.DetectChanges(old, @new);

@@ -19,9 +19,12 @@ public static class FindUnreferencedTool
         if (db == null)
             return ResponseBuilder.BuildEmpty(notReady);
 
+        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+            return authError;
+
         var conn = db.GetConnection();
-        var projectStore = new ProjectStore(conn);
-        var symbolStore = new SymbolStore(conn) { Scope = SnapshotReadScope.ForSelected(conn) };
+        var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
+        var symbolStore = new SymbolStore(conn) { Scope = readContext.Scope };
 
         // Resolve project canonical ID to DB ID if provided
         long? projectDbId = null;
@@ -29,7 +32,7 @@ public static class FindUnreferencedTool
         {
             var proj = projectStore.GetByCanonicalId(project_id);
             if (proj == null)
-                return ResponseBuilder.BuildEmpty("Project not found.");
+                return ResponseBuilder.BuildEmpty("Project not found.", readContext.Provenance);
             projectDbId = proj.Value.id;
         }
 
@@ -46,6 +49,6 @@ public static class FindUnreferencedTool
             results.Add(FindSymbolTool.MapSymbol(s, FindSymbolTool.ResolveCanonicalId(s.ProjectId, canonicalIdCache)));
         }
 
-        return ResponseBuilder.Build(results, freshness);
+        return ResponseBuilder.Build(results, freshness, provenance: readContext.Provenance);
     }
 }

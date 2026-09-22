@@ -216,7 +216,11 @@ public sealed class IndexOrchestrator
                     // A full LOCAL index over a DIRTY working tree (Phase-10 fallback: no compatible base)
                     // carries the working-tree delta so it never claims identity with the clean base
                     // commit's snapshot (issue #43). Null for a genuine clean-HEAD full index.
-                    WorkingTreeDelta = workingTreeDelta
+                    WorkingTreeDelta = workingTreeDelta,
+                    // A full index is never an overlay; for a dirty fallback this keeps its identity
+                    // distinct from an overlay of the same dirty tree (issue #47). Ignored when the tree
+                    // is clean (delta null → discriminator not folded).
+                    IsOverlay = false
                 };
                 var (snapId, existed, status) = snapshotStore.BeginPending(
                     identity, repositoryId.Value, commitId, runScope.RunId, now, fallbackReason: fallbackReason);
@@ -261,7 +265,9 @@ public sealed class IndexOrchestrator
                         AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
                         ConfigHash = _profile.ConfigurationHash,
                         ToolchainFingerprint = ToolchainFingerprint.Current,
-                        WorkingTreeDelta = overlay.WorkingTreeDelta
+                        WorkingTreeDelta = overlay.WorkingTreeDelta,
+                        // An overlay is distinct from a full-local fallback for the same dirty tree (#47).
+                        IsOverlay = true
                     };
                     var (overlayId, overlayExisted, overlayStatus) = snapshotStore.BeginPending(
                         overlayIdentity, repositoryId.Value, commitId, runScope.RunId, now,

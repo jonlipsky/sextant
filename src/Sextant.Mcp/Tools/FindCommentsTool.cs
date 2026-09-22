@@ -26,21 +26,24 @@ public static class FindCommentsTool
         if (db == null)
             return ResponseBuilder.BuildEmpty(notReady);
 
+        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+            return authError;
+
         if (!CapabilityGate.Ensure(db, Core.IndexFeature.Comments, "comments", out var unavailable))
             return unavailable;
 
         var conn = db.GetConnection();
-        var snapshotScope = SnapshotReadScope.ForSelected(conn);
+        var snapshotScope = readContext.Scope;
         var commentStore = new CommentStore(conn) { Scope = snapshotScope };
         var symbolStore = new SymbolStore(conn) { Scope = snapshotScope };
-        var projectStore = new ProjectStore(conn);
+        var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
 
         long? projectDbId = null;
         if (project_id != null)
         {
             var proj = projectStore.GetByCanonicalId(project_id);
             if (proj == null)
-                return ResponseBuilder.BuildEmpty("Project not found.");
+                return ResponseBuilder.BuildEmpty("Project not found.", readContext.Provenance);
             projectDbId = proj.Value.id;
         }
 
@@ -51,7 +54,7 @@ public static class FindCommentsTool
         {
             var resolution = SymbolResolver.Resolve(symbolStore, projectStore, in_symbol);
             if (resolution.Symbol == null)
-                return ResponseBuilder.BuildEmpty("Symbol not found.");
+                return ResponseBuilder.BuildEmpty("Symbol not found.", readContext.Provenance);
             ambiguity = resolution.Ambiguity;
             comments = commentStore.GetBySymbol(resolution.Symbol.Id);
         }
@@ -96,6 +99,6 @@ public static class FindCommentsTool
         }).ToList();
 
         var freshness = comments.Count > 0 ? comments.Min(c => c.LastIndexedAt) : 0;
-        return ResponseBuilder.Build(results, freshness, ambiguity);
+        return ResponseBuilder.Build(results, freshness, ambiguity, readContext.Provenance);
     }
 }

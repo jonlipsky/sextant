@@ -5,8 +5,18 @@ namespace Sextant.Store;
 
 public sealed class ProjectStore(SqliteConnection connection)
 {
-    private SnapshotStore? _snapshots;
-    private SnapshotStore Snapshots => _snapshots ??= new SnapshotStore(connection);
+    /// <summary>
+    /// The Phase-11 pinned read scope (issue #42). When set, project resolution reuses this ONE scope —
+    /// resolved once for the whole MCP request by <c>FederatedReadContext</c> — instead of independently
+    /// re-reading the mutable selected branch pointer, so a publish that lands mid-request can never
+    /// splice a different generation's project rows into a request already pinned to another (symbols from
+    /// generation A, project/canonical-id resolution from generation B). Null (the write path and any
+    /// unpinned caller) resolves the current selected snapshot per call via
+    /// <see cref="SnapshotReadScope.ForSelected"/>, exactly as before.
+    /// </summary>
+    public SnapshotReadScope? Scope { get; set; }
+
+    private SnapshotReadScope EffectiveScope => Scope ?? SnapshotReadScope.ForSelected(connection);
 
     public long Insert(ProjectIdentity project, long lastIndexedAt)
     {
@@ -43,7 +53,7 @@ public sealed class ProjectStore(SqliteConnection connection)
     /// while distinct snapshots' rows coexist (criterion 1), and its commit-invariant identity lives in
     /// <paramref name="logicalProjectId"/>. Re-registration of the same (snapshot, logical project)
     /// during one run refreshes the existing row rather than creating a duplicate. The suffix never
-    /// leaks to clients — read methods surface the logical canonical id via <see cref="Snapshots"/>.
+    /// leaks to clients — read methods surface the logical canonical id (<c>logical_projects.canonical_id</c>).
     /// </summary>
     public long UpsertSnapshotProject(ProjectIdentity project, long snapshotId, long logicalProjectId, long lastIndexedAt)
     {
@@ -148,30 +158,19 @@ public sealed class ProjectStore(SqliteConnection connection)
 
     public (long id, ProjectIdentity project, long lastIndexedAt)? GetByCanonicalId(string canonicalId)
     {
-        var selected = Snapshots.GetSelectedSnapshotId();
+        var scope = EffectiveScope;
         using var cmd = connection.CreateCommand();
-        if (selected is long snap)
-        {
-            // A snapshot is selected: resolve the working row for this LOGICAL identity within it via
-            // its snapshot_projects membership — the SAME authoritative scope every other store uses
-            // (SnapshotReadScope). Resolving through membership (not the physical projects.snapshot_id
-            // column) is required for Phase-10 overlays: an overlay SHARES a base snapshot's unchanged
-            // project-version row, so that row's snapshot_id stays the BASE while it is mapped into the
-            // overlay via snapshot_projects. A projects.snapshot_id = @snap filter would drop every
-            // shared (unchanged) project under an overlay; membership resolution includes them. For a
-            // full snapshot the two are equivalent (every member row is tagged with @snap).
-            cmd.CommandText = SelectProject
-                + " WHERE p.id IN (SELECT project_id FROM snapshot_projects WHERE snapshot_id = @snap)"
-                + " AND lp.canonical_id = @canon LIMIT 1;";
-            cmd.Parameters.AddWithValue("@snap", snap);
-            cmd.Parameters.AddWithValue("@canon", canonicalId);
-        }
-        else
-        {
-            // Legacy / pre-first-publish: match the mutable legacy row by its stored canonical id.
-            cmd.CommandText = SelectProject + " WHERE p.snapshot_id IS NULL AND p.canonical_id = @canon LIMIT 1;";
-            cmd.Parameters.AddWithValue("@canon", canonicalId);
-        }
+        // Match the LOGICAL canonical id — lp.canonical_id within a snapshot, or the mutable row's
+        // p.canonical_id for a legacy row (COALESCE resolves whichever applies) — restricted to the
+        // pinned scope's project versions. The scope fragment resolves membership via snapshot_projects
+        // (required for Phase-10 overlays, whose SHARED unchanged rows physically keep the BASE snapshot's
+        // id), the legacy rows when legacy-pinned, no filter for a pure legacy DB, or no rows for a
+        // deny-all (fail-closed) scope — the SAME authoritative scope every other store uses.
+        cmd.CommandText = SelectProject
+            + " WHERE COALESCE(lp.canonical_id, p.canonical_id) = @canon"
+            + scope.And("p.id") + " LIMIT 1;";
+        cmd.Parameters.AddWithValue("@canon", canonicalId);
+        scope.Bind(cmd);
 
         using var reader = cmd.ExecuteReader();
         return reader.Read() ? ReadProjectRow(reader) : null;
@@ -191,23 +190,16 @@ public sealed class ProjectStore(SqliteConnection connection)
 
     public List<(long id, ProjectIdentity project)> GetAll()
     {
-        var selected = Snapshots.GetSelectedSnapshotId();
+        var scope = EffectiveScope;
         using var cmd = connection.CreateCommand();
-        if (selected is long snap)
-        {
-            // Default to the selected snapshot's project versions (criterion 6): a scope-less caller
-            // never iterates another (pending/superseded) snapshot's or a swept legacy row. Membership
-            // is resolved through snapshot_projects (not projects.snapshot_id) so an overlay's SHARED,
-            // unchanged project-version rows — which physically keep the base snapshot's id — are still
-            // enumerated (Phase-10 overlays). For a full snapshot the two are equivalent.
-            cmd.CommandText = SelectProject
-                + " WHERE p.id IN (SELECT project_id FROM snapshot_projects WHERE snapshot_id = @snap);";
-            cmd.Parameters.AddWithValue("@snap", snap);
-        }
-        else
-        {
-            cmd.CommandText = SelectProject + " WHERE p.snapshot_id IS NULL;";
-        }
+        // Default to the pinned scope's project versions (criterion 6): a scope-less caller never
+        // iterates another (pending/superseded) snapshot's or a swept legacy row. Membership is resolved
+        // through snapshot_projects (not projects.snapshot_id) so an overlay's SHARED, unchanged
+        // project-version rows — which physically keep the base snapshot's id — are still enumerated
+        // (Phase-10 overlays). A pure legacy DB is unscoped (all rows are legacy); a deny-all scope
+        // yields no rows.
+        cmd.CommandText = SelectProject + scope.Where("p.id") + ";";
+        scope.Bind(cmd);
 
         var results = new List<(long, ProjectIdentity)>();
         using var reader = cmd.ExecuteReader();

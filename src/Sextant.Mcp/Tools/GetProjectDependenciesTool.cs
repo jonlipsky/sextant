@@ -17,20 +17,23 @@ public static class GetProjectDependenciesTool
         if (db == null)
             return ResponseBuilder.BuildEmpty(notReady);
 
+        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+            return authError;
+
         var conn = db.GetConnection();
-        var projectStore = new ProjectStore(conn);
+        var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
         var dependencyStore = new ProjectDependencyStore(conn);
 
         var project = projectStore.GetByCanonicalId(project_id);
         if (project == null)
-            return ResponseBuilder.BuildEmpty($"Project not found: {project_id}");
+            return ResponseBuilder.BuildEmpty($"Project not found: {project_id}", readContext.Provenance);
 
         var visited = new HashSet<long>();
         var results = new List<object>();
 
         CollectDependencies(project.Value.id, 0, transitive, visited, results, projectStore, dependencyStore);
 
-        return ResponseBuilder.Build(results, project.Value.lastIndexedAt);
+        return ResponseBuilder.Build(results, project.Value.lastIndexedAt, provenance: readContext.Provenance);
     }
 
     private static void CollectDependencies(

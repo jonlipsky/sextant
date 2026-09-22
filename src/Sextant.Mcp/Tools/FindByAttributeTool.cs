@@ -18,13 +18,16 @@ public static class FindByAttributeTool
         if (db == null)
             return ResponseBuilder.BuildEmpty(notReady);
 
+        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+            return authError;
+
         var conn = db.GetConnection();
-        var symbolStore = new SymbolStore(conn) { Scope = SnapshotReadScope.ForSelected(conn) };
+        var symbolStore = new SymbolStore(conn) { Scope = readContext.Scope };
 
         // GetByAttribute does the substring pre-filter AND the exact JSON-array membership check.
         var matches = symbolStore.GetByAttribute(attribute_fqn);
 
-        var scopeFilter = ScopeResolver.Resolve(scope, conn);
+        var scopeFilter = ScopeResolver.Resolve(scope, conn, readContext.Scope);
 
         var results = new List<object>();
         long freshness = 0;
@@ -56,6 +59,6 @@ public static class FindByAttributeTool
             });
         }
 
-        return ResponseBuilder.Build(results, freshness);
+        return ResponseBuilder.Build(results, freshness, provenance: readContext.Provenance);
     }
 }

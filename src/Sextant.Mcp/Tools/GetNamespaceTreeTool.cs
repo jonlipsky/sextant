@@ -22,16 +22,19 @@ public static class GetNamespaceTreeTool
         if (db == null)
             return ResponseBuilder.BuildEmpty(notReady);
 
+        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+            return authError;
+
         var conn = db.GetConnection();
-        var symbolStore = new SymbolStore(conn) { Scope = SnapshotReadScope.ForSelected(conn) };
-        var projectStore = new ProjectStore(conn);
+        var symbolStore = new SymbolStore(conn) { Scope = readContext.Scope };
+        var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
 
         long? projectDbId = null;
         if (project_id != null)
         {
             var proj = projectStore.GetByCanonicalId(project_id);
             if (proj == null)
-                return ResponseBuilder.BuildEmpty("Project not found.");
+                return ResponseBuilder.BuildEmpty("Project not found.", readContext.Provenance);
             projectDbId = proj.Value.id;
         }
 
@@ -109,7 +112,7 @@ public static class GetNamespaceTreeTool
             }
         };
 
-        return ResponseBuilder.Build(result, null);
+        return ResponseBuilder.Build(result, null, provenance: readContext.Provenance);
     }
 
     internal static string? ExtractNamespace(string fullyQualifiedName)

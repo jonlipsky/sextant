@@ -23,14 +23,17 @@ public static class FindTestsTool
         if (db == null)
             return ResponseBuilder.BuildEmpty(notReady);
 
+        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+            return authError;
+
         if (!CapabilityGate.Ensure(db, IndexFeature.TestIndexing, "test_indexing", out var unavailable))
             return unavailable;
 
         var conn = db.GetConnection();
-        var snapshotScope = SnapshotReadScope.ForSelected(conn);
+        var snapshotScope = readContext.Scope;
         var symbolStore = new SymbolStore(conn) { Scope = snapshotScope };
         var referenceStore = new ReferenceStore(conn) { Scope = snapshotScope };
-        var projectStore = new ProjectStore(conn);
+        var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
 
         var testAttributes = GetTestAttributes(framework);
 
@@ -51,7 +54,7 @@ public static class FindTestsTool
         {
             var resolution = SymbolResolver.Resolve(symbolStore, projectStore, for_symbol);
             if (resolution.Symbol == null)
-                return ResponseBuilder.BuildEmpty("Symbol not found.");
+                return ResponseBuilder.BuildEmpty("Symbol not found.", readContext.Provenance);
             var targetSymbol = resolution.Symbol;
             ambiguity = resolution.Ambiguity;
 
@@ -95,7 +98,7 @@ public static class FindTestsTool
         }).ToList();
 
         var freshness = testMethods.Count > 0 ? testMethods.Min(t => t.LastIndexedAt) : 0;
-        return ResponseBuilder.Build(results, freshness, ambiguity);
+        return ResponseBuilder.Build(results, freshness, ambiguity, readContext.Provenance);
     }
 
     private static List<string> GetTestAttributes(string framework)
