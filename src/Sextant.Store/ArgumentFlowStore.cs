@@ -6,9 +6,9 @@ namespace Sextant.Store;
 public sealed class ArgumentFlowStore(SqliteConnection connection)
 {
     private const string InsertSql = """
-        INSERT INTO argument_flow (call_graph_id, parameter_ordinal, parameter_name,
+        INSERT INTO argument_flow (occurrence_id, parameter_ordinal, parameter_name,
             argument_expression, argument_kind, source_symbol_fqn, last_indexed_at)
-        VALUES (@call_graph_id, @ordinal, @name, @expression, @kind, @source_fqn, @last_indexed_at)
+        VALUES (@occurrence_id, @ordinal, @name, @expression, @kind, @source_fqn, @last_indexed_at)
         RETURNING id;
         """;
 
@@ -32,7 +32,7 @@ public sealed class ArgumentFlowStore(SqliteConnection connection)
                        string argumentExpression, string argumentKind, string? sourceSymbolFqn,
                        long lastIndexedAt)
     {
-        SqlParam.Set(cmd, "@call_graph_id", callGraphId);
+        SqlParam.Set(cmd, "@occurrence_id", callGraphId);
         SqlParam.Set(cmd, "@ordinal", parameterOrdinal);
         SqlParam.Set(cmd, "@name", parameterName);
         SqlParam.Set(cmd, "@expression", argumentExpression);
@@ -45,7 +45,7 @@ public sealed class ArgumentFlowStore(SqliteConnection connection)
     public List<ArgumentFlowInfo> GetByCallGraphId(long callGraphId)
     {
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = "SELECT * FROM argument_flow WHERE call_graph_id = @id ORDER BY parameter_ordinal;";
+        cmd.CommandText = "SELECT * FROM argument_flow WHERE occurrence_id = @id ORDER BY parameter_ordinal;";
         cmd.Parameters.AddWithValue("@id", callGraphId);
         return ReadAll(cmd);
     }
@@ -57,7 +57,7 @@ public sealed class ArgumentFlowStore(SqliteConnection connection)
 
         using var cmd = connection.CreateCommand();
         var placeholders = string.Join(",", ids.Select((_, i) => $"@id{i}"));
-        cmd.CommandText = $"SELECT * FROM argument_flow WHERE call_graph_id IN ({placeholders}) ORDER BY call_graph_id, parameter_ordinal;";
+        cmd.CommandText = $"SELECT * FROM argument_flow WHERE occurrence_id IN ({placeholders}) ORDER BY occurrence_id, parameter_ordinal;";
         for (var i = 0; i < ids.Count; i++)
             cmd.Parameters.AddWithValue($"@id{i}", ids[i]);
         return ReadAll(cmd);
@@ -66,7 +66,7 @@ public sealed class ArgumentFlowStore(SqliteConnection connection)
     public void DeleteByCallGraphId(long callGraphId)
     {
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = "DELETE FROM argument_flow WHERE call_graph_id = @id;";
+        cmd.CommandText = "DELETE FROM argument_flow WHERE occurrence_id = @id;";
         cmd.Parameters.AddWithValue("@id", callGraphId);
         cmd.ExecuteNonQuery();
     }
@@ -80,7 +80,7 @@ public sealed class ArgumentFlowStore(SqliteConnection connection)
             results.Add(new ArgumentFlowInfo
             {
                 Id = reader.GetInt64(reader.GetOrdinal("id")),
-                CallGraphId = reader.GetInt64(reader.GetOrdinal("call_graph_id")),
+                CallGraphId = reader.GetInt64(reader.GetOrdinal("occurrence_id")),
                 ParameterOrdinal = reader.GetInt32(reader.GetOrdinal("parameter_ordinal")),
                 ParameterName = reader.GetString(reader.GetOrdinal("parameter_name")),
                 ArgumentExpression = reader.GetString(reader.GetOrdinal("argument_expression")),

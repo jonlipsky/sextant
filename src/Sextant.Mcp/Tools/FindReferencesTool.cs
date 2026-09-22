@@ -18,14 +18,15 @@ public static class FindReferencesTool
         [Description("Scope filter: 'file:/path', 'project:canonical_id', 'solution:/path', or 'all'")] string? scope = null,
         [Description("Filter by access kind: 'read', 'write', 'readwrite', or null for all")] string? access_kind = null)
     {
-        var db = dbProvider.GetDatabase();
+        var db = dbProvider.GetReadyDatabase(out var notReady);
         if (db == null)
-            return ResponseBuilder.BuildEmpty("No index database found.");
+            return ResponseBuilder.BuildEmpty(notReady);
 
         var conn = db.GetConnection();
         var symbolStore = new SymbolStore(conn);
         var referenceStore = new ReferenceStore(conn);
         var projectStore = new ProjectStore(conn);
+        var contextRetriever = new SourceContextRetriever(new FileStore(conn));
 
         var resolution = SymbolResolver.Resolve(symbolStore, projectStore, symbol_fqn);
         if (resolution.Symbol == null)
@@ -72,13 +73,13 @@ public static class FindReferencesTool
                 ["file_path"] = r.FilePath,
                 ["line"] = r.Line,
                 ["reference_kind"] = r.ReferenceKind.ToString().ToLowerInvariant(),
-                ["context_snippet"] = r.ContextSnippet,
+                ["context_snippet"] = contextRetriever.GetLineSnippet(r.InProjectId, r.FilePath, r.Line),
                 ["in_project_id"] = FindSymbolTool.ResolveCanonicalId(r.InProjectId, canonicalIdCache),
                 ["access_kind"] = r.AccessKind?.ToString().ToLowerInvariant()
             };
 
             if (include_source)
-                result["source_context"] = SourceReader.ReadContext(r.FilePath, r.Line, 2);
+                result["source_context"] = contextRetriever.GetContext(r.InProjectId, r.FilePath, r.Line, 2);
 
             return result;
         }).ToList<object>();

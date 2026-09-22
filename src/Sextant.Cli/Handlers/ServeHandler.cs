@@ -10,6 +10,8 @@ internal static class ServeHandler
         var dbPath = DbResolver.Resolve(db, profile, config);
         if (dbPath == null) return 1;
 
+        WarnIfIndexNotReady(dbPath);
+
         if (config.AutoSpawnDaemon)
         {
             var repoRoot = Core.SextantConfiguration.FindRepoRoot(Directory.GetCurrentDirectory());
@@ -31,5 +33,26 @@ internal static class ServeHandler
         var app = Mcp.McpServerSetup.CreateHttpMcpHost([], httpPort, dbPath, config.LogsPath);
         await app.RunAsync();
         return 0;
+    }
+
+    // Surfaces an actionable rebuild message when the database exists but is not a complete, servable
+    // index (older/incompatible schema, or a compact schema awaiting its first full run). The server
+    // still starts — an auto-spawned daemon rebuilds in the background and the MCP tools echo the same
+    // guidance — but the operator is told up front rather than seeing empty results.
+    private static void WarnIfIndexNotReady(string dbPath)
+    {
+        if (!File.Exists(dbPath))
+            return;
+        try
+        {
+            using var db = new Store.IndexDatabase(dbPath);
+            var readiness = db.CheckReadiness();
+            if (!readiness.Ready)
+                Console.Error.WriteLine($"[sextant] {readiness.Message}");
+        }
+        catch (Microsoft.Data.Sqlite.SqliteException)
+        {
+            // A malformed/locked database is reported by the tools themselves; don't block serving.
+        }
     }
 }

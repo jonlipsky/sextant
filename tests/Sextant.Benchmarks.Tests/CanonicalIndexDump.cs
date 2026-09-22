@@ -14,6 +14,14 @@ namespace Sextant.Benchmarks.Tests;
 /// here iff they encode the same semantic graph, which is the Phase 4 full/incremental equivalence
 /// acceptance criterion.
 /// </summary>
+/// <remarks>
+/// Phase 7 normalized source identity: a file's path lives once in <c>files</c>, its content identity
+/// in <c>file_versions</c>, and both <c>references</c> and <c>call_graph</c> collapsed into the unified
+/// <c>occurrences</c> table (a pure reference has <c>source_symbol_id IS NULL</c>; a call edge carries
+/// the enclosing caller in <c>source_symbol_id</c>). This dump reconstructs each usage's repository-
+/// relative path from its <c>file_version_id</c> so the canonical projection stays path-stable across
+/// the two code paths without ever storing an absolute path.
+/// </remarks>
 public static class CanonicalIndexDump
 {
     /// <summary>Renders the canonical dump of every semantically-meaningful table.</summary>
@@ -32,20 +40,28 @@ public static class CanonicalIndexDump
             SELECT p.canonical_id, s.symbol_key, s.fully_qualified_name, s.display_name, s.kind,
                    s.accessibility, s.is_static, s.is_abstract, s.is_virtual, s.is_override,
                    COALESCE(s.signature,''), COALESCE(s.signature_hash,''), COALESCE(s.doc_comment,''),
-                   s.file_path, s.line_start, s.line_end, COALESCE(s.attributes,'')
+                   COALESCE(f.repo_relative_path,''), s.line_start, s.line_end, COALESCE(s.attributes,'')
             FROM symbols s
             JOIN projects p ON s.project_id = p.id
+            LEFT JOIN file_versions fv ON fv.id = s.file_version_id
+            LEFT JOIN files f ON f.id = fv.file_id
             ORDER BY 1, 2, 14, 15
             """);
 
+        // Pure references = occurrences with no enclosing source symbol. Mirrors the old `references`
+        // table one-for-one (kind is now the integer ordinal; the stored snippet is gone — dropped
+        // from the projection since it is no longer persisted).
         Section(sb, conn, "references", """
-            SELECT tp.canonical_id, ts.symbol_key, ip.canonical_id, r.file_path, r.line,
-                   r.reference_kind, COALESCE(r.context_snippet,'')
-            FROM "references" r
-            JOIN symbols ts ON r.symbol_id = ts.id
+            SELECT tp.canonical_id, ts.symbol_key, ip.canonical_id,
+                   COALESCE(f.repo_relative_path,''), o.line, o.kind
+            FROM occurrences o
+            JOIN symbols ts ON o.target_symbol_id = ts.id
             JOIN projects tp ON ts.project_id = tp.id
-            JOIN projects ip ON r.in_project_id = ip.id
-            ORDER BY 1, 2, 3, 4, 5, 6, 7
+            JOIN projects ip ON o.in_project_id = ip.id
+            LEFT JOIN file_versions fv ON fv.id = o.file_version_id
+            LEFT JOIN files f ON f.id = fv.file_id
+            WHERE o.source_symbol_id IS NULL
+            ORDER BY 1, 2, 3, 4, 5, 6
             """);
 
         Section(sb, conn, "relationships", """
@@ -58,58 +74,70 @@ public static class CanonicalIndexDump
             ORDER BY 1, 2, 3, 4, 5
             """);
 
+        // Call edges = occurrences with an enclosing source symbol (the caller). callee = target.
         Section(sb, conn, "call_graph", """
             SELECT cp.canonical_id, cs.symbol_key, ep.canonical_id, es.symbol_key,
-                   cg.call_site_file, cg.call_site_line
-            FROM call_graph cg
-            JOIN symbols cs ON cg.caller_symbol_id = cs.id
+                   COALESCE(f.repo_relative_path,''), o.line
+            FROM occurrences o
+            JOIN symbols cs ON o.source_symbol_id = cs.id
             JOIN projects cp ON cs.project_id = cp.id
-            JOIN symbols es ON cg.callee_symbol_id = es.id
+            JOIN symbols es ON o.target_symbol_id = es.id
             JOIN projects ep ON es.project_id = ep.id
+            LEFT JOIN file_versions fv ON fv.id = o.file_version_id
+            LEFT JOIN files f ON f.id = fv.file_id
+            WHERE o.source_symbol_id IS NOT NULL
             ORDER BY 1, 2, 3, 4, 5, 6
             """);
 
         Section(sb, conn, "comments", """
-            SELECT p.canonical_id, c.file_path, c.line, c.tag, c.text,
+            SELECT p.canonical_id, COALESCE(f.repo_relative_path,''), c.line, c.tag, c.text,
                    COALESCE(es.symbol_key,'')
             FROM comments c
             JOIN projects p ON c.project_id = p.id
+            LEFT JOIN file_versions fv ON fv.id = c.file_version_id
+            LEFT JOIN files f ON f.id = fv.file_id
             LEFT JOIN symbols es ON c.enclosing_symbol_id = es.id
             ORDER BY 1, 2, 3, 4, 5, 6
             """);
 
-        Section(sb, conn, "file_index", """
-            SELECT p.canonical_id, fi.file_path, fi.content_hash
-            FROM file_index fi
-            JOIN projects p ON fi.project_id = p.id
+        // Files + their content identity replace the old file_index fingerprint table.
+        Section(sb, conn, "files", """
+            SELECT p.canonical_id, f.repo_relative_path, hex(fv.content_hash)
+            FROM files f
+            JOIN file_versions fv ON fv.file_id = f.id
+            JOIN projects p ON f.project_id = p.id
             ORDER BY 1, 2, 3
             """);
 
         Section(sb, conn, "argument_flow", """
             SELECT cp.canonical_id, cs.symbol_key, ep.canonical_id, es.symbol_key,
-                   cg.call_site_file, cg.call_site_line,
+                   COALESCE(f.repo_relative_path,''), o.line,
                    af.parameter_ordinal, af.parameter_name, af.argument_expression,
                    af.argument_kind, COALESCE(af.source_symbol_fqn,'')
             FROM argument_flow af
-            JOIN call_graph cg ON af.call_graph_id = cg.id
-            JOIN symbols cs ON cg.caller_symbol_id = cs.id
+            JOIN occurrences o ON af.occurrence_id = o.id
+            JOIN symbols cs ON o.source_symbol_id = cs.id
             JOIN projects cp ON cs.project_id = cp.id
-            JOIN symbols es ON cg.callee_symbol_id = es.id
+            JOIN symbols es ON o.target_symbol_id = es.id
             JOIN projects ep ON es.project_id = ep.id
+            LEFT JOIN file_versions fv ON fv.id = o.file_version_id
+            LEFT JOIN files f ON f.id = fv.file_id
             ORDER BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11
             """);
 
         Section(sb, conn, "return_flow", """
             SELECT cp.canonical_id, cs.symbol_key, ep.canonical_id, es.symbol_key,
-                   cg.call_site_file, cg.call_site_line,
+                   COALESCE(f.repo_relative_path,''), o.line,
                    rf.destination_kind, COALESCE(rf.destination_variable,''),
                    COALESCE(rf.destination_symbol_fqn,'')
             FROM return_flow rf
-            JOIN call_graph cg ON rf.call_graph_id = cg.id
-            JOIN symbols cs ON cg.caller_symbol_id = cs.id
+            JOIN occurrences o ON rf.occurrence_id = o.id
+            JOIN symbols cs ON o.source_symbol_id = cs.id
             JOIN projects cp ON cs.project_id = cp.id
-            JOIN symbols es ON cg.callee_symbol_id = es.id
+            JOIN symbols es ON o.target_symbol_id = es.id
             JOIN projects ep ON es.project_id = ep.id
+            LEFT JOIN file_versions fv ON fv.id = o.file_version_id
+            LEFT JOIN files f ON f.id = fv.file_id
             ORDER BY 1, 2, 3, 4, 5, 6, 7, 8, 9
             """);
 

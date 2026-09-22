@@ -10,6 +10,13 @@ internal static class QueryHandler
 
         using var dbProvider = new Mcp.DatabaseProvider(dbPath);
 
+        var readinessProblem = CheckIndexReadiness(dbProvider);
+        if (readinessProblem != null)
+        {
+            Console.Error.WriteLine(readinessProblem);
+            return 1;
+        }
+
         string result;
         try
         {
@@ -67,6 +74,19 @@ internal static class QueryHandler
     }
 
     private static bool HasFlag(string[] args, string flag) => args.Contains(flag);
+
+    // Returns an actionable rebuild message when the resolved database exists but cannot be served as a
+    // complete index (older/incompatible schema, or a compact schema not yet re-populated by a full
+    // run). Returns null when the index is servable, or when the file is simply absent — in that case
+    // the individual tools already report "No index database found."
+    private static string? CheckIndexReadiness(Mcp.DatabaseProvider dbProvider)
+    {
+        var db = dbProvider.GetDatabase();
+        if (db == null)
+            return null;
+        var readiness = db.CheckReadiness();
+        return readiness.Ready ? null : readiness.Message;
+    }
 
     private static string RunFindSymbol(Mcp.DatabaseProvider db, string[] args)
     {

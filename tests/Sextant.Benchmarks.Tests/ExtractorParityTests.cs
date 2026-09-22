@@ -87,7 +87,8 @@ public sealed class ExtractorParityTests
             var newRefRows = Section(newDump, "references");
 
             // (a) The new extractor emits no Override reference kind (folded into the real occurrence).
-            Assert.IsFalse(newRefRows.Any(r => ReferenceKindOf(r) == "override"),
+            var overrideKind = ((int)Sextant.Core.ReferenceKind.Override).ToString();
+            Assert.IsFalse(newRefRows.Any(r => ReferenceKindOf(r) == overrideKind),
                 "the document-oriented extractor must not emit the legacy Override reference kind");
 
             // (b) No spurious type target: every type the new extractor references, legacy references too.

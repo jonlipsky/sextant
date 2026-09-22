@@ -1,16 +1,35 @@
-using System.Diagnostics;
+using Microsoft.Data.Sqlite;
 using Sextant.Core;
 
 namespace Sextant.Store.Tests;
 
+/// <summary>
+/// Query-plan guards for the hot read paths. These previously asserted absolute wall-clock latencies
+/// (issue #33), which flaked ~1/15 on Windows under parallel test load because a single Stopwatch
+/// sample is perturbed by GC pauses and scheduler hiccups. The performance-critical property is not a
+/// millisecond count but that each hot query is *index-backed* rather than a full table scan — a
+/// deterministic fact we read from <c>EXPLAIN QUERY PLAN</c>. Correctness of the same query is asserted
+/// through the real store method. The SELECT/WHERE shapes here mirror the SQL composed by
+/// <see cref="SymbolStore"/>; if those change, update the mirrored SQL below.
+/// </summary>
 [TestClass]
 public class PerformanceTests
 {
+    private const int SeedCount = 1000;
+
     private string _dbPath = null!;
     private IndexDatabase _db = null!;
     private ProjectStore _projectStore = null!;
     private SymbolStore _symbolStore = null!;
     private long _projectId;
+
+    // Mirror of SymbolStore.SelectPrefix (id column only — enough to fix the query plan).
+    private const string SelectPrefix = """
+        SELECT s.id FROM symbols s
+        LEFT JOIN file_versions fv ON fv.id = s.file_version_id
+        LEFT JOIN files f ON f.id = fv.file_id
+        LEFT JOIN projects p ON p.id = s.project_id
+        """;
 
     [TestInitialize]
     public void TestInitialize()
@@ -30,8 +49,7 @@ public class PerformanceTests
             RepoRelativePath = "src/PerfTest/PerfTest.csproj"
         }, now);
 
-        // Seed with 5000 symbols to simulate a real project
-        for (var i = 0; i < 5000; i++)
+        for (var i = 0; i < SeedCount; i++)
         {
             _symbolStore.Insert(new SymbolInfo
             {
@@ -50,71 +68,63 @@ public class PerformanceTests
     }
 
     [TestCleanup]
-    public void TestCleanup()
+    public void TestCleanup() => SqliteTestDatabase.Delete(_dbPath, _db);
+
+    [TestMethod]
+    public void ExactFqnLookup_IsIndexBacked()
     {
-        SqliteTestDatabase.Delete(_dbPath, _db);
+        var result = _symbolStore.GetByFqn("global::PerfTest.Namespace25.Class2500");
+        // (This exact FQN exists only when SeedCount > 2500; the plan assertion is the guard, and the
+        // lookup below uses an in-range FQN for the correctness check.)
+        result = _symbolStore.GetByFqn("global::PerfTest.Namespace5.Class500");
+        Assert.IsNotNull(result, "exact FQN lookup must resolve a seeded symbol");
+
+        var plan = QueryPlan(SelectPrefix + " WHERE s.fully_qualified_name = @fqn;", ("@fqn", "global::PerfTest.Namespace5.Class500"));
+        StringAssert.Contains(plan, "USING INDEX ix_symbols_fqn_lookup",
+            $"exact FQN lookup must use the FQN index, not a table scan. Plan:\n{plan}");
+        Assert.IsFalse(plan.Contains("SCAN s\n") || plan.EndsWith("SCAN s"),
+            $"exact FQN lookup must not full-scan symbols. Plan:\n{plan}");
     }
 
     [TestMethod]
-    public void ExactFqnLookup_Under5ms()
+    public void Fts5Search_UsesFtsVirtualTable()
     {
-        // Warm up
-        _symbolStore.GetByFqn("global::PerfTest.Namespace25.Class2500");
+        var results = _symbolStore.SearchFts("Class500", 20);
+        Assert.IsNotNull(results);
+        Assert.IsTrue(results.Count >= 1, "FTS search must find the seeded symbol");
 
-        // Measure average over 100 lookups
-        var sw = Stopwatch.StartNew();
-        for (var i = 0; i < 100; i++)
-        {
-            var idx = i * 50; // Spread across different symbols
-            var result = _symbolStore.GetByFqn($"global::PerfTest.Namespace{idx / 100}.Class{idx}");
-            Assert.IsNotNull(result);
-        }
-        sw.Stop();
-
-        var avgMs = sw.Elapsed.TotalMilliseconds / 100;
-        Assert.IsTrue(avgMs < 5, $"Average exact FQN lookup: {avgMs:F2}ms (target: <5ms)");
+        var plan = QueryPlan(
+            SelectPrefix + " JOIN symbols_fts fts ON fts.rowid = s.id WHERE symbols_fts MATCH @q ORDER BY rank LIMIT 20;",
+            ("@q", "Class500"));
+        StringAssert.Contains(plan, "VIRTUAL TABLE INDEX",
+            $"FTS search must be driven by the symbols_fts virtual-table index. Plan:\n{plan}");
+        StringAssert.Contains(plan, "SEARCH s USING INTEGER PRIMARY KEY",
+            $"FTS search must resolve symbols by rowid, not a table scan. Plan:\n{plan}");
     }
 
     [TestMethod]
-    public void Fts5Search_Under20ms()
+    public void GetByProjectAndAccessibility_IsIndexBacked()
     {
-        // Warm up
-        _symbolStore.SearchFts("Class100", 20);
-
-        // Measure average over 50 searches
-        var sw = Stopwatch.StartNew();
-        for (var i = 0; i < 50; i++)
-        {
-            var results = _symbolStore.SearchFts($"Class{i * 100}", 20);
-            Assert.IsNotNull(results);
-        }
-        sw.Stop();
-
-        var avgMs = sw.Elapsed.TotalMilliseconds / 50;
-        Assert.IsTrue(avgMs < 20, $"Average FTS5 search: {avgMs:F2}ms (target: <20ms)");
-    }
-
-    [TestMethod]
-    public void GetByProjectAndAccessibility_Under20ms()
-    {
-        // Warm up
-        _symbolStore.GetByProjectAndAccessibility(_projectId, ["public"]);
-
-        // Best-of-N: a single wall-clock sample is easily perturbed by a GC pause or scheduler
-        // hiccup when the suite runs under parallel load, which made this assertion flaky on Windows.
-        // Taking the fastest of several runs measures the query's achievable latency (the perf
-        // characteristic under test) without the load-induced noise, keeping the same <20ms guard.
         var symbols = _symbolStore.GetByProjectAndAccessibility(_projectId, ["public"]);
-        var bestMs = long.MaxValue;
-        for (var i = 0; i < 5; i++)
-        {
-            var sw = Stopwatch.StartNew();
-            symbols = _symbolStore.GetByProjectAndAccessibility(_projectId, ["public"]);
-            sw.Stop();
-            bestMs = Math.Min(bestMs, sw.ElapsedMilliseconds);
-        }
+        Assert.AreEqual(SeedCount, symbols.Count, "all seeded symbols are public");
 
-        Assert.AreEqual(5000, symbols.Count);
-        Assert.IsTrue(bestMs < 20, $"GetByProjectAndAccessibility best-of-5 took {bestMs}ms (target: <20ms)");
+        var plan = QueryPlan(
+            SelectPrefix + " WHERE s.project_id = @project_id AND s.accessibility IN (0);",
+            ("@project_id", _projectId));
+        StringAssert.Contains(plan, "USING INDEX ix_symbols_project_access",
+            $"project+accessibility filter must use the composite index, not a table scan. Plan:\n{plan}");
+    }
+
+    private string QueryPlan(string sql, params (string name, object value)[] parameters)
+    {
+        using var cmd = _db.GetConnection().CreateCommand();
+        cmd.CommandText = "EXPLAIN QUERY PLAN " + sql;
+        foreach (var (name, value) in parameters)
+            cmd.Parameters.AddWithValue(name, value);
+        using var reader = cmd.ExecuteReader();
+        var lines = new List<string>();
+        while (reader.Read())
+            lines.Add(reader.GetString(3));
+        return string.Join("\n", lines);
     }
 }

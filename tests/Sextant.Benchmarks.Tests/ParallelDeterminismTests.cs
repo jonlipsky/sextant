@@ -121,38 +121,33 @@ public sealed class ParallelDeterminismTests
     }
 
     /// <summary>
-    /// A row-order-sensitive dump of the occurrence tables (references, call_graph, relationships)
-    /// ordered by <c>rowid</c> — i.e. the actual persistence order — with each foreign key projected to
-    /// its stable semantic identity so two databases are comparable. Unlike the order-normalized
-    /// <see cref="CanonicalIndexDump"/>, equality here proves the persisted ROW ORDER (not just the
-    /// row set) is identical, and it includes <c>access_kind</c> so a read/write-classification
-    /// divergence under parallelism cannot slip through. This is the byte-equivalence bar of
-    /// criterion 1 for the parallel-vs-sequential comparison (both sides are the same extractor, so it
-    /// carries no legacy-parity risk).
+    /// A row-order-sensitive dump of the unified <c>occurrences</c> table (references + call edges)
+    /// plus <c>relationships</c>, ordered by <c>rowid</c> — i.e. the actual persistence order — with
+    /// each foreign key projected to its stable semantic identity so two databases are comparable.
+    /// Unlike the order-normalized <see cref="CanonicalIndexDump"/>, equality here proves the persisted
+    /// ROW ORDER (not just the row set) is identical, and it includes <c>source</c> (call vs pure
+    /// reference), <c>col</c> and the access <c>flags</c> so a read/write-classification or ordering
+    /// divergence under parallelism cannot slip through. This is the byte-equivalence bar of criterion
+    /// 1 for the parallel-vs-sequential comparison (both sides are the same extractor, so it carries no
+    /// legacy-parity risk).
     /// </summary>
     private static string RawOrderedDump(SqliteConnection conn)
     {
         var sb = new System.Text.StringBuilder();
 
-        AppendOrdered(sb, conn, "references", """
-            SELECT tp.canonical_id, ts.symbol_key, ip.canonical_id, r.file_path, r.line,
-                   r.reference_kind, COALESCE(r.access_kind,''), COALESCE(r.context_snippet,'')
-            FROM "references" r
-            JOIN symbols ts ON r.symbol_id = ts.id
+        AppendOrdered(sb, conn, "occurrences", """
+            SELECT ip.canonical_id, tp.canonical_id, ts.symbol_key,
+                   COALESCE(sp.canonical_id,''), COALESCE(ss.symbol_key,''),
+                   COALESCE(f.repo_relative_path,''), o.line, o.col, o.kind, o.flags
+            FROM occurrences o
+            JOIN symbols ts ON o.target_symbol_id = ts.id
             JOIN projects tp ON ts.project_id = tp.id
-            JOIN projects ip ON r.in_project_id = ip.id
-            ORDER BY r.rowid
-            """);
-
-        AppendOrdered(sb, conn, "call_graph", """
-            SELECT cp.canonical_id, cs.symbol_key, ep.canonical_id, es.symbol_key,
-                   cg.call_site_file, cg.call_site_line
-            FROM call_graph cg
-            JOIN symbols cs ON cg.caller_symbol_id = cs.id
-            JOIN projects cp ON cs.project_id = cp.id
-            JOIN symbols es ON cg.callee_symbol_id = es.id
-            JOIN projects ep ON es.project_id = ep.id
-            ORDER BY cg.rowid
+            JOIN projects ip ON o.in_project_id = ip.id
+            LEFT JOIN symbols ss ON o.source_symbol_id = ss.id
+            LEFT JOIN projects sp ON ss.project_id = sp.id
+            LEFT JOIN file_versions fv ON fv.id = o.file_version_id
+            LEFT JOIN files f ON f.id = fv.file_id
+            ORDER BY o.rowid
             """);
 
         AppendOrdered(sb, conn, "relationships", """
