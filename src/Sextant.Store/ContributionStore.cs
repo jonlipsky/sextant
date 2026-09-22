@@ -55,19 +55,23 @@ public sealed class ContributionStore(SqliteConnection connection)
     /// <summary>
     /// Records an accepted contribution against the assembled snapshot it fed. <paramref name="contentHash"/>
     /// is UNIQUE, so a duplicate insert is ignored (the idempotency guard is the earlier
-    /// <see cref="GetByContentHash"/> lookup). Returns the row id (existing on conflict).
+    /// <see cref="GetByContentHash"/> lookup). <paramref name="completeness"/> is the contribution's declared
+    /// assembly completeness ('complete'/'partial'/'unsupported', issue #70) — the finalize gate publishes the
+    /// assembled snapshot Partial when ANY contribution that fed it was non-complete. Returns the row id
+    /// (existing on conflict).
     /// </summary>
     public long Record(
         long snapshotId, string contentHash, string? tenant, string repositoryUrl, string commitSha,
-        string? capabilityFingerprint, string? producer, string? toolchainFingerprint, string? manifestHash)
+        string? capabilityFingerprint, string? producer, string? toolchainFingerprint, string? manifestHash,
+        string completeness = "complete")
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         using var cmd = connection.CreateCommand();
         cmd.CommandText = """
             INSERT INTO snapshot_contributions
                 (snapshot_id, content_hash, tenant, repository_url, commit_sha, capability_fingerprint,
-                 producer, toolchain_fingerprint, manifest_hash, created_at)
-            VALUES (@snap, @hash, @tenant, @repo, @commit, @cap, @producer, @tool, @manifest, @now)
+                 producer, toolchain_fingerprint, manifest_hash, created_at, completeness)
+            VALUES (@snap, @hash, @tenant, @repo, @commit, @cap, @producer, @tool, @manifest, @now, @complete)
             ON CONFLICT(content_hash) DO UPDATE SET content_hash = excluded.content_hash
             RETURNING id;
             """;
@@ -81,7 +85,22 @@ public sealed class ContributionStore(SqliteConnection connection)
         cmd.Parameters.AddWithValue("@tool", (object?)toolchainFingerprint ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@manifest", (object?)manifestHash ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@now", now);
+        cmd.Parameters.AddWithValue("@complete", completeness);
         return Convert.ToInt64(cmd.ExecuteScalar()!);
+    }
+
+    /// <summary>
+    /// True when ANY contribution that fed <paramref name="snapshotId"/> declared itself non-complete
+    /// (issue #70). The finalize completeness gate uses this to publish the assembled snapshot Partial
+    /// rather than silently Complete.
+    /// </summary>
+    public bool HasIncompleteContribution(long snapshotId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText =
+            "SELECT 1 FROM snapshot_contributions WHERE snapshot_id = @s AND completeness <> 'complete' LIMIT 1;";
+        cmd.Parameters.AddWithValue("@s", snapshotId);
+        return cmd.ExecuteScalar() is not null;
     }
 
     private const string Select = """

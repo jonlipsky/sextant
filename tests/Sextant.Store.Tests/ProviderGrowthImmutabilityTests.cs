@@ -85,6 +85,27 @@ public class ProviderGrowthImmutabilityTests
         Assert.IsFalse(HasProject(_providerSnapshot, "B"), "the half-added project B is not observable");
     }
 
+    [TestMethod]
+    public void GrownProviderProject_IsExtracted_NotLeftEmpty()
+    {
+        // Issue #58 empty-project edge: a provider project pulled in ONLY as a late cross-repo reference
+        // (outside an incremental run's filter) must still be EXTRACTED when the provider grows, or the
+        // republished-complete provider would carry a mapped-but-empty project version. The orchestrator
+        // forces extraction (extractThisProject = true) for the grown project; this pins the observable
+        // contract at the store/query layer — the grown provider's added project version is non-empty and
+        // queryable under the republished snapshot.
+        Exec("BEGIN IMMEDIATE;");
+        _snapshots.MarkStatus(_providerSnapshot, SnapshotStatus.Pending);
+        AddProject(_providerSnapshot, "B");
+        AddSymbol(_providerSnapshot, "B", "global::Lib.B.Api");
+        Assert.AreEqual(1, _snapshots.MarkComplete(_providerSnapshot, _now + 3), "the grown provider republishes complete");
+        Exec("COMMIT;");
+
+        var symbols = ScopedSymbolCount(_providerSnapshot, "B");
+        Assert.AreEqual(1, symbols,
+            "the late-referenced grown project version is extracted, not published as an empty project (#58)");
+    }
+
     private long BeginCompleteRun()
     {
         var runStore = new IndexRunStore(_conn);
@@ -125,6 +146,58 @@ public class ProviderGrowthImmutabilityTests
         cmd.Parameters.AddWithValue("@snap", snapshotId);
         cmd.Parameters.AddWithValue("@c", $"proj_{tag}_{snapshotId}");
         return Convert.ToInt64(cmd.ExecuteScalar()) > 0;
+    }
+
+    private void AddSymbol(long snapshotId, string tag, string key)
+    {
+        var projectId = ProjectId(snapshotId, tag);
+        long fileId;
+        using (var f = _conn.CreateCommand())
+        {
+            f.CommandText = "INSERT INTO files (project_id, repo_relative_path) VALUES (@p, @path) RETURNING id;";
+            f.Parameters.AddWithValue("@p", projectId);
+            f.Parameters.AddWithValue("@path", $"src/{tag}/{tag}.cs");
+            fileId = (long)f.ExecuteScalar()!;
+        }
+        long fvId;
+        using (var fv = _conn.CreateCommand())
+        {
+            fv.CommandText = "INSERT INTO file_versions (file_id, content_hash, last_indexed_at) VALUES (@f, @h, @now) RETURNING id;";
+            fv.Parameters.AddWithValue("@f", fileId);
+            fv.Parameters.AddWithValue("@h", new byte[32]);
+            fv.Parameters.AddWithValue("@now", _now);
+            fvId = (long)fv.ExecuteScalar()!;
+        }
+        using var s = _conn.CreateCommand();
+        s.CommandText = """
+            INSERT INTO symbols
+                (project_id, symbol_key, fully_qualified_name, display_name, kind, accessibility,
+                 file_version_id, line_start, line_end, last_indexed_at)
+            VALUES (@p, @key, @key, @name, 0, 0, @fv, 1, 10, @now);
+            """;
+        s.Parameters.AddWithValue("@p", projectId);
+        s.Parameters.AddWithValue("@key", $"{key}:{snapshotId}");
+        s.Parameters.AddWithValue("@name", "Api");
+        s.Parameters.AddWithValue("@fv", fvId);
+        s.Parameters.AddWithValue("@now", _now);
+        s.ExecuteNonQuery();
+    }
+
+    private long ProjectId(long snapshotId, string tag)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM projects WHERE snapshot_id = @snap AND canonical_id = @c;";
+        cmd.Parameters.AddWithValue("@snap", snapshotId);
+        cmd.Parameters.AddWithValue("@c", $"proj_{tag}_{snapshotId}");
+        return (long)cmd.ExecuteScalar()!;
+    }
+
+    private int ScopedSymbolCount(long snapshotId, string tag)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "SELECT COUNT(*) FROM symbols WHERE project_id = @pid;";
+        cmd.Parameters.AddWithValue("@pid", ProjectId(snapshotId, tag));
+        return Convert.ToInt32(cmd.ExecuteScalar());
     }
 
     private void Exec(string sql)

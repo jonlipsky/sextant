@@ -9,6 +9,7 @@ public sealed class IndexDatabase : IDisposable
     private readonly string _dbPath;
     private readonly IndexWriteOptions _writeOptions;
     private SqliteConnection? _connection;
+    private Func<bool>? _writerLostProbe;
 
     public IndexDatabase(string dbPath, IndexWriteOptions? writeOptions = null)
     {
@@ -69,7 +70,17 @@ public sealed class IndexDatabase : IDisposable
 
     /// <summary>Opens a bounded, batched write session over the single writer connection.</summary>
     public IndexWriteSession BeginWriteSession(IndexWriteOptions? options = null)
-        => new(GetConnection(), options ?? _writeOptions, InvalidateConnection);
+        => new(GetConnection(), options ?? _writeOptions, InvalidateConnection, _writerLostProbe);
+
+    /// <summary>
+    /// Registers a probe every write session consults at each batch boundary to detect a LOST
+    /// single-writer lease (issue #38). Once set, an in-flight index aborts BETWEEN batches — rolling
+    /// back the open batch and never publishing a generation — if the probe reports the lease was stolen
+    /// (Phase 17 criterion 3, no corrupt publication under writer loss). A writer that owns a
+    /// <see cref="WriterLease"/> wires <c>() =&gt; lease.IsLost</c>; a run with no lease (the byte-identical
+    /// single-node default) leaves it unset and behaves exactly as before.
+    /// </summary>
+    public void SetWriterLostProbe(Func<bool>? writerLostProbe) => _writerLostProbe = writerLostProbe;
 
     public SqliteConnection GetConnection()
     {
