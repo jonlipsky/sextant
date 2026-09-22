@@ -107,6 +107,18 @@ public sealed record ReadAuthorization(bool Allowed, string? Reason)
 public interface IReadAuthorizer
 {
     ReadAuthorization Authorize(SnapshotRow? selected);
+
+    /// <summary>
+    /// Authorizes access to a specific CONSUMER repository during a Phase-12 cross-repository usage query.
+    /// A cross-repo read touches other repositories' snapshots, so each candidate consumer repository is
+    /// checked here and only authorized ones contribute results — an inaccessible repository must yield
+    /// NEITHER a result NOR any existence/count metadata (fail closed, criterion 4). Deliberately declared
+    /// WITHOUT a default body: this is a security boundary, so every implementer is forced to make an
+    /// explicit allow/deny decision. A default (which would have to fail OPEN to preserve the single-tenant
+    /// local behavior) would let a future remote/multi-tenant authorizer that overrides only
+    /// <see cref="Authorize"/> silently leak every repository's usages, with no compiler signal for the gap.
+    /// </summary>
+    ReadAuthorization AuthorizeRepository(long repositoryId, string remoteUrl);
 }
 
 /// <summary>The permissive default authorizer for a single-tenant local index.</summary>
@@ -114,6 +126,7 @@ public sealed class AllowAllReadAuthorizer : IReadAuthorizer
 {
     public static readonly AllowAllReadAuthorizer Instance = new();
     public ReadAuthorization Authorize(SnapshotRow? selected) => ReadAuthorization.Allow;
+    public ReadAuthorization AuthorizeRepository(long repositoryId, string remoteUrl) => ReadAuthorization.Allow;
 }
 
 /// <summary>

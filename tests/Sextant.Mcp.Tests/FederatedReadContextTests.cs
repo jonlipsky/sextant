@@ -332,5 +332,7 @@ public class FederatedReadContextTests
     {
         public ReadAuthorization Authorize(SnapshotRow? selected) =>
             ReadAuthorization.Deny("test principal is not authorized");
+        public ReadAuthorization AuthorizeRepository(long repositoryId, string remoteUrl) =>
+            ReadAuthorization.Deny("test principal is not authorized");
     }
 }

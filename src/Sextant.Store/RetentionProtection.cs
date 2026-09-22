@@ -171,3 +171,39 @@ public sealed class OverlayBaseProtection : IRetentionProtectionProvider
         return cmd.ExecuteScalar() is not null;
     }
 }
+
+/// <summary>
+/// Protects the submodule PROVIDER snapshot shared by every branch-pointed consumer (Phase 12, criterion
+/// 6). A parent snapshot references a deduplicated provider project version through a
+/// <c>snapshot_dependencies</c> edge rather than copying the provider's semantic rows, so those rows
+/// belong to the provider's generation. GC'ing the provider generation would delete rows a live parent
+/// still reads — and would let updating one parent's pin destroy another parent's usable data. For every
+/// edge whose consumer snapshot is branch-pointed this pins the provider's generation (<c>run_id</c>) and
+/// the provider commit's API history. Forward/backward-safe: contributes nothing when the Phase-12
+/// <c>snapshot_dependencies</c> table is absent (pre-migration DB).
+/// </summary>
+public sealed class SubmoduleProviderProtection : IRetentionProtectionProvider
+{
+    public string Name => "submodule-provider";
+
+    public void Contribute(SqliteConnection connection, RetentionProtectionBuilder builder)
+    {
+        if (!TableExists(connection, "snapshot_dependencies")) return;
+
+        foreach (var (runId, commitSha) in new SnapshotStore(connection).GetSubmoduleProviderProtectionTargets())
+        {
+            if (runId.HasValue)
+                builder.ProtectGeneration(runId.Value, "provider generation shared by a branch-pointed consumer");
+            if (!string.IsNullOrEmpty(commitSha))
+                builder.ProtectCommit(commitSha!, "API history for a submodule provider's commit");
+        }
+    }
+
+    private static bool TableExists(SqliteConnection connection, string table)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = @name LIMIT 1;";
+        cmd.Parameters.AddWithValue("@name", table);
+        return cmd.ExecuteScalar() is not null;
+    }
+}
