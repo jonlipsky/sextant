@@ -36,6 +36,25 @@ public sealed class SextantConfiguration
     /// </summary>
     public bool DocumentExtractor { get; set; } = true;
 
+    /// <summary>
+    /// Maximum degree of parallelism for the document-oriented extractor's per-document analysis. 0
+    /// (the default) means auto-resolve to the smaller of the processor count and an experimentally
+    /// chosen cap. Analysis workers never touch SQLite — a single batched writer consumes their
+    /// deterministically-ordered output through a bounded channel. Overridable via
+    /// <c>max_parallelism</c> in <c>sextant.json</c> or the <c>SEXTANT_MAX_PARALLELISM</c> env var.
+    /// </summary>
+    public int MaxParallelism { get; set; }
+
+    /// <summary>
+    /// Capacity of the bounded channel that feeds extracted per-project contributions to the single
+    /// SQLite writer. It bounds how many completed contribution sets can be buffered ahead of
+    /// persistence (and thus outstanding contribution memory) before extraction blocks on
+    /// backpressure. 0 (the default) means auto-resolve. Overridable via
+    /// <c>extraction_queue_capacity</c> in <c>sextant.json</c> or the
+    /// <c>SEXTANT_EXTRACTION_QUEUE_CAPACITY</c> env var.
+    /// </summary>
+    public int ExtractionQueueCapacity { get; set; }
+
     private static readonly Regex ValidProfileName = new(@"^[a-zA-Z0-9_-]+$", RegexOptions.Compiled);
 
     public string LogsPath => Path.Combine(
@@ -139,6 +158,10 @@ public sealed class SextantConfiguration
                             config.JournalSizeLimitBytes = fileConfig.JournalSizeLimitBytes.Value;
                         if (fileConfig.DocumentExtractor.HasValue)
                             config.DocumentExtractor = fileConfig.DocumentExtractor.Value;
+                        if (fileConfig.MaxParallelism.HasValue)
+                            config.MaxParallelism = fileConfig.MaxParallelism.Value;
+                        if (fileConfig.ExtractionQueueCapacity.HasValue)
+                            config.ExtractionQueueCapacity = fileConfig.ExtractionQueueCapacity.Value;
                     }
                 }
                 catch (JsonException)
@@ -205,6 +228,14 @@ public sealed class SextantConfiguration
         var documentExtractor = Environment.GetEnvironmentVariable("SEXTANT_DOCUMENT_EXTRACTOR");
         if (!string.IsNullOrEmpty(documentExtractor))
             config.DocumentExtractor = !(documentExtractor == "false" || documentExtractor == "0");
+
+        var maxParallelism = Environment.GetEnvironmentVariable("SEXTANT_MAX_PARALLELISM");
+        if (int.TryParse(maxParallelism, out var parallelism))
+            config.MaxParallelism = parallelism;
+
+        var queueCapacity = Environment.GetEnvironmentVariable("SEXTANT_EXTRACTION_QUEUE_CAPACITY");
+        if (int.TryParse(queueCapacity, out var capacity))
+            config.ExtractionQueueCapacity = capacity;
     }
 
     public static string? FindRepoRoot(string startDir)
@@ -257,5 +288,11 @@ public sealed class SextantConfiguration
 
         [JsonPropertyName("document_extractor")]
         public bool? DocumentExtractor { get; set; }
+
+        [JsonPropertyName("max_parallelism")]
+        public int? MaxParallelism { get; set; }
+
+        [JsonPropertyName("extraction_queue_capacity")]
+        public int? ExtractionQueueCapacity { get; set; }
     }
 }
