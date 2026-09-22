@@ -23,10 +23,12 @@ public static class GetTypeDependentsTool
         var conn = db.GetConnection();
         var symbolStore = new SymbolStore(conn);
         var relationshipStore = new RelationshipStore(conn);
+        var projectStore = new ProjectStore(conn);
 
-        var targetSymbol = symbolStore.GetByFqn(symbol_fqn);
-        if (targetSymbol == null)
+        var resolution = SymbolResolver.Resolve(symbolStore, projectStore, symbol_fqn);
+        if (resolution.Symbol == null)
             return ResponseBuilder.BuildEmpty("Symbol not found.");
+        var targetSymbol = resolution.Symbol;
 
         RelationshipKind? kindFilter = null;
         if (dependency_kind != "all")
@@ -48,14 +50,17 @@ public static class GetTypeDependentsTool
 
             var containingTypeFqn = GetContainingTypeFqn(fromSymbol);
             var containingType = containingTypeFqn != fromSymbol.FullyQualifiedName
-                ? symbolStore.GetByFqn(containingTypeFqn)
+                ? symbolStore.GetByFqn(containingTypeFqn, fromSymbol.ProjectId)
                 : fromSymbol;
 
-            var key = containingType?.FullyQualifiedName ?? fromSymbol.FullyQualifiedName;
+            var groupSymbol = containingType ?? fromSymbol;
+            // Key by project + FQN so same-named types in different projects are not merged into one
+            // dependent. The containing-type lookup is scoped to the dependent's own project above.
+            var key = $"{groupSymbol.ProjectId}:{groupSymbol.FullyQualifiedName}";
 
             if (!dependentMap.TryGetValue(key, out var info))
             {
-                var s = containingType ?? fromSymbol;
+                var s = groupSymbol;
                 info = new DependentInfo
                 {
                     DependentType = s.FullyQualifiedName,
@@ -71,7 +76,7 @@ public static class GetTypeDependentsTool
             info.Relationships.Add(new
             {
                 kind = rel.Kind.ToString().ToLowerInvariant(),
-                via_member = fromSymbol.FullyQualifiedName != key ? fromSymbol.DisplayName : null,
+                via_member = fromSymbol.FullyQualifiedName != groupSymbol.FullyQualifiedName ? fromSymbol.DisplayName : null,
                 file_path = fromSymbol.FilePath,
                 line_start = fromSymbol.LineStart
             });
@@ -87,7 +92,7 @@ public static class GetTypeDependentsTool
             relationships = d.Relationships
         }).ToList();
 
-        return ResponseBuilder.Build(results, targetSymbol.LastIndexedAt);
+        return ResponseBuilder.Build(results, targetSymbol.LastIndexedAt, resolution.Ambiguity);
     }
 
     private static string GetContainingTypeFqn(SymbolInfo symbol)

@@ -30,9 +30,10 @@ public static class GetTypeMembersTool
         var projectStore = new ProjectStore(conn);
         var canonicalIdCache = FindSymbolTool.BuildCanonicalIdCache(projectStore);
 
-        var typeSymbol = symbolStore.GetByFqn(symbol_fqn);
-        if (typeSymbol == null)
+        var resolution = SymbolResolver.Resolve(symbolStore, projectStore, symbol_fqn);
+        if (resolution.Symbol == null)
             return ResponseBuilder.BuildEmpty("Type not found.");
+        var typeSymbol = resolution.Symbol;
 
         // Get members from the same file that have the type's FQN as a prefix
         var fileSymbols = symbolStore.GetByFile(typeSymbol.FilePath);
@@ -53,7 +54,7 @@ public static class GetTypeMembersTool
 
         var mapped = members.Select(s => FindSymbolTool.MapSymbol(s, FindSymbolTool.ResolveCanonicalId(s.ProjectId, canonicalIdCache))).ToList<object>();
         var freshness = members.Count > 0 ? members.Min(s => s.LastIndexedAt) : typeSymbol.LastIndexedAt;
-        return ResponseBuilder.Build(mapped, freshness);
+        return ResponseBuilder.Build(mapped, freshness, resolution.Ambiguity);
     }
 
     private static List<SymbolInfo> GetMembersForSymbolId(SymbolStore store, long symbolId)

@@ -4,6 +4,12 @@ public sealed class SymbolInfo
 {
     public long Id { get; set; }
     public long ProjectId { get; set; }
+
+    /// <summary>
+    /// The stable semantic declaration key (documentation ID or versioned source fallback). This is
+    /// the collision-resistant identity; the fully-qualified name below is display/query data only.
+    /// </summary>
+    public required string SymbolKey { get; init; }
     public required string FullyQualifiedName { get; init; }
     public required string DisplayName { get; init; }
     public required SymbolKind Kind { get; init; }

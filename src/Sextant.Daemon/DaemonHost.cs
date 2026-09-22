@@ -152,7 +152,8 @@ public sealed class DaemonHost : IDisposable
                 foreach (var project in solution.Projects)
                 {
                     if (project.FilePath == null) continue;
-                    var identity = GitRemoteResolver.Resolve(project.FilePath);
+                    var targetFramework = ProjectIdentityFactory.ResolveEvaluatedTargetFramework(project);
+                    var identity = GitRemoteResolver.Resolve(project.FilePath, targetFramework);
                     var existing = new ProjectStore(conn).GetByCanonicalId(identity.CanonicalId);
                     if (existing == null) continue;
 

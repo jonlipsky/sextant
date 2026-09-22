@@ -95,7 +95,7 @@ public class Phase3StoreTests
         var symId = symbolStore.Insert(new SymbolInfo
         {
             ProjectId = _projectA,
-            FullyQualifiedName = "global::A.MyClass",
+            SymbolKey = "global::A.MyClass", FullyQualifiedName = "global::A.MyClass",
             DisplayName = "MyClass",
             Kind = SymbolKind.Class,
             Accessibility = Accessibility.Public,

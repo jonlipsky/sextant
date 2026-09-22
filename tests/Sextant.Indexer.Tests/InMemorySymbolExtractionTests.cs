@@ -215,8 +215,8 @@ public class InMemorySymbolExtractionTests
 
         // Compute calls Add and Subtract
         Assert.IsTrue(edges.Count >= 2, $"Expected at least 2 call edges, got {edges.Count}");
-        Assert.IsTrue(edges.Any(e => e.CalleeFqn.Contains("Add")));
-        Assert.IsTrue(edges.Any(e => e.CalleeFqn.Contains("Subtract")));
+        Assert.IsTrue(edges.Any(e => e.CalleeKey.Contains("Add")));
+        Assert.IsTrue(edges.Any(e => e.CalleeKey.Contains("Subtract")));
         foreach (var e in edges)
         {
             Assert.IsTrue(e.CallSiteLine > 0);
@@ -255,8 +255,8 @@ public class InMemorySymbolExtractionTests
 
         var rels = RelationshipExtractor.ExtractRelationships(typeSymbol);
 
-        Assert.IsTrue(rels.Any(r => r.kind == Sextant.Core.RelationshipKind.Inherits && r.toFqn.Contains("BaseService")));
-        Assert.IsTrue(rels.Any(r => r.kind == Sextant.Core.RelationshipKind.Implements && r.toFqn.Contains("IService")));
+        Assert.IsTrue(rels.Any(r => r.kind == Sextant.Core.RelationshipKind.Inherits && r.toKey.Contains("BaseService")));
+        Assert.IsTrue(rels.Any(r => r.kind == Sextant.Core.RelationshipKind.Implements && r.toKey.Contains("IService")));
     }
 
     [TestMethod]
@@ -394,8 +394,8 @@ public class InMemorySymbolExtractionTests
 
         var overrideRel = rels.FirstOrDefault(r => r.kind == Sextant.Core.RelationshipKind.Overrides);
         Assert.AreNotEqual(default, overrideRel);
-        StringAssert.Contains(overrideRel.fromFqn, "Speak");
-        StringAssert.Contains(overrideRel.toFqn, "Speak");
+        StringAssert.Contains(overrideRel.fromKey, "Speak");
+        StringAssert.Contains(overrideRel.toKey, "Speak");
     }
 
     [TestMethod]
@@ -435,12 +435,12 @@ public class InMemorySymbolExtractionTests
         var rels = RelationshipExtractor.ExtractRelationships(handlerSymbol);
 
         Assert.IsTrue(rels.Any(r => r.kind == Sextant.Core.RelationshipKind.Returns
-            && r.fromFqn.Contains("Handle")
-            && r.toFqn.Contains("Response")));
+            && r.fromKey.Contains("Handle")
+            && r.toKey.Contains("Response")));
 
         Assert.IsTrue(rels.Any(r => r.kind == Sextant.Core.RelationshipKind.ParameterOf
-            && r.fromFqn.Contains("Request")
-            && r.toFqn.Contains("Handle")));
+            && r.fromKey.Contains("Request")
+            && r.toKey.Contains("Handle")));
     }
 
     [TestMethod]
@@ -482,7 +482,7 @@ public class InMemorySymbolExtractionTests
         var rels = RelationshipExtractor.ExtractInstantiates(factorySymbol, compilation);
 
         Assert.IsTrue(rels.Any(r => r.kind == Sextant.Core.RelationshipKind.Instantiates
-            && r.fromFqn.Contains("Create")
-            && r.toFqn.Contains("SomeClass")));
+            && r.fromKey.Contains("Create")
+            && r.toKey.Contains("SomeClass")));
     }
 }

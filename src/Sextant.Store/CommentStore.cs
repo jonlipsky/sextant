@@ -86,6 +86,17 @@ public sealed class CommentStore(SqliteConnection connection)
         cmd.ExecuteNonQuery();
     }
 
+    // Project-scoped delete: comments carry their owning project, so clearing one logical (per-TFM)
+    // project's comments for a shared source file leaves the sibling framework's comments intact.
+    public void DeleteByFile(string filePath, long projectId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "DELETE FROM comments WHERE file_path = @filePath AND project_id = @projectId;";
+        cmd.Parameters.AddWithValue("@filePath", filePath);
+        cmd.Parameters.AddWithValue("@projectId", projectId);
+        cmd.ExecuteNonQuery();
+    }
+
     private static List<CommentInfo> ReadAll(SqliteCommand cmd)
     {
         var results = new List<CommentInfo>();

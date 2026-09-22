@@ -27,9 +27,10 @@ public static class FindReferencesTool
         var referenceStore = new ReferenceStore(conn);
         var projectStore = new ProjectStore(conn);
 
-        var symbol = symbolStore.GetByFqn(symbol_fqn);
-        if (symbol == null)
+        var resolution = SymbolResolver.Resolve(symbolStore, projectStore, symbol_fqn);
+        if (resolution.Symbol == null)
             return ResponseBuilder.BuildEmpty("Symbol not found.");
+        var symbol = resolution.Symbol;
 
         var refs = referenceStore.GetBySymbolId(symbol.Id);
 
@@ -86,10 +87,10 @@ public static class FindReferencesTool
         {
             var groups = group_by.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
             var grouped = GroupReferences(mapped, groups);
-            return ResponseBuilder.Build(grouped, symbol.LastIndexedAt);
+            return ResponseBuilder.Build(grouped, symbol.LastIndexedAt, resolution.Ambiguity);
         }
 
-        return ResponseBuilder.Build(mapped, symbol.LastIndexedAt);
+        return ResponseBuilder.Build(mapped, symbol.LastIndexedAt, resolution.Ambiguity);
     }
 
     private static List<object> GroupReferences(List<object> refs, string[] groupKeys)

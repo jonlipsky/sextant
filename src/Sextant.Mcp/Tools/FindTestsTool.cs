@@ -25,6 +25,7 @@ public static class FindTestsTool
         var conn = db.GetConnection();
         var symbolStore = new SymbolStore(conn);
         var referenceStore = new ReferenceStore(conn);
+        var projectStore = new ProjectStore(conn);
 
         var testAttributes = GetTestAttributes(framework);
 
@@ -39,12 +40,15 @@ public static class FindTestsTool
             .ToList();
 
         var testMethods = allTestMethods;
+        SymbolAmbiguity? ambiguity = null;
 
         if (for_symbol != null)
         {
-            var targetSymbol = symbolStore.GetByFqn(for_symbol);
-            if (targetSymbol == null)
+            var resolution = SymbolResolver.Resolve(symbolStore, projectStore, for_symbol);
+            if (resolution.Symbol == null)
                 return ResponseBuilder.BuildEmpty("Symbol not found.");
+            var targetSymbol = resolution.Symbol;
+            ambiguity = resolution.Ambiguity;
 
             var refs = referenceStore.GetBySymbolId(targetSymbol.Id);
             var testFiles = testMethods.Select(t => t.FilePath).ToHashSet();
@@ -86,7 +90,7 @@ public static class FindTestsTool
         }).ToList();
 
         var freshness = testMethods.Count > 0 ? testMethods.Min(t => t.LastIndexedAt) : 0;
-        return ResponseBuilder.Build(results, freshness);
+        return ResponseBuilder.Build(results, freshness, ambiguity);
     }
 
     private static List<string> GetTestAttributes(string framework)

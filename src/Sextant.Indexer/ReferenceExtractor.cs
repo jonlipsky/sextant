@@ -10,7 +10,7 @@ public static class ReferenceExtractor
 {
     public static async Task<List<ReferenceInfo>> ExtractReferencesAsync(
         ISymbol symbol, long symbolId, Solution solution,
-        Dictionary<string, long> projectPathToId)
+        IReadOnlyDictionary<ProjectId, long> projectRoslynToId)
     {
         var references = new List<ReferenceInfo>();
 
@@ -24,7 +24,7 @@ public static class ReferenceExtractor
                 if (doc.FilePath == null)
                     continue;
 
-                var projectId = GetProjectId(doc.Project, projectPathToId);
+                var projectId = GetProjectId(doc.Project, projectRoslynToId);
                 if (projectId == null)
                     continue;
 
@@ -158,9 +158,9 @@ public static class ReferenceExtractor
         return AccessKind.Read;
     }
 
-    private static long? GetProjectId(Project project, Dictionary<string, long> projectPathToId)
+    private static long? GetProjectId(Project project, IReadOnlyDictionary<ProjectId, long> projectRoslynToId)
     {
-        if (project.FilePath != null && projectPathToId.TryGetValue(project.FilePath, out var id))
+        if (projectRoslynToId.TryGetValue(project.Id, out var id))
             return id;
         return null;
     }

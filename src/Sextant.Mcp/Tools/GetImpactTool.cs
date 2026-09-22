@@ -23,9 +23,10 @@ public static class GetImpactTool
         var apiSurfaceStore = new ApiSurfaceStore(conn);
         var projectStore = new ProjectStore(conn);
 
-        var symbol = symbolStore.GetByFqn(symbol_fqn);
-        if (symbol == null)
+        var resolution = SymbolResolver.Resolve(symbolStore, projectStore, symbol_fqn);
+        if (resolution.Symbol == null)
             return ResponseBuilder.BuildEmpty($"Symbol not found: {symbol_fqn}");
+        var symbol = resolution.Symbol;
 
         // Find all projects that depend on this symbol's project
         var consumers = dependencyStore.GetByDependency(symbol.ProjectId);
@@ -95,7 +96,7 @@ public static class GetImpactTool
             }
         };
 
-        return ResponseBuilder.Build(result, symbol.LastIndexedAt);
+        return ResponseBuilder.Build(result, symbol.LastIndexedAt, resolution.Ambiguity);
     }
 
     private static List<(string fqn, string signatureHash, string accessibility)> BuildSurface(

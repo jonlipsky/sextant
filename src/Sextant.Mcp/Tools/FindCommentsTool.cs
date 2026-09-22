@@ -40,13 +40,15 @@ public static class FindCommentsTool
         }
 
         List<Core.CommentInfo> comments;
+        SymbolAmbiguity? ambiguity = null;
 
         if (in_symbol != null)
         {
-            var symbol = symbolStore.GetByFqn(in_symbol);
-            if (symbol == null)
+            var resolution = SymbolResolver.Resolve(symbolStore, projectStore, in_symbol);
+            if (resolution.Symbol == null)
                 return ResponseBuilder.BuildEmpty("Symbol not found.");
-            comments = commentStore.GetBySymbol(symbol.Id);
+            ambiguity = resolution.Ambiguity;
+            comments = commentStore.GetBySymbol(resolution.Symbol.Id);
         }
         else if (!string.IsNullOrEmpty(search))
         {
@@ -89,6 +91,6 @@ public static class FindCommentsTool
         }).ToList();
 
         var freshness = comments.Count > 0 ? comments.Min(c => c.LastIndexedAt) : 0;
-        return ResponseBuilder.Build(results, freshness);
+        return ResponseBuilder.Build(results, freshness, ambiguity);
     }
 }

@@ -55,7 +55,7 @@ public class McpTestFixture : IDisposable
         var baseClassId = symbolStore.Insert(new SymbolInfo
         {
             ProjectId = ProjectId,
-            FullyQualifiedName = "global::Alpha.BaseService",
+            SymbolKey = "global::Alpha.BaseService", FullyQualifiedName = "global::Alpha.BaseService",
             DisplayName = "BaseService",
             Kind = SymbolKind.Class,
             Accessibility = Accessibility.Public,
@@ -67,7 +67,7 @@ public class McpTestFixture : IDisposable
         var derivedClassId = symbolStore.Insert(new SymbolInfo
         {
             ProjectId = ProjectId,
-            FullyQualifiedName = "global::Alpha.DerivedService",
+            SymbolKey = "global::Alpha.DerivedService", FullyQualifiedName = "global::Alpha.DerivedService",
             DisplayName = "DerivedService",
             Kind = SymbolKind.Class,
             Accessibility = Accessibility.Public,
@@ -87,7 +87,7 @@ public class McpTestFixture : IDisposable
         var interfaceId = symbolStore.Insert(new SymbolInfo
         {
             ProjectId = ProjectId,
-            FullyQualifiedName = "global::Alpha.IProcessor",
+            SymbolKey = "global::Alpha.IProcessor", FullyQualifiedName = "global::Alpha.IProcessor",
             DisplayName = "IProcessor",
             Kind = SymbolKind.Interface,
             Accessibility = Accessibility.Public,
@@ -107,7 +107,7 @@ public class McpTestFixture : IDisposable
         var voidMethodId = symbolStore.Insert(new SymbolInfo
         {
             ProjectId = ProjectId,
-            FullyQualifiedName = "global::Alpha.BaseService.Init()",
+            SymbolKey = "global::Alpha.BaseService.Init()", FullyQualifiedName = "global::Alpha.BaseService.Init()",
             DisplayName = "Init",
             Kind = SymbolKind.Method,
             Accessibility = Accessibility.Public,
@@ -121,7 +121,7 @@ public class McpTestFixture : IDisposable
         var stringParamMethodId = symbolStore.Insert(new SymbolInfo
         {
             ProjectId = ProjectId,
-            FullyQualifiedName = "global::Alpha.BaseService.Process(string)",
+            SymbolKey = "global::Alpha.BaseService.Process(string)", FullyQualifiedName = "global::Alpha.BaseService.Process(string)",
             DisplayName = "Process",
             Kind = SymbolKind.Method,
             Accessibility = Accessibility.Public,
@@ -135,7 +135,7 @@ public class McpTestFixture : IDisposable
         symbolStore.Insert(new SymbolInfo
         {
             ProjectId = ProjectId,
-            FullyQualifiedName = "global::Alpha.BaseService.Transform(string, int)",
+            SymbolKey = "global::Alpha.BaseService.Transform(string, int)", FullyQualifiedName = "global::Alpha.BaseService.Transform(string, int)",
             DisplayName = "Transform",
             Kind = SymbolKind.Method,
             Accessibility = Accessibility.Public,
@@ -149,7 +149,7 @@ public class McpTestFixture : IDisposable
         symbolStore.Insert(new SymbolInfo
         {
             ProjectId = ProjectId,
-            FullyQualifiedName = "global::Alpha.BaseService.LoadAsync()",
+            SymbolKey = "global::Alpha.BaseService.LoadAsync()", FullyQualifiedName = "global::Alpha.BaseService.LoadAsync()",
             DisplayName = "LoadAsync",
             Kind = SymbolKind.Method,
             Accessibility = Accessibility.Public,
@@ -163,7 +163,7 @@ public class McpTestFixture : IDisposable
         symbolStore.Insert(new SymbolInfo
         {
             ProjectId = ProjectId,
-            FullyQualifiedName = "global::Alpha.BaseService.Name",
+            SymbolKey = "global::Alpha.BaseService.Name", FullyQualifiedName = "global::Alpha.BaseService.Name",
             DisplayName = "Name",
             Kind = SymbolKind.Property,
             Accessibility = Accessibility.Public,
@@ -177,7 +177,7 @@ public class McpTestFixture : IDisposable
         symbolStore.Insert(new SymbolInfo
         {
             ProjectId = ProjectId,
-            FullyQualifiedName = "global::Alpha.BaseService.Merge(string, Dictionary<string, int>, bool)",
+            SymbolKey = "global::Alpha.BaseService.Merge(string, Dictionary<string, int>, bool)", FullyQualifiedName = "global::Alpha.BaseService.Merge(string, Dictionary<string, int>, bool)",
             DisplayName = "Merge",
             Kind = SymbolKind.Method,
             Accessibility = Accessibility.Public,
@@ -191,7 +191,7 @@ public class McpTestFixture : IDisposable
         var betaClassId = symbolStore.Insert(new SymbolInfo
         {
             ProjectId = ProjectId2,
-            FullyQualifiedName = "global::Beta.Consumer",
+            SymbolKey = "global::Beta.Consumer", FullyQualifiedName = "global::Beta.Consumer",
             DisplayName = "Consumer",
             Kind = SymbolKind.Class,
             Accessibility = Accessibility.Public,
@@ -203,7 +203,7 @@ public class McpTestFixture : IDisposable
         var betaMethodId = symbolStore.Insert(new SymbolInfo
         {
             ProjectId = ProjectId2,
-            FullyQualifiedName = "global::Beta.Consumer.Run()",
+            SymbolKey = "global::Beta.Consumer.Run()", FullyQualifiedName = "global::Beta.Consumer.Run()",
             DisplayName = "Run",
             Kind = SymbolKind.Method,
             Accessibility = Accessibility.Public,
@@ -217,7 +217,7 @@ public class McpTestFixture : IDisposable
         symbolStore.Insert(new SymbolInfo
         {
             ProjectId = ProjectId2,
-            FullyQualifiedName = "global::Beta.Consumer.GetService()",
+            SymbolKey = "global::Beta.Consumer.GetService()", FullyQualifiedName = "global::Beta.Consumer.GetService()",
             DisplayName = "GetService",
             Kind = SymbolKind.Method,
             Accessibility = Accessibility.Public,
@@ -231,7 +231,7 @@ public class McpTestFixture : IDisposable
         symbolStore.Insert(new SymbolInfo
         {
             ProjectId = ProjectId2,
-            FullyQualifiedName = "global::Beta.Consumer.UseService(BaseService)",
+            SymbolKey = "global::Beta.Consumer.UseService(BaseService)", FullyQualifiedName = "global::Beta.Consumer.UseService(BaseService)",
             DisplayName = "UseService",
             Kind = SymbolKind.Method,
             Accessibility = Accessibility.Public,
@@ -291,7 +291,7 @@ public class McpTestFixture : IDisposable
         symbolStore.Insert(new SymbolInfo
         {
             ProjectId = ProjectId,
-            FullyQualifiedName = "global::Alpha.Tests.BaseServiceTests.Process_ReturnsExpected()",
+            SymbolKey = "global::Alpha.Tests.BaseServiceTests.Process_ReturnsExpected()", FullyQualifiedName = "global::Alpha.Tests.BaseServiceTests.Process_ReturnsExpected()",
             DisplayName = "Process_ReturnsExpected",
             Kind = SymbolKind.Method,
             Accessibility = Accessibility.Public,
@@ -305,7 +305,7 @@ public class McpTestFixture : IDisposable
         symbolStore.Insert(new SymbolInfo
         {
             ProjectId = ProjectId,
-            FullyQualifiedName = "global::Alpha.Tests.BaseServiceTests.Init_Works()",
+            SymbolKey = "global::Alpha.Tests.BaseServiceTests.Init_Works()", FullyQualifiedName = "global::Alpha.Tests.BaseServiceTests.Init_Works()",
             DisplayName = "Init_Works",
             Kind = SymbolKind.Method,
             Accessibility = Accessibility.Public,
@@ -320,7 +320,7 @@ public class McpTestFixture : IDisposable
         symbolStore.Insert(new SymbolInfo
         {
             ProjectId = ProjectId,
-            FullyQualifiedName = "global::Alpha.Tests.NUnitTests.SomeTest()",
+            SymbolKey = "global::Alpha.Tests.NUnitTests.SomeTest()", FullyQualifiedName = "global::Alpha.Tests.NUnitTests.SomeTest()",
             DisplayName = "SomeTest",
             Kind = SymbolKind.Method,
             Accessibility = Accessibility.Public,
@@ -360,7 +360,7 @@ public class McpTestFixture : IDisposable
         var callerMethodId = symbolStore.Insert(new SymbolInfo
         {
             ProjectId = ProjectId,
-            FullyQualifiedName = "global::Alpha.Orchestrator.Execute()",
+            SymbolKey = "global::Alpha.Orchestrator.Execute()", FullyQualifiedName = "global::Alpha.Orchestrator.Execute()",
             DisplayName = "Execute",
             Kind = SymbolKind.Method,
             Accessibility = Accessibility.Public,

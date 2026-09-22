@@ -108,7 +108,7 @@ public class IncrementalIndexerTests
         _symbolStore.Insert(new SymbolInfo
         {
             ProjectId = _projectId,
-            FullyQualifiedName = "global::Test.OldClass",
+            SymbolKey = "global::Test.OldClass", FullyQualifiedName = "global::Test.OldClass",
             DisplayName = "OldClass",
             Kind = SymbolKind.Class,
             Accessibility = Accessibility.Public,
@@ -132,7 +132,7 @@ public class IncrementalIndexerTests
         _symbolStore.Insert(new SymbolInfo
         {
             ProjectId = _projectId,
-            FullyQualifiedName = "global::Test.NewClass",
+            SymbolKey = "global::Test.NewClass", FullyQualifiedName = "global::Test.NewClass",
             DisplayName = "NewClass",
             Kind = SymbolKind.Class,
             Accessibility = Accessibility.Public,

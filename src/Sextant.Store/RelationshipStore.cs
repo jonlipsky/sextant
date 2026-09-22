@@ -57,6 +57,22 @@ public sealed class RelationshipStore(SqliteConnection connection)
         cmd.ExecuteNonQuery();
     }
 
+    // Project-scoped delete: relationships have no project column, so scope through the endpoint
+    // symbols' project. This clears only relationships anchored on one logical (per-TFM) project's
+    // symbols in the shared source file, leaving the sibling framework's relationships intact.
+    public void DeleteByFile(string filePath, long projectId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            DELETE FROM relationships WHERE
+                from_symbol_id IN (SELECT id FROM symbols WHERE file_path = @file_path AND project_id = @project_id)
+                OR to_symbol_id IN (SELECT id FROM symbols WHERE file_path = @file_path AND project_id = @project_id);
+            """;
+        cmd.Parameters.AddWithValue("@file_path", filePath);
+        cmd.Parameters.AddWithValue("@project_id", projectId);
+        cmd.ExecuteNonQuery();
+    }
+
     private static List<RelationshipInfo> ReadAll(SqliteCommand cmd)
     {
         var results = new List<RelationshipInfo>();
