@@ -23,6 +23,15 @@ public sealed record IndexRun
     public long? FinalWalBytes { get; init; }
     public long? FinalShmBytes { get; init; }
     public long? PeakStagedBytes { get; init; }
+
+    /// <summary>Stable configuration hash recorded for this run (null for pre-Phase-8 runs).</summary>
+    public string? ConfigHash { get; init; }
+
+    /// <summary>Canonical indexing-profile name recorded for this run (null for pre-Phase-8 runs).</summary>
+    public string? IndexingProfile { get; init; }
+
+    /// <summary>The <c>IndexFeature</c> bit set built by this run (null for pre-Phase-8 runs).</summary>
+    public long? Features { get; init; }
 }
 
 /// <summary>
@@ -33,17 +42,21 @@ public sealed record IndexRun
 /// </summary>
 public sealed class IndexRunStore(SqliteConnection connection)
 {
-    public long BeginRun(string mode, long startedAt)
+    public long BeginRun(string mode, long startedAt,
+        string? configHash = null, string? indexingProfile = null, long? features = null)
     {
         using var cmd = connection.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO index_runs (mode, status, started_at)
-            VALUES (@mode, @status, @started_at)
+            INSERT INTO index_runs (mode, status, started_at, config_hash, indexing_profile, features)
+            VALUES (@mode, @status, @started_at, @config_hash, @indexing_profile, @features)
             RETURNING id;
             """;
         cmd.Parameters.AddWithValue("@mode", mode);
         cmd.Parameters.AddWithValue("@status", IndexRunState.Staging);
         cmd.Parameters.AddWithValue("@started_at", startedAt);
+        cmd.Parameters.AddWithValue("@config_hash", (object?)configHash ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@indexing_profile", (object?)indexingProfile ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@features", (object?)features ?? DBNull.Value);
         return (long)cmd.ExecuteScalar()!;
     }
 
@@ -139,6 +152,31 @@ public sealed class IndexRunStore(SqliteConnection connection)
         return reader.Read() ? Read(reader) : null;
     }
 
+    /// <summary>Every recorded run, newest first. Used by retention to classify generations.</summary>
+    public IReadOnlyList<IndexRun> GetAllRuns()
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT * FROM index_runs ORDER BY id DESC;";
+        using var reader = cmd.ExecuteReader();
+        var runs = new List<IndexRun>();
+        while (reader.Read())
+            runs.Add(Read(reader));
+        return runs;
+    }
+
+    /// <summary>
+    /// Deletes a single run row (retention GC of a superseded/abandoned generation). Runs on the
+    /// caller's connection so it enrols in the caller's ambient retention transaction. Returns the
+    /// number of rows deleted.
+    /// </summary>
+    public int DeleteRun(long id)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "DELETE FROM index_runs WHERE id = @id;";
+        cmd.Parameters.AddWithValue("@id", id);
+        return cmd.ExecuteNonQuery();
+    }
+
     public IndexRun? GetById(long id)
     {
         using var cmd = connection.CreateCommand();
@@ -154,8 +192,9 @@ public sealed class IndexRunStore(SqliteConnection connection)
     /// batch back), this gives the atomic generation boundary: readers keep seeing the previous
     /// complete run until the caller calls <see cref="IndexRunScope.Complete"/>.
     /// </summary>
-    public IndexRunScope BeginScope(string mode, long startedAt)
-        => new(this, BeginRun(mode, startedAt));
+    public IndexRunScope BeginScope(string mode, long startedAt,
+        string? configHash = null, string? indexingProfile = null, long? features = null)
+        => new(this, BeginRun(mode, startedAt, configHash, indexingProfile, features));
 
     private static IndexRun Read(SqliteDataReader reader) => new()
     {
@@ -168,13 +207,22 @@ public sealed class IndexRunStore(SqliteConnection connection)
         FinalDbBytes = NullableLong(reader, "final_db_bytes"),
         FinalWalBytes = NullableLong(reader, "final_wal_bytes"),
         FinalShmBytes = NullableLong(reader, "final_shm_bytes"),
-        PeakStagedBytes = NullableLong(reader, "peak_staged_bytes")
+        PeakStagedBytes = NullableLong(reader, "peak_staged_bytes"),
+        ConfigHash = NullableString(reader, "config_hash"),
+        IndexingProfile = NullableString(reader, "indexing_profile"),
+        Features = NullableLong(reader, "features")
     };
 
     private static long? NullableLong(SqliteDataReader reader, string column)
     {
         var ordinal = reader.GetOrdinal(column);
         return reader.IsDBNull(ordinal) ? null : reader.GetInt64(ordinal);
+    }
+
+    private static string? NullableString(SqliteDataReader reader, string column)
+    {
+        var ordinal = reader.GetOrdinal(column);
+        return reader.IsDBNull(ordinal) ? null : reader.GetString(ordinal);
     }
 }
 

@@ -18,17 +18,20 @@ public sealed class IncrementalIndexer
     private readonly Action<string>? _log;
     private readonly bool _useDocumentExtractor;
     private readonly ExtractionParallelismOptions _parallelism;
+    private readonly IndexProfileDescriptor? _profile;
 
     public IncrementalIndexer(
         IndexDatabase db,
         Action<string>? log = null,
         bool useDocumentExtractor = false,
-        ExtractionParallelismOptions? parallelism = null)
+        ExtractionParallelismOptions? parallelism = null,
+        IndexProfileDescriptor? profile = null)
     {
         _db = db;
         _log = log;
         _useDocumentExtractor = useDocumentExtractor;
         _parallelism = parallelism ?? ExtractionParallelismOptions.Default;
+        _profile = profile;
     }
 
     /// <summary>
@@ -161,7 +164,7 @@ public sealed class IncrementalIndexer
         // Delegate to the shared full-index extraction, restricted to the closure. This reuses the
         // Phase 3 write session + index_runs generation ledger inside the orchestrator; the incremental
         // path opens no transaction of its own.
-        await new IndexOrchestrator(_db, _log, _useDocumentExtractor, _parallelism).IndexSolutionAsync(
+        await new IndexOrchestrator(_db, _log, _useDocumentExtractor, _parallelism, _profile).IndexSolutionAsync(
             solution,
             progress: null,
             metrics: new IndexingMetrics { Mode = "incremental", ChangedFileCount = affected.Count },

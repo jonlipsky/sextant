@@ -3,6 +3,7 @@ using ModelContextProtocol.Server;
 
 namespace Sextant.Mcp.Tools;
 
+[McpServerToolType]
 public static class GetSourceContextTool
 {
     [McpServerTool(Name = "get_source_context"),

@@ -50,6 +50,9 @@ public sealed class BenchmarkReport
     /// <summary>Which extractor produced this report — <c>document</c> (Phase 5) or <c>legacy</c>.</summary>
     public string? ExtractorMode { get; set; }
 
+    /// <summary>The indexing profile (Phase 8) this run indexed under — <c>core</c>/<c>standard</c>/<c>deep</c>.</summary>
+    public string? IndexingProfile { get; set; }
+
     /// <summary>Effective document-extractor analysis parallelism for this run (resolved from the
     /// requested value against the host), recorded so a parallelism sweep is self-describing.</summary>
     public int? ExtractionParallelism { get; set; }
@@ -69,6 +72,37 @@ public sealed class BenchmarkReport
 
     public string ToJson() => JsonSerializer.Serialize(this, JsonOptions);
 
+    /// <summary>
+    /// Renders a size+performance comparison across profiles (Phase 8, criterion 6). Given the reports
+    /// from a <c>--profile all</c> sweep of one corpus, produces a single markdown table so the cost of
+    /// each semantic depth (core → standard → deep) is directly comparable.
+    /// </summary>
+    public static string ToProfileComparison(IReadOnlyList<BenchmarkReport> reports)
+    {
+        var sb = new StringBuilder();
+        var corpus = reports.Count > 0 ? reports[0].CorpusName : "(none)";
+        sb.AppendLine($"# Sextant benchmark — profile comparison ({corpus})");
+        sb.AppendLine();
+        sb.AppendLine("| Profile | Full status | Full time | Symbols | References | Comments | Final DB | Peak DB+WAL |");
+        sb.AppendLine("|---|---|--:|--:|--:|--:|--:|--:|");
+        foreach (var r in reports)
+        {
+            var f = r.FullIndex;
+            var rows = f?.Rows;
+            sb.AppendLine(
+                $"| {r.IndexingProfile ?? "(unknown)"} " +
+                $"| {(f == null ? "-" : f.Status.ToString())} " +
+                $"| {(f == null ? "-" : FormatMs(f.TotalDurationMs))} " +
+                $"| {(rows == null ? "-" : rows.Symbols.ToString("N0"))} " +
+                $"| {(rows == null ? "-" : rows.References.ToString("N0"))} " +
+                $"| {(rows == null ? "-" : rows.Comments.ToString("N0"))} " +
+                $"| {(f == null ? "-" : FormatBytes(f.Storage.FinalDbBytes))} " +
+                $"| {(f == null ? "-" : FormatBytes(f.Storage.PeakDbPlusWalBytes))} |");
+        }
+        sb.AppendLine();
+        return sb.ToString();
+    }
+
     /// <summary>Renders a compact human-readable summary of the report.</summary>
     public string ToMarkdown()
     {
@@ -84,6 +118,8 @@ public sealed class BenchmarkReport
         if (Environment.MachineDescription != null) sb.AppendLine($"- Machine: {Environment.MachineDescription}");
         if (Environment.GitCommit != null) sb.AppendLine($"- Commit: {Environment.GitCommit}");
         sb.AppendLine($"- Targets: {Targets.RuntimeSpeedupFactor:0.#}x runtime, {Targets.PeakDiskReductionFraction:P0} peak-disk reduction");
+        if (IndexingProfile != null)
+            sb.AppendLine($"- Profile: {IndexingProfile}");
         if (ExtractorMode != null)
             sb.AppendLine($"- Extractor: {ExtractorMode}" +
                           (ExtractionParallelism != null ? $" (parallelism {ExtractionParallelism})" : string.Empty));

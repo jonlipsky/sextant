@@ -167,7 +167,10 @@ public static class DocumentSemanticExtractor
     /// indexed project id (compilation-scoped resolution); pass null to skip it (the orchestrator then
     /// falls back to key-only resolution, and unit tests that don't exercise cross-project identity omit
     /// it). The delegate keeps the extractor database-free: it only maps a Roslyn assembly symbol the
-    /// orchestrator already knows how to resolve against the solution.
+    /// orchestrator already knows how to resolve against the solution. <paramref name="includeDataflow"/>
+    /// gates the per-call argument/return-flow analysis: when false (a non-deep profile), the walk skips
+    /// <see cref="DataflowExtractor.ExtractFromInvocation"/> entirely and carries an empty result, so the
+    /// deep-only work is not merely dropped at persistence but never performed (Phase 8, criterion 2).
     /// </summary>
     public static void ExtractDocument(
         SyntaxNode root,
@@ -175,7 +178,8 @@ public static class DocumentSemanticExtractor
         string filePath,
         SourceText text,
         DocumentContributionSet sink,
-        Func<IAssemblySymbol, long?>? resolveTargetProject = null)
+        Func<IAssemblySymbol, long?>? resolveTargetProject = null,
+        bool includeDataflow = true)
     {
         foreach (var node in root.DescendantNodes())
         {
@@ -191,7 +195,7 @@ public static class DocumentSemanticExtractor
                     break;
 
                 case InvocationExpressionSyntax invocation:
-                    EmitCall(invocation, model, filePath, sink, resolveTargetProject);
+                    EmitCall(invocation, model, filePath, sink, resolveTargetProject, includeDataflow);
                     break;
 
                 case ObjectCreationExpressionSyntax objectCreation:
@@ -291,7 +295,8 @@ public static class DocumentSemanticExtractor
         SemanticModel model,
         string filePath,
         DocumentContributionSet sink,
-        Func<IAssemblySymbol, long?>? resolveTargetProject)
+        Func<IAssemblySymbol, long?>? resolveTargetProject,
+        bool includeDataflow)
     {
         var callee = (model.GetOperation(invocation) as IInvocationOperation)?.TargetMethod
                      ?? model.GetSymbolInfo(invocation).Symbol as IMethodSymbol;
@@ -313,8 +318,12 @@ public static class DocumentSemanticExtractor
         // Extract dataflow now, while the semantic model for this document is live, and carry only the
         // plain result forward. Deferring it to persistence would pin every document's SemanticModel
         // for the whole project (they accumulate in the contribution set), defeating Roslyn's weak
-        // model caching and working against the extractor's near-linear-scaling goal.
-        var dataflow = DataflowExtractor.ExtractFromInvocation(invocation, model);
+        // model caching and working against the extractor's near-linear-scaling goal. When the active
+        // profile omits dataflow (non-deep), skip the analysis entirely — not just its persistence —
+        // so core/standard indexing does not pay the deep profile's cost (Phase 8, criterion 2).
+        var dataflow = includeDataflow
+            ? DataflowExtractor.ExtractFromInvocation(invocation, model)
+            : new DataflowResult();
         sink.AddCall(new CallContribution(
             callerKey,
             SemanticSymbolKeyFactory.DeclarationKey(canonicalCallee),

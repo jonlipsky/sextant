@@ -40,42 +40,68 @@ public static class Program
         }
 
         Directory.CreateDirectory(outDir);
-        Console.WriteLine($"Running benchmark: corpus={options.Corpus}, out={outDir}");
 
-        BenchmarkReport report;
-        try
+        var profiles = string.Equals(options.Profile, "all", StringComparison.OrdinalIgnoreCase)
+            ? new[] { Core.IndexProfiles.Core, Core.IndexProfiles.Standard, Core.IndexProfiles.Deep }
+            : [options.Profile];
+
+        var reports = new List<BenchmarkReport>();
+        foreach (var profile in profiles)
         {
-            report = await BenchmarkRunner.RunAsync(options);
+            options.Profile = profile;
+            Console.WriteLine($"Running benchmark: corpus={options.Corpus}, profile={profile}, out={outDir}");
+
+            BenchmarkReport report;
+            try
+            {
+                report = await BenchmarkRunner.RunAsync(options);
+            }
+            catch (Exception ex)
+            {
+                var redactErrors = options.Redact || options.Corpus == "external";
+                Console.Error.WriteLine(redactErrors
+                    ? $"benchmark failed: {ex.GetType().Name}"
+                    : $"benchmark failed: {ex}");
+                return 1;
+            }
+
+            var stamp = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss");
+            var baseName = profiles.Length > 1
+                ? $"benchmark-{options.Corpus}-{profile}-{stamp}"
+                : $"benchmark-{options.Corpus}-{stamp}";
+            var jsonPath = Path.Combine(outDir, baseName + ".json");
+            var mdPath = Path.Combine(outDir, baseName + ".md");
+            await File.WriteAllTextAsync(jsonPath, report.ToJson());
+            await File.WriteAllTextAsync(mdPath, report.ToMarkdown());
+
+            PrintSummary(report);
+            Console.WriteLine();
+            Console.WriteLine($"JSON:     {jsonPath}");
+            Console.WriteLine($"Markdown: {mdPath}");
+            reports.Add(report);
         }
-        catch (Exception ex)
+
+        if (reports.Count > 1)
         {
-            // In redact mode an exception message/stack can embed paths or symbol names; surface
-            // only the exception type so nothing identifying reaches stderr or CI logs.
-            var redactErrors = options.Redact || options.Corpus == "external";
-            Console.Error.WriteLine(redactErrors
-                ? $"benchmark failed: {ex.GetType().Name}"
-                : $"benchmark failed: {ex}");
-            return 1;
+            var comparison = BenchmarkReport.ToProfileComparison(reports);
+            var stamp = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss");
+            var comparisonPath = Path.Combine(outDir, $"benchmark-{options.Corpus}-profiles-{stamp}.md");
+            await File.WriteAllTextAsync(comparisonPath, comparison);
+            Console.WriteLine();
+            Console.WriteLine(comparison);
+            Console.WriteLine($"Profile comparison: {comparisonPath}");
         }
-
-        var stamp = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss");
-        var baseName = $"benchmark-{options.Corpus}-{stamp}";
-        var jsonPath = Path.Combine(outDir, baseName + ".json");
-        var mdPath = Path.Combine(outDir, baseName + ".md");
-        await File.WriteAllTextAsync(jsonPath, report.ToJson());
-        await File.WriteAllTextAsync(mdPath, report.ToMarkdown());
-
-        PrintSummary(report);
-        Console.WriteLine();
-        Console.WriteLine($"JSON:     {jsonPath}");
-        Console.WriteLine($"Markdown: {mdPath}");
 
         // Fail the command if any requested run did not complete, so CI never accepts a benchmark
         // whose full or incremental pass was cancelled or failed.
-        var fullOk = report.FullIndex?.Status == Core.IndexRunStatus.Completed;
-        var incrementalOk = report.IncrementalIndex == null
-            || report.IncrementalIndex.Status == Core.IndexRunStatus.Completed;
-        return fullOk && incrementalOk ? 0 : 1;
+        var allOk = reports.All(report =>
+        {
+            var fullOk = report.FullIndex?.Status == Core.IndexRunStatus.Completed;
+            var incrementalOk = report.IncrementalIndex == null
+                || report.IncrementalIndex.Status == Core.IndexRunStatus.Completed;
+            return fullOk && incrementalOk;
+        });
+        return allOk ? 0 : 1;
     }
 
     private static (BenchmarkOptions, string outDir) ParseArgs(string[] args)
@@ -94,6 +120,7 @@ public static class Program
         string? machine = null;
         var documentExtractor = false;
         var maxParallelism = 0;
+        var profile = Core.IndexProfiles.Deep;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -113,6 +140,7 @@ public static class Program
                 case "--machine": machine = RequireValue(args, ref i); break;
                 case "--document-extractor": documentExtractor = true; break;
                 case "--max-parallelism": maxParallelism = int.Parse(RequireValue(args, ref i)); break;
+                case "--profile": profile = RequireValue(args, ref i); break;
                 default: throw new ArgumentException($"unknown argument '{args[i]}'");
             }
         }
@@ -132,6 +160,7 @@ public static class Program
             MachineDescription = machine,
             UseDocumentExtractor = documentExtractor,
             MaxParallelism = maxParallelism,
+            Profile = profile,
             Log = msg => Console.WriteLine($"  {msg}")
         };
         return (options, outDir);
@@ -172,6 +201,7 @@ public static class Program
               --large-methods <n>   methods per type for the large corpus (default: 6)
               --document-extractor  use the Phase 5 document-oriented extractor (default: legacy)
               --max-parallelism <n> analysis worker cap for the document extractor (0 = auto)
+              --profile <name>      core | standard | deep | all (default: deep; 'all' sweeps every profile)
               --machine <label>     machine label recorded in the report
               -h, --help            show this help
             """);

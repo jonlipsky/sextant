@@ -7,20 +7,27 @@ internal static class ProfilesHandler
         var root = Core.SextantConfiguration.FindRepoRoot(Directory.GetCurrentDirectory()) ?? ".";
         var profilesDir = Path.Combine(root, ".sextant", "profiles");
 
+        var config = Core.SextantConfiguration.Load();
+        var activeProfile = profileOverride
+            ?? Environment.GetEnvironmentVariable("SEXTANT_PROFILE")
+            ?? config.Profile;
+
+        var descriptor = Core.IndexProfileDescriptor.FromConfiguration(config);
+        Console.WriteLine("Indexing profile:");
+        Console.WriteLine($"  {descriptor.Profile} — features: {string.Join(", ", Core.IndexProfiles.FeatureNames(descriptor.Features))}");
+        Console.WriteLine($"  generated source: {descriptor.GeneratedSourcePolicy}");
+        Console.WriteLine($"  config hash: {descriptor.ConfigurationHash}");
+        Console.WriteLine();
+
         if (!Directory.Exists(profilesDir))
         {
-            Console.WriteLine("No profiles found.");
+            Console.WriteLine("No database profiles found.");
             return;
         }
 
         var profiles = Directory.GetDirectories(profilesDir)
             .Select(d => new DirectoryInfo(d))
             .OrderBy(d => d.Name);
-
-        var config = Core.SextantConfiguration.Load();
-        var activeProfile = profileOverride
-            ?? Environment.GetEnvironmentVariable("SEXTANT_PROFILE")
-            ?? config.Profile;
 
         Console.WriteLine("Profiles:");
         foreach (var dir in profiles)
