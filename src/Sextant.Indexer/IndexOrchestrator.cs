@@ -18,11 +18,66 @@ public sealed class IndexOrchestrator
         _log = log;
     }
 
-    public Task IndexSolutionAsync(Solution solution)
-        => IndexSolutionAsync(solution, null);
-
-    public async Task IndexSolutionAsync(Solution solution, IProgress<IndexingProgress>? progress)
+    public async Task IndexSolutionAsync(
+        Solution solution,
+        IProgress<IndexingProgress>? progress = null,
+        IndexingMetrics? metrics = null,
+        CancellationToken cancellationToken = default)
     {
+        var totalStopwatch = Stopwatch.StartNew();
+        var phaseStopwatch = new Stopwatch();
+        PhaseMetric? currentPhase = null;
+
+        void StartPhase(string phaseName)
+        {
+            // Finish (and stamp Completed) the previous phase *before* honoring cancellation, so a
+            // fully-finished phase is never left marked Running when cancellation lands between phases.
+            FinishPhase();
+            ThrowIfCancelled();
+            currentPhase = new PhaseMetric { Name = phaseName };
+            metrics?.Phases.Add(currentPhase);
+            phaseStopwatch.Restart();
+        }
+
+        void FinishPhase()
+        {
+            if (currentPhase == null) return;
+            phaseStopwatch.Stop();
+            currentPhase.DurationMs = phaseStopwatch.ElapsedMilliseconds;
+            currentPhase.Status = IndexRunStatus.Completed;
+            currentPhase = null;
+        }
+
+        void EnterProject()
+        {
+            ThrowIfCancelled();
+            if (currentPhase != null) currentPhase.ProjectsProcessed++;
+        }
+
+        // Cooperative cancellation point. Before unwinding it records the interrupted phase's
+        // partial duration + Cancelled status and the run-level Cancelled outcome, so per-phase and
+        // per-run metrics recorded up to this point survive the cancellation.
+        void ThrowIfCancelled()
+        {
+            if (!cancellationToken.IsCancellationRequested) return;
+            if (currentPhase is { Status: IndexRunStatus.Running })
+            {
+                phaseStopwatch.Stop();
+                currentPhase.DurationMs = phaseStopwatch.ElapsedMilliseconds;
+                currentPhase.Status = IndexRunStatus.Cancelled;
+            }
+            if (metrics != null)
+            {
+                totalStopwatch.Stop();
+                metrics.TotalDurationMs = totalStopwatch.ElapsedMilliseconds;
+                metrics.Status = IndexRunStatus.Cancelled;
+                metrics.FailureReason = "cancelled";
+            }
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+
+        ThrowIfCancelled();
+
         var conn = _db.GetConnection();
         var projectStore = new ProjectStore(conn);
         var symbolStore = new SymbolStore(conn);
@@ -57,7 +112,9 @@ public sealed class IndexOrchestrator
         var projectList = solution.Projects.ToList();
         var totalProjects = projectList.Count;
         var projectIndex = 0;
+        if (metrics != null) metrics.ProjectCount = totalProjects;
 
+        StartPhase("registering_projects");
         _log?.Invoke("Registering projects...");
         progress?.Report(new IndexingProgress
         {
@@ -68,6 +125,7 @@ public sealed class IndexOrchestrator
         });
         foreach (var project in solution.Projects)
         {
+            EnterProject();
             if (project.FilePath == null) continue;
 
             ProjectIdentity identity;
@@ -112,6 +170,7 @@ public sealed class IndexOrchestrator
         }
 
         // Phase 2: Extract symbols from all projects
+        StartPhase("extracting_symbols");
         _log?.Invoke("Extracting symbols...");
         projectIndex = 0;
         foreach (var project in solution.Projects)
@@ -119,6 +178,7 @@ public sealed class IndexOrchestrator
             if (project.FilePath == null || !projectPathToId.TryGetValue(project.FilePath, out var projectId))
                 continue;
 
+            EnterProject();
             projectIndex++;
             _log?.Invoke($"  {project.Name}...");
             progress?.Report(new IndexingProgress
@@ -144,6 +204,7 @@ public sealed class IndexOrchestrator
         }
 
         // Phase 3: Extract relationships
+        StartPhase("extracting_relationships");
         _log?.Invoke("Extracting relationships...");
         projectIndex = 0;
         progress?.Report(new IndexingProgress
@@ -155,6 +216,7 @@ public sealed class IndexOrchestrator
         });
         foreach (var project in solution.Projects)
         {
+            EnterProject();
             projectIndex++;
             progress?.Report(new IndexingProgress
             {
@@ -164,13 +226,14 @@ public sealed class IndexOrchestrator
                 ProjectIndex = projectIndex,
                 ProjectCount = totalProjects
             });
-            var compilation = await project.GetCompilationAsync();
+            var compilation = await project.GetCompilationAsync(cancellationToken);
             if (compilation == null) continue;
 
             foreach (var syntaxTree in compilation.SyntaxTrees)
             {
+                ThrowIfCancelled();
                 var semanticModel = compilation.GetSemanticModel(syntaxTree);
-                var root = await syntaxTree.GetRootAsync();
+                var root = await syntaxTree.GetRootAsync(cancellationToken);
 
                 foreach (var node in root.DescendantNodes())
                 {
@@ -198,10 +261,12 @@ public sealed class IndexOrchestrator
         }
 
         // Phase 4: Extract references
+        StartPhase("extracting_references");
         _log?.Invoke("Extracting references...");
         projectIndex = 0;
         foreach (var project in solution.Projects)
         {
+            EnterProject();
             projectIndex++;
             progress?.Report(new IndexingProgress
             {
@@ -211,7 +276,7 @@ public sealed class IndexOrchestrator
                 ProjectIndex = projectIndex,
                 ProjectCount = totalProjects
             });
-            var compilation = await project.GetCompilationAsync();
+            var compilation = await project.GetCompilationAsync(cancellationToken);
             if (compilation == null) continue;
 
             if (project.FilePath != null && projectPathToId.ContainsKey(project.FilePath))
@@ -226,11 +291,12 @@ public sealed class IndexOrchestrator
 
             foreach (var syntaxTree in compilation.SyntaxTrees)
             {
+                ThrowIfCancelled();
                 if (SymbolExtractor.IsGeneratedFile(syntaxTree.FilePath))
                     continue;
 
                 var semanticModel = compilation.GetSemanticModel(syntaxTree);
-                var root = await syntaxTree.GetRootAsync();
+                var root = await syntaxTree.GetRootAsync(cancellationToken);
 
                 foreach (var node in root.DescendantNodes())
                 {
@@ -260,11 +326,13 @@ public sealed class IndexOrchestrator
         }
 
         // Phase 4.5: Extract tagged comments
+        StartPhase("extracting_comments");
         _log?.Invoke("Extracting tagged comments...");
         projectIndex = 0;
         var commentStore = new CommentStore(conn);
         foreach (var project in solution.Projects)
         {
+            EnterProject();
             projectIndex++;
             progress?.Report(new IndexingProgress
             {
@@ -274,7 +342,7 @@ public sealed class IndexOrchestrator
                 ProjectIndex = projectIndex,
                 ProjectCount = totalProjects
             });
-            var compilation = await project.GetCompilationAsync();
+            var compilation = await project.GetCompilationAsync(cancellationToken);
             if (compilation == null) continue;
 
             if (project.FilePath == null || !projectPathToId.TryGetValue(project.FilePath, out var commentProjectId))
@@ -282,6 +350,7 @@ public sealed class IndexOrchestrator
 
             foreach (var syntaxTree in compilation.SyntaxTrees)
             {
+                ThrowIfCancelled();
                 if (SymbolExtractor.IsGeneratedFile(syntaxTree.FilePath))
                     continue;
 
@@ -300,12 +369,14 @@ public sealed class IndexOrchestrator
         }
 
         // Phase 5: Extract call graph and dataflow
+        StartPhase("extracting_call_graph");
         _log?.Invoke("Extracting call graph...");
         projectIndex = 0;
         var argumentFlowStore = new ArgumentFlowStore(conn);
         var returnFlowStore = new ReturnFlowStore(conn);
         foreach (var project in solution.Projects)
         {
+            EnterProject();
             projectIndex++;
             progress?.Report(new IndexingProgress
             {
@@ -315,7 +386,7 @@ public sealed class IndexOrchestrator
                 ProjectIndex = projectIndex,
                 ProjectCount = totalProjects
             });
-            var compilation = await project.GetCompilationAsync();
+            var compilation = await project.GetCompilationAsync(cancellationToken);
             if (compilation == null) continue;
 
             if (project.FilePath != null && projectPathToId.ContainsKey(project.FilePath))
@@ -329,11 +400,12 @@ public sealed class IndexOrchestrator
 
             foreach (var syntaxTree in compilation.SyntaxTrees)
             {
+                ThrowIfCancelled();
                 if (SymbolExtractor.IsGeneratedFile(syntaxTree.FilePath))
                     continue;
 
                 var semanticModel = compilation.GetSemanticModel(syntaxTree);
-                var root = await syntaxTree.GetRootAsync();
+                var root = await syntaxTree.GetRootAsync(cancellationToken);
 
                 foreach (var node in root.DescendantNodes())
                 {
@@ -390,6 +462,7 @@ public sealed class IndexOrchestrator
         // Phase 6: Record project dependencies
         if (repoRoot != null)
         {
+            StartPhase("recording_dependencies");
             _log?.Invoke("Recording project dependencies...");
             progress?.Report(new IndexingProgress
             {
@@ -409,6 +482,7 @@ public sealed class IndexOrchestrator
         }
 
         // Phase 7: Capture API surface snapshots for projects with inbound dependencies
+        StartPhase("capturing_api_surface");
         _log?.Invoke("Capturing API surface snapshots...");
         progress?.Report(new IndexingProgress
         {
@@ -452,6 +526,18 @@ public sealed class IndexOrchestrator
                 }
             }
             _log?.Invoke($"  API surface captured for {projectsWithConsumers.Count} project(s)");
+        }
+
+        FinishPhase();
+
+        if (metrics != null)
+        {
+            // Stop the clock before collecting row metrics so the post-index aggregate queries
+            // (a DISTINCT scan over every reference row) never inflate total_duration_ms.
+            totalStopwatch.Stop();
+            metrics.TotalDurationMs = totalStopwatch.ElapsedMilliseconds;
+            metrics.Rows = new IndexMetricsStore(conn).Collect();
+            metrics.Status = IndexRunStatus.Completed;
         }
 
         _log?.Invoke("Indexing complete.");

@@ -15,5 +15,7 @@
     <Project Path="tests/Sextant.Mcp.Tests/Sextant.Mcp.Tests.csproj" />
     <Project Path="tests/Sextant.Store.Tests/Sextant.Store.Tests.csproj" />
     <Project Path="tests/Sextant.Integration.Tests/Sextant.Integration.Tests.csproj" />
+    <Project Path="tests/Sextant.Benchmarks/Sextant.Benchmarks.csproj" />
+    <Project Path="tests/Sextant.Benchmarks.Tests/Sextant.Benchmarks.Tests.csproj" />
   </Folder>
 </Solution>

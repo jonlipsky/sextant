@@ -6,11 +6,14 @@ namespace Sextant.Store;
 public sealed class IndexDatabase : IDisposable
 {
     private readonly string _connectionString;
+    private readonly string _dbPath;
     private SqliteConnection? _connection;
 
     public IndexDatabase(string dbPath)
     {
-        var dir = Path.GetDirectoryName(Path.GetFullPath(dbPath));
+        _dbPath = Path.GetFullPath(dbPath);
+
+        var dir = Path.GetDirectoryName(_dbPath);
         if (!string.IsNullOrEmpty(dir))
             Directory.CreateDirectory(dir);
 
@@ -20,6 +23,40 @@ public sealed class IndexDatabase : IDisposable
             Mode = SqliteOpenMode.ReadWriteCreate,
             Cache = SqliteCacheMode.Shared
         }.ToString();
+    }
+
+    /// <summary>Absolute path to the main database file.</summary>
+    public string DbPath => _dbPath;
+
+    /// <summary>Current size of the main database file in bytes (0 if it does not exist yet).</summary>
+    public long MainDbBytes => FileLengthOrZero(_dbPath);
+
+    /// <summary>Current size of the write-ahead log in bytes (0 if it does not exist).</summary>
+    public long WalBytes => FileLengthOrZero(_dbPath + "-wal");
+
+    private static long FileLengthOrZero(string path)
+    {
+        try
+        {
+            var info = new FileInfo(path);
+            return info.Exists ? info.Length : 0;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    /// <summary>
+    /// Checkpoints the write-ahead log and truncates it, folding pending WAL pages into
+    /// the main database file so <see cref="MainDbBytes"/> reflects the final size.
+    /// </summary>
+    public void Checkpoint()
+    {
+        var conn = GetConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "PRAGMA wal_checkpoint(TRUNCATE);";
+        cmd.ExecuteNonQuery();
     }
 
     public SqliteConnection GetConnection()
