@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
@@ -13,13 +14,24 @@ public sealed class IndexOrchestrator
     private readonly IndexDatabase _db;
     private readonly Action<string>? _log;
     private readonly bool _useDocumentExtractor;
+    private readonly ExtractionParallelismOptions _parallelism;
 
-    public IndexOrchestrator(IndexDatabase db, Action<string>? log = null, bool useDocumentExtractor = false)
+    public IndexOrchestrator(
+        IndexDatabase db,
+        Action<string>? log = null,
+        bool useDocumentExtractor = false,
+        ExtractionParallelismOptions? parallelism = null)
     {
         _db = db;
         _log = log;
         _useDocumentExtractor = useDocumentExtractor;
+        _parallelism = parallelism ?? ExtractionParallelismOptions.Default;
     }
+
+    /// <summary>One non-generated document paired with its project's compilation, the unit of parallel
+    /// per-document extraction. The semantic model is built inside the worker so each model is used on
+    /// a single thread; the compilation is immutable and safely shared.</summary>
+    private readonly record struct OccurrenceDoc(Compilation Compilation, SyntaxTree Tree);
 
     public async Task IndexSolutionAsync(
         Solution solution,
@@ -238,7 +250,7 @@ public sealed class IndexOrchestrator
         if (_useDocumentExtractor)
         {
             StartPhase("extracting_occurrences");
-            _log?.Invoke("Extracting occurrences (document-oriented)...");
+            _log?.Invoke($"Extracting occurrences (document-oriented, parallelism={_parallelism.MaxParallelism})...");
 
             // Compilation-scoped exact resolution: map a bound occurrence target's containing assembly
             // to its exact indexed (per-TFM) project id. This restores parity with the legacy
@@ -249,58 +261,96 @@ public sealed class IndexOrchestrator
             // one assembly is the target of many occurrences. A null result (metadata / out-of-solution
             // assembly, or a project outside the indexed map) leaves the contribution to fall back to
             // key-only resolution in the persistence loops below.
-            var assemblyProjectCache = new Dictionary<IAssemblySymbol, long?>(SymbolEqualityComparer.Default);
-            long? ResolveTargetProject(IAssemblySymbol assembly)
+            //
+            // The cache is a ConcurrentDictionary because ResolveTargetProject is invoked from the
+            // parallel per-document workers (it stamps each occurrence's exact TargetProjectId). Its
+            // factory — Solution.GetProject over the immutable solution plus a read-only
+            // projectRoslynToId lookup — is deterministic and side-effect-free, so a benign racing
+            // double-computation yields the identical value: thread-safe and determinism-preserving.
+            // It is cleared at each project boundary (below) so it only ever retains assembly symbols
+            // referenced by the current project — all of which are already rooted by that project's
+            // live compilation — keeping the "one compilation live at a time" memory bound intact
+            // (criteria 2 & 6) rather than accumulating every processed project's assemblies.
+            var assemblyProjectCache = new ConcurrentDictionary<IAssemblySymbol, long?>(SymbolEqualityComparer.Default);
+            long? ResolveTargetProject(IAssemblySymbol assembly) =>
+                assemblyProjectCache.GetOrAdd(assembly, a =>
+                    solution.GetProject(a) is { } targetProject
+                    && projectRoslynToId.TryGetValue(targetProject.Id, out var targetPid)
+                        ? targetPid
+                        : null);
+
+            // Pure, CPU-bound per-document extraction run in parallel. Builds the document's semantic
+            // model on the calling worker thread (one model per thread) and walks it once into a
+            // fresh per-document contribution set; the catalog and SQLite are never touched here. The
+            // linked token (not the outer request token) is threaded through so a consumer/worker
+            // fault cancels in-flight analysis, not just externally-requested cancellation.
+            DocumentContributionSet ExtractOne(OccurrenceDoc doc, CancellationToken ct)
             {
-                if (assemblyProjectCache.TryGetValue(assembly, out var cached))
-                    return cached;
-                long? resolved = solution.GetProject(assembly) is { } targetProject
-                                 && projectRoslynToId.TryGetValue(targetProject.Id, out var targetPid)
-                    ? targetPid
-                    : null;
-                assemblyProjectCache[assembly] = resolved;
-                return resolved;
+                var model = doc.Compilation.GetSemanticModel(doc.Tree);
+                var root = doc.Tree.GetRoot(ct);
+                var text = doc.Tree.GetText(ct);
+                var set = new DocumentContributionSet();
+                DocumentSemanticExtractor.ExtractDocument(
+                    root, model, doc.Tree.FilePath, text, set, ResolveTargetProject);
+                return set;
             }
 
-            projectIndex = 0;
+            // Project descriptors in deterministic solution order. Each materializes its compilation and
+            // non-generated documents just-in-time (one project at a time) so completed projects'
+            // compilations/models are released and peak memory stays bounded (criteria 2 & 6).
+            var projectDescriptors =
+                new List<Func<CancellationToken, Task<ProjectExtraction<OccurrenceDoc>>>>();
             foreach (var project in solution.Projects)
             {
                 if (!processSet.Contains(project.Id)) continue;
+                if (!projectRoslynToId.TryGetValue(project.Id, out var ownerProjectId)) continue;
+
+                var captured = project;
+                var owner = ownerProjectId;
+                projectDescriptors.Add(async ct =>
+                {
+                    // Release the previous project's cached assembly symbols before extracting this
+                    // one. The producer invokes descriptors sequentially with no worker active (the
+                    // prior project's Parallel.ForEachAsync has completed and this project's has not
+                    // started), and the consumer never calls ResolveTargetProject (targets are already
+                    // stamped into the contribution records), so clearing here races nothing.
+                    assemblyProjectCache.Clear();
+                    var compilation = await captured.GetCompilationAsync(ct);
+                    var docs = new List<OccurrenceDoc>();
+                    if (compilation != null)
+                    {
+                        foreach (var syntaxTree in compilation.SyntaxTrees)
+                        {
+                            if (SymbolExtractor.IsGeneratedFile(syntaxTree.FilePath))
+                                continue;
+                            docs.Add(new OccurrenceDoc(compilation, syntaxTree));
+                        }
+                    }
+                    return new ProjectExtraction<OccurrenceDoc>(owner, captured.Name, docs);
+                });
+            }
+
+            // Single-consumer persistence: the only stage that touches the catalog and the SQLite
+            // writer. Runs one project at a time, in the deterministic order the producer enqueued
+            // them, so target resolution (and AmbiguousEdgeBindings counting) and rowid assignment stay
+            // single-threaded and deterministic.
+            var occurrenceProjectIndex = 0;
+            Task PersistProject(ProjectContributions project, CancellationToken persistToken)
+            {
+                persistToken.ThrowIfCancellationRequested();
                 EnterProject();
-                projectIndex++;
+                occurrenceProjectIndex++;
                 progress?.Report(new IndexingProgress
                 {
                     Phase = "extracting_occurrences",
-                    Description = $"Extracting occurrences from {project.Name}",
+                    Description = $"Persisting occurrences from {project.Name}",
                     CurrentProject = project.Name,
-                    ProjectIndex = projectIndex,
+                    ProjectIndex = occurrenceProjectIndex,
                     ProjectCount = totalProjects
                 });
-                var compilation = await project.GetCompilationAsync(cancellationToken);
-                if (compilation == null) continue;
 
-                long? ownerProjectId = projectRoslynToId.TryGetValue(project.Id, out var ownerPid)
-                    ? ownerPid
-                    : null;
-                if (ownerProjectId == null) continue;
-
-                // One contribution set per project so partial-type relationships across files coalesce
-                // and repeated same-line occurrences dedup (acceptance criterion 5). All processed
-                // projects' symbols are already in the catalog (Phase 2), so cross-project targets
-                // resolve regardless of the order projects are visited here.
-                var contributions = new DocumentContributionSet();
-                foreach (var syntaxTree in compilation.SyntaxTrees)
-                {
-                    ThrowIfCancelled();
-                    if (SymbolExtractor.IsGeneratedFile(syntaxTree.FilePath))
-                        continue;
-
-                    var semanticModel = compilation.GetSemanticModel(syntaxTree);
-                    var root = await syntaxTree.GetRootAsync(cancellationToken);
-                    var text = await syntaxTree.GetTextAsync(cancellationToken);
-                    DocumentSemanticExtractor.ExtractDocument(
-                        root, semanticModel, syntaxTree.FilePath, text, contributions, ResolveTargetProject);
-                }
+                long ownerProjectId = project.OwnerProjectId;
+                var contributions = project.Contributions;
 
                 foreach (var rel in contributions.Relationships)
                 {
@@ -331,7 +381,7 @@ public sealed class IndexOrchestrator
                     referenceStore.Insert(referenceInsert, new ReferenceInfo
                     {
                         SymbolId = targetId,
-                        InProjectId = ownerProjectId.Value,
+                        InProjectId = ownerProjectId,
                         FilePath = reference.FilePath,
                         Line = reference.Line,
                         ContextSnippet = reference.Snippet,
@@ -382,8 +432,15 @@ public sealed class IndexOrchestrator
                                  "region(s) (extraction completeness diagnostic)");
 
                 _log?.Invoke($"  {project.Name}: occurrences extracted");
+                // Honour cancellation before publishing this project's batch so a mid-run cancel drops
+                // the uncommitted rows (rolled back on session dispose) instead of committing them.
+                persistToken.ThrowIfCancellationRequested();
                 session.CommitBatch();
+                return Task.CompletedTask;
             }
+
+            await ParallelExtractionPipeline.RunAsync(
+                projectDescriptors, ExtractOne, PersistProject, _parallelism, cancellationToken);
         }
 
         // Phase 3: Extract relationships (legacy declaration-driven path; skipped when the

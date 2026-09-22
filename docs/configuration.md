@@ -11,13 +11,17 @@ Create a `sextant.json` file at your repository root to customize behavior:
   "fts_max_results": 20,
   "solutions": ["src/App.sln"],
   "auto_spawn_daemon": true,
-  "document_extractor": true
+  "document_extractor": true,
+  "max_parallelism": 0,
+  "extraction_queue_capacity": 0
 }
 ```
 
 All fields are optional — Sextant uses sensible defaults.
 
 `document_extractor` (default `true`) selects the extraction engine. When `true` (the default), indexing uses the Phase 5 **document-oriented** extractor (a single usage-site pass per document) instead of the legacy declaration-driven `FindReferencesAsync` path. Set it to `false` to fall back to the legacy extractor, which is retained as an emergency fallback; see [indexing.md](indexing.md#document-oriented-extractor-phase-5-feature-flagged).
+
+`max_parallelism` and `extraction_queue_capacity` (Phase 6) tune the document extractor's bounded parallel pipeline. Per-document analysis runs across up to `max_parallelism` workers; the completed per-project contribution sets flow to the single SQLite writer through a bounded channel of capacity `extraction_queue_capacity`, which applies backpressure and bounds outstanding contribution memory. Both default to `0` (auto): `max_parallelism` resolves to `min(processorCount, 8)` and the queue capacity to a small multiple of the resolved parallelism. A positive `max_parallelism` is honored but clamped to the processor count so a misconfiguration cannot oversubscribe the CPU. The pipeline preserves deterministic output — the canonical index is byte-for-byte identical to a single-threaded run regardless of the parallelism level. These knobs only affect the document extractor; the legacy fallback is unaffected.
 
 ### Environment Variable Overrides
 
@@ -30,6 +34,8 @@ Environment variables take precedence over `sextant.json`:
 | `SEXTANT_FTS_MAX` | Max FTS search results | `20` |
 | `SEXTANT_AUTO_SPAWN_DAEMON` | Auto-spawn daemon from MCP server | `true` (set `false` or `0` to disable) |
 | `SEXTANT_DOCUMENT_EXTRACTOR` | Use the Phase 5 document-oriented extractor | `true` (set `false`/`0` for the legacy fallback) |
+| `SEXTANT_MAX_PARALLELISM` | Document-extractor analysis worker cap | `0` (auto: `min(cores, 8)`) |
+| `SEXTANT_EXTRACTION_QUEUE_CAPACITY` | Bounded writer-channel capacity (contribution sets) | `0` (auto: small multiple of parallelism) |
 
 ### Runtime Output
 

@@ -93,6 +93,7 @@ public static class Program
         var largeMethods = 6;
         string? machine = null;
         var documentExtractor = false;
+        var maxParallelism = 0;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -111,6 +112,7 @@ public static class Program
                 case "--large-methods": largeMethods = int.Parse(RequireValue(args, ref i)); break;
                 case "--machine": machine = RequireValue(args, ref i); break;
                 case "--document-extractor": documentExtractor = true; break;
+                case "--max-parallelism": maxParallelism = int.Parse(RequireValue(args, ref i)); break;
                 default: throw new ArgumentException($"unknown argument '{args[i]}'");
             }
         }
@@ -129,6 +131,7 @@ public static class Program
             LargeMethods = largeMethods,
             MachineDescription = machine,
             UseDocumentExtractor = documentExtractor,
+            MaxParallelism = maxParallelism,
             Log = msg => Console.WriteLine($"  {msg}")
         };
         return (options, outDir);
@@ -168,6 +171,7 @@ public static class Program
               --large-types <n>     types per project for the large corpus (default: 8)
               --large-methods <n>   methods per type for the large corpus (default: 6)
               --document-extractor  use the Phase 5 document-oriented extractor (default: legacy)
+              --max-parallelism <n> analysis worker cap for the document extractor (0 = auto)
               --machine <label>     machine label recorded in the report
               -h, --help            show this help
             """);

@@ -111,6 +111,26 @@ public sealed class DocumentContributionSet
         _relationships.Add(r);
         return true;
     }
+
+    /// <summary>
+    /// Folds another document's contributions into this (project-level) set, replaying the source's
+    /// relationships, references, and calls in their emission order through this set's first-wins
+    /// dedup. Merging the per-document sets in ascending document ordinal reproduces the sequential
+    /// single-sink append byte-for-byte: each list's internal order is preserved and cross-document
+    /// dedup (only relationships can collapse across documents — reference/call keys include the file)
+    /// resolves identically to the sequential path. This is what lets per-document extraction run in
+    /// parallel while the persisted output stays independent of task completion order.
+    /// </summary>
+    public void MergeFrom(DocumentContributionSet other)
+    {
+        foreach (var relationship in other._relationships)
+            AddRelationship(relationship);
+        foreach (var reference in other._references)
+            AddReference(reference);
+        foreach (var call in other._calls)
+            AddCall(call);
+        CompletenessDiagnostics += other.CompletenessDiagnostics;
+    }
 }
 
 /// <summary>

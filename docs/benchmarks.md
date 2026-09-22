@@ -46,6 +46,8 @@ inside the Sextant source tree. Generation is byte-for-byte deterministic.
 | `--large-projects <n>` | `25` | Project count for the `large` corpus. |
 | `--large-types <n>` | `8` | Types per project for the `large` corpus. |
 | `--large-methods <n>` | `6` | Methods per type for the `large` corpus. |
+| `--document-extractor` | off | Use the Phase 5 document-oriented extractor (required to exercise the Phase 6 parallel pipeline). |
+| `--max-parallelism <n>` | `0` | Document-extractor analysis worker cap (`0` = auto: `min(cores, 8)`). Drive the parallelism sweep with `1`/`2`/`4`/`8`/`0`. |
 | `--machine <label>` | machine name | Machine label recorded in the report (cleared when redacted). |
 
 ### Examples
@@ -170,6 +172,46 @@ hybrid isolation across generations is Phase 9 (immutable snapshots). Two caveat
 `wal_autocheckpoint` is a trigger, not a hard cap (peak WAL ≈ one active batch, not a strict ceiling),
 and a long-lived concurrent reader pins the WAL tail and defers `wal_checkpoint(TRUNCATE)` — the bound
 holds under the normal short-reader workload.
+
+## Phase 6 result — bounded parallel extraction
+
+Phase 6 parallelizes the document extractor's per-document analysis behind a bounded
+producer→single-consumer pipeline (`ParallelExtractionPipeline`): analysis workers extract
+per-document contributions in parallel (capped by `--max-parallelism`), each project's per-document
+sets are merged by ascending document ordinal into one deterministic set, and a **single** consumer
+drains a bounded channel and persists through the Phase 3 writer — the only stage that touches
+SQLite. Persistence order follows project order, so the canonical index is byte-for-byte identical to
+a single-threaded run (validated by `ParallelDeterminismTests`).
+
+Only the `extracting_occurrences` phase is parallelized; the symbol-declaration phase is unchanged.
+The sweep below indexes a generated corpus (`--corpus large --document-extractor --large-projects 20
+--large-types 16 --large-methods 12`, ~4,160 symbols) at parallelism `1/2/4/8/auto` on a 24-core
+machine (so `auto` resolves to 8). Absolute timings vary by hardware; the **occurrence-phase speedup
+and the flat peak memory** are the invariants.
+
+| Parallelism | Occurrence phase | Occ. speedup | Full index total | Peak working set | Peak managed |
+|---|--:|--:|--:|--:|--:|
+| 1 | 4,842 ms | 1.00× | 11,639 ms | 205.9 MB | 45.0 MB |
+| 2 | 3,924 ms | 1.23× | 10,229 ms | 200.8 MB | 46.2 MB |
+| 4 | 2,326 ms | 2.08× | 8,738 ms | 197.8 MB | 47.5 MB |
+| 8 | 1,644 ms | 2.95× | 8,065 ms | 201.0 MB | 49.7 MB |
+| auto (8) | 1,634 ms | 2.96× | 8,459 ms | 201.0 MB | 50.1 MB |
+
+At default (auto) parallelism the parallelized phase runs **~2.95× faster** and the full index
+**~1.44× faster** (the remainder is the non-parallelized symbol phase, ~6.1 s here — an Amdahl
+ceiling, not a pipeline limit), while **peak working set stays flat (~200 MB)** and peak managed heap
+grows only ~10% from P=1 to P=8. This is the criterion-6 guarantee: default parallelism improves
+runtime **without** exceeding the memory budget, because the producer holds one project's compilation
+at a time and the bounded channel caps outstanding contribution sets. Reproduce with:
+
+```bash
+for P in 1 2 4 8 0; do
+  dotnet run --project tests/Sextant.Benchmarks -c Release -- \
+    --corpus large --document-extractor --max-parallelism $P --no-incremental \
+    --large-projects 20 --large-types 16 --large-methods 12 \
+    --out ./benchmark-results/p$P --work ./scratch/p$P
+done
+```
 
 ## Redaction guarantees
 
