@@ -84,6 +84,17 @@ public sealed class SextantConfiguration
     /// </summary>
     public int ReconcileIntervalSeconds { get; set; } = 30;
 
+    /// <summary>
+    /// Platform-routing policy (Phase 15): how the standalone index service routes platform-specific
+    /// project graphs across worker capabilities. <c>auto</c> (default) escalates a project to a native
+    /// Windows/macOS worker only when Linux evaluation is demonstrably insufficient AND a compatible
+    /// worker exists; <c>linux_only</c> never leaves the default (Linux) worker. This is an orchestration
+    /// choice consumed only by the multi-worker service — a local/single-node index ignores it and always
+    /// evaluates in-process — so it is deliberately NOT folded into the configuration hash. Overridable
+    /// via <c>platform_routing</c> in <c>sextant.json</c> or the <c>SEXTANT_PLATFORM_ROUTING</c> env var.
+    /// </summary>
+    public string PlatformRouting { get; set; } = "auto";
+
     private static readonly Regex ValidProfileName = new(@"^[a-zA-Z0-9_-]+$", RegexOptions.Compiled);
 
     public string LogsPath => Path.Combine(
@@ -193,6 +204,8 @@ public sealed class SextantConfiguration
                             config.ExtractionQueueCapacity = fileConfig.ExtractionQueueCapacity.Value;
                         if (fileConfig.ReconcileIntervalSeconds.HasValue)
                             config.ReconcileIntervalSeconds = fileConfig.ReconcileIntervalSeconds.Value;
+                        if (fileConfig.PlatformRouting != null)
+                            config.PlatformRouting = fileConfig.PlatformRouting;
                         if (fileConfig.IndexingProfile != null)
                             config.IndexingProfile = fileConfig.IndexingProfile;
                         if (fileConfig.GeneratedSourcePolicy != null)
@@ -285,6 +298,10 @@ public sealed class SextantConfiguration
         if (int.TryParse(reconcileInterval, out var interval))
             config.ReconcileIntervalSeconds = interval;
 
+        var platformRouting = Environment.GetEnvironmentVariable("SEXTANT_PLATFORM_ROUTING");
+        if (!string.IsNullOrWhiteSpace(platformRouting))
+            config.PlatformRouting = platformRouting;
+
         var indexingProfile = Environment.GetEnvironmentVariable("SEXTANT_INDEXING_PROFILE");
         if (!string.IsNullOrEmpty(indexingProfile))
             config.IndexingProfile = indexingProfile;
@@ -371,6 +388,9 @@ public sealed class SextantConfiguration
 
         [JsonPropertyName("reconcile_interval_seconds")]
         public int? ReconcileIntervalSeconds { get; set; }
+
+        [JsonPropertyName("platform_routing")]
+        public string? PlatformRouting { get; set; }
 
         [JsonPropertyName("indexing_profile")]
         public string? IndexingProfile { get; set; }

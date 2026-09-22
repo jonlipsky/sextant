@@ -18,7 +18,24 @@ internal static class RetentionHandler
         }
 
         using var indexDb = new Store.IndexDatabase(dbPath, Store.IndexWriteOptions.FromConfiguration(config));
-        indexDb.RunMigrations();
+
+        // #38: retention is a WRITER. Take the single-writer lease before touching the database so a
+        // dry-run or --execute can never race a live daemon/service writer. Migrate WITHOUT recovery
+        // first (the writer_lease table must exist to acquire), then acquire, then recover — recovery
+        // must not run while another writer owns a staging generation.
+        indexDb.RunMigrations(recover: false);
+
+        using var lease = Store.WriterLease.TryAcquire(dbPath, $"retention:pid={Environment.ProcessId}");
+        if (lease == null)
+        {
+            var holder = Store.WriterLease.GetCurrent(indexDb.GetConnection())?.Holder ?? "another writer";
+            Console.Error.WriteLine(
+                $"Refusing to run retention: {holder} currently holds the writer lease. " +
+                "Stop the daemon/service (or wait for its lease to expire) and retry.");
+            return 1;
+        }
+
+        indexDb.Recover();
 
         var conn = indexDb.GetConnection();
         var service = new RetentionService(conn, config.Retention);
@@ -41,6 +58,8 @@ internal static class RetentionHandler
             Console.WriteLine($"    #{g.Id} [{g.Status}]{ProfileSuffix(g)} — {g.Reason}");
 
         Console.WriteLine();
+        Console.WriteLine($"  Snapshots GC'd:                {report.SnapshotsDeleted}");
+        Console.WriteLine($"  Snapshot project-versions GC'd:{report.SnapshotProjectVersionsDeleted}");
         Console.WriteLine($"  API-surface snapshots deleted: {report.ApiSnapshotsDeleted}");
         Console.WriteLine($"  Source blobs deleted:          {report.FileVersionsDeleted}");
         Console.WriteLine($"  Reclaimed:                     {FormatBytes(report.ReclaimedBytes)}");

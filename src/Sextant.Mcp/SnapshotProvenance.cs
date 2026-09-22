@@ -1,4 +1,5 @@
 using Sextant.Core;
+using Sextant.Core.Platform;
 using Sextant.Store;
 
 namespace Sextant.Mcp;
@@ -48,14 +49,21 @@ public sealed record IncompatibilityInfo(string Dimension, string Expected, stri
 /// Defaults to the live process values; tests inject fabricated values to simulate binary/config drift
 /// without rebuilding an index. Read-time enforcement complements the Phase-8 index-time config hash:
 /// the index-time hash only guards the generation being written, so a later read federating an older base
-/// snapshot needs its own compatibility verdict.
+/// snapshot needs its own compatibility verdict. <see cref="CapabilityFingerprint"/> is the Phase-15
+/// worker-capability fingerprint of the running node (its default placement), added as a trailing
+/// optional so existing callers/tests are source-compatible.
 /// </summary>
-public sealed record CompatibilityInputs(int SchemaVersion, string AnalyzerVersion, string ToolchainFingerprint)
+public sealed record CompatibilityInputs(
+    int SchemaVersion,
+    string AnalyzerVersion,
+    string ToolchainFingerprint,
+    string? CapabilityFingerprint = null)
 {
     public static CompatibilityInputs Current => new(
         IndexDatabase.LatestSchemaVersion,
         IndexConfigurationHash.AnalyzerVersion,
-        Core.ToolchainFingerprint.Current);
+        Core.ToolchainFingerprint.Current,
+        WorkerCapability.LocalDefault.Fingerprint);
 }
 
 /// <summary>
@@ -86,6 +94,16 @@ public static class ReadCompatibility
             !string.Equals(toolchain, running.ToolchainFingerprint, StringComparison.Ordinal))
             issues.Add(new IncompatibilityInfo(
                 "toolchain", running.ToolchainFingerprint, toolchain));
+
+        // Phase-15 worker-capability drift: a snapshot produced under a DIFFERENT worker capability set
+        // (e.g. built with the Apple workloads on a macOS worker) must not be silently reused under an
+        // incompatible running capability (criterion 5). Both sides must be known; a null on either side
+        // is "unknown" (a local snapshot leaves capability null), never a mismatch — matching toolchain.
+        if (snapshot.CapabilityFingerprint is { Length: > 0 } capability &&
+            running.CapabilityFingerprint is { Length: > 0 } runningCapability &&
+            !string.Equals(capability, runningCapability, StringComparison.Ordinal))
+            issues.Add(new IncompatibilityInfo(
+                "capability", runningCapability, capability));
 
         return issues;
     }

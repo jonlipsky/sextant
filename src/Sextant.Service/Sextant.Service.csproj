@@ -1,0 +1,20 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Sextant.Service.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Sextant.Core\Sextant.Core.csproj" />
+    <ProjectReference Include="..\Sextant.Store\Sextant.Store.csproj" />
+    <ProjectReference Include="..\Sextant.Indexer\Sextant.Indexer.csproj" />
+    <ProjectReference Include="..\Sextant.Mcp\Sextant.Mcp.csproj" />
+  </ItemGroup>
+
+</Project>

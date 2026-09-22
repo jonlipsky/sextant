@@ -1,0 +1,41 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="8.0.0">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.3.0" />
+    <PackageReference Include="MSTest.TestFramework" Version="4.1.0" />
+    <PackageReference Include="MSTest.TestAdapter" Version="4.1.0" />
+    <PackageReference Include="Microsoft.AspNetCore.TestHost" Version="10.0.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Microsoft.VisualStudio.TestTools.UnitTesting" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Sextant.Service\Sextant.Service.csproj" />
+    <ProjectReference Include="..\..\src\Sextant.Service.Host\Sextant.Service.Host.csproj" />
+    <!-- Core libraries referenced so the criterion-6 boundary test can assert none depend on the service. -->
+    <ProjectReference Include="..\..\src\Sextant.Core\Sextant.Core.csproj" />
+    <ProjectReference Include="..\..\src\Sextant.Store\Sextant.Store.csproj" />
+    <ProjectReference Include="..\..\src\Sextant.Indexer\Sextant.Indexer.csproj" />
+    <ProjectReference Include="..\..\src\Sextant.Daemon\Sextant.Daemon.csproj" />
+    <ProjectReference Include="..\..\src\Sextant.Mcp\Sextant.Mcp.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\Shared\SqliteTestDatabase.cs" Link="Shared\SqliteTestDatabase.cs" />
+    <Using Include="Sextant.TestSupport" />
+  </ItemGroup>
+
+</Project>

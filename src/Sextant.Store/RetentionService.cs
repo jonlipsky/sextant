@@ -29,6 +29,13 @@ public sealed record RetentionReport
     public IReadOnlyList<RetentionGeneration> Deleted { get; init; } = [];
     public int ApiSnapshotsDeleted { get; init; }
     public int FileVersionsDeleted { get; init; }
+
+    /// <summary>Immutable snapshot rows reclaimed by snapshot-data GC (issue #46), with their catalog metadata.</summary>
+    public int SnapshotsDeleted { get; init; }
+
+    /// <summary>Project-version rows (and their cascaded symbols/occurrences/comments/api rows) reclaimed by snapshot-data GC (issue #46).</summary>
+    public int SnapshotProjectVersionsDeleted { get; init; }
+
     public long ReclaimedBytes { get; init; }
 }
 
@@ -127,14 +134,17 @@ public sealed class RetentionService
         }
 
         var deletableCommits = DeletableApiCommits(protections);
-        var deletableFileVersionIds = _policy.PruneSupersededSourceBlobs
-            ? OrphanFileVersionIds(protections)
-            : [];
+
+        // Snapshot-data GC (issue #46): reclaim the semantic rows owned by snapshots that no retained
+        // generation, branch pointer, overlay base, or retained consumer still references (issue #54).
+        var orphanedSnapshotIds = OrphanedSnapshotIds(deletableRunIds);
 
         long pageSize = 0;
         long freelistBefore = 0;
         var apiDeleted = 0;
         var fileVersionsDeleted = 0;
+        var snapshotProjectsDeleted = 0;
+        var snapshotsDeleted = 0;
         long reclaimed = 0;
 
         Exec("BEGIN IMMEDIATE;");
@@ -149,8 +159,14 @@ public sealed class RetentionService
             foreach (var runId in deletableRunIds)
                 runStore.DeleteRun(runId);
 
+            (snapshotProjectsDeleted, snapshotsDeleted) = DeleteSnapshotData(orphanedSnapshotIds);
+
             apiDeleted = DeleteApiCommits(deletableCommits);
-            fileVersionsDeleted = DeleteFileVersions(deletableFileVersionIds);
+
+            // Blob prune runs LAST and computes orphans inside the transaction so it reclaims blobs newly
+            // orphaned by the snapshot-data GC above too (bounded + protected-set-aware — issue #37).
+            if (_policy.PruneSupersededSourceBlobs)
+                fileVersionsDeleted = PruneOrphanFileVersions(protections);
 
             long freelistAfter = ScalarLong("PRAGMA freelist_count;");
             reclaimed = Math.Max(0, freelistAfter - freelistBefore) * pageSize;
@@ -178,6 +194,8 @@ public sealed class RetentionService
             Deleted = deletedGenerations,
             ApiSnapshotsDeleted = apiDeleted,
             FileVersionsDeleted = fileVersionsDeleted,
+            SnapshotsDeleted = snapshotsDeleted,
+            SnapshotProjectVersionsDeleted = snapshotProjectsDeleted,
             ReclaimedBytes = reclaimed
         };
     }
@@ -239,38 +257,140 @@ public sealed class RetentionService
         return deleted;
     }
 
-    /// <summary>Source blobs referenced by no live symbol/occurrence/comment, minus protected blobs.</summary>
-    private List<long> OrphanFileVersionIds(RetentionProtectionSet protections)
+    /// <summary>
+    /// The immutable snapshots whose semantic DATA a retention pass may reclaim (issue #46): every
+    /// snapshot NOT kept alive by a retained generation, a branch pointer, an overlay base it is layered
+    /// on, or a submodule provider a retained consumer still references (issue #54). Computed as the
+    /// complement of the RETAINED-snapshot closure so a shared provider/base is never orphaned while any
+    /// retained snapshot still reads it. Pending snapshots are excluded (a live writer may own them).
+    /// </summary>
+    private List<long> OrphanedSnapshotIds(List<long> deletableRunIds)
     {
-        var ids = new List<long>();
-        using (var cmd = _connection.CreateCommand())
+        var snapshots = new SnapshotStore(_connection).GetSnapshotsForRetention();
+        if (snapshots.Count == 0) return [];
+
+        var snapshotStore = new SnapshotStore(_connection);
+        var deletableRuns = deletableRunIds.ToHashSet();
+        var branchPointed = snapshotStore.GetBranchPointedSnapshotIds().ToHashSet();
+        var edges = snapshotStore.GetSnapshotDependencyEdges();
+
+        // Seed the retained set with every snapshot on a generation this pass is NOT deleting (servable,
+        // within the keep window, or in-progress), plus pending snapshots and any branch-pointed head.
+        var retained = new HashSet<long>();
+        foreach (var s in snapshots)
         {
-            cmd.CommandText = """
-                SELECT id FROM file_versions
-                WHERE id NOT IN (SELECT file_version_id FROM symbols WHERE file_version_id IS NOT NULL)
-                  AND id NOT IN (SELECT file_version_id FROM occurrences)
-                  AND id NOT IN (SELECT file_version_id FROM comments WHERE file_version_id IS NOT NULL);
-                """;
-            using var reader = cmd.ExecuteReader();
-            while (reader.Read())
-                ids.Add(reader.GetInt64(0));
+            var onRetainedGeneration = s.runId is long rid && !deletableRuns.Contains(rid);
+            if (s.status == SnapshotStatus.Pending || onRetainedGeneration || branchPointed.Contains(s.id))
+                retained.Add(s.id);
         }
 
-        ids.RemoveAll(protections.IsFileVersionProtected);
-        return ids;
+        // Transitively expand: a retained overlay pins its base; a retained consumer pins every provider
+        // it references (issue #54). Iterate to a fixpoint so provider/base chains are fully covered.
+        var baseOf = new Dictionary<long, long>();
+        foreach (var s in snapshots)
+            if (s.baseSnapshotId is long b)
+                baseOf[s.id] = b;
+
+        var providersOf = new Dictionary<long, List<long>>();
+        foreach (var (consumer, provider) in edges)
+            (providersOf.TryGetValue(consumer, out var list) ? list : providersOf[consumer] = []).Add(provider);
+
+        var frontier = new Queue<long>(retained);
+        while (frontier.Count > 0)
+        {
+            var id = frontier.Dequeue();
+            if (baseOf.TryGetValue(id, out var baseId) && retained.Add(baseId))
+                frontier.Enqueue(baseId);
+            if (providersOf.TryGetValue(id, out var provs))
+                foreach (var p in provs)
+                    if (retained.Add(p))
+                        frontier.Enqueue(p);
+        }
+
+        var orphaned = new List<long>();
+        foreach (var s in snapshots)
+            if (s.status != SnapshotStatus.Pending && !retained.Contains(s.id))
+                orphaned.Add(s.id);
+        return orphaned;
     }
 
-    private int DeleteFileVersions(List<long> ids)
+    /// <summary>
+    /// Reclaims the project-version rows owned by the orphaned snapshots (and their cascaded
+    /// symbols/occurrences/comments/files/api rows via the Phase-7 <c>projects</c> cascade), then deletes
+    /// the now-empty snapshot catalog rows (cascading <c>snapshot_projects</c>/<c>snapshot_dependencies</c>).
+    /// Bounded: set-based deletes in fixed-size id chunks rather than one statement per row (issue #46/#37).
+    /// Returns (project-versions deleted, snapshot rows deleted).
+    /// </summary>
+    private (int projectVersions, int snapshots) DeleteSnapshotData(List<long> orphanedSnapshotIds)
     {
-        var deleted = 0;
-        foreach (var id in ids)
+        if (orphanedSnapshotIds.Count == 0) return (0, 0);
+
+        var projectsDeleted = 0;
+        var snapshotsDeleted = 0;
+        foreach (var chunk in Chunk(orphanedSnapshotIds, 256))
+        {
+            var inList = string.Join(",", chunk);
+
+            using (var projCmd = _connection.CreateCommand())
+            {
+                projCmd.CommandText = $"DELETE FROM projects WHERE snapshot_id IN ({inList});";
+                projectsDeleted += projCmd.ExecuteNonQuery();
+            }
+
+            using var snapCmd = _connection.CreateCommand();
+            snapCmd.CommandText = $"DELETE FROM snapshots WHERE id IN ({inList});";
+            snapshotsDeleted += snapCmd.ExecuteNonQuery();
+        }
+        return (projectsDeleted, snapshotsDeleted);
+    }
+
+    /// <summary>
+    /// Prunes source blobs referenced by no live symbol/occurrence/comment (bounded, protected-set-aware —
+    /// issue #37). When no blob is protected (the common case) this is a single set-based DELETE; when a
+    /// provider protects specific blobs it materializes the orphan set, removes the protected ids, and
+    /// deletes the rest in fixed-size chunks. Returns the number of blobs pruned.
+    /// </summary>
+    private int PruneOrphanFileVersions(RetentionProtectionSet protections)
+    {
+        const string orphanPredicate = """
+            id NOT IN (SELECT file_version_id FROM symbols WHERE file_version_id IS NOT NULL)
+              AND id NOT IN (SELECT file_version_id FROM occurrences)
+              AND id NOT IN (SELECT file_version_id FROM comments WHERE file_version_id IS NOT NULL)
+            """;
+
+        if (protections.FileVersions.Count == 0)
         {
             using var cmd = _connection.CreateCommand();
-            cmd.CommandText = "DELETE FROM file_versions WHERE id = @id;";
-            cmd.Parameters.AddWithValue("@id", id);
+            cmd.CommandText = $"DELETE FROM file_versions WHERE {orphanPredicate};";
+            return cmd.ExecuteNonQuery();
+        }
+
+        var ids = new List<long>();
+        using (var select = _connection.CreateCommand())
+        {
+            select.CommandText = $"SELECT id FROM file_versions WHERE {orphanPredicate};";
+            using var reader = select.ExecuteReader();
+            while (reader.Read())
+            {
+                var id = reader.GetInt64(0);
+                if (!protections.IsFileVersionProtected(id)) ids.Add(id);
+            }
+        }
+
+        var deleted = 0;
+        foreach (var chunk in Chunk(ids, 256))
+        {
+            using var cmd = _connection.CreateCommand();
+            cmd.CommandText = $"DELETE FROM file_versions WHERE id IN ({string.Join(",", chunk)});";
             deleted += cmd.ExecuteNonQuery();
         }
         return deleted;
+    }
+
+    private static IEnumerable<IReadOnlyList<long>> Chunk(List<long> ids, int size)
+    {
+        for (var i = 0; i < ids.Count; i += size)
+            yield return ids.GetRange(i, Math.Min(size, ids.Count - i));
     }
 
     private long ScalarLong(string sql)
