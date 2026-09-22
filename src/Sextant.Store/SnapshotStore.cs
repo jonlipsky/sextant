@@ -425,6 +425,59 @@ public sealed class SnapshotStore(SqliteConnection connection)
         cmd.ExecuteNonQuery();
     }
 
+    /// <summary>The control-plane head sequence a branch pointer has advanced to (issue #84), or null when
+    /// no sequence-bearing ensure has advanced it yet (every branch advanced only by the local path).</summary>
+    public long? GetBranchHeadSequence(long branchId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT head_sequence FROM branches WHERE id = @id;";
+        cmd.Parameters.AddWithValue("@id", branchId);
+        return cmd.ExecuteScalar() is long seq ? seq : null;
+    }
+
+    /// <summary>Records the control-plane head sequence a branch pointer has advanced to (issue #84).</summary>
+    public void SetBranchHeadSequence(long branchId, long sequence)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "UPDATE branches SET head_sequence = @seq WHERE id = @id;";
+        cmd.Parameters.AddWithValue("@seq", sequence);
+        cmd.Parameters.AddWithValue("@id", branchId);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// Forward-only branch-pointer advance for the SERVICE ensure path (issue #84). Encapsulates the whole
+    /// gate so it is unit-testable and shared by the orchestrator's <c>AdvanceBranchToSnapshot</c>:
+    /// <list type="bullet">
+    /// <item><paramref name="headSequence"/> is <c>null</c> (the local CLI/daemon path, and every non-service
+    /// caller): the pointer advances UNCONDITIONALLY and the previous target is superseded — byte-identical
+    /// to the pre-#84 behavior; <c>head_sequence</c> is never written.</item>
+    /// <item><paramref name="headSequence"/> is present and strictly greater than the branch's stored
+    /// sequence (or the branch has none yet): the pointer advances to <paramref name="snapshotId"/>, the
+    /// previous target is superseded, and the new sequence is stored.</item>
+    /// <item><paramref name="headSequence"/> is present and less-than-or-equal to the stored sequence: an
+    /// out-of-order/older ensure — the pointer and the previous target are left UNTOUCHED (no regression),
+    /// and the immutable snapshot is ensured/attached elsewhere. Returns <c>false</c>.</item>
+    /// </list>
+    /// Runs on the caller's connection so a full index advances the branch inside the same transaction that
+    /// publishes the snapshot. Returns <c>true</c> when the pointer advanced.
+    /// </summary>
+    public bool AdvanceBranchPointerForwardOnly(long branchId, long snapshotId, long? headSequence, long now)
+    {
+        if (headSequence is long seq)
+        {
+            if (GetBranchHeadSequence(branchId) is long stored && seq <= stored)
+                return false;
+            SetBranchHeadSequence(branchId, seq);
+        }
+
+        var previousSnapshot = GetBranchSnapshotId(branchId);
+        SetBranchPointer(branchId, snapshotId, now);
+        if (previousSnapshot is long prev && prev != snapshotId)
+            MarkStatus(prev, SnapshotStatus.Superseded);
+        return true;
+    }
+
     /// <summary>
     /// Makes <paramref name="keepBranchId"/> the single default branch for its repository by clearing
     /// <c>is_default</c> on every sibling. A full index marks the checked-out branch it just published as

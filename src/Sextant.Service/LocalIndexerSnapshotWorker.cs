@@ -89,18 +89,7 @@ public sealed class LocalIndexerSnapshotWorker(
                 "Checkout provisioning is orchestrated separately (Phase 14); this node indexes existing checkouts only.");
         }
 
-        var context = new SnapshotContext
-        {
-            RepositoryRemoteUrl = request.RepositoryRemoteUrl,
-            CommitSha = request.CommitSha,
-            TreeSha = request.TreeSha,
-            BranchName = request.BranchName ?? "main",
-            IsDefaultBranch = request.BranchName is null,
-            // Stamp the producing node's capability fingerprint (Phase 15) so the published snapshot's
-            // identity + provenance record what evaluated it. Null when unset — an ordinary local index
-            // that never routes — keeping the identity byte-identical to the pre-Phase-15 path (CRITICAL 2).
-            CapabilityFingerprint = capability?.Fingerprint
-        };
+        var context = CreateSnapshotContext(request, capability);
 
         // The untrusted region: loading the solution EVALUATES its MSBuild projects (arbitrary imported
         // targets / SDK resolvers / inline tasks), so — private repo or not — it runs under the evaluation
@@ -151,4 +140,28 @@ public sealed class LocalIndexerSnapshotWorker(
             return SnapshotWorkResult.Failed(ex.Message);
         }
     }
+
+    /// <summary>
+    /// Builds the <see cref="SnapshotContext"/> the orchestrator publishes the ensured snapshot against.
+    /// This is the ONE seam that carries the service ensure request's optional monotonic
+    /// <see cref="EnsureSnapshotRequest.BranchHeadSequence"/> into the orchestrator so the branch advance
+    /// becomes forward-only on the service path (issue #84); a null sequence flows through unchanged, so a
+    /// non-sequence ensure (and every local CLI/daemon run, which never reaches this worker) keeps the
+    /// unconditional-advance behavior byte-for-byte. Internal + static so it is unit-testable without a
+    /// real checkout/MSBuild.
+    /// </summary>
+    internal static SnapshotContext CreateSnapshotContext(EnsureSnapshotRequest request, WorkerCapability? capability) => new()
+    {
+        RepositoryRemoteUrl = request.RepositoryRemoteUrl,
+        CommitSha = request.CommitSha,
+        TreeSha = request.TreeSha,
+        BranchName = request.BranchName ?? "main",
+        IsDefaultBranch = request.BranchName is null,
+        // Stamp the producing node's capability fingerprint (Phase 15) so the published snapshot's
+        // identity + provenance record what evaluated it. Null when unset — an ordinary local index
+        // that never routes — keeping the identity byte-identical to the pre-Phase-15 path (CRITICAL 2).
+        CapabilityFingerprint = capability?.Fingerprint,
+        // The control-plane forward-only head sequence (issue #84); null preserves unconditional advance.
+        BranchHeadSequence = request.BranchHeadSequence
+    };
 }
