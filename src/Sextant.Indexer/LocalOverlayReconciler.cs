@@ -17,7 +17,14 @@ public enum OverlayReconcileKind
     Overlay,
 
     /// <summary>Dirty tree with no compatible base — a full LOCAL index carrying the delta + reason (criterion 5).</summary>
-    FullFallback
+    FullFallback,
+
+    /// <summary>
+    /// The git HEAD or working tree moved mid-pass (issue #49): the pass was aborted BEFORE publishing so
+    /// no mixed-state generation was committed. A subsequent pass over the now-stable tree publishes the
+    /// correct single-state snapshot (self-heal / bounded retry).
+    /// </summary>
+    Aborted
 }
 
 /// <summary>The outcome of a reconciliation pass.</summary>
@@ -66,19 +73,25 @@ public sealed class LocalOverlayReconciler
     private readonly bool _useDocumentExtractor;
     private readonly ExtractionParallelismOptions _parallelism;
     private readonly IndexProfileDescriptor? _profile;
+    private readonly IGitStateProbe _gitStateProbe;
 
     public LocalOverlayReconciler(
         IndexDatabase db,
         Action<string>? log = null,
         bool useDocumentExtractor = false,
         ExtractionParallelismOptions? parallelism = null,
-        IndexProfileDescriptor? profile = null)
+        IndexProfileDescriptor? profile = null,
+        IGitStateProbe? gitStateProbe = null)
     {
         _db = db;
         _log = log;
         _useDocumentExtractor = useDocumentExtractor;
         _parallelism = parallelism ?? ExtractionParallelismOptions.Default;
         _profile = profile;
+        // Issue #49: the git-state probe pins HEAD/tree/status for the whole pass. Captured HERE (before
+        // the working-tree status read below) so a move any time between this capture and the pre-publish
+        // re-verification aborts the pass. Defaults to the real git probe; tests inject a fake.
+        _gitStateProbe = gitStateProbe ?? GitStateProbe.Default;
     }
 
     /// <summary>Runs a single authoritative reconciliation pass over <paramref name="solution"/>.</summary>
@@ -90,13 +103,52 @@ public sealed class LocalOverlayReconciler
         var ctx = IndexOrchestrator.TryResolveSnapshotContext(repoRoot);
 
         // No git root / no HEAD commit: nothing to reconcile against, so index the tree fully (this is a
-        // normal no-snapshot local index — the pre-Phase-9 mutable path — not a "fallback" state).
+        // normal no-snapshot local index — the pre-Phase-9 mutable path — not a "fallback" state). No git
+        // identity is published, so the #49 mid-pass-move guard is inert here (no pin captured).
         if (repoRoot == null || ctx == null)
         {
-            await RunFullAsync(solution, cancellationToken, workingTreeDelta: null, fallbackReason: null);
+            await RunFullAsync(solution, cancellationToken, workingTreeDelta: null, fallbackReason: null,
+                ctx: null, gitStatePin: null);
             return new OverlayReconcileResult { Kind = OverlayReconcileKind.FullInitial, ChangeCount = 0 };
         }
 
+        // Issue #49: pin the git state BEFORE reading working-tree status below, so the status read, the
+        // source reads (during extraction) and the recorded commit are all bound to one state. The
+        // orchestrator re-verifies this pin immediately before publishing and throws GitStateMovedException
+        // if HEAD/the working tree moved — we translate that into an Aborted result (no snapshot published).
+        var pin = _gitStateProbe.Capture(repoRoot);
+        if (pin == null)
+        {
+            // Fail-closed (issue #49): a git-backed context resolved, but the git state could not be
+            // pinned, so we cannot prove HEAD/status/sources are one consistent state. Abort rather than
+            // publish an unverifiable generation; the next periodic pass self-heals once git is readable.
+            _log?.Invoke("Overlay reconcile aborted: git state could not be pinned for a git-backed context (issue #49).");
+            return new OverlayReconcileResult
+            {
+                Kind = OverlayReconcileKind.Aborted,
+                FallbackReason = "git state could not be pinned for a git-backed context",
+                ChangeCount = 0
+            };
+        }
+        try
+        {
+            return await ReconcileWithContextAsync(solution, repoRoot, ctx, pin, cancellationToken);
+        }
+        catch (GitStateMovedException ex)
+        {
+            _log?.Invoke($"Overlay reconcile aborted: {ex.Message}");
+            return new OverlayReconcileResult
+            {
+                Kind = OverlayReconcileKind.Aborted,
+                FallbackReason = ex.Message,
+                ChangeCount = 0
+            };
+        }
+    }
+
+    private async Task<OverlayReconcileResult> ReconcileWithContextAsync(
+        Solution solution, string repoRoot, SnapshotContext ctx, GitStatePin? pin, CancellationToken cancellationToken)
+    {
         var changeSet = GitChangeProvider.TryGetChangeSet(repoRoot);
 
         // Git unavailable for status (but a HEAD resolved): treat as non-reconcilable and index fully.
@@ -112,7 +164,7 @@ public sealed class LocalOverlayReconciler
             // self-consistent snapshot that always carries its explicit reason yet still re-selects
             // idempotently on a repeated status-unavailable pass.
             await RunFullAsync(solution, cancellationToken,
-                workingTreeDelta: StatusUnavailableDeltaSentinel, fallbackReason: reason);
+                workingTreeDelta: StatusUnavailableDeltaSentinel, fallbackReason: reason, ctx: ctx, gitStatePin: pin);
             return new OverlayReconcileResult
             {
                 Kind = OverlayReconcileKind.FullFallback,
@@ -126,7 +178,8 @@ public sealed class LocalOverlayReconciler
             // Clean tree: the full-index path is an idempotent select-or-build. An exact committed base
             // is re-selected without rebuild (empty overlay, criterion 1); if none exists it is built.
             var hadBase = ResolveCompatibleBaseId(ctx) != null;
-            await RunFullAsync(solution, cancellationToken, workingTreeDelta: null, fallbackReason: null);
+            await RunFullAsync(solution, cancellationToken, workingTreeDelta: null, fallbackReason: null,
+                ctx: ctx, gitStatePin: pin);
             return new OverlayReconcileResult
             {
                 Kind = hadBase ? OverlayReconcileKind.CleanBase : OverlayReconcileKind.FullInitial,
@@ -143,7 +196,8 @@ public sealed class LocalOverlayReconciler
             var reason = $"no compatible committed base snapshot for HEAD {ctx.CommitSha} " +
                          "(base not indexed, or schema/analyzer/config/toolchain mismatch); indexed the dirty working tree fully";
             _log?.Invoke($"Overlay reconcile: {reason}.");
-            await RunFullAsync(solution, cancellationToken, workingTreeDelta: delta, fallbackReason: reason);
+            await RunFullAsync(solution, cancellationToken, workingTreeDelta: delta, fallbackReason: reason,
+                ctx: ctx, gitStatePin: pin);
             return new OverlayReconcileResult
             {
                 Kind = OverlayReconcileKind.FullFallback,
@@ -154,8 +208,8 @@ public sealed class LocalOverlayReconciler
 
         _log?.Invoke($"Overlay reconcile: {changeSet.Changes.Count} working-tree change(s) over base snapshot {baseId}; staging overlay.");
         var overlay = new OverlayContext { BaseSnapshotId = baseId.Value, WorkingTreeDelta = delta };
-        await new IncrementalIndexer(_db, _log, _useDocumentExtractor, _parallelism, _profile)
-            .IndexChangedFilesAsync(solution, changeSet.TouchedAbsolutePaths(), cancellationToken, overlay, ctx);
+        await new IncrementalIndexer(_db, _log, _useDocumentExtractor, _parallelism, _profile, _gitStateProbe)
+            .IndexChangedFilesAsync(solution, changeSet.TouchedAbsolutePaths(), cancellationToken, overlay, ctx, pin);
 
         return new OverlayReconcileResult
         {
@@ -190,14 +244,17 @@ public sealed class LocalOverlayReconciler
         return null;
     }
 
-    private Task RunFullAsync(Solution solution, CancellationToken cancellationToken, string? workingTreeDelta, string? fallbackReason)
-        => new IndexOrchestrator(_db, _log, _useDocumentExtractor, _parallelism, _profile).IndexSolutionAsync(
+    private Task RunFullAsync(Solution solution, CancellationToken cancellationToken, string? workingTreeDelta,
+        string? fallbackReason, SnapshotContext? ctx, GitStatePin? gitStatePin)
+        => new IndexOrchestrator(_db, _log, _useDocumentExtractor, _parallelism, _profile, _gitStateProbe).IndexSolutionAsync(
             solution,
             progress: null,
             metrics: new IndexingMetrics { Mode = fallbackReason != null ? "overlay-fallback" : "full" },
             cancellationToken: cancellationToken,
+            snapshotContext: ctx,
             workingTreeDelta: workingTreeDelta,
-            fallbackReason: fallbackReason);
+            fallbackReason: fallbackReason,
+            gitStatePin: gitStatePin);
 
     private static string? ResolveRepoRoot(Solution solution)
     {

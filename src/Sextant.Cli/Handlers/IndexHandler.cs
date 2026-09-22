@@ -106,10 +106,43 @@ internal static class IndexHandler
                 indexDb, logCallback, config.DocumentExtractor,
                 Indexer.ExtractionParallelismOptions.FromConfiguration(config),
                 Core.IndexProfileDescriptor.FromConfiguration(config));
-            await orchestrator.IndexSolutionAsync(solution, progress);
+
+            // Issue #49: if HEAD/the working tree moves mid-index the pass aborts before publishing
+            // (no mixed-state generation). Retry a bounded number of times, RELOADING the solution each
+            // attempt so it reflects the now-current on-disk state and a fresh git pin is captured. If the
+            // tree is still moving after the retries, report cleanly without having published anything.
+            const int maxAttempts = 3;
+            var published = false;
+            for (var attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                try
+                {
+                    await orchestrator.IndexSolutionAsync(solution, progress);
+                    published = true;
+                    break;
+                }
+                catch (Indexer.GitStateMovedException)
+                {
+                    if (isInteractive) ClearLine();
+                    if (attempt < maxAttempts)
+                    {
+                        Console.WriteLine($"  Repository changed during indexing (attempt {attempt}/{maxAttempts}); reloading and retrying...");
+                        solution = await Indexer.SolutionLoader.LoadSolutionAsync(solutionPath);
+                        lastPhase = "";
+                    }
+                }
+            }
 
             if (isInteractive)
                 ClearLine();
+
+            if (!published)
+            {
+                Console.Error.WriteLine(
+                    "Repository kept changing during indexing (HEAD or working tree moved); nothing was " +
+                    "published. Re-run 'sextant index' once the working tree is stable.");
+                return 1;
+            }
 
             Console.WriteLine();
             return 0;
