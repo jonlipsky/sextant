@@ -21,6 +21,19 @@ public sealed record EnsureSnapshotRequest
     public string? ConfigHash { get; init; }
 
     /// <summary>
+    /// An OPTIONAL monotonic per-branch head sequence supplied by the control plane (issue #84). The
+    /// service ensures EVERY delivered commit — including out-of-order/older ones — so an unconditional
+    /// branch advance could transiently REGRESS the data-plane branch pointer. When present, the service
+    /// ensure path advances the branch pointer only when this sequence is strictly greater than the one
+    /// already recorded for the branch (forward-only); a lower/equal sequence still ensures/attaches the
+    /// immutable, content-addressed snapshot but never moves the pointer. When <c>null</c> (the local
+    /// CLI/daemon path) the advance stays unconditional — byte-identical to the pre-#84 behavior. It is
+    /// deliberately NOT folded into <see cref="ToIdentity"/>: the same committed state re-ensured under a
+    /// different sequence is the SAME immutable snapshot. Serializes as <c>branch_head_sequence</c>.
+    /// </summary>
+    public long? BranchHeadSequence { get; init; }
+
+    /// <summary>
     /// Builds the durable identity for this request using the service-side schema/analyzer/toolchain.
     /// A committed-branch ensure is always a clean, non-overlay identity (no working-tree delta). When the
     /// request omits <see cref="ConfigHash"/> the caller's <paramref name="fallbackConfigHash"/> (the
