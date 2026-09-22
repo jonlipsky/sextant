@@ -23,6 +23,7 @@ public sealed class DaemonHost : IDisposable
     private long _indexingStartedAt;
     private volatile IndexingProgress? _currentProgress;
     private Solution? _currentSolution;
+    private bool _useDocumentExtractor;
 
     public int StatusPort => _statusServer?.Port ?? 0;
 
@@ -44,6 +45,7 @@ public sealed class DaemonHost : IDisposable
             Directory.CreateDirectory(dbDir);
 
         _db = new IndexDatabase(_dbPath, IndexWriteOptions.FromConfiguration(SextantConfiguration.Load(_repoRoot)));
+        _useDocumentExtractor = SextantConfiguration.Load(_repoRoot).DocumentExtractor;
         _db.RunMigrations();
         _queue = new IndexingQueue();
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -119,7 +121,7 @@ public sealed class DaemonHost : IDisposable
                 var solution = await SolutionLoader.LoadSolutionAsync(solutionPath);
                 _currentSolution = solution;
 
-                var orchestrator = new IndexOrchestrator(_db!, _log);
+                var orchestrator = new IndexOrchestrator(_db!, _log, _useDocumentExtractor);
                 await orchestrator.IndexSolutionAsync(solution, progressReporter);
             }
             _lastIndexedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -222,7 +224,7 @@ public sealed class DaemonHost : IDisposable
             // an unchanged solution yields an empty closure and does no work.
             foreach (var (solution, changedPaths) in loaded)
             {
-                var incremental = new IncrementalIndexer(_db!, _log);
+                var incremental = new IncrementalIndexer(_db!, _log, _useDocumentExtractor);
                 await incremental.IndexChangedFilesAsync(solution, changedPaths);
             }
 
@@ -281,7 +283,7 @@ public sealed class DaemonHost : IDisposable
                     // The incremental indexer rebuilds the full invalidated project closure, so there
                     // is no signature-changed follow-up set to re-enqueue: every dependent in the
                     // closure was already rebuilt in the same pass.
-                    var incremental = new IncrementalIndexer(_db!, _log);
+                    var incremental = new IncrementalIndexer(_db!, _log, _useDocumentExtractor);
                     await incremental.IndexChangedFilesAsync(_currentSolution, item.FilePaths);
                 }
                 _lastIndexedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();

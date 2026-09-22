@@ -26,6 +26,16 @@ public sealed class SextantConfiguration
     /// <summary><c>PRAGMA journal_size_limit</c> in bytes — caps the WAL file left on disk after a checkpoint.</summary>
     public long JournalSizeLimitBytes { get; set; } = 64L * 1024 * 1024;
 
+    /// <summary>
+    /// Feature flag for the document-oriented semantic extractor. When true (default) the indexer uses
+    /// the single-pass, per-document usage-site extractor with compilation-scoped exact target
+    /// resolution. When false it falls back to the legacy declaration-driven extractor (whole-solution
+    /// <c>FindReferencesAsync</c> per declaration), retained as an emergency fallback. Defaulted on now
+    /// that the new extractor is proven at parity with the legacy path. Overridable via
+    /// <c>document_extractor</c> in <c>sextant.json</c> or the <c>SEXTANT_DOCUMENT_EXTRACTOR</c> env var.
+    /// </summary>
+    public bool DocumentExtractor { get; set; } = true;
+
     private static readonly Regex ValidProfileName = new(@"^[a-zA-Z0-9_-]+$", RegexOptions.Compiled);
 
     public string LogsPath => Path.Combine(
@@ -127,6 +137,8 @@ public sealed class SextantConfiguration
                             config.WalAutocheckpointPages = fileConfig.WalAutocheckpointPages.Value;
                         if (fileConfig.JournalSizeLimitBytes.HasValue)
                             config.JournalSizeLimitBytes = fileConfig.JournalSizeLimitBytes.Value;
+                        if (fileConfig.DocumentExtractor.HasValue)
+                            config.DocumentExtractor = fileConfig.DocumentExtractor.Value;
                     }
                 }
                 catch (JsonException)
@@ -189,6 +201,10 @@ public sealed class SextantConfiguration
         var journalLimit = Environment.GetEnvironmentVariable("SEXTANT_JOURNAL_SIZE_LIMIT");
         if (long.TryParse(journalLimit, out var journalBytes))
             config.JournalSizeLimitBytes = journalBytes;
+
+        var documentExtractor = Environment.GetEnvironmentVariable("SEXTANT_DOCUMENT_EXTRACTOR");
+        if (!string.IsNullOrEmpty(documentExtractor))
+            config.DocumentExtractor = !(documentExtractor == "false" || documentExtractor == "0");
     }
 
     public static string? FindRepoRoot(string startDir)
@@ -238,5 +254,8 @@ public sealed class SextantConfiguration
 
         [JsonPropertyName("journal_size_limit_bytes")]
         public long? JournalSizeLimitBytes { get; set; }
+
+        [JsonPropertyName("document_extractor")]
+        public bool? DocumentExtractor { get; set; }
     }
 }

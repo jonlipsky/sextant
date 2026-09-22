@@ -27,6 +27,13 @@ public sealed class BenchmarkOptions
     public int LargeTypes { get; init; } = 8;
     public int LargeMethods { get; init; } = 6;
 
+    /// <summary>
+    /// When true, both the full and incremental passes use the document-oriented extractor (Phase 5)
+    /// instead of the legacy declaration-driven one. Used to measure the new extractor's near-linear
+    /// growth vs source size across the generated scale tiers (Phase 5 acceptance criterion 6).
+    /// </summary>
+    public bool UseDocumentExtractor { get; init; }
+
     public string? MachineDescription { get; init; }
     public Action<string>? Log { get; init; }
 
@@ -92,7 +99,7 @@ public sealed class BenchmarkRunner
             loadSw.Stop();
             metrics.SolutionLoadMs = loadSw.ElapsedMilliseconds;
 
-            var orchestrator = new IndexOrchestrator(db, log);
+            var orchestrator = new IndexOrchestrator(db, log, options.UseDocumentExtractor);
             await orchestrator.IndexSolutionAsync(solution, progress: null, metrics, ct);
         }
         catch (OperationCanceledException)
@@ -146,7 +153,7 @@ public sealed class BenchmarkRunner
             metrics.ProjectCount = solution.Projects.Count();
             phase.ProjectsProcessed = metrics.ProjectCount;
 
-            var incremental = new IncrementalIndexer(db, log);
+            var incremental = new IncrementalIndexer(db, log, options.UseDocumentExtractor);
             // total_duration_ms excludes solution load, so time only the reindex.
             var indexSw = Stopwatch.StartNew();
             await incremental.IndexChangedFilesAsync(solution, [changedFile], ct);

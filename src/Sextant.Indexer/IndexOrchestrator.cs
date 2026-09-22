@@ -12,11 +12,13 @@ public sealed class IndexOrchestrator
 {
     private readonly IndexDatabase _db;
     private readonly Action<string>? _log;
+    private readonly bool _useDocumentExtractor;
 
-    public IndexOrchestrator(IndexDatabase db, Action<string>? log = null)
+    public IndexOrchestrator(IndexDatabase db, Action<string>? log = null, bool useDocumentExtractor = false)
     {
         _db = db;
         _log = log;
+        _useDocumentExtractor = useDocumentExtractor;
     }
 
     public async Task IndexSolutionAsync(
@@ -117,6 +119,10 @@ public sealed class IndexOrchestrator
         using var referenceInsert = referenceStore.CreateInsertCommand();
         using var relationshipInsert = relationshipStore.CreateInsertCommand();
         using var callGraphInsert = callGraphStore.CreateInsertCommand();
+        var argumentFlowStore = new ArgumentFlowStore(conn);
+        var returnFlowStore = new ReturnFlowStore(conn);
+        using var argumentFlowInsert = argumentFlowStore.CreateInsertCommand();
+        using var returnFlowInsert = returnFlowStore.CreateInsertCommand();
         session.Begin();
 
         // Discover submodules from the repo root
@@ -221,7 +227,169 @@ public sealed class IndexOrchestrator
             _log?.Invoke($"    {symbols.Count} symbols extracted");
         }
 
-        // Phase 3: Extract relationships
+        // Phase 3-5 (document-oriented): one pass over each processed project's documents emits
+        // relationships, references, and call/dataflow contributions from a single cached semantic
+        // model + root per document, replacing the legacy declaration-driven FindReferencesAsync
+        // passes below. Occurrence ownership flips to the using document; cross-project references
+        // still persist in_project_id = the using project and symbol_id = the target declaration, so
+        // the Phase-4 incremental closure's cross-project connectivity
+        // (ReferenceStore.GetCrossProjectPairs) — and therefore its correctness — is preserved because
+        // every cross-project call/inheritance also emits a reference edge.
+        if (_useDocumentExtractor)
+        {
+            StartPhase("extracting_occurrences");
+            _log?.Invoke("Extracting occurrences (document-oriented)...");
+
+            // Compilation-scoped exact resolution: map a bound occurrence target's containing assembly
+            // to its exact indexed (per-TFM) project id. This restores parity with the legacy
+            // declaration-anchored reference path — which bound each reference to the exact declared
+            // symbol — for keys that are ambiguous across projects (a multi-targeted dependency several
+            // of whose TFMs are indexed, or an extern-alias-duplicated assembly). Solution.GetProject
+            // maps a source assembly symbol back to its originating project; results are memoized since
+            // one assembly is the target of many occurrences. A null result (metadata / out-of-solution
+            // assembly, or a project outside the indexed map) leaves the contribution to fall back to
+            // key-only resolution in the persistence loops below.
+            var assemblyProjectCache = new Dictionary<IAssemblySymbol, long?>(SymbolEqualityComparer.Default);
+            long? ResolveTargetProject(IAssemblySymbol assembly)
+            {
+                if (assemblyProjectCache.TryGetValue(assembly, out var cached))
+                    return cached;
+                long? resolved = solution.GetProject(assembly) is { } targetProject
+                                 && projectRoslynToId.TryGetValue(targetProject.Id, out var targetPid)
+                    ? targetPid
+                    : null;
+                assemblyProjectCache[assembly] = resolved;
+                return resolved;
+            }
+
+            projectIndex = 0;
+            foreach (var project in solution.Projects)
+            {
+                if (!processSet.Contains(project.Id)) continue;
+                EnterProject();
+                projectIndex++;
+                progress?.Report(new IndexingProgress
+                {
+                    Phase = "extracting_occurrences",
+                    Description = $"Extracting occurrences from {project.Name}",
+                    CurrentProject = project.Name,
+                    ProjectIndex = projectIndex,
+                    ProjectCount = totalProjects
+                });
+                var compilation = await project.GetCompilationAsync(cancellationToken);
+                if (compilation == null) continue;
+
+                long? ownerProjectId = projectRoslynToId.TryGetValue(project.Id, out var ownerPid)
+                    ? ownerPid
+                    : null;
+                if (ownerProjectId == null) continue;
+
+                // One contribution set per project so partial-type relationships across files coalesce
+                // and repeated same-line occurrences dedup (acceptance criterion 5). All processed
+                // projects' symbols are already in the catalog (Phase 2), so cross-project targets
+                // resolve regardless of the order projects are visited here.
+                var contributions = new DocumentContributionSet();
+                foreach (var syntaxTree in compilation.SyntaxTrees)
+                {
+                    ThrowIfCancelled();
+                    if (SymbolExtractor.IsGeneratedFile(syntaxTree.FilePath))
+                        continue;
+
+                    var semanticModel = compilation.GetSemanticModel(syntaxTree);
+                    var root = await syntaxTree.GetRootAsync(cancellationToken);
+                    var text = await syntaxTree.GetTextAsync(cancellationToken);
+                    DocumentSemanticExtractor.ExtractDocument(
+                        root, semanticModel, syntaxTree.FilePath, text, contributions, ResolveTargetProject);
+                }
+
+                foreach (var rel in contributions.Relationships)
+                {
+                    if (catalog.TryResolveEdge(rel.FromKey, ownerProjectId, out var fromId) &&
+                        catalog.TryResolveEdge(rel.ToKey, ownerProjectId, out var toId))
+                    {
+                        relationshipStore.Insert(relationshipInsert, new RelationshipInfo
+                        {
+                            FromSymbolId = fromId,
+                            ToSymbolId = toId,
+                            Kind = rel.Kind,
+                            LastIndexedAt = now
+                        });
+                        session.RowsWritten();
+                    }
+                }
+
+                foreach (var reference in contributions.References)
+                {
+                    // Prefer the exact per-TFM target row when the extractor resolved the target's real
+                    // owning project (compilation-scoped); fall back to key-only resolution (which
+                    // deterministically picks and counts an ambiguity) only for targets outside the
+                    // indexed set.
+                    if (!TryResolveTarget(catalog, reference.TargetKey, reference.TargetProjectId,
+                            ownerProjectId, out var targetId))
+                        continue;
+
+                    referenceStore.Insert(referenceInsert, new ReferenceInfo
+                    {
+                        SymbolId = targetId,
+                        InProjectId = ownerProjectId.Value,
+                        FilePath = reference.FilePath,
+                        Line = reference.Line,
+                        ContextSnippet = reference.Snippet,
+                        ReferenceKind = reference.Kind,
+                        AccessKind = reference.Access
+                    });
+                    session.RowsWritten();
+                }
+
+                foreach (var call in contributions.Calls)
+                {
+                    // The caller is the enclosing member of this document, so it resolves exactly in the
+                    // owner project; the callee uses compilation-scoped exact resolution with key-only
+                    // fallback (parity with the legacy call path for in-solution unique targets).
+                    if (!catalog.TryResolveEdge(call.CallerKey, ownerProjectId, out var callerId) ||
+                        !TryResolveTarget(catalog, call.CalleeKey, call.CalleeProjectId, ownerProjectId, out var calleeId))
+                        continue;
+
+                    var edgeId = callGraphStore.Insert(callGraphInsert, new CallGraphEdge
+                    {
+                        CallerSymbolId = callerId,
+                        CalleeSymbolId = calleeId,
+                        CallSiteFile = call.CallSiteFile,
+                        CallSiteLine = call.CallSiteLine,
+                        LastIndexedAt = now
+                    });
+                    session.RowsWritten();
+
+                    var dfResult = call.Dataflow;
+                    foreach (var arg in dfResult.Arguments)
+                    {
+                        argumentFlowStore.Insert(argumentFlowInsert, edgeId, arg.ParameterOrdinal, arg.ParameterName,
+                            arg.ArgumentExpression, arg.ArgumentKind, arg.SourceSymbolFqn, now);
+                        session.RowsWritten();
+                    }
+
+                    if (dfResult.ReturnDestination != null)
+                    {
+                        returnFlowStore.Insert(returnFlowInsert, edgeId, dfResult.ReturnDestination.DestinationKind,
+                            dfResult.ReturnDestination.DestinationVariable,
+                            dfResult.ReturnDestination.DestinationSymbolFqn, now);
+                        session.RowsWritten();
+                    }
+                }
+
+                if (contributions.CompletenessDiagnostics > 0)
+                    _log?.Invoke($"  {project.Name}: {contributions.CompletenessDiagnostics} unresolved " +
+                                 "region(s) (extraction completeness diagnostic)");
+
+                _log?.Invoke($"  {project.Name}: occurrences extracted");
+                session.CommitBatch();
+            }
+        }
+
+        // Phase 3: Extract relationships (legacy declaration-driven path; skipped when the
+        // document-oriented extractor above has already produced relationships/references/calls)
+        if (!_useDocumentExtractor)
+        {
         StartPhase("extracting_relationships");
         _log?.Invoke("Extracting relationships...");
         projectIndex = 0;
@@ -355,6 +523,7 @@ public sealed class IndexOrchestrator
             _log?.Invoke($"  {project.Name}: references extracted");
             session.CommitBatch();
         }
+        }
 
         // Phase 4.5: Extract tagged comments
         StartPhase("extracting_comments");
@@ -405,14 +574,13 @@ public sealed class IndexOrchestrator
             session.CommitBatch();
         }
 
-        // Phase 5: Extract call graph and dataflow
+        // Phase 5: Extract call graph and dataflow (legacy path; skipped when the document-oriented
+        // extractor above has already produced call edges + dataflow)
+        if (!_useDocumentExtractor)
+        {
         StartPhase("extracting_call_graph");
         _log?.Invoke("Extracting call graph...");
         projectIndex = 0;
-        var argumentFlowStore = new ArgumentFlowStore(conn);
-        var returnFlowStore = new ReturnFlowStore(conn);
-        using var argumentFlowInsert = argumentFlowStore.CreateInsertCommand();
-        using var returnFlowInsert = returnFlowStore.CreateInsertCommand();
         foreach (var project in solution.Projects)
         {
             if (!processSet.Contains(project.Id)) continue;
@@ -500,6 +668,7 @@ public sealed class IndexOrchestrator
 
             _log?.Invoke($"  {project.Name}: call graph extracted");
             session.CommitBatch();
+        }
         }
 
         // Phase 6: Record project dependencies
@@ -631,9 +800,10 @@ public sealed class IndexOrchestrator
 
         if (catalog.AmbiguousEdgeBindings > 0)
         {
-            _log?.Invoke($"  {catalog.AmbiguousEdgeBindings} cross-project edge(s) bound to a " +
-                         "deterministic pick due to a key defined in multiple projects; exact " +
-                         "per-project resolution deferred to the document-oriented extractor phase.");
+            _log?.Invoke($"  {catalog.AmbiguousEdgeBindings} edge(s) bound to a deterministic pick " +
+                         "due to a key defined in multiple projects. References and call callees use " +
+                         "compilation-scoped exact resolution, so these are residual key-only bindings: " +
+                         "relationship endpoints, or a target that mapped to no indexed project.");
         }
 
         _log?.Invoke("Indexing complete.");
@@ -710,6 +880,21 @@ public sealed class IndexOrchestrator
     {
         var hashBytes = SHA256.HashData(Encoding.UTF8.GetBytes(signature));
         return Convert.ToHexStringLower(hashBytes);
+    }
+
+    /// <summary>
+    /// Resolves an occurrence target (reference/call) to a stored symbol row. Prefers compilation-scoped
+    /// exact resolution when the document extractor supplied the target's exact owning project
+    /// (<paramref name="exactProjectId"/>) — restoring parity with the legacy declaration-anchored path
+    /// and never counting an ambiguity — and falls back to key-only resolution (<see cref="SymbolCatalog.TryResolveEdge"/>,
+    /// a deterministic pick that counts the ambiguity) for targets outside the indexed set.
+    /// </summary>
+    private static bool TryResolveTarget(SymbolCatalog catalog, string targetKey, long? exactProjectId,
+        long? ownerProjectId, out long symbolId)
+    {
+        if (exactProjectId is { } exact && catalog.TryResolveExact(targetKey, exact, out symbolId))
+            return true;
+        return catalog.TryResolveEdge(targetKey, ownerProjectId, out symbolId);
     }
 
     private static long? ResolveEnclosingSymbol(int line, string filePath, long projectId, SymbolStore symbolStore)
