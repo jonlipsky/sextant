@@ -23,7 +23,8 @@ public sealed class IndexOrchestrator
         Solution solution,
         IProgress<IndexingProgress>? progress = null,
         IndexingMetrics? metrics = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        IReadOnlySet<string>? projectCanonicalFilter = null)
     {
         var totalStopwatch = Stopwatch.StartNew();
         var phaseStopwatch = new Stopwatch();
@@ -87,6 +88,7 @@ public sealed class IndexOrchestrator
         var relationshipStore = new RelationshipStore(conn);
         var dependencyStore = new ProjectDependencyStore(conn);
         var apiSurfaceStore = new ApiSurfaceStore(conn);
+        var fileIndexStore = new FileIndexStore(conn);
 
         var solutionStore = new SolutionStore(conn);
         var runStore = new IndexRunStore(conn);
@@ -96,6 +98,12 @@ public sealed class IndexOrchestrator
         // evaluated-TFM instances of one multi-targeted csproj map to distinct logical projects
         // instead of collapsing onto a single id (which would make DeleteByProject cross-TFM).
         var projectRoslynToId = new Dictionary<ProjectId, long>();
+        // Logical-project rows this run is responsible for (re)building. For a full index it is every
+        // registered project; for an incremental rebuild the orchestrator is handed a canonical-id
+        // filter naming the invalidated project closure, and only those projects are reset and
+        // re-extracted. Registration and dependency recording always cover every project so the
+        // cross-project reference/usage mapping and the dependency graph stay complete.
+        var processSet = new HashSet<ProjectId>();
         var catalog = new SymbolCatalog();
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
@@ -150,6 +158,8 @@ public sealed class IndexOrchestrator
 
             var projectId = projectStore.Insert(identity, now);
             projectRoslynToId[project.Id] = projectId;
+            if (projectCanonicalFilter == null || projectCanonicalFilter.Contains(identity.CanonicalId))
+                processSet.Add(project.Id);
             _log?.Invoke($"  Project: {project.Name} (id={projectId}, tfm={identity.TargetFramework}, test={identity.IsTestProject})");
         }
 
@@ -168,7 +178,8 @@ public sealed class IndexOrchestrator
         projectIndex = 0;
         foreach (var project in solution.Projects)
         {
-            if (project.FilePath == null || !projectRoslynToId.TryGetValue(project.Id, out var projectId))
+            if (project.FilePath == null || !projectRoslynToId.TryGetValue(project.Id, out var projectId)
+                || !processSet.Contains(project.Id))
                 continue;
 
             EnterProject();
@@ -183,8 +194,13 @@ public sealed class IndexOrchestrator
                 ProjectCount = totalProjects
             });
 
-            // Clear existing data for this project (full re-index)
+            // Reset this logical (per-TFM) project's contributions before re-extracting. Deleting the
+            // project's symbols cascades its references/relationships/call edges/dataflow AND the
+            // inbound edges that point into them, so those are all rebuilt from scratch below; the
+            // file_index rows are cleared here too so files that were deleted/renamed away since the
+            // last run leave no stale fingerprint.
             symbolStore.DeleteByProject(projectId);
+            fileIndexStore.DeleteByProject(projectId);
 
             var symbols = await SymbolExtractor.ExtractFromProjectAsync(project, projectId);
             foreach (var symbol in symbols)
@@ -193,6 +209,13 @@ public sealed class IndexOrchestrator
                 catalog.Add(projectId, symbol.SymbolKey, id);
                 session.RowsWritten();
             }
+
+            // Fingerprint every indexed (non-generated, on-disk) file so an unchanged daemon restart
+            // short-circuits to zero work, and record the project's evaluation fingerprint so a later
+            // catch-up can detect config/props/global.json/assets changes.
+            await SeedFileIndexAsync(project, projectId, fileIndexStore, session, now, cancellationToken);
+            projectStore.SetEvaluationFingerprint(projectId, EvaluationFingerprint.Compute(project.FilePath, repoRoot));
+
             session.CommitBatch();
 
             _log?.Invoke($"    {symbols.Count} symbols extracted");
@@ -211,6 +234,7 @@ public sealed class IndexOrchestrator
         });
         foreach (var project in solution.Projects)
         {
+            if (!processSet.Contains(project.Id)) continue;
             EnterProject();
             projectIndex++;
             progress?.Report(new IndexingProgress
@@ -269,6 +293,7 @@ public sealed class IndexOrchestrator
         projectIndex = 0;
         foreach (var project in solution.Projects)
         {
+            if (!processSet.Contains(project.Id)) continue;
             EnterProject();
             projectIndex++;
             progress?.Report(new IndexingProgress
@@ -286,16 +311,11 @@ public sealed class IndexOrchestrator
                 ? refPid
                 : null;
 
-            if (refProjectId is { } refClearId)
-            {
-                // Clear existing references for files in THIS logical (per-TFM) project only, so a
-                // sibling framework's references for a shared source file survive this phase.
-                foreach (var syntaxTree in compilation.SyntaxTrees)
-                {
-                    if (!string.IsNullOrEmpty(syntaxTree.FilePath))
-                        referenceStore.DeleteByFile(syntaxTree.FilePath, refClearId);
-                }
-            }
+            // No per-file reference clear here: the symbol phase already reset every processed
+            // project (DeleteByProject), which cascade-deleted the references those symbols owned —
+            // including cross-project usages that point INTO this project's declarations. Re-deleting
+            // by usage file after inserts have begun is what dropped freshly-inserted cross-project
+            // rows when a dependency was processed before its consumer (acceptance criterion 4).
 
             foreach (var syntaxTree in compilation.SyntaxTrees)
             {
@@ -344,6 +364,7 @@ public sealed class IndexOrchestrator
         using var commentInsert = commentStore.CreateInsertCommand();
         foreach (var project in solution.Projects)
         {
+            if (!processSet.Contains(project.Id)) continue;
             EnterProject();
             projectIndex++;
             progress?.Report(new IndexingProgress
@@ -360,13 +381,15 @@ public sealed class IndexOrchestrator
             if (project.FilePath == null || !projectRoslynToId.TryGetValue(project.Id, out var commentProjectId))
                 continue;
 
+            // Comments are not cascade-deleted by the symbol reset, so clear the whole project's
+            // comments once (covering files deleted/renamed away since the last run) before re-extract.
+            commentStore.DeleteByProject(commentProjectId);
+
             foreach (var syntaxTree in compilation.SyntaxTrees)
             {
                 ThrowIfCancelled();
                 if (SymbolExtractor.IsGeneratedFile(syntaxTree.FilePath))
                     continue;
-
-                commentStore.DeleteByFile(syntaxTree.FilePath, commentProjectId);
 
                 var comments = CommentExtractor.ExtractComments(syntaxTree);
                 foreach (var comment in comments)
@@ -392,6 +415,7 @@ public sealed class IndexOrchestrator
         using var returnFlowInsert = returnFlowStore.CreateInsertCommand();
         foreach (var project in solution.Projects)
         {
+            if (!processSet.Contains(project.Id)) continue;
             EnterProject();
             projectIndex++;
             progress?.Report(new IndexingProgress
@@ -409,16 +433,9 @@ public sealed class IndexOrchestrator
                 ? callPid
                 : null;
 
-            if (callProjectId is { } callClearId)
-            {
-                // Clear existing call edges made from THIS logical (per-TFM) project's code only, so a
-                // sibling framework's call edges for a shared source file survive this phase.
-                foreach (var syntaxTree in compilation.SyntaxTrees)
-                {
-                    if (!string.IsNullOrEmpty(syntaxTree.FilePath))
-                        callGraphStore.DeleteByFile(syntaxTree.FilePath, callClearId);
-                }
-            }
+            // No per-file call-edge clear here: the symbol phase's DeleteByProject already cascaded
+            // this project's outbound call edges and the inbound edges targeting its methods. Deleting
+            // by call-site file after inserts began would drop freshly-inserted cross-project edges.
 
             foreach (var syntaxTree in compilation.SyntaxTrees)
             {
@@ -498,6 +515,12 @@ public sealed class IndexOrchestrator
                 ProjectCount = totalProjects
             });
             var deps = DependencyExtractor.ExtractDependencies(solution, projectRoslynToId, submodules, repoRoot);
+            // Replace the entire dependency set rather than only upserting: the extractor recomputes
+            // every edge in the solution each run and registration covers every project, so clearing
+            // each consumer's edges first purges any that were removed since the last run (e.g. a
+            // dropped project reference) instead of leaving a stale project_dependencies row behind.
+            foreach (var pid in projectRoslynToId.Values)
+                dependencyStore.DeleteByConsumer(pid);
             foreach (var dep in deps)
             {
                 if (dep.DependencyProjectId == 0)
@@ -521,22 +544,31 @@ public sealed class IndexOrchestrator
         var gitCommit = GetHeadCommit(repoRoot);
         if (gitCommit != null)
         {
+            // Partition the projects this run rebuilt into those that still have inbound dependencies
+            // and those that don't. Every rebuilt project's current-commit snapshot is purged first so
+            // a project that lost its last consumer since the previous run does not keep a stale
+            // current-commit snapshot (a fresh full index would not create one); snapshots captured at
+            // other commits are historical and left untouched (criterion 7).
+            var rebuiltProjectIds = new List<long>();
             var projectsWithConsumers = new HashSet<long>();
             foreach (var project in solution.Projects)
             {
+                if (!processSet.Contains(project.Id))
+                    continue;
                 if (projectRoslynToId.TryGetValue(project.Id, out var pid))
                 {
+                    rebuiltProjectIds.Add(pid);
                     var consumers = dependencyStore.GetByDependency(pid);
                     if (consumers.Count > 0)
                         projectsWithConsumers.Add(pid);
                 }
             }
 
+            foreach (var pid in rebuiltProjectIds)
+                apiSurfaceStore.DeleteByProjectAndCommit(pid, gitCommit);
+
             foreach (var projectId in projectsWithConsumers)
             {
-                // Delete existing snapshot for this commit (idempotent)
-                apiSurfaceStore.DeleteByProjectAndCommit(projectId, gitCommit);
-
                 // Get all public/protected symbols for this project
                 var publicSymbols = symbolStore.GetByProjectAndAccessibility(projectId, ["public", "protected"]);
                 foreach (var sym in publicSymbols)
@@ -546,6 +578,9 @@ public sealed class IndexOrchestrator
                     {
                         ProjectId = projectId,
                         SymbolId = sym.Id,
+                        SymbolKey = sym.SymbolKey,
+                        FullyQualifiedName = sym.FullyQualifiedName,
+                        Accessibility = SymbolStore.FormatAccessibility(sym.Accessibility),
                         SignatureHash = sigHash,
                         CapturedAt = now,
                         GitCommit = gitCommit
@@ -609,6 +644,44 @@ public sealed class IndexOrchestrator
             ProjectIndex = totalProjects,
             ProjectCount = totalProjects
         });
+    }
+
+    /// <summary>
+    /// Records a content fingerprint in <c>file_index</c> for every non-generated, on-disk source file
+    /// owned by this logical (per-TFM) project. Seeding this during a full index is what lets a later
+    /// daemon restart short-circuit unchanged files to zero work, and gives the incremental path a
+    /// per-file baseline to diff against. Files that are not present on disk (e.g. an in-memory
+    /// ad-hoc workspace used in tests) are skipped — no stable content hash can be taken for them.
+    /// </summary>
+    private static async Task SeedFileIndexAsync(
+        Project project,
+        long projectId,
+        FileIndexStore fileIndexStore,
+        IndexWriteSession session,
+        long now,
+        CancellationToken cancellationToken)
+    {
+        var compilation = await project.GetCompilationAsync(cancellationToken);
+        if (compilation == null) return;
+
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var syntaxTree in compilation.SyntaxTrees)
+        {
+            var filePath = syntaxTree.FilePath;
+            if (string.IsNullOrEmpty(filePath) || SymbolExtractor.IsGeneratedFile(filePath))
+                continue;
+            if (!File.Exists(filePath) || !seen.Add(filePath))
+                continue;
+
+            fileIndexStore.Upsert(new FileIndexEntry
+            {
+                ProjectId = projectId,
+                FilePath = filePath,
+                ContentHash = IncrementalIndexer.ComputeFileHash(filePath),
+                LastIndexedAt = now
+            });
+            session.RowsWritten();
+        }
     }
 
     private static string? GetHeadCommit(string? repoRoot)

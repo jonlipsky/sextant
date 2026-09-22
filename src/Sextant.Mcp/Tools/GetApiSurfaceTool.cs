@@ -57,15 +57,13 @@ public static class GetApiSurfaceTool
         var oldSurface = new List<(string fqn, string signatureHash, string accessibility)>();
         foreach (var snapshot in oldSnapshots)
         {
-            var sym = symbolStore.GetById(snapshot.SymbolId);
-            if (sym != null)
-            {
-                oldSurface.Add((
-                    sym.FullyQualifiedName,
-                    snapshot.SignatureHash,
-                    SymbolStore.FormatAccessibility(sym.Accessibility)
-                ));
-            }
+            // Reconstruct the historical surface from the snapshot's own stable fields rather than the
+            // live symbol row, which may have been rebuilt (new id) or removed since capture.
+            oldSurface.Add((
+                snapshot.FullyQualifiedName,
+                snapshot.SignatureHash,
+                snapshot.Accessibility
+            ));
         }
 
         var newSurface = publicSymbols.Select(s => (

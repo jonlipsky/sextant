@@ -16,8 +16,7 @@ public class IndexDatabaseTests
     [TestCleanup]
     public void TestCleanup()
     {
-        if (File.Exists(_dbPath))
-            File.Delete(_dbPath);
+        SqliteTestDatabase.Delete(_dbPath);
     }
 
     [TestMethod]

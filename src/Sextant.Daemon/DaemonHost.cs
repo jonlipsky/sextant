@@ -139,62 +139,93 @@ public sealed class DaemonHost : IDisposable
         _currentProgress = null;
         try
         {
+            var conn = _db!.GetConnection();
+            var projectStore = new ProjectStore(conn);
+            var fileIndexStore = new FileIndexStore(conn);
+
+            var loaded = new List<(Solution solution, List<string> changedPaths)>();
+            var liveCanonicalIds = new HashSet<string>(StringComparer.Ordinal);
+
             foreach (var solutionPath in _solutionPaths)
             {
                 var solution = await SolutionLoader.LoadSolutionAsync(solutionPath);
                 _currentSolution = solution;
 
-                // Find all .cs files and check hashes
-                var conn = _db!.GetConnection();
-                var fileIndexStore = new FileIndexStore(conn);
-                var changedFiles = new List<string>();
-
+                var changedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var project in solution.Projects)
                 {
                     if (project.FilePath == null) continue;
                     var targetFramework = ProjectIdentityFactory.ResolveEvaluatedTargetFramework(project);
                     var identity = GitRemoteResolver.Resolve(project.FilePath, targetFramework);
-                    var existing = new ProjectStore(conn).GetByCanonicalId(identity.CanonicalId);
-                    if (existing == null) continue;
+                    liveCanonicalIds.Add(identity.CanonicalId);
 
-                    var projectId = existing.Value.id;
-                    var compilation = await project.GetCompilationAsync();
-                    if (compilation == null) continue;
-
-                    foreach (var tree in compilation.SyntaxTrees)
+                    var existing = projectStore.GetByCanonicalId(identity.CanonicalId);
+                    if (existing == null)
                     {
-                        if (string.IsNullOrEmpty(tree.FilePath) || SymbolExtractor.IsGeneratedFile(tree.FilePath))
-                            continue;
-
-                        var currentHash = IncrementalIndexer.ComputeFileHash(tree.FilePath);
-                        var entry = fileIndexStore.GetByProjectAndFile(projectId, tree.FilePath);
-
-                        if (entry == null || entry.ContentHash != currentHash)
-                            changedFiles.Add(tree.FilePath);
-                    }
-                }
-
-                if (changedFiles.Count > 0)
-                {
-                    _log?.Invoke($"Found {changedFiles.Count} changed files since last index.");
-                    var incremental = new IncrementalIndexer(_db!, _log);
-                    var signatureChanged = await incremental.IndexChangedFilesAsync(solution, changedFiles);
-
-                    if (signatureChanged.Count > 0)
-                    {
-                        _queue!.Enqueue(new WorkItem
+                        // A project added (or a new target framework) while the daemon was stopped has
+                        // no DB row yet. Catch-up runs an incremental pass, not a full index, so mark
+                        // all of the project's on-disk source files changed: IncrementalIndexer then
+                        // registers the new per-TFM logical project and indexes it from scratch (its
+                        // fingerprints are absent, so every file reads as stale).
+                        foreach (var document in project.Documents)
                         {
-                            Priority = WorkPriority.Background,
-                            FilePaths = signatureChanged,
-                            Description = "Re-resolve references for signature-changed files"
-                        });
+                            var docPath = document.FilePath;
+                            if (!string.IsNullOrEmpty(docPath)
+                                && !SymbolExtractor.IsGeneratedFile(docPath)
+                                && File.Exists(docPath))
+                                changedPaths.Add(docPath);
+                        }
+                        continue;
+                    }
+                    var projectId = existing.Value.id;
+
+                    // Changed / new source files: on-disk hash differs from the recorded fingerprint.
+                    var compilation = await project.GetCompilationAsync();
+                    if (compilation != null)
+                    {
+                        foreach (var tree in compilation.SyntaxTrees)
+                        {
+                            if (string.IsNullOrEmpty(tree.FilePath) || SymbolExtractor.IsGeneratedFile(tree.FilePath))
+                                continue;
+                            if (!File.Exists(tree.FilePath)) continue;
+                            var currentHash = IncrementalIndexer.ComputeFileHash(tree.FilePath);
+                            var entry = fileIndexStore.GetByProjectAndFile(projectId, tree.FilePath);
+                            if (entry == null || entry.ContentHash != currentHash)
+                                changedPaths.Add(tree.FilePath);
+                        }
+                    }
+
+                    // Deleted / renamed-away files: recorded in file_index but gone from disk.
+                    foreach (var entry in fileIndexStore.GetByProject(projectId))
+                    {
+                        if (!File.Exists(entry.FilePath))
+                            changedPaths.Add(entry.FilePath);
                     }
                 }
-                else
+
+                loaded.Add((solution, changedPaths.ToList()));
+            }
+
+            // Purge projects that were removed from every watched solution (their historical snapshots
+            // go with them); a rebuild of a still-present project never deletes its project row.
+            foreach (var (projectId, identity) in projectStore.GetAll())
+            {
+                if (!liveCanonicalIds.Contains(identity.CanonicalId))
                 {
-                    _log?.Invoke("All files up to date.");
+                    _log?.Invoke($"Removing project no longer in solution: {identity.CanonicalId}");
+                    projectStore.Delete(projectId);
                 }
             }
+
+            // Reindex each solution's invalidated closure. IncrementalIndexer also recomputes evaluation
+            // fingerprints, so a config/props/global.json/assets change escalates even with no .cs delta;
+            // an unchanged solution yields an empty closure and does no work.
+            foreach (var (solution, changedPaths) in loaded)
+            {
+                var incremental = new IncrementalIndexer(_db!, _log);
+                await incremental.IndexChangedFilesAsync(solution, changedPaths);
+            }
+
             _lastIndexedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         }
         finally
@@ -247,25 +278,11 @@ public sealed class DaemonHost : IDisposable
             {
                 if (_currentSolution != null)
                 {
+                    // The incremental indexer rebuilds the full invalidated project closure, so there
+                    // is no signature-changed follow-up set to re-enqueue: every dependent in the
+                    // closure was already rebuilt in the same pass.
                     var incremental = new IncrementalIndexer(_db!, _log);
-                    var signatureChanged = await incremental.IndexChangedFilesAsync(
-                        _currentSolution, item.FilePaths);
-
-                    if (signatureChanged.Count > 0 && item.Priority == WorkPriority.Immediate)
-                    {
-                        // Find all files that reference symbols from the changed files
-                        var dependentFiles = FindDependentFiles(signatureChanged);
-                        var allFilesToReindex = new HashSet<string>(signatureChanged);
-                        foreach (var f in dependentFiles)
-                            allFilesToReindex.Add(f);
-
-                        _queue.Enqueue(new WorkItem
-                        {
-                            Priority = WorkPriority.Background,
-                            FilePaths = allFilesToReindex.ToList(),
-                            Description = $"Re-resolve references for {allFilesToReindex.Count} files affected by signature changes"
-                        });
-                    }
+                    await incremental.IndexChangedFilesAsync(_currentSolution, item.FilePaths);
                 }
                 _lastIndexedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             }
@@ -280,36 +297,6 @@ public sealed class DaemonHost : IDisposable
                 _indexingStartedAt = 0;
             }
         }
-    }
-
-    private List<string> FindDependentFiles(IReadOnlyList<string> changedFiles)
-    {
-        var dependentFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        try
-        {
-            var conn = _db!.GetConnection();
-            var symbolStore = new SymbolStore(conn);
-            var referenceStore = new ReferenceStore(conn);
-
-            foreach (var filePath in changedFiles)
-            {
-                var symbols = symbolStore.GetByFile(filePath);
-                foreach (var symbol in symbols)
-                {
-                    var refs = referenceStore.GetBySymbolId(symbol.Id);
-                    foreach (var r in refs)
-                    {
-                        if (!changedFiles.Contains(r.FilePath))
-                            dependentFiles.Add(r.FilePath);
-                    }
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            _log?.Invoke($"Warning: could not find dependent files: {ex.Message}");
-        }
-        return dependentFiles.ToList();
     }
 
     private StatusInfo GetStatus()
@@ -373,5 +360,6 @@ public sealed class DaemonHost : IDisposable
         _fileWatcher?.Dispose();
         _statusServer?.Dispose();
         _cts?.Dispose();
+        _db?.Dispose();
     }
 }
