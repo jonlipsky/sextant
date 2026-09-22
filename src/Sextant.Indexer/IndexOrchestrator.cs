@@ -1543,10 +1543,10 @@ public sealed class IndexOrchestrator
         var branchId = snapshotStore.EnsureBranch(repositoryId, ctx.BranchName, ctx.IsDefaultBranch, completedAt);
         if (ctx.IsDefaultBranch)
             snapshotStore.PromoteSoleDefaultBranch(repositoryId, branchId);
-        var previousSnapshot = snapshotStore.GetBranchSnapshotId(branchId);
-        snapshotStore.SetBranchPointer(branchId, snapshotId, completedAt);
-        if (previousSnapshot is long prev && prev != snapshotId)
-            snapshotStore.MarkStatus(prev, SnapshotStatus.Superseded);
+        // Forward-only when the service ensure path supplies a head sequence (issue #84); unconditional
+        // (byte-identical to the pre-#84 behavior) when it is null, which is every local CLI/daemon run.
+        // The store method also supersedes the branch's previous target on a genuine advance.
+        snapshotStore.AdvanceBranchPointerForwardOnly(branchId, snapshotId, ctx.BranchHeadSequence, completedAt);
     }
 
     /// <summary>

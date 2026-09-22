@@ -1,0 +1,30 @@
+-- Phase 14 / issue #84: forward-only branch-head advance on the SERVICE /control/ensure path.
+--
+-- The service ensures EVERY delivered commit (including out-of-order/older ones) to build immutable,
+-- content-addressed snapshots. Before this change the ensure publish path advanced the branch pointer
+-- UNCONDITIONALLY (AdvanceBranchToSnapshot -> SetBranchPointer), so a late/older ensure could transiently
+-- REGRESS the data-plane branch pointer and briefly serve a stale snapshot to a branch-scoped query.
+-- Self-healing on the next in-order push (no snapshot data is ever lost — snapshots are immutable), but
+-- the transient regression is wrong for the service.
+--
+-- The control plane owns commit ordering (Sextant has no ancestry and completed_at is invalid for recency
+-- under out-of-order delivery), so it now supplies an OPTIONAL monotonic BranchHeadSequence on the ensure
+-- request and Sextant enforces it forward-only. This column persists that per-branch head sequence
+-- alongside the branch pointer:
+--
+--   branches.head_sequence — the highest control-plane head sequence the branch pointer has advanced to,
+--                            or NULL when no sequence-bearing ensure has advanced it yet (every existing
+--                            row, and every branch only ever advanced by the local CLI/daemon path, which
+--                            passes no sequence). The service ensure path advances the pointer + stores
+--                            the new sequence only when the supplied sequence is strictly greater than the
+--                            stored one; a lower/equal sequence ensures/attaches the immutable snapshot but
+--                            leaves both the pointer and this column untouched (no regression). A NULL
+--                            supplied sequence (local path) advances unconditionally and never writes here.
+--
+-- WHY ADDITIVE / FORWARD-ONLY (NOT rebuild-required): one nullable column on an existing table; nothing
+-- dropped and index_runs is NOT cleared. Like migrations 012-020 this advances the schema version (folded
+-- into the Phase-9 snapshot identity_hash), so an existing schema-20 base is treated as schema-incompatible
+-- and rebuilt into a schema-21 base on first run via IndexDatabase.CheckReadiness — the safe upgrade path.
+-- LatestSchemaVersion auto-derives from LoadMigrations().Max(version), so it becomes 21 with no code edit.
+
+ALTER TABLE branches ADD COLUMN head_sequence INTEGER;

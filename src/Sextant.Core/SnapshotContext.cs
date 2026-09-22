@@ -32,4 +32,13 @@ public sealed record SnapshotContext
     /// and single-node paths require zero routing infrastructure).
     /// </summary>
     public string? CapabilityFingerprint { get; init; }
+
+    /// <summary>
+    /// An OPTIONAL monotonic per-branch head sequence for the SERVICE ensure path (issue #84). When set,
+    /// <c>AdvanceBranchToSnapshot</c> advances the branch pointer only when this value is strictly greater
+    /// than the sequence already recorded for the branch (forward-only), so an out-of-order/older service
+    /// ensure never regresses the pointer. <c>null</c> (the local CLI/daemon path, and every non-service
+    /// caller) preserves the unconditional-advance behavior byte-for-byte.
+    /// </summary>
+    public long? BranchHeadSequence { get; init; }
 }

@@ -220,7 +220,7 @@ public sealed class SnapshotService : IDisposable
 
         if (SnapshotJobStatus.IsTerminal(job.Status) && terminalUsable)
         {
-            WithWrite(() => { EnsureAttachBranchPointer(request, job.SnapshotId); return 0; });
+            WithWrite(() => { AdvanceOrAttachBranchPointer(request, job.SnapshotId); return 0; });
             return Attach(job, existed);
         }
 
@@ -235,7 +235,7 @@ public sealed class SnapshotService : IDisposable
             var current = jobs.GetJob(job.Id)!;
             if (SnapshotJobStatus.IsTerminal(current.Status) && TerminalResultUsable(current, hash, snapshots))
             {
-                EnsureAttachBranchPointer(request, current.SnapshotId);
+                AdvanceOrAttachBranchPointer(request, current.SnapshotId);
                 return Attach(current, existed);
             }
 
@@ -245,7 +245,7 @@ public sealed class SnapshotService : IDisposable
             if (published is { Status: SnapshotStatus.Complete })
             {
                 jobs.MarkResult(job.Id, SnapshotJobStatus.Complete, published.Id);
-                EnsureAttachBranchPointer(request, published.Id);
+                AdvanceOrAttachBranchPointer(request, published.Id);
                 return Attach(jobs.GetJob(job.Id)!, existed);
             }
 
@@ -684,6 +684,38 @@ public sealed class SnapshotService : IDisposable
         if (snapshots.GetRepositoryId(request.RepositoryRemoteUrl) is not long repoId)
             return;
         snapshots.AttachBranchPointer(repoId, branch, sid, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+    }
+
+    // The branch-pointer decision for a REUSE/terminal-attach ensure — a snapshot the service attaches
+    // WITHOUT running the worker (an already-terminal job or an already-published snapshot), so the
+    // orchestrator's gated AdvanceBranchToSnapshot never runs on these paths. Issue #84: when the request
+    // carries a monotonic head sequence, apply the SAME forward-only gate the orchestrator would have, so a
+    // higher-sequence re-ensure of an already-published commit still advances the pointer (e.g. a
+    // reset/force-push A@10 → B@20 → A@30) and a lower/equal one still declines — never regressing the
+    // branch head and always persisting the advanced sequence. When the request carries NO sequence (the
+    // local/legacy path) this preserves today's forward-only attach-if-unset behavior byte-for-byte
+    // (criterion 2). Raw DB write — callers must already hold the write gate.
+    private void AdvanceOrAttachBranchPointer(EnsureSnapshotRequest request, long? snapshotId)
+    {
+        if (request.BranchHeadSequence is not long seq)
+        {
+            EnsureAttachBranchPointer(request, snapshotId);
+            return;
+        }
+        if (snapshotId is not long sid)
+            return;
+        var snapshots = new SnapshotStore(_conn);
+        if (snapshots.GetRepositoryId(request.RepositoryRemoteUrl) is not long repoId)
+            return;
+        // Mirror CreateSnapshotContext's branch/default resolution so the reuse path and the worker path
+        // advance the SAME branch under the SAME default semantics.
+        var branchName = request.BranchName ?? "main";
+        var isDefault = request.BranchName is null;
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var branchId = snapshots.EnsureBranch(repoId, branchName, isDefault, now);
+        if (isDefault)
+            snapshots.PromoteSoleDefaultBranch(repoId, branchId);
+        snapshots.AdvanceBranchPointerForwardOnly(branchId, sid, seq, now);
     }
 
     // Advances a branch pointer to a published snapshot and supersedes the previous target — the same
