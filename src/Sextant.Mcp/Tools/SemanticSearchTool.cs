@@ -20,6 +20,9 @@ public static class SemanticSearchTool
         if (db == null)
             return ResponseBuilder.BuildEmpty(notReady);
 
+        if (!CapabilityGate.Ensure(db, IndexFeature.DocumentationSearch, "documentation_search", out var unavailable))
+            return unavailable;
+
         var conn = db.GetConnection();
         var symbolStore = new SymbolStore(conn);
         var projectStore = new ProjectStore(conn);

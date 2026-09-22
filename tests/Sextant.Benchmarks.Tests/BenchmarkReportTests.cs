@@ -74,6 +74,45 @@ public sealed class BenchmarkReportTests
         Assert.IsFalse(json.Contains("private"));
     }
 
+    // === Phase 8, criterion 6: per-profile benchmark output ========================================
+
+    [TestMethod]
+    public void IndexingProfile_IsRecordedInJsonAndMarkdown()
+    {
+        var report = BuildReport();
+        report.IndexingProfile = "core";
+
+        StringAssert.Contains(report.ToJson(), "\"indexing_profile\": \"core\"");
+        StringAssert.Contains(report.ToMarkdown(), "- Profile: core");
+    }
+
+    [TestMethod]
+    public void ToProfileComparison_RendersOneRowPerProfile()
+    {
+        var reports = new[]
+        {
+            ReportForProfile("core"),
+            ReportForProfile("standard"),
+            ReportForProfile("deep"),
+        };
+
+        var table = BenchmarkReport.ToProfileComparison(reports);
+
+        StringAssert.Contains(table, "profile comparison (correctness)");
+        StringAssert.Contains(table, "| Profile |");
+        foreach (var profile in new[] { "core", "standard", "deep" })
+            StringAssert.Contains(table, $"| {profile} ");
+    }
+
+    private static BenchmarkReport ReportForProfile(string profile)
+    {
+        var report = BuildReport();
+        report.IndexingProfile = profile;
+        report.FullIndex!.Rows = new RowCountMetrics { Symbols = 10, References = 20, Comments = 5 };
+        report.FullIndex.Storage = new StorageMetrics { FinalDbBytes = 1000, PeakDbPlusWalBytes = 2000 };
+        return report;
+    }
+
     private static BenchmarkReport BuildReport() => new()
     {
         CorpusName = "correctness",

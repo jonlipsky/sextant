@@ -4,6 +4,7 @@ using ModelContextProtocol.Server;
 
 namespace Sextant.Mcp.Tools;
 
+[McpServerToolType]
 public static class FindBySignatureTool
 {
     [McpServerTool(Name = "find_by_signature"),

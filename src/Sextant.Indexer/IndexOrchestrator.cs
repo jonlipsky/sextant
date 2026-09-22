@@ -15,17 +15,23 @@ public sealed class IndexOrchestrator
     private readonly Action<string>? _log;
     private readonly bool _useDocumentExtractor;
     private readonly ExtractionParallelismOptions _parallelism;
+    private readonly IndexProfileDescriptor _profile;
 
     public IndexOrchestrator(
         IndexDatabase db,
         Action<string>? log = null,
         bool useDocumentExtractor = false,
-        ExtractionParallelismOptions? parallelism = null)
+        ExtractionParallelismOptions? parallelism = null,
+        IndexProfileDescriptor? profile = null)
     {
         _db = db;
         _log = log;
         _useDocumentExtractor = useDocumentExtractor;
         _parallelism = parallelism ?? ExtractionParallelismOptions.Default;
+        // Default to the "everything on" profile so a construction that does not specify one keeps the
+        // pre-profile behavior of building every optional feature (behavior-preserving for tests and
+        // any direct caller). Production entry points pass the configured profile explicitly.
+        _profile = profile ?? IndexProfileDescriptor.Full;
     }
 
     /// <summary>One non-generated document paired with its project's compilation, the unit of parallel
@@ -130,11 +136,20 @@ public sealed class IndexOrchestrator
         var catalog = new SymbolCatalog();
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
+        // Feature gates (Phase 8). Calls, references, and relationships are core and always built; the
+        // profile only gates the optional add-ons. Dataflow rows (argument/return flow) are the deep
+        // profile's extended evidence; comments are their own phase. When a feature is off the indexer
+        // does not persist its rows so the optional tables stay empty and the run is cheaper.
+        var persistDataflow = _profile.Has(IndexFeature.Dataflow);
+        var extractComments = _profile.Has(IndexFeature.Comments);
+
         // Open a staging generation and a single bounded, batched write session for the whole run.
         // The session replaces per-row implicit transactions with a small number of explicit,
         // project-bounded batches; the run scope keeps the previous complete generation visible until
         // this one is published, and abandons the staging generation if the run fails or is cancelled.
-        using var runScope = runStore.BeginScope(metrics?.Mode ?? "full", now);
+        using var runScope = runStore.BeginScope(
+            metrics?.Mode ?? "full", now,
+            _profile.ConfigurationHash, _profile.Profile, (long)_profile.Features);
         using var session = _db.BeginWriteSession();
         using var symbolInsert = symbolStore.CreateInsertCommand();
         using var referenceInsert = referenceStore.CreateInsertCommand();
@@ -232,7 +247,8 @@ public sealed class IndexOrchestrator
             symbolStore.DeleteByProject(projectId);
             fileStore.DeleteByProject(projectId);
 
-            var symbols = await SymbolExtractor.ExtractFromProjectAsync(project, projectId);
+            var symbols = await SymbolExtractor.ExtractFromProjectAsync(
+                project, projectId, includeDocComments: _profile.Has(IndexFeature.DocumentationSearch));
             foreach (var symbol in symbols)
             {
                 var id = symbolStore.Insert(symbolInsert, symbol);
@@ -303,7 +319,8 @@ public sealed class IndexOrchestrator
                 var text = doc.Tree.GetText(ct);
                 var set = new DocumentContributionSet();
                 DocumentSemanticExtractor.ExtractDocument(
-                    root, model, doc.Tree.FilePath, text, set, ResolveTargetProject);
+                    root, model, doc.Tree.FilePath, text, set, ResolveTargetProject,
+                    includeDataflow: persistDataflow);
                 return set;
             }
 
@@ -424,19 +441,22 @@ public sealed class IndexOrchestrator
                     session.RowsWritten();
 
                     var dfResult = call.Dataflow;
-                    foreach (var arg in dfResult.Arguments)
+                    if (persistDataflow)
                     {
-                        argumentFlowStore.Insert(argumentFlowInsert, edgeId, arg.ParameterOrdinal, arg.ParameterName,
-                            arg.ArgumentExpression, arg.ArgumentKind, arg.SourceSymbolFqn, now);
-                        session.RowsWritten();
-                    }
+                        foreach (var arg in dfResult.Arguments)
+                        {
+                            argumentFlowStore.Insert(argumentFlowInsert, edgeId, arg.ParameterOrdinal, arg.ParameterName,
+                                arg.ArgumentExpression, arg.ArgumentKind, arg.SourceSymbolFqn, now);
+                            session.RowsWritten();
+                        }
 
-                    if (dfResult.ReturnDestination != null)
-                    {
-                        returnFlowStore.Insert(returnFlowInsert, edgeId, dfResult.ReturnDestination.DestinationKind,
-                            dfResult.ReturnDestination.DestinationVariable,
-                            dfResult.ReturnDestination.DestinationSymbolFqn, now);
-                        session.RowsWritten();
+                        if (dfResult.ReturnDestination != null)
+                        {
+                            returnFlowStore.Insert(returnFlowInsert, edgeId, dfResult.ReturnDestination.DestinationKind,
+                                dfResult.ReturnDestination.DestinationVariable,
+                                dfResult.ReturnDestination.DestinationSymbolFqn, now);
+                            session.RowsWritten();
+                        }
                     }
                 }
 
@@ -595,7 +615,9 @@ public sealed class IndexOrchestrator
         }
         }
 
-        // Phase 4.5: Extract tagged comments
+        // Phase 4.5: Extract tagged comments (gated: standard+ profiles only)
+        if (extractComments)
+        {
         StartPhase("extracting_comments");
         _log?.Invoke("Extracting tagged comments...");
         projectIndex = 0;
@@ -645,6 +667,7 @@ public sealed class IndexOrchestrator
 
             _log?.Invoke($"  {project.Name}: comments extracted");
             session.CommitBatch();
+        }
         }
 
         // Phase 5: Extract call graph and dataflow (legacy path; skipped when the document-oriented
@@ -714,7 +737,7 @@ public sealed class IndexOrchestrator
                             session.RowsWritten();
 
                             // Extract and store dataflow for this call site
-                            if (edge.InvocationSyntax != null && edge.SemanticModel != null)
+                            if (persistDataflow && edge.InvocationSyntax != null && edge.SemanticModel != null)
                             {
                                 var dfResult = DataflowExtractor.ExtractFromInvocation(
                                     edge.InvocationSyntax, edge.SemanticModel);

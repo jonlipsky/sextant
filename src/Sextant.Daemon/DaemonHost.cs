@@ -25,6 +25,7 @@ public sealed class DaemonHost : IDisposable
     private Solution? _currentSolution;
     private bool _useDocumentExtractor;
     private Indexer.ExtractionParallelismOptions _parallelism = Indexer.ExtractionParallelismOptions.Default;
+    private IndexProfileDescriptor _profile = IndexProfileDescriptor.Full;
 
     public int StatusPort => _statusServer?.Port ?? 0;
 
@@ -49,6 +50,7 @@ public sealed class DaemonHost : IDisposable
         _db = new IndexDatabase(_dbPath, IndexWriteOptions.FromConfiguration(config));
         _useDocumentExtractor = config.DocumentExtractor;
         _parallelism = Indexer.ExtractionParallelismOptions.FromConfiguration(config);
+        _profile = IndexProfileDescriptor.FromConfiguration(config);
         _db.RunMigrations();
         _queue = new IndexingQueue();
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -66,6 +68,20 @@ public sealed class DaemonHost : IDisposable
         if (needsFullIndex)
         {
             _log?.Invoke("No existing index — performing full initial index...");
+        }
+        else if (ConfigurationChangedSinceLastRun())
+        {
+            // The indexing profile / feature configuration changed since the last complete run (e.g.
+            // core→standard, which never built the optional tables). An incremental catch-up would
+            // leave the newly-enabled tables unbuilt (or the newly-disabled ones stale), so treat this
+            // like a generation-invalidating change and rebuild fully. A null recorded hash (a
+            // pre-Phase-8 generation) counts as changed, mirroring the null-fingerprint semantics.
+            _log?.Invoke("Indexing configuration changed since last index — performing full re-index...");
+            needsFullIndex = true;
+        }
+
+        if (needsFullIndex)
+        {
             await PerformFullIndexAsync();
         }
         else
@@ -124,7 +140,7 @@ public sealed class DaemonHost : IDisposable
                 var solution = await SolutionLoader.LoadSolutionAsync(solutionPath);
                 _currentSolution = solution;
 
-                var orchestrator = new IndexOrchestrator(_db!, _log, _useDocumentExtractor, _parallelism);
+                var orchestrator = new IndexOrchestrator(_db!, _log, _useDocumentExtractor, _parallelism, _profile);
                 await orchestrator.IndexSolutionAsync(solution, progressReporter);
             }
             _lastIndexedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -227,7 +243,7 @@ public sealed class DaemonHost : IDisposable
             // an unchanged solution yields an empty closure and does no work.
             foreach (var (solution, changedPaths) in loaded)
             {
-                var incremental = new IncrementalIndexer(_db!, _log, _useDocumentExtractor, _parallelism);
+                var incremental = new IncrementalIndexer(_db!, _log, _useDocumentExtractor, _parallelism, _profile);
                 await incremental.IndexChangedFilesAsync(solution, changedPaths);
             }
 
@@ -286,7 +302,7 @@ public sealed class DaemonHost : IDisposable
                     // The incremental indexer rebuilds the full invalidated project closure, so there
                     // is no signature-changed follow-up set to re-enqueue: every dependent in the
                     // closure was already rebuilt in the same pass.
-                    var incremental = new IncrementalIndexer(_db!, _log, _useDocumentExtractor, _parallelism);
+                    var incremental = new IncrementalIndexer(_db!, _log, _useDocumentExtractor, _parallelism, _profile);
                     await incremental.IndexChangedFilesAsync(_currentSolution, item.FilePaths);
                 }
                 _lastIndexedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -338,6 +354,29 @@ public sealed class DaemonHost : IDisposable
         catch
         {
             return true;
+        }
+    }
+
+    /// <summary>
+    /// True when the current indexing profile's configuration hash differs from the last complete
+    /// run's recorded hash (Phase 8). A difference means the feature set changed since the served
+    /// generation was built, so an incremental catch-up would leave optional tables unbuilt or stale;
+    /// the caller forces a full re-index instead. A null recorded hash (a pre-Phase-8 generation)
+    /// counts as changed. Never treats a missing/broken ledger as changed, so a fresh full-index
+    /// decision is left to <see cref="IsEmptyDatabase"/>.
+    /// </summary>
+    private bool ConfigurationChangedSinceLastRun()
+    {
+        try
+        {
+            var lastComplete = new IndexRunStore(_db!.GetConnection()).GetLastCompleteRun();
+            if (lastComplete == null)
+                return false;
+            return !string.Equals(lastComplete.ConfigHash, _profile.ConfigurationHash, StringComparison.Ordinal);
+        }
+        catch
+        {
+            return false;
         }
     }
 

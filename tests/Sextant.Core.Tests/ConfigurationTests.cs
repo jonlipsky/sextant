@@ -158,6 +158,139 @@ public class ConfigurationTests
         }
     }
 
+    // === Phase 8: indexing profile, generated-source policy, and retention config ===================
+
+    [TestMethod]
+    public void IndexingProfile_DefaultsToStandard()
+    {
+        var config = SextantConfiguration.Load(_tempDir);
+        Assert.AreEqual(IndexProfiles.Standard, config.IndexingProfile, "standard is the default profile");
+        Assert.AreEqual(GeneratedSourcePolicies.Exclude, config.GeneratedSourcePolicy);
+    }
+
+    [TestMethod]
+    public void IndexingProfile_LoadedFromJson()
+    {
+        File.WriteAllText(Path.Combine(_tempDir, "sextant.json"),
+            """{ "indexing_profile": "core", "generated_source_policy": "exclude" }""");
+
+        var config = SextantConfiguration.Load(_tempDir);
+        Assert.AreEqual("core", config.IndexingProfile);
+        Assert.AreEqual("exclude", config.GeneratedSourcePolicy);
+    }
+
+    [TestMethod]
+    public void IndexingProfile_EnvVarOverridesConfig()
+    {
+        File.WriteAllText(Path.Combine(_tempDir, "sextant.json"), """{ "indexing_profile": "core" }""");
+        Environment.SetEnvironmentVariable("SEXTANT_INDEXING_PROFILE", "deep");
+        try
+        {
+            Assert.AreEqual("deep", SextantConfiguration.Load(_tempDir).IndexingProfile,
+                "SEXTANT_INDEXING_PROFILE overrides the json profile");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("SEXTANT_INDEXING_PROFILE", null);
+        }
+    }
+
+    [TestMethod]
+    public void Retention_DefaultsAreApplied()
+    {
+        var config = SextantConfiguration.Load(_tempDir);
+        Assert.AreEqual(3, config.Retention.KeepCompleteGenerations);
+        Assert.AreEqual(10, config.Retention.ApiSnapshotKeepCommits);
+        Assert.IsTrue(config.Retention.PruneSupersededSourceBlobs);
+    }
+
+    [TestMethod]
+    public void Retention_LoadedFromJson()
+    {
+        File.WriteAllText(Path.Combine(_tempDir, "sextant.json"), """
+        {
+            "retention": {
+                "keep_complete_generations": 5,
+                "api_snapshot_keep_commits": 25,
+                "prune_superseded_source_blobs": false
+            }
+        }
+        """);
+
+        var config = SextantConfiguration.Load(_tempDir);
+        Assert.AreEqual(5, config.Retention.KeepCompleteGenerations);
+        Assert.AreEqual(25, config.Retention.ApiSnapshotKeepCommits);
+        Assert.IsFalse(config.Retention.PruneSupersededSourceBlobs);
+    }
+
+    [TestMethod]
+    public void Retention_EnvVarsOverrideConfig()
+    {
+        File.WriteAllText(Path.Combine(_tempDir, "sextant.json"),
+            """{ "retention": { "keep_complete_generations": 5 } }""");
+        Environment.SetEnvironmentVariable("SEXTANT_RETENTION_KEEP_GENERATIONS", "1");
+        Environment.SetEnvironmentVariable("SEXTANT_RETENTION_API_KEEP_COMMITS", "2");
+        Environment.SetEnvironmentVariable("SEXTANT_RETENTION_PRUNE_SOURCE_BLOBS", "false");
+        try
+        {
+            var config = SextantConfiguration.Load(_tempDir);
+            Assert.AreEqual(1, config.Retention.KeepCompleteGenerations);
+            Assert.AreEqual(2, config.Retention.ApiSnapshotKeepCommits);
+            Assert.IsFalse(config.Retention.PruneSupersededSourceBlobs);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("SEXTANT_RETENTION_KEEP_GENERATIONS", null);
+            Environment.SetEnvironmentVariable("SEXTANT_RETENTION_API_KEEP_COMMITS", null);
+            Environment.SetEnvironmentVariable("SEXTANT_RETENTION_PRUNE_SOURCE_BLOBS", null);
+        }
+    }
+
+    [TestMethod]
+    public void Retention_PruneEnvVar_ParsesCaseInsensitively()
+    {
+        // A destructive default-on flag must not silently stay enabled for a mixed-case or padded
+        // "false" spelling (review hardening).
+        foreach (var off in new[] { "False", "FALSE", " false ", "Off", "No", "0" })
+        {
+            Environment.SetEnvironmentVariable("SEXTANT_RETENTION_PRUNE_SOURCE_BLOBS", off);
+            try
+            {
+                var config = SextantConfiguration.Load(_tempDir);
+                Assert.IsFalse(config.Retention.PruneSupersededSourceBlobs,
+                    $"'{off}' must disable source-blob pruning");
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("SEXTANT_RETENTION_PRUNE_SOURCE_BLOBS", null);
+            }
+        }
+    }
+
+    [TestMethod]
+    public void Retention_NegativeKeepCounts_FallBackToDefaults()
+    {
+        // A stray negative keep-count is a misconfiguration, not a request to delete everything: it
+        // normalizes to the safe default, while an explicit 0 (keep only the servable generation) is
+        // preserved as a valid aggressive policy (review hardening).
+        var negative = new RetentionPolicy
+        {
+            KeepCompleteGenerations = -1,
+            ApiSnapshotKeepCommits = -5,
+            PruneSupersededSourceBlobs = true
+        }.Normalized();
+        Assert.AreEqual(RetentionPolicy.DefaultKeepCompleteGenerations, negative.KeepCompleteGenerations);
+        Assert.AreEqual(RetentionPolicy.DefaultApiSnapshotKeepCommits, negative.ApiSnapshotKeepCommits);
+
+        var zero = new RetentionPolicy
+        {
+            KeepCompleteGenerations = 0,
+            ApiSnapshotKeepCommits = 0
+        }.Normalized();
+        Assert.AreEqual(0, zero.KeepCompleteGenerations);
+        Assert.AreEqual(0, zero.ApiSnapshotKeepCommits);
+    }
+
     [TestMethod]
     public void FindRepoRoot_FindsGitDirectory()
     {

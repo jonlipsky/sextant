@@ -5,6 +5,7 @@ using ModelContextProtocol.Server;
 
 namespace Sextant.Mcp.Tools;
 
+[McpServerToolType]
 public static class GetDaemonStatusTool
 {
     [McpServerTool(Name = "get_daemon_status"), Description(

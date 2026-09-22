@@ -14,7 +14,8 @@ public static partial class SymbolExtractor
 
     private static readonly SymbolDisplayFormat FqnFormat = SymbolDisplayFormat.FullyQualifiedFormat;
 
-    public static async Task<List<Sextant.Core.SymbolInfo>> ExtractFromProjectAsync(Project project, long projectId)
+    public static async Task<List<Sextant.Core.SymbolInfo>> ExtractFromProjectAsync(
+        Project project, long projectId, bool includeDocComments = true)
     {
         var compilation = await project.GetCompilationAsync();
         if (compilation == null)
@@ -68,7 +69,7 @@ public static partial class SymbolExtractor
                     IsOverride = declaredSymbol.IsOverride,
                     Signature = signature,
                     SignatureHash = signature != null ? HashSignature(signature) : null,
-                    DocComment = GetDocComment(declaredSymbol),
+                    DocComment = includeDocComments ? GetDocComment(declaredSymbol) : null,
                     FilePath = syntaxTree.FilePath,
                     LineStart = lineSpan.StartLinePosition.Line + 1,
                     LineEnd = lineSpan.EndLinePosition.Line + 1,

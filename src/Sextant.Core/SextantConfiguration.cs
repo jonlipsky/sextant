@@ -15,6 +15,24 @@ public sealed class SextantConfiguration
     public bool AutoSpawnDaemon { get; set; } = true;
 
     /// <summary>
+    /// The indexing profile selecting semantic depth: <c>core</c>, <c>standard</c> (default), or
+    /// <c>deep</c> (Phase 8). Distinct from <see cref="Profile"/>, which names the on-disk index slot.
+    /// Overridable via <c>indexing_profile</c> in <c>sextant.json</c> or the
+    /// <c>SEXTANT_INDEXING_PROFILE</c> env var.
+    /// </summary>
+    public string IndexingProfile { get; set; } = IndexProfiles.Default;
+
+    /// <summary>
+    /// Generated-source handling policy (Phase 8). Currently always <c>exclude</c>; recorded in the
+    /// configuration hash and status so a future include-generated mode is an explicit, rebuild-forcing
+    /// change. Overridable via <c>generated_source_policy</c> or <c>SEXTANT_GENERATED_SOURCE_POLICY</c>.
+    /// </summary>
+    public string GeneratedSourcePolicy { get; set; } = GeneratedSourcePolicies.Default;
+
+    /// <summary>Retention limits for superseded generations, API history, and source blobs (Phase 8).</summary>
+    public RetentionPolicy Retention { get; set; } = new();
+
+    /// <summary>
     /// Row count that forces a mid-project commit so one abnormally large project cannot build an
     /// unbounded transaction (and WAL). Normal projects commit at their project boundary first.
     /// </summary>
@@ -162,6 +180,19 @@ public sealed class SextantConfiguration
                             config.MaxParallelism = fileConfig.MaxParallelism.Value;
                         if (fileConfig.ExtractionQueueCapacity.HasValue)
                             config.ExtractionQueueCapacity = fileConfig.ExtractionQueueCapacity.Value;
+                        if (fileConfig.IndexingProfile != null)
+                            config.IndexingProfile = fileConfig.IndexingProfile;
+                        if (fileConfig.GeneratedSourcePolicy != null)
+                            config.GeneratedSourcePolicy = fileConfig.GeneratedSourcePolicy;
+                        if (fileConfig.Retention != null)
+                        {
+                            if (fileConfig.Retention.KeepCompleteGenerations.HasValue)
+                                config.Retention.KeepCompleteGenerations = fileConfig.Retention.KeepCompleteGenerations.Value;
+                            if (fileConfig.Retention.ApiSnapshotKeepCommits.HasValue)
+                                config.Retention.ApiSnapshotKeepCommits = fileConfig.Retention.ApiSnapshotKeepCommits.Value;
+                            if (fileConfig.Retention.PruneSupersededSourceBlobs.HasValue)
+                                config.Retention.PruneSupersededSourceBlobs = fileConfig.Retention.PruneSupersededSourceBlobs.Value;
+                        }
                     }
                 }
                 catch (JsonException)
@@ -236,6 +267,32 @@ public sealed class SextantConfiguration
         var queueCapacity = Environment.GetEnvironmentVariable("SEXTANT_EXTRACTION_QUEUE_CAPACITY");
         if (int.TryParse(queueCapacity, out var capacity))
             config.ExtractionQueueCapacity = capacity;
+
+        var indexingProfile = Environment.GetEnvironmentVariable("SEXTANT_INDEXING_PROFILE");
+        if (!string.IsNullOrEmpty(indexingProfile))
+            config.IndexingProfile = indexingProfile;
+
+        var generatedPolicy = Environment.GetEnvironmentVariable("SEXTANT_GENERATED_SOURCE_POLICY");
+        if (!string.IsNullOrEmpty(generatedPolicy))
+            config.GeneratedSourcePolicy = generatedPolicy;
+
+        var keepGenerations = Environment.GetEnvironmentVariable("SEXTANT_RETENTION_KEEP_GENERATIONS");
+        if (int.TryParse(keepGenerations, out var generations))
+            config.Retention.KeepCompleteGenerations = generations;
+
+        var apiKeepCommits = Environment.GetEnvironmentVariable("SEXTANT_RETENTION_API_KEEP_COMMITS");
+        if (int.TryParse(apiKeepCommits, out var commits))
+            config.Retention.ApiSnapshotKeepCommits = commits;
+
+        var pruneBlobs = Environment.GetEnvironmentVariable("SEXTANT_RETENTION_PRUNE_SOURCE_BLOBS");
+        if (!string.IsNullOrWhiteSpace(pruneBlobs))
+        {
+            // Destructive default-on flag: parse leniently but treat any negative spelling as "off"
+            // (trimmed, case-insensitive), so "False"/"OFF"/" no " never silently keep pruning enabled.
+            var normalized = pruneBlobs.Trim().ToLowerInvariant();
+            config.Retention.PruneSupersededSourceBlobs =
+                normalized is not ("false" or "0" or "no" or "off");
+        }
     }
 
     public static string? FindRepoRoot(string startDir)
@@ -294,5 +351,27 @@ public sealed class SextantConfiguration
 
         [JsonPropertyName("extraction_queue_capacity")]
         public int? ExtractionQueueCapacity { get; set; }
+
+        [JsonPropertyName("indexing_profile")]
+        public string? IndexingProfile { get; set; }
+
+        [JsonPropertyName("generated_source_policy")]
+        public string? GeneratedSourcePolicy { get; set; }
+
+        [JsonPropertyName("retention")]
+        public RetentionConfigFile? Retention { get; set; }
+    }
+
+    /// <summary>Deserialization model for the <c>retention</c> object — all fields nullable.</summary>
+    private sealed class RetentionConfigFile
+    {
+        [JsonPropertyName("keep_complete_generations")]
+        public int? KeepCompleteGenerations { get; set; }
+
+        [JsonPropertyName("api_snapshot_keep_commits")]
+        public int? ApiSnapshotKeepCommits { get; set; }
+
+        [JsonPropertyName("prune_superseded_source_blobs")]
+        public bool? PruneSupersededSourceBlobs { get; set; }
     }
 }

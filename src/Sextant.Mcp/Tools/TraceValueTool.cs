@@ -4,6 +4,7 @@ using ModelContextProtocol.Server;
 
 namespace Sextant.Mcp.Tools;
 
+[McpServerToolType]
 public static class TraceValueTool
 {
     [McpServerTool(Name = "trace_value"),
@@ -22,6 +23,9 @@ public static class TraceValueTool
         var db = dbProvider.GetReadyDatabase(out var notReady);
         if (db == null)
             return ResponseBuilder.BuildEmpty(notReady);
+
+        if (!CapabilityGate.Ensure(db, Core.IndexFeature.Dataflow, "dataflow", out var unavailable))
+            return unavailable;
 
         var conn = db.GetConnection();
         var symbolStore = new SymbolStore(conn);

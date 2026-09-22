@@ -4,6 +4,7 @@ using ModelContextProtocol.Server;
 
 namespace Sextant.Mcp.Tools;
 
+[McpServerToolType]
 public static class FindCommentsTool
 {
     [McpServerTool(Name = "find_comments"),
@@ -24,6 +25,9 @@ public static class FindCommentsTool
         var db = dbProvider.GetReadyDatabase(out var notReady);
         if (db == null)
             return ResponseBuilder.BuildEmpty(notReady);
+
+        if (!CapabilityGate.Ensure(db, Core.IndexFeature.Comments, "comments", out var unavailable))
+            return unavailable;
 
         var conn = db.GetConnection();
         var commentStore = new CommentStore(conn);
