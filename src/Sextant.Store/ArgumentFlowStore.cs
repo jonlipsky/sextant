@@ -5,25 +5,40 @@ namespace Sextant.Store;
 
 public sealed class ArgumentFlowStore(SqliteConnection connection)
 {
+    private const string InsertSql = """
+        INSERT INTO argument_flow (call_graph_id, parameter_ordinal, parameter_name,
+            argument_expression, argument_kind, source_symbol_fqn, last_indexed_at)
+        VALUES (@call_graph_id, @ordinal, @name, @expression, @kind, @source_fqn, @last_indexed_at)
+        RETURNING id;
+        """;
+
+    public SqliteCommand CreateInsertCommand()
+    {
+        var cmd = connection.CreateCommand();
+        cmd.CommandText = InsertSql;
+        return cmd;
+    }
+
     public long Insert(long callGraphId, int parameterOrdinal, string parameterName,
                        string argumentExpression, string argumentKind, string? sourceSymbolFqn,
                        long lastIndexedAt)
     {
-        using var cmd = connection.CreateCommand();
-        cmd.CommandText = """
-            INSERT INTO argument_flow (call_graph_id, parameter_ordinal, parameter_name,
-                argument_expression, argument_kind, source_symbol_fqn, last_indexed_at)
-            VALUES (@call_graph_id, @ordinal, @name, @expression, @kind, @source_fqn, @last_indexed_at)
-            RETURNING id;
-            """;
-        cmd.Parameters.AddWithValue("@call_graph_id", callGraphId);
-        cmd.Parameters.AddWithValue("@ordinal", parameterOrdinal);
-        cmd.Parameters.AddWithValue("@name", parameterName);
-        cmd.Parameters.AddWithValue("@expression", argumentExpression);
-        cmd.Parameters.AddWithValue("@kind", argumentKind);
-        cmd.Parameters.AddWithValue("@source_fqn", (object?)sourceSymbolFqn ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@last_indexed_at", lastIndexedAt);
+        using var cmd = CreateInsertCommand();
+        return Insert(cmd, callGraphId, parameterOrdinal, parameterName, argumentExpression,
+            argumentKind, sourceSymbolFqn, lastIndexedAt);
+    }
 
+    public long Insert(SqliteCommand cmd, long callGraphId, int parameterOrdinal, string parameterName,
+                       string argumentExpression, string argumentKind, string? sourceSymbolFqn,
+                       long lastIndexedAt)
+    {
+        SqlParam.Set(cmd, "@call_graph_id", callGraphId);
+        SqlParam.Set(cmd, "@ordinal", parameterOrdinal);
+        SqlParam.Set(cmd, "@name", parameterName);
+        SqlParam.Set(cmd, "@expression", argumentExpression);
+        SqlParam.Set(cmd, "@kind", argumentKind);
+        SqlParam.Set(cmd, "@source_fqn", sourceSymbolFqn);
+        SqlParam.Set(cmd, "@last_indexed_at", lastIndexedAt);
         return (long)cmd.ExecuteScalar()!;
     }
 

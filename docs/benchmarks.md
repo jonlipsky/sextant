@@ -84,9 +84,15 @@ re-emits the same semantic occurrence many times.
 ### Storage — final vs. peak (important)
 - `final_db_bytes` — the main database file size **after** a `PRAGMA wal_checkpoint(TRUNCATE)`.
 - `final_wal_bytes` — the write-ahead log size at the end of the run, before the checkpoint.
+- `final_shm_bytes` — the shared-memory index (`-shm`) size at the end of the run.
 - `peak_db_plus_wal_bytes` — the **transient** maximum of main-db-plus-WAL sampled on a timer
   during the run. This is typically far larger than the final database because the WAL grows
   before it is checkpointed.
+- `peak_wal_bytes` / `peak_shm_bytes` — the transient maxima of the WAL and SHM files alone,
+  sampled on the same timer. `peak_wal_bytes` is the headline signal Phase 3 bounds: batched,
+  checkpoint-bounded writes keep it near the size of one active batch instead of the whole run.
+- `peak_staged_artifact_bytes` — the transient maximum of all on-disk artifacts a staging
+  generation holds (main DB + WAL + SHM) while a new index is being built and not yet published.
 
 The report always distinguishes these two so a small final database does not hide a large transient
 disk footprint. Later phases must reduce the **peak**, not just the final size.
@@ -128,6 +134,42 @@ Every report embeds the initiative's acceptance targets under `targets`:
 
 A later phase that cannot meet a target must record a revised threshold with rationale rather than
 silently changing it.
+
+## Phase 3 result — bounded, batched writes
+
+Phase 3 replaces the per-row implicit-transaction write path with a single-writer unit-of-work
+(`IndexWriteSession`) that reuses prepared commands, commits at project/document batch boundaries,
+bounds the WAL with `wal_autocheckpoint` + `journal_size_limit`, and checkpoint-truncates at the end
+of the run. Data for a run stages under an `index_runs` generation and is published atomically, so a
+cancelled or crashed run never replaces the last complete index.
+
+Reproduced with `--corpus self` on the same machine, before (Phase 2 base) vs. after (Phase 3);
+absolute sizes vary by hardware and corpus, but the **WAL-to-final-DB ratio** is the invariant:
+
+| Metric | Before (per-row) | After (batched) |
+|---|--:|--:|
+| Final database | 5.23 MB | 6.04 MB |
+| Final WAL | 81.55 MB | 8 KB |
+| Peak WAL | ~81.6 MB | 5.97 MB |
+| Peak DB + WAL | 86.72 MB | 12.01 MB |
+| Peak WAL ÷ final DB | ~15.6× | ~1.0× |
+
+Peak DB+WAL drops **~86%** (target: ≥70%), and the WAL is no longer tens-of-times the final database
+— the headline amplification the phase set out to remove. The FTS5 per-row triggers stay active in
+the "after" run yet peak WAL remains ~1× the final DB, so the trigger writes are absorbed into each
+batch's transaction; a bulk-defer/rebuild of FTS is therefore deferred to the schema phase (Phase 7)
+rather than changed here.
+
+**Scope of "published atomically."** Phase 3's atomicity is a *pointer* guarantee: the last-complete
+generation flip (`index_runs.status`) commits inside the final write transaction, so `GetLastCompleteRun`
+never returns a complete run without its committed data, and a cancelled/crashed run never advances that
+pointer. It is **not** yet physical multi-version isolation — readers still query the shared symbol and
+reference tables, so a reader running *during* a full re-index can observe a partially rebuilt (hybrid)
+state, and a crash leaves already-committed batches in place for recovery to reconcile. Never-observe-a-
+hybrid isolation across generations is Phase 9 (immutable snapshots). Two caveats on the WAL bound:
+`wal_autocheckpoint` is a trigger, not a hard cap (peak WAL ≈ one active batch, not a strict ceiling),
+and a long-lived concurrent reader pins the WAL tail and defers `wal_checkpoint(TRUNCATE)` — the bound
+holds under the normal short-reader workload.
 
 ## Redaction guarantees
 

@@ -5,25 +5,37 @@ namespace Sextant.Store;
 
 public sealed class ReferenceStore(SqliteConnection connection)
 {
+    private const string InsertSql = """
+        INSERT INTO "references" (symbol_id, in_project_id, file_path, line, context_snippet, reference_kind, access_kind, last_indexed_at)
+        VALUES (@symbol_id, @in_project_id, @file_path, @line, @context_snippet, @reference_kind, @access_kind, @last_indexed_at)
+        RETURNING id;
+        """;
+
+    public SqliteCommand CreateInsertCommand()
+    {
+        var cmd = connection.CreateCommand();
+        cmd.CommandText = InsertSql;
+        return cmd;
+    }
+
     public long Insert(ReferenceInfo reference)
     {
-        using var cmd = connection.CreateCommand();
-        cmd.CommandText = """
-            INSERT INTO "references" (symbol_id, in_project_id, file_path, line, context_snippet, reference_kind, access_kind, last_indexed_at)
-            VALUES (@symbol_id, @in_project_id, @file_path, @line, @context_snippet, @reference_kind, @access_kind, @last_indexed_at)
-            RETURNING id;
-            """;
-        cmd.Parameters.AddWithValue("@symbol_id", reference.SymbolId);
-        cmd.Parameters.AddWithValue("@in_project_id", reference.InProjectId);
-        cmd.Parameters.AddWithValue("@file_path", reference.FilePath);
-        cmd.Parameters.AddWithValue("@line", reference.Line);
-        cmd.Parameters.AddWithValue("@context_snippet", (object?)reference.ContextSnippet ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@reference_kind", reference.ReferenceKind.ToString().ToLowerInvariant());
-        cmd.Parameters.AddWithValue("@access_kind", reference.AccessKind.HasValue
-            ? reference.AccessKind.Value.ToString().ToLowerInvariant()
-            : DBNull.Value);
-        cmd.Parameters.AddWithValue("@last_indexed_at", reference.LastIndexedAt);
+        using var cmd = CreateInsertCommand();
+        return Insert(cmd, reference);
+    }
 
+    public long Insert(SqliteCommand cmd, ReferenceInfo reference)
+    {
+        SqlParam.Set(cmd, "@symbol_id", reference.SymbolId);
+        SqlParam.Set(cmd, "@in_project_id", reference.InProjectId);
+        SqlParam.Set(cmd, "@file_path", reference.FilePath);
+        SqlParam.Set(cmd, "@line", reference.Line);
+        SqlParam.Set(cmd, "@context_snippet", reference.ContextSnippet);
+        SqlParam.Set(cmd, "@reference_kind", reference.ReferenceKind.ToString().ToLowerInvariant());
+        SqlParam.Set(cmd, "@access_kind", reference.AccessKind.HasValue
+            ? reference.AccessKind.Value.ToString().ToLowerInvariant()
+            : null);
+        SqlParam.Set(cmd, "@last_indexed_at", reference.LastIndexedAt);
         return (long)cmd.ExecuteScalar()!;
     }
 

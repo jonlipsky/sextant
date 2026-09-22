@@ -38,7 +38,7 @@ internal static class IndexHandler
 
             Console.WriteLine();
 
-            var indexDb = new Store.IndexDatabase(dbPath);
+            using var indexDb = new Store.IndexDatabase(dbPath, Store.IndexWriteOptions.FromConfiguration(config));
             indexDb.RunMigrations();
 
             var stopwatch = Stopwatch.StartNew();

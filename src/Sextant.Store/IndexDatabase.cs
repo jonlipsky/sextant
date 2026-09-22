@@ -7,11 +7,13 @@ public sealed class IndexDatabase : IDisposable
 {
     private readonly string _connectionString;
     private readonly string _dbPath;
+    private readonly IndexWriteOptions _writeOptions;
     private SqliteConnection? _connection;
 
-    public IndexDatabase(string dbPath)
+    public IndexDatabase(string dbPath, IndexWriteOptions? writeOptions = null)
     {
         _dbPath = Path.GetFullPath(dbPath);
+        _writeOptions = writeOptions ?? IndexWriteOptions.Default;
 
         var dir = Path.GetDirectoryName(_dbPath);
         if (!string.IsNullOrEmpty(dir))
@@ -28,11 +30,17 @@ public sealed class IndexDatabase : IDisposable
     /// <summary>Absolute path to the main database file.</summary>
     public string DbPath => _dbPath;
 
+    /// <summary>Write-path tuning (batch size, WAL controls, retry) applied to this database.</summary>
+    public IndexWriteOptions WriteOptions => _writeOptions;
+
     /// <summary>Current size of the main database file in bytes (0 if it does not exist yet).</summary>
     public long MainDbBytes => FileLengthOrZero(_dbPath);
 
     /// <summary>Current size of the write-ahead log in bytes (0 if it does not exist).</summary>
     public long WalBytes => FileLengthOrZero(_dbPath + "-wal");
+
+    /// <summary>Current size of the shared-memory index file in bytes (0 if it does not exist).</summary>
+    public long ShmBytes => FileLengthOrZero(_dbPath + "-shm");
 
     private static long FileLengthOrZero(string path)
     {
@@ -59,6 +67,10 @@ public sealed class IndexDatabase : IDisposable
         cmd.ExecuteNonQuery();
     }
 
+    /// <summary>Opens a bounded, batched write session over the single writer connection.</summary>
+    public IndexWriteSession BeginWriteSession(IndexWriteOptions? options = null)
+        => new(GetConnection(), options ?? _writeOptions, InvalidateConnection);
+
     public SqliteConnection GetConnection()
     {
         if (_connection != null)
@@ -68,6 +80,25 @@ public sealed class IndexDatabase : IDisposable
         _connection.Open();
         ConfigurePragmas(_connection);
         return _connection;
+    }
+
+    /// <summary>
+    /// Discards the memoized writer connection so the next <see cref="GetConnection"/> opens a fresh
+    /// one. Called when a write session's rollback fails non-benignly and the connection's transaction
+    /// state is unknown: reusing it could run the next write inside a still-open transaction. The next
+    /// caller re-runs the configured pragmas on the new connection.
+    /// </summary>
+    public void InvalidateConnection()
+    {
+        try
+        {
+            _connection?.Dispose();
+        }
+        catch (SqliteException)
+        {
+            // The connection is already in a bad state; dropping the reference is what matters.
+        }
+        _connection = null;
     }
 
     public SqliteConnection CreateReadOnlyConnection()
@@ -83,14 +114,16 @@ public sealed class IndexDatabase : IDisposable
         return conn;
     }
 
-    private static void ConfigurePragmas(SqliteConnection connection)
+    private void ConfigurePragmas(SqliteConnection connection)
     {
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = """
+        cmd.CommandText = $"""
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA foreign_keys = ON;
             PRAGMA busy_timeout = 5000;
+            PRAGMA wal_autocheckpoint = {_writeOptions.WalAutocheckpointPages};
+            PRAGMA journal_size_limit = {_writeOptions.JournalSizeLimitBytes};
             """;
         cmd.ExecuteNonQuery();
     }
@@ -122,6 +155,43 @@ public sealed class IndexDatabase : IDisposable
                 throw;
             }
         }
+
+        Recover();
+    }
+
+    /// <summary>
+    /// Startup recovery. Folds a valid write-ahead log into the main database (recovering a WAL left
+    /// by a prior process and truncating it), then abandons any staging generations that a dead
+    /// process left behind so a partially written run can never be mistaken for the current index.
+    /// Safe to call on every open; a no-op on a clean, fully checkpointed database.
+    /// </summary>
+    public void Recover()
+    {
+        var conn = GetConnection();
+
+        try
+        {
+            using var checkpoint = conn.CreateCommand();
+            checkpoint.CommandText = "PRAGMA wal_checkpoint(TRUNCATE);";
+            checkpoint.ExecuteNonQuery();
+        }
+        catch (SqliteException)
+        {
+            // A busy/locked checkpoint is non-fatal; the WAL is still valid and folds in later.
+        }
+
+        if (!TableExists(conn, "index_runs"))
+            return;
+
+        new IndexRunStore(conn).AbandonStaleRuns(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+    }
+
+    private static bool TableExists(SqliteConnection conn, string name)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = @name;";
+        cmd.Parameters.AddWithValue("@name", name);
+        return cmd.ExecuteScalar() != null;
     }
 
     private static void EnsureSchemaVersionTable(SqliteConnection conn)

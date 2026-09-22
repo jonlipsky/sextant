@@ -123,7 +123,11 @@ public sealed class BenchmarkReport
         sb.AppendLine("|---|--:|");
         sb.AppendLine($"| final database | {FormatBytes(s.FinalDbBytes)} |");
         sb.AppendLine($"| final WAL | {FormatBytes(s.FinalWalBytes)} |");
+        sb.AppendLine($"| final SHM | {FormatBytes(s.FinalShmBytes)} |");
         sb.AppendLine($"| peak database + WAL | {FormatBytes(s.PeakDbPlusWalBytes)} |");
+        sb.AppendLine($"| peak WAL | {FormatBytes(s.PeakWalBytes)} |");
+        sb.AppendLine($"| peak SHM | {FormatBytes(s.PeakShmBytes)} |");
+        sb.AppendLine($"| peak staged artifacts | {FormatBytes(s.PeakStagedArtifactBytes)} |");
         sb.AppendLine($"| peak managed memory | {FormatBytes(m.Memory.PeakManagedBytes)} |");
         sb.AppendLine($"| peak working set | {FormatBytes(m.Memory.PeakWorkingSetBytes)} |");
         sb.AppendLine();

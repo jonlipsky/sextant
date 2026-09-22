@@ -5,20 +5,32 @@ namespace Sextant.Store;
 
 public sealed class CallGraphStore(SqliteConnection connection)
 {
+    private const string InsertSql = """
+        INSERT INTO call_graph (caller_symbol_id, callee_symbol_id, call_site_file, call_site_line, last_indexed_at)
+        VALUES (@caller, @callee, @file, @line, @last_indexed_at)
+        RETURNING id;
+        """;
+
+    public SqliteCommand CreateInsertCommand()
+    {
+        var cmd = connection.CreateCommand();
+        cmd.CommandText = InsertSql;
+        return cmd;
+    }
+
     public long Insert(CallGraphEdge edge)
     {
-        using var cmd = connection.CreateCommand();
-        cmd.CommandText = """
-            INSERT INTO call_graph (caller_symbol_id, callee_symbol_id, call_site_file, call_site_line, last_indexed_at)
-            VALUES (@caller, @callee, @file, @line, @last_indexed_at)
-            RETURNING id;
-            """;
-        cmd.Parameters.AddWithValue("@caller", edge.CallerSymbolId);
-        cmd.Parameters.AddWithValue("@callee", edge.CalleeSymbolId);
-        cmd.Parameters.AddWithValue("@file", edge.CallSiteFile);
-        cmd.Parameters.AddWithValue("@line", edge.CallSiteLine);
-        cmd.Parameters.AddWithValue("@last_indexed_at", edge.LastIndexedAt);
+        using var cmd = CreateInsertCommand();
+        return Insert(cmd, edge);
+    }
 
+    public long Insert(SqliteCommand cmd, CallGraphEdge edge)
+    {
+        SqlParam.Set(cmd, "@caller", edge.CallerSymbolId);
+        SqlParam.Set(cmd, "@callee", edge.CalleeSymbolId);
+        SqlParam.Set(cmd, "@file", edge.CallSiteFile);
+        SqlParam.Set(cmd, "@line", edge.CallSiteLine);
+        SqlParam.Set(cmd, "@last_indexed_at", edge.LastIndexedAt);
         return (long)cmd.ExecuteScalar()!;
     }
 

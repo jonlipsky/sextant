@@ -5,23 +5,36 @@ namespace Sextant.Store;
 
 public sealed class CommentStore(SqliteConnection connection)
 {
+    private const string InsertSql = """
+        INSERT INTO comments (project_id, file_path, line, tag, text, enclosing_symbol_id, last_indexed_at)
+        VALUES (@project_id, @file_path, @line, @tag, @text, @enclosing_symbol_id, @last_indexed_at)
+        RETURNING id;
+        """;
+
+    public SqliteCommand CreateInsertCommand()
+    {
+        var cmd = connection.CreateCommand();
+        cmd.CommandText = InsertSql;
+        return cmd;
+    }
+
     public long Insert(long projectId, string filePath, int line, string tag,
                        string text, long? enclosingSymbolId, long lastIndexedAt)
     {
-        using var cmd = connection.CreateCommand();
-        cmd.CommandText = """
-            INSERT INTO comments (project_id, file_path, line, tag, text, enclosing_symbol_id, last_indexed_at)
-            VALUES (@project_id, @file_path, @line, @tag, @text, @enclosing_symbol_id, @last_indexed_at)
-            RETURNING id;
-            """;
-        cmd.Parameters.AddWithValue("@project_id", projectId);
-        cmd.Parameters.AddWithValue("@file_path", filePath);
-        cmd.Parameters.AddWithValue("@line", line);
-        cmd.Parameters.AddWithValue("@tag", tag);
-        cmd.Parameters.AddWithValue("@text", text);
-        cmd.Parameters.AddWithValue("@enclosing_symbol_id", enclosingSymbolId.HasValue ? enclosingSymbolId.Value : DBNull.Value);
-        cmd.Parameters.AddWithValue("@last_indexed_at", lastIndexedAt);
+        using var cmd = CreateInsertCommand();
+        return Insert(cmd, projectId, filePath, line, tag, text, enclosingSymbolId, lastIndexedAt);
+    }
 
+    public long Insert(SqliteCommand cmd, long projectId, string filePath, int line, string tag,
+                       string text, long? enclosingSymbolId, long lastIndexedAt)
+    {
+        SqlParam.Set(cmd, "@project_id", projectId);
+        SqlParam.Set(cmd, "@file_path", filePath);
+        SqlParam.Set(cmd, "@line", line);
+        SqlParam.Set(cmd, "@tag", tag);
+        SqlParam.Set(cmd, "@text", text);
+        SqlParam.Set(cmd, "@enclosing_symbol_id", enclosingSymbolId.HasValue ? enclosingSymbolId.Value : (object?)null);
+        SqlParam.Set(cmd, "@last_indexed_at", lastIndexedAt);
         return (long)cmd.ExecuteScalar()!;
     }
 

@@ -5,22 +5,35 @@ namespace Sextant.Store;
 
 public sealed class ReturnFlowStore(SqliteConnection connection)
 {
+    private const string InsertSql = """
+        INSERT INTO return_flow (call_graph_id, destination_kind, destination_variable,
+            destination_symbol_fqn, last_indexed_at)
+        VALUES (@call_graph_id, @kind, @variable, @symbol_fqn, @last_indexed_at)
+        RETURNING id;
+        """;
+
+    public SqliteCommand CreateInsertCommand()
+    {
+        var cmd = connection.CreateCommand();
+        cmd.CommandText = InsertSql;
+        return cmd;
+    }
+
     public long Insert(long callGraphId, string destinationKind, string? destinationVariable,
                        string? destinationSymbolFqn, long lastIndexedAt)
     {
-        using var cmd = connection.CreateCommand();
-        cmd.CommandText = """
-            INSERT INTO return_flow (call_graph_id, destination_kind, destination_variable,
-                destination_symbol_fqn, last_indexed_at)
-            VALUES (@call_graph_id, @kind, @variable, @symbol_fqn, @last_indexed_at)
-            RETURNING id;
-            """;
-        cmd.Parameters.AddWithValue("@call_graph_id", callGraphId);
-        cmd.Parameters.AddWithValue("@kind", destinationKind);
-        cmd.Parameters.AddWithValue("@variable", (object?)destinationVariable ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@symbol_fqn", (object?)destinationSymbolFqn ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@last_indexed_at", lastIndexedAt);
+        using var cmd = CreateInsertCommand();
+        return Insert(cmd, callGraphId, destinationKind, destinationVariable, destinationSymbolFqn, lastIndexedAt);
+    }
 
+    public long Insert(SqliteCommand cmd, long callGraphId, string destinationKind, string? destinationVariable,
+                       string? destinationSymbolFqn, long lastIndexedAt)
+    {
+        SqlParam.Set(cmd, "@call_graph_id", callGraphId);
+        SqlParam.Set(cmd, "@kind", destinationKind);
+        SqlParam.Set(cmd, "@variable", destinationVariable);
+        SqlParam.Set(cmd, "@symbol_fqn", destinationSymbolFqn);
+        SqlParam.Set(cmd, "@last_indexed_at", lastIndexedAt);
         return (long)cmd.ExecuteScalar()!;
     }
 

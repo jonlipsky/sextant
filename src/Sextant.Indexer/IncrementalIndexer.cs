@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using Sextant.Core;
 using Sextant.Store;
 using Microsoft.CodeAnalysis;
+using Microsoft.Data.Sqlite;
 
 namespace Sextant.Indexer;
 
@@ -40,6 +41,7 @@ public sealed class IncrementalIndexer
         var callGraphStore = new CallGraphStore(conn);
         var relationshipStore = new RelationshipStore(conn);
         var projectStore = new ProjectStore(conn);
+        var runStore = new IndexRunStore(conn);
 
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var signatureChangedFiles = new List<string>();
@@ -86,6 +88,16 @@ public sealed class IncrementalIndexer
         }
 
         var changedSet = new HashSet<string>(changedFilePaths, StringComparer.OrdinalIgnoreCase);
+
+        // Wrap the whole incremental delta in one bounded write session and staging generation.
+        // Each changed file is an atomic batch (delete stale rows + re-insert), committed at its
+        // boundary; the generation is published (and the WAL folded back) once every file succeeds.
+        using var runScope = runStore.BeginScope("incremental", now);
+        using var session = _db.BeginWriteSession();
+        using var symbolInsert = symbolStore.CreateInsertCommand();
+        using var relationshipInsert = relationshipStore.CreateInsertCommand();
+        using var callGraphInsert = callGraphStore.CreateInsertCommand();
+        session.Begin();
 
         foreach (var project in solution.Projects)
         {
@@ -151,10 +163,11 @@ public sealed class IncrementalIndexer
                     var symbolInfo = SymbolExtractor.ExtractSymbolInfo(declared, projectId);
                     if (symbolInfo == null) continue;
 
-                    var id = symbolStore.Insert(symbolInfo);
+                    var id = symbolStore.Insert(symbolInsert, symbolInfo);
                     catalog.Add(projectId, symbolInfo.SymbolKey, id);
                     symbolInfo.Id = id;
                     newSymbols.Add(symbolInfo);
+                    session.RowsWritten();
                 }
 
                 // Check for signature changes
@@ -183,13 +196,14 @@ public sealed class IncrementalIndexer
                             if (catalog.TryResolveEdge(fromKey, projectId, out var fromId) &&
                                 catalog.TryResolveEdge(toKey, projectId, out var toId))
                             {
-                                relationshipStore.Insert(new RelationshipInfo
+                                relationshipStore.Insert(relationshipInsert, new RelationshipInfo
                                 {
                                     FromSymbolId = fromId,
                                     ToSymbolId = toId,
                                     Kind = relKind,
                                     LastIndexedAt = now
                                 });
+                                session.RowsWritten();
                             }
                         }
                     }
@@ -211,7 +225,7 @@ public sealed class IncrementalIndexer
                     {
                         if (catalog.TryResolveEdge(edge.CalleeKey, projectId, out var calleeSymbolId))
                         {
-                            callGraphStore.Insert(new CallGraphEdge
+                            callGraphStore.Insert(callGraphInsert, new CallGraphEdge
                             {
                                 CallerSymbolId = callerSymbolId,
                                 CalleeSymbolId = calleeSymbolId,
@@ -219,6 +233,7 @@ public sealed class IncrementalIndexer
                                 CallSiteLine = edge.CallSiteLine,
                                 LastIndexedAt = now
                             });
+                            session.RowsWritten();
                         }
                     }
                 }
@@ -231,7 +246,30 @@ public sealed class IncrementalIndexer
                     ContentHash = contentHash,
                     LastIndexedAt = now
                 });
+                session.CommitBatch();
             }
+        }
+
+        // Publish the incremental generation atomically with the final file's data (see the orchestrator
+        // for the rationale). Refuse a no-op publish, then run checkpoint/footprint as best-effort
+        // post-publish maintenance so a maintenance failure never discards the successful result.
+        var completedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        if (runStore.MarkComplete(runScope.RunId, completedAt, projectRoslynToId.Count) != 1)
+            throw new InvalidOperationException(
+                $"Index run {runScope.RunId} was not in staging state at publish; aborting to avoid a false completion.");
+        session.Complete();
+        runScope.Detach();
+
+        var finalWalBytes = _db.WalBytes;
+        var finalShmBytes = _db.ShmBytes;
+        try
+        {
+            _db.Checkpoint();
+            runStore.RecordFootprint(runScope.RunId, _db.MainDbBytes, finalWalBytes, finalShmBytes);
+        }
+        catch (SqliteException ex)
+        {
+            _log?.Invoke($"  Post-publish maintenance (checkpoint/footprint) failed, index already published: {ex.Message}");
         }
 
         return signatureChangedFiles;
