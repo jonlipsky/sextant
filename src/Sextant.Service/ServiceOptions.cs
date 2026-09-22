@@ -1,6 +1,7 @@
 using Sextant.Core;
 using Sextant.Core.Platform;
 using Sextant.Indexer;
+using Sextant.Service.Contributions;
 
 namespace Sextant.Service;
 
@@ -73,6 +74,14 @@ public sealed record ServiceOptions
     /// </summary>
     public PlatformRoutingPolicy PlatformRouting { get; init; } = PlatformRoutingPolicy.Default;
 
+    /// <summary>
+    /// The client/CI contribution policy (Phase 16): how strictly the service authorizes and Git-content-
+    /// verifies an uploaded contribution, and the max artifact size. Defaults to the dev-open posture
+    /// (<see cref="ContributionPolicy.Default"/>) so a single-node service accepts contributions with no
+    /// auth server / Git provider wired; a multi-tenant deployment sets the require-* flags true.
+    /// </summary>
+    public ContributionPolicy Contribution { get; init; } = ContributionPolicy.Default;
+
     private const string EnvPrefix = "SEXTANT_SERVICE_";
 
     /// <summary>
@@ -113,7 +122,16 @@ public sealed record ServiceOptions
             // into published snapshots so request identity == published identity and cross-node reuse under
             // an incompatible capability is blocked (criterion 5).
             DefaultCapabilityFingerprint = WorkerCapability.LocalDefault.Fingerprint,
-            PlatformRouting = PlatformRoutingPolicy.Parse(config.PlatformRouting)
+            PlatformRouting = PlatformRoutingPolicy.Parse(config.PlatformRouting),
+            // Client/CI contribution policy (Phase 16). Dev-open by default; a multi-tenant deployment sets
+            // the require-* flags true (and wires a real authorizer/provider — enforced fail-closed at Start).
+            Contribution = new ContributionPolicy
+            {
+                RequireAuthorization = EnvBool("CONTRIB_REQUIRE_AUTH") ?? false,
+                RequireGitContentVerification = EnvBool("CONTRIB_REQUIRE_GIT_VERIFY") ?? false,
+                MaxArtifactBytes = EnvLong("CONTRIB_MAX_ARTIFACT_BYTES") is long max and > 0
+                    ? max : ContributionPolicy.Default.MaxArtifactBytes
+            }
         };
     }
 
@@ -122,6 +140,12 @@ public sealed record ServiceOptions
 
     private static int? EnvInt(string name) =>
         int.TryParse(Env(name), out var v) ? v : null;
+
+    private static long? EnvLong(string name) =>
+        long.TryParse(Env(name), out var v) ? v : null;
+
+    private static bool? EnvBool(string name) =>
+        Env(name) is { } v ? v is "1" or "true" or "TRUE" or "True" or "yes" or "on" : null;
 }
 
 /// <summary>

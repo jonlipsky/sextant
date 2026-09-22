@@ -75,26 +75,14 @@ public sealed class SolutionEvaluationProbe(ICheckoutProvider checkoutProvider) 
             ? []
             : diagnostics.Where(d => d.Contains(projectFileName, StringComparison.OrdinalIgnoreCase)).ToArray();
 
-    // Extracts a target-platform token (e.g. "windows", "ios") from the multi-TFM display suffix of a
-    // project name — "Foo (net8.0-windows)" → "windows". Returns null when the name carries no
-    // parenthesized TFM (a single-TFM/plain name like "Acme-Cli" must NOT be mis-parsed to a bogus
-    // platform "cli"). This is a display-only hint that only NAMES the owning OS — it never by itself
+    // Extracts a target-platform token (e.g. "windows", "ios") from a project name via the ONE canonical
+    // TFM parser (<see cref="Sextant.Core.Platform.TargetFrameworkFacts"/>, issue #65) — "Foo
+    // (net8.0-windows)" → "windows", "Foo (net8.0-windows10.0.19041)" → "windows". Returns null when the
+    // name carries no parenthesized platform-specific TFM (a single-TFM/plain name like "Acme-Cli" must NOT
+    // be mis-parsed to a bogus platform "cli", and a portable "Foo (net8.0)" is platform-agnostic). Sharing
+    // the parser with the contribution manifest builder keeps route-time and contribution-time capability
+    // detection consistent. This is a display-only hint that only NAMES the owning OS — it never by itself
     // triggers routing; a demonstrated load failure does.
-    internal static string? ParseTargetPlatform(string projectName)
-    {
-        var open = projectName.LastIndexOf('(');
-        var close = projectName.LastIndexOf(')');
-        if (open < 0 || close <= open)
-            return null;
-        var tfm = projectName[(open + 1)..close];
-        var dash = tfm.IndexOf('-');
-        if (dash < 0 || dash + 1 >= tfm.Length)
-            return null;
-        var platform = tfm[(dash + 1)..].Trim();
-        // Strip a trailing platform version (net8.0-windows10.0.19041 → windows).
-        var end = 0;
-        while (end < platform.Length && !char.IsDigit(platform[end])) end++;
-        var name = platform[..end].Trim().ToLowerInvariant();
-        return name.Length > 0 ? name : null;
-    }
+    internal static string? ParseTargetPlatform(string projectName) =>
+        Sextant.Core.Platform.TargetFrameworkFacts.Parse(projectName).Platform;
 }
