@@ -24,20 +24,16 @@ public static class FindCrossRepositoryUsagesTool
         [Description("Optional: restrict to consumers at this exact commit (historical scope). Omit for branch-head scope.")]
         string? consumer_commit = null)
     {
-        var db = dbProvider.GetReadyDatabase(out var notReady);
-        if (db == null)
-            return ResponseBuilder.BuildEmpty(notReady);
-
-        // Honour the Phase-11 fail-closed top-level read gate before touching any cross-repo data: a
-        // denied read must surface a structured error, never an empty successful result.
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+        // Honour the Phase-17 fail-closed top-level read gate before touching any cross-repo data: a
+        // denied read surfaces the uniform not-found, never an empty successful result.
+        if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
 
-        var conn = db.GetConnection();
+        using var conn = db.OpenReadConnection();
         var scope = new CrossRepoUsageScope { Branch = branch, ConsumerCommitSha = consumer_commit };
 
         var outcome = CrossRepositoryUsageResolver.Resolve(
-            conn, provider_repository_url, symbol_fqn, scope, AllowAllReadAuthorizer.Instance);
+            conn, provider_repository_url, symbol_fqn, scope, dbProvider.Authorizer);
 
         // FQN did not resolve to a stable provider symbol identity: an FQN-only cross-repo match is
         // prohibited, so say so explicitly instead of implying the symbol has zero usages.

@@ -23,18 +23,14 @@ public static class FindSubmoduleConsumersTool
         [Description("Optional: restrict to consumers at this exact commit (historical scope). Omit for branch-head scope.")]
         string? consumer_commit = null)
     {
-        var db = dbProvider.GetReadyDatabase(out var notReady);
-        if (db == null)
-            return ResponseBuilder.BuildEmpty(notReady);
-
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+        if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
 
-        var conn = db.GetConnection();
+        using var conn = db.OpenReadConnection();
         var scope = new CrossRepoUsageScope { Branch = branch, ConsumerCommitSha = consumer_commit };
 
         var consumers = CrossRepositoryUsageResolver.ResolveConsumers(
-            conn, provider_repository_url, provider_commit, scope, AllowAllReadAuthorizer.Instance);
+            conn, provider_repository_url, provider_commit, scope, dbProvider.Authorizer);
 
         var results = consumers.Select(c => (object)new
         {

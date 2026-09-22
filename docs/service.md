@@ -191,6 +191,29 @@ separate from the persistent checkout/artifact/cache volumes**:
 So a botched worker-scratch cleanup can **never** reach — let alone delete — a published snapshot's durable
 data. This extends the Phase-8 retention servable guard + Phase-9 `BranchPointerProtection`.
 
+## Untrusted evaluation sandbox (Phase 17, criterion 2)
+
+MSBuild project evaluation is an **untrusted execution boundary — even for a private repo** (imported
+targets, SDK resolvers, inline `UsingTask`/`Exec` tasks run arbitrary code). Every service-worker evaluation
+of a checkout therefore runs through `EvaluationSandbox`, which enforces a wall-clock **time budget**, a
+watchdog **memory ceiling**, **secret scrubbing** + an **offline/no-telemetry** environment, and
+**fail-closed scratch confinement** (it refuses to run if the per-job scratch is not under the scratch root,
+so evaluation can never write into a persistent volume).
+
+> ⚠️ **Defense in depth, NOT a hard security boundary.** The untrusted work runs **in-process**, so a
+> hostile project can still read/write arbitrary filesystem paths the worker user can reach, spawn child
+> processes, open network sockets, and ignore the cooperative cancellation (a tight native loop never
+> observes the token). The memory ceiling is a cooperative abort, not an OS hard cap; the offline posture is
+> best-effort environment, not a kernel network block.
+
+**Operational rule:** do **not** host untrusted third-party repositories in multi-tenant production on this
+in-process tier. It is adequate for local/single-node use and for **explicitly-onboarded, trusted pilot
+repositories**. True OS-hard isolation (job object / cgroup + rlimits + network namespace / `sandbox-exec`,
+over an **out-of-process** evaluator) is tracked as **issue #76** and is a **documented precondition** for
+untrusted multi-tenant production — it will be wired into the security runbook and the pilot exit criteria
+(criterion 7), and cross-referenced from the ProcessStack integration (#19). The single-node local CLI/daemon
+path does not run this worker, so leaving the sandbox unwired there keeps local operation byte-identical.
+
 ## Retention & GC — the service is the lease owner (#46 / #37 / #54 / #38)
 
 Now that the service owns the durable catalog and a `/control/retention` endpoint, it performs the

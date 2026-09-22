@@ -15,14 +15,10 @@ public static class FindUnreferencedTool
         [Description("Exclude symbols defined in test projects (default: true)")] bool exclude_test_projects = true,
         [Description("Optional accessibility filter (public, internal, etc.)")] string? accessibility = null)
     {
-        var db = dbProvider.GetReadyDatabase(out var notReady);
-        if (db == null)
-            return ResponseBuilder.BuildEmpty(notReady);
-
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+        if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
 
-        var conn = db.GetConnection();
+        using var conn = db.OpenReadConnection();
         var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
         var symbolStore = new SymbolStore(conn) { Scope = readContext.Scope };
 

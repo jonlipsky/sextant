@@ -38,6 +38,53 @@ public sealed class ServicePaths
         Directory.CreateDirectory(_scratchRoot);
     }
 
+    /// <summary>
+    /// The sanitized single-segment directory name a repository's checkout lives under, on the checkout
+    /// volume. This is the ONE canonical repo-url → directory mapping, shared by the checkout provider
+    /// (which locates the checkout to index) and the Git-content provider (#68, which must look in the SAME
+    /// directory to verify blobs), so the two can never disagree. It strips a trailing <c>.git</c>, replaces
+    /// invalid filename characters, and trims separators/dots so <c>.</c>/<c>..</c> traversal collapses to a
+    /// safe default.
+    /// <para>
+    /// Cross-tenant isolation (issue #7): the basename alone is NOT unique — <c>org-a/common</c> and
+    /// <c>org-b/common</c> are DIFFERENT repositories that share a basename. Mapping both to the same
+    /// directory would let one tenant's checkout satisfy another tenant's request (a cross-tenant
+    /// isolation bug, criterion 1). So the segment is suffixed with a short stable hash of the FULL
+    /// normalized remote URL: distinct URLs get distinct directories while the human-readable basename is
+    /// preserved. Trivially-equivalent spellings (trailing <c>/</c> or <c>.git</c>) normalize to the SAME
+    /// hash so the same repo always maps to the same directory.
+    /// </para>
+    /// </summary>
+    public static string RepoDirectoryName(string repositoryRemoteUrl)
+    {
+        var url = repositoryRemoteUrl ?? string.Empty;
+        var trimmed = url.TrimEnd('/');
+        var lastSlash = trimmed.LastIndexOf('/');
+        var name = lastSlash >= 0 ? trimmed[(lastSlash + 1)..] : trimmed;
+        if (name.EndsWith(".git", StringComparison.OrdinalIgnoreCase))
+            name = name[..^4];
+        var chars = name.Select(c => Array.IndexOf(Path.GetInvalidFileNameChars(), c) >= 0 ? '_' : c).ToArray();
+        var safe = new string(chars).Trim('_', '.');
+        if (safe.Length == 0)
+            safe = "repo";
+        return $"{safe}-{ShortUrlHash(url)}";
+    }
+
+    /// <summary>
+    /// A short, stable, collision-resistant hash of the identity-bearing part of a remote URL. Only the
+    /// identity-neutral trailing <c>/</c> and <c>.git</c> are normalized away (mirroring the basename
+    /// derivation) so equivalent spellings of one repo share a directory; everything else — host, owner,
+    /// path, case — is significant, so two genuinely-distinct repositories never collide.
+    /// </summary>
+    private static string ShortUrlHash(string repositoryRemoteUrl)
+    {
+        var normalized = (repositoryRemoteUrl ?? string.Empty).Trim().TrimEnd('/');
+        if (normalized.EndsWith(".git", StringComparison.OrdinalIgnoreCase))
+            normalized = normalized[..^4];
+        var digest = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(normalized));
+        return Convert.ToHexString(digest, 0, 6).ToLowerInvariant();
+    }
+
     /// <summary>Allocates a fresh, empty per-job scratch directory under the scratch root.</summary>
     public string AllocateScratch(string jobLabel)
     {
@@ -71,6 +118,14 @@ public sealed class ServicePaths
         var full = NormalizeFull(path);
         return IsUnder(full, _checkoutRoot) || IsUnder(full, _artifactRoot) || IsUnder(full, _cacheRoot);
     }
+
+    /// <summary>
+    /// True when <paramref name="path"/> lies inside the ephemeral worker-scratch root. The evaluation
+    /// sandbox (Phase 17, criterion 2) uses this as a fail-closed guard: untrusted repository evaluation may
+    /// only be allowed to WRITE into scratch, which is separate from and unreachable by the persistent
+    /// volumes, so a botched or hostile evaluation can never corrupt a published snapshot.
+    /// </summary>
+    public bool IsScratch(string path) => IsUnder(NormalizeFull(path), _scratchRoot);
 
     private static void AssertSeparate(string aName, string a, string bName, string b)
     {

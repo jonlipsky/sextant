@@ -22,17 +22,14 @@ public static class FindCommentsTool
         [Description("Maximum results (default 50)")]
         int max_results = 50)
     {
-        var db = dbProvider.GetReadyDatabase(out var notReady);
-        if (db == null)
-            return ResponseBuilder.BuildEmpty(notReady);
-
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+        if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
 
-        if (!CapabilityGate.Ensure(db, Core.IndexFeature.Comments, "comments", out var unavailable))
+        if (!CapabilityGate.Ensure(db, Core.IndexFeature.Comments, "comments", out var unavailable,
+                readContext.SelectedSnapshotId, dbProvider.Authorizer.IsEnforcing))
             return unavailable;
 
-        var conn = db.GetConnection();
+        using var conn = db.OpenReadConnection();
         var snapshotScope = readContext.Scope;
         var commentStore = new CommentStore(conn) { Scope = snapshotScope };
         var symbolStore = new SymbolStore(conn) { Scope = snapshotScope };

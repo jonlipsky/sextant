@@ -11,11 +11,13 @@ public static class GetIndexStatusTool
     [McpServerTool(Name = "get_index_status"), Description("Check what projects are indexed, symbol/reference counts, index freshness, the active indexing profile, its enabled feature capabilities, and retained storage. Call this first to see what data is available.")]
     public static string GetIndexStatus(DatabaseProvider dbProvider)
     {
-        var db = dbProvider.GetReadyDatabase(out var notReady);
-        if (db == null)
-            return ResponseBuilder.BuildEmpty(notReady);
+        // Fail closed (criterion 1): status reveals project names, git remotes, symbol/reference counts and
+        // storage — all existence/count signals. An unauthorized principal must get the uniform not-found,
+        // never the status, so authorize BEFORE reading anything.
+        if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
+            return authError;
 
-        var conn = db.GetConnection();
+        using var conn = db.OpenReadConnection();
 
         var results = new List<object>();
         long freshness = 0;
@@ -24,7 +26,8 @@ public static class GetIndexStatusTool
         // lists exactly the current snapshot, surfaces the commit-invariant logical canonical id (never
         // the per-snapshot-suffixed storage value), and never double-counts across coexisting snapshots.
         // A legacy/pre-first-publish DB (no selected snapshot) lists the mutable rows exactly as before.
-        var selected = new SnapshotStore(conn).GetSelectedSnapshotId();
+        // The pinned selection comes from the read context so it honours the Phase-17 repository selector.
+        var selected = readContext.SelectedSnapshotId;
         using var cmd = conn.CreateCommand();
         cmd.CommandText = $"""
             SELECT COALESCE(lp.canonical_id, p.canonical_id) AS canonical_id, p.git_remote_url, p.repo_relative_path,
@@ -61,13 +64,28 @@ public static class GetIndexStatusTool
             }
         }
 
-        var index = BuildIndexInfo(conn, selected);
+        var index = BuildIndexInfo(conn, selected, dbProvider.Authorizer.IsEnforcing);
         return ResponseBuilder.BuildStatus(results, freshness, index);
     }
 
-    private static object BuildIndexInfo(Microsoft.Data.Sqlite.SqliteConnection conn, long? selectedSnapshotId)
+    private static object BuildIndexInfo(
+        Microsoft.Data.Sqlite.SqliteConnection conn, long? selectedSnapshotId, bool policyEnforced)
     {
-        var run = new IndexRunStore(conn).GetLastCompleteRun();
+        // Under an enforced multi-tenant policy, scope run metadata (profile / config_hash / features) to
+        // the caller's SELECTED snapshot's own index run instead of the DB-wide latest complete run, which
+        // would leak another tenant's indexing profile and config hash (Phase 17, criterion 1). The
+        // zero-policy local path keeps using the last-complete run (byte-identical to pre-Phase-17).
+        var runStore = new IndexRunStore(conn);
+        IndexRun? run;
+        if (policyEnforced)
+        {
+            var snapRunId = selectedSnapshotId is long sid ? new SnapshotStore(conn).GetById(sid)?.RunId : null;
+            run = snapRunId is long rid ? runStore.GetById(rid) : null;
+        }
+        else
+        {
+            run = runStore.GetLastCompleteRun();
+        }
 
         // A generation with no recorded features (pre-Phase-8 index) is served with every capability.
         var features = run?.Features is { } f ? (IndexFeature)f : IndexFeature.Deep;
@@ -79,7 +97,10 @@ public static class GetIndexStatusTool
             config_hash = run?.ConfigHash,
             features = IndexProfiles.FeatureNames(features),
             overlay = BuildOverlayInfo(conn, selectedSnapshotId),
-            storage = BuildStorageInfo(conn)
+            // Storage is a DB-WIDE (all-tenant) aggregate; omit it under an enforced multi-tenant policy so
+            // a per-repository authorized caller cannot read another tenant's storage/existence counts
+            // (Phase 17, criterion 1). The zero-policy local path keeps reporting it (byte-identical).
+            storage = policyEnforced ? null : BuildStorageInfo(conn)
         };
     }
 

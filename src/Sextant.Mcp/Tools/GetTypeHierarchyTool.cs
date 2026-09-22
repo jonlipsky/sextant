@@ -14,14 +14,10 @@ public static class GetTypeHierarchyTool
         [Description("The fully qualified name of the type")] string symbol_fqn,
         [Description("Direction: 'up' (base types), 'down' (derived types), or 'both'")] string direction = "both")
     {
-        var db = dbProvider.GetReadyDatabase(out var notReady);
-        if (db == null)
-            return ResponseBuilder.BuildEmpty(notReady);
-
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+        if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
 
-        var conn = db.GetConnection();
+        using var conn = db.OpenReadConnection();
         var symbolStore = new SymbolStore(conn) { Scope = readContext.Scope };
         var relationshipStore = new RelationshipStore(conn);
         var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };

@@ -84,6 +84,36 @@ public class CrossRepositoryUsageResolverTests
     }
 
     [TestMethod]
+    public void Resolve_EnforcingProviderDenied_ReportsUnresolved_NoProviderSymbolOracle()
+    {
+        SeedProviderAndTwoConsumers();
+
+        // Under ENFORCEMENT, a caller with no access to the PROVIDER repo must not learn its symbol
+        // resolved: the result collapses to the SAME "no stable identity" outcome as a nonexistent symbol,
+        // so StableIdentityResolved is a provider-symbol existence oracle no longer (Phase 17, criterion 1).
+        var result = CrossRepositoryUsageResolver.Resolve(
+            _conn, ProviderUrl, ProviderFqn, CrossRepoUsageScope.DefaultHeads, new DenyProviderAuthorizer(ProviderUrl));
+
+        Assert.IsFalse(result.StableIdentityResolved,
+            "a denied provider repo reveals no stable identity (byte-identical to a nonexistent symbol)");
+        Assert.AreEqual(0, result.ResolvedSymbolKeyCount);
+        Assert.AreEqual(0, result.Usages.Count);
+    }
+
+    [TestMethod]
+    public void ResolveConsumers_EnforcingProviderDenied_ReturnsEmpty_NoConsumerExistenceLeak()
+    {
+        SeedProviderAndTwoConsumers();
+
+        var consumers = CrossRepositoryUsageResolver.ResolveConsumers(
+            _conn, ProviderUrl, providerCommitSha: null, CrossRepoUsageScope.DefaultHeads,
+            new DenyProviderAuthorizer(ProviderUrl));
+
+        Assert.AreEqual(0, consumers.Count,
+            "a caller denied the provider repo learns nothing about its consumers (fail closed)");
+    }
+
+    [TestMethod]
     public void Resolve_FqnWithNoStableProviderIdentity_IsReportedUnresolved_NotEmptyUsages()
     {
         SeedProviderAndTwoConsumers();
@@ -141,6 +171,10 @@ public class CrossRepositoryUsageResolverTests
 
     private sealed class DenyRepositoryAuthorizer(string deniedUrl) : IReadAuthorizer
     {
+        // Non-enforcing: these tests assert the PER-REPOSITORY cross-repo gate (AuthorizeRepository) in
+        // isolation, with the top-level provider-repository gate (Phase 17) deliberately NOT engaged, so
+        // provider resolution still succeeds and only the denied CONSUMER is filtered.
+        public bool IsEnforcing => false;
         public ReadAuthorization Authorize(SnapshotRow? selected) => ReadAuthorization.Allow;
         public ReadAuthorization AuthorizeRepository(long repositoryId, string remoteUrl) =>
             remoteUrl == deniedUrl ? ReadAuthorization.Deny("not authorized for " + remoteUrl) : ReadAuthorization.Allow;
@@ -148,9 +182,23 @@ public class CrossRepositoryUsageResolverTests
 
     private sealed class DenyAllRepositoriesAuthorizer : IReadAuthorizer
     {
+        public bool IsEnforcing => false;
         public ReadAuthorization Authorize(SnapshotRow? selected) => ReadAuthorization.Allow;
         public ReadAuthorization AuthorizeRepository(long repositoryId, string remoteUrl) =>
             ReadAuthorization.Deny("no cross-repo access");
+    }
+
+    /// <summary>
+    /// An ENFORCING authorizer that denies the provider repository itself. Under enforcement the resolver
+    /// must collapse to "no stable identity" (never reveal the provider symbol resolved) so an unauthorized
+    /// caller gets no provider-symbol existence oracle (Phase 17, criterion 1).
+    /// </summary>
+    private sealed class DenyProviderAuthorizer(string providerUrl) : IReadAuthorizer
+    {
+        public bool IsEnforcing => true;
+        public ReadAuthorization Authorize(SnapshotRow? selected) => ReadAuthorization.Allow;
+        public ReadAuthorization AuthorizeRepository(long repositoryId, string remoteUrl) =>
+            remoteUrl == providerUrl ? ReadAuthorization.Deny("provider not authorized") : ReadAuthorization.Allow;
     }
 
     // ==== seeding (direct, no git/Roslyn) ======================================================

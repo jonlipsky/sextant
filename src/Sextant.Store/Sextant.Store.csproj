@@ -8,6 +8,16 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.3" />
+    <!--
+      Supply-chain hardening (Phase 17): Microsoft.Data.Sqlite 10.0.3 pulls in
+      SQLitePCLRaw.bundle_e_sqlite3 2.1.11 transitively, which bundles a native SQLite older than
+      3.50.2 and carries NU1903 / CVE-2025-6965 (GHSA-2m69-gcr7-jv3q — aggregate-term memory
+      corruption). Pin the bundle up to a patched build that ships SQLite >= 3.50.2. This stays on the
+      2.1.x line so it satisfies Microsoft.Data.Sqlite.Core's `SQLitePCLRaw.core >= 2.1.11` floor with
+      no API-surface change. Verified: the 2.1.13 bundle ships SQLite 3.53.3 (>= 3.50.2), and the
+      build no longer emits NU1903.
+    -->
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.13" />
   </ItemGroup>
 
   <ItemGroup>

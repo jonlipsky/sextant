@@ -46,6 +46,23 @@ public static class CrossRepositoryUsageResolver
     {
         var store = new SnapshotDependencyStore(conn);
 
+        // Authorize the PROVIDER repository BEFORE resolving its symbol identity (Phase 17, criterion 1):
+        // otherwise StableIdentityResolved is a provider-symbol existence oracle for a caller with no
+        // access to the provider repo. Gated on IsEnforcing so the zero-policy local path is byte-identical
+        // (AllowAll resolves nothing here). An unauthorized OR unknown provider collapses to the SAME
+        // "no stable identity" outcome as a symbol that genuinely does not exist — no existence leak.
+        if (authorizer.IsEnforcing)
+        {
+            // Authorize on the provider repository URL, INDEPENDENT of whether the provider exists (the
+            // policy decision is URL-based; the id is not consulted). An unknown provider (id null → 0) and
+            // an existing-but-denied provider therefore run the identical authorize-and-return path, so
+            // neither the result nor the work performed distinguishes "denied" from "does not exist"
+            // (criterion 1 — no timing/existence oracle).
+            var providerRepoId = new SnapshotStore(conn).GetRepositoryId(providerRepositoryUrl);
+            if (!authorizer.AuthorizeRepository(providerRepoId ?? 0, providerRepositoryUrl).Allowed)
+                return new CrossRepositoryUsageResult(StableIdentityResolved: false, ResolvedSymbolKeys: [], Usages: []);
+        }
+
         // Bind the input FQN to the provider's STABLE symbol key(s). No key ⇒ no stable identity /
         // assembly lineage for this name in the provider repo, so a cross-repo match is prohibited: report
         // that explicitly rather than silently searching by FQN string (which could conflate two repos'
@@ -96,6 +113,21 @@ public static class CrossRepositoryUsageResolver
         IReadAuthorizer authorizer)
     {
         var store = new SnapshotDependencyStore(conn);
+
+        // Provider-repository authorization (Phase 17, criterion 1) FIRST, before enumerating any consumer
+        // rows: a caller with no access to the provider must learn nothing about it — not that it exists,
+        // and not (via query latency) how many consumers it has. IsEnforcing-gated so the local path is
+        // byte-identical. An unknown/denied provider returns empty, indistinguishable from "no consumers".
+        if (authorizer.IsEnforcing)
+        {
+            // URL-based authorization, INDEPENDENT of provider existence (see Resolve): unknown-and-denied
+            // is indistinguishable from unknown-and-authorized-with-no-consumers — both return empty after
+            // the same work, so query latency reveals neither existence nor consumer cardinality.
+            var providerRepoId = new SnapshotStore(conn).GetRepositoryId(providerRepositoryUrl);
+            if (!authorizer.AuthorizeRepository(providerRepoId ?? 0, providerRepositoryUrl).Allowed)
+                return [];
+        }
+
         var rows = store.GetConsumersByProviderRepository(providerRepositoryUrl, providerCommitSha, scope);
 
         var authorizationMemo = new Dictionary<long, bool>();

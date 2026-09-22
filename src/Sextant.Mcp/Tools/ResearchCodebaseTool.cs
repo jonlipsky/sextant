@@ -29,9 +29,11 @@ public static class ResearchCodebaseTool
         [Description("Response detail level: 'brief' (default) or 'detailed'")] string? detail_level = null,
         CancellationToken cancellationToken = default)
     {
-        var db = dbProvider.GetReadyDatabase(out var notReady);
-        if (db == null)
-            return ResponseBuilder.BuildEmpty(notReady);
+        // Fail closed (criterion 1) before doing ANY work: an unauthorized principal must not reach the
+        // research agent — otherwise the index's project/symbol counts would leak into the system prompt
+        // and its tool calls would run. A denied read returns the uniform not-found, never an empty answer.
+        if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
+            return authError;
 
         LlmConfiguration config;
         try
@@ -70,7 +72,8 @@ public static class ResearchCodebaseTool
             max_tool_calls,
             level,
             db,
-            cancellationToken
+            cancellationToken,
+            readContext.Scope
         );
 
         var response = new

@@ -74,6 +74,54 @@ public class WorkerCapabilityTests
     }
 
     [TestMethod]
+    public void DirectConstruction_WithNonCanonicalValues_NormalizesToCanonicalFingerprint()
+    {
+        // #66: the Create factory normalizes, but a capability can also be built directly — an object
+        // initializer, a `with` expression, or JSON deserialization (which uses the init setters). Every
+        // one of those paths must canonicalize too, or an attacker-supplied capability could dodge the
+        // snapshot compatibility gate by fingerprinting differently from a logically-equal one.
+        var direct = new WorkerCapability
+        {
+            OperatingSystem = PlatformOperatingSystem.Windows,
+            Architecture = "  X64 ",
+            SdkFeatureBands = ["8.0.400", "8.0.100", "8.0.400"],
+            TargetPlatforms = ["Windows", "windows"],
+            InstalledWorkloads = [" IOS ", "android"]
+        };
+        var canonical = WorkerCapability.Create(
+            PlatformOperatingSystem.Windows, "x64",
+            sdkFeatureBands: ["8.0.100", "8.0.400"],
+            targetPlatforms: ["windows"],
+            installedWorkloads: ["android", "ios"]);
+
+        Assert.AreEqual(canonical.Fingerprint, direct.Fingerprint,
+            "a directly-constructed non-canonical capability must fingerprint identically to its canonical form");
+        Assert.AreEqual("x64", direct.Architecture);
+        CollectionAssert.AreEqual(new[] { "8.0.100", "8.0.400" }, direct.SdkFeatureBands.ToArray());
+        CollectionAssert.AreEqual(new[] { "windows" }, direct.TargetPlatforms.ToArray());
+        CollectionAssert.AreEqual(new[] { "android", "ios" }, direct.InstalledWorkloads.ToArray());
+    }
+
+    [TestMethod]
+    public void JsonRoundTrip_NormalizesNonCanonicalCapability()
+    {
+        const string json =
+            "{\"operatingSystem\":3,\"architecture\":\"ARM64\",\"sdkFeatureBands\":[\"9.0.200\",\"9.0.100\",\"9.0.100\"]," +
+            "\"targetPlatforms\":[\"IOS\",\"ios\"],\"installedWorkloads\":[],\"referencePacks\":[],\"customToolLabels\":[]}";
+        var options = new System.Text.Json.JsonSerializerOptions
+        {
+            PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase
+        };
+        var capability = System.Text.Json.JsonSerializer.Deserialize<WorkerCapability>(json, options)!;
+
+        var canonical = WorkerCapability.Create(
+            PlatformOperatingSystem.MacOS, "arm64",
+            sdkFeatureBands: ["9.0.100", "9.0.200"], targetPlatforms: ["ios"]);
+        Assert.AreEqual(canonical.Fingerprint, capability.Fingerprint,
+            "a deserialized non-canonical capability must fingerprint identically to its canonical form");
+    }
+
+    [TestMethod]
     public void CanReuse_BlocksIncompatibleCapability()
     {
         // Criterion 5 (routing-side gate): a snapshot produced without the Apple workloads must not be

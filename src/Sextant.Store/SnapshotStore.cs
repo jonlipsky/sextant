@@ -407,6 +407,45 @@ public sealed class SnapshotStore(SqliteConnection connection)
     }
 
     /// <summary>
+    /// The selected current snapshot for a NAMED consumer repository (Phase 17, criterion 1 — the
+    /// multi-tenant request-level selector). Resolves that repository's default-branch complete snapshot
+    /// regardless of how many repositories the catalog holds, so an enforced multi-tenant service is
+    /// queryable-and-scoped (the caller names its authorized repository via the request) instead of
+    /// deny-all — unlike <see cref="GetSelectedSnapshotId"/>, which resolves ONLY when exactly one
+    /// consumer repository exists. Providers are excluded (<c>is_provider = 0</c>). Returns null when the
+    /// URL is unknown, has no complete default-branch snapshot yet, or is a provider — the enforced read
+    /// gate then denies (a null selection is unauthorized), so an unknown/unauthorized repository and a
+    /// genuinely-absent one collapse to the same uniform not-found (no existence oracle).
+    /// </summary>
+    public long? GetSelectedSnapshotIdForRepository(string remoteUrl)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT b.snapshot_id
+            FROM branches b
+            JOIN snapshots s ON s.id = b.snapshot_id
+            JOIN repositories r ON r.id = b.repository_id
+            WHERE b.is_default = 1 AND s.status = @complete
+              AND r.is_provider = 0 AND r.remote_url = @url
+            ORDER BY b.updated_at DESC, b.id DESC
+            LIMIT 1;
+            """;
+        cmd.Parameters.AddWithValue("@complete", SnapshotStatus.Complete);
+        cmd.Parameters.AddWithValue("@url", remoteUrl);
+        return cmd.ExecuteScalar() is long id ? id : null;
+    }
+
+    /// <summary>
+    /// The full <see cref="SnapshotRow"/> for a named repository's selected snapshot
+    /// (<see cref="GetSelectedSnapshotIdForRepository"/>), or null when none resolves.
+    /// </summary>
+    public SnapshotRow? GetSelectedSnapshotRowForRepository(string remoteUrl)
+    {
+        var id = GetSelectedSnapshotIdForRepository(remoteUrl);
+        return id.HasValue ? GetById(id.Value) : null;
+    }
+
+    /// <summary>
     /// True for a single-repository database that carries snapshot-tagged project rows
     /// (<c>projects.snapshot_id IS NOT NULL</c>) — i.e. a Phase-9 build has run or is in flight. When this
     /// holds but <see cref="GetSelectedSnapshotId"/> returns null (no complete snapshot selected yet),

@@ -18,14 +18,10 @@ public static class GetNamespaceTreeTool
         [Description("Depth of namespace levels to return (default 1 = immediate children only)")]
         int depth = 1)
     {
-        var db = dbProvider.GetReadyDatabase(out var notReady);
-        if (db == null)
-            return ResponseBuilder.BuildEmpty(notReady);
-
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+        if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
 
-        var conn = db.GetConnection();
+        using var conn = db.OpenReadConnection();
         var symbolStore = new SymbolStore(conn) { Scope = readContext.Scope };
         var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
 

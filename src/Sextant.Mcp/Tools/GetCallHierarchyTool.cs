@@ -16,14 +16,10 @@ public static class GetCallHierarchyTool
         [Description("Maximum depth to traverse")] int depth = 5,
         [Description("Include source code snippet at each call site")] bool include_source = false)
     {
-        var db = dbProvider.GetReadyDatabase(out var notReady);
-        if (db == null)
-            return ResponseBuilder.BuildEmpty(notReady);
-
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+        if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
 
-        var conn = db.GetConnection();
+        using var conn = db.OpenReadConnection();
         var snapshotScope = readContext.Scope;
         var symbolStore = new SymbolStore(conn) { Scope = snapshotScope };
         var callGraphStore = new CallGraphStore(conn) { Scope = snapshotScope };
@@ -71,7 +67,11 @@ public static class GetCallHierarchyTool
                     ["depth"] = currentDepth + 1
                 };
 
-                if (include_source)
+                // Raw host-filesystem read (no content-hash verification): suppress under an enforced
+                // multi-tenant policy so a reconstructed absolute call-site path cannot expose a file
+                // outside the caller's authorized repository. Location-only under enforcement; the
+                // zero-policy local path is byte-identical (hardening review, criteria 1 & 2).
+                if (include_source && !dbProvider.Authorizer.IsEnforcing)
                     entry["source_context"] = SourceReader.ReadContext(edge.CallSiteFile, edge.CallSiteLine, 2);
 
                 results.Add(entry);

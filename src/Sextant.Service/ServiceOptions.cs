@@ -2,6 +2,7 @@ using Sextant.Core;
 using Sextant.Core.Platform;
 using Sextant.Indexer;
 using Sextant.Service.Contributions;
+using Sextant.Service.Sandbox;
 
 namespace Sextant.Service;
 
@@ -26,6 +27,23 @@ public sealed record ServiceOptions
 
     /// <summary>Bearer token required by the query endpoints (<c>/mcp</c>, <c>/query/*</c>). Null allows anonymous read (local default).</summary>
     public string? QueryToken { get; init; }
+
+    /// <summary>
+    /// A LEAST-PRIVILEGE contributor token for <c>/control/contribute</c>, SEPARATE from the control token
+    /// (issue #71). A contributor holding only this token can upload contributions but CANNOT reach the
+    /// other control-plane endpoints (ensure/status/resolve/retention). The full <see cref="ControlToken"/>
+    /// remains a superset that also authorizes contribution. Null → the contribute endpoint falls back to
+    /// the control token (or open, when neither is set — dev default).
+    /// </summary>
+    public string? ContributeToken { get; init; }
+
+    /// <summary>
+    /// The enforced read-authorization policy for the query plane (Phase 17, criterion 1). When
+    /// <see cref="ReadAuthorizationPolicy.Enabled"/> the query plane authenticates KNOWN principals and the
+    /// <c>PolicyReadAuthorizer</c> fails closed on any repository a principal is not granted. The default
+    /// <see cref="ReadAuthorizationPolicy.Disabled"/> keeps single-node local operation zero-friction.
+    /// </summary>
+    public ReadAuthorizationPolicy ReadPolicy { get; init; } = ReadAuthorizationPolicy.Disabled;
 
     /// <summary>Port for the control + query surface (one port hosts both when <see cref="QueryPort"/> matches or is null).</summary>
     public int ControlPort { get; init; } = 3011;
@@ -82,6 +100,14 @@ public sealed record ServiceOptions
     /// </summary>
     public ContributionPolicy Contribution { get; init; } = ContributionPolicy.Default;
 
+    /// <summary>
+    /// The enforced evaluation-sandbox limits for the service worker (Phase 17, criterion 2). MSBuild
+    /// evaluation of a checkout is an UNTRUSTED execution boundary even for a private repo, so the worker
+    /// always evaluates under this policy. Defaults to <see cref="SandboxPolicy.Enforced"/>; the single-node
+    /// local CLI/daemon path does not run the service worker, so local operation stays byte-identical.
+    /// </summary>
+    public SandboxPolicy Sandbox { get; init; } = SandboxPolicy.Enforced;
+
     private const string EnvPrefix = "SEXTANT_SERVICE_";
 
     /// <summary>
@@ -106,6 +132,8 @@ public sealed record ServiceOptions
                 scratchRoot: Env("SCRATCH_ROOT")),
             ControlToken = Env("CONTROL_TOKEN"),
             QueryToken = Env("QUERY_TOKEN"),
+            ContributeToken = Env("CONTRIBUTE_TOKEN"),
+            ReadPolicy = ReadAuthorizationPolicy.Parse(Env("READ_POLICY")),
             ControlPort = EnvInt("CONTROL_PORT") ?? 3011,
             QueryPort = EnvInt("QUERY_PORT"),
             LeaseTtl = EnvInt("LEASE_TTL_SECONDS") is int ttl and > 0 ? TimeSpan.FromSeconds(ttl) : TimeSpan.FromSeconds(30),
@@ -131,6 +159,19 @@ public sealed record ServiceOptions
                 RequireGitContentVerification = EnvBool("CONTRIB_REQUIRE_GIT_VERIFY") ?? false,
                 MaxArtifactBytes = EnvLong("CONTRIB_MAX_ARTIFACT_BYTES") is long max and > 0
                     ? max : ContributionPolicy.Default.MaxArtifactBytes
+            },
+            // Evaluation sandbox (criterion 2). Enforced by default; a deployment can widen the budgets or
+            // (rarely, e.g. a fully trusted single-tenant node) allow network. Secrets are always scrubbed
+            // unless explicitly disabled.
+            Sandbox = new SandboxPolicy
+            {
+                Enabled = EnvBool("SANDBOX_ENABLED") ?? true,
+                TimeBudget = EnvInt("SANDBOX_TIME_BUDGET_SECONDS") is int secs and > 0
+                    ? TimeSpan.FromSeconds(secs) : SandboxPolicy.Enforced.TimeBudget,
+                MemoryBudgetBytes = EnvLong("SANDBOX_MEMORY_BUDGET_BYTES") is long mem and > 0
+                    ? mem : SandboxPolicy.Enforced.MemoryBudgetBytes,
+                AllowNetwork = EnvBool("SANDBOX_ALLOW_NETWORK") ?? false,
+                ScrubSecrets = EnvBool("SANDBOX_SCRUB_SECRETS") ?? true
             }
         };
     }
@@ -144,8 +185,27 @@ public sealed record ServiceOptions
     private static long? EnvLong(string name) =>
         long.TryParse(Env(name), out var v) ? v : null;
 
-    private static bool? EnvBool(string name) =>
-        Env(name) is { } v ? v is "1" or "true" or "TRUE" or "True" or "yes" or "on" : null;
+    /// <summary>
+    /// Parses a boolean env var, recognizing common true/false spellings case-insensitively. Returns null
+    /// when unset (the caller's secure default then applies) and THROWS on any other nonempty value rather
+    /// than silently returning false — a typo in a security-relevant toggle (e.g. SANDBOX_ENABLED=tru) must
+    /// fail startup loudly, never quietly disable the control (fail closed; hardening review finding).
+    /// </summary>
+    private static bool? EnvBool(string name)
+    {
+        var v = Env(name);
+        if (v is null)
+            return null;
+        return v.Trim().ToLowerInvariant() switch
+        {
+            "1" or "true" or "yes" or "on" => true,
+            "0" or "false" or "no" or "off" => false,
+            _ => throw new InvalidOperationException(
+                $"Environment variable {EnvPrefix + name} has an invalid boolean value '{v}'. Use one of " +
+                "1/0, true/false, yes/no, on/off. Refusing to start with an ambiguous security-relevant " +
+                "setting (fail closed).")
+        };
+    }
 }
 
 /// <summary>

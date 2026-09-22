@@ -13,14 +13,10 @@ public static class GetProjectDependenciesTool
         [Description("Canonical ID of the project")] string project_id,
         [Description("Include transitive dependencies (default: false)")] bool transitive = false)
     {
-        var db = dbProvider.GetReadyDatabase(out var notReady);
-        if (db == null)
-            return ResponseBuilder.BuildEmpty(notReady);
-
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+        if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
 
-        var conn = db.GetConnection();
+        using var conn = db.OpenReadConnection();
         var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
         var dependencyStore = new ProjectDependencyStore(conn);
 

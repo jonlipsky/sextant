@@ -228,24 +228,31 @@ public sealed class ToolRegistry
                 GetOptionalInt(args, "depth") ?? 1
             ));
 
-        Register("get_source_context",
-            "Get source code lines from a file with optional context around a target line.",
-            new
-            {
-                type = "object",
-                properties = new Dictionary<string, object>
+        // Raw filesystem read (arbitrary absolute path). Registered ONLY on the zero-policy local path:
+        // under an enforced multi-tenant policy the research agent must not be able to read files off disk
+        // (arbitrary-file-read / cross-tenant leak — hardening review, criterion 1). Index-backed tools
+        // stay available because they route through the scoped, authorized DatabaseProvider.
+        if (!_dbProvider.Authorizer.IsEnforcing)
+        {
+            Register("get_source_context",
+                "Get source code lines from a file with optional context around a target line.",
+                new
                 {
-                    ["file_path"] = new { type = "string", description = "Absolute path to the source file" },
-                    ["line"] = new { type = "integer", description = "Target line number (1-indexed)" },
-                    ["context_lines"] = new { type = "integer", description = "Number of context lines before and after" }
+                    type = "object",
+                    properties = new Dictionary<string, object>
+                    {
+                        ["file_path"] = new { type = "string", description = "Absolute path to the source file" },
+                        ["line"] = new { type = "integer", description = "Target line number (1-indexed)" },
+                        ["context_lines"] = new { type = "integer", description = "Number of context lines before and after" }
+                    },
+                    required = new[] { "file_path", "line" }
                 },
-                required = new[] { "file_path", "line" }
-            },
-            args => GetSourceContextTool.GetSourceContext(
-                args.GetProperty("file_path").GetString()!,
-                args.GetProperty("line").GetInt32(),
-                GetOptionalInt(args, "context_lines") ?? 5
-            ));
+                args => GetSourceContextTool.GetSourceContext(
+                    args.GetProperty("file_path").GetString()!,
+                    args.GetProperty("line").GetInt32(),
+                    GetOptionalInt(args, "context_lines") ?? 5
+                ));
+        }
 
         Register("get_file_symbols",
             "Get all symbols defined in a source file.",

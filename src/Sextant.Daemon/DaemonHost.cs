@@ -13,6 +13,7 @@ public sealed class DaemonHost : IDisposable
     private readonly Action<string>? _log;
 
     private IndexDatabase? _db;
+    private WriterLease? _lease;
     private FileWatcherService? _fileWatcher;
     private StatusServer? _statusServer;
     private IndexingQueue? _queue;
@@ -60,7 +61,16 @@ public sealed class DaemonHost : IDisposable
         _parallelism = Indexer.ExtractionParallelismOptions.FromConfiguration(config);
         _profile = IndexProfileDescriptor.FromConfiguration(config);
         _reconcileIntervalSeconds = config.ReconcileIntervalSeconds;
-        _db.RunMigrations();
+
+        // Single-writer lease (issue #38 / #59): the daemon is a long-lived writer, so it holds the lease
+        // for its whole lifetime and fails closed if another writer (a second daemon, the index service, or
+        // a one-shot `sextant index`) already owns this database. Ordering matches the service: migrate
+        // WITHOUT recovery, acquire the lease, THEN recover — so recovery never abandons a live writer's
+        // staging generation.
+        _db.RunMigrations(recover: false);
+        _lease = WriterLease.AcquireOrThrow(
+            _db.DbPath, $"sextant-daemon@{Environment.MachineName}#{Environment.ProcessId}");
+        _db.Recover();
         _queue = new IndexingQueue();
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
@@ -567,6 +577,9 @@ public sealed class DaemonHost : IDisposable
         _fileWatcher?.Dispose();
         _statusServer?.Dispose();
         _cts?.Dispose();
+        // Release the single-writer lease BEFORE closing the database so the next writer can acquire it
+        // immediately on a clean shutdown (a crash leaves it to expire).
+        _lease?.Dispose();
         _db?.Dispose();
     }
 }

@@ -39,7 +39,14 @@ internal static class IndexHandler
             Console.WriteLine();
 
             using var indexDb = new Store.IndexDatabase(dbPath, Store.IndexWriteOptions.FromConfiguration(config));
-            indexDb.RunMigrations();
+            indexDb.RunMigrations(recover: false);
+
+            // Single-writer lease (issue #38 / #59): a one-shot index is a write path too, so fail closed
+            // if a daemon or index service already owns this database instead of racing a second writer and
+            // risking a corrupt publish (criterion 3). Held only for this run; released when it disposes.
+            using var lease = Store.WriterLease.AcquireOrThrow(
+                indexDb.DbPath, $"sextant-index@{Environment.MachineName}#{Environment.ProcessId}");
+            indexDb.Recover();
 
             var stopwatch = Stopwatch.StartNew();
             var isInteractive = !Console.IsOutputRedirected;
