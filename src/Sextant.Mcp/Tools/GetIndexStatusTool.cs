@@ -61,11 +61,11 @@ public static class GetIndexStatusTool
             }
         }
 
-        var index = BuildIndexInfo(conn);
+        var index = BuildIndexInfo(conn, selected);
         return ResponseBuilder.BuildStatus(results, freshness, index);
     }
 
-    private static object BuildIndexInfo(Microsoft.Data.Sqlite.SqliteConnection conn)
+    private static object BuildIndexInfo(Microsoft.Data.Sqlite.SqliteConnection conn, long? selectedSnapshotId)
     {
         var run = new IndexRunStore(conn).GetLastCompleteRun();
 
@@ -78,7 +78,36 @@ public static class GetIndexStatusTool
             profile,
             config_hash = run?.ConfigHash,
             features = IndexProfiles.FeatureNames(features),
+            overlay = BuildOverlayInfo(conn, selectedSnapshotId),
             storage = BuildStorageInfo(conn)
+        };
+    }
+
+    /// <summary>
+    /// Phase 10 provenance: when the selected generation is a working-tree overlay, or a full LOCAL
+    /// fallback that could not reuse a committed base, surfaces that fact plus the EXPLICIT reason
+    /// (criterion 5) and the base it layers on. Null (and so omitted) for a clean committed base or a
+    /// legacy/pre-snapshot DB, so existing status output is unchanged.
+    /// </summary>
+    private static object? BuildOverlayInfo(Microsoft.Data.Sqlite.SqliteConnection conn, long? selectedSnapshotId)
+    {
+        if (selectedSnapshotId is not long id)
+            return null;
+
+        var snap = new SnapshotStore(conn).GetById(id);
+        if (snap == null)
+            return null;
+
+        // Only surface the block when there is something Phase-10-specific to report.
+        if (!snap.IsOverlay && snap.FallbackReason == null)
+            return null;
+
+        return new
+        {
+            is_overlay = snap.IsOverlay,
+            base_snapshot_id = snap.BaseSnapshotId,
+            has_working_tree_delta = snap.WorkingTreeDelta != null,
+            fallback_reason = snap.FallbackReason
         };
     }
 

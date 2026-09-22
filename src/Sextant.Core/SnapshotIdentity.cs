@@ -34,6 +34,17 @@ public sealed record SnapshotIdentity
     public required string ToolchainFingerprint { get; init; }
 
     /// <summary>
+    /// Phase-10 working-tree delta digest. A stable hash over the dirty working tree's
+    /// changed/renamed/deleted/untracked paths and their content hashes. <c>null</c> for a clean
+    /// checkout (the identity is then the bare committed state). When set it makes a DIRTY working
+    /// tree's snapshot identity <em>commit + delta</em> — never the bare commit — so a dirty tree
+    /// under an otherwise-clean HEAD is never mis-identified as the clean committed snapshot (issue
+    /// #43), and an identical dirty tree recomputes the identical digest so a restart/periodic pass
+    /// idempotently re-selects the same overlay instead of rebuilding it (acceptance criterion 3).
+    /// </summary>
+    public string? WorkingTreeDelta { get; init; }
+
+    /// <summary>
     /// The stable idempotency/compatibility hash over the identity tuple. Deterministic across
     /// machines and runs: a fixed, ordered <c>key=value;</c> pre-image hashed with SHA-256 (hex).
     /// </summary>
@@ -44,7 +55,7 @@ public sealed record SnapshotIdentity
             var canonical =
                 $"v=1;repo={RepositoryRemoteUrl};commit={CommitSha};tree={TreeSha ?? string.Empty};" +
                 $"schema={SchemaVersion};analyzer={AnalyzerVersion};config={ConfigHash ?? string.Empty};" +
-                $"toolchain={ToolchainFingerprint}";
+                $"toolchain={ToolchainFingerprint};delta={WorkingTreeDelta ?? string.Empty}";
             var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(canonical));
             return Convert.ToHexStringLower(bytes);
         }

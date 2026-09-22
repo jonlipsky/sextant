@@ -73,6 +73,17 @@ public sealed class SextantConfiguration
     /// </summary>
     public int ExtractionQueueCapacity { get; set; }
 
+    /// <summary>
+    /// How often (seconds) the daemon runs an AUTHORITATIVE Git reconciliation pass that reconstructs
+    /// the working-tree state from git (independent of file-watcher events) and refreshes it as a
+    /// local overlay (Phase 10). The file watcher supplies only hints; this periodic pass is the
+    /// backstop that guarantees the overlay converges to git state even if a watcher event is missed,
+    /// and it re-resolves the solution + live <c>sextant.json</c> config each pass (issue #28). 0
+    /// disables the periodic pass (startup reconciliation still runs). Overridable via
+    /// <c>reconcile_interval_seconds</c> in <c>sextant.json</c> or <c>SEXTANT_RECONCILE_INTERVAL</c>.
+    /// </summary>
+    public int ReconcileIntervalSeconds { get; set; } = 30;
+
     private static readonly Regex ValidProfileName = new(@"^[a-zA-Z0-9_-]+$", RegexOptions.Compiled);
 
     public string LogsPath => Path.Combine(
@@ -180,6 +191,8 @@ public sealed class SextantConfiguration
                             config.MaxParallelism = fileConfig.MaxParallelism.Value;
                         if (fileConfig.ExtractionQueueCapacity.HasValue)
                             config.ExtractionQueueCapacity = fileConfig.ExtractionQueueCapacity.Value;
+                        if (fileConfig.ReconcileIntervalSeconds.HasValue)
+                            config.ReconcileIntervalSeconds = fileConfig.ReconcileIntervalSeconds.Value;
                         if (fileConfig.IndexingProfile != null)
                             config.IndexingProfile = fileConfig.IndexingProfile;
                         if (fileConfig.GeneratedSourcePolicy != null)
@@ -268,6 +281,10 @@ public sealed class SextantConfiguration
         if (int.TryParse(queueCapacity, out var capacity))
             config.ExtractionQueueCapacity = capacity;
 
+        var reconcileInterval = Environment.GetEnvironmentVariable("SEXTANT_RECONCILE_INTERVAL");
+        if (int.TryParse(reconcileInterval, out var interval))
+            config.ReconcileIntervalSeconds = interval;
+
         var indexingProfile = Environment.GetEnvironmentVariable("SEXTANT_INDEXING_PROFILE");
         if (!string.IsNullOrEmpty(indexingProfile))
             config.IndexingProfile = indexingProfile;
@@ -351,6 +368,9 @@ public sealed class SextantConfiguration
 
         [JsonPropertyName("extraction_queue_capacity")]
         public int? ExtractionQueueCapacity { get; set; }
+
+        [JsonPropertyName("reconcile_interval_seconds")]
+        public int? ReconcileIntervalSeconds { get; set; }
 
         [JsonPropertyName("indexing_profile")]
         public string? IndexingProfile { get; set; }
