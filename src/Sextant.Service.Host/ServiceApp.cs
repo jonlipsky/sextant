@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.DependencyInjection;
 using Sextant.Mcp;
@@ -111,6 +112,52 @@ public static class ServiceApp
             var report = service.RunRetention(execute ?? false);
             return Results.Json(report, ServiceJson.Options);
         });
+
+        // Client/CI contribution ingest (Phase 16). The raw artifact bytes are the request body; finalize /
+        // branch / default_branch are query params. The contributor identity is the bearer token (the
+        // control token already gated entry; the authorizer sees the same token). The whole supply-chain
+        // gate (authz + hash/capability verify) runs inside the service; a rejected contribution returns 422
+        // with structured diagnostics and is never published (acceptance criterion 3).
+        control.MapPost("/contribute", async (HttpRequest req, SnapshotService service, CancellationToken ct) =>
+        {
+            // Let the SERVICE's own MaxArtifactBytes cap govern the untrusted upload, enforced INCREMENTALLY
+            // as the body streams in (SnapshotService.IngestContributionAsync(Stream,…)), so an oversized
+            // upload is rejected without buffering it whole. Lift the transport's default request-body limit
+            // for this one endpoint so it cannot pre-empt our cap with an opaque 413/400 (the artifact cap is
+            // the single source of truth on this boundary).
+            var sizeFeature = req.HttpContext.Features.Get<IHttpMaxRequestBodySizeFeature>();
+            if (sizeFeature is { IsReadOnly: false })
+                sizeFeature.MaxRequestBodySize = null;
+
+            // Parse the booleans STRICTLY: an ABSENT value takes the documented default, but an UNPARSEABLE
+            // value is a 400 — never silently coerced. `finalize` defaults true (single-environment
+            // contract), so a typo'd `?finalize=maybe` must not silently publish an incomplete assembly.
+            var finalize = true;
+            if (req.Query.ContainsKey("finalize") && !bool.TryParse(req.Query["finalize"], out finalize))
+                return Results.BadRequest("query parameter 'finalize' must be 'true' or 'false'.");
+            var isDefault = false;
+            if (req.Query.ContainsKey("default_branch") && !bool.TryParse(req.Query["default_branch"], out isDefault))
+                return Results.BadRequest("query parameter 'default_branch' must be 'true' or 'false'.");
+            var branch = req.Query["branch"].ToString();
+
+            var result = await service.IngestContributionAsync(
+                req.Body,
+                ExtractBearer(req),
+                finalize,
+                string.IsNullOrWhiteSpace(branch) ? null : branch,
+                isDefault,
+                ct);
+
+            return Results.Json(result, ServiceJson.Options,
+                statusCode: result.Accepted ? StatusCodes.Status200OK : StatusCodes.Status422UnprocessableEntity);
+        });
+    }
+
+    private static string? ExtractBearer(HttpRequest req)
+    {
+        var header = req.Headers.Authorization.ToString();
+        return header.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase) ? header["Bearer ".Length..].Trim()
+            : string.IsNullOrWhiteSpace(header) ? null : header;
     }
 
     private static void MapQuery(WebApplication app, ServiceOptions options)
