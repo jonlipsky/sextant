@@ -4,6 +4,7 @@ using System.Text;
 using Sextant.Core;
 using Sextant.Store;
 using Microsoft.CodeAnalysis;
+using Microsoft.Data.Sqlite;
 
 namespace Sextant.Indexer;
 
@@ -88,6 +89,7 @@ public sealed class IndexOrchestrator
         var apiSurfaceStore = new ApiSurfaceStore(conn);
 
         var solutionStore = new SolutionStore(conn);
+        var runStore = new IndexRunStore(conn);
 
         // Map each Roslyn project instance to its stored logical-project row. Keyed by the Roslyn
         // ProjectId (unique per instance) rather than the csproj file path, so the multiple
@@ -96,6 +98,18 @@ public sealed class IndexOrchestrator
         var projectRoslynToId = new Dictionary<ProjectId, long>();
         var catalog = new SymbolCatalog();
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        // Open a staging generation and a single bounded, batched write session for the whole run.
+        // The session replaces per-row implicit transactions with a small number of explicit,
+        // project-bounded batches; the run scope keeps the previous complete generation visible until
+        // this one is published, and abandons the staging generation if the run fails or is cancelled.
+        using var runScope = runStore.BeginScope(metrics?.Mode ?? "full", now);
+        using var session = _db.BeginWriteSession();
+        using var symbolInsert = symbolStore.CreateInsertCommand();
+        using var referenceInsert = referenceStore.CreateInsertCommand();
+        using var relationshipInsert = relationshipStore.CreateInsertCommand();
+        using var callGraphInsert = callGraphStore.CreateInsertCommand();
+        session.Begin();
 
         // Discover submodules from the repo root
         var submodules = new List<SubmoduleInfo>();
@@ -146,6 +160,7 @@ public sealed class IndexOrchestrator
             foreach (var pid in projectRoslynToId.Values)
                 solutionStore.AddProjectMapping(solutionId, pid);
         }
+        session.CommitBatch();
 
         // Phase 2: Extract symbols from all projects
         StartPhase("extracting_symbols");
@@ -174,9 +189,11 @@ public sealed class IndexOrchestrator
             var symbols = await SymbolExtractor.ExtractFromProjectAsync(project, projectId);
             foreach (var symbol in symbols)
             {
-                var id = symbolStore.Insert(symbol);
+                var id = symbolStore.Insert(symbolInsert, symbol);
                 catalog.Add(projectId, symbol.SymbolKey, id);
+                session.RowsWritten();
             }
+            session.CommitBatch();
 
             _log?.Invoke($"    {symbols.Count} symbols extracted");
         }
@@ -230,18 +247,20 @@ public sealed class IndexOrchestrator
                             if (catalog.TryResolveEdge(fromKey, relProjectId, out var fromId) &&
                                 catalog.TryResolveEdge(toKey, relProjectId, out var toId))
                             {
-                                relationshipStore.Insert(new RelationshipInfo
+                                relationshipStore.Insert(relationshipInsert, new RelationshipInfo
                                 {
                                     FromSymbolId = fromId,
                                     ToSymbolId = toId,
                                     Kind = kind,
                                     LastIndexedAt = now
                                 });
+                                session.RowsWritten();
                             }
                         }
                     }
                 }
             }
+            session.CommitBatch();
         }
 
         // Phase 4: Extract references
@@ -307,12 +326,14 @@ public sealed class IndexOrchestrator
 
                     foreach (var refInfo in refs)
                     {
-                        referenceStore.Insert(refInfo);
+                        referenceStore.Insert(referenceInsert, refInfo);
+                        session.RowsWritten();
                     }
                 }
             }
 
             _log?.Invoke($"  {project.Name}: references extracted");
+            session.CommitBatch();
         }
 
         // Phase 4.5: Extract tagged comments
@@ -320,6 +341,7 @@ public sealed class IndexOrchestrator
         _log?.Invoke("Extracting tagged comments...");
         projectIndex = 0;
         var commentStore = new CommentStore(conn);
+        using var commentInsert = commentStore.CreateInsertCommand();
         foreach (var project in solution.Projects)
         {
             EnterProject();
@@ -350,12 +372,14 @@ public sealed class IndexOrchestrator
                 foreach (var comment in comments)
                 {
                     var enclosingSymbolId = ResolveEnclosingSymbol(comment.Line, comment.FilePath, commentProjectId, symbolStore);
-                    commentStore.Insert(commentProjectId, comment.FilePath, comment.Line, comment.Tag,
+                    commentStore.Insert(commentInsert, commentProjectId, comment.FilePath, comment.Line, comment.Tag,
                                        comment.Text, enclosingSymbolId, now);
+                    session.RowsWritten();
                 }
             }
 
             _log?.Invoke($"  {project.Name}: comments extracted");
+            session.CommitBatch();
         }
 
         // Phase 5: Extract call graph and dataflow
@@ -364,6 +388,8 @@ public sealed class IndexOrchestrator
         projectIndex = 0;
         var argumentFlowStore = new ArgumentFlowStore(conn);
         var returnFlowStore = new ReturnFlowStore(conn);
+        using var argumentFlowInsert = argumentFlowStore.CreateInsertCommand();
+        using var returnFlowInsert = returnFlowStore.CreateInsertCommand();
         foreach (var project in solution.Projects)
         {
             EnterProject();
@@ -419,7 +445,7 @@ public sealed class IndexOrchestrator
                     {
                         if (catalog.TryResolveEdge(edge.CalleeKey, callProjectId, out var calleeSymbolId))
                         {
-                            var edgeId = callGraphStore.Insert(new CallGraphEdge
+                            var edgeId = callGraphStore.Insert(callGraphInsert, new CallGraphEdge
                             {
                                 CallerSymbolId = callerSymbolId,
                                 CalleeSymbolId = calleeSymbolId,
@@ -427,6 +453,7 @@ public sealed class IndexOrchestrator
                                 CallSiteLine = edge.CallSiteLine,
                                 LastIndexedAt = now
                             });
+                            session.RowsWritten();
 
                             // Extract and store dataflow for this call site
                             if (edge.InvocationSyntax != null && edge.SemanticModel != null)
@@ -436,15 +463,17 @@ public sealed class IndexOrchestrator
 
                                 foreach (var arg in dfResult.Arguments)
                                 {
-                                    argumentFlowStore.Insert(edgeId, arg.ParameterOrdinal, arg.ParameterName,
+                                    argumentFlowStore.Insert(argumentFlowInsert, edgeId, arg.ParameterOrdinal, arg.ParameterName,
                                         arg.ArgumentExpression, arg.ArgumentKind, arg.SourceSymbolFqn, now);
+                                    session.RowsWritten();
                                 }
 
                                 if (dfResult.ReturnDestination != null)
                                 {
-                                    returnFlowStore.Insert(edgeId, dfResult.ReturnDestination.DestinationKind,
+                                    returnFlowStore.Insert(returnFlowInsert, edgeId, dfResult.ReturnDestination.DestinationKind,
                                         dfResult.ReturnDestination.DestinationVariable,
                                         dfResult.ReturnDestination.DestinationSymbolFqn, now);
+                                    session.RowsWritten();
                                 }
                             }
                         }
@@ -453,6 +482,7 @@ public sealed class IndexOrchestrator
             }
 
             _log?.Invoke($"  {project.Name}: call graph extracted");
+            session.CommitBatch();
         }
 
         // Phase 6: Record project dependencies
@@ -475,6 +505,7 @@ public sealed class IndexOrchestrator
                 dependencyStore.Insert(dep);
             }
             _log?.Invoke($"  {deps.Count} dependencies recorded");
+            session.CommitBatch();
         }
 
         // Phase 7: Capture API surface snapshots for projects with inbound dependencies
@@ -519,12 +550,39 @@ public sealed class IndexOrchestrator
                         CapturedAt = now,
                         GitCommit = gitCommit
                     });
+                    session.RowsWritten();
                 }
             }
             _log?.Invoke($"  API surface captured for {projectsWithConsumers.Count} project(s)");
         }
 
         FinishPhase();
+
+        // Publish the generation atomically with the final batch of data: the completion pointer flip
+        // enrols in the still-open write transaction, so a reader either sees the previous complete run
+        // or this one — never a "complete" pointer without its committed data. If the guarded update
+        // publishes no row (e.g. recovery abandoned this run under an unsupported second writer), abort
+        // before committing so disposal rolls back the final batch and leaves the ledger consistent.
+        var completedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        if (runStore.MarkComplete(runScope.RunId, completedAt, projectRoslynToId.Count) != 1)
+            throw new InvalidOperationException(
+                $"Index run {runScope.RunId} was not in staging state at publish; aborting to avoid a false completion.");
+        session.Complete();
+        runScope.Detach();
+
+        // Post-publish maintenance/provenance only: the generation is already durably published, so a
+        // checkpoint or footprint failure must not turn a successful index into a reported failure.
+        var finalWalBytes = _db.WalBytes;
+        var finalShmBytes = _db.ShmBytes;
+        try
+        {
+            _db.Checkpoint();
+            runStore.RecordFootprint(runScope.RunId, _db.MainDbBytes, finalWalBytes, finalShmBytes);
+        }
+        catch (SqliteException ex)
+        {
+            _log?.Invoke($"  Post-publish maintenance (checkpoint/footprint) failed, index already published: {ex.Message}");
+        }
 
         if (metrics != null)
         {

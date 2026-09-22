@@ -43,7 +43,7 @@ public sealed class DaemonHost : IDisposable
         if (!string.IsNullOrEmpty(dbDir))
             Directory.CreateDirectory(dbDir);
 
-        _db = new IndexDatabase(_dbPath);
+        _db = new IndexDatabase(_dbPath, IndexWriteOptions.FromConfiguration(SextantConfiguration.Load(_repoRoot)));
         _db.RunMigrations();
         _queue = new IndexingQueue();
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
