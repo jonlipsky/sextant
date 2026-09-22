@@ -432,4 +432,45 @@ public class SymbolCatalogTests
         Assert.AreEqual(50, id);
         Assert.AreEqual(0, catalog.AmbiguousEdgeBindings);
     }
+
+    [TestMethod]
+    public void TryResolveExact_BindsExactProjectAndNeverCounts()
+    {
+        var catalog = new SymbolCatalog();
+        // The same declaration key registered under two projects models a multi-targeted dependency
+        // whose two TFMs are both indexed (projects 3 and 5 hold the same logical symbol).
+        catalog.Add(projectId: 3, "T:Dep.Foo", symbolId: 30);
+        catalog.Add(projectId: 5, "T:Dep.Foo", symbolId: 50);
+
+        // Key-only edge resolution from a consumer that declares neither is ambiguous: it picks the
+        // lowest project id (30) and counts the ambiguity.
+        Assert.IsTrue(catalog.TryResolveEdge("T:Dep.Foo", preferProjectId: 99, out var ambiguousId));
+        Assert.AreEqual(30, ambiguousId, "Key-only resolution picks the lowest project id.");
+        Assert.AreEqual(1, catalog.AmbiguousEdgeBindings);
+
+        // Compilation-scoped exact resolution binds the EXACT bound TFM's row (the consumer bound
+        // project 5, not the lowest-id project 3) and must NOT bump the ambiguity counter.
+        Assert.IsTrue(catalog.TryResolveExact("T:Dep.Foo", targetProjectId: 5, out var exactId));
+        Assert.AreEqual(50, exactId, "Exact resolution returns the bound TFM's row, not the lowest id.");
+        Assert.AreEqual(1, catalog.AmbiguousEdgeBindings, "Exact resolution never counts an ambiguity.");
+
+        Assert.IsTrue(catalog.TryResolveExact("T:Dep.Foo", targetProjectId: 3, out var otherExactId));
+        Assert.AreEqual(30, otherExactId);
+    }
+
+    [TestMethod]
+    public void TryResolveExact_MissesWhenKeyNotInThatProject()
+    {
+        var catalog = new SymbolCatalog();
+        catalog.Add(projectId: 3, "T:Dep.Foo", symbolId: 30);
+
+        // The key is not registered in project 9 (e.g. an excluded target or a project outside the
+        // indexed set), so exact resolution reports a miss and the caller falls back to key resolution.
+        Assert.IsFalse(catalog.TryResolveExact("T:Dep.Foo", targetProjectId: 9, out var id));
+        Assert.AreEqual(0, id);
+        Assert.AreEqual(0, catalog.AmbiguousEdgeBindings, "A miss is not an ambiguous binding.");
+
+        // Unknown key also misses.
+        Assert.IsFalse(catalog.TryResolveExact("T:Dep.Missing", targetProjectId: 3, out _));
+    }
 }

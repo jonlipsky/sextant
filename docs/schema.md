@@ -60,17 +60,17 @@ Every named type and member extracted from the codebase.
 
 ### `references`
 
-Every usage of a symbol across the codebase.
+Every usage of a symbol across the codebase. `symbol_id` is the **target** (the referenced declaration, in its declaring project); `in_project_id` + `file_path`/`line` locate the **using** occurrence. Cross-project usages therefore have `symbol_id` in the dependency project and `in_project_id` in the consumer — the connectivity the incremental closure relies on.
 
 | Column | Type | Description |
 |---|---|---|
 | `id` | `INTEGER PRIMARY KEY` | |
-| `symbol_id` | `INTEGER NOT NULL` | FK to `symbols.id` |
-| `in_project_id` | `INTEGER NOT NULL` | FK to `projects.id` |
+| `symbol_id` | `INTEGER NOT NULL` | FK to `symbols.id` (the referenced/target declaration) |
+| `in_project_id` | `INTEGER NOT NULL` | FK to `projects.id` (the using project) |
 | `file_path` | `TEXT NOT NULL` | |
 | `line` | `INTEGER NOT NULL` | |
 | `context_snippet` | `TEXT` | ~120 chars of surrounding context |
-| `reference_kind` | `TEXT NOT NULL` | `invocation`, `type_ref`, `attribute`, `inheritance`, `override`, `object_creation` |
+| `reference_kind` | `TEXT NOT NULL` | `invocation`, `type_ref`, `attribute`, `inheritance`, `override`, `object_creation`. The Phase 5 document-oriented extractor classifies by the name's precise syntactic role and folds `override` into the real occurrence kind (so it does not emit `override`); object-creation/attribute occurrences target the constructed type. |
 
 ### `relationships`
 

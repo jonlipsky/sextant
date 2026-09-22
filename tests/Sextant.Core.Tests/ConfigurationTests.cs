@@ -35,6 +35,7 @@ public class ConfigurationTests
             Assert.AreEqual(5, config.MaxCallHierarchyDepth);
             Assert.AreEqual(20, config.FtsMaxResults);
             Assert.AreEqual(0, config.Solutions.Count);
+            Assert.IsTrue(config.DocumentExtractor, "the document-oriented extractor is the shipping default");
         }
         finally
         {
@@ -108,6 +109,35 @@ public class ConfigurationTests
 
         var config = SextantConfiguration.Load(_tempDir);
         Assert.AreEqual("/tmp/sextant.sock", config.DaemonSocket);
+    }
+
+    [TestMethod]
+    public void DocumentExtractor_DefaultsOnAndCanBeDisabled()
+    {
+        // Shipping default is on; the legacy extractor remains reachable as a fallback via json...
+        File.WriteAllText(Path.Combine(_tempDir, "sextant.json"), """{ "document_extractor": false }""");
+        var disabled = SextantConfiguration.Load(_tempDir);
+        Assert.IsFalse(disabled.DocumentExtractor, "json can disable the extractor (legacy fallback)");
+
+        File.WriteAllText(Path.Combine(_tempDir, "sextant.json"), """{ "document_extractor": true }""");
+        Assert.IsTrue(SextantConfiguration.Load(_tempDir).DocumentExtractor);
+    }
+
+    [TestMethod]
+    public void DocumentExtractor_EnvVarOverridesConfig()
+    {
+        // ...and via the env var, which takes precedence over the file.
+        File.WriteAllText(Path.Combine(_tempDir, "sextant.json"), """{ "document_extractor": true }""");
+        Environment.SetEnvironmentVariable("SEXTANT_DOCUMENT_EXTRACTOR", "false");
+        try
+        {
+            Assert.IsFalse(SextantConfiguration.Load(_tempDir).DocumentExtractor,
+                "SEXTANT_DOCUMENT_EXTRACTOR=false forces the legacy fallback even when json enables it");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("SEXTANT_DOCUMENT_EXTRACTOR", null);
+        }
     }
 
     [TestMethod]

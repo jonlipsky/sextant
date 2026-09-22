@@ -15,8 +15,11 @@ namespace Sextant.Indexer;
 /// graph complete for the common ambiguous case, a multi-targeted dependency whose two TFM instances
 /// are copies of the *same* logical symbol, where either row is a semantically-correct target.
 /// Resolving exactly which project such an edge truly targets (via the referencing compilation's
-/// assembly identity) is the compilation-scoped resolution introduced by the later document-oriented
-/// extractor phase; it is intentionally out of scope here.
+/// assembly identity) is the compilation-scoped resolution the document-oriented extractor performs
+/// through <see cref="TryResolveExact"/>: when it knows the target's real owning project (from the
+/// bound symbol's containing assembly) it binds the exact row and never counts an ambiguity. This
+/// key-only path remains the fallback for targets that map to no in-solution project (metadata /
+/// out-of-solution) and for the legacy declaration-driven extractor.
 /// </remarks>
 public sealed class SymbolCatalog
 {
@@ -106,5 +109,21 @@ public sealed class SymbolCatalog
         if (resolution.Found && resolution.Ambiguous)
             AmbiguousEdgeBindings++;
         return resolution.Found;
+    }
+
+    /// <summary>
+    /// Resolves a declaration key to the stored row in an <em>exact</em> known target project
+    /// (compilation-scoped resolution). The document-oriented extractor supplies the target's real
+    /// owning project — derived from the bound occurrence symbol's <see cref="ISymbol.ContainingAssembly"/>
+    /// mapped through <c>Solution.GetProject</c> — so the <c>(key, project)</c> pair identifies a unique
+    /// row and the binding is never ambiguous (it does not touch <see cref="AmbiguousEdgeBindings"/>).
+    /// Returns false when the key is not registered in that project (e.g. an excluded target or a
+    /// project outside the indexed set), letting the caller fall back to <see cref="TryResolveEdge"/>.
+    /// </summary>
+    public bool TryResolveExact(string declarationKey, long targetProjectId, out long symbolId)
+    {
+        symbolId = 0;
+        return _byKey.TryGetValue(declarationKey, out var perProject)
+               && perProject.TryGetValue(targetProjectId, out symbolId);
     }
 }
