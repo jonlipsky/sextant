@@ -9,6 +9,8 @@ obj/
 *.nupkg
 artifacts/
 project.lock.json
+TestResults/
+scratch/
 
 # IDE
 .idea/

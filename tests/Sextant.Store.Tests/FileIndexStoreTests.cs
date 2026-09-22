@@ -80,8 +80,8 @@ public class FileIndexStoreTests
     [TestMethod]
     public void GetByProject_ReturnsAllEntriesForProject()
     {
-        _fileIndexStore.Upsert(new FileIndexEntry { ProjectId = _projectId, FilePath = "src/A.cs", ContentHash = "a", LastIndexedAt = 1000 });
-        _fileIndexStore.Upsert(new FileIndexEntry { ProjectId = _projectId, FilePath = "src/B.cs", ContentHash = "b", LastIndexedAt = 1000 });
+        _fileIndexStore.Upsert(new FileIndexEntry { ProjectId = _projectId, FilePath = "src/A.cs", ContentHash = "aa", LastIndexedAt = 1000 });
+        _fileIndexStore.Upsert(new FileIndexEntry { ProjectId = _projectId, FilePath = "src/B.cs", ContentHash = "bb", LastIndexedAt = 1000 });
 
         var entries = _fileIndexStore.GetByProject(_projectId);
         Assert.AreEqual(2, entries.Count);

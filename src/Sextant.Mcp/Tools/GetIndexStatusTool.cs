@@ -10,9 +10,9 @@ public static class GetIndexStatusTool
     [McpServerTool(Name = "get_index_status"), Description("Check what projects are indexed, symbol/reference counts, and index freshness. Call this first to see what data is available.")]
     public static string GetIndexStatus(DatabaseProvider dbProvider)
     {
-        var db = dbProvider.GetDatabase();
+        var db = dbProvider.GetReadyDatabase(out var notReady);
         if (db == null)
-            return ResponseBuilder.BuildEmpty("No index database found.");
+            return ResponseBuilder.BuildEmpty(notReady);
 
         var conn = db.GetConnection();
 
@@ -24,7 +24,7 @@ public static class GetIndexStatusTool
             SELECT p.canonical_id, p.git_remote_url, p.repo_relative_path,
                    p.assembly_name, p.is_test_project, p.last_indexed_at,
                    (SELECT COUNT(*) FROM symbols WHERE project_id = p.id) as symbol_count,
-                   (SELECT COUNT(*) FROM "references" WHERE in_project_id = p.id) as reference_count
+                   (SELECT COUNT(*) FROM occurrences WHERE in_project_id = p.id AND source_symbol_id IS NULL) as reference_count
             FROM projects p
             ORDER BY p.last_indexed_at DESC;
             """;

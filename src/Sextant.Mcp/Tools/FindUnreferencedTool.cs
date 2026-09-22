@@ -14,12 +14,13 @@ public static class FindUnreferencedTool
         [Description("Exclude symbols defined in test projects (default: true)")] bool exclude_test_projects = true,
         [Description("Optional accessibility filter (public, internal, etc.)")] string? accessibility = null)
     {
-        var db = dbProvider.GetDatabase();
+        var db = dbProvider.GetReadyDatabase(out var notReady);
         if (db == null)
-            return ResponseBuilder.BuildEmpty("No index database found.");
+            return ResponseBuilder.BuildEmpty(notReady);
 
         var conn = db.GetConnection();
         var projectStore = new ProjectStore(conn);
+        var symbolStore = new SymbolStore(conn);
 
         // Resolve project canonical ID to DB ID if provided
         long? projectDbId = null;
@@ -33,66 +34,15 @@ public static class FindUnreferencedTool
 
         var canonicalIdCache = FindSymbolTool.BuildCanonicalIdCache(projectStore);
 
-        using var cmd = conn.CreateCommand();
-
-        var clauses = new List<string> { "r.id IS NULL" };
-        if (kind != null)
-        {
-            clauses.Add("s.kind = @kind");
-            cmd.Parameters.AddWithValue("@kind", kind);
-        }
-        if (projectDbId != null)
-        {
-            clauses.Add("s.project_id = @project_db_id");
-            cmd.Parameters.AddWithValue("@project_db_id", projectDbId.Value);
-        }
-        if (exclude_test_projects)
-        {
-            clauses.Add("p.is_test_project = 0");
-        }
-        if (accessibility != null)
-        {
-            clauses.Add("s.accessibility = @accessibility");
-            cmd.Parameters.AddWithValue("@accessibility", accessibility);
-        }
-
-        var whereClause = string.Join(" AND ", clauses);
-
-        cmd.CommandText = $"""
-            SELECT s.fully_qualified_name, s.display_name, s.kind, s.project_id,
-                   s.file_path, s.line_start, s.line_end, s.accessibility,
-                   s.signature, s.last_indexed_at
-            FROM symbols s
-            LEFT JOIN "references" r ON r.symbol_id = s.id
-            LEFT JOIN projects p ON p.id = s.project_id
-            WHERE {whereClause}
-            ORDER BY s.file_path, s.line_start;
-            """;
+        var symbols = symbolStore.GetUnreferenced(projectDbId, kind, exclude_test_projects, accessibility);
 
         var results = new List<object>();
         long freshness = 0;
-        using var reader = cmd.ExecuteReader();
-        while (reader.Read())
+        foreach (var s in symbols)
         {
-            var lastIndexed = reader.GetInt64(reader.GetOrdinal("last_indexed_at"));
-            if (freshness == 0 || lastIndexed < freshness)
-                freshness = lastIndexed;
-
-            var projId = reader.GetInt64(reader.GetOrdinal("project_id"));
-            var canonicalId = FindSymbolTool.ResolveCanonicalId(projId, canonicalIdCache);
-
-            results.Add(new
-            {
-                fully_qualified_name = reader.GetString(reader.GetOrdinal("fully_qualified_name")),
-                display_name = reader.GetString(reader.GetOrdinal("display_name")),
-                kind = reader.GetString(reader.GetOrdinal("kind")),
-                project_id = canonicalId,
-                file_path = reader.GetString(reader.GetOrdinal("file_path")),
-                line_start = reader.GetInt32(reader.GetOrdinal("line_start")),
-                line_end = reader.GetInt32(reader.GetOrdinal("line_end")),
-                accessibility = reader.GetString(reader.GetOrdinal("accessibility")),
-                signature = reader.IsDBNull(reader.GetOrdinal("signature")) ? null : reader.GetString(reader.GetOrdinal("signature"))
-            });
+            if (freshness == 0 || s.LastIndexedAt < freshness)
+                freshness = s.LastIndexedAt;
+            results.Add(FindSymbolTool.MapSymbol(s, FindSymbolTool.ResolveCanonicalId(s.ProjectId, canonicalIdCache)));
         }
 
         return ResponseBuilder.Build(results, freshness);

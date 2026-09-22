@@ -29,9 +29,9 @@ public static class ResearchCodebaseTool
         [Description("Response detail level: 'brief' (default) or 'detailed'")] string? detail_level = null,
         CancellationToken cancellationToken = default)
     {
-        var db = dbProvider.GetDatabase();
+        var db = dbProvider.GetReadyDatabase(out var notReady);
         if (db == null)
-            return ResponseBuilder.BuildEmpty("No index database found.");
+            return ResponseBuilder.BuildEmpty(notReady);
 
         LlmConfiguration config;
         try

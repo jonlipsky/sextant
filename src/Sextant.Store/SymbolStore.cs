@@ -5,13 +5,37 @@ namespace Sextant.Store;
 
 public sealed class SymbolStore(SqliteConnection connection)
 {
+    /// <summary>
+    /// Optional shared file-version resolver. The indexer injects one so the symbol phase, occurrence
+    /// phase and comment phase share a single (project, path) → file_version_id cache and repo-root
+    /// cache. When unset (ad-hoc/test callers of the convenience <see cref="Insert(SymbolInfo)"/>) a
+    /// per-store instance is created lazily.
+    /// </summary>
+    public FileStore? Files { get; set; }
+
+    private FileStore FilesOrDefault => Files ??= new FileStore(connection);
+
+    // Reads reconstruct the absolute FilePath from the file version's repo-relative path and the
+    // owning project's disk path, so no absolute path is ever stored (acceptance criterion 1).
+    private const string SelectPrefix = """
+        SELECT s.id, s.project_id, s.symbol_key, s.fully_qualified_name, s.display_name, s.kind,
+               s.accessibility, s.is_static, s.is_abstract, s.is_virtual, s.is_override, s.signature,
+               s.signature_hash, s.doc_comment, s.line_start, s.line_end, s.attributes, s.last_indexed_at,
+               f.repo_relative_path AS repo_relative_path, p.disk_path AS disk_path,
+               p.repo_relative_path AS project_repo_relative
+        FROM symbols s
+        LEFT JOIN file_versions fv ON fv.id = s.file_version_id
+        LEFT JOIN files f ON f.id = fv.file_id
+        LEFT JOIN projects p ON p.id = s.project_id
+        """;
+
     private const string InsertSql = """
         INSERT INTO symbols (project_id, symbol_key, fully_qualified_name, display_name, kind, accessibility,
             is_static, is_abstract, is_virtual, is_override, signature, signature_hash,
-            doc_comment, file_path, line_start, line_end, attributes, last_indexed_at)
+            doc_comment, file_version_id, line_start, line_end, attributes, last_indexed_at)
         VALUES (@project_id, @symbol_key, @fqn, @display_name, @kind, @accessibility,
             @is_static, @is_abstract, @is_virtual, @is_override, @signature, @signature_hash,
-            @doc_comment, @file_path, @line_start, @line_end, @attributes, @last_indexed_at)
+            @doc_comment, @file_version_id, @line_start, @line_end, @attributes, @last_indexed_at)
         ON CONFLICT(project_id, symbol_key) DO UPDATE SET
             fully_qualified_name = excluded.fully_qualified_name,
             display_name = excluded.display_name,
@@ -24,7 +48,7 @@ public sealed class SymbolStore(SqliteConnection connection)
             signature = excluded.signature,
             signature_hash = excluded.signature_hash,
             doc_comment = excluded.doc_comment,
-            file_path = excluded.file_path,
+            file_version_id = excluded.file_version_id,
             line_start = excluded.line_start,
             line_end = excluded.line_end,
             attributes = excluded.attributes,
@@ -52,18 +76,20 @@ public sealed class SymbolStore(SqliteConnection connection)
 
     public long Insert(SqliteCommand cmd, SymbolInfo symbol)
     {
-        Bind(cmd, symbol);
+        var fileVersionId = FilesOrDefault.ResolveFileVersionId(
+            symbol.ProjectId, symbol.FilePath, contentHash: null, lastIndexedAt: symbol.LastIndexedAt);
+        Bind(cmd, symbol, fileVersionId);
         return (long)cmd.ExecuteScalar()!;
     }
 
-    private static void Bind(SqliteCommand cmd, SymbolInfo symbol)
+    private static void Bind(SqliteCommand cmd, SymbolInfo symbol, long fileVersionId)
     {
         SqlParam.Set(cmd, "@project_id", symbol.ProjectId);
         SqlParam.Set(cmd, "@symbol_key", symbol.SymbolKey);
         SqlParam.Set(cmd, "@fqn", symbol.FullyQualifiedName);
         SqlParam.Set(cmd, "@display_name", symbol.DisplayName);
-        SqlParam.Set(cmd, "@kind", symbol.Kind.ToString().ToLowerInvariant());
-        SqlParam.Set(cmd, "@accessibility", FormatAccessibility(symbol.Accessibility));
+        SqlParam.Set(cmd, "@kind", (int)symbol.Kind);
+        SqlParam.Set(cmd, "@accessibility", (int)symbol.Accessibility);
         SqlParam.Set(cmd, "@is_static", symbol.IsStatic ? 1 : 0);
         SqlParam.Set(cmd, "@is_abstract", symbol.IsAbstract ? 1 : 0);
         SqlParam.Set(cmd, "@is_virtual", symbol.IsVirtual ? 1 : 0);
@@ -71,7 +97,7 @@ public sealed class SymbolStore(SqliteConnection connection)
         SqlParam.Set(cmd, "@signature", symbol.Signature);
         SqlParam.Set(cmd, "@signature_hash", symbol.SignatureHash);
         SqlParam.Set(cmd, "@doc_comment", symbol.DocComment);
-        SqlParam.Set(cmd, "@file_path", symbol.FilePath);
+        SqlParam.Set(cmd, "@file_version_id", fileVersionId);
         SqlParam.Set(cmd, "@line_start", symbol.LineStart);
         SqlParam.Set(cmd, "@line_end", symbol.LineEnd);
         SqlParam.Set(cmd, "@attributes", symbol.Attributes);
@@ -81,7 +107,7 @@ public sealed class SymbolStore(SqliteConnection connection)
     public SymbolInfo? GetById(long id)
     {
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = "SELECT * FROM symbols WHERE id = @id;";
+        cmd.CommandText = SelectPrefix + " WHERE s.id = @id;";
         cmd.Parameters.AddWithValue("@id", id);
         using var reader = cmd.ExecuteReader();
         return reader.Read() ? ReadSymbol(reader) : null;
@@ -91,8 +117,8 @@ public sealed class SymbolStore(SqliteConnection connection)
     {
         using var cmd = connection.CreateCommand();
         cmd.CommandText = projectId.HasValue
-            ? "SELECT * FROM symbols WHERE fully_qualified_name = @fqn AND project_id = @project_id;"
-            : "SELECT * FROM symbols WHERE fully_qualified_name = @fqn;";
+            ? SelectPrefix + " WHERE s.fully_qualified_name = @fqn AND s.project_id = @project_id;"
+            : SelectPrefix + " WHERE s.fully_qualified_name = @fqn;";
         cmd.Parameters.AddWithValue("@fqn", fullyQualifiedName);
         if (projectId.HasValue)
             cmd.Parameters.AddWithValue("@project_id", projectId.Value);
@@ -105,7 +131,7 @@ public sealed class SymbolStore(SqliteConnection connection)
     public SymbolInfo? GetBySymbolKey(string symbolKey, long projectId)
     {
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = "SELECT * FROM symbols WHERE symbol_key = @symbol_key AND project_id = @project_id;";
+        cmd.CommandText = SelectPrefix + " WHERE s.symbol_key = @symbol_key AND s.project_id = @project_id;";
         cmd.Parameters.AddWithValue("@symbol_key", symbolKey);
         cmd.Parameters.AddWithValue("@project_id", projectId);
         using var reader = cmd.ExecuteReader();
@@ -124,8 +150,8 @@ public sealed class SymbolStore(SqliteConnection connection)
     {
         using var cmd = connection.CreateCommand();
         cmd.CommandText = projectId.HasValue
-            ? "SELECT * FROM symbols WHERE fully_qualified_name = @fqn AND project_id = @project_id ORDER BY project_id, symbol_key, id;"
-            : "SELECT * FROM symbols WHERE fully_qualified_name = @fqn ORDER BY project_id, symbol_key, id;";
+            ? SelectPrefix + " WHERE s.fully_qualified_name = @fqn AND s.project_id = @project_id ORDER BY s.project_id, s.symbol_key, s.id;"
+            : SelectPrefix + " WHERE s.fully_qualified_name = @fqn ORDER BY s.project_id, s.symbol_key, s.id;";
         cmd.Parameters.AddWithValue("@fqn", fullyQualifiedName);
         if (projectId.HasValue)
             cmd.Parameters.AddWithValue("@project_id", projectId.Value);
@@ -134,10 +160,15 @@ public sealed class SymbolStore(SqliteConnection connection)
 
     public List<SymbolInfo> GetByFile(string filePath)
     {
+        var candidates = CandidateRelatives(filePath);
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = "SELECT * FROM symbols WHERE file_path = @file_path;";
-        cmd.Parameters.AddWithValue("@file_path", filePath);
-        return ReadAll(cmd);
+        var placeholders = string.Join(", ", candidates.Select((_, i) => $"@rel{i}"));
+        cmd.CommandText = SelectPrefix + $" WHERE f.repo_relative_path IN ({placeholders});";
+        for (var i = 0; i < candidates.Count; i++)
+            cmd.Parameters.AddWithValue($"@rel{i}", candidates[i]);
+        // Exact-match on the reconstructed absolute path so a coincidental same-relative-path file in
+        // another repo root (submodule) is not returned.
+        return ReadAll(cmd).Where(s => PathEquals(s.FilePath, filePath)).ToList();
     }
 
     // Project-scoped variant: a source file that is shared across the evaluated target frameworks of a
@@ -145,19 +176,20 @@ public sealed class SymbolStore(SqliteConnection connection)
     // resolve within one framework must restrict to that project rather than matching every variant.
     public List<SymbolInfo> GetByFile(string filePath, long projectId)
     {
+        var rel = SourcePaths.ToRepoRelative(FilesOrDefault.GetRepoRoot(projectId), filePath);
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = "SELECT * FROM symbols WHERE file_path = @file_path AND project_id = @project_id;";
-        cmd.Parameters.AddWithValue("@file_path", filePath);
+        cmd.CommandText = SelectPrefix + " WHERE s.project_id = @project_id AND f.repo_relative_path = @rel;";
         cmd.Parameters.AddWithValue("@project_id", projectId);
+        cmd.Parameters.AddWithValue("@rel", rel);
         return ReadAll(cmd);
     }
 
     public List<SymbolInfo> GetByProjectAndAccessibility(long projectId, string accessibility)
     {
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = "SELECT * FROM symbols WHERE project_id = @project_id AND accessibility = @accessibility;";
+        cmd.CommandText = SelectPrefix + " WHERE s.project_id = @project_id AND s.accessibility = @accessibility;";
         cmd.Parameters.AddWithValue("@project_id", projectId);
-        cmd.Parameters.AddWithValue("@accessibility", accessibility);
+        cmd.Parameters.AddWithValue("@accessibility", AccessibilityNameToInt(accessibility));
         return ReadAll(cmd);
     }
 
@@ -165,10 +197,10 @@ public sealed class SymbolStore(SqliteConnection connection)
     {
         using var cmd = connection.CreateCommand();
         var placeholders = string.Join(", ", accessibilities.Select((_, i) => $"@acc{i}"));
-        cmd.CommandText = $"SELECT * FROM symbols WHERE project_id = @project_id AND accessibility IN ({placeholders});";
+        cmd.CommandText = SelectPrefix + $" WHERE s.project_id = @project_id AND s.accessibility IN ({placeholders});";
         cmd.Parameters.AddWithValue("@project_id", projectId);
         for (var i = 0; i < accessibilities.Length; i++)
-            cmd.Parameters.AddWithValue($"@acc{i}", accessibilities[i]);
+            cmd.Parameters.AddWithValue($"@acc{i}", AccessibilityNameToInt(accessibilities[i]));
         return ReadAll(cmd);
     }
 
@@ -177,8 +209,8 @@ public sealed class SymbolStore(SqliteConnection connection)
         using var cmd = connection.CreateCommand();
         var kindClause = kindFilter != null ? " AND s.kind = @kind" : "";
         cmd.CommandText = $"""
-            SELECT s.* FROM symbols_fts fts
-            JOIN symbols s ON s.id = fts.rowid
+            {SelectPrefix}
+            JOIN symbols_fts fts ON fts.rowid = s.id
             WHERE symbols_fts MATCH @query{kindClause}
             ORDER BY rank
             LIMIT @max_results;
@@ -186,15 +218,22 @@ public sealed class SymbolStore(SqliteConnection connection)
         cmd.Parameters.AddWithValue("@query", query);
         cmd.Parameters.AddWithValue("@max_results", maxResults);
         if (kindFilter != null)
-            cmd.Parameters.AddWithValue("@kind", kindFilter);
+            cmd.Parameters.AddWithValue("@kind", KindNameToInt(kindFilter));
         return ReadAll(cmd);
     }
+
+    private static readonly int[] TypeKindOrdinals =
+    {
+        (int)SymbolKind.Class, (int)SymbolKind.Interface, (int)SymbolKind.Struct,
+        (int)SymbolKind.Enum, (int)SymbolKind.Delegate, (int)SymbolKind.Record
+    };
 
     public List<string> GetAllTypeFqns(long? projectId = null)
     {
         using var cmd = connection.CreateCommand();
         var projectClause = projectId.HasValue ? " AND project_id = @projectId" : "";
-        cmd.CommandText = $"SELECT fully_qualified_name FROM symbols WHERE kind IN ('class','interface','struct','enum','delegate','record'){projectClause};";
+        var kindList = string.Join(",", TypeKindOrdinals);
+        cmd.CommandText = $"SELECT fully_qualified_name FROM symbols WHERE kind IN ({kindList}){projectClause};";
         if (projectId.HasValue)
             cmd.Parameters.AddWithValue("@projectId", projectId.Value);
 
@@ -208,8 +247,8 @@ public sealed class SymbolStore(SqliteConnection connection)
     public List<SymbolInfo> GetByFqnPrefix(string prefix, long? projectId = null)
     {
         using var cmd = connection.CreateCommand();
-        var projectClause = projectId.HasValue ? " AND project_id = @projectId" : "";
-        cmd.CommandText = $"SELECT * FROM symbols WHERE fully_qualified_name LIKE @prefix || '%'{projectClause};";
+        var projectClause = projectId.HasValue ? " AND s.project_id = @projectId" : "";
+        cmd.CommandText = SelectPrefix + $" WHERE s.fully_qualified_name LIKE @prefix || '%'{projectClause};";
         cmd.Parameters.AddWithValue("@prefix", prefix);
         if (projectId.HasValue)
             cmd.Parameters.AddWithValue("@projectId", projectId.Value);
@@ -219,7 +258,7 @@ public sealed class SymbolStore(SqliteConnection connection)
     public List<SymbolInfo> GetByAttribute(string attributeFqn)
     {
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = "SELECT * FROM symbols WHERE attributes LIKE '%' || @attr || '%';";
+        cmd.CommandText = SelectPrefix + " WHERE s.attributes LIKE '%' || @attr || '%' ORDER BY s.fully_qualified_name, s.id;";
         cmd.Parameters.AddWithValue("@attr", attributeFqn);
         var results = ReadAll(cmd);
         // Verify exact match in JSON array
@@ -235,38 +274,76 @@ public sealed class SymbolStore(SqliteConnection connection)
         }).ToList();
     }
 
+    /// <summary>
+    /// Symbols with zero inbound pure-reference occurrences (dead-code detection). Mirrors the
+    /// pre-Phase-7 <c>LEFT JOIN "references"</c> semantics against the unified occurrences table:
+    /// only source-NULL (pure-reference) occurrences count as a "reference", which — because the
+    /// document extractor emits a reference row for every usage including invocations — is the same
+    /// referenced-set the old dedicated references table produced.
+    /// </summary>
+    public List<SymbolInfo> GetUnreferenced(long? projectDbId, string? kind, bool excludeTestProjects, string? accessibility)
+    {
+        using var cmd = connection.CreateCommand();
+        var clauses = new List<string> { "occ.id IS NULL" };
+        if (kind != null)
+        {
+            clauses.Add("s.kind = @kind");
+            cmd.Parameters.AddWithValue("@kind", KindNameToInt(kind));
+        }
+        if (projectDbId != null)
+        {
+            clauses.Add("s.project_id = @project_db_id");
+            cmd.Parameters.AddWithValue("@project_db_id", projectDbId.Value);
+        }
+        if (excludeTestProjects)
+            clauses.Add("p.is_test_project = 0");
+        if (accessibility != null)
+        {
+            clauses.Add("s.accessibility = @accessibility");
+            cmd.Parameters.AddWithValue("@accessibility", AccessibilityNameToInt(accessibility));
+        }
+        var where = string.Join(" AND ", clauses);
+        cmd.CommandText = SelectPrefix + $"""
+
+            LEFT JOIN occurrences occ ON occ.target_symbol_id = s.id AND occ.source_symbol_id IS NULL
+            WHERE {where}
+            ORDER BY f.repo_relative_path, s.line_start;
+            """;
+        return ReadAll(cmd);
+    }
+
     public List<SymbolInfo> SearchBySignature(
         string? returnTypePattern, string? paramTypePattern,
         string? kind, long? projectId, int maxResults)
     {
         using var cmd = connection.CreateCommand();
-        var sql = new System.Text.StringBuilder("SELECT * FROM symbols WHERE 1=1");
+        var sql = new System.Text.StringBuilder(SelectPrefix + " WHERE 1=1");
 
         if (kind != null)
         {
-            sql.Append(" AND kind = @kind");
-            cmd.Parameters.AddWithValue("@kind", kind);
+            sql.Append(" AND s.kind = @kind");
+            cmd.Parameters.AddWithValue("@kind", KindNameToInt(kind));
         }
         else
         {
-            sql.Append(" AND kind IN ('method', 'constructor')");
+            sql.Append($" AND s.kind IN ({(int)SymbolKind.Method}, {(int)SymbolKind.Constructor})");
         }
 
         if (returnTypePattern != null)
         {
-            sql.Append(" AND signature LIKE @return_type_pattern");
+            sql.Append(" AND s.signature LIKE @return_type_pattern");
             cmd.Parameters.AddWithValue("@return_type_pattern", $"%{returnTypePattern} %");
         }
 
         if (paramTypePattern != null)
         {
-            sql.Append(" AND signature LIKE @param_type_pattern");
+            sql.Append(" AND s.signature LIKE @param_type_pattern");
             cmd.Parameters.AddWithValue("@param_type_pattern", $"%(%{paramTypePattern}%");
         }
 
         if (projectId.HasValue)
         {
-            sql.Append(" AND project_id = @projectId");
+            sql.Append(" AND s.project_id = @projectId");
             cmd.Parameters.AddWithValue("@projectId", projectId.Value);
         }
 
@@ -279,9 +356,16 @@ public sealed class SymbolStore(SqliteConnection connection)
 
     public void DeleteByFile(string filePath)
     {
+        var candidates = CandidateRelatives(filePath);
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = "DELETE FROM symbols WHERE file_path = @file_path;";
-        cmd.Parameters.AddWithValue("@file_path", filePath);
+        var placeholders = string.Join(", ", candidates.Select((_, i) => $"@rel{i}"));
+        cmd.CommandText = $"""
+            DELETE FROM symbols WHERE file_version_id IN (
+                SELECT fv.id FROM files f JOIN file_versions fv ON fv.file_id = f.id
+                WHERE f.repo_relative_path IN ({placeholders}));
+            """;
+        for (var i = 0; i < candidates.Count; i++)
+            cmd.Parameters.AddWithValue($"@rel{i}", candidates[i]);
         cmd.ExecuteNonQuery();
     }
 
@@ -290,10 +374,15 @@ public sealed class SymbolStore(SqliteConnection connection)
     // symbols declared in the same shared source file.
     public void DeleteByFile(string filePath, long projectId)
     {
+        var rel = SourcePaths.ToRepoRelative(FilesOrDefault.GetRepoRoot(projectId), filePath);
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = "DELETE FROM symbols WHERE file_path = @file_path AND project_id = @project_id;";
-        cmd.Parameters.AddWithValue("@file_path", filePath);
+        cmd.CommandText = """
+            DELETE FROM symbols WHERE project_id = @project_id AND file_version_id IN (
+                SELECT fv.id FROM files f JOIN file_versions fv ON fv.file_id = f.id
+                WHERE f.project_id = @project_id AND f.repo_relative_path = @rel);
+            """;
         cmd.Parameters.AddWithValue("@project_id", projectId);
+        cmd.Parameters.AddWithValue("@rel", rel);
         cmd.ExecuteNonQuery();
     }
 
@@ -316,6 +405,18 @@ public sealed class SymbolStore(SqliteConnection connection)
 
     private static SymbolInfo ReadSymbol(SqliteDataReader reader)
     {
+        var repoRelOrdinal = reader.GetOrdinal("repo_relative_path");
+        string filePath = "";
+        if (!reader.IsDBNull(repoRelOrdinal))
+        {
+            var repoRel = reader.GetString(repoRelOrdinal);
+            var diskOrdinal = reader.GetOrdinal("disk_path");
+            var projRelOrdinal = reader.GetOrdinal("project_repo_relative");
+            var disk = reader.IsDBNull(diskOrdinal) ? null : reader.GetString(diskOrdinal);
+            var projRel = reader.IsDBNull(projRelOrdinal) ? null : reader.GetString(projRelOrdinal);
+            filePath = SourcePaths.ToAbsolute(SourcePaths.DeriveRepoRoot(disk, projRel), repoRel);
+        }
+
         return new SymbolInfo
         {
             Id = reader.GetInt64(reader.GetOrdinal("id")),
@@ -323,8 +424,8 @@ public sealed class SymbolStore(SqliteConnection connection)
             SymbolKey = reader.GetString(reader.GetOrdinal("symbol_key")),
             FullyQualifiedName = reader.GetString(reader.GetOrdinal("fully_qualified_name")),
             DisplayName = reader.GetString(reader.GetOrdinal("display_name")),
-            Kind = Enum.Parse<SymbolKind>(reader.GetString(reader.GetOrdinal("kind")), ignoreCase: true),
-            Accessibility = ParseAccessibility(reader.GetString(reader.GetOrdinal("accessibility"))),
+            Kind = (SymbolKind)reader.GetInt64(reader.GetOrdinal("kind")),
+            Accessibility = (Accessibility)reader.GetInt64(reader.GetOrdinal("accessibility")),
             IsStatic = reader.GetInt64(reader.GetOrdinal("is_static")) != 0,
             IsAbstract = reader.GetInt64(reader.GetOrdinal("is_abstract")) != 0,
             IsVirtual = reader.GetInt64(reader.GetOrdinal("is_virtual")) != 0,
@@ -332,13 +433,51 @@ public sealed class SymbolStore(SqliteConnection connection)
             Signature = reader.IsDBNull(reader.GetOrdinal("signature")) ? null : reader.GetString(reader.GetOrdinal("signature")),
             SignatureHash = reader.IsDBNull(reader.GetOrdinal("signature_hash")) ? null : reader.GetString(reader.GetOrdinal("signature_hash")),
             DocComment = reader.IsDBNull(reader.GetOrdinal("doc_comment")) ? null : reader.GetString(reader.GetOrdinal("doc_comment")),
-            FilePath = reader.GetString(reader.GetOrdinal("file_path")),
+            FilePath = filePath,
             LineStart = reader.GetInt32(reader.GetOrdinal("line_start")),
             LineEnd = reader.GetInt32(reader.GetOrdinal("line_end")),
             Attributes = reader.IsDBNull(reader.GetOrdinal("attributes")) ? null : reader.GetString(reader.GetOrdinal("attributes")),
             LastIndexedAt = reader.GetInt64(reader.GetOrdinal("last_indexed_at"))
         };
     }
+
+    // Distinct repo-relative candidate strings for an absolute (or already-relative) path across every
+    // known project root, plus the raw input, so file lookups by absolute path still resolve.
+    private List<string> CandidateRelatives(string path)
+    {
+        var candidates = new HashSet<string>(StringComparer.Ordinal) { path };
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT DISTINCT disk_path, repo_relative_path FROM projects;";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            var disk = reader.IsDBNull(0) ? null : reader.GetString(0);
+            var projRel = reader.IsDBNull(1) ? null : reader.GetString(1);
+            candidates.Add(SourcePaths.ToRepoRelative(SourcePaths.DeriveRepoRoot(disk, projRel), path));
+        }
+        return candidates.ToList();
+    }
+
+    private static bool PathEquals(string a, string b)
+        => string.Equals(
+            a.Replace('\\', '/'), b.Replace('\\', '/'),
+            OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal);
+
+    // Maps a lowercase kind name (as used by MCP filters) to its stored ordinal, or -1 when unknown so
+    // an unrecognized filter matches nothing (matching the pre-Phase-7 text-equality behavior).
+    private static int KindNameToInt(string name)
+        => Enum.TryParse<SymbolKind>(name, ignoreCase: true, out var kind) ? (int)kind : -1;
+
+    private static int AccessibilityNameToInt(string value) => value switch
+    {
+        "public" => (int)Accessibility.Public,
+        "internal" => (int)Accessibility.Internal,
+        "protected" => (int)Accessibility.Protected,
+        "private" => (int)Accessibility.Private,
+        "protected_internal" => (int)Accessibility.ProtectedInternal,
+        "private_protected" => (int)Accessibility.PrivateProtected,
+        _ => -1
+    };
 
     public static string FormatAccessibility(Accessibility accessibility) => accessibility switch
     {

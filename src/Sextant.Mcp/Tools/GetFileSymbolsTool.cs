@@ -12,9 +12,9 @@ public static class GetFileSymbolsTool
         DatabaseProvider dbProvider,
         [Description("The source file path")] string file_path)
     {
-        var db = dbProvider.GetDatabase();
+        var db = dbProvider.GetReadyDatabase(out var notReady);
         if (db == null)
-            return ResponseBuilder.BuildEmpty("No index database found.");
+            return ResponseBuilder.BuildEmpty(notReady);
 
         var conn = db.GetConnection();
         var symbolStore = new SymbolStore(conn);

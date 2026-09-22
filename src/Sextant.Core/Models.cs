@@ -57,6 +57,7 @@ public sealed class CallGraphEdge
     public long CalleeSymbolId { get; set; }
     public required string CallSiteFile { get; init; }
     public int CallSiteLine { get; init; }
+    public int CallSiteColumn { get; init; }
     public long LastIndexedAt { get; init; }
 }
 

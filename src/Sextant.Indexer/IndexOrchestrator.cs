@@ -102,7 +102,16 @@ public sealed class IndexOrchestrator
         var relationshipStore = new RelationshipStore(conn);
         var dependencyStore = new ProjectDependencyStore(conn);
         var apiSurfaceStore = new ApiSurfaceStore(conn);
-        var fileIndexStore = new FileIndexStore(conn);
+
+        // One shared file/version engine for the whole run. All stores that resolve a source path to a
+        // file_version_id (symbols, occurrences, comments) route through it so path→id resolution is
+        // single-sourced, cached, and — because it is only touched by the sequential symbol phase and
+        // the single occurrence-persistence consumer — deterministic (Phase 6).
+        var fileStore = new FileStore(conn);
+        symbolStore.Files = fileStore;
+        referenceStore.Files = fileStore;
+        callGraphStore.Files = fileStore;
+        relationshipStore.Files = fileStore;
 
         var solutionStore = new SolutionStore(conn);
         var runStore = new IndexRunStore(conn);
@@ -213,12 +222,15 @@ public sealed class IndexOrchestrator
             });
 
             // Reset this logical (per-TFM) project's contributions before re-extracting. Deleting the
-            // project's symbols cascades its references/relationships/call edges/dataflow AND the
-            // inbound edges that point into them, so those are all rebuilt from scratch below; the
-            // file_index rows are cleared here too so files that were deleted/renamed away since the
-            // last run leave no stale fingerprint.
+            // project's symbols cascades its relationships, its outbound call occurrences, and every
+            // inbound occurrence that targets them (target_symbol_id cascade); deleting the project's
+            // files cascades its file_versions and, through them, the pure-reference occurrences and
+            // comments located in this project's files (the outbound usages this project owns) and
+            // clears fingerprints for files deleted/renamed away since the last run. Together the two
+            // deletes clear exactly this project's owned rows — the usage-site production domain — so
+            // they are all rebuilt from scratch below.
             symbolStore.DeleteByProject(projectId);
-            fileIndexStore.DeleteByProject(projectId);
+            fileStore.DeleteByProject(projectId);
 
             var symbols = await SymbolExtractor.ExtractFromProjectAsync(project, projectId);
             foreach (var symbol in symbols)
@@ -231,7 +243,7 @@ public sealed class IndexOrchestrator
             // Fingerprint every indexed (non-generated, on-disk) file so an unchanged daemon restart
             // short-circuits to zero work, and record the project's evaluation fingerprint so a later
             // catch-up can detect config/props/global.json/assets changes.
-            await SeedFileIndexAsync(project, projectId, fileIndexStore, session, now, cancellationToken);
+            await SeedFileIndexAsync(project, projectId, fileStore, session, now, cancellationToken);
             projectStore.SetEvaluationFingerprint(projectId, EvaluationFingerprint.Compute(project.FilePath, repoRoot));
 
             session.CommitBatch();
@@ -406,8 +418,9 @@ public sealed class IndexOrchestrator
                         CalleeSymbolId = calleeId,
                         CallSiteFile = call.CallSiteFile,
                         CallSiteLine = call.CallSiteLine,
+                        CallSiteColumn = call.CallSiteColumn,
                         LastIndexedAt = now
-                    });
+                    }, ownerProjectId);
                     session.RowsWritten();
 
                     var dfResult = call.Dataflow;
@@ -587,6 +600,7 @@ public sealed class IndexOrchestrator
         _log?.Invoke("Extracting tagged comments...");
         projectIndex = 0;
         var commentStore = new CommentStore(conn);
+        commentStore.Files = fileStore;
         using var commentInsert = commentStore.CreateInsertCommand();
         foreach (var project in solution.Projects)
         {
@@ -607,8 +621,10 @@ public sealed class IndexOrchestrator
             if (project.FilePath == null || !projectRoslynToId.TryGetValue(project.Id, out var commentProjectId))
                 continue;
 
-            // Comments are not cascade-deleted by the symbol reset, so clear the whole project's
-            // comments once (covering files deleted/renamed away since the last run) before re-extract.
+            // The symbol-phase reset already cascade-deleted this project's comments (comments FK to
+            // file_version, and the project's file_versions were deleted there). Re-clear defensively
+            // so a comment-only re-run still drops stale rows (files deleted/renamed away) before
+            // re-extract; it is project-scoped (file_version → file → project_id), never cross-project.
             commentStore.DeleteByProject(commentProjectId);
 
             foreach (var syntaxTree in compilation.SyntaxTrees)
@@ -883,7 +899,7 @@ public sealed class IndexOrchestrator
     private static async Task SeedFileIndexAsync(
         Project project,
         long projectId,
-        FileIndexStore fileIndexStore,
+        FileStore fileStore,
         IndexWriteSession session,
         long now,
         CancellationToken cancellationToken)
@@ -900,13 +916,11 @@ public sealed class IndexOrchestrator
             if (!File.Exists(filePath) || !seen.Add(filePath))
                 continue;
 
-            fileIndexStore.Upsert(new FileIndexEntry
-            {
-                ProjectId = projectId,
-                FilePath = filePath,
-                ContentHash = IncrementalIndexer.ComputeFileHash(filePath),
-                LastIndexedAt = now
-            });
+            // Ensure a file_version exists for every on-disk source file, including those with no
+            // top-level symbols. The symbol phase already seeded versions for files it touched;
+            // select-existing-first reuses those rows (no re-hash), so this only adds the gaps and the
+            // fingerprint hash is a raw SHA-256 taken from disk — the same bytes the daemon compares.
+            fileStore.ResolveFileVersionId(projectId, filePath, contentHash: null, lastIndexedAt: now);
             session.RowsWritten();
         }
     }

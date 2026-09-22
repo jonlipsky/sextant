@@ -40,15 +40,19 @@ public sealed class MetricsStoreTests
 
     private static void InsertReference(SqliteConnection conn, long symbolId, string file, int line, string kind)
     {
+        // Phase 7: a "reference" is an occurrence with a NULL source (enclosing) symbol. Distinctness in
+        // IndexMetricsStore is (target_symbol_id, file_version_id, line, kind), so map each file name to
+        // a stable synthetic file_version id and each kind label to its integer ordinal.
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO "references" (symbol_id, in_project_id, file_path, line, reference_kind)
-            VALUES (@symbol_id, 1, @file, @line, @kind);
+            INSERT INTO occurrences
+                (in_project_id, target_symbol_id, source_symbol_id, file_version_id, line, col, kind, flags, last_indexed_at)
+            VALUES (1, @target, NULL, @fv, @line, 0, @kind, 0, 0);
             """;
-        cmd.Parameters.AddWithValue("@symbol_id", symbolId);
-        cmd.Parameters.AddWithValue("@file", file);
+        cmd.Parameters.AddWithValue("@target", symbolId);
+        cmd.Parameters.AddWithValue("@fv", (long)(uint)file.GetHashCode());
         cmd.Parameters.AddWithValue("@line", line);
-        cmd.Parameters.AddWithValue("@kind", kind);
+        cmd.Parameters.AddWithValue("@kind", kind == "call" ? 0 : 1);
         cmd.ExecuteNonQuery();
     }
 

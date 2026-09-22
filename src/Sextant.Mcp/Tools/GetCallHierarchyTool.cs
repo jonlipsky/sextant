@@ -16,9 +16,9 @@ public static class GetCallHierarchyTool
         [Description("Maximum depth to traverse")] int depth = 5,
         [Description("Include source code snippet at each call site")] bool include_source = false)
     {
-        var db = dbProvider.GetDatabase();
+        var db = dbProvider.GetReadyDatabase(out var notReady);
         if (db == null)
-            return ResponseBuilder.BuildEmpty("No index database found.");
+            return ResponseBuilder.BuildEmpty(notReady);
 
         var conn = db.GetConnection();
         var symbolStore = new SymbolStore(conn);

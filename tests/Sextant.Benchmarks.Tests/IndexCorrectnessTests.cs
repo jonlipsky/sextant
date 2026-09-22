@@ -106,23 +106,23 @@ public sealed class IndexCorrectnessTests
             await new IndexOrchestrator(db).IndexSolutionAsync(solution);
 
             var conn = db.GetConnection();
-            var fileIndexRows = Scalar(conn, "SELECT COUNT(*) FROM file_index");
-            Assert.IsTrue(fileIndexRows > 0, "file_index must be populated by the initial index (criterion 1).");
+            var fileVersionRows = Scalar(conn, "SELECT COUNT(*) FROM file_versions");
+            Assert.IsTrue(fileVersionRows > 0, "file_versions must be populated by the initial index (criterion 1).");
 
-            // Every non-generated source symbol's file must have a file_index fingerprint row, and
-            // every fingerprint must be a real content hash (not the empty string).
+            // Every non-generated source symbol must resolve to a file_version fingerprint, and every
+            // fingerprint must be a real (non-empty) content hash. In the Phase-7 schema a symbol's
+            // file identity is its file_version_id (files.repo_relative_path stored once); a null id
+            // would mean the symbol phase failed to seed the file's version.
             var symbolFilesWithoutFingerprint = Scalar(conn, """
-                SELECT COUNT(DISTINCT s.file_path)
+                SELECT COUNT(*)
                 FROM symbols s
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM file_index fi
-                    WHERE fi.project_id = s.project_id AND fi.file_path = s.file_path)
+                WHERE s.file_version_id IS NULL
                 """);
             Assert.AreEqual(0, symbolFilesWithoutFingerprint,
-                "Every indexed source file must have a file_index fingerprint row.");
+                "Every indexed source symbol must resolve to a file_version fingerprint row.");
 
-            var emptyHashes = Scalar(conn, "SELECT COUNT(*) FROM file_index WHERE content_hash = '' OR content_hash IS NULL");
-            Assert.AreEqual(0, emptyHashes, "Every file_index row must carry a real content hash.");
+            var emptyHashes = Scalar(conn, "SELECT COUNT(*) FROM file_versions WHERE content_hash IS NULL OR length(content_hash) = 0");
+            Assert.AreEqual(0, emptyHashes, "Every file_version row must carry a real content hash.");
         }
         finally
         {
@@ -205,9 +205,9 @@ public sealed class IndexCorrectnessTests
 
             Assert.IsFalse(SymbolExists(conn, "Describer"),
                 "A deleted file's symbols must be purged on the next incremental pass.");
-            var staleFileIndex = Scalar(conn, "SELECT COUNT(*) FROM file_index WHERE file_path = $p",
-                ("$p", deleted));
-            Assert.AreEqual(0, staleFileIndex, "A deleted file must leave no stale file_index fingerprint.");
+            var staleFileIndex = Scalar(conn, "SELECT COUNT(*) FROM files WHERE repo_relative_path LIKE '%' || $p",
+                ("$p", Path.GetFileName(deleted)));
+            Assert.AreEqual(0, staleFileIndex, "A deleted file must leave no stale file fingerprint row.");
         }
         finally
         {
@@ -507,11 +507,12 @@ public sealed class IndexCorrectnessTests
     private static bool CrossProjectReferenceExists(SqliteConnection conn, string consumerFrag, string dependencyFrag) =>
         Scalar(conn, """
             SELECT COUNT(*)
-            FROM "references" r
-            JOIN symbols s ON s.id = r.symbol_id
+            FROM occurrences r
+            JOIN symbols s ON s.id = r.target_symbol_id
             JOIN projects pc ON pc.id = r.in_project_id
             JOIN projects pd ON pd.id = s.project_id
-            WHERE r.in_project_id != s.project_id
+            WHERE r.source_symbol_id IS NULL
+              AND r.in_project_id != s.project_id
               AND pc.repo_relative_path LIKE $c
               AND pd.repo_relative_path LIKE $d
             """, ("$c", "%" + consumerFrag + "%"), ("$d", "%" + dependencyFrag + "%")) > 0;

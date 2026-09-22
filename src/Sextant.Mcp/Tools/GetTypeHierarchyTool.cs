@@ -14,9 +14,9 @@ public static class GetTypeHierarchyTool
         [Description("The fully qualified name of the type")] string symbol_fqn,
         [Description("Direction: 'up' (base types), 'down' (derived types), or 'both'")] string direction = "both")
     {
-        var db = dbProvider.GetDatabase();
+        var db = dbProvider.GetReadyDatabase(out var notReady);
         if (db == null)
-            return ResponseBuilder.BuildEmpty("No index database found.");
+            return ResponseBuilder.BuildEmpty(notReady);
 
         var conn = db.GetConnection();
         var symbolStore = new SymbolStore(conn);

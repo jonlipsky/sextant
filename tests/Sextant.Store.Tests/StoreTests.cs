@@ -146,7 +146,10 @@ public class StoreTests
         var refs = _referenceStore.GetBySymbolId(symbolId);
         Assert.AreEqual(1, refs.Count);
         Assert.AreEqual(ReferenceKind.Invocation, refs[0].ReferenceKind);
-        Assert.AreEqual("myObj.MyMethod();", refs[0].ContextSnippet);
+        Assert.AreEqual("src/Caller.cs", refs[0].FilePath);
+        // Phase 7: snippets are no longer stored on the occurrence; context is reproduced at query time
+        // from the exact source version, so the round-tripped snippet is null.
+        Assert.IsNull(refs[0].ContextSnippet);
     }
 
     [TestMethod]
