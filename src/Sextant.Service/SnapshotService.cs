@@ -1,4 +1,5 @@
 using Microsoft.Data.Sqlite;
+using Sextant.Core.Platform;
 using Sextant.Service.Contributions;
 using Sextant.Store;
 
@@ -98,6 +99,10 @@ public sealed class SnapshotService : IDisposable
 
             try
             {
+                // Once the lease is held, make every write session abort between batches if it is ever
+                // stolen (issue #38 / criterion 3): a long worker index run consults this probe at each
+                // batch boundary and rolls back rather than racing the new owner into a corrupt publish.
+                db.SetWriterLostProbe(() => lease.IsLost);
                 db.Recover();
                 var service = new SnapshotService(
                     options, worker ?? new UnavailableSnapshotWorker(), paths, db, lease, ownsDatabase,
@@ -119,16 +124,29 @@ public sealed class SnapshotService : IDisposable
     }
 
     /// <summary>
-    /// Reconciles jobs a previous worker left <c>running</c> (criterion 2). This service holds a fresh lease
-    /// token, so every <c>running</c> job not owned by THIS token is reset to <c>queued</c> for re-attempt.
+    /// Reconciles state a previous worker/service instance left orphaned by a crash (Phase 17 criterion 3),
+    /// so worker/service loss at every stage resolves to retryable/failed/complete and NEVER a corrupt
+    /// publish. This service holds a fresh lease token, so it: (1) resets every <c>running</c> job not owned
+    /// by THIS token to <c>queued</c> for re-attempt; (2) resets any PHANTOM terminal job — <c>complete</c>/
+    /// <c>partial</c> with a now-NULL <c>snapshot_id</c> (crash between the status write and the publish
+    /// commit, or the snapshot later reclaimed) — back to <c>queued</c> so a later ensure regenerates it
+    /// rather than reporting a phantom-complete forever; and (3) sweeps orphaned per-job scratch left by a
+    /// crash. Returns the number of jobs reconciled.
     /// </summary>
     public int ReconcileOnStartup()
     {
-        return WithWrite(() =>
+        var reconciled = WithWrite(() =>
         {
             var jobs = new SnapshotJobStore(_conn);
-            return jobs.ReconcileOrphanedJobs(_lease.OwnerToken);
+            return jobs.ReconcileOrphanedJobs(_lease.OwnerToken)
+                 + jobs.ReconcilePhantomTerminalJobs();
         });
+
+        // Best-effort scratch sweep OUTSIDE the write transaction (filesystem, not catalog state); confined
+        // to the scratch root so it can never touch a persistent volume.
+        _paths.SweepOrphanedScratch();
+
+        return reconciled;
     }
 
     /// <summary>
@@ -157,7 +175,10 @@ public sealed class SnapshotService : IDisposable
         }).ConfigureAwait(false);
 
         if (SnapshotJobStatus.IsTerminal(job.Status) && terminalUsable)
+        {
+            WithWrite(() => { EnsureAttachBranchPointer(request, job.SnapshotId); return 0; });
             return Attach(job, existed);
+        }
 
         // Serialize production so only ONE worker runs per identity; concurrent callers attach.
         await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -169,7 +190,10 @@ public sealed class SnapshotService : IDisposable
 
             var current = jobs.GetJob(job.Id)!;
             if (SnapshotJobStatus.IsTerminal(current.Status) && TerminalResultUsable(current, hash, snapshots))
+            {
+                EnsureAttachBranchPointer(request, current.SnapshotId);
                 return Attach(current, existed);
+            }
 
             // A complete snapshot may already be published for this identity (produced by an earlier run
             // whose job row predates migration 016, or a race we lost). Attach to it without re-indexing.
@@ -177,6 +201,7 @@ public sealed class SnapshotService : IDisposable
             if (published is { Status: SnapshotStatus.Complete })
             {
                 jobs.MarkResult(job.Id, SnapshotJobStatus.Complete, published.Id);
+                EnsureAttachBranchPointer(request, published.Id);
                 return Attach(jobs.GetJob(job.Id)!, existed);
             }
 
@@ -471,30 +496,116 @@ public sealed class SnapshotService : IDisposable
         }
 
         // (5) Import the validated payload's project versions + compact rows into the pending snapshot,
-        // stamping each project's producing capability (migration 018).
-        importer.Import(payloadConn, validation.PayloadSnapshotId!.Value, snapshotId, repoId, manifest, now);
+        // stamping each project's producing capability (migration 018). A payload whose logical-project
+        // tuple diverges from shared catalog metadata is rejected here rather than perturbing shared state
+        // (issue #69) — EnsureLogicalProject verifies instead of overwriting.
+        try
+        {
+            importer.Import(payloadConn, validation.PayloadSnapshotId!.Value, snapshotId, repoId, manifest, now);
+        }
+        catch (LogicalProjectConflictException ex)
+        {
+            jobs.ReplaceDiagnostics(job.Id, [new ProjectOutcome
+            {
+                Severity = JobDiagnosticSeverity.Error,
+                Code = Contributions.ContributionRejectionCode.ProjectGraphMismatch,
+                Message = ex.Message
+            }.ToDiagnostic(job.Id)]);
+            jobs.MarkResult(job.Id, SnapshotJobStatus.Failed, null,
+                $"{Contributions.ContributionRejectionCode.ProjectGraphMismatch}: {ex.Message}");
+            return new IngestContributionResult
+            {
+                Accepted = false,
+                Status = ContributionIngestStatus.Rejected,
+                RejectionCode = Contributions.ContributionRejectionCode.ProjectGraphMismatch,
+                Message = ex.Message,
+                JobId = job.Id,
+                IdentityHash = identityHash,
+                ContentHash = contentHash,
+                Diagnostics = jobs.GetDiagnostics(job.Id)
+            };
+        }
 
         // (6) Record contribution provenance keyed by content address (idempotency + assembled-snapshot lineage).
+        // The contribution's declared completeness is recorded durably so the finalize gate can publish the
+        // assembled snapshot Partial if ANY contribution that fed it was non-complete (issue #70).
         contributions.Record(snapshotId, contentHash, manifest.Tenant, manifest.RepositoryRemoteUrl,
             manifest.CommitSha, manifest.CapabilityFingerprint, manifest.Producer,
-            manifest.ToolchainFingerprint, manifest.ManifestHash);
+            manifest.ToolchainFingerprint, manifest.ManifestHash, ManifestCompleteness(manifest));
 
         // (7) Finalize → publish + advance branch, or leave assembling (pending) for more contributions.
         if (!request.Finalize)
             return Accepted(ContributionIngestStatus.Assembling, job.Id, snapshotId, contentHash, identityHash);
 
+        // (7a) Completeness/topology gate (issue #70): an assembled snapshot may only publish COMPLETE when
+        // it is provably complete for its identity. If any contribution declared itself non-complete, or the
+        // assembled graph is missing an intra-repository project version it references, publish PARTIAL — a
+        // materially-incomplete assembly is NEVER silently Complete (criterion 3). Cross-repo provider
+        // references are resolved via snapshot_dependencies (#72) and are not counted as incompleteness.
+        var gate = Contributions.AssemblyFinalizeGate.Evaluate(
+            manifest,
+            contributions.HasIncompleteContribution(snapshotId),
+            snapshots.GetSnapshotLogicalCanonicalIds(snapshotId),
+            snapshots.GetKnownLogicalCanonicalIds(repoId));
+        if (!gate.IsComplete)
+        {
+            var reason = string.Join(" ", gate.Reasons);
+            if (snapshots.MarkPartial(snapshotId, now) == 1)
+            {
+                jobs.ReplaceDiagnostics(job.Id, gate.Reasons.Select(r => new ProjectOutcome
+                {
+                    Severity = JobDiagnosticSeverity.Error,
+                    Code = "assembly_incomplete",
+                    Message = r
+                }.ToDiagnostic(job.Id)));
+                jobs.MarkResult(job.Id, SnapshotJobStatus.Partial, snapshotId, $"assembly incomplete: {reason}");
+            }
+            return Accepted(ContributionIngestStatus.Assembling, job.Id, snapshotId, contentHash, identityHash);
+        }
+
         // Publish is guarded on status = pending inside MarkComplete; a zero-row result means the snapshot was
-        // NOT pending at publish time (concurrent completion / immutability). Never advance the branch or mark
-        // the job complete against a snapshot we did not ourselves transition to complete.
+        // NOT pending at publish time. That is only safe to report Complete when the snapshot is ALREADY
+        // complete (a concurrent finalize won the pending→complete race / immutability). "Not pending" also
+        // covers PARTIAL (an earlier topology/contribution gate marked it) and other non-complete states —
+        // reporting Complete for a partial snapshot would silently publish a materially-incomplete assembly,
+        // so we re-read the real status and never claim Complete for a snapshot we did not complete
+        // (criterion 3). Never advance the branch against a snapshot we did not transition to complete.
         if (snapshots.MarkComplete(snapshotId, now) != 1)
         {
-            jobs.MarkResult(job.Id, SnapshotJobStatus.Complete, snapshotId);
-            return Accepted(ContributionIngestStatus.Complete, job.Id, snapshotId, contentHash, identityHash);
+            // Not pending at publish time. A COMPLETE or SUPERSEDED snapshot is fully-published immutable
+            // data — safe to report Complete (a concurrent finalize won the pending→complete race, or a
+            // branch has since moved past it). But "not pending" ALSO covers PARTIAL (an earlier
+            // topology/contribution gate marked it): reporting Complete for a partial snapshot would
+            // silently publish a materially-incomplete assembly, so we re-read the real status and report
+            // the true terminal state, never claiming Complete for a snapshot we did not complete
+            // (criterion 3).
+            if (snapshots.GetById(snapshotId) is { Status: SnapshotStatus.Complete or SnapshotStatus.Superseded })
+            {
+                jobs.MarkResult(job.Id, SnapshotJobStatus.Complete, snapshotId);
+                return Accepted(ContributionIngestStatus.Complete, job.Id, snapshotId, contentHash, identityHash);
+            }
+            jobs.MarkResult(job.Id, SnapshotJobStatus.Partial, snapshotId, "assembly not complete at finalize");
+            return Accepted(ContributionIngestStatus.Assembling, job.Id, snapshotId, contentHash, identityHash);
         }
         if (!string.IsNullOrWhiteSpace(request.BranchName))
             AdvanceBranch(snapshots, repoId, request.BranchName, request.IsDefaultBranch, snapshotId, now);
         jobs.MarkResult(job.Id, SnapshotJobStatus.Complete, snapshotId);
         return Accepted(ContributionIngestStatus.Complete, job.Id, snapshotId, contentHash, identityHash);
+    }
+
+    // Reduces a contribution's per-project declared completeness to one contribution-level value: unsupported
+    // dominates partial, which dominates complete (issue #70).
+    private static string ManifestCompleteness(ContributionManifest manifest)
+    {
+        var worst = "complete";
+        foreach (var p in manifest.Projects)
+        {
+            if (string.Equals(p.Completeness, "unsupported", StringComparison.OrdinalIgnoreCase))
+                return "unsupported";
+            if (string.Equals(p.Completeness, "partial", StringComparison.OrdinalIgnoreCase))
+                worst = "partial";
+        }
+        return worst;
     }
 
     private static IngestContributionResult Accepted(string status, long jobId, long snapshotId, string contentHash, string identityHash) => new()
@@ -516,6 +627,20 @@ public sealed class SnapshotService : IDisposable
         JobId = jobId,
         IdentityHash = identityHash
     };
+
+    // Ensures the requesting branch owns a pointer to the snapshot it attached to (issue #62), so a second
+    // branch at the same commit both resolves and protects the shared snapshot. Raw DB write — callers must
+    // already hold the write gate. No-op when the request carries no branch, no resolved snapshot, or an
+    // unknown repository.
+    private void EnsureAttachBranchPointer(EnsureSnapshotRequest request, long? snapshotId)
+    {
+        if (request.BranchName is not { Length: > 0 } branch || snapshotId is not long sid)
+            return;
+        var snapshots = new SnapshotStore(_conn);
+        if (snapshots.GetRepositoryId(request.RepositoryRemoteUrl) is not long repoId)
+            return;
+        snapshots.AttachBranchPointer(repoId, branch, sid, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+    }
 
     // Advances a branch pointer to a published snapshot and supersedes the previous target — the same
     // atomic branch advance the orchestrator performs, run inside the ingest write transaction.
@@ -611,9 +736,71 @@ public sealed class SnapshotService : IDisposable
         });
     }
 
+    /// <summary>
+    /// Registers (or updates) an OPEN pull-request snapshot retention root (Phase 17 criterion 4): the
+    /// snapshot indexed for a PR head must not be reclaimed by retention while the PR is open, so an open-PR
+    /// reviewer's cross-repo/find-references queries keep resolving. Idempotent per <c>(repository, pr)</c>.
+    /// When <paramref name="snapshotId"/> is omitted the PR head commit is resolved to its complete snapshot.
+    /// Fails closed — returns false without writing a root — when the repository is unknown OR (no snapshot id
+    /// supplied AND no complete snapshot exists for the head commit); a NULL-snapshot root protects nothing,
+    /// so it is never persisted.
+    /// </summary>
+    public bool RegisterPullRequestSnapshot(
+        string repositoryRemoteUrl, int prNumber, string headCommitSha, long? snapshotId = null)
+    {
+        return WithWrite(() =>
+        {
+            var snapshots = new SnapshotStore(_conn);
+            if (snapshots.GetRepositoryId(repositoryRemoteUrl) is not long repoId)
+                return false;
+
+            long? resolved;
+            if (snapshotId is long supplied)
+            {
+                // A caller-supplied id must be a COMPLETE snapshot that belongs to THIS repository and was
+                // indexed at the PR head commit — otherwise the "protection" would pin the wrong (or a
+                // partial) snapshot while the real open-PR head goes unprotected. Validate, else fail closed.
+                if (snapshots.GetById(supplied) is not { Status: SnapshotStatus.Complete } row
+                    || row.RepositoryId != repoId
+                    || snapshots.GetCommitSha(row.CommitId) != headCommitSha)
+                    return false;
+                resolved = supplied;
+            }
+            else
+            {
+                resolved = snapshots.ResolveCompleteSnapshotByCommit(repoId, headCommitSha);
+            }
+            if (resolved is null)
+                return false;
+
+            var prStore = new PullRequestSnapshotStore(_conn);
+            prStore.Register(repoId, prNumber, resolved, headCommitSha,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            return true;
+        });
+    }
+
+    /// <summary>
+    /// Marks a pull-request retention root CLOSED (Phase 17 criterion 4): once closed the snapshot is no
+    /// longer protected as an open-PR root and becomes eligible for the normal retention window/quota.
+    /// Idempotent; returns false when the repository is unknown.
+    /// </summary>
+    public bool ClosePullRequestSnapshot(string repositoryRemoteUrl, int prNumber)
+    {
+        return WithWrite(() =>
+        {
+            var snapshots = new SnapshotStore(_conn);
+            if (snapshots.GetRepositoryId(repositoryRemoteUrl) is not long repoId)
+                return false;
+
+            var prStore = new PullRequestSnapshotStore(_conn);
+            prStore.Close(repoId, prNumber, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            return true;
+        });
+    }
+
     /// <summary>Service AVAILABILITY: the catalog is reachable and this instance holds the writer lease.</summary>
     public bool IsAvailable => !_disposed;
-
     /// <summary>
     /// Worker CAPACITY, distinct from availability (health vs readiness): whether this node can currently
     /// accept production work. A node whose worker is the unavailable placeholder is available for QUERIES

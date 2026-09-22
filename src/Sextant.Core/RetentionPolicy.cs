@@ -36,6 +36,15 @@ public sealed class RetentionPolicy
     public bool PruneSupersededSourceBlobs { get; set; } = true;
 
     /// <summary>
+    /// Per-repository quota on retained COMPLETE snapshots (Phase 17 slice 2). A positive value caps how
+    /// many complete snapshots a single repository may keep; the retention/GC pass reclaims the oldest
+    /// snapshots ABOVE the cap, but ONLY ones that are also unprotected (never a branch head, open-PR
+    /// snapshot, submodule pin, or active-overlay base). <c>0</c> (the default) means unbounded — the cap
+    /// is purely additive to the generation keep-window, so an unset quota changes nothing.
+    /// </summary>
+    public int MaxSnapshotsPerRepository { get; set; }
+
+    /// <summary>
     /// Defends against a misconfigured negative keep-count. A negative value is treated as "unset"
     /// and falls back to the safe default rather than collapsing to <c>0</c> — which is itself a
     /// valid, deliberately-aggressive "keep only the servable generation" policy — so a stray
@@ -47,6 +56,7 @@ public sealed class RetentionPolicy
             KeepCompleteGenerations < 0 ? DefaultKeepCompleteGenerations : KeepCompleteGenerations,
         ApiSnapshotKeepCommits =
             ApiSnapshotKeepCommits < 0 ? DefaultApiSnapshotKeepCommits : ApiSnapshotKeepCommits,
-        PruneSupersededSourceBlobs = PruneSupersededSourceBlobs
+        PruneSupersededSourceBlobs = PruneSupersededSourceBlobs,
+        MaxSnapshotsPerRepository = MaxSnapshotsPerRepository < 0 ? 0 : MaxSnapshotsPerRepository
     };
 }

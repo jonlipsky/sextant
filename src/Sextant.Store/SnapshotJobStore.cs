@@ -243,6 +243,32 @@ public sealed class SnapshotJobStore(SqliteConnection connection)
         return cmd.ExecuteNonQuery();
     }
 
+    /// <summary>
+    /// Reconciles jobs a previous worker left in a PHANTOM terminal state (Phase 17 criterion 3): a job
+    /// recorded <c>complete</c>/<c>partial</c> whose <c>snapshot_id</c> is now NULL (the published snapshot
+    /// was reclaimed by retention via <c>ON DELETE SET NULL</c>, or a crash recorded the terminal status
+    /// before the publish transaction committed and the pending snapshot was later abandoned) is reset to
+    /// <c>queued</c> so a later ensure regenerates it, instead of reporting a phantom-complete forever. A
+    /// terminal job that still points at a live snapshot is untouched (its usability is verified at
+    /// ensure time). Returns the number of jobs reconciled.
+    /// </summary>
+    public int ReconcilePhantomTerminalJobs()
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            UPDATE snapshot_jobs
+               SET status = @queued, owner_token = NULL, last_error = NULL,
+                   started_at = NULL, completed_at = NULL, updated_at = @now
+             WHERE status IN (@complete, @partial) AND snapshot_id IS NULL;
+            """;
+        cmd.Parameters.AddWithValue("@queued", SnapshotJobStatus.Queued);
+        cmd.Parameters.AddWithValue("@complete", SnapshotJobStatus.Complete);
+        cmd.Parameters.AddWithValue("@partial", SnapshotJobStatus.Partial);
+        cmd.Parameters.AddWithValue("@now", now);
+        return cmd.ExecuteNonQuery();
+    }
+
     /// <summary>Clears any prior diagnostics for a job, then records the supplied set (idempotent per attempt).</summary>
     public void ReplaceDiagnostics(long jobId, IEnumerable<SnapshotJobDiagnostic> diagnostics)
     {

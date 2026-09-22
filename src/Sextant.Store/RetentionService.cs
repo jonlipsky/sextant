@@ -71,7 +71,7 @@ public sealed class RetentionService
 
     /// <summary>The providers active today. Phase 9/10/12 append branch/PR/overlay/pin providers here.</summary>
     public static IReadOnlyList<IRetentionProtectionProvider> DefaultProviders { get; } =
-        [new LastCompleteRunProtection(), new BranchPointerProtection(), new OverlayBaseProtection(), new SubmoduleProviderProtection()];
+        [new LastCompleteRunProtection(), new BranchPointerProtection(), new OverlayBaseProtection(), new SubmoduleProviderProtection(), new PullRequestSnapshotProtection()];
 
     /// <summary>Reports what retention would do without modifying the database.</summary>
     public RetentionReport Plan() => Run(execute: false);
@@ -266,26 +266,17 @@ public sealed class RetentionService
     /// </summary>
     private List<long> OrphanedSnapshotIds(List<long> deletableRunIds)
     {
-        var snapshots = new SnapshotStore(_connection).GetSnapshotsForRetention();
+        var snapshotStore = new SnapshotStore(_connection);
+        var snapshots = snapshotStore.GetSnapshotsForRetention();
         if (snapshots.Count == 0) return [];
 
-        var snapshotStore = new SnapshotStore(_connection);
         var deletableRuns = deletableRunIds.ToHashSet();
-        var branchPointed = snapshotStore.GetBranchPointedSnapshotIds().ToHashSet();
+        var rootPinned = snapshotStore.GetBranchPointedSnapshotIds()
+            .Concat(snapshotStore.GetOpenPullRequestSnapshotIds())
+            .ToHashSet();
         var edges = snapshotStore.GetSnapshotDependencyEdges();
 
-        // Seed the retained set with every snapshot on a generation this pass is NOT deleting (servable,
-        // within the keep window, or in-progress), plus pending snapshots and any branch-pointed head.
-        var retained = new HashSet<long>();
-        foreach (var s in snapshots)
-        {
-            var onRetainedGeneration = s.runId is long rid && !deletableRuns.Contains(rid);
-            if (s.status == SnapshotStatus.Pending || onRetainedGeneration || branchPointed.Contains(s.id))
-                retained.Add(s.id);
-        }
-
-        // Transitively expand: a retained overlay pins its base; a retained consumer pins every provider
-        // it references (issue #54). Iterate to a fixpoint so provider/base chains are fully covered.
+        // Dependency maps shared by the retained-closure expansion and the quota safety check.
         var baseOf = new Dictionary<long, long>();
         foreach (var s in snapshots)
             if (s.baseSnapshotId is long b)
@@ -295,16 +286,46 @@ public sealed class RetentionService
         foreach (var (consumer, provider) in edges)
             (providersOf.TryGetValue(consumer, out var list) ? list : providersOf[consumer] = []).Add(provider);
 
-        var frontier = new Queue<long>(retained);
-        while (frontier.Count > 0)
+        // Expands a seed set across base + provider edges to a fixpoint (a retained snapshot pins the
+        // base it overlays and every provider it consumes — issues #44/#54).
+        HashSet<long> ExpandClosure(IEnumerable<long> seed)
         {
-            var id = frontier.Dequeue();
-            if (baseOf.TryGetValue(id, out var baseId) && retained.Add(baseId))
-                frontier.Enqueue(baseId);
-            if (providersOf.TryGetValue(id, out var provs))
-                foreach (var p in provs)
-                    if (retained.Add(p))
-                        frontier.Enqueue(p);
+            var set = new HashSet<long>(seed);
+            var frontier = new Queue<long>(set);
+            while (frontier.Count > 0)
+            {
+                var id = frontier.Dequeue();
+                if (baseOf.TryGetValue(id, out var baseId) && set.Add(baseId))
+                    frontier.Enqueue(baseId);
+                if (providersOf.TryGetValue(id, out var provs))
+                    foreach (var p in provs)
+                        if (set.Add(p))
+                            frontier.Enqueue(p);
+            }
+            return set;
+        }
+
+        // HARD protected closure (criterion 4): pending snapshots (a live writer may own them) plus every
+        // snapshot pinned by a branch pointer or an open pull request, transitively expanded across the
+        // base/provider chains. Quota eviction may NEVER cross this set.
+        var pending = snapshots.Where(s => s.status == SnapshotStatus.Pending).Select(s => s.id);
+        var hardProtected = ExpandClosure(pending.Concat(rootPinned));
+
+        // Seed the retained set with everything the generation keep-window keeps (a snapshot on a
+        // generation this pass is NOT deleting), plus the hard-protected set, then expand to a fixpoint.
+        var windowSeed = new HashSet<long>(hardProtected);
+        foreach (var s in snapshots)
+            if (s.runId is long rid && !deletableRuns.Contains(rid))
+                windowSeed.Add(s.id);
+        var retained = ExpandClosure(windowSeed);
+
+        // Per-repository quota (Phase 17): cap retained COMPLETE snapshots per repository, evicting oldest
+        // first — but only snapshots that are neither hard-protected nor depended on by a still-retained
+        // snapshot, so quota GC is provably protected-set-aware and never deletes shared base/provider data.
+        if (_policy.MaxSnapshotsPerRepository > 0)
+        {
+            var evictions = ComputeQuotaEvictions(snapshots, retained, hardProtected, baseOf, providersOf);
+            retained.ExceptWith(evictions);
         }
 
         var orphaned = new List<long>();
@@ -312,6 +333,56 @@ public sealed class RetentionService
             if (s.status != SnapshotStatus.Pending && !retained.Contains(s.id))
                 orphaned.Add(s.id);
         return orphaned;
+    }
+
+    /// <summary>
+    /// Selects the oldest-over-cap complete snapshots per repository that are safe to evict for the quota:
+    /// never a hard-protected (branch/open-PR/overlay/provider) snapshot, and never one a still-retained
+    /// snapshot depends on (its base or a provider it consumes). The dependency guard runs to a fixpoint so
+    /// evicting a snapshot can never strand a kept snapshot's shared rows.
+    /// </summary>
+    private List<long> ComputeQuotaEvictions(
+        IReadOnlyList<(long id, long repositoryId, long? runId, string status, long? baseSnapshotId, bool isProvider, long createdAt)> snapshots,
+        HashSet<long> retained,
+        HashSet<long> hardProtected,
+        Dictionary<long, long> baseOf,
+        Dictionary<long, List<long>> providersOf)
+    {
+        var cap = _policy.MaxSnapshotsPerRepository;
+        var evict = new HashSet<long>();
+
+        foreach (var repoGroup in snapshots
+                     .Where(s => s.status == SnapshotStatus.Complete && retained.Contains(s.id) && !hardProtected.Contains(s.id))
+                     .GroupBy(s => s.repositoryId))
+        {
+            // Newest first (created_at desc, id desc as a stable tiebreak); keep the cap newest, evict the rest.
+            var ranked = repoGroup.OrderByDescending(s => s.createdAt).ThenByDescending(s => s.id).ToList();
+            for (var i = cap; i < ranked.Count; i++)
+                evict.Add(ranked[i].id);
+        }
+
+        if (evict.Count == 0) return [];
+
+        // Safety fixpoint: never evict a snapshot that a KEPT (retained-and-not-evicted) snapshot still
+        // depends on. Un-evict any base/provider referenced by a kept snapshot until stable.
+        bool changed;
+        do
+        {
+            changed = false;
+            foreach (var kept in retained)
+            {
+                if (evict.Contains(kept)) continue;
+                if (baseOf.TryGetValue(kept, out var baseId) && evict.Remove(baseId))
+                    changed = true;
+                if (providersOf.TryGetValue(kept, out var provs))
+                    foreach (var p in provs)
+                        if (evict.Remove(p))
+                            changed = true;
+            }
+        }
+        while (changed);
+
+        return evict.ToList();
     }
 
     /// <summary>

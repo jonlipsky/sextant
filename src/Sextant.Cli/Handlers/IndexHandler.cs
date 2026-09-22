@@ -46,6 +46,8 @@ internal static class IndexHandler
             // risking a corrupt publish (criterion 3). Held only for this run; released when it disposes.
             using var lease = Store.WriterLease.AcquireOrThrow(
                 indexDb.DbPath, $"sextant-index@{Environment.MachineName}#{Environment.ProcessId}");
+            // Abort the index between batches if the lease is ever stolen (issue #38 / criterion 3).
+            indexDb.SetWriterLostProbe(() => lease.IsLost);
             indexDb.Recover();
 
             var stopwatch = Stopwatch.StartNew();

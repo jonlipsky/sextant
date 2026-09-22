@@ -208,6 +208,27 @@ public class SnapshotStoreTests
         Assert.AreEqual(SnapshotStatus.Partial, retry.status, "the retry observes the partial status before resetting it to pending");
     }
 
+    [TestMethod]
+    public void C3_MarkComplete_OnAPartialSnapshot_IsAGuardedNoOp_AndNeverFlipsItComplete()
+    {
+        // Regression for the finalize publish branch: MarkComplete is guarded on status = pending, so a
+        // snapshot already marked PARTIAL by the topology/completeness gate can NEVER be flipped to
+        // complete. A finalize whose MarkComplete returns 0 against a partial snapshot must therefore report
+        // the true (partial) status, never Complete — a materially-incomplete assembly is never silently
+        // published Complete (criterion 3).
+        var repoId = EnsureRepo("https://github.com/org/repo");
+        var store = new SnapshotStore(_conn);
+        var commitId = store.EnsureCommit(repoId, "commit_cccc", "tree_cccc", now: 1);
+        var identity = Identity("https://github.com/org/repo", "commit_cccc", "tree_cccc");
+        var (snapId, _, _) = store.BeginPending(identity, repoId, commitId, runId: null, now: 1);
+
+        Assert.AreEqual(1, store.MarkPartial(snapId, publishedAt: 2), "the gate marks the pending snapshot partial");
+        Assert.AreEqual(0, store.MarkComplete(snapId, publishedAt: 3),
+            "MarkComplete is a guarded no-op on a partial snapshot — it never flips partial -> complete");
+        Assert.AreEqual(SnapshotStatus.Partial, store.GetById(snapId)!.Status,
+            "the snapshot stays partial; a later finalize must report its true status, never Complete (criterion 3)");
+    }
+
     // ==== Criterion 4: incompatibility prevents unsafe reuse ====================================
 
     [TestMethod]

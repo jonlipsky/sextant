@@ -85,6 +85,33 @@ public sealed class ServicePaths
         return Convert.ToHexString(digest, 0, 6).ToLowerInvariant();
     }
 
+    /// <summary>
+    /// Deletes every leftover per-job scratch directory under the scratch root (Phase 17 criterion 3).
+    /// A worker/service crash mid-job leaves its scratch behind (the <c>finally</c> that releases it never
+    /// ran); on the next startup this sweeps them so a crashed run leaks no staged artifacts. Confined to
+    /// the scratch root exactly like <see cref="ReleaseScratch"/> — it never touches a persistent volume —
+    /// and best-effort per entry so one undeletable directory cannot block the rest. Returns the count swept.
+    /// </summary>
+    public int SweepOrphanedScratch()
+    {
+        if (!Directory.Exists(_scratchRoot)) return 0;
+
+        var swept = 0;
+        foreach (var dir in Directory.EnumerateDirectories(_scratchRoot))
+        {
+            try
+            {
+                ReleaseScratch(dir);
+                swept++;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Best-effort: a directory still locked by a dying process is retried on the next sweep.
+            }
+        }
+        return swept;
+    }
+
     /// <summary>Allocates a fresh, empty per-job scratch directory under the scratch root.</summary>
     public string AllocateScratch(string jobLabel)
     {

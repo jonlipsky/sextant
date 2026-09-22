@@ -2,6 +2,16 @@ using Microsoft.Data.Sqlite;
 
 namespace Sextant.Store;
 
+/// <summary>
+/// Thrown when an in-flight index/retention write is aborted because this process LOST the single-writer
+/// lease (issue #38): it expired and another writer legitimately stole it. A batched write session checks
+/// the lease at every batch boundary (<see cref="IndexWriteSession.CommitBatch"/>/<c>Complete</c>) so a
+/// writer that lost exclusivity stops BETWEEN batches — rolling back the open batch and never flipping a
+/// generation/snapshot pointer — instead of racing the new owner and risking a corrupt publish (Phase 17
+/// criterion 3). Already-committed staging batches are left for recovery to sweep; nothing is published.
+/// </summary>
+public sealed class WriterLeaseLostException(string message) : Exception(message);
+
 /// <summary>A read-only view of the current writer-lease holder (for status/reporting).</summary>
 public sealed record WriterLeaseInfo
 {

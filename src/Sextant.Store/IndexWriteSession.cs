@@ -23,16 +23,22 @@ public sealed class IndexWriteSession : IDisposable
     private readonly SqliteConnection _connection;
     private readonly IndexWriteOptions _options;
     private readonly Action? _onConnectionPoisoned;
+    private readonly Func<bool>? _isWriterLost;
     private bool _open;
     private int _pendingRows;
     private bool _disposed;
     private bool _poisoned;
 
-    public IndexWriteSession(SqliteConnection connection, IndexWriteOptions? options = null, Action? onConnectionPoisoned = null)
+    public IndexWriteSession(
+        SqliteConnection connection,
+        IndexWriteOptions? options = null,
+        Action? onConnectionPoisoned = null,
+        Func<bool>? isWriterLost = null)
     {
         _connection = connection;
         _options = options ?? IndexWriteOptions.Default;
         _onConnectionPoisoned = onConnectionPoisoned;
+        _isWriterLost = isWriterLost;
     }
 
     /// <summary>True while a transaction is currently open.</summary>
@@ -70,6 +76,7 @@ public sealed class IndexWriteSession : IDisposable
     public void CommitBatch()
     {
         if (!_open) return;
+        AbortIfWriterLost();
         ExecuteWithRetry("COMMIT;");
         _open = false;
         _pendingRows = 0;
@@ -81,10 +88,26 @@ public sealed class IndexWriteSession : IDisposable
     public void Complete()
     {
         if (!_open) return;
+        AbortIfWriterLost();
         ExecuteWithRetry("COMMIT;");
         _open = false;
         _pendingRows = 0;
         CommittedBatches++;
+    }
+
+    // Fail closed BETWEEN batches when this process lost the single-writer lease (issue #38): roll the
+    // open, uncommitted batch back and throw so the caller aborts. Already-committed staging batches are
+    // left for recovery; crucially the generation/snapshot pointer flip (which the orchestrator runs
+    // inside the final batch, right before Complete) never commits, so no corrupt publish can occur
+    // (Phase 17 criterion 3). Checked before COMMIT so a lost lease can never publish a batch.
+    private void AbortIfWriterLost()
+    {
+        if (_isWriterLost?.Invoke() != true) return;
+        Rollback();
+        throw new WriterLeaseLostException(
+            "Aborting the in-flight index write: this process lost the single-writer lease (it expired and " +
+            "was stolen by another writer). The open batch was rolled back and no generation was published " +
+            "(issue #38 / Phase 17 criterion 3).");
     }
 
     /// <summary>Rolls back any open, uncommitted batch. Already-committed batches are unaffected.</summary>

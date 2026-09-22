@@ -71,6 +71,14 @@ public sealed record SnapshotRow
 }
 
 /// <summary>
+/// Thrown when a producer/contribution supplies a logical-project tuple (repo-relative path + target
+/// framework) that DIVERGES from the metadata already stored for the same <c>canonical_id</c> (issue #69).
+/// A contribution must never silently mutate another producer's shared logical-project row, so the write
+/// is rejected rather than overwriting shared state.
+/// </summary>
+public sealed class LogicalProjectConflictException(string message) : Exception(message);
+
+/// <summary>
 /// Reads and writes the Phase-9 immutable-snapshot tables (<c>repositories</c>, <c>commits</c>,
 /// <c>logical_projects</c>, <c>snapshots</c>, <c>branches</c>, <c>snapshot_projects</c>). The store is
 /// a thin adapter over parameterized SQL; it runs on the caller's connection so its publish statements
@@ -134,27 +142,52 @@ public sealed class SnapshotStore(SqliteConnection connection)
     }
 
     /// <summary>
-    /// Get-or-create the commit-invariant logical project identity. <paramref name="canonicalId"/> is the
-    /// existing logical hash (git-remote|repo-relative-path|tfm); it is the identity surfaced to clients
-    /// and correlated across snapshots — never the per-snapshot-suffixed storage value on the row.
+    /// Get-or-verify the commit-invariant logical project identity WITHOUT perturbing shared state (issue
+    /// #69). <paramref name="canonicalId"/> is the existing logical hash (git-remote|repo-relative-path|tfm);
+    /// it is the identity surfaced to clients and correlated across snapshots — never the
+    /// per-snapshot-suffixed storage value on the row. The row is inserted when absent; on conflict the
+    /// EXISTING metadata is kept, never overwritten — a contribution or a second producer must not silently
+    /// mutate another producer's logical-project tuple. If the supplied <paramref name="repoRelativePath"/>/
+    /// <paramref name="targetFramework"/> DIVERGE from the stored tuple, this throws
+    /// <see cref="LogicalProjectConflictException"/> rather than corrupting shared metadata. (canonical_id
+    /// deterministically derives from the path/tfm, so an honest producer never diverges.)
     /// </summary>
     public long EnsureLogicalProject(long repositoryId, string canonicalId, string repoRelativePath, string? targetFramework, long now)
     {
-        using var cmd = connection.CreateCommand();
-        cmd.CommandText = """
-            INSERT INTO logical_projects (repository_id, canonical_id, repo_relative_path, target_framework, created_at)
-            VALUES (@repo, @canon, @rel, @tfm, @now)
-            ON CONFLICT(repository_id, canonical_id) DO UPDATE SET
-                repo_relative_path = excluded.repo_relative_path,
-                target_framework = excluded.target_framework
-            RETURNING id;
+        using (var insert = connection.CreateCommand())
+        {
+            insert.CommandText = """
+                INSERT INTO logical_projects (repository_id, canonical_id, repo_relative_path, target_framework, created_at)
+                VALUES (@repo, @canon, @rel, @tfm, @now)
+                ON CONFLICT(repository_id, canonical_id) DO NOTHING;
+                """;
+            insert.Parameters.AddWithValue("@repo", repositoryId);
+            insert.Parameters.AddWithValue("@canon", canonicalId);
+            insert.Parameters.AddWithValue("@rel", repoRelativePath);
+            insert.Parameters.AddWithValue("@tfm", (object?)targetFramework ?? DBNull.Value);
+            insert.Parameters.AddWithValue("@now", now);
+            insert.ExecuteNonQuery();
+        }
+
+        using var read = connection.CreateCommand();
+        read.CommandText = """
+            SELECT id, repo_relative_path, target_framework
+            FROM logical_projects WHERE repository_id = @repo AND canonical_id = @canon;
             """;
-        cmd.Parameters.AddWithValue("@repo", repositoryId);
-        cmd.Parameters.AddWithValue("@canon", canonicalId);
-        cmd.Parameters.AddWithValue("@rel", repoRelativePath);
-        cmd.Parameters.AddWithValue("@tfm", (object?)targetFramework ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@now", now);
-        return (long)cmd.ExecuteScalar()!;
+        read.Parameters.AddWithValue("@repo", repositoryId);
+        read.Parameters.AddWithValue("@canon", canonicalId);
+        using var reader = read.ExecuteReader();
+        if (!reader.Read())
+            throw new InvalidOperationException($"logical_projects row for canonical_id '{canonicalId}' vanished after upsert.");
+
+        var id = reader.GetInt64(0);
+        var storedPath = reader.IsDBNull(1) ? null : reader.GetString(1);
+        var storedTfm = reader.IsDBNull(2) ? null : reader.GetString(2);
+        if (storedPath != repoRelativePath || storedTfm != targetFramework)
+            throw new LogicalProjectConflictException(
+                $"contribution project tuple diverges from the shared logical project '{canonicalId}': " +
+                $"stored ({storedPath}, {storedTfm ?? "<null>"}) vs supplied ({repoRelativePath}, {targetFramework ?? "<null>"}).");
+        return id;
     }
 
     public long EnsureBranch(long repositoryId, string name, bool isDefault, long now)
@@ -255,6 +288,27 @@ public sealed class SnapshotStore(SqliteConnection connection)
         return cmd.ExecuteNonQuery();
     }
 
+    /// <summary>
+    /// Guarded pending→partial transition for the finalize completeness gate (issue #70). Like
+    /// <see cref="MarkComplete"/> it advances ONLY a still-pending snapshot, so it can never downgrade an
+    /// already-published (immutable) complete snapshot. A partial snapshot is diagnosable but is NEVER
+    /// selected by a branch pointer, so a materially-incomplete assembly is retained for inspection yet
+    /// never served as if it were complete. Returns the number of rows updated (1 = transitioned).
+    /// </summary>
+    public int MarkPartial(long snapshotId, long publishedAt)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            UPDATE snapshots SET status = @partial, published_at = @at
+             WHERE id = @id AND status = @pending;
+            """;
+        cmd.Parameters.AddWithValue("@partial", SnapshotStatus.Partial);
+        cmd.Parameters.AddWithValue("@at", publishedAt);
+        cmd.Parameters.AddWithValue("@id", snapshotId);
+        cmd.Parameters.AddWithValue("@pending", SnapshotStatus.Pending);
+        return cmd.ExecuteNonQuery();
+    }
+
     /// <summary>Sets a snapshot's status (e.g. to partial/failed/unsupported/superseded for diagnosis).</summary>
     public void MarkStatus(long snapshotId, string status)
     {
@@ -284,6 +338,30 @@ public sealed class SnapshotStore(SqliteConnection connection)
     }
 
     /// <summary>
+    /// Resolves a repository + git head commit SHA to the id of a COMPLETE snapshot indexed at that commit,
+    /// or null when no such snapshot exists yet. Used by the Phase-17 open-PR retention root (criterion 4)
+    /// to bind a PR head to the snapshot it must protect when the caller supplies only the head commit. When
+    /// several complete snapshots share the commit (multiple generations) the most recent is returned, so
+    /// the protected root is the freshest complete index for that PR head.
+    /// </summary>
+    public long? ResolveCompleteSnapshotByCommit(long repositoryId, string commitSha)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT s.id
+            FROM snapshots s
+            JOIN commits c ON c.id = s.commit_id
+            WHERE s.repository_id = @repo AND c.commit_sha = @sha AND s.status = 'complete'
+            ORDER BY s.created_at DESC, s.id DESC
+            LIMIT 1;
+            """;
+        cmd.Parameters.AddWithValue("@repo", repositoryId);
+        cmd.Parameters.AddWithValue("@sha", commitSha);
+        var result = cmd.ExecuteScalar();
+        return result is null or DBNull ? null : Convert.ToInt64(result);
+    }
+
+    /// <summary>
     /// The git commit SHA for a <c>commits.id</c> (a snapshot's <see cref="SnapshotRow.CommitId"/>), or
     /// null when the id is null or unknown. Used by the Phase-11 federated read planner to stamp the base
     /// commit into a response's provenance metadata (criterion 4) without exposing internal row ids.
@@ -298,6 +376,39 @@ public sealed class SnapshotStore(SqliteConnection connection)
     }
 
     // ---- branch pointers -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Ensures the requesting branch has its OWN pointer to a snapshot it resolves to on ATTACH, without
+    /// perturbing shared state (issue #62). Because snapshot identity excludes the branch name, two
+    /// branches at the same commit share ONE snapshot; the first indexes and points at it, but a second
+    /// branch that merely ATTACHES (no re-index) would otherwise have no pointer — so it neither resolves
+    /// via <c>ResolveBranch</c> nor protects the snapshot from retention. This inserts the branch as
+    /// NON-default when absent (<c>ON CONFLICT DO NOTHING</c> preserves any existing <c>is_default</c> and
+    /// never demotes the real default) and points it at the snapshot only when it has no pointer yet — it
+    /// never supersedes an EXISTING pointer, so a late/duplicate attach for an older snapshot can never roll
+    /// a branch (e.g. the default) back off a newer target it already advanced to (branch advancement is the
+    /// exclusive job of the publish path, <c>AdvanceBranch</c>). Returns the branch id.
+    /// </summary>
+    public long AttachBranchPointer(long repositoryId, string branchName, long snapshotId, long now)
+    {
+        using (var insert = connection.CreateCommand())
+        {
+            insert.CommandText = """
+                INSERT INTO branches (repository_id, name, snapshot_id, is_default, updated_at)
+                VALUES (@repo, @name, NULL, 0, @now)
+                ON CONFLICT(repository_id, name) DO NOTHING;
+                """;
+            insert.Parameters.AddWithValue("@repo", repositoryId);
+            insert.Parameters.AddWithValue("@name", branchName);
+            insert.Parameters.AddWithValue("@now", now);
+            insert.ExecuteNonQuery();
+        }
+
+        var branchId = GetBranchId(repositoryId, branchName)!.Value;
+        if (GetBranchSnapshotId(branchId) is null)
+            SetBranchPointer(branchId, snapshotId, now);
+        return branchId;
+    }
 
     /// <summary>
     /// Points a branch at a snapshot (advance or rollback). Mutating only this pointer row leaves every
@@ -331,9 +442,48 @@ public sealed class SnapshotStore(SqliteConnection connection)
         cmd.ExecuteNonQuery();
     }
 
-    public long? GetDefaultBranchId(long repositoryId)
+    /// <summary>
+    /// The set of logical project canonical ids present in an assembled/native snapshot (issue #70 finalize
+    /// gate). COALESCEs the logical-project canonical id with the physical project canonical id — the same
+    /// identity the importer/validator map under — so it can be compared to a manifest's declared graph.
+    /// </summary>
+    public HashSet<string> GetSnapshotLogicalCanonicalIds(long snapshotId)
     {
         using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT DISTINCT COALESCE(lp.canonical_id, p.canonical_id)
+            FROM snapshot_projects sp
+            JOIN projects p ON p.id = sp.project_id
+            LEFT JOIN logical_projects lp ON lp.id = p.logical_project_id
+            WHERE sp.snapshot_id = @s;
+            """;
+        cmd.Parameters.AddWithValue("@s", snapshotId);
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            if (!reader.IsDBNull(0)) ids.Add(reader.GetString(0));
+        return ids;
+    }
+
+    /// <summary>
+    /// Every logical project canonical id the catalog has ever recorded for a repository (issue #70). Used
+    /// by the finalize gate to classify a referenced project-version key as intra-repo (must be assembled)
+    /// vs a cross-repo provider reference (resolved via snapshot_dependencies; #72 deferred).
+    /// </summary>
+    public HashSet<string> GetKnownLogicalCanonicalIds(long repositoryId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT DISTINCT canonical_id FROM logical_projects WHERE repository_id = @repo;";
+        cmd.Parameters.AddWithValue("@repo", repositoryId);
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            if (!reader.IsDBNull(0)) ids.Add(reader.GetString(0));
+        return ids;
+    }
+
+    public long? GetDefaultBranchId(long repositoryId)
+    {        using var cmd = connection.CreateCommand();
         cmd.CommandText = "SELECT id FROM branches WHERE repository_id = @repo AND is_default = 1 ORDER BY id LIMIT 1;";
         cmd.Parameters.AddWithValue("@repo", repositoryId);
         return cmd.ExecuteScalar() is long id ? id : null;
@@ -556,6 +706,61 @@ public sealed class SnapshotStore(SqliteConnection connection)
         return rows;
     }
 
+    /// <summary>
+    /// The (run id, commit SHA) targets an open-pull-request retention protection must spare (Phase 17,
+    /// criterion 4): for every snapshot an OPEN pull request root points at, its generation
+    /// (<c>run_id</c>) and the git commit whose API history belongs to it. This keeps a PR-head snapshot
+    /// alive for as long as the PR is open even when its generation has fallen out of the keep window and
+    /// its head commit is not itself a branch pointer. Contributes nothing when the migration-019
+    /// <c>pull_request_snapshots</c> table is absent (pre-migration DB).
+    /// </summary>
+    public IReadOnlyList<(long? runId, string? commitSha)> GetOpenPullRequestProtectionTargets()
+    {
+        if (!TableExists("pull_request_snapshots")) return [];
+
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT DISTINCT s.run_id, c.commit_sha
+            FROM pull_request_snapshots pr
+            JOIN snapshots s ON s.id = pr.snapshot_id
+            LEFT JOIN commits c ON c.id = s.commit_id
+            WHERE pr.state = 'open' AND pr.snapshot_id IS NOT NULL;
+            """;
+        var rows = new List<(long?, string?)>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            rows.Add((
+                reader.IsDBNull(0) ? null : reader.GetInt64(0),
+                reader.IsDBNull(1) ? null : reader.GetString(1)));
+        return rows;
+    }
+
+    /// <summary>
+    /// The snapshot ids currently pinned by an OPEN pull request (never data-GC eligible). Feeds the
+    /// retained-snapshot closure in retention/quota GC alongside branch-pointed heads. Empty when the
+    /// migration-019 <c>pull_request_snapshots</c> table is absent.
+    /// </summary>
+    public IReadOnlyList<long> GetOpenPullRequestSnapshotIds()
+    {
+        if (!TableExists("pull_request_snapshots")) return [];
+
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText =
+            "SELECT DISTINCT snapshot_id FROM pull_request_snapshots WHERE state = 'open' AND snapshot_id IS NOT NULL;";
+        var ids = new List<long>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read()) ids.Add(reader.GetInt64(0));
+        return ids;
+    }
+
+    private bool TableExists(string table)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = @name LIMIT 1;";
+        cmd.Parameters.AddWithValue("@name", table);
+        return cmd.ExecuteScalar() is not null;
+    }
+
     // ---- helpers -------------------------------------------------------------------------------
 
     /// <summary>
@@ -588,25 +793,28 @@ public sealed class SnapshotStore(SqliteConnection connection)
     }
 
     /// <summary>
-    /// Every snapshot row a retention pass needs to classify data ownership: its id, owning generation
-    /// (<c>run_id</c>), status, base snapshot (overlay sharing), and provider flag. Used to compute the
-    /// retained-snapshot closure so orphaned snapshot DATA can be GC'd (issue #46) while providers shared
-    /// by any retained consumer are spared (issue #54).
+    /// Every snapshot row a retention pass needs to classify data ownership: its id, owning repository,
+    /// owning generation (<c>run_id</c>), status, base snapshot (overlay sharing), provider flag, and
+    /// creation timestamp (recency for the per-repository quota). Used to compute the retained-snapshot
+    /// closure so orphaned snapshot DATA can be GC'd (issue #46) while providers shared by any retained
+    /// consumer are spared (issue #54) and the per-repository quota evicts oldest-first (Phase 17).
     /// </summary>
-    public IReadOnlyList<(long id, long? runId, string status, long? baseSnapshotId, bool isProvider)> GetSnapshotsForRetention()
+    public IReadOnlyList<(long id, long repositoryId, long? runId, string status, long? baseSnapshotId, bool isProvider, long createdAt)> GetSnapshotsForRetention()
     {
         using var cmd = connection.CreateCommand();
         cmd.CommandText =
-            "SELECT id, run_id, status, base_snapshot_id, is_provider FROM snapshots;";
-        var rows = new List<(long, long?, string, long?, bool)>();
+            "SELECT id, repository_id, run_id, status, base_snapshot_id, is_provider, created_at FROM snapshots;";
+        var rows = new List<(long, long, long?, string, long?, bool, long)>();
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
             rows.Add((
                 reader.GetInt64(0),
-                reader.IsDBNull(1) ? null : reader.GetInt64(1),
-                reader.GetString(2),
-                reader.IsDBNull(3) ? null : reader.GetInt64(3),
-                !reader.IsDBNull(4) && reader.GetInt64(4) != 0));
+                reader.GetInt64(1),
+                reader.IsDBNull(2) ? null : reader.GetInt64(2),
+                reader.GetString(3),
+                reader.IsDBNull(4) ? null : reader.GetInt64(4),
+                !reader.IsDBNull(5) && reader.GetInt64(5) != 0,
+                reader.GetInt64(6)));
         return rows;
     }
 
