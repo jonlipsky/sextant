@@ -59,9 +59,10 @@ public static class FindSymbolTool
                 projectDbId = proj.Value.id;
             }
 
-            var symbol = symbolStore.GetByFqn(name, projectDbId);
-            if (symbol == null)
+            var resolution = SymbolResolver.Resolve(symbolStore, projectStore, name, projectDbId);
+            if (resolution.Symbol == null)
                 return ResponseBuilder.BuildEmpty("Symbol not found.");
+            var symbol = resolution.Symbol;
 
             if (!scopeFilter.IsEmpty)
             {
@@ -72,7 +73,7 @@ public static class FindSymbolTool
             }
 
             var mapped = new List<object> { MapSymbol(symbol, ResolveCanonicalId(symbol.ProjectId, canonicalIdCache), include_source) };
-            return ResponseBuilder.Build(mapped, symbol.LastIndexedAt);
+            return ResponseBuilder.Build(mapped, symbol.LastIndexedAt, resolution.Ambiguity);
         }
     }
 

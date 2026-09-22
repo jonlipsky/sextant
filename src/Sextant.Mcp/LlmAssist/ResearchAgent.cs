@@ -229,9 +229,12 @@ public sealed class ResearchAgent
             if (!seen.Add(lookupFqn))
                 continue;
 
-            var symbol = symbolStore.GetByFqn(lookupFqn);
-            if (symbol != null)
+            // FQN is no longer unique, so resolve to the deterministically-ordered candidate list and
+            // cite the stable first match rather than an arbitrary single row.
+            var candidates = symbolStore.ResolveByFqn(lookupFqn);
+            if (candidates.Count > 0)
             {
+                var symbol = candidates[0];
                 sources.Add(new SourceReference(
                     symbol.FullyQualifiedName,
                     symbol.FilePath,

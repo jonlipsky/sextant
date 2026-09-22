@@ -65,7 +65,7 @@ public class StressTests
                     _symbolStore.Insert(new SymbolInfo
                     {
                         ProjectId = projectId,
-                        FullyQualifiedName = $"global::Sol{sol}.Proj{proj}.Class{sym}",
+                        SymbolKey = $"global::Sol{sol}.Proj{proj}.Class{sym}", FullyQualifiedName = $"global::Sol{sol}.Proj{proj}.Class{sym}",
                         DisplayName = $"Class{sym}",
                         Kind = SymbolKind.Class,
                         Accessibility = Accessibility.Public,
@@ -173,7 +173,7 @@ public class StressTests
             var symbolId = _symbolStore.Insert(new SymbolInfo
             {
                 ProjectId = sharedCoreId,
-                FullyQualifiedName = $"global::SharedCore.Service{i}",
+                SymbolKey = $"global::SharedCore.Service{i}", FullyQualifiedName = $"global::SharedCore.Service{i}",
                 DisplayName = $"Service{i}",
                 Kind = SymbolKind.Class,
                 Accessibility = Accessibility.Public,
@@ -252,7 +252,7 @@ public class StressTests
             var id = _symbolStore.Insert(new SymbolInfo
             {
                 ProjectId = projectId,
-                FullyQualifiedName = $"global::App.Handler.Method{i}()",
+                SymbolKey = $"global::App.Handler.Method{i}()", FullyQualifiedName = $"global::App.Handler.Method{i}()",
                 DisplayName = $"Method{i}",
                 Kind = SymbolKind.Method,
                 Accessibility = Accessibility.Public,
@@ -352,7 +352,7 @@ public class StressTests
             _symbolStore.Insert(new SymbolInfo
             {
                 ProjectId = projectId,
-                FullyQualifiedName = $"global::Concurrent.Class{i}",
+                SymbolKey = $"global::Concurrent.Class{i}", FullyQualifiedName = $"global::Concurrent.Class{i}",
                 DisplayName = $"Class{i}",
                 Kind = SymbolKind.Class,
                 Accessibility = Accessibility.Public,
@@ -379,7 +379,7 @@ public class StressTests
                 _symbolStore.Insert(new SymbolInfo
                 {
                     ProjectId = projectId,
-                    FullyQualifiedName = $"global::Concurrent.Class{i}",
+                    SymbolKey = $"global::Concurrent.Class{i}", FullyQualifiedName = $"global::Concurrent.Class{i}",
                     DisplayName = $"Class{i}",
                     Kind = SymbolKind.Class,
                     Accessibility = Accessibility.Public,

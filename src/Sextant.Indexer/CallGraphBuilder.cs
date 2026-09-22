@@ -6,11 +6,12 @@ namespace Sextant.Indexer;
 public static class CallGraphBuilder
 {
     /// <summary>
-    /// Represents a call graph edge with the callee identified by FQN (for later resolution to ID).
+    /// Represents a call graph edge with the callee identified by its stable declaration key
+    /// (for later resolution to a stored symbol id).
     /// </summary>
     public sealed class CallEdge
     {
-        public required string CalleeFqn { get; init; }
+        public required string CalleeKey { get; init; }
         public required string CallSiteFile { get; init; }
         public int CallSiteLine { get; init; }
         public InvocationExpressionSyntax? InvocationSyntax { get; init; }
@@ -24,8 +25,6 @@ public static class CallGraphBuilder
         var compilation = await project.GetCompilationAsync();
         if (compilation == null)
             return edges;
-
-        var fqnFormat = SymbolDisplayFormat.FullyQualifiedFormat;
 
         foreach (var syntaxRef in method.DeclaringSyntaxReferences)
         {
@@ -42,7 +41,7 @@ public static class CallGraphBuilder
 
                 edges.Add(new CallEdge
                 {
-                    CalleeFqn = callee.ToDisplayString(fqnFormat),
+                    CalleeKey = SemanticSymbolKeyFactory.DeclarationKey(callee),
                     CallSiteFile = syntaxRef.SyntaxTree.FilePath,
                     CallSiteLine = lineSpan.StartLinePosition.Line + 1,
                     InvocationSyntax = invocation,

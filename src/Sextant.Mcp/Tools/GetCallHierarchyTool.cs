@@ -23,13 +23,15 @@ public static class GetCallHierarchyTool
         var conn = db.GetConnection();
         var symbolStore = new SymbolStore(conn);
         var callGraphStore = new CallGraphStore(conn);
+        var projectStore = new ProjectStore(conn);
 
         var config = SextantConfiguration.FromEnvironment();
         depth = Math.Min(depth, config.MaxCallHierarchyDepth);
 
-        var rootSymbol = symbolStore.GetByFqn(symbol_fqn);
-        if (rootSymbol == null)
+        var resolution = SymbolResolver.Resolve(symbolStore, projectStore, symbol_fqn);
+        if (resolution.Symbol == null)
             return ResponseBuilder.BuildEmpty("Symbol not found.");
+        var rootSymbol = resolution.Symbol;
 
         var results = new List<object>();
         var visited = new HashSet<long>();
@@ -78,6 +80,6 @@ public static class GetCallHierarchyTool
         }
 
         var freshness = rootSymbol.LastIndexedAt;
-        return ResponseBuilder.Build(results, freshness);
+        return ResponseBuilder.Build(results, freshness, resolution.Ambiguity);
     }
 }

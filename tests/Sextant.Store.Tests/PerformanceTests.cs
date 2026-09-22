@@ -36,7 +36,7 @@ public class PerformanceTests
             _symbolStore.Insert(new SymbolInfo
             {
                 ProjectId = _projectId,
-                FullyQualifiedName = $"global::PerfTest.Namespace{i / 100}.Class{i}",
+                SymbolKey = $"global::PerfTest.Namespace{i / 100}.Class{i}", FullyQualifiedName = $"global::PerfTest.Namespace{i / 100}.Class{i}",
                 DisplayName = $"Class{i}",
                 Kind = i % 5 == 0 ? SymbolKind.Interface : SymbolKind.Class,
                 Accessibility = Accessibility.Public,

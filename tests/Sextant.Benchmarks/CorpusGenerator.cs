@@ -11,8 +11,11 @@ public static class CorpusGenerator
 {
     /// <summary>
     /// Writes the correctness corpus: a small multi-project solution that exercises duplicate
-    /// member names across types, overloaded methods, partial types split across files, a
-    /// project reference, and a multi-target project. Returns the solution (.slnx) path.
+    /// member names across types, overloaded methods, constructors, generic types and methods,
+    /// explicit interface implementations, partial types split across files, records with primary
+    /// constructors, anonymous-object property names, a project reference, a multi-target project,
+    /// and the same fully-qualified name declared in two separate assemblies. Returns the solution
+    /// (.slnx) path.
     /// </summary>
     public static string GenerateCorrectnessCorpus(string rootDir)
     {
@@ -64,6 +67,69 @@ public static class CorpusGenerator
                     public int Perimeter() => 2 * (Width + Height);
                 }
                 """,
+            ["Generics.cs"] = """
+                namespace Lib;
+
+                // Generic type and generic method: type parameters have no documentation ID and
+                // exercise the versioned source-declaration fallback key.
+                public class Box<T>
+                {
+                    public T? Value { get; set; }
+                    public TOut Map<TOut>(System.Func<T, TOut> f) => f(Value!);
+                }
+                """,
+            ["Interfaces.cs"] = """
+                namespace Lib;
+
+                public interface ILeft { void Run(); }
+                public interface IRight { void Run(); }
+
+                // Explicit interface implementations: same display name, distinct semantic keys.
+                public class Worker : ILeft, IRight
+                {
+                    void ILeft.Run() { }
+                    void IRight.Run() { }
+                }
+                """,
+            ["Records.cs"] = """
+                namespace Lib;
+
+                // Record with a primary constructor: positional parameters become properties.
+                public record Point(int X, int Y);
+                """,
+            ["Anonymous.cs"] = """
+                namespace Lib;
+
+                public class Describer
+                {
+                    // Anonymous-object property names ("type", "description") must NOT become
+                    // top-level query symbols.
+                    public object Describe() => new { type = "widget", description = "a thing" };
+                }
+                """,
+            ["Shared.cs"] = """
+                namespace Lib;
+
+                // Also declared in the Lib2 project under the same namespace + name, so the display
+                // FQN "global::Lib.Shared" exists in two separate assemblies (ambiguous by FQN).
+                public class Shared
+                {
+                    public int Compute() => 1;
+                }
+                """,
+        });
+
+        WriteProject(rootDir, "Lib2", ["net10.0"], projectRefs: [], new()
+        {
+            ["Shared.cs"] = """
+                namespace Lib;
+
+                // Same fully-qualified name as Lib.Shared, in a different assembly.
+                public class Shared
+                {
+                    public int Compute() => 2;
+                }
+                """,
         });
 
         WriteProject(rootDir, "MultiTarget", ["net10.0", "netstandard2.0"], projectRefs: [], new()
@@ -75,6 +141,7 @@ public static class CorpusGenerator
 
                 public class Formatter
                 {
+                    // Shared member: present under every target framework.
                     public string Join(string a, string b)
                     {
                         var sb = new StringBuilder();
@@ -83,6 +150,13 @@ public static class CorpusGenerator
                         sb.Append(b);
                         return sb.ToString();
                     }
+
+                #if NET10_0
+                    // Conditional member: compiled only for net10.0 and absent under netstandard2.0.
+                    // Proves that processing one evaluated target framework does not delete the other
+                    // framework's #if-gated symbols (each TFM is a distinct logical project).
+                    public string JoinModern(string a, string b) => string.Join('/', a, b);
+                #endif
                 }
                 """,
         });
@@ -113,7 +187,7 @@ public static class CorpusGenerator
                 """,
         });
 
-        return WriteSolution(rootDir, "Correctness", ["Lib", "MultiTarget", "App"]);
+        return WriteSolution(rootDir, "Correctness", ["Lib", "Lib2", "MultiTarget", "App"]);
     }
 
     /// <summary>

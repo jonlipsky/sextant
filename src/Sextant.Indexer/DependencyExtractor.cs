@@ -10,7 +10,7 @@ public static class DependencyExtractor
     /// </summary>
     public static List<ProjectDependency> ExtractDependencies(
         Solution solution,
-        IReadOnlyDictionary<string, long> projectPathToId,
+        IReadOnlyDictionary<ProjectId, long> projectRoslynToId,
         IReadOnlyList<SubmoduleInfo> submodules,
         string repoRoot)
     {
@@ -18,7 +18,7 @@ public static class DependencyExtractor
 
         foreach (var project in solution.Projects)
         {
-            if (project.FilePath == null || !projectPathToId.TryGetValue(project.FilePath, out var consumerId))
+            if (!projectRoslynToId.TryGetValue(project.Id, out var consumerId))
                 continue;
 
             // Process ProjectReference items
@@ -28,7 +28,7 @@ public static class DependencyExtractor
                 if (referencedProject?.FilePath == null)
                     continue;
 
-                if (!projectPathToId.TryGetValue(referencedProject.FilePath, out var dependencyId))
+                if (!projectRoslynToId.TryGetValue(projectRef.ProjectId, out var dependencyId))
                     continue;
 
                 var submodule = SubmoduleDiscovery.FindContainingSubmodule(

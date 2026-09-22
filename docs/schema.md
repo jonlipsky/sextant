@@ -39,7 +39,8 @@ Every named type and member extracted from the codebase.
 |---|---|---|
 | `id` | `INTEGER PRIMARY KEY` | Auto-increment |
 | `project_id` | `INTEGER NOT NULL` | FK to `projects.id` |
-| `fully_qualified_name` | `TEXT NOT NULL` | Roslyn `ISymbol.ToDisplayString(FullyQualifiedFormat)` |
+| `symbol_key` | `TEXT NOT NULL` | Stable semantic declaration key — a Roslyn documentation ID (`M:Ns.Type.M(System.Int32)`) when available, else a version-scoped `src:`/`meta:` fallback. This is the identity; the FQN is display/query data. |
+| `fully_qualified_name` | `TEXT NOT NULL` | Roslyn `ISymbol.ToDisplayString(FullyQualifiedFormat)`. Display/query data — **not unique** (overloads share it). |
 | `display_name` | `TEXT NOT NULL` | Short name for display and FTS |
 | `kind` | `TEXT NOT NULL` | One of: `class`, `interface`, `struct`, `enum`, `delegate`, `record`, `method`, `constructor`, `property`, `field`, `event`, `indexer`, `type_parameter` |
 | `accessibility` | `TEXT NOT NULL` | `public`, `internal`, `protected`, `private`, `protected_internal`, `private_protected` |
@@ -148,7 +149,8 @@ SQL triggers keep the FTS table in sync with `symbols` on insert, update, and de
 ## Indexes
 
 ```sql
-CREATE UNIQUE INDEX ix_symbols_fqn ON symbols(fully_qualified_name, project_id);
+CREATE UNIQUE INDEX ix_symbols_key ON symbols(project_id, symbol_key);
+CREATE INDEX ix_symbols_fqn_lookup ON symbols(fully_qualified_name, project_id);
 CREATE INDEX ix_symbols_project_access ON symbols(project_id, accessibility);
 CREATE INDEX ix_symbols_file ON symbols(file_path);
 CREATE INDEX ix_symbols_kind ON symbols(kind);
@@ -168,3 +170,9 @@ CREATE INDEX ix_file_index_lookup ON file_index(project_id, file_path);
 Schema changes are managed through hand-written SQL migration scripts in `src/Sextant.Store/Migrations/`, numbered sequentially (`001_initial_schema.sql`, `002_add_file_index.sql`, etc.) and embedded as assembly resources.
 
 A `schema_version` table tracks the current version. On startup, the store applies all unapplied migrations in order. Migrations are forward-only — no rollback support.
+
+### Symbol identity (migration `007`)
+
+Symbols were originally keyed by their display FQN under a unique index on `(fully_qualified_name, project_id)`. Because the display FQN omits parameter lists, overloads, same-named members on different types, and anonymous-object property names (`type`, `description`) collided and overwrote each other. Migration `007_symbol_key_identity.sql` replaces that identity with the stable `symbol_key` column and a unique index on `(project_id, symbol_key)`; the FQN keeps a non-unique lookup index.
+
+This migration is **rebuild-required**: colliding rows in an existing index already lost information and cannot be reinterpreted as valid. The migration clears every derived semantic table (symbols, references, relationships, call graph, dataflow, API snapshots, comments) and `file_index` — preserving only logical `projects` rows — so the next index run re-populates correct keys. On a fresh database the clears are no-ops. Re-run a full index after upgrading.
