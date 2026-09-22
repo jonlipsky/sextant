@@ -358,15 +358,37 @@ public sealed class DaemonHost : IDisposable
             // #28: re-read config and re-resolve the solution every pass, never a stale cached copy.
             RefreshRuntimeConfig();
             var solutionPath = _solutionPaths[0];
-            var solution = await SolutionLoader.LoadSolutionAsync(solutionPath);
-            _currentSolution = solution;
 
-            var reconciler = new LocalOverlayReconciler(_db!, _log, _useDocumentExtractor, _parallelism, _profile);
-            var result = await reconciler.ReconcileAsync(solution, ct);
+            // Issue #49: a reconcile pass aborts (publishing nothing) if HEAD/the working tree moves
+            // mid-pass. Retry a bounded number of times, RELOADING the solution each attempt so it
+            // reflects the now-current on-disk state — a fresh git pin is captured per attempt. If the
+            // tree is still moving after the retries, leave it: the periodic reconcile self-heals once the
+            // tree settles. No mixed-state generation is ever published on any attempt.
+            const int maxAttempts = 3;
+            OverlayReconcileResult? result = null;
+            for (var attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                var solution = await SolutionLoader.LoadSolutionAsync(solutionPath);
+                _currentSolution = solution;
+
+                var reconciler = new LocalOverlayReconciler(_db!, _log, _useDocumentExtractor, _parallelism, _profile);
+                result = await reconciler.ReconcileAsync(solution, ct);
+                if (result.Kind != OverlayReconcileKind.Aborted)
+                    break;
+
+                _log?.Invoke($"Reconcile attempt {attempt}/{maxAttempts} aborted (git state moved mid-pass); " +
+                             (attempt < maxAttempts ? "retrying with a fresh solution." : "will retry on the next periodic pass."));
+            }
+
             _lastReconcileResult = result;
-            var reasonSuffix = result.FallbackReason is { } r ? $" — {r}" : string.Empty;
+            var reasonSuffix = result!.FallbackReason is { } r ? $" — {r}" : string.Empty;
             _log?.Invoke($"Reconcile: {result.Kind} ({result.ChangeCount} change(s)){reasonSuffix}");
-            _lastIndexedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            // Only advance "last indexed" when the pass actually reconciled to a published state. An
+            // all-attempts-aborted pass (issue #49: the tree kept moving) publishes nothing, so stamping
+            // the timestamp would make a persistently-failing daemon look freshly indexed on the status
+            // endpoint. Leave the previous value; the next periodic pass self-heals once the tree settles.
+            if (result.Kind != OverlayReconcileKind.Aborted)
+                _lastIndexedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         }
         finally
         {

@@ -282,6 +282,217 @@ public class LocalOverlayIntegrationTests : IDisposable
         Assert.AreEqual(baseFingerprint, SnapshotFingerprint(conn, baseId), "two overlays never mutated the base (#44)");
     }
 
+    // ---- issue #49: pin the reconcile pass to one git state --------------------------------------
+
+    /// <summary>
+    /// Criterion 1: a HEAD/working-tree move BETWEEN the start-of-pass pin capture and the pre-publish
+    /// re-verification is detected and the pass aborts WITHOUT publishing a mixed-state snapshot. Injects
+    /// the move via a scripted probe whose second capture (the orchestrator's re-verify) reports a moved
+    /// HEAD.
+    /// </summary>
+    [TestMethod]
+    public async Task MidPassGitMove_AbortsWithoutPublishing()
+    {
+        var repo = CreateGitProject("Widget");
+        var dbPath = Path.Combine(_tempDir, "index.db");
+        using var db = new IndexDatabase(dbPath);
+        db.RunMigrations();
+        var conn = db.GetConnection();
+        var store = new SnapshotStore(conn);
+
+        // Build the committed base over the clean checkout with the real probe.
+        await ReconcileAsync(db, repo.SolutionPath);
+        var baseId = store.GetSelectedSnapshotId();
+        Assert.IsNotNull(baseId, "a base snapshot is selected after the first index");
+        var completeBefore = CountComplete(conn);
+
+        // Dirty the tree so the pass takes the overlay path, then reconcile with a probe that reports a
+        // move on the pre-publish re-verify (call 2): baseline (call 1) is the real state.
+        File.WriteAllText(repo.SourceFile,
+            "namespace App;\npublic class Widget { public int Value() => 1; public int Added() => 2; }\n");
+        var probe = new ScriptedGitStateProbe(moveOnCall: 2);
+        var result = await ReconcileWithProbeAsync(db, repo.SolutionPath, probe);
+
+        Assert.AreEqual(OverlayReconcileKind.Aborted, result.Kind, "a mid-pass move aborts the pass (criterion 1)");
+        Assert.IsTrue(probe.Calls >= 2, "the guard captured a baseline and re-verified before publish");
+        Assert.AreEqual(baseId, store.GetSelectedSnapshotId(), "the aborted pass published nothing — the base stays selected");
+        Assert.AreEqual(completeBefore, CountComplete(conn), "no overlay/partial snapshot was published on abort (criterion 1)");
+        Assert.IsFalse(SnapshotHasSymbol(conn, baseId.Value, "Added"), "the base never gained the un-published edit");
+    }
+
+    /// <summary>
+    /// Criterion 2: after an aborted pass leaves nothing published, a subsequent pass over the now-stable
+    /// tree publishes the correct single-state overlay (self-heal / bounded retry).
+    /// </summary>
+    [TestMethod]
+    public async Task AbortedPass_ThenStablePass_PublishesCorrectSnapshot()
+    {
+        var repo = CreateGitProject("Widget");
+        var dbPath = Path.Combine(_tempDir, "index.db");
+        using var db = new IndexDatabase(dbPath);
+        db.RunMigrations();
+        var conn = db.GetConnection();
+        var store = new SnapshotStore(conn);
+
+        await ReconcileAsync(db, repo.SolutionPath);
+        var baseId = store.GetSelectedSnapshotId()!.Value;
+        var baseFingerprint = SnapshotFingerprint(conn, baseId);
+
+        File.WriteAllText(repo.SourceFile,
+            "namespace App;\npublic class Widget { public int Value() => 1; public int Added() => 2; }\n");
+
+        // First pass aborts mid-flight — nothing published, base untouched.
+        var aborted = await ReconcileWithProbeAsync(db, repo.SolutionPath, new ScriptedGitStateProbe(moveOnCall: 2));
+        Assert.AreEqual(OverlayReconcileKind.Aborted, aborted.Kind, "the first pass aborts");
+        Assert.AreEqual(1, CountComplete(conn), "the aborted pass left no partial/overlay generation behind (criterion 2)");
+        Assert.AreEqual(baseFingerprint, SnapshotFingerprint(conn, baseId), "the aborted pass never mutated the base");
+
+        // Self-heal: a stable pass (real probe) now publishes the correct overlay.
+        var healed = await ReconcileAsync(db, repo.SolutionPath);
+        Assert.AreEqual(OverlayReconcileKind.Overlay, healed.Kind, "the stable pass publishes the overlay (criterion 2)");
+        var overlayId = store.GetSelectedSnapshotId()!.Value;
+        Assert.AreNotEqual(baseId, overlayId, "the overlay is a distinct published snapshot");
+        Assert.AreEqual(2, CountComplete(conn), "exactly base + one overlay after self-heal — no orphan generations");
+        Assert.IsTrue(SnapshotHasSymbol(conn, overlayId, "Added"), "the healed overlay reflects the edit");
+        Assert.AreEqual(baseFingerprint, SnapshotFingerprint(conn, baseId), "the base stays byte-identical through abort + heal");
+    }
+
+    /// <summary>
+    /// Criterion 3: on a stable tree the guard is INERT — a probe that never reports a move publishes the
+    /// overlay exactly as the real path (same distinct snapshot, folded delta, and edit), so a stable pass
+    /// is byte-identical to pre-fix behavior.
+    /// </summary>
+    [TestMethod]
+    public async Task StableTree_GuardIsInert_PublishesNormally()
+    {
+        var repo = CreateGitProject("Widget");
+        var dbPath = Path.Combine(_tempDir, "index.db");
+        using var db = new IndexDatabase(dbPath);
+        db.RunMigrations();
+        var conn = db.GetConnection();
+        var store = new SnapshotStore(conn);
+
+        await ReconcileAsync(db, repo.SolutionPath);
+        var baseId = store.GetSelectedSnapshotId()!.Value;
+
+        File.WriteAllText(repo.SourceFile,
+            "namespace App;\npublic class Widget { public int Value() => 1; public int Added() => 2; }\n");
+
+        var probe = new ScriptedGitStateProbe(moveOnCall: 0); // never moves
+        var result = await ReconcileWithProbeAsync(db, repo.SolutionPath, probe);
+
+        Assert.AreEqual(OverlayReconcileKind.Overlay, result.Kind, "a stable tree still publishes an overlay (guard inert)");
+        Assert.IsTrue(probe.Calls >= 2, "the guard ran (captured baseline + re-verified) yet did not interfere");
+        var overlayId = store.GetSelectedSnapshotId()!.Value;
+        Assert.AreNotEqual(baseId, overlayId, "the overlay is a distinct snapshot from the base");
+        var overlayRow = store.GetById(overlayId)!;
+        Assert.IsTrue(overlayRow.IsOverlay, "the published snapshot is an overlay");
+        Assert.IsNotNull(overlayRow.WorkingTreeDelta, "the overlay identity folds in the working-tree delta (no new guard component)");
+        Assert.AreEqual(baseId, overlayRow.BaseSnapshotId, "the overlay layers on the exact base");
+        Assert.IsTrue(SnapshotHasSymbol(conn, overlayId, "Added"), "the overlay reflects the edit");
+        Assert.AreEqual(2, CountComplete(conn), "base + one overlay, exactly as the real path");
+    }
+
+    /// <summary>
+    /// Regression for the anchoring window (issue #49): if the baseline pin disagrees with the snapshot
+    /// context that feeds identity (git moved between context resolution and the pin capture), the pass
+    /// aborts BEFORE indexing rather than publish a snapshot whose identity (commit X) disagrees with the
+    /// state its sources are read at. Simulated by a probe whose FIRST (baseline) capture reports a moved
+    /// HEAD, so it never matches the resolved context.
+    /// </summary>
+    [TestMethod]
+    public async Task ContextPinSkew_AbortsBeforeIndexing()
+    {
+        var repo = CreateGitProject("Widget");
+        var dbPath = Path.Combine(_tempDir, "index.db");
+        using var db = new IndexDatabase(dbPath);
+        db.RunMigrations();
+        var conn = db.GetConnection();
+        var store = new SnapshotStore(conn);
+
+        await ReconcileAsync(db, repo.SolutionPath);
+        var baseId = store.GetSelectedSnapshotId();
+        var completeBefore = CountComplete(conn);
+
+        File.WriteAllText(repo.SourceFile,
+            "namespace App;\npublic class Widget { public int Value() => 1; public int Added() => 2; }\n");
+
+        // moveOnCall:1 → the baseline capture itself reports a HEAD that disagrees with the context.
+        var probe = new ScriptedGitStateProbe(moveOnCall: 1);
+        var result = await ReconcileWithProbeAsync(db, repo.SolutionPath, probe);
+
+        Assert.AreEqual(OverlayReconcileKind.Aborted, result.Kind, "a baseline pin that disagrees with the context aborts (issue #49 anchoring)");
+        Assert.AreEqual(baseId, store.GetSelectedSnapshotId(), "the aborted pass published nothing");
+        Assert.AreEqual(completeBefore, CountComplete(conn), "no torn generation was published on a context/pin skew");
+    }
+
+    /// <summary>
+    /// Fail-closed (issue #49): when a git-backed context resolved but the git state cannot be pinned
+    /// (the probe returns null), the pass aborts rather than publish an unverifiable generation.
+    /// </summary>
+    [TestMethod]
+    public async Task UnpinnableGitState_AbortsFailClosed()
+    {
+        var repo = CreateGitProject("Widget");
+        var dbPath = Path.Combine(_tempDir, "index.db");
+        using var db = new IndexDatabase(dbPath);
+        db.RunMigrations();
+        var conn = db.GetConnection();
+        var store = new SnapshotStore(conn);
+
+        await ReconcileAsync(db, repo.SolutionPath);
+        var baseId = store.GetSelectedSnapshotId();
+        var completeBefore = CountComplete(conn);
+
+        File.WriteAllText(repo.SourceFile,
+            "namespace App;\npublic class Widget { public int Value() => 1; public int Added() => 2; }\n");
+
+        // nullFromCall:1 → the baseline pin capture yields null (git unavailable): fail-closed abort.
+        var probe = new ScriptedGitStateProbe(moveOnCall: 0, nullFromCall: 1);
+        var result = await ReconcileWithProbeAsync(db, repo.SolutionPath, probe);
+
+        Assert.AreEqual(OverlayReconcileKind.Aborted, result.Kind, "an unpinnable git state aborts fail-closed (issue #49)");
+        Assert.AreEqual(baseId, store.GetSelectedSnapshotId(), "the fail-closed abort published nothing");
+        Assert.AreEqual(completeBefore, CountComplete(conn), "no unverifiable generation was published");
+    }
+
+    /// <summary>
+    /// A test <see cref="IGitStateProbe"/> that returns the REAL git pin except that, starting with its
+    /// <c>moveOnCall</c>-th capture (1-based), it reports a different HEAD to simulate a mid-pass move, and
+    /// (when <c>nullFromCall</c> &gt; 0) returns null from its <c>nullFromCall</c>-th capture onward to
+    /// simulate an unavailable git state. <c>moveOnCall == 0</c> never moves; <c>nullFromCall == 0</c>
+    /// never nulls.
+    /// </summary>
+    private sealed class ScriptedGitStateProbe(int moveOnCall, int nullFromCall = 0) : IGitStateProbe
+    {
+        private int _calls;
+
+        public int Calls => _calls;
+
+        public GitStatePin? Capture(string repoRoot)
+        {
+            _calls++;
+            if (nullFromCall != 0 && _calls >= nullFromCall)
+                return null;
+            var real = GitStateProbe.Default.Capture(repoRoot);
+            if (real == null || moveOnCall == 0 || _calls < moveOnCall)
+                return real;
+            return real with { Head = real.Head + "-moved" };
+        }
+    }
+
+    private static async Task<OverlayReconcileResult> ReconcileWithProbeAsync(
+        IndexDatabase db, string solutionPath, IGitStateProbe probe)
+    {
+        var solution = await SolutionLoader.LoadSolutionAsync(solutionPath);
+        var reconciler = new LocalOverlayReconciler(
+            db, log: null, useDocumentExtractor: true,
+            parallelism: ExtractionParallelismOptions.Default,
+            profile: IndexProfileDescriptor.For(IndexProfiles.Standard),
+            gitStateProbe: probe);
+        return await reconciler.ReconcileAsync(solution);
+    }
+
     // ---- helpers -------------------------------------------------------------------------------
 
     private sealed record GitProject(string RepoRoot, string SolutionPath, string SourceFile);
