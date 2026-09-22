@@ -27,6 +27,14 @@ public sealed class DaemonHost : IDisposable
     private Indexer.ExtractionParallelismOptions _parallelism = Indexer.ExtractionParallelismOptions.Default;
     private IndexProfileDescriptor _profile = IndexProfileDescriptor.Full;
 
+    // Phase 10: when true (single solution + git repo) the daemon drives a Git-authoritative overlay
+    // reconciliation instead of the legacy file_index catch-up. The file watcher's events are hints;
+    // this pass reconstructs the working-tree state from git and never relies on missed events.
+    private bool _snapshotEnabled;
+    private int _reconcileIntervalSeconds = 30;
+    private Task? _periodicTask;
+    private volatile OverlayReconcileResult? _lastReconcileResult;
+
     public int StatusPort => _statusServer?.Port ?? 0;
 
     public DaemonHost(string repoRoot, string dbPath, string[] solutionPaths, Action<string>? log = null)
@@ -51,9 +59,15 @@ public sealed class DaemonHost : IDisposable
         _useDocumentExtractor = config.DocumentExtractor;
         _parallelism = Indexer.ExtractionParallelismOptions.FromConfiguration(config);
         _profile = IndexProfileDescriptor.FromConfiguration(config);
+        _reconcileIntervalSeconds = config.ReconcileIntervalSeconds;
         _db.RunMigrations();
         _queue = new IndexingQueue();
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+
+        // Phase 10: a single-solution repo under git is eligible for Git-authoritative overlay
+        // reconciliation (which also produces Phase-9 snapshots). A multi-solution repo, or a non-git
+        // working copy, stays on the legacy file_index catch-up path.
+        _snapshotEnabled = _solutionPaths.Length == 1 && GitRemoteResolver.ResolveGitRoot(_repoRoot) != null;
 
         // Start status server
         _statusServer = new StatusServer(GetStatus);
@@ -63,31 +77,42 @@ public sealed class DaemonHost : IDisposable
         // Write pid file
         WritePidFile();
 
-        // Check if database needs full index or incremental catch-up
-        var needsFullIndex = !File.Exists(_dbPath) || IsEmptyDatabase();
-        if (needsFullIndex)
+        if (_snapshotEnabled)
         {
-            _log?.Invoke("No existing index — performing full initial index...");
-        }
-        else if (ConfigurationChangedSinceLastRun())
-        {
-            // The indexing profile / feature configuration changed since the last complete run (e.g.
-            // core→standard, which never built the optional tables). An incremental catch-up would
-            // leave the newly-enabled tables unbuilt (or the newly-disabled ones stale), so treat this
-            // like a generation-invalidating change and rebuild fully. A null recorded hash (a
-            // pre-Phase-8 generation) counts as changed, mirroring the null-fingerprint semantics.
-            _log?.Invoke("Indexing configuration changed since last index — performing full re-index...");
-            needsFullIndex = true;
-        }
-
-        if (needsFullIndex)
-        {
-            await PerformFullIndexAsync();
+            // The authoritative Git reconciliation pass subsumes full index, incremental catch-up, and
+            // overlay staging. It reconstructs the working-tree state purely from git and MUST run before
+            // the file watcher is enabled (criterion 3), so a restart never depends on missed events.
+            _log?.Invoke("Snapshot mode — running authoritative Git reconciliation...");
+            await ReconcileAuthoritativeAsync(_cts.Token);
         }
         else
         {
-            _log?.Invoke("Existing index found — checking for changed files...");
-            await PerformIncrementalCatchUpAsync();
+            // Check if database needs full index or incremental catch-up
+            var needsFullIndex = !File.Exists(_dbPath) || IsEmptyDatabase();
+            if (needsFullIndex)
+            {
+                _log?.Invoke("No existing index — performing full initial index...");
+            }
+            else if (ConfigurationChangedSinceLastRun())
+            {
+                // The indexing profile / feature configuration changed since the last complete run (e.g.
+                // core→standard, which never built the optional tables). An incremental catch-up would
+                // leave the newly-enabled tables unbuilt (or the newly-disabled ones stale), so treat this
+                // like a generation-invalidating change and rebuild fully. A null recorded hash (a
+                // pre-Phase-8 generation) counts as changed, mirroring the null-fingerprint semantics.
+                _log?.Invoke("Indexing configuration changed since last index — performing full re-index...");
+                needsFullIndex = true;
+            }
+
+            if (needsFullIndex)
+            {
+                await PerformFullIndexAsync();
+            }
+            else
+            {
+                _log?.Invoke("Existing index found — checking for changed files...");
+                await PerformIncrementalCatchUpAsync();
+            }
         }
 
         // Start file watcher
@@ -97,6 +122,10 @@ public sealed class DaemonHost : IDisposable
 
         // Start background worker
         _workerTask = ProcessQueueAsync(_cts.Token);
+
+        // Phase 10: periodic authoritative reconciliation catches changes the watcher missed (criterion 3).
+        if (_snapshotEnabled)
+            _periodicTask = RunPeriodicReconcileAsync(_cts.Token);
 
         _log?.Invoke("Daemon started.");
     }
@@ -108,6 +137,12 @@ public sealed class DaemonHost : IDisposable
         _fileWatcher?.Stop();
         _queue?.Complete();
         _cts?.Cancel();
+
+        if (_periodicTask != null)
+        {
+            try { await _periodicTask; }
+            catch (OperationCanceledException) { }
+        }
 
         if (_workerTask != null)
         {
@@ -273,6 +308,106 @@ public sealed class DaemonHost : IDisposable
         });
     }
 
+    /// <summary>
+    /// Issue #28: re-reads <c>sextant.json</c> so a live config edit (extractor toggle, parallelism,
+    /// profile, reconcile interval) is picked up on the authoritative pass — not only when the daemon
+    /// first started. Called at the head of every reconciliation, so a stale cached runtime config never
+    /// drives an index.
+    /// </summary>
+    private void RefreshRuntimeConfig()
+    {
+        var config = SextantConfiguration.Load(_repoRoot);
+        _useDocumentExtractor = config.DocumentExtractor;
+        _parallelism = Indexer.ExtractionParallelismOptions.FromConfiguration(config);
+        _profile = IndexProfileDescriptor.FromConfiguration(config);
+        _reconcileIntervalSeconds = config.ReconcileIntervalSeconds;
+    }
+
+    /// <summary>
+    /// The AUTHORITATIVE Git reconciliation pass (Phase 10). Re-reads config (issue #28), re-resolves the
+    /// solution from disk (so a project/config change since the last pass is honoured — issue #28), and
+    /// runs <see cref="LocalOverlayReconciler"/>, which reconstructs the working-tree state from git and
+    /// publishes a base/overlay/fallback generation atomically. Serialized through the single worker (and
+    /// the startup call), so it is the only writer.
+    /// </summary>
+    private async Task ReconcileAuthoritativeAsync(CancellationToken ct)
+    {
+        _state = "indexing";
+        _indexingStartedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        _currentProgress = new IndexingProgress
+        {
+            Phase = "reconciling",
+            Description = "Git-authoritative reconciliation",
+            ProjectIndex = 0,
+            ProjectCount = 0
+        };
+        try
+        {
+            // #28: re-read config and re-resolve the solution every pass, never a stale cached copy.
+            RefreshRuntimeConfig();
+            var solutionPath = _solutionPaths[0];
+            var solution = await SolutionLoader.LoadSolutionAsync(solutionPath);
+            _currentSolution = solution;
+
+            var reconciler = new LocalOverlayReconciler(_db!, _log, _useDocumentExtractor, _parallelism, _profile);
+            var result = await reconciler.ReconcileAsync(solution, ct);
+            _lastReconcileResult = result;
+            var reasonSuffix = result.FallbackReason is { } r ? $" — {r}" : string.Empty;
+            _log?.Invoke($"Reconcile: {result.Kind} ({result.ChangeCount} change(s)){reasonSuffix}");
+            _lastIndexedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        }
+        finally
+        {
+            _state = "idle";
+            _currentProgress = null;
+            _indexingStartedAt = 0;
+        }
+    }
+
+    /// <summary>
+    /// Periodic authoritative reconciliation (criterion 3): even if the file watcher drops or coalesces
+    /// events, a full git reconstruction runs on the interval and converges the overlay on the true
+    /// working-tree state. Enqueues a hint so the pass serializes through the single worker.
+    /// </summary>
+    private async Task RunPeriodicReconcileAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            // Re-read the interval each loop so a live edit to reconcile_interval_seconds takes effect.
+            var seconds = _reconcileIntervalSeconds > 0 ? _reconcileIntervalSeconds : 30;
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(seconds), ct);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+
+            if (ct.IsCancellationRequested) break;
+
+            // A negative/zero interval disables periodic reconciliation, but keep the loop alive so a
+            // later positive edit re-enables it without a daemon restart.
+            if (_reconcileIntervalSeconds <= 0) continue;
+
+            // Coalesce: a periodic reconcile is an IDEMPOTENT full reconstruction of the working-tree
+            // delta from git, so at most one needs to be pending at a time. Skipping the enqueue while a
+            // Background item is already queued bounds the queue under sustained load — a slow indexer no
+            // longer accretes a backlog of redundant reconciles. Convergence is preserved: once the
+            // pending pass is dequeued and starts, GetBackgroundCount drops to 0 and the next tick
+            // enqueues a fresh reconcile that reads the current git state at execution time.
+            if (_queue is { } queue && queue.GetBackgroundCount() == 0)
+            {
+                queue.Enqueue(new WorkItem
+                {
+                    Priority = WorkPriority.Background,
+                    FilePaths = Array.Empty<string>(),
+                    Description = "Periodic Git reconciliation"
+                });
+            }
+        }
+    }
+
     private async Task ProcessQueueAsync(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
@@ -303,6 +438,15 @@ public sealed class DaemonHost : IDisposable
 
             try
             {
+                if (_snapshotEnabled)
+                {
+                    // Git is authoritative: the watcher's file list is only a hint that SOMETHING may
+                    // have changed. Reconstruct the whole working-tree delta from git and reconcile the
+                    // overlay, so a missed/merged event never leaves the index diverged (criterion 3).
+                    await ReconcileAuthoritativeAsync(ct);
+                    continue;
+                }
+
                 if (_currentSolution != null)
                 {
                     // The incremental indexer rebuilds the full invalidated project closure, so there

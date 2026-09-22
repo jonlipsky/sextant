@@ -83,4 +83,44 @@ public class IndexConfigurationHashTests
 
         Assert.AreNotEqual(exclude, include, "a generated-source policy change must change the hash");
     }
+
+    // ==== Issue #39: the document_extractor toggle is part of the configuration hash ==============
+
+    [TestMethod]
+    public void DocumentExtractorToggle_ChangesHash()
+    {
+        // The document-oriented extractor and the legacy declaration-driven path are not row-identical,
+        // so flipping the toggle must change the configuration hash — the daemon then treats it as a
+        // generation-invalidating change and forces a rebuild (issue #39).
+        var document = IndexConfigurationHash.Compute(
+            IndexProfiles.Standard, IndexFeature.Standard, GeneratedSourcePolicies.Exclude, documentExtractor: true);
+        var legacy = IndexConfigurationHash.Compute(
+            IndexProfiles.Standard, IndexFeature.Standard, GeneratedSourcePolicies.Exclude, documentExtractor: false);
+
+        Assert.AreNotEqual(document, legacy, "flipping document_extractor must change the configuration hash (#39)");
+    }
+
+    [TestMethod]
+    public void DefaultCompute_MatchesDocumentExtractorOn()
+    {
+        // The 3-arg overload defaults to the document extractor (the shipped default), so a pre-#39
+        // caller keeps its exact hash — no spurious rebuild for the default configuration.
+        var implicitDefault = IndexConfigurationHash.Compute(
+            IndexProfiles.Standard, IndexFeature.Standard, GeneratedSourcePolicies.Exclude);
+        var explicitOn = IndexConfigurationHash.Compute(
+            IndexProfiles.Standard, IndexFeature.Standard, GeneratedSourcePolicies.Exclude, documentExtractor: true);
+
+        Assert.AreEqual(implicitDefault, explicitOn, "the default overload must equal document_extractor=on");
+    }
+
+    [TestMethod]
+    public void DescriptorExtractorToggle_FlowsIntoHash()
+    {
+        // The descriptor threads the toggle through to the hash, so a config that disables the document
+        // extractor produces a different descriptor hash than the default-on descriptor (#39).
+        var on = IndexProfileDescriptor.For(IndexProfiles.Standard, documentExtractor: true).ConfigurationHash;
+        var off = IndexProfileDescriptor.For(IndexProfiles.Standard, documentExtractor: false).ConfigurationHash;
+
+        Assert.AreNotEqual(on, off, "the descriptor must fold the extractor toggle into its configuration hash (#39)");
+    }
 }

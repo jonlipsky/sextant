@@ -46,7 +46,10 @@ public sealed class IndexOrchestrator
         CancellationToken cancellationToken = default,
         IReadOnlySet<string>? projectCanonicalFilter = null,
         SnapshotContext? snapshotContext = null,
-        bool enableSnapshots = true)
+        bool enableSnapshots = true,
+        OverlayContext? overlay = null,
+        string? workingTreeDelta = null,
+        string? fallbackReason = null)
     {
         var totalStopwatch = Stopwatch.StartNew();
         var phaseStopwatch = new Stopwatch();
@@ -192,6 +195,7 @@ public sealed class IndexOrchestrator
         long? repositoryId = null;
         long? commitId = null;
         long? activeSnapshotId = null;
+        var isOverlayRun = false;
         if (effectiveCtx != null)
         {
             snapshotStore = new SnapshotStore(conn);
@@ -208,10 +212,14 @@ public sealed class IndexOrchestrator
                     SchemaVersion = IndexDatabase.LatestSchemaVersion,
                     AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
                     ConfigHash = _profile.ConfigurationHash,
-                    ToolchainFingerprint = ToolchainFingerprint.Current
+                    ToolchainFingerprint = ToolchainFingerprint.Current,
+                    // A full LOCAL index over a DIRTY working tree (Phase-10 fallback: no compatible base)
+                    // carries the working-tree delta so it never claims identity with the clean base
+                    // commit's snapshot (issue #43). Null for a genuine clean-HEAD full index.
+                    WorkingTreeDelta = workingTreeDelta
                 };
                 var (snapId, existed, status) = snapshotStore.BeginPending(
-                    identity, repositoryId.Value, commitId, runScope.RunId, now);
+                    identity, repositoryId.Value, commitId, runScope.RunId, now, fallbackReason: fallbackReason);
                 if (existed && (status == SnapshotStatus.Complete || status == SnapshotStatus.Superseded))
                 {
                     // A snapshot for this exact identity (commit + tree + schema + analyzer + config +
@@ -238,9 +246,54 @@ public sealed class IndexOrchestrator
             }
             else
             {
-                // Incremental: mutate the selected working-head snapshot in place. Its own project rows
-                // are the only ones touched, so every other snapshot stays byte-identical (criterion C).
-                activeSnapshotId = snapshotStore.GetSelectedSnapshotId();
+                if (overlay != null)
+                {
+                    // Phase-10 overlay (issue #44): stage a FRESH snapshot layered on the committed base
+                    // rather than mutating the base in place. Its identity = the base commit identity +
+                    // the working-tree delta digest (issue #43), so a dirty tree never collides with the
+                    // clean base commit's snapshot, and the same dirty state re-selects idempotently.
+                    var overlayIdentity = new SnapshotIdentity
+                    {
+                        RepositoryRemoteUrl = effectiveCtx.RepositoryRemoteUrl,
+                        CommitSha = effectiveCtx.CommitSha,
+                        TreeSha = effectiveCtx.TreeSha,
+                        SchemaVersion = IndexDatabase.LatestSchemaVersion,
+                        AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
+                        ConfigHash = _profile.ConfigurationHash,
+                        ToolchainFingerprint = ToolchainFingerprint.Current,
+                        WorkingTreeDelta = overlay.WorkingTreeDelta
+                    };
+                    var (overlayId, overlayExisted, overlayStatus) = snapshotStore.BeginPending(
+                        overlayIdentity, repositoryId.Value, commitId, runScope.RunId, now,
+                        baseSnapshotId: overlay.BaseSnapshotId);
+                    if (overlayExisted && (overlayStatus == SnapshotStatus.Complete || overlayStatus == SnapshotStatus.Superseded))
+                    {
+                        // This exact dirty state was already built as an overlay: re-select it without
+                        // rebuilding (criterion 3 idempotent restart), never touching the base. Use the
+                        // overlay-aware re-select so re-pointing the branch supersedes only a stale
+                        // OVERLAY it may currently target — never the committed base (issue #44): the
+                        // branch can legitimately point at the base here (e.g. built overlay-X, reverted
+                        // to clean so the branch rolled back to the base, then re-applied the identical
+                        // edit), and superseding it would break every later base lookup.
+                        SelectExistingOverlay(snapshotStore, repositoryId.Value, effectiveCtx, overlayId, now);
+                        session.Complete();
+                        _log?.Invoke($"Overlay {overlayId} for the current working-tree delta already exists; " +
+                                     $"re-selected for branch '{effectiveCtx.BranchName}' without rebuild (idempotent).");
+                        return;
+                    }
+                    activeSnapshotId = overlayId;
+                    isOverlayRun = true;
+                    if (overlayExisted && overlayStatus != SnapshotStatus.Pending)
+                        snapshotStore.MarkStatus(overlayId, SnapshotStatus.Pending);
+                }
+                else
+                {
+                    // Legacy (pre-Phase-10) incremental: mutate the selected working-head snapshot in
+                    // place. Only reachable when a caller drives incremental WITHOUT an overlay context
+                    // (e.g. the direct IncrementalIndexer test path); the Phase-10 reconciler always
+                    // supplies an overlay so a published base snapshot is never mutated.
+                    activeSnapshotId = snapshotStore.GetSelectedSnapshotId();
+                }
             }
         }
 
@@ -265,24 +318,46 @@ public sealed class IndexOrchestrator
             if (project.FilePath == null) continue;
 
             var identity = ProjectIdentityFactory.Create(project, submodules, repoRoot);
+            var inFilter = projectCanonicalFilter == null || projectCanonicalFilter.Contains(identity.CanonicalId);
 
             long projectId;
+            var extractThisProject = inFilter;
             if (activeSnapshotId is long snapId && snapshotStore != null && repositoryId is long repoId)
             {
-                // Snapshot-tagged project version: a fresh (per-snapshot) row keyed by the commit-invariant
-                // logical identity, so distinct commits' versions coexist without overwriting (criterion 1)
-                // and the branch pointer stays out of the row key (criterion 2).
                 var logicalId = snapshotStore.EnsureLogicalProject(
                     repoId, identity.CanonicalId, identity.RepoRelativePath, identity.TargetFramework, now);
-                projectId = projectStore.UpsertSnapshotProject(identity, snapId, logicalId, now);
-                snapshotStore.MapProject(snapId, projectId);
+
+                if (overlay != null && !inFilter
+                    && projectStore.GetSnapshotProjectRow(overlay.BaseSnapshotId, logicalId) is long baseRowId)
+                {
+                    // Out-of-closure project in an overlay run: SHARE the base snapshot's existing,
+                    // unchanged project-version row by mapping it into the overlay's snapshot_projects.
+                    // No new row and no re-extraction, so the base snapshot stays byte-identical (issue
+                    // #44). Safe because the undirected closure guarantees no reference edge crosses the
+                    // boundary between shared and re-extracted projects (Phase-4 invariant).
+                    projectId = baseRowId;
+                    snapshotStore.MapProject(snapId, projectId);
+                }
+                else
+                {
+                    // Snapshot-tagged project version: a fresh (per-snapshot) row keyed by the commit-
+                    // invariant logical identity, so distinct commits' versions coexist without
+                    // overwriting (criterion 1) and the branch pointer stays out of the row key
+                    // (criterion 2). In an overlay run this covers every closure project, plus the
+                    // defensive case of an out-of-closure project with no base row to share (then force
+                    // its extraction so the fresh row is not left empty).
+                    projectId = projectStore.UpsertSnapshotProject(identity, snapId, logicalId, now);
+                    snapshotStore.MapProject(snapId, projectId);
+                    if (overlay != null && !inFilter)
+                        extractThisProject = true;
+                }
             }
             else
             {
                 projectId = projectStore.Insert(identity, now);
             }
             projectRoslynToId[project.Id] = projectId;
-            if (projectCanonicalFilter == null || projectCanonicalFilter.Contains(identity.CanonicalId))
+            if (extractThisProject)
                 processSet.Add(project.Id);
             _log?.Invoke($"  Project: {project.Name} (id={projectId}, tfm={identity.TargetFramework}, test={identity.IsTestProject})");
         }
@@ -341,6 +416,17 @@ public sealed class IndexOrchestrator
                 compilationFailures++;
                 _log?.Invoke($"    WARNING: {project.Name} produced no compilation; generation will be marked partial.");
             }
+
+            // Issue #35 (TOCTOU): capture each analyzed on-disk source file's raw-disk hash NOW, before
+            // any symbol/occurrence resolves its file_version row, so the persisted content hash is the
+            // bytes analyzed rather than whatever is on disk later at persist time.
+            foreach (var document in project.Documents)
+            {
+                var docPath = document.FilePath;
+                if (!string.IsNullOrEmpty(docPath) && !SymbolExtractor.IsGeneratedFile(docPath) && File.Exists(docPath))
+                    fileStore.CaptureAnalyzedHash(projectId, docPath);
+            }
+
             foreach (var symbol in symbols)
             {
                 var id = symbolStore.Insert(symbolInsert, symbol);
@@ -872,16 +958,26 @@ public sealed class IndexOrchestrator
                 ProjectCount = totalProjects
             });
             var deps = DependencyExtractor.ExtractDependencies(solution, projectRoslynToId, submodules, repoRoot);
-            // Replace the entire dependency set rather than only upserting: the extractor recomputes
-            // every edge in the solution each run and registration covers every project, so clearing
-            // each consumer's edges first purges any that were removed since the last run (e.g. a
-            // dropped project reference) instead of leaving a stale project_dependencies row behind.
-            foreach (var pid in projectRoslynToId.Values)
+            // Replace the dependency set for the projects this run actually (re)built. Registration
+            // covers every project so the extractor can resolve every edge's endpoints, but only the
+            // processed projects' consumer edges are cleared and re-inserted: for a full index that is
+            // every project (identical to before); for an incremental/overlay run the out-of-closure
+            // (shared base) projects' edges are left untouched, so an overlay never mutates a published
+            // base snapshot's project_dependencies (issue #44). By the undirected-closure property a
+            // processed consumer's dependencies are themselves processed, so no processed edge is lost.
+            var processedProjectIds = new HashSet<long>();
+            foreach (var project in solution.Projects)
+                if (processSet.Contains(project.Id) && projectRoslynToId.TryGetValue(project.Id, out var procId))
+                    processedProjectIds.Add(procId);
+
+            foreach (var pid in processedProjectIds)
                 dependencyStore.DeleteByConsumer(pid);
             foreach (var dep in deps)
             {
                 if (dep.DependencyProjectId == 0)
                     continue; // Skip NuGet refs with no indexed project
+                if (!processedProjectIds.Contains(dep.ConsumerProjectId))
+                    continue; // Only (re)write edges for the processed consumers (issue #44 for overlays)
                 dependencyStore.Insert(dep);
             }
             _log?.Invoke($"  {deps.Count} dependencies recorded");
@@ -963,7 +1059,7 @@ public sealed class IndexOrchestrator
         // and readable, so a failed/partial snapshot is never served as a branch head. The (unpublished)
         // staging run is abandoned on dispose; a later re-index of the same commit resets the snapshot to
         // pending and retries. Only the snapshot path gates here; the legacy mutable-row path is unchanged.
-        if (isFullIndex && compilationFailures > 0 && activeSnapshotId is long partialId && snapshotStore != null)
+        if ((isFullIndex || isOverlayRun) && compilationFailures > 0 && activeSnapshotId is long partialId && snapshotStore != null)
         {
             snapshotStore.MarkStatus(partialId, SnapshotStatus.Partial);
             session.Complete();
@@ -1009,6 +1105,22 @@ public sealed class IndexOrchestrator
             // returns to ~1x, first re-pointing their historical api-surface snapshots onto the new
             // snapshot's project rows so those comparisons survive the sweep (criterion 5 + Condition E).
             ReconcileLegacyRows(conn, publishId);
+        }
+
+        // Phase-10 overlay publish (issue #44): publish the overlay generation and advance the branch to
+        // it in the SAME transaction as the data and the run pointer, mirroring the full-index atomicity
+        // so MCP never reads a half-updated overlay. CRUCIALLY, the base snapshot is NEVER superseded:
+        // AdvanceBranchToOverlay only supersedes the branch's previous target when that target was itself
+        // an overlay (a prior working-tree delta being replaced by a newer one), so the committed base
+        // stays Complete and its shared rows remain readable.
+        if (isOverlayRun && activeSnapshotId is long overlayPublishId && snapshotStore != null
+            && repositoryId is long overlayRepoId && effectiveCtx != null)
+        {
+            if (snapshotStore.MarkComplete(overlayPublishId, completedAt) != 1)
+                throw new InvalidOperationException(
+                    $"Overlay snapshot {overlayPublishId} was not pending at publish; aborting to avoid a false completion.");
+
+            AdvanceBranchToOverlay(snapshotStore, overlayRepoId, effectiveCtx, overlayPublishId, completedAt);
         }
 
         session.Complete();
@@ -1161,6 +1273,27 @@ public sealed class IndexOrchestrator
     }
 
     /// <summary>
+    /// Advances a branch pointer to a just-published OVERLAY (Phase 10, issue #44). Identical to
+    /// <see cref="AdvanceBranchToSnapshot"/> EXCEPT it supersedes the branch's previous target only when
+    /// that target was itself an overlay — a committed base snapshot is NEVER superseded, so it stays
+    /// Complete and keeps serving the unchanged (shared) project rows the overlay layers on. Advancing
+    /// from base→overlay therefore leaves the base Complete; advancing overlay→overlay supersedes the
+    /// stale overlay so exactly one working-tree delta is selected at a time.
+    /// </summary>
+    private static void AdvanceBranchToOverlay(
+        SnapshotStore snapshotStore, long repositoryId, SnapshotContext ctx, long overlaySnapshotId, long completedAt)
+    {
+        var branchId = snapshotStore.EnsureBranch(repositoryId, ctx.BranchName, ctx.IsDefaultBranch, completedAt);
+        if (ctx.IsDefaultBranch)
+            snapshotStore.PromoteSoleDefaultBranch(repositoryId, branchId);
+        var previousSnapshot = snapshotStore.GetBranchSnapshotId(branchId);
+        snapshotStore.SetBranchPointer(branchId, overlaySnapshotId, completedAt);
+        if (previousSnapshot is long prev && prev != overlaySnapshotId
+            && snapshotStore.GetById(prev)?.IsOverlay == true)
+            snapshotStore.MarkStatus(prev, SnapshotStatus.Superseded);
+    }
+
+    /// <summary>
     /// Re-selects an existing, already-built immutable snapshot for a branch without rebuilding it — the
     /// idempotent duplicate-publish path (a Complete snapshot) and the branch-rollback / older-commit
     /// re-checkout path (a Superseded snapshot). Restores the snapshot to Complete (un-supersedes it) and
@@ -1174,7 +1307,23 @@ public sealed class IndexOrchestrator
         AdvanceBranchToSnapshot(snapshotStore, repositoryId, ctx, snapshotId, completedAt);
     }
 
-    private static SnapshotContext? TryResolveSnapshotContext(string? repoRoot)
+    /// <summary>
+    /// Re-selects an existing, already-built OVERLAY for a branch without rebuilding it — the Phase-10
+    /// idempotent overlay path (restart with the same dirty state, or re-applying a working-tree delta
+    /// that was previously built then superseded). Mirrors <see cref="SelectExistingSnapshot"/> but
+    /// re-points the branch through <see cref="AdvanceBranchToOverlay"/>, so it supersedes only a stale
+    /// OVERLAY the branch currently targets and NEVER the committed base (issue #44) — the branch may
+    /// legitimately point at the base at this moment (delta built, reverted to clean, then re-applied).
+    /// Never touches the overlay's data rows, so the immutable overlay stays byte-identical.
+    /// </summary>
+    private static void SelectExistingOverlay(
+        SnapshotStore snapshotStore, long repositoryId, SnapshotContext ctx, long overlaySnapshotId, long completedAt)
+    {
+        snapshotStore.MarkStatus(overlaySnapshotId, SnapshotStatus.Complete);
+        AdvanceBranchToOverlay(snapshotStore, repositoryId, ctx, overlaySnapshotId, completedAt);
+    }
+
+    internal static SnapshotContext? TryResolveSnapshotContext(string? repoRoot)
     {
         if (repoRoot == null) return null;
         var commit = GetHeadCommit(repoRoot);

@@ -25,6 +25,36 @@ public sealed class FileStore(SqliteConnection connection)
     private readonly Dictionary<long, string?> _repoRootByProject = new();
     private readonly Dictionary<(long ProjectId, string Path), long> _fileVersionCache = new();
 
+    // Issue #35 (TOCTOU): content hashes captured at ANALYSIS time, keyed by (project, repo-relative
+    // path). When the symbol phase opens a project's documents it captures each on-disk file's raw
+    // SHA-256 here BEFORE any file-version row is resolved; ResolveFileVersionId then prefers this
+    // captured hash over a fresh disk read, so the persisted file_versions.content_hash reflects the
+    // bytes analyzed, not whatever is on disk later at persist time. This closes the persist-time
+    // window where a file that changes between analysis and persistence would otherwise store a hash
+    // that never matches what was analyzed. (The residual load->capture window — a file changing
+    // between Roslyn's compilation load and this capture — is narrowed but not fully closed, since
+    // MSBuildWorkspace owns the load; it is documented and accepted.)
+    private readonly Dictionary<(long ProjectId, string Path), byte[]> _analyzedHashByKey = new();
+
+    /// <summary>
+    /// Captures (once) the raw-disk SHA-256 of an on-disk source file at analysis time and returns it,
+    /// so a later <see cref="ResolveFileVersionId"/> for the same path persists exactly these bytes'
+    /// hash rather than re-reading the (possibly drifted) file at persist time (issue #35). Idempotent
+    /// per (project, path): a repeated call returns the already-captured hash without re-reading disk.
+    /// </summary>
+    public byte[] CaptureAnalyzedHash(long projectId, string path)
+    {
+        var repoRoot = GetRepoRoot(projectId);
+        var repoRelative = SourcePaths.ToRepoRelative(repoRoot, path);
+        var key = (projectId, repoRelative);
+        if (_analyzedHashByKey.TryGetValue(key, out var existing))
+            return existing;
+
+        var hash = ComputeContentHash(repoRoot, repoRelative, path);
+        _analyzedHashByKey[key] = hash;
+        return hash;
+    }
+
     /// <summary>
     /// Resolves the file-version id for a source path within a project, creating the <c>files</c> and
     /// <c>file_versions</c> rows on first encounter. <paramref name="contentHash"/> is the raw SHA-256
@@ -52,12 +82,19 @@ public sealed class FileStore(SqliteConnection connection)
             return existing.Value;
         }
 
-        var hash = contentHash ?? ComputeContentHash(repoRoot, repoRelative, path);
+        var hash = contentHash ?? AnalyzedOrDiskHash(projectId, repoRoot, repoRelative, path);
         var fileId = UpsertFile(projectId, repoRelative);
         var fileVersionId = UpsertFileVersion(fileId, hash, lastIndexedAt);
         _fileVersionCache[cacheKey] = fileVersionId;
         return fileVersionId;
     }
+
+    // Prefer an analysis-time captured hash (issue #35) over a fresh disk read, so the persisted hash
+    // is the bytes analyzed rather than the bytes on disk at persist time.
+    private byte[] AnalyzedOrDiskHash(long projectId, string? repoRoot, string repoRelative, string path)
+        => _analyzedHashByKey.TryGetValue((projectId, repoRelative), out var captured)
+            ? captured
+            : ComputeContentHash(repoRoot, repoRelative, path);
 
     private long? FindExistingFileVersion(long projectId, string repoRelative)
     {
@@ -118,6 +155,8 @@ public sealed class FileStore(SqliteConnection connection)
 
         foreach (var key in _fileVersionCache.Keys.Where(k => k.ProjectId == projectId).ToList())
             _fileVersionCache.Remove(key);
+        foreach (var key in _analyzedHashByKey.Keys.Where(k => k.ProjectId == projectId).ToList())
+            _analyzedHashByKey.Remove(key);
     }
 
     /// <summary>Per-file content hashes for a project, keyed by reconstructed absolute path.</summary>

@@ -46,10 +46,25 @@ public sealed class IncrementalIndexer
         => IndexChangedFilesAsync(solution, changedFilePaths, default);
 
     /// <inheritdoc cref="IndexChangedFilesAsync(Solution, IReadOnlyList{string})" />
-    public async Task<List<string>> IndexChangedFilesAsync(
+    public Task<List<string>> IndexChangedFilesAsync(
         Solution solution,
         IReadOnlyList<string> changedFilePaths,
         CancellationToken cancellationToken)
+        => IndexChangedFilesAsync(solution, changedFilePaths, cancellationToken, overlay: null, snapshotContext: null);
+
+    /// <summary>
+    /// As <see cref="IndexChangedFilesAsync(Solution, IReadOnlyList{string}, CancellationToken)"/>, but
+    /// when <paramref name="overlay"/> is supplied the invalidated closure is staged as a Phase-10
+    /// OVERLAY generation layered on the committed base snapshot (issue #44) rather than mutating the
+    /// working head in place. <paramref name="snapshotContext"/> pins the repository/commit coordinates
+    /// (the reconciler resolves them once from git so the base lookup and the overlay identity agree).
+    /// </summary>
+    public async Task<List<string>> IndexChangedFilesAsync(
+        Solution solution,
+        IReadOnlyList<string> changedFilePaths,
+        CancellationToken cancellationToken,
+        OverlayContext? overlay,
+        SnapshotContext? snapshotContext)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
@@ -95,11 +110,26 @@ public sealed class IncrementalIndexer
                 // A changed or newly-created source file: invalidate every owning project whose stored
                 // fingerprint for it is missing or stale. An unchanged file (hash matches file_index)
                 // adds nothing, so a spurious watcher event or an unchanged restart schedules no work.
-                var hash = ComputeFileHash(path);
                 if (fileToCanonical.TryGetValue(path, out var owners))
                 {
+                    string? hash = null;
                     foreach (var canonicalId in owners)
                     {
+                        if (overlay != null)
+                        {
+                            // Overlay runs represent the FULL working-tree delta versus the committed
+                            // base snapshot. The reconciler only feeds paths git reports as differing
+                            // from HEAD (the base commit), so every such file's owning project genuinely
+                            // differs from the base and MUST be re-extracted into the overlay — never
+                            // left out-of-closure and then SHARED as the base's (clean) version. The
+                            // file_index hash is deliberately NOT consulted here: it reflects the LAST
+                            // overlay generation, not the base, so a project dirty-versus-base but
+                            // unchanged since the previous overlay would otherwise be wrongly shared from
+                            // the base and lose its edit across successive overlays (issue #44).
+                            affected.Add(canonicalId);
+                            continue;
+                        }
+                        hash ??= ComputeFileHash(path);
                         var entry = dbIdByCanonical.TryGetValue(canonicalId, out var dbId)
                             ? fileIndexStore.GetByProjectAndFile(dbId, path)
                             : null;
@@ -167,9 +197,11 @@ public sealed class IncrementalIndexer
         await new IndexOrchestrator(_db, _log, _useDocumentExtractor, _parallelism, _profile).IndexSolutionAsync(
             solution,
             progress: null,
-            metrics: new IndexingMetrics { Mode = "incremental", ChangedFileCount = affected.Count },
+            metrics: new IndexingMetrics { Mode = overlay != null ? "overlay" : "incremental", ChangedFileCount = affected.Count },
             cancellationToken: cancellationToken,
-            projectCanonicalFilter: closure);
+            projectCanonicalFilter: closure,
+            snapshotContext: snapshotContext,
+            overlay: overlay);
 
         return [];
     }

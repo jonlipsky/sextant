@@ -41,6 +41,18 @@ public sealed record SnapshotRow
     public required string Status { get; init; }
     public required long CreatedAt { get; init; }
     public long? PublishedAt { get; init; }
+
+    /// <summary>The committed base snapshot this overlay layers on, or null for a base/full snapshot (Phase 10).</summary>
+    public long? BaseSnapshotId { get; init; }
+
+    /// <summary>True for an overlay generation (Phase 10); false for a base/full one.</summary>
+    public bool IsOverlay { get; init; }
+
+    /// <summary>The dirty working-tree delta digest folded into the identity, or null for a clean tree (Phase 10, #43).</summary>
+    public string? WorkingTreeDelta { get; init; }
+
+    /// <summary>When Phase 10 fell back to a full local index for lack of a compatible base, the reason (criterion 5).</summary>
+    public string? FallbackReason { get; init; }
 }
 
 /// <summary>
@@ -133,7 +145,8 @@ public sealed class SnapshotStore(SqliteConnection connection)
     /// select-then-insert has no race.
     /// </summary>
     public (long id, bool existed, string status) BeginPending(
-        SnapshotIdentity identity, long repositoryId, long? commitId, long? runId, long now)
+        SnapshotIdentity identity, long repositoryId, long? commitId, long? runId, long now,
+        long? baseSnapshotId = null, string? fallbackReason = null)
     {
         var existing = GetByIdentityHash(identity.Hash);
         if (existing is not null)
@@ -143,8 +156,10 @@ public sealed class SnapshotStore(SqliteConnection connection)
         cmd.CommandText = """
             INSERT INTO snapshots
                 (repository_id, commit_id, run_id, identity_hash, tree_sha, schema_version,
-                 analyzer_version, config_hash, toolchain_fingerprint, status, created_at)
-            VALUES (@repo, @commit, @run, @hash, @tree, @schema, @analyzer, @config, @toolchain, @status, @now)
+                 analyzer_version, config_hash, toolchain_fingerprint, status, created_at,
+                 base_snapshot_id, is_overlay, working_tree_delta, fallback_reason)
+            VALUES (@repo, @commit, @run, @hash, @tree, @schema, @analyzer, @config, @toolchain, @status, @now,
+                    @base, @is_overlay, @delta, @fallback)
             RETURNING id;
             """;
         cmd.Parameters.AddWithValue("@repo", repositoryId);
@@ -158,6 +173,10 @@ public sealed class SnapshotStore(SqliteConnection connection)
         cmd.Parameters.AddWithValue("@toolchain", (object?)identity.ToolchainFingerprint ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@status", SnapshotStatus.Pending);
         cmd.Parameters.AddWithValue("@now", now);
+        cmd.Parameters.AddWithValue("@base", (object?)baseSnapshotId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@is_overlay", baseSnapshotId.HasValue ? 1 : 0);
+        cmd.Parameters.AddWithValue("@delta", (object?)identity.WorkingTreeDelta ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@fallback", (object?)fallbackReason ?? DBNull.Value);
         return ((long)cmd.ExecuteScalar()!, false, SnapshotStatus.Pending);
     }
 
@@ -377,11 +396,42 @@ public sealed class SnapshotStore(SqliteConnection connection)
         return rows;
     }
 
+    // ---- Phase-10 overlay support --------------------------------------------------------------
+
+    /// <summary>
+    /// The (base run id, base commit SHA) targets a Phase-10 overlay-base retention protection must
+    /// spare: for every branch-pointed OVERLAY, its committed base snapshot's generation
+    /// (<c>run_id</c>) and commit. A live overlay SHARES its base snapshot's unchanged project-version
+    /// rows (they are mapped into the overlay via <c>snapshot_projects</c> but physically belong to the
+    /// base's generation), so GC'ing the base generation would delete rows the selected overlay still
+    /// reads. This keeps the base pinned for as long as any branch points at an overlay layered on it.
+    /// </summary>
+    public IReadOnlyList<(long? runId, string? commitSha)> GetOverlayBaseProtectionTargets()
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT DISTINCT base.run_id, c.commit_sha
+            FROM branches b
+            JOIN snapshots o ON o.id = b.snapshot_id AND o.is_overlay = 1 AND o.base_snapshot_id IS NOT NULL
+            JOIN snapshots base ON base.id = o.base_snapshot_id
+            LEFT JOIN commits c ON c.id = base.commit_id
+            WHERE b.snapshot_id IS NOT NULL;
+            """;
+        var rows = new List<(long?, string?)>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            rows.Add((
+                reader.IsDBNull(0) ? null : reader.GetInt64(0),
+                reader.IsDBNull(1) ? null : reader.GetString(1)));
+        return rows;
+    }
+
     // ---- helpers -------------------------------------------------------------------------------
 
     private const string SelectSnapshot = """
         SELECT id, repository_id, commit_id, run_id, identity_hash, tree_sha, schema_version,
-               analyzer_version, config_hash, toolchain_fingerprint, status, created_at, published_at
+               analyzer_version, config_hash, toolchain_fingerprint, status, created_at, published_at,
+               base_snapshot_id, is_overlay, working_tree_delta, fallback_reason
         FROM snapshots
         """;
 
@@ -399,6 +449,10 @@ public sealed class SnapshotStore(SqliteConnection connection)
         ToolchainFingerprint = reader.IsDBNull(9) ? null : reader.GetString(9),
         Status = reader.GetString(10),
         CreatedAt = reader.GetInt64(11),
-        PublishedAt = reader.IsDBNull(12) ? null : reader.GetInt64(12)
+        PublishedAt = reader.IsDBNull(12) ? null : reader.GetInt64(12),
+        BaseSnapshotId = reader.IsDBNull(13) ? null : reader.GetInt64(13),
+        IsOverlay = !reader.IsDBNull(14) && reader.GetInt64(14) != 0,
+        WorkingTreeDelta = reader.IsDBNull(15) ? null : reader.GetString(15),
+        FallbackReason = reader.IsDBNull(16) ? null : reader.GetString(16)
     };
 }

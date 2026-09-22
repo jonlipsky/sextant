@@ -91,6 +91,16 @@ public sealed class ProjectStore(SqliteConnection connection)
         return cmd.ExecuteScalar() is long id ? id : null;
     }
 
+    /// <summary>
+    /// The existing project-version row for a (snapshot, logical project), or null. Used by the
+    /// Phase-10 overlay path to SHARE a base snapshot's unchanged project-version: rather than
+    /// re-extracting an out-of-closure project, the overlay maps the base's existing row into its own
+    /// <c>snapshot_projects</c>. Because the base row is never deleted or updated, the base snapshot
+    /// stays byte-identical (issue #44).
+    /// </summary>
+    public long? GetSnapshotProjectRow(long snapshotId, long logicalProjectId)
+        => FindSnapshotProjectRow(snapshotId, logicalProjectId);
+
     private static void BindIdentity(SqliteCommand cmd, ProjectIdentity project, long lastIndexedAt)
     {
         cmd.Parameters.AddWithValue("@git_remote_url", project.GitRemoteUrl);
@@ -142,10 +152,17 @@ public sealed class ProjectStore(SqliteConnection connection)
         using var cmd = connection.CreateCommand();
         if (selected is long snap)
         {
-            // A snapshot is selected: resolve the working row for this LOGICAL identity within it
-            // (Condition B — (snapshot_id, logical_project_id) resolution), never a stray legacy or
-            // other-snapshot row.
-            cmd.CommandText = SelectProject + " WHERE p.snapshot_id = @snap AND lp.canonical_id = @canon LIMIT 1;";
+            // A snapshot is selected: resolve the working row for this LOGICAL identity within it via
+            // its snapshot_projects membership — the SAME authoritative scope every other store uses
+            // (SnapshotReadScope). Resolving through membership (not the physical projects.snapshot_id
+            // column) is required for Phase-10 overlays: an overlay SHARES a base snapshot's unchanged
+            // project-version row, so that row's snapshot_id stays the BASE while it is mapped into the
+            // overlay via snapshot_projects. A projects.snapshot_id = @snap filter would drop every
+            // shared (unchanged) project under an overlay; membership resolution includes them. For a
+            // full snapshot the two are equivalent (every member row is tagged with @snap).
+            cmd.CommandText = SelectProject
+                + " WHERE p.id IN (SELECT project_id FROM snapshot_projects WHERE snapshot_id = @snap)"
+                + " AND lp.canonical_id = @canon LIMIT 1;";
             cmd.Parameters.AddWithValue("@snap", snap);
             cmd.Parameters.AddWithValue("@canon", canonicalId);
         }
@@ -179,8 +196,12 @@ public sealed class ProjectStore(SqliteConnection connection)
         if (selected is long snap)
         {
             // Default to the selected snapshot's project versions (criterion 6): a scope-less caller
-            // never iterates another (pending/superseded) snapshot's or a swept legacy row.
-            cmd.CommandText = SelectProject + " WHERE p.snapshot_id = @snap;";
+            // never iterates another (pending/superseded) snapshot's or a swept legacy row. Membership
+            // is resolved through snapshot_projects (not projects.snapshot_id) so an overlay's SHARED,
+            // unchanged project-version rows — which physically keep the base snapshot's id — are still
+            // enumerated (Phase-10 overlays). For a full snapshot the two are equivalent.
+            cmd.CommandText = SelectProject
+                + " WHERE p.id IN (SELECT project_id FROM snapshot_projects WHERE snapshot_id = @snap);";
             cmd.Parameters.AddWithValue("@snap", snap);
         }
         else

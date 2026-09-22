@@ -17,6 +17,13 @@ public static partial class SubmoduleDiscovery
     {
         var results = new List<SubmoduleInfo>();
 
+        // Fast path: submodules are defined in a top-level .gitmodules file. When it is absent the repo
+        // has no submodules and `git submodule status --recursive` would return nothing anyway, so skip
+        // the subprocess entirely — on git-for-windows that recursive submodule call is ~2s of helper
+        // bootstrap, and it otherwise runs on every incremental/overlay reindex of a submodule-free repo.
+        if (!File.Exists(Path.Combine(repoRoot, ".gitmodules")))
+            return results;
+
         var statusOutput = await RunGitAsync(repoRoot, "submodule status --recursive");
         if (string.IsNullOrWhiteSpace(statusOutput))
             return results;
