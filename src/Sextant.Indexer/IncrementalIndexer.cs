@@ -2,10 +2,16 @@ using System.Security.Cryptography;
 using Sextant.Core;
 using Sextant.Store;
 using Microsoft.CodeAnalysis;
-using Microsoft.Data.Sqlite;
 
 namespace Sextant.Indexer;
 
+/// <summary>
+/// Drives incremental re-indexing by computing the invalidated project closure for a set of changed
+/// files/config and delegating the actual rebuild to <see cref="IndexOrchestrator"/> with a
+/// canonical-id filter. Because both the full and incremental paths run the same extraction code, an
+/// incremental rebuild of a closure is canonically identical to the same projects in a full index —
+/// there is no second, divergent per-file extraction path to keep in sync (Phase 4).
+/// </summary>
 public sealed class IncrementalIndexer
 {
     private readonly IndexDatabase _db;
@@ -18,261 +24,200 @@ public sealed class IncrementalIndexer
     }
 
     /// <summary>
-    /// Returns the set of file paths whose signatures changed (callers may need re-resolution).
+    /// Reindexes the invalidated project closure implied by <paramref name="changedFilePaths"/> plus
+    /// any project whose evaluation fingerprint changed. Returns an empty list: the closure rebuild is
+    /// complete on return, so callers have no signature-changed follow-up set to re-enqueue (the whole
+    /// dependency closure was already rebuilt). The list return type is retained for API compatibility.
     /// </summary>
     public Task<List<string>> IndexChangedFilesAsync(
         Solution solution,
         IReadOnlyList<string> changedFilePaths)
         => IndexChangedFilesAsync(solution, changedFilePaths, default);
 
-    /// <summary>
-    /// Returns the set of file paths whose signatures changed (callers may need re-resolution).
-    /// </summary>
+    /// <inheritdoc cref="IndexChangedFilesAsync(Solution, IReadOnlyList{string})" />
     public async Task<List<string>> IndexChangedFilesAsync(
         Solution solution,
         IReadOnlyList<string> changedFilePaths,
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+
         var conn = _db.GetConnection();
-        var fileIndexStore = new FileIndexStore(conn);
-        var symbolStore = new SymbolStore(conn);
-        var referenceStore = new ReferenceStore(conn);
-        var callGraphStore = new CallGraphStore(conn);
-        var relationshipStore = new RelationshipStore(conn);
         var projectStore = new ProjectStore(conn);
-        var runStore = new IndexRunStore(conn);
+        var fileIndexStore = new FileIndexStore(conn);
 
-        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        var signatureChangedFiles = new List<string>();
+        // Resolve project identity exactly as IndexOrchestrator does, so the canonical ids we hand it
+        // as a filter line up with the ids it computes during registration.
+        var (repoRoot, submodules) = await ResolveRepoContextAsync(solution);
 
-        // Build Roslyn-project → stored-id mapping. Keyed by the Roslyn ProjectId so the multiple
-        // evaluated-TFM instances of one multi-targeted csproj resolve to distinct logical projects.
-        var projectRoslynToId = new Dictionary<ProjectId, long>();
+        var projectCanonicalById = new Dictionary<ProjectId, string>();
+        var dbIdByCanonical = new Dictionary<string, long>(StringComparer.Ordinal);
+        var canonicalByDbId = new Dictionary<long, string>();
         foreach (var project in solution.Projects)
         {
             if (project.FilePath == null) continue;
-            var targetFramework = ProjectIdentityFactory.ResolveEvaluatedTargetFramework(project);
-            var identity = GitRemoteResolver.Resolve(project.FilePath, targetFramework);
+            var identity = ProjectIdentityFactory.Create(project, submodules, repoRoot);
+            projectCanonicalById[project.Id] = identity.CanonicalId;
             var existing = projectStore.GetByCanonicalId(identity.CanonicalId);
             if (existing != null)
-                projectRoslynToId[project.Id] = existing.Value.id;
+            {
+                dbIdByCanonical[identity.CanonicalId] = existing.Value.id;
+                canonicalByDbId[existing.Value.id] = identity.CanonicalId;
+            }
         }
 
-        // Build a project-aware symbol catalog for the whole solution (needed for relationships/calls).
-        var catalog = new SymbolCatalog();
-        foreach (var project in solution.Projects)
+        // Map every current on-disk source file to the projects (per-TFM logical ids) that own it, so
+        // a shared/linked file invalidates each framework it participates in.
+        var fileToCanonical = BuildFileOwnershipMap(solution, projectCanonicalById);
+
+        var affected = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var rawPath in changedFilePaths)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (!projectRoslynToId.TryGetValue(project.Id, out var pid))
+            var path = rawPath;
+            if (string.IsNullOrEmpty(path) || SymbolExtractor.IsGeneratedFile(path))
                 continue;
-            var compilation = await project.GetCompilationAsync(cancellationToken);
-            if (compilation == null) continue;
-            foreach (var tree in compilation.SyntaxTrees)
+
+            if (File.Exists(path))
             {
-                var sm = compilation.GetSemanticModel(tree);
-                var root = await tree.GetRootAsync(cancellationToken);
-                foreach (var node in root.DescendantNodes())
+                // A changed or newly-created source file: invalidate every owning project whose stored
+                // fingerprint for it is missing or stale. An unchanged file (hash matches file_index)
+                // adds nothing, so a spurious watcher event or an unchanged restart schedules no work.
+                var hash = ComputeFileHash(path);
+                if (fileToCanonical.TryGetValue(path, out var owners))
                 {
-                    var declared = sm.GetDeclaredSymbol(node);
-                    if (declared == null || declared.IsImplicitlyDeclared) continue;
-                    if (SemanticSymbolKeyFactory.IsExcludedArtifact(declared)) continue;
-                    if (SymbolExtractor.MapSymbolKind(declared) == null) continue;
-                    var declKey = SemanticSymbolKeyFactory.DeclarationKey(declared);
-                    // Try to get existing ID from DB
-                    var existing = symbolStore.GetBySymbolKey(declKey, pid);
-                    if (existing != null)
-                        catalog.Add(pid, declKey, existing.Id);
+                    foreach (var canonicalId in owners)
+                    {
+                        var entry = dbIdByCanonical.TryGetValue(canonicalId, out var dbId)
+                            ? fileIndexStore.GetByProjectAndFile(dbId, path)
+                            : null;
+                        if (entry == null || entry.ContentHash != hash)
+                            affected.Add(canonicalId);
+                    }
+                }
+            }
+            else
+            {
+                // A deleted/renamed-away source file no longer has a Roslyn document, so recover its
+                // owning projects from the persisted file_index and rebuild them to purge stale rows.
+                foreach (var dbId in fileIndexStore.GetProjectIdsByFile(path))
+                {
+                    if (canonicalByDbId.TryGetValue(dbId, out var canonicalId))
+                        affected.Add(canonicalId);
                 }
             }
         }
 
-        var changedSet = new HashSet<string>(changedFilePaths, StringComparer.OrdinalIgnoreCase);
-
-        // Wrap the whole incremental delta in one bounded write session and staging generation.
-        // Each changed file is an atomic batch (delete stale rows + re-insert), committed at its
-        // boundary; the generation is published (and the WAL folded back) once every file succeeds.
-        using var runScope = runStore.BeginScope("incremental", now);
-        using var session = _db.BeginWriteSession();
-        using var symbolInsert = symbolStore.CreateInsertCommand();
-        using var relationshipInsert = relationshipStore.CreateInsertCommand();
-        using var callGraphInsert = callGraphStore.CreateInsertCommand();
-        session.Begin();
-
+        // Escalate any project whose evaluation inputs (csproj, Directory.Build.*, global.json,
+        // analyzer/editor config, restored assets) changed, even when no .cs byte changed.
         foreach (var project in solution.Projects)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (!projectRoslynToId.TryGetValue(project.Id, out var projectId))
+            if (project.FilePath == null
+                || !projectCanonicalById.TryGetValue(project.Id, out var canonicalId)
+                || !dbIdByCanonical.TryGetValue(canonicalId, out var dbId))
                 continue;
 
-            var compilation = await project.GetCompilationAsync(cancellationToken);
-            if (compilation == null) continue;
+            var current = EvaluationFingerprint.Compute(project.FilePath, repoRoot);
+            var stored = projectStore.GetEvaluationFingerprint(dbId);
+            if (!string.Equals(current, stored, StringComparison.Ordinal))
+                affected.Add(canonicalId);
+        }
 
-            foreach (var syntaxTree in compilation.SyntaxTrees)
+        if (affected.Count == 0)
+        {
+            _log?.Invoke("Incremental: no changed projects — nothing to reindex.");
+            return [];
+        }
+
+        // Expand to the undirected connected closure over the solution's project references, UNIONED
+        // with the previous index's persisted cross-project connectivity. Unioning the old edges is
+        // what lets a removed project reference (or a deleted cross-project usage) still pull the
+        // now-detached neighbour into the closure: its symbols still own the stale inbound reference
+        // rows, and only reprocessing it rebuilds them away. Old edges are read from persisted
+        // references (always recorded), so this holds even when project_dependencies is not populated.
+        var edges = new List<(string Consumer, string Dependency)>(
+            BuildDependencyEdges(solution, projectCanonicalById));
+        var referenceStore = new ReferenceStore(conn);
+        foreach (var (consumerDbId, dependencyDbId) in referenceStore.GetCrossProjectPairs())
+        {
+            if (canonicalByDbId.TryGetValue(consumerDbId, out var consumer)
+                && canonicalByDbId.TryGetValue(dependencyDbId, out var dependency))
+                edges.Add((consumer, dependency));
+        }
+        var adjacency = ProjectClosure.BuildUndirectedAdjacency(edges, StringComparer.Ordinal);
+        var closure = ProjectClosure.Expand(affected, adjacency, StringComparer.Ordinal);
+
+        _log?.Invoke($"Incremental: {affected.Count} changed project(s), rebuilding closure of {closure.Count}.");
+
+        // Delegate to the shared full-index extraction, restricted to the closure. This reuses the
+        // Phase 3 write session + index_runs generation ledger inside the orchestrator; the incremental
+        // path opens no transaction of its own.
+        await new IndexOrchestrator(_db, _log).IndexSolutionAsync(
+            solution,
+            progress: null,
+            metrics: new IndexingMetrics { Mode = "incremental", ChangedFileCount = affected.Count },
+            cancellationToken: cancellationToken,
+            projectCanonicalFilter: closure);
+
+        return [];
+    }
+
+    private static async Task<(string? repoRoot, List<SubmoduleInfo> submodules)> ResolveRepoContextAsync(
+        Solution solution)
+    {
+        var submodules = new List<SubmoduleInfo>();
+        string? repoRoot = null;
+        var firstProjectPath = solution.Projects.FirstOrDefault(p => p.FilePath != null)?.FilePath;
+        if (firstProjectPath != null)
+        {
+            repoRoot = GitRemoteResolver.ResolveGitRoot(firstProjectPath);
+            if (repoRoot != null)
+                submodules = await SubmoduleDiscovery.DiscoverAsync(repoRoot);
+        }
+        return (repoRoot, submodules);
+    }
+
+    private static Dictionary<string, List<string>> BuildFileOwnershipMap(
+        Solution solution,
+        Dictionary<ProjectId, string> projectCanonicalById)
+    {
+        var map = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var project in solution.Projects)
+        {
+            if (!projectCanonicalById.TryGetValue(project.Id, out var canonicalId))
+                continue;
+            foreach (var document in project.Documents)
             {
-                var filePath = syntaxTree.FilePath;
-                if (string.IsNullOrEmpty(filePath) || !changedSet.Contains(filePath))
+                var filePath = document.FilePath;
+                if (string.IsNullOrEmpty(filePath) || SymbolExtractor.IsGeneratedFile(filePath))
                     continue;
-
-                if (SymbolExtractor.IsGeneratedFile(filePath))
-                    continue;
-
-                // Compute content hash
-                var contentHash = ComputeFileHash(filePath);
-                var existingEntry = fileIndexStore.GetByProjectAndFile(projectId, filePath);
-
-                if (existingEntry != null && existingEntry.ContentHash == contentHash)
+                if (!map.TryGetValue(filePath, out var owners))
                 {
-                    _log?.Invoke($"  Skipping unchanged file: {filePath}");
-                    continue;
+                    owners = [];
+                    map[filePath] = owners;
                 }
-
-                _log?.Invoke($"  Re-indexing: {filePath}");
-                cancellationToken.ThrowIfCancellationRequested();
-
-                // Collect old signature hashes before deleting. Scope to this logical (per-TFM)
-                // project so a shared source file's sibling-framework symbols are not read as this
-                // project's old signatures.
-                var oldSymbols = symbolStore.GetByFile(filePath, projectId);
-                var oldSignatures = oldSymbols
-                    .Where(s => s.SignatureHash != null)
-                    .GroupBy(s => s.SymbolKey)
-                    .ToDictionary(g => g.Key, g => g.First().SignatureHash!);
-
-                // Delete stale data for this file, scoped to this logical (per-TFM) project so
-                // re-indexing one framework does not delete the sibling framework's rows for the
-                // same shared source file (the last-TFM-wins data-loss class this phase fixes).
-                relationshipStore.DeleteByFile(filePath, projectId);
-                symbolStore.DeleteByFile(filePath, projectId);
-                referenceStore.DeleteByFile(filePath, projectId);
-                callGraphStore.DeleteByFile(filePath, projectId);
-
-                // Re-extract symbols for this file
-                var semanticModel = compilation.GetSemanticModel(syntaxTree);
-                var root = await syntaxTree.GetRootAsync(cancellationToken);
-                var newSymbols = new List<Sextant.Core.SymbolInfo>();
-
-                foreach (var node in root.DescendantNodes())
-                {
-                    var declared = semanticModel.GetDeclaredSymbol(node);
-                    if (declared == null || declared.IsImplicitlyDeclared) continue;
-
-                    var kind = SymbolExtractor.MapSymbolKind(declared);
-                    if (kind == null) continue;
-
-                    var symbolInfo = SymbolExtractor.ExtractSymbolInfo(declared, projectId);
-                    if (symbolInfo == null) continue;
-
-                    var id = symbolStore.Insert(symbolInsert, symbolInfo);
-                    catalog.Add(projectId, symbolInfo.SymbolKey, id);
-                    symbolInfo.Id = id;
-                    newSymbols.Add(symbolInfo);
-                    session.RowsWritten();
-                }
-
-                // Check for signature changes
-                foreach (var newSym in newSymbols)
-                {
-                    if (newSym.SignatureHash != null &&
-                        oldSignatures.TryGetValue(newSym.SymbolKey, out var oldHash) &&
-                        oldHash != newSym.SignatureHash)
-                    {
-                        signatureChangedFiles.Add(filePath);
-                        break;
-                    }
-                }
-
-                // Re-extract relationships for types in this file
-                foreach (var node in root.DescendantNodes())
-                {
-                    if (semanticModel.GetDeclaredSymbol(node) is INamedTypeSymbol typeSymbol &&
-                        !typeSymbol.IsImplicitlyDeclared &&
-                        !SemanticSymbolKeyFactory.IsExcludedArtifact(typeSymbol))
-                    {
-                        var rels = RelationshipExtractor.ExtractRelationships(typeSymbol);
-                        var instantiates = RelationshipExtractor.ExtractInstantiates(typeSymbol, compilation);
-                        foreach (var (fromKey, toKey, relKind) in rels.Concat(instantiates))
-                        {
-                            if (catalog.TryResolveEdge(fromKey, projectId, out var fromId) &&
-                                catalog.TryResolveEdge(toKey, projectId, out var toId))
-                            {
-                                relationshipStore.Insert(relationshipInsert, new RelationshipInfo
-                                {
-                                    FromSymbolId = fromId,
-                                    ToSymbolId = toId,
-                                    Kind = relKind,
-                                    LastIndexedAt = now
-                                });
-                                session.RowsWritten();
-                            }
-                        }
-                    }
-                }
-
-                // Re-extract call graph for methods in this file
-                foreach (var node in root.DescendantNodes())
-                {
-                    var declared = semanticModel.GetDeclaredSymbol(node);
-                    if (declared is not IMethodSymbol methodSymbol || declared.IsImplicitlyDeclared)
-                        continue;
-
-                    var callerKey = SemanticSymbolKeyFactory.DeclarationKey(methodSymbol);
-                    if (!catalog.TryResolveEdge(callerKey, projectId, out var callerSymbolId))
-                        continue;
-
-                    var edges = await CallGraphBuilder.BuildCallGraphAsync(methodSymbol, project);
-                    foreach (var edge in edges)
-                    {
-                        if (catalog.TryResolveEdge(edge.CalleeKey, projectId, out var calleeSymbolId))
-                        {
-                            callGraphStore.Insert(callGraphInsert, new CallGraphEdge
-                            {
-                                CallerSymbolId = callerSymbolId,
-                                CalleeSymbolId = calleeSymbolId,
-                                CallSiteFile = edge.CallSiteFile,
-                                CallSiteLine = edge.CallSiteLine,
-                                LastIndexedAt = now
-                            });
-                            session.RowsWritten();
-                        }
-                    }
-                }
-
-                // Update file_index
-                fileIndexStore.Upsert(new FileIndexEntry
-                {
-                    ProjectId = projectId,
-                    FilePath = filePath,
-                    ContentHash = contentHash,
-                    LastIndexedAt = now
-                });
-                session.CommitBatch();
+                if (!owners.Contains(canonicalId, StringComparer.Ordinal))
+                    owners.Add(canonicalId);
             }
         }
+        return map;
+    }
 
-        // Publish the incremental generation atomically with the final file's data (see the orchestrator
-        // for the rationale). Refuse a no-op publish, then run checkpoint/footprint as best-effort
-        // post-publish maintenance so a maintenance failure never discards the successful result.
-        var completedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        if (runStore.MarkComplete(runScope.RunId, completedAt, projectRoslynToId.Count) != 1)
-            throw new InvalidOperationException(
-                $"Index run {runScope.RunId} was not in staging state at publish; aborting to avoid a false completion.");
-        session.Complete();
-        runScope.Detach();
-
-        var finalWalBytes = _db.WalBytes;
-        var finalShmBytes = _db.ShmBytes;
-        try
+    private static IEnumerable<(string Consumer, string Dependency)> BuildDependencyEdges(
+        Solution solution,
+        Dictionary<ProjectId, string> projectCanonicalById)
+    {
+        foreach (var project in solution.Projects)
         {
-            _db.Checkpoint();
-            runStore.RecordFootprint(runScope.RunId, _db.MainDbBytes, finalWalBytes, finalShmBytes);
+            if (!projectCanonicalById.TryGetValue(project.Id, out var consumer))
+                continue;
+            foreach (var reference in project.ProjectReferences)
+            {
+                if (projectCanonicalById.TryGetValue(reference.ProjectId, out var dependency))
+                    yield return (consumer, dependency);
+            }
         }
-        catch (SqliteException ex)
-        {
-            _log?.Invoke($"  Post-publish maintenance (checkpoint/footprint) failed, index already published: {ex.Message}");
-        }
-
-        return signatureChangedFiles;
     }
 
     public static string ComputeFileHash(string filePath)

@@ -9,12 +9,12 @@ public class ToolRegistryTests : IDisposable
     private readonly McpTestFixture _fixture = new();
 
     [TestMethod]
-    public void BuildAiTools_Returns10Tools()
+    public void BuildAiTools_Returns20Tools()
     {
         var registry = new ToolRegistry(_fixture.DbProvider);
         var tools = registry.BuildAiTools();
 
-        Assert.AreEqual(10, tools.Count);
+        Assert.AreEqual(20, tools.Count);
     }
 
     [TestMethod]

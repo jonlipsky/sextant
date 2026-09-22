@@ -9,12 +9,16 @@ public sealed class ApiSurfaceStore(SqliteConnection connection)
     {
         using var cmd = connection.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO api_surface_snapshots (project_id, symbol_id, signature_hash, captured_at, git_commit)
-            VALUES (@project_id, @symbol_id, @signature_hash, @captured_at, @git_commit)
+            INSERT INTO api_surface_snapshots
+                (project_id, symbol_id, symbol_key, fully_qualified_name, accessibility, signature_hash, captured_at, git_commit)
+            VALUES (@project_id, @symbol_id, @symbol_key, @fully_qualified_name, @accessibility, @signature_hash, @captured_at, @git_commit)
             RETURNING id;
             """;
         cmd.Parameters.AddWithValue("@project_id", snapshot.ProjectId);
-        cmd.Parameters.AddWithValue("@symbol_id", snapshot.SymbolId);
+        cmd.Parameters.AddWithValue("@symbol_id", (object?)snapshot.SymbolId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@symbol_key", snapshot.SymbolKey);
+        cmd.Parameters.AddWithValue("@fully_qualified_name", snapshot.FullyQualifiedName);
+        cmd.Parameters.AddWithValue("@accessibility", snapshot.Accessibility);
         cmd.Parameters.AddWithValue("@signature_hash", snapshot.SignatureHash);
         cmd.Parameters.AddWithValue("@captured_at", snapshot.CapturedAt);
         cmd.Parameters.AddWithValue("@git_commit", snapshot.GitCommit);
@@ -26,7 +30,8 @@ public sealed class ApiSurfaceStore(SqliteConnection connection)
     {
         using var cmd = connection.CreateCommand();
         cmd.CommandText = """
-            SELECT a.id, a.project_id, a.symbol_id, a.signature_hash, a.captured_at, a.git_commit
+            SELECT a.id, a.project_id, a.symbol_id, a.symbol_key, a.fully_qualified_name, a.accessibility,
+                   a.signature_hash, a.captured_at, a.git_commit
             FROM api_surface_snapshots a
             WHERE a.project_id = @project_id AND a.git_commit = @git_commit;
             """;
@@ -40,7 +45,8 @@ public sealed class ApiSurfaceStore(SqliteConnection connection)
     {
         using var cmd = connection.CreateCommand();
         cmd.CommandText = """
-            SELECT a.id, a.project_id, a.symbol_id, a.signature_hash, a.captured_at, a.git_commit
+            SELECT a.id, a.project_id, a.symbol_id, a.symbol_key, a.fully_qualified_name, a.accessibility,
+                   a.signature_hash, a.captured_at, a.git_commit
             FROM api_surface_snapshots a
             WHERE a.project_id = @project_id
               AND a.captured_at = (
@@ -85,10 +91,13 @@ public sealed class ApiSurfaceStore(SqliteConnection connection)
             {
                 Id = reader.GetInt64(0),
                 ProjectId = reader.GetInt64(1),
-                SymbolId = reader.GetInt64(2),
-                SignatureHash = reader.GetString(3),
-                CapturedAt = reader.GetInt64(4),
-                GitCommit = reader.GetString(5)
+                SymbolId = reader.IsDBNull(2) ? null : reader.GetInt64(2),
+                SymbolKey = reader.GetString(3),
+                FullyQualifiedName = reader.GetString(4),
+                Accessibility = reader.GetString(5),
+                SignatureHash = reader.GetString(6),
+                CapturedAt = reader.GetInt64(7),
+                GitCommit = reader.GetString(8)
             });
         }
         return results;

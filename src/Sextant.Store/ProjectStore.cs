@@ -33,6 +33,43 @@ public sealed class ProjectStore(SqliteConnection connection)
         return (long)cmd.ExecuteScalar()!;
     }
 
+    /// <summary>
+    /// Records the evaluation fingerprint (config/props/global.json/editorconfig/assets hash) for a
+    /// project. Kept separate from <see cref="Insert"/> so re-registration never overwrites a stored
+    /// fingerprint with a stale value; the indexer refreshes it only for projects it actually rebuilt.
+    /// </summary>
+    public void SetEvaluationFingerprint(long projectId, string? fingerprint)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "UPDATE projects SET evaluation_fingerprint = @fp WHERE id = @id;";
+        cmd.Parameters.AddWithValue("@fp", (object?)fingerprint ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@id", projectId);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>Reads the stored evaluation fingerprint for a project (null if never recorded).</summary>
+    public string? GetEvaluationFingerprint(long projectId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT evaluation_fingerprint FROM projects WHERE id = @id;";
+        cmd.Parameters.AddWithValue("@id", projectId);
+        var result = cmd.ExecuteScalar();
+        return result is string s ? s : null;
+    }
+
+    /// <summary>
+    /// Deletes a logical project row. Cascades (ON DELETE CASCADE) remove its symbols, references,
+    /// call edges, relationships, comments, file_index rows, dependency edges, solution mappings and
+    /// api-surface snapshots. Used to purge a project that was removed from the solution entirely.
+    /// </summary>
+    public void Delete(long projectId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "DELETE FROM projects WHERE id = @id;";
+        cmd.Parameters.AddWithValue("@id", projectId);
+        cmd.ExecuteNonQuery();
+    }
+
     public (long id, ProjectIdentity project, long lastIndexedAt)? GetByCanonicalId(string canonicalId)
     {
         using var cmd = connection.CreateCommand();

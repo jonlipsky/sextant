@@ -56,9 +56,11 @@ public static class GetImpactTool
             });
         }
 
-        // Check if this symbol is part of the API surface
+        // Check if this symbol is part of the API surface. Compare by stable semantic key rather than
+        // the volatile row id, so a snapshot whose soft symbol_id back-pointer was nulled by a later
+        // rebuild is still recognised as covering this symbol.
         var latestSnapshots = apiSurfaceStore.GetLatestByProject(symbol.ProjectId);
-        var isApiSurface = latestSnapshots.Any(s => s.SymbolId == symbol.Id);
+        var isApiSurface = latestSnapshots.Any(s => s.SymbolKey == symbol.SymbolKey);
 
         // Determine change classification
         string? changeClassification = null;
@@ -69,8 +71,8 @@ public static class GetImpactTool
             if (previousCommit != null)
             {
                 var oldSnapshots = apiSurfaceStore.GetByProjectAndCommit(symbol.ProjectId, previousCommit);
-                var oldSurface = BuildSurface(oldSnapshots, symbolStore);
-                var newSurface = BuildSurface(latestSnapshots, symbolStore);
+                var oldSurface = BuildSurface(oldSnapshots);
+                var newSurface = BuildSurface(latestSnapshots);
 
                 var changes = BreakingChangeDetector.DetectChanges(oldSurface, newSurface);
                 var overall = BreakingChangeDetector.GetOverallClassification(changes);
@@ -100,21 +102,19 @@ public static class GetImpactTool
     }
 
     private static List<(string fqn, string signatureHash, string accessibility)> BuildSurface(
-        List<Sextant.Core.ApiSurfaceSnapshot> snapshots,
-        SymbolStore symbolStore)
+        List<Sextant.Core.ApiSurfaceSnapshot> snapshots)
     {
+        // Snapshots are self-contained: fqn/accessibility/signature come from the row itself, not from
+        // the live symbol table, so a historical surface reconstructs correctly even after the working
+        // symbols were rebuilt (and their ids reassigned) since capture.
         var surface = new List<(string, string, string)>();
         foreach (var snapshot in snapshots)
         {
-            var sym = symbolStore.GetById(snapshot.SymbolId);
-            if (sym != null)
-            {
-                surface.Add((
-                    sym.FullyQualifiedName,
-                    snapshot.SignatureHash,
-                    SymbolStore.FormatAccessibility(sym.Accessibility)
-                ));
-            }
+            surface.Add((
+                snapshot.FullyQualifiedName,
+                snapshot.SignatureHash,
+                snapshot.Accessibility
+            ));
         }
         return surface;
     }

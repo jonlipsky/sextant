@@ -35,9 +35,7 @@ public class StressTests
     [TestCleanup]
     public void TestCleanup()
     {
-        _db.Dispose();
-        if (File.Exists(_dbPath))
-            File.Delete(_dbPath);
+        SqliteTestDatabase.Delete(_dbPath, _db);
     }
 
     [TestMethod]

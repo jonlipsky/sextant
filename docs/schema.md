@@ -22,14 +22,15 @@ Represents a .NET project (`.csproj`) in the index.
 | Column | Type | Description |
 |---|---|---|
 | `id` | `INTEGER PRIMARY KEY` | Auto-increment |
-| `canonical_id` | `TEXT UNIQUE NOT NULL` | SHA256 hash of `(git_remote_url, repo_relative_path)`, first 16 hex chars |
+| `canonical_id` | `TEXT UNIQUE NOT NULL` | SHA256 hash of `(git_remote_url, repo_relative_path, target_framework)`, first 16 hex chars — each evaluated TFM is a distinct logical project |
 | `git_remote_url` | `TEXT NOT NULL` | Normalized HTTPS remote URL |
 | `repo_relative_path` | `TEXT NOT NULL` | Path from git root to `.csproj` |
 | `disk_path` | `TEXT` | Absolute path on current machine |
 | `assembly_name` | `TEXT` | |
-| `target_framework` | `TEXT` | |
+| `target_framework` | `TEXT` | Evaluated per-instance TFM; part of project identity |
 | `is_test_project` | `INTEGER NOT NULL DEFAULT 0` | Boolean flag |
 | `last_indexed_at` | `INTEGER NOT NULL` | Unix epoch ms |
+| `evaluation_fingerprint` | `TEXT` | Hash of evaluation inputs (csproj, `Directory.Build.*`, `global.json`, package assets, analyzer/editor config) captured at index time; nullable = unknown/changed (migration `010`) |
 
 ### `symbols`
 
@@ -108,20 +109,23 @@ Inter-project dependency edges.
 
 ### `api_surface_snapshots`
 
-Point-in-time snapshots of public/protected API signatures for breaking change detection.
+Point-in-time snapshots of public/protected API signatures for breaking change detection. Each snapshot is **self-contained** (migration `009`): it stores the stable `symbol_key`, display FQN, and accessibility inline so a diff never needs to resolve a live symbol row, and historical commit snapshots survive a working-index rebuild (acceptance criterion 7). `symbol_id` is a nullable soft back-pointer to the current generation's row (`ON DELETE SET NULL`) — rebuilding symbols nulls it instead of cascade-deleting the snapshot.
 
 | Column | Type | Description |
 |---|---|---|
 | `id` | `INTEGER PRIMARY KEY` | |
-| `project_id` | `INTEGER NOT NULL` | FK to `projects.id` |
-| `symbol_id` | `INTEGER NOT NULL` | FK to `symbols.id` |
+| `project_id` | `INTEGER NOT NULL` | FK to `projects.id`, `ON DELETE CASCADE` |
+| `symbol_id` | `INTEGER` | Nullable FK to `symbols.id`, `ON DELETE SET NULL` |
+| `symbol_key` | `TEXT NOT NULL` | Stable semantic key, captured inline |
+| `fully_qualified_name` | `TEXT NOT NULL` | Display FQN, captured inline |
+| `accessibility` | `TEXT NOT NULL` | Captured inline |
 | `signature_hash` | `TEXT NOT NULL` | |
 | `captured_at` | `INTEGER NOT NULL` | Unix epoch ms |
 | `git_commit` | `TEXT NOT NULL` | HEAD SHA at capture time |
 
 ### `file_index`
 
-Tracks file content hashes for incremental indexing.
+Tracks file content hashes for incremental indexing. **Populated during initial (full) indexing**, not only incrementally: the symbol phase seeds one row per indexed document so a subsequent daemon restart can short-circuit unchanged files (acceptance criteria 1–2).
 
 | Column | Type | Description |
 |---|---|---|
@@ -132,6 +136,8 @@ Tracks file content hashes for incremental indexing.
 | `last_indexed_at` | `INTEGER NOT NULL` | Unix epoch ms |
 
 Unique constraint: `(project_id, file_path)`.
+
+File-content hashes alone do not capture configuration changes (an edited `Directory.Build.props`, `global.json`, restored package assets, or analyzer/editor config leaves every `.cs` byte-identical). The per-project `projects.evaluation_fingerprint` column (migration `010`) hashes those evaluation inputs at index time; startup catch-up recomputes it from disk and escalates a project whose fingerprint changed to a full project rebuild (acceptance criterion 6). A null fingerprint means "unknown" and is treated as changed.
 
 ## Full-Text Search
 

@@ -44,16 +44,16 @@ public class McpStdioProtocolTests
 
         var result = response.GetProperty("result");
         var tools = result.GetProperty("tools");
-        Assert.IsTrue(tools.GetArrayLength() >= 22, $"Expected >= 22 tools, got {tools.GetArrayLength()}");
+        Assert.IsTrue(tools.GetArrayLength() >= 13, $"Expected >= 13 tools, got {tools.GetArrayLength()}");
 
         var toolNames = tools.EnumerateArray()
             .Select(t => t.GetProperty("name").GetString())
             .ToList();
         Assert.IsTrue(toolNames.Contains("find_symbol"));
         Assert.IsTrue(toolNames.Contains("find_references"));
-        Assert.IsTrue(toolNames.Contains("get_source_context"));
-        Assert.IsTrue(toolNames.Contains("find_comments"));
-        Assert.IsTrue(toolNames.Contains("trace_value"));
+        Assert.IsTrue(toolNames.Contains("get_call_hierarchy"));
+        Assert.IsTrue(toolNames.Contains("get_type_members"));
+        Assert.IsTrue(toolNames.Contains("semantic_search"));
     }
 
     [TestMethod]

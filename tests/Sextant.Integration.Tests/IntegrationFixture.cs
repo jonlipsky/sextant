@@ -32,8 +32,7 @@ public class IntegrationFixture
         if (Instance == null) return Task.CompletedTask;
 
         Instance.DbProvider?.Dispose();
-        if (File.Exists(Instance.DbPath))
-            File.Delete(Instance.DbPath);
+        SqliteTestDatabase.Delete(Instance.DbPath);
         return Task.CompletedTask;
     }
 

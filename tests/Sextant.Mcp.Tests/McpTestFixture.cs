@@ -411,8 +411,6 @@ public class McpTestFixture : IDisposable
     public void Dispose()
     {
         DbProvider.Dispose();
-        Db.Dispose();
-        if (File.Exists(DbPath))
-            File.Delete(DbPath);
+        SqliteTestDatabase.Delete(DbPath, Db);
     }
 }

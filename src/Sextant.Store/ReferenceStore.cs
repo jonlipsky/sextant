@@ -55,6 +55,30 @@ public sealed class ReferenceStore(SqliteConnection connection)
         return ReadAll(cmd);
     }
 
+    /// <summary>
+    /// Returns the distinct (consumerProjectId, dependencyProjectId) pairs implied by the persisted
+    /// cross-project references: a reference row whose usage site (in_project_id) differs from the
+    /// project that owns the referenced symbol (symbols.project_id). Incremental reindexing unions
+    /// these OLD edges into the invalidation closure so that after a removed project reference (or a
+    /// deleted cross-project usage) the previously-referenced project is reprocessed too, letting its
+    /// reference extraction rebuild away the now-stale inbound rows its symbols still own.
+    /// </summary>
+    public List<(long ConsumerProjectId, long DependencyProjectId)> GetCrossProjectPairs()
+    {
+        var pairs = new List<(long, long)>();
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT DISTINCT r.in_project_id AS consumer, s.project_id AS dependency
+            FROM "references" r
+            JOIN symbols s ON s.id = r.symbol_id
+            WHERE r.in_project_id != s.project_id;
+            """;
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            pairs.Add((reader.GetInt64(0), reader.GetInt64(1)));
+        return pairs;
+    }
+
     public void DeleteByFile(string filePath)
     {
         using var cmd = connection.CreateCommand();
