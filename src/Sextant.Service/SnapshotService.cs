@@ -1,6 +1,9 @@
 using Microsoft.Data.Sqlite;
 using Sextant.Core.Platform;
+using Sextant.Service.Backup;
 using Sextant.Service.Contributions;
+using Sextant.Service.Observability;
+using Sextant.Service.Rollout;
 using Sextant.Store;
 
 namespace Sextant.Service;
@@ -33,6 +36,7 @@ public sealed class SnapshotService : IDisposable
     private readonly IContributionAuthorizer _authorizer;
     private readonly IGitContentProvider _gitContent;
     private readonly ContributionPolicy _contributionPolicy;
+    private readonly ServiceMetrics _metrics = new();
     private bool _disposed;
 
     private SnapshotService(
@@ -53,6 +57,24 @@ public sealed class SnapshotService : IDisposable
     }
 
     public ServicePaths Paths => _paths;
+
+    /// <summary>The live in-process metric counters (criterion 5), shared with the host query-timing middleware.</summary>
+    public ServiceMetrics Metrics => _metrics;
+
+    /// <summary>
+    /// True once startup recovery + reconciliation completed on this instance (set by
+    /// <see cref="ReconcileOnStartup"/>). The pilot-readiness gate uses it as the criterion-3 signal.
+    /// </summary>
+    public bool RecoveryCompleted { get; private set; }
+
+    /// <summary>
+    /// Whether OS-hard, out-of-process worker isolation (issue #76) is available on this build. It is a
+    /// SERVICE capability, never a request parameter — the pilot gate reads it here so a caller cannot
+    /// assert the #76 hard precondition into existence. Currently always false: #76 is open and this build
+    /// ships only the in-process defense-in-depth sandbox. When #76 lands, this reflects the worker's real
+    /// isolation capability.
+    /// </summary>
+    public bool HardOsIsolationAvailable => false;
 
     /// <summary>The writer-lease token this service instance holds (identifies jobs it owns).</summary>
     public string OwnerToken => _lease.OwnerToken;
@@ -138,25 +160,47 @@ public sealed class SnapshotService : IDisposable
         var reconciled = WithWrite(() =>
         {
             var jobs = new SnapshotJobStore(_conn);
-            return jobs.ReconcileOrphanedJobs(_lease.OwnerToken)
-                 + jobs.ReconcilePhantomTerminalJobs();
+            var count = jobs.ReconcileOrphanedJobs(_lease.OwnerToken)
+                      + jobs.ReconcilePhantomTerminalJobs();
+            // Durable audit trail of the recovery action (criterion 5). Service-wide (no repository scope).
+            new AuditLogStore(_conn).Append(
+                AuditAction.Reconcile, AuditOutcome.Complete, detail: $"reconciled_{count}");
+            return count;
         });
 
         // Best-effort scratch sweep OUTSIDE the write transaction (filesystem, not catalog state); confined
         // to the scratch root so it can never touch a persistent volume.
         _paths.SweepOrphanedScratch();
 
+        RecoveryCompleted = true;
         return reconciled;
     }
 
     /// <summary>
-    /// Idempotently ensures a committed-branch snapshot exists (acceptance criterion 1). Repeated requests
-    /// for the same identity attach to the ONE durable job. If a compatible complete snapshot already
-    /// exists it is returned immediately; otherwise the pluggable worker produces one under a per-job
-    /// scratch directory, whose output is validated and published through the catalog, with a terminal job
-    /// status + per-project diagnostics recorded (criterion 5).
+    /// Idempotently ensures a committed-branch snapshot exists (acceptance criterion 1), recording the
+    /// observability signals around it: an ensure-latency trace span, the idempotent-reuse counter
+    /// (criterion 5, cache reuse), and a durable audit row attributing the outcome and worker cost to the
+    /// requested repository scope (criterion 5, audit + cost attribution). <paramref name="principal"/> is
+    /// the control-plane bearer the host authenticated; it is stored ONLY as a non-reversible hash.
     /// </summary>
     public async Task<EnsureSnapshotResult> EnsureSnapshotAsync(
+        EnsureSnapshotRequest request, CancellationToken cancellationToken = default, string? principal = null)
+    {
+        using var activity = ServiceTelemetry.Source.StartActivity("ensure_snapshot");
+        activity?.SetTag("sextant.repository", request.RepositoryRemoteUrl);
+        activity?.SetTag("sextant.commit", request.CommitSha);
+
+        var result = await EnsureSnapshotCoreAsync(request, cancellationToken).ConfigureAwait(false);
+
+        _metrics.RecordEnsure(result.Attached);
+        activity?.SetTag("sextant.status", result.Status);
+        activity?.SetTag("sextant.attached", result.Attached);
+        RecordEnsureAudit(request, result, principal);
+        return result;
+    }
+
+    // The idempotent-ensure core (unchanged behavior). Wrapped by EnsureSnapshotAsync for observability.
+    private async Task<EnsureSnapshotResult> EnsureSnapshotCoreAsync(
         EnsureSnapshotRequest request, CancellationToken cancellationToken = default)
     {
         var identity = request.ToIdentity(_options.DefaultConfigHash, _options.DefaultCapabilityFingerprint);
@@ -727,12 +771,106 @@ public sealed class SnapshotService : IDisposable
     /// retained consumer's providers. The service is the natural lease owner, so this can never race a live
     /// writer.
     /// </summary>
-    public RetentionReport RunRetention(bool execute)
+    public RetentionReport RunRetention(bool execute, string? principal = null)
     {
+        using var activity = ServiceTelemetry.Source.StartActivity("retention");
+        activity?.SetTag("sextant.execute", execute);
         return WithWrite(() =>
         {
             var retention = new RetentionService(_conn, _options.Retention);
-            return execute ? retention.Execute() : retention.Plan();
+            var report = execute ? retention.Execute() : retention.Plan();
+            // Service-wide audit row (no single repository scope). Records the operator + whether it was a
+            // dry-run plan or an executed GC pass (criterion 5, audit).
+            new AuditLogStore(_conn).Append(
+                AuditAction.Retention, AuditOutcome.Complete,
+                actor: AuditLogStore.HashActor(principal),
+                detail: execute ? "execute" : "plan");
+            return report;
+        });
+    }
+
+    /// <summary>
+    /// Collects a point-in-time observability snapshot (criterion 5) — indexing latency, queue delay,
+    /// success/completeness, worker capacity, storage, cache reuse, query latency, alerts, and per-
+    /// repository cost attribution. Reads through an INDEPENDENT read connection so collecting metrics
+    /// never blocks the writer or a running index. OPERATOR-ONLY data — the host exposes it on the control
+    /// plane only (criterion-1 leakage guard).
+    /// </summary>
+    public MetricsSnapshot CollectMetrics(AlertThresholds? thresholds = null)
+    {
+        using var conn = OpenReadConnection();
+        var collector = new MetricsCollector(conn, _paths, _options.CatalogDbPath, _metrics, HasWorkerCapacity);
+        return collector.Collect(thresholds);
+    }
+
+    /// <summary>
+    /// Returns the most recent audit rows (criterion 5, security audit trail). OPERATOR-ONLY — the host
+    /// gates this behind the CONTROL token, never the query token, so a query-plane tenant can never read
+    /// another tenant's audit rows (criterion-1 leakage guard).
+    /// </summary>
+    public IReadOnlyList<AuditEntry> RecentAudit(
+        int limit = 100, string? action = null, string? repositoryScope = null)
+    {
+        using var conn = OpenReadConnection();
+        return new AuditLogStore(conn).Recent(limit, action, repositoryScope);
+    }
+
+    /// <summary>Per-repository cost attribution rolled up from the audit log (criterion 5). OPERATOR-ONLY.</summary>
+    public IReadOnlyList<AuditCostAttribution> CostAttribution()
+    {
+        using var conn = OpenReadConnection();
+        return new AuditLogStore(conn).CostByRepository();
+    }
+
+    /// <summary>
+    /// Writes a consistent backup of the catalog + immutable artifact volume into
+    /// <paramref name="destinationDir"/> (criterion 6). Runs under the writer gate so the online catalog
+    /// copy races no concurrent write, and records a durable audit row. The backup NEVER contains secrets;
+    /// the manifest documents the credentials boundary an operator re-provides on restore.
+    /// </summary>
+    public BackupManifest CreateBackup(string destinationDir, string? principal = null)
+    {
+        using var activity = ServiceTelemetry.Source.StartActivity("backup");
+        return WithWrite(() =>
+        {
+            var manifest = ServiceBackup.Create(
+                _conn, IndexDatabase.LatestSchemaVersion, _paths, destinationDir,
+                configFingerprint: _options.DefaultConfigHash ?? "none");
+            new AuditLogStore(_conn).Append(
+                AuditAction.Backup, AuditOutcome.Complete,
+                actor: AuditLogStore.HashActor(principal),
+                detail: $"schema_{manifest.SchemaVersion}");
+            return manifest;
+        });
+    }
+
+    /// <summary>
+    /// Evaluates whether this service meets its documented pilot exit criteria + rollback preconditions for
+    /// the given workload class (criterion 7), so the go/no-go decision is EXERCISED rather than only
+    /// written down. Every capability is derived from the service's ACTUAL state — never a request
+    /// parameter: the issue-#76 hard precondition (an UNTRUSTED multi-tenant pilot is not ready until
+    /// out-of-process OS-hard worker isolation exists — the current sandbox is in-process defense-in-depth)
+    /// reads <see cref="HardOsIsolationAvailable"/>; the DR-proven signal reads a durable successful backup
+    /// row from the audit log; the control-plane-secured signal reads whether a control token is configured.
+    /// </summary>
+    public PilotReadinessReport EvaluatePilotReadiness(PilotWorkloadClass workloadClass)
+    {
+        var metrics = CollectMetrics();
+        bool recentBackup;
+        using (var conn = OpenReadConnection())
+            recentBackup = new AuditLogStore(conn).HasAction(AuditAction.Backup, AuditOutcome.Complete);
+
+        return PilotReadiness.Evaluate(new PilotReadinessInput
+        {
+            WorkloadClass = workloadClass,
+            AuthorizationEnabled = _options.ReadPolicy.Enabled,
+            ControlPlaneSecured = _options.ControlToken is { Length: > 0 },
+            SandboxEnforced = _options.Sandbox.Enabled,
+            HardOsIsolationAvailable = HardOsIsolationAvailable,
+            RecentBackupAvailable = recentBackup,
+            CatalogRecovered = RecoveryCompleted,
+            WorkerCapacityAvailable = HasWorkerCapacity,
+            Alerts = metrics.Alerts
         });
     }
 
@@ -863,6 +1001,59 @@ public sealed class SnapshotService : IDisposable
         Code = "worker_exception",
         Message = message
     };
+
+    // Records the durable audit row for an ensure request (criterion 5): outcome + repository scope +
+    // worker cost (index milliseconds), attributed to the requesting principal's non-reversible hash. Cost
+    // is recorded only for a job that actually RAN (an attach reuses prior work and has no new cost).
+    private void RecordEnsureAudit(EnsureSnapshotRequest request, EnsureSnapshotResult result, string? principal)
+    {
+        WithWrite(() =>
+        {
+            var job = new SnapshotJobStore(_conn).GetJob(result.JobId);
+            long? costMs = !result.Attached && job is { StartedAt: long s, CompletedAt: long c } && c >= s
+                ? c - s
+                : null;
+            new AuditLogStore(_conn).Append(
+                AuditAction.Ensure,
+                MapOutcome(result.Status),
+                actor: AuditLogStore.HashActor(principal),
+                repositoryScope: request.RepositoryRemoteUrl,
+                detail: $"job_{result.JobId}",
+                costIndexMs: costMs);
+            return 0;
+        });
+    }
+
+    // Maps a job status to an audit outcome. Non-terminal (queued/running) is recorded as accepted;
+    // cancelled is recorded as error (it carries no usable result).
+    private static string MapOutcome(string status) => status switch
+    {
+        SnapshotJobStatus.Complete => AuditOutcome.Complete,
+        SnapshotJobStatus.Partial => AuditOutcome.Partial,
+        SnapshotJobStatus.Failed => AuditOutcome.Failed,
+        SnapshotJobStatus.Unsupported => AuditOutcome.Unsupported,
+        SnapshotJobStatus.Cancelled => AuditOutcome.Error,
+        _ => AuditOutcome.Accepted
+    };
+
+    // An independent, short-lived READ connection to the catalog for metrics/audit reads, so operator
+    // observability never contends with the writer (WAL supports concurrent readers). Read-only mode so a
+    // metrics read can never mutate the catalog.
+    private SqliteConnection OpenReadConnection()
+    {
+        var connectionString = new SqliteConnectionStringBuilder
+        {
+            DataSource = _options.CatalogDbPath,
+            Mode = SqliteOpenMode.ReadOnly,
+            Pooling = true
+        }.ToString();
+        var conn = new SqliteConnection(connectionString);
+        conn.Open();
+        using var pragma = conn.CreateCommand();
+        pragma.CommandText = "PRAGMA busy_timeout = 5000;";
+        pragma.ExecuteNonQuery();
+        return conn;
+    }
 
     private T WithWrite<T>(Func<T> work)
     {

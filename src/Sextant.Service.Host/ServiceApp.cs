@@ -6,6 +6,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Sextant.Mcp;
 using Sextant.Mcp.Tools;
 using Sextant.Service;
+using Sextant.Service.Observability;
 using Sextant.Store;
 
 namespace Sextant.Service.Host;
@@ -132,6 +133,39 @@ public static class ServiceApp
             await next();
         });
 
+        // Query-plane latency instrumentation (criterion 5, query latency): times /mcp + /query requests
+        // and feeds the live ServiceMetrics histogram. Runs only for the query planes so control-plane
+        // operator calls do not pollute the query-latency signal. A request counts as FAILED when it
+        // returns a 5xx OR when the pipeline throws — an unhandled exception unwinds through this finally
+        // while the response status is still 200, so we must observe the throw explicitly rather than
+        // trusting the status code, otherwise server-side faults would be mis-recorded as successes.
+        app.Use(async (context, next) =>
+        {
+            var path = context.Request.Path;
+            if (!path.StartsWithSegments("/mcp") && !path.StartsWithSegments("/query"))
+            {
+                await next();
+                return;
+            }
+            var started = System.Diagnostics.Stopwatch.GetTimestamp();
+            var threw = false;
+            try
+            {
+                await next();
+            }
+            catch
+            {
+                threw = true;
+                throw;
+            }
+            finally
+            {
+                var elapsedMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+                var service = context.RequestServices.GetService<SnapshotService>();
+                service?.Metrics.RecordQuery(elapsedMs, failed: threw || context.Response.StatusCode >= 500);
+            }
+        });
+
         MapHealth(app);
         MapControl(app);
         MapQuery(app, options);
@@ -157,9 +191,9 @@ public static class ServiceApp
     {
         var control = app.MapGroup("/control");
 
-        control.MapPost("/ensure", async (EnsureSnapshotRequest request, SnapshotService service, CancellationToken ct) =>
+        control.MapPost("/ensure", async (EnsureSnapshotRequest request, HttpRequest req, SnapshotService service, CancellationToken ct) =>
         {
-            var result = await service.EnsureSnapshotAsync(request, ct);
+            var result = await service.EnsureSnapshotAsync(request, ct, ExtractBearer(req));
             return Results.Json(result, ServiceJson.Options);
         });
 
@@ -175,10 +209,54 @@ public static class ServiceApp
             return row is null ? Results.NotFound() : Results.Json(row, ServiceJson.Options);
         });
 
-        control.MapPost("/retention", (bool? execute, SnapshotService service) =>
+        control.MapPost("/retention", (bool? execute, HttpRequest req, SnapshotService service) =>
         {
-            var report = service.RunRetention(execute ?? false);
+            var report = service.RunRetention(execute ?? false, ExtractBearer(req));
             return Results.Json(report, ServiceJson.Options);
+        });
+
+        // Observability surface (criterion 5). These live under /control so they inherit the CONTROL-token
+        // gate — they are OPERATOR-ONLY and must NEVER be reachable by a query-plane tenant, because they
+        // aggregate cross-tenant repository scopes, counts, and cost (criterion-1 leakage guard).
+
+        // Metrics: JSON by default, or Prometheus text exposition with ?format=prometheus for a scraper.
+        control.MapGet("/metrics", (string? format, SnapshotService service) =>
+        {
+            var snapshot = service.CollectMetrics();
+            return string.Equals(format, "prometheus", StringComparison.OrdinalIgnoreCase)
+                ? Results.Text(PrometheusExposition.Render(snapshot), "text/plain; version=0.0.4")
+                : Results.Json(snapshot, ServiceJson.Options);
+        });
+
+        // Durable audit trail (security + cost attribution). Optional action/repository filters.
+        control.MapGet("/audit", (int? limit, string? action, string? repository, SnapshotService service) =>
+        {
+            var entries = service.RecentAudit(limit ?? 100, action, repository);
+            return Results.Json(new { entries, result_count = entries.Count }, ServiceJson.Options);
+        });
+
+        // Pilot readiness gate (criterion 7): evaluates the documented exit criteria for a workload class,
+        // including the issue-#76 hard precondition for untrusted multi-tenant pilots. The security-
+        // relevant capabilities (#76 hard isolation, a proven backup, a secured control plane) are derived
+        // from the SERVICE's actual state, never from request parameters — a caller must not be able to
+        // assert the #76 precondition into existence by passing a query flag.
+        control.MapGet("/pilot", (string? workload, SnapshotService service) =>
+        {
+            var workloadClass = string.Equals(workload, "untrusted", StringComparison.OrdinalIgnoreCase)
+                ? Rollout.PilotWorkloadClass.UntrustedMultiTenant
+                : Rollout.PilotWorkloadClass.TrustedSingleTenant;
+            var report = service.EvaluatePilotReadiness(workloadClass);
+            return Results.Json(report, ServiceJson.Options);
+        });
+
+        // Backup (criterion 6). Writes a consistent catalog + artifact backup to the requested directory.
+        // Restore runs OFFLINE via `sextant service restore` (it must precede service startup).
+        control.MapPost("/backup", (string dir, HttpRequest req, SnapshotService service) =>
+        {
+            if (string.IsNullOrWhiteSpace(dir))
+                return Results.BadRequest("query parameter 'dir' is required.");
+            var manifest = service.CreateBackup(dir, ExtractBearer(req));
+            return Results.Json(manifest, ServiceJson.Options);
         });
 
         // Client/CI contribution ingest (Phase 16). The raw artifact bytes are the request body; finalize /
