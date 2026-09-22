@@ -58,4 +58,30 @@ public class SnapshotIdentityTests
             Identity("delta_x", isOverlay: true).Hash,
             "the same overlay inputs must recompute the same identity (idempotent restart)");
     }
+
+    [TestMethod]
+    public void CapabilityFingerprint_FoldedOnlyWhenSet_LocalIdentityUnchanged()
+    {
+        // Phase 15 / CRITICAL 2: a null capability (local/single-node run) must leave the identity
+        // byte-identical to before the field existed, while a non-null capability changes it.
+        var withoutCapability = Identity(delta: null, isOverlay: false);
+        var withCapability = withoutCapability with { CapabilityFingerprint = "cap-linux" };
+
+        Assert.AreNotEqual(withoutCapability.Hash, withCapability.Hash,
+            "a set capability fingerprint must change the identity (criterion 5 gate)");
+
+        var nullCapabilityExplicit = withoutCapability with { CapabilityFingerprint = null };
+        Assert.AreEqual(withoutCapability.Hash, nullCapabilityExplicit.Hash,
+            "a null capability must not perturb the identity (local path unchanged)");
+    }
+
+    [TestMethod]
+    public void DifferentCapabilities_ProduceDistinctIdentities()
+    {
+        var linuxBuilt = Identity(delta: null, isOverlay: false) with { CapabilityFingerprint = "cap-linux" };
+        var windowsBuilt = Identity(delta: null, isOverlay: false) with { CapabilityFingerprint = "cap-windows" };
+
+        Assert.AreNotEqual(linuxBuilt.Hash, windowsBuilt.Hash,
+            "snapshots built under different worker capabilities must not share an identity");
+    }
 }

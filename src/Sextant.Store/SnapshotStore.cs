@@ -42,6 +42,13 @@ public sealed record SnapshotRow
     public required long CreatedAt { get; init; }
     public long? PublishedAt { get; init; }
 
+    /// <summary>
+    /// The Phase-15 worker-capability fingerprint of the worker that produced this snapshot, or null for
+    /// a local/single-node run that did not route. Recorded in provenance and folded into the snapshot
+    /// identity only when non-null, so an incompatible-capability reuse is blocked (criterion 5).
+    /// </summary>
+    public string? CapabilityFingerprint { get; init; }
+
     /// <summary>The committed base snapshot this overlay layers on, or null for a base/full snapshot (Phase 10).</summary>
     public long? BaseSnapshotId { get; init; }
 
@@ -188,9 +195,10 @@ public sealed class SnapshotStore(SqliteConnection connection)
             INSERT INTO snapshots
                 (repository_id, commit_id, run_id, identity_hash, tree_sha, schema_version,
                  analyzer_version, config_hash, toolchain_fingerprint, status, created_at,
-                 base_snapshot_id, is_overlay, working_tree_delta, fallback_reason, is_provider)
+                 base_snapshot_id, is_overlay, working_tree_delta, fallback_reason, is_provider,
+                 capability_fingerprint)
             VALUES (@repo, @commit, @run, @hash, @tree, @schema, @analyzer, @config, @toolchain, @status, @now,
-                    @base, @is_overlay, @delta, @fallback, @is_provider)
+                    @base, @is_overlay, @delta, @fallback, @is_provider, @capability)
             RETURNING id;
             """;
         cmd.Parameters.AddWithValue("@repo", repositoryId);
@@ -209,6 +217,7 @@ public sealed class SnapshotStore(SqliteConnection connection)
         cmd.Parameters.AddWithValue("@delta", (object?)identity.WorkingTreeDelta ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@fallback", (object?)fallbackReason ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@is_provider", isProvider ? 1 : 0);
+        cmd.Parameters.AddWithValue("@capability", (object?)identity.CapabilityFingerprint ?? DBNull.Value);
         return ((long)cmd.ExecuteScalar()!, false, SnapshotStatus.Pending);
     }
 
@@ -327,6 +336,25 @@ public sealed class SnapshotStore(SqliteConnection connection)
         using var cmd = connection.CreateCommand();
         cmd.CommandText = "SELECT id FROM branches WHERE repository_id = @repo AND is_default = 1 ORDER BY id LIMIT 1;";
         cmd.Parameters.AddWithValue("@repo", repositoryId);
+        return cmd.ExecuteScalar() is long id ? id : null;
+    }
+
+    /// <summary>The repository id for a remote url, or null when it has never been indexed (read-only lookup).</summary>
+    public long? GetRepositoryId(string remoteUrl)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT id FROM repositories WHERE remote_url = @url LIMIT 1;";
+        cmd.Parameters.AddWithValue("@url", remoteUrl);
+        return cmd.ExecuteScalar() is long id ? id : null;
+    }
+
+    /// <summary>The branch id for a (repository, name) pair, or null when absent (read-only lookup).</summary>
+    public long? GetBranchId(long repositoryId, string name)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT id FROM branches WHERE repository_id = @repo AND name = @name LIMIT 1;";
+        cmd.Parameters.AddWithValue("@repo", repositoryId);
+        cmd.Parameters.AddWithValue("@name", name);
         return cmd.ExecuteScalar() is long id ? id : null;
     }
 
@@ -520,10 +548,70 @@ public sealed class SnapshotStore(SqliteConnection connection)
         return rows;
     }
 
+    /// <summary>
+    /// Every snapshot row a retention pass needs to classify data ownership: its id, owning generation
+    /// (<c>run_id</c>), status, base snapshot (overlay sharing), and provider flag. Used to compute the
+    /// retained-snapshot closure so orphaned snapshot DATA can be GC'd (issue #46) while providers shared
+    /// by any retained consumer are spared (issue #54).
+    /// </summary>
+    public IReadOnlyList<(long id, long? runId, string status, long? baseSnapshotId, bool isProvider)> GetSnapshotsForRetention()
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText =
+            "SELECT id, run_id, status, base_snapshot_id, is_provider FROM snapshots;";
+        var rows = new List<(long, long?, string, long?, bool)>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            rows.Add((
+                reader.GetInt64(0),
+                reader.IsDBNull(1) ? null : reader.GetInt64(1),
+                reader.GetString(2),
+                reader.IsDBNull(3) ? null : reader.GetInt64(3),
+                !reader.IsDBNull(4) && reader.GetInt64(4) != 0));
+        return rows;
+    }
+
+    /// <summary>
+    /// Every submodule-dedup edge (consumer snapshot -&gt; provider snapshot). Feeds the retained-snapshot
+    /// closure: a provider whose consumer is retained must itself be retained (issue #54). Empty when the
+    /// Phase-12 <c>snapshot_dependencies</c> table is absent (pre-migration DB).
+    /// </summary>
+    public IReadOnlyList<(long consumerSnapshotId, long providerSnapshotId)> GetSnapshotDependencyEdges()
+    {
+        using (var check = connection.CreateCommand())
+        {
+            check.CommandText =
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'snapshot_dependencies' LIMIT 1;";
+            if (check.ExecuteScalar() is null) return [];
+        }
+
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText =
+            "SELECT consumer_snapshot_id, provider_snapshot_id FROM snapshot_dependencies;";
+        var rows = new List<(long, long)>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            rows.Add((reader.GetInt64(0), reader.GetInt64(1)));
+        return rows;
+    }
+
+    /// <summary>The snapshot ids currently referenced by a branch pointer (never data-GC eligible).</summary>
+    public IReadOnlyList<long> GetBranchPointedSnapshotIds()
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText =
+            "SELECT DISTINCT snapshot_id FROM branches WHERE snapshot_id IS NOT NULL;";
+        var ids = new List<long>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read()) ids.Add(reader.GetInt64(0));
+        return ids;
+    }
+
     private const string SelectSnapshot = """
         SELECT id, repository_id, commit_id, run_id, identity_hash, tree_sha, schema_version,
                analyzer_version, config_hash, toolchain_fingerprint, status, created_at, published_at,
-               base_snapshot_id, is_overlay, working_tree_delta, fallback_reason, is_provider
+               base_snapshot_id, is_overlay, working_tree_delta, fallback_reason, is_provider,
+               capability_fingerprint
         FROM snapshots
         """;
 
@@ -546,6 +634,7 @@ public sealed class SnapshotStore(SqliteConnection connection)
         IsOverlay = !reader.IsDBNull(14) && reader.GetInt64(14) != 0,
         WorkingTreeDelta = reader.IsDBNull(15) ? null : reader.GetString(15),
         FallbackReason = reader.IsDBNull(16) ? null : reader.GetString(16),
-        IsProvider = !reader.IsDBNull(17) && reader.GetInt64(17) != 0
+        IsProvider = !reader.IsDBNull(17) && reader.GetInt64(17) != 0,
+        CapabilityFingerprint = reader.IsDBNull(18) ? null : reader.GetString(18)
     };
 }

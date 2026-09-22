@@ -128,7 +128,16 @@ public sealed class IndexDatabase : IDisposable
         cmd.ExecuteNonQuery();
     }
 
-    public void RunMigrations()
+    /// <summary>
+    /// Applies pending migrations, then reconciles the database via <see cref="Recover"/>.
+    /// </summary>
+    /// <param name="recover">
+    /// When true (default) run <see cref="Recover"/> after migrating. Pass false to apply schema DDL
+    /// ONLY — used by a cooperative writer (issue #38) that must acquire the writer lease BEFORE
+    /// recovery so it never abandons a live writer's staging generation. That caller applies DDL with
+    /// <c>recover:false</c>, acquires the lease, and only then calls <see cref="Recover"/> itself.
+    /// </param>
+    public void RunMigrations(bool recover = true)
     {
         var conn = GetConnection();
         EnsureSchemaVersionTable(conn);
@@ -156,7 +165,8 @@ public sealed class IndexDatabase : IDisposable
             }
         }
 
-        Recover();
+        if (recover)
+            Recover();
     }
 
     /// <summary>The highest migration version embedded in this build.</summary>

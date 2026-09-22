@@ -216,7 +216,7 @@ This migration is **rebuild-required**: colliding rows in an existing index alre
 
 ### Normalize files and compact occurrences (migration `011`)
 
-Migration `011_normalize_files_and_occurrences.sql` is the Phase-7 compaction. It is the current schema head (`LatestSchemaVersion` = 11) and is **rebuild-required**. It:
+Migration `011_normalize_files_and_occurrences.sql` is the Phase-7 compaction. It was the schema head through Phase 7 and is **rebuild-required**. It:
 
 - Introduces `files` (repo-relative path stored once) + `file_versions` (raw SHA-256 `content_hash` BLOB, optional `git_blob_hash`/`source_ref`).
 - Rebuilds `symbols` to reference `file_version_id` instead of an absolute `file_path`, and stores `kind`/`accessibility` as compact **integer** ordinals instead of text.
@@ -225,3 +225,23 @@ Migration `011_normalize_files_and_occurrences.sql` is the Phase-7 compaction. I
 - Keeps `api_surface_snapshots` intact (self-contained since migration `009`).
 
 **Rebuild gate.** Because the old row shapes cannot be reinterpreted, the migration runs `DELETE FROM index_runs`, dropping the last-complete-generation pointer so an upgraded-but-not-reindexed database is **not** mistaken for a complete index. `IndexDatabase.CheckReadiness()` reports an actionable message in three cases: an older schema ("built by an older Sextant schema … rebuild"), a newer schema ("newer schema … upgrade Sextant"), and a current-schema database with no complete generation and no symbols ("no complete index generation … run a full index"). The CLI query handler, `serve`, and the `get_index_status` MCP tool surface this instead of failing on a missing table. Re-run a full index after upgrading.
+
+### Later additive migrations (`012`–`016`)
+
+Migrations `012` through `017` are all **additive / forward-only** (new tables, indices, or columns only; nothing is dropped and `index_runs` is never cleared), so they are *not* rebuild-required in the destructive sense of `007`/`011`. Each still advances `schema_version`, and because the Phase-9 snapshot-identity hash folds the schema version in, an existing lower-schema base is treated as schema-incompatible and rebuilt into the current schema on the next full run (the safe, expected upgrade path via `IndexDatabase.CheckReadiness`). `LatestSchemaVersion` auto-derives from `LoadMigrations().Max()` and is currently **17**.
+
+- `012_index_run_configuration.sql` — per-run indexing profile + configuration hash (Phase 8).
+- `013_immutable_snapshots.sql` — the Phase-9 immutable snapshot catalog: `snapshots` (identity-hashed generations), `branches`, `commits`, branch/commit pointers.
+- `014_local_overlay.sql` — Phase-10 git-aware local overlay bookkeeping.
+- `015_snapshot_dependencies.sql` — Phase-12 cross-repository `snapshot_dependencies` (consumer→provider) edges + `snapshot_projects` mapping.
+- `017_snapshot_capability_fingerprint.sql` — Phase-15 worker-capability fingerprint: adds the nullable `snapshots.capability_fingerprint` column (the producing worker's `WorkerCapability.Fingerprint`), recorded in provenance and folded into the snapshot identity only when non-null so a snapshot built under one capability set is never silently reused under an incompatible one (a null value keeps a local/single-node snapshot byte-identical to pre-Phase-15).
+
+### Standalone index service catalog (migration `016`)
+
+Migration `016_service_job_catalog.sql` adds the durable bookkeeping the Phase-13 standalone index service needs. It **extends** the Phase-9 snapshot catalog rather than duplicating it — the snapshot rows, branch/commit pointers, and dependency edges stay exactly as Phase 9/10/12 left them — by adding a JOB ledger over them plus a cross-process writer lease:
+
+- `snapshot_jobs` — the durable ensure-snapshot request ledger, keyed by `identity_hash` (**UNIQUE**, the same Phase-9 `SnapshotIdentity.Hash` idempotency key), so a repeated ensure for the same snapshot attaches to the ONE existing job/result instead of creating a second (**criterion 1**). `status` is `queued | running | complete | partial | failed | unsupported | cancelled`. `snapshot_id` → `snapshots(id)` `ON DELETE SET NULL` so retention GC of an old snapshot never deletes the job-history row. `owner_token` is the writer-lease token that owns an in-progress job, so a restart can reconcile jobs a dead worker left `running` back to `queued` without touching a job a live writer still owns (**criterion 2**).
+- `snapshot_job_diagnostics` — structured, per-project diagnostics for a job (**criterion 5**): one row per affected project with a machine-parseable `code` + `severity` + `message`, so the status API can explain WHICH projects failed and WHY (extends the Phase-9 completeness gate + Phase-8 capability meta). `ON DELETE CASCADE` with its job.
+- `writer_lease` — a single-node, cross-process **single-writer** lease (issue #38): a singleton row (`CHECK (id = 1)`) a writer acquires by an atomic conditional upsert under `BEGIN IMMEDIATE`, renews via heartbeat, and releases on shutdown; a stale (expired) lease may be stolen so a crashed holder never wedges the DB. It is a cooperative lease over the existing single-writer-connection + `BEGIN IMMEDIATE` invariant so retention/publish/GC cannot race a live daemon/service, not a replacement for it.
+
+Migration `016` is **additive / forward-only** (see above): only new tables + their indices are created, so it is not rebuild-required.

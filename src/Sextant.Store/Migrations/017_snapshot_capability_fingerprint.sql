@@ -1,0 +1,27 @@
+-- Phase 15: worker-capability fingerprint on the snapshot catalog.
+--
+-- Phase 15 routes each project graph to a worker whose capabilities can actually load and evaluate it:
+-- Linux is the default worker and evaluates most projects with restored reference packs; only a project
+-- Linux genuinely CANNOT evaluate is routed to a native Windows/macOS worker — and routing keys off
+-- DEMONSTRATED evaluation success plus policy, never the TFM name alone. The worker's capability
+-- fingerprint (its OS, SDK bands, installed workloads, reference packs — Sextant.Core WorkerCapability)
+-- must be recorded so a snapshot built under one capability set is never silently reused under an
+-- incompatible one (acceptance criterion 5).
+--
+-- This migration EXTENDS the Phase-9 snapshot catalog with ONE nullable provenance column rather than a
+-- parallel table: capability_fingerprint records the producing worker's capability. It is nullable
+-- because a local/single-node run does not route and leaves it NULL — and the Phase-9 SnapshotIdentity
+-- folds the capability into identity_hash ONLY when non-null, so an existing local snapshot's identity is
+-- byte-identical to before this field existed (CRITICAL 2: zero-dependency local operation). The service
+-- stamps the producing node's default capability fingerprint here and into identity_hash so request
+-- identity == published identity and Phase-13 idempotent job attachment is preserved.
+--
+-- WHY ADDITIVE / FORWARD-ONLY (NOT rebuild-required): only one nullable column is added; nothing is
+-- dropped and the index_runs ledger is NOT cleared. As with migrations 012–016 this DOES advance the
+-- schema version, which the Phase-9 snapshot-identity gate folds into every snapshot's identity_hash, so
+-- an existing schema-16 base is treated as schema-incompatible and rebuilt into a schema-17 base on the
+-- first run (via IndexDatabase.CheckReadiness) — the safe, expected upgrade path. No data migration is
+-- required; existing rows keep capability_fingerprint = NULL (unknown), which the read-time compatibility
+-- gate treats as "unknown", never as a mismatch.
+
+ALTER TABLE snapshots ADD COLUMN capability_fingerprint TEXT;

@@ -18,6 +18,7 @@ var rootCommand = new RootCommand("Sextant — Roslyn-based semantic code indexe
     IndexCommand.Build(dbOption, profileOption),
     QueryCommand.Build(dbOption, profileOption),
     ServeCommand.Build(dbOption, profileOption),
+    ServiceCommand.Build(),
     DaemonCommand.Build(dbOption, profileOption),
     InstallCommand.Build(dbOption, profileOption),
     UninstallCommand.Build(),
