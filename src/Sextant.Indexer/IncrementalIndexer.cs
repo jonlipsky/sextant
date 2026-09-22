@@ -19,10 +19,20 @@ public sealed class IncrementalIndexer
     /// <summary>
     /// Returns the set of file paths whose signatures changed (callers may need re-resolution).
     /// </summary>
-    public async Task<List<string>> IndexChangedFilesAsync(
+    public Task<List<string>> IndexChangedFilesAsync(
         Solution solution,
         IReadOnlyList<string> changedFilePaths)
+        => IndexChangedFilesAsync(solution, changedFilePaths, default);
+
+    /// <summary>
+    /// Returns the set of file paths whose signatures changed (callers may need re-resolution).
+    /// </summary>
+    public async Task<List<string>> IndexChangedFilesAsync(
+        Solution solution,
+        IReadOnlyList<string> changedFilePaths,
+        CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var conn = _db.GetConnection();
         var fileIndexStore = new FileIndexStore(conn);
         var symbolStore = new SymbolStore(conn);
@@ -49,14 +59,15 @@ public sealed class IncrementalIndexer
         var symbolFqnToId = new Dictionary<string, long>();
         foreach (var project in solution.Projects)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (project.FilePath == null || !projectPathToId.TryGetValue(project.FilePath, out var pid))
                 continue;
-            var compilation = await project.GetCompilationAsync();
+            var compilation = await project.GetCompilationAsync(cancellationToken);
             if (compilation == null) continue;
             foreach (var tree in compilation.SyntaxTrees)
             {
                 var sm = compilation.GetSemanticModel(tree);
-                var root = await tree.GetRootAsync();
+                var root = await tree.GetRootAsync(cancellationToken);
                 foreach (var node in root.DescendantNodes())
                 {
                     var declared = sm.GetDeclaredSymbol(node);
@@ -75,10 +86,11 @@ public sealed class IncrementalIndexer
 
         foreach (var project in solution.Projects)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (project.FilePath == null || !projectPathToId.TryGetValue(project.FilePath, out var projectId))
                 continue;
 
-            var compilation = await project.GetCompilationAsync();
+            var compilation = await project.GetCompilationAsync(cancellationToken);
             if (compilation == null) continue;
 
             foreach (var syntaxTree in compilation.SyntaxTrees)
@@ -101,6 +113,7 @@ public sealed class IncrementalIndexer
                 }
 
                 _log?.Invoke($"  Re-indexing: {filePath}");
+                cancellationToken.ThrowIfCancellationRequested();
 
                 // Collect old signature hashes before deleting
                 var oldSymbols = symbolStore.GetByFile(filePath);
@@ -116,7 +129,7 @@ public sealed class IncrementalIndexer
 
                 // Re-extract symbols for this file
                 var semanticModel = compilation.GetSemanticModel(syntaxTree);
-                var root = await syntaxTree.GetRootAsync();
+                var root = await syntaxTree.GetRootAsync(cancellationToken);
                 var newSymbols = new List<Sextant.Core.SymbolInfo>();
 
                 foreach (var node in root.DescendantNodes())
