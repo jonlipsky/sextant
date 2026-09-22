@@ -45,6 +45,31 @@ public class ServicePathsTests
     }
 
     [TestMethod]
+    public void RepoDirectoryName_SameBasenameDifferentOwner_DoesNotCollide()
+    {
+        // Cross-tenant isolation (issue #7): two DIFFERENT repositories that happen to share a basename
+        // must map to DIFFERENT checkout directories, or one tenant's checkout could satisfy another
+        // tenant's request. The basename is preserved for readability, but a URL-hash suffix disambiguates.
+        var a = ServicePaths.RepoDirectoryName("https://github.com/org-a/common.git");
+        var b = ServicePaths.RepoDirectoryName("https://github.com/org-b/common.git");
+        Assert.AreNotEqual(a, b, "same-basename repos from different owners must not share a checkout directory");
+        Assert.IsTrue(a.StartsWith("common-", StringComparison.Ordinal), "the human-readable basename is preserved");
+        Assert.IsTrue(b.StartsWith("common-", StringComparison.Ordinal), "the human-readable basename is preserved");
+    }
+
+    [TestMethod]
+    public void RepoDirectoryName_EquivalentSpellingsOfSameRepo_MapToSameDirectory()
+    {
+        // The same repository must map to a STABLE directory across identity-neutral spelling differences
+        // (a trailing slash or a .git suffix), so a checkout is found regardless of how the URL was written.
+        var bare = ServicePaths.RepoDirectoryName("https://github.com/org/app");
+        var dotGit = ServicePaths.RepoDirectoryName("https://github.com/org/app.git");
+        var trailingSlash = ServicePaths.RepoDirectoryName("https://github.com/org/app/");
+        Assert.AreEqual(bare, dotGit, ".git is not identity-bearing");
+        Assert.AreEqual(bare, trailingSlash, "a trailing slash is not identity-bearing");
+    }
+
+    [TestMethod]
     public void ReleaseScratch_DeletesAnAllocatedScratchDir()
     {
         var dir = _paths.AllocateScratch("job-2");

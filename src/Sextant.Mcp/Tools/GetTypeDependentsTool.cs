@@ -17,14 +17,10 @@ public static class GetTypeDependentsTool
         [Description("Filter by dependency kind: 'inherits', 'implements', 'returns', 'parameter_of', 'instantiates', or 'all' (default)")]
         string dependency_kind = "all")
     {
-        var db = dbProvider.GetReadyDatabase(out var notReady);
-        if (db == null)
-            return ResponseBuilder.BuildEmpty(notReady);
-
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+        if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
 
-        var conn = db.GetConnection();
+        using var conn = db.OpenReadConnection();
         var symbolStore = new SymbolStore(conn) { Scope = readContext.Scope };
         var relationshipStore = new RelationshipStore(conn);
         var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };

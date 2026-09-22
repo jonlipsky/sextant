@@ -5,7 +5,9 @@ using Microsoft.Extensions.Logging;
 using Sextant.Core;
 using Sextant.Core.Platform;
 using Sextant.Service;
+using Sextant.Service.Contributions;
 using Sextant.Service.Placement;
+using Sextant.Service.Sandbox;
 using Sextant.Store;
 
 namespace Sextant.Service.Host;
@@ -35,8 +37,12 @@ public static class ServiceHostRunner
         // Windows/macOS placements are wired by ProcessStack in Phase 14 behind this same seam.
         var nodeCapability = WorkerCapability.LocalDefault;
         var checkoutProvider = new PersistentVolumeCheckoutProvider(paths);
+        // Criterion 2: the service worker evaluates UNTRUSTED checkouts, so wrap its MSBuild evaluation in
+        // the enforced sandbox (time/memory/secret/filesystem isolation) — applied to private and public
+        // repos alike. The local CLI/daemon path does not construct this worker, so it stays byte-identical.
+        var sandbox = new EvaluationSandbox(options.Sandbox, paths, Console.Error.WriteLine);
         var localWorker = new LocalIndexerSnapshotWorker(
-            database, config, checkoutProvider, Console.Error.WriteLine, nodeCapability);
+            database, config, checkoutProvider, Console.Error.WriteLine, nodeCapability, sandbox);
         var defaultPlacement = new LocalPlacement(nodeCapability, localWorker);
         var worker = new CapabilityRoutingSnapshotWorker(
             defaultPlacement,
@@ -48,7 +54,15 @@ public static class ServiceHostRunner
         SnapshotService service;
         try
         {
-            service = SnapshotService.Start(options, worker, database);
+            // #68: when a deployment REQUIRES Git-content verification, wire the real git-CLI provider over
+            // the persistent checkout volume so declared blobs are verified against the repository's content
+            // at the exact commit. Left unset (dev default) the service uses the Unavailable provider and the
+            // fail-closed startup guard keeps required-verification deployments from silently running open.
+            IGitContentProvider? gitContent = options.Contribution.RequireGitContentVerification
+                ? GitCliContentProvider.ForVolume(paths)
+                : null;
+
+            service = SnapshotService.Start(options, worker, database, gitContent: gitContent);
         }
         catch (Exception ex)
         {

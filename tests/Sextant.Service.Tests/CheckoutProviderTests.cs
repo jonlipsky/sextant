@@ -49,11 +49,10 @@ public class CheckoutProviderTests
         var paths = new ServicePaths(volumes);
 
         // A well-formed checkout under the volume resolves normally (the guard is not over-broad).
-        var checkout = Path.Combine(paths.CheckoutRoot, "app");
+        var request = ServiceTestFixtures.Request() with { RepositoryRemoteUrl = "https://github.com/org/app.git" };
+        var checkout = Path.Combine(paths.CheckoutRoot, ServicePaths.RepoDirectoryName(request.RepositoryRemoteUrl));
         Directory.CreateDirectory(checkout);
         File.WriteAllText(Path.Combine(checkout, "App.slnx"), string.Empty);
-
-        var request = ServiceTestFixtures.Request() with { RepositoryRemoteUrl = "https://github.com/org/app.git" };
 
         var provider = new PersistentVolumeCheckoutProvider(paths);
         Assert.IsTrue(provider.TryResolve(request, out var dir, out var sln),

@@ -35,6 +35,28 @@ public class WriterLeaseTests
     }
 
     [TestMethod]
+    public void AcquireOrThrow_WhileHeld_ThrowsFailClosed()
+    {
+        // #59: the daemon and one-shot CLI index adopt the same fail-closed guard as the service. When a
+        // live writer already owns the database, AcquireOrThrow must refuse the second writer LOUDLY rather
+        // than return a racing lease, so two writers can never corrupt a publish (criterion 3).
+        using var first = WriterLease.TryAcquire(_dbPath, "holder-1", autoHeartbeat: false);
+        Assert.IsNotNull(first);
+
+        var ex = Assert.ThrowsExactly<InvalidOperationException>(
+            () => WriterLease.AcquireOrThrow(_dbPath, "holder-2"));
+        StringAssert.Contains(ex.Message, "single-writer lease");
+    }
+
+    [TestMethod]
+    public void AcquireOrThrow_WhenFree_Succeeds()
+    {
+        using var lease = WriterLease.AcquireOrThrow(_dbPath, "sole-writer");
+        Assert.IsNotNull(lease, "the only writer acquires the lease");
+        Assert.IsFalse(lease.IsLost);
+    }
+
+    [TestMethod]
     public void Release_FreesTheLease_ForTheNextWriter()
     {
         var first = WriterLease.TryAcquire(_dbPath, "holder-1", autoHeartbeat: false);

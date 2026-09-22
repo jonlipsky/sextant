@@ -1,6 +1,7 @@
 using Sextant.Core;
 using Sextant.Core.Platform;
 using Sextant.Indexer;
+using Sextant.Service.Sandbox;
 using Sextant.Store;
 
 namespace Sextant.Service;
@@ -29,7 +30,7 @@ public sealed class PersistentVolumeCheckoutProvider(ServicePaths paths) : IChec
         checkoutDir = string.Empty;
         solutionPath = string.Empty;
 
-        var dirName = SanitizeRepo(request.RepositoryRemoteUrl);
+        var dirName = ServicePaths.RepoDirectoryName(request.RepositoryRemoteUrl);
         var root = Path.GetFullPath(paths.CheckoutRoot);
         var candidate = Path.GetFullPath(Path.Combine(root, dirName));
         // Containment guard (defense in depth with SanitizeRepo): a crafted repository URL must never
@@ -59,18 +60,7 @@ public sealed class PersistentVolumeCheckoutProvider(ServicePaths paths) : IChec
             && !Path.IsPathRooted(rel);
     }
 
-    private static string SanitizeRepo(string url)
-    {
-        var trimmed = url.TrimEnd('/');
-        var lastSlash = trimmed.LastIndexOf('/');
-        var name = lastSlash >= 0 ? trimmed[(lastSlash + 1)..] : trimmed;
-        if (name.EndsWith(".git", StringComparison.OrdinalIgnoreCase))
-            name = name[..^4];
-        var chars = name.Select(c => Array.IndexOf(Path.GetInvalidFileNameChars(), c) >= 0 ? '_' : c).ToArray();
-        // Trim separators AND leading/trailing dots so "." / ".." (traversal) collapse to the safe default.
-        var safe = new string(chars).Trim('_', '.');
-        return safe.Length == 0 ? "repo" : safe;
-    }
+    private static string SanitizeRepo(string url) => ServicePaths.RepoDirectoryName(url);
 }
 
 /// <summary>
@@ -86,12 +76,13 @@ public sealed class LocalIndexerSnapshotWorker(
     SextantConfiguration configuration,
     ICheckoutProvider checkoutProvider,
     Action<string>? log = null,
-    WorkerCapability? capability = null) : ISnapshotWorker
+    WorkerCapability? capability = null,
+    IEvaluationSandbox? sandbox = null) : ISnapshotWorker
 {
     public async Task<SnapshotWorkResult> ProduceAsync(
         EnsureSnapshotRequest request, string identityHash, string scratchDir, CancellationToken cancellationToken)
     {
-        if (!checkoutProvider.TryResolve(request, out _, out var solutionPath))
+        if (!checkoutProvider.TryResolve(request, out var checkoutDir, out var solutionPath))
         {
             return SnapshotWorkResult.Unsupported(
                 $"No provisioned checkout with a solution found for '{request.RepositoryRemoteUrl}'. " +
@@ -111,16 +102,20 @@ public sealed class LocalIndexerSnapshotWorker(
             CapabilityFingerprint = capability?.Fingerprint
         };
 
-        try
+        // The untrusted region: loading the solution EVALUATES its MSBuild projects (arbitrary imported
+        // targets / SDK resolvers / inline tasks), so — private repo or not — it runs under the evaluation
+        // sandbox's enforced time/memory/secret/filesystem isolation (criterion 2) whenever one is wired.
+        // With no sandbox (the byte-identical single-node local default) it runs directly.
+        async Task<SnapshotWorkResult> EvaluateAsync(CancellationToken token)
         {
-            var solution = await SolutionLoader.LoadSolutionAsync(solutionPath).ConfigureAwait(false);
+            var solution = await SolutionLoader.LoadSolutionAsync(solutionPath, cancellationToken: token).ConfigureAwait(false);
             var orchestrator = new IndexOrchestrator(
                 database, log, configuration.DocumentExtractor,
                 ExtractionParallelismOptions.FromConfiguration(configuration),
                 IndexProfileDescriptor.FromConfiguration(configuration));
 
             await orchestrator.IndexSolutionAsync(
-                solution, progress: null, metrics: null, cancellationToken: cancellationToken,
+                solution, progress: null, metrics: null, cancellationToken: token,
                 snapshotContext: context).ConfigureAwait(false);
 
             var published = new SnapshotStore(database.GetConnection()).GetByIdentityHash(identityHash);
@@ -130,6 +125,22 @@ public sealed class LocalIndexerSnapshotWorker(
             return SnapshotWorkResult.Failed(
                 "indexing finished but no complete snapshot was published for the requested identity " +
                 "(the checkout's committed state may differ from the requested commit).");
+        }
+
+        try
+        {
+            return sandbox is not null
+                ? await sandbox.RunAsync(checkoutDir, scratchDir, EvaluateAsync, cancellationToken).ConfigureAwait(false)
+                : await EvaluateAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (SandboxLimitExceededException ex)
+        {
+            // A budget breach aborts the job cleanly — Failed (retryable), never a partial/complete publish.
+            return SnapshotWorkResult.Failed(ex.Message);
+        }
+        catch (SandboxViolationException ex)
+        {
+            return SnapshotWorkResult.Failed(ex.Message);
         }
         catch (OperationCanceledException)
         {

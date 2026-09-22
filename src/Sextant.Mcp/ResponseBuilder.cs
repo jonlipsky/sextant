@@ -58,6 +58,22 @@ public static class ResponseBuilder
         return JsonSerializer.Serialize(response, JsonOptions);
     }
 
+    /// <summary>
+    /// The single uniform "nothing to serve" response returned for EVERY fail-closed read denial under an
+    /// enforced policy (Phase 17, criterion 1). An unauthorized principal, a cross-tenant repository, an
+    /// unidentifiable/nonexistent repository, and an unprovisioned service ALL collapse to these exact
+    /// bytes: no error code, no message, no provenance, and <c>result_count</c> 0. An unauthorized caller
+    /// therefore cannot distinguish "exists but forbidden" from "does not exist" or "service not
+    /// provisioned" — no data, counts, names, existence, or artifact-access signal leaks (only the
+    /// always-varying <c>queried_at</c> differs). This deliberately replaces the Phase-11
+    /// <c>authorization_denied</c> structured error on the ACL path: a distinct denial code is itself an
+    /// existence/authorization oracle, which criterion 1 forbids. The Phase-11 "never present a denial as
+    /// no matches" guarantee is preserved where it still applies — a denial only ever happens under an
+    /// ENABLED multi-tenant policy, never on the zero-friction local path where a mistyped token would be
+    /// the single-tenant usability concern that guarantee was written for.
+    /// </summary>
+    public static string BuildNotFound() => BuildEmpty(message: null, provenance: null);
+
     public static string BuildEmpty(string? message = null, SnapshotProvenance? provenance = null)
     {
         var response = new

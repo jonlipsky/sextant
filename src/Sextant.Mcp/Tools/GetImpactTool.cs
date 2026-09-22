@@ -12,14 +12,10 @@ public static class GetImpactTool
         DatabaseProvider dbProvider,
         [Description("Fully qualified name of the symbol")] string symbol_fqn)
     {
-        var db = dbProvider.GetReadyDatabase(out var notReady);
-        if (db == null)
-            return ResponseBuilder.BuildEmpty(notReady);
-
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+        if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
 
-        var conn = db.GetConnection();
+        using var conn = db.OpenReadConnection();
         var snapshotScope = readContext.Scope;
         var symbolStore = new SymbolStore(conn) { Scope = snapshotScope };
         var dependencyStore = new ProjectDependencyStore(conn);

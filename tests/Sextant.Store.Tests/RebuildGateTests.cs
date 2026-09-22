@@ -109,6 +109,42 @@ public class RebuildGateTests
     }
 
     [TestMethod]
+    public void ConcurrentReadinessChecks_DoNotShareOneConnection()
+    {
+        // Issue #57 residual / #15: every MCP tool invocation runs CheckReadiness, and concurrent /mcp
+        // requests would race on the single shared memoized connection (SqliteConnection is not
+        // thread-safe). CheckReadiness now opens a fresh pooled read connection per call, so a burst of
+        // concurrent checks must all succeed and agree, with no exception from a shared-handle race.
+        var conn = _db.GetConnection();
+        var projectId = new ProjectStore(conn).Insert(new ProjectIdentity
+        {
+            CanonicalId = "concurrentproj123",
+            GitRemoteUrl = "https://github.com/test/repo",
+            RepoRelativePath = "src/Test/Test.csproj"
+        }, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        new SymbolStore(conn).Insert(new SymbolInfo
+        {
+            ProjectId = projectId,
+            SymbolKey = "global::Test.Concurrent",
+            FullyQualifiedName = "global::Test.Concurrent",
+            DisplayName = "Concurrent",
+            Kind = SymbolKind.Class,
+            Accessibility = Accessibility.Public,
+            FilePath = "src/Concurrent.cs",
+            LineStart = 1,
+            LineEnd = 10,
+            LastIndexedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+        });
+
+        var results = new System.Collections.Concurrent.ConcurrentBag<bool>();
+        Parallel.For(0, 64, new ParallelOptions { MaxDegreeOfParallelism = 16 },
+            _ => results.Add(_db.CheckReadiness().Ready));
+
+        Assert.AreEqual(64, results.Count);
+        Assert.IsTrue(results.All(r => r), "every concurrent readiness check must agree the index is servable");
+    }
+
+    [TestMethod]
     public void OlderSchemaIndex_SurfacesRebuildMessage()
     {
         // Simulate opening an index built before the latest migration: roll the recorded schema

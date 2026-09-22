@@ -97,6 +97,22 @@ public sealed class WriterLease : IDisposable
         return lease;
     }
 
+    /// <summary>
+    /// Acquires the single-writer lease for a write path, or throws a fail-closed
+    /// <see cref="InvalidOperationException"/> when another LIVE writer already holds it (issue #38 / #59).
+    /// This is the shared guard EVERY write path uses — the standalone service, the daemon, and the
+    /// one-shot CLI index — so two writers can never race one database and corrupt a publish (criterion 3).
+    /// Call it AFTER migrations (the <c>writer_lease</c> table must exist) and BEFORE recovery, so recovery
+    /// never abandons a live writer's staging generation. A holder identifies the process in the lease row
+    /// and logs.
+    /// </summary>
+    public static WriterLease AcquireOrThrow(string dbPath, string holder, TimeSpan? ttl = null) =>
+        TryAcquire(dbPath, holder, ttl)
+        ?? throw new InvalidOperationException(
+            $"Another Sextant writer already holds the single-writer lease on '{dbPath}'. " +
+            "A daemon, index service, or one-shot index is already writing this database; stop it or wait " +
+            "before starting another writer (issue #38) — two concurrent writers could corrupt a publish.");
+
     /// <summary>Reads the current lease holder without acquiring anything (null when unheld).</summary>
     public static WriterLeaseInfo? GetCurrent(SqliteConnection connection)
     {

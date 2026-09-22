@@ -19,17 +19,14 @@ public static class FindTestsTool
         [Description("Maximum results (default 50)")]
         int max_results = 50)
     {
-        var db = dbProvider.GetReadyDatabase(out var notReady);
-        if (db == null)
-            return ResponseBuilder.BuildEmpty(notReady);
-
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+        if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
 
-        if (!CapabilityGate.Ensure(db, IndexFeature.TestIndexing, "test_indexing", out var unavailable))
+        if (!CapabilityGate.Ensure(db, IndexFeature.TestIndexing, "test_indexing", out var unavailable,
+                readContext.SelectedSnapshotId, dbProvider.Authorizer.IsEnforcing))
             return unavailable;
 
-        var conn = db.GetConnection();
+        using var conn = db.OpenReadConnection();
         var snapshotScope = readContext.Scope;
         var symbolStore = new SymbolStore(conn) { Scope = snapshotScope };
         var referenceStore = new ReferenceStore(conn) { Scope = snapshotScope };

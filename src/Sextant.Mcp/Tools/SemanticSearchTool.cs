@@ -16,17 +16,14 @@ public static class SemanticSearchTool
         [Description("Maximum number of results")] int max_results = 20,
         [Description("Scope filter: 'file:/path', 'project:canonical_id', 'solution:/path', or 'all'")] string? scope = null)
     {
-        var db = dbProvider.GetReadyDatabase(out var notReady);
-        if (db == null)
-            return ResponseBuilder.BuildEmpty(notReady);
-
-        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+        if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
 
-        if (!CapabilityGate.Ensure(db, IndexFeature.DocumentationSearch, "documentation_search", out var unavailable))
+        if (!CapabilityGate.Ensure(db, IndexFeature.DocumentationSearch, "documentation_search", out var unavailable,
+                readContext.SelectedSnapshotId, dbProvider.Authorizer.IsEnforcing))
             return unavailable;
 
-        var conn = db.GetConnection();
+        using var conn = db.OpenReadConnection();
         var symbolStore = new SymbolStore(conn) { Scope = readContext.Scope };
         var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
         var config = SextantConfiguration.FromEnvironment();
