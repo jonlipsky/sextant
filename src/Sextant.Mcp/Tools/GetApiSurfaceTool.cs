@@ -19,7 +19,7 @@ public static class GetApiSurfaceTool
 
         var conn = db.GetConnection();
         var projectStore = new ProjectStore(conn);
-        var symbolStore = new SymbolStore(conn);
+        var symbolStore = new SymbolStore(conn) { Scope = SnapshotReadScope.ForSelected(conn) };
         var apiSurfaceStore = new ApiSurfaceStore(conn);
 
         var project = projectStore.GetByCanonicalId(project_id);

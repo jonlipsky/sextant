@@ -27,8 +27,9 @@ public static class FindTestsTool
             return unavailable;
 
         var conn = db.GetConnection();
-        var symbolStore = new SymbolStore(conn);
-        var referenceStore = new ReferenceStore(conn);
+        var snapshotScope = SnapshotReadScope.ForSelected(conn);
+        var symbolStore = new SymbolStore(conn) { Scope = snapshotScope };
+        var referenceStore = new ReferenceStore(conn) { Scope = snapshotScope };
         var projectStore = new ProjectStore(conn);
 
         var testAttributes = GetTestAttributes(framework);

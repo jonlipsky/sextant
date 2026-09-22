@@ -28,8 +28,9 @@ public static class TraceValueTool
             return unavailable;
 
         var conn = db.GetConnection();
-        var symbolStore = new SymbolStore(conn);
-        var callGraphStore = new CallGraphStore(conn);
+        var snapshotScope = SnapshotReadScope.ForSelected(conn);
+        var symbolStore = new SymbolStore(conn) { Scope = snapshotScope };
+        var callGraphStore = new CallGraphStore(conn) { Scope = snapshotScope };
         var argumentFlowStore = new ArgumentFlowStore(conn);
         var returnFlowStore = new ReturnFlowStore(conn);
         var projectStore = new ProjectStore(conn);

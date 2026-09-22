@@ -64,7 +64,7 @@ public sealed class RetentionService
 
     /// <summary>The providers active today. Phase 9/10/12 append branch/PR/overlay/pin providers here.</summary>
     public static IReadOnlyList<IRetentionProtectionProvider> DefaultProviders { get; } =
-        [new LastCompleteRunProtection()];
+        [new LastCompleteRunProtection(), new BranchPointerProtection()];
 
     /// <summary>Reports what retention would do without modifying the database.</summary>
     public RetentionReport Plan() => Run(execute: false);

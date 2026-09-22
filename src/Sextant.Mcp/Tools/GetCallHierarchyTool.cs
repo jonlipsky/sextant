@@ -21,8 +21,9 @@ public static class GetCallHierarchyTool
             return ResponseBuilder.BuildEmpty(notReady);
 
         var conn = db.GetConnection();
-        var symbolStore = new SymbolStore(conn);
-        var callGraphStore = new CallGraphStore(conn);
+        var snapshotScope = SnapshotReadScope.ForSelected(conn);
+        var symbolStore = new SymbolStore(conn) { Scope = snapshotScope };
+        var callGraphStore = new CallGraphStore(conn) { Scope = snapshotScope };
         var projectStore = new ProjectStore(conn);
 
         var config = SextantConfiguration.FromEnvironment();

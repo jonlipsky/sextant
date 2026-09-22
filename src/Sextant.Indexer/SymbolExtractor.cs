@@ -16,10 +16,21 @@ public static partial class SymbolExtractor
 
     public static async Task<List<Sextant.Core.SymbolInfo>> ExtractFromProjectAsync(
         Project project, long projectId, bool includeDocComments = true)
+        => (await ExtractFromProjectWithStatusAsync(project, projectId, includeDocComments)).Symbols;
+
+    /// <summary>
+    /// Extracts a project's top-level symbols and reports whether a Roslyn compilation was actually
+    /// produced. A null compilation (missing SDK/reference, broken evaluation) yields an empty symbol
+    /// list AND <c>CompilationAvailable == false</c>, letting the orchestrator distinguish a genuinely
+    /// empty project from a failed one and mark an incomplete generation partial (criterion 3) rather
+    /// than publishing it as a complete branch head.
+    /// </summary>
+    public static async Task<(List<Sextant.Core.SymbolInfo> Symbols, bool CompilationAvailable)> ExtractFromProjectWithStatusAsync(
+        Project project, long projectId, bool includeDocComments = true)
     {
         var compilation = await project.GetCompilationAsync();
         if (compilation == null)
-            return [];
+            return ([], false);
 
         var symbols = new List<Sextant.Core.SymbolInfo>();
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -79,7 +90,7 @@ public static partial class SymbolExtractor
             }
         }
 
-        return symbols;
+        return (symbols, true);
     }
 
     public static Sextant.Core.SymbolInfo? ExtractSymbolInfo(ISymbol declaredSymbol, long projectId)

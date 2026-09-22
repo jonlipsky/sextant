@@ -23,6 +23,14 @@ public sealed class ReferenceStore(SqliteConnection connection)
 
     private FileStore FilesOrDefault => Files ??= new FileStore(connection);
 
+    /// <summary>
+    /// Optional Phase-9 snapshot read scope. Default <see cref="SnapshotReadScope.Unscoped"/> keeps
+    /// reads byte-identical to pre-Phase-9 (no snapshot filter). The undirected-closure feeder
+    /// <see cref="GetCrossProjectPairs"/> is deliberately NOT scoped — it runs on the write path over
+    /// the whole working generation.
+    /// </summary>
+    public SnapshotReadScope Scope { get; set; } = SnapshotReadScope.Unscoped;
+
     private const string InsertSql = """
         INSERT INTO occurrences (in_project_id, target_symbol_id, source_symbol_id, file_version_id, line, col, kind, flags, last_indexed_at)
         VALUES (@in_project_id, @target_symbol_id, NULL, @file_version_id, @line, 0, @kind, @flags, @last_indexed_at)
@@ -33,7 +41,7 @@ public sealed class ReferenceStore(SqliteConnection connection)
     // A "reference" is an occurrence with a NULL source symbol (see class remarks): filtering on that
     // makes this store's projection byte-for-byte the pre-Phase-7 references table, since the extractor
     // emits one source-NULL reference row per usage (including call sites) alongside each call edge.
-    private const string SelectPrefix = """
+    private const string SelectBase = """
         SELECT o.id AS id, o.target_symbol_id, o.in_project_id, o.file_version_id, o.line, o.kind, o.flags,
                o.last_indexed_at AS last_indexed_at,
                f.repo_relative_path AS repo_relative_path, p.disk_path AS disk_path,
@@ -43,6 +51,10 @@ public sealed class ReferenceStore(SqliteConnection connection)
         JOIN files f ON f.id = fv.file_id
         JOIN projects p ON p.id = o.in_project_id
         """;
+
+    // When scoped, an inner JOIN to snapshot_projects restricts reads to the selected snapshot's
+    // project versions (criteria 6/7). Unscoped, it is exactly SelectBase.
+    private string SelectPrefix => SelectBase + Scope.Join("o.in_project_id");
 
     public SqliteCommand CreateInsertCommand()
     {
@@ -158,8 +170,9 @@ public sealed class ReferenceStore(SqliteConnection connection)
         return candidates.ToList();
     }
 
-    private static List<ReferenceInfo> ReadAll(SqliteCommand cmd)
+    private List<ReferenceInfo> ReadAll(SqliteCommand cmd)
     {
+        Scope.Bind(cmd);
         var results = new List<ReferenceInfo>();
         using var reader = cmd.ExecuteReader();
         while (reader.Read())

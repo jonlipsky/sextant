@@ -25,7 +25,7 @@ public static class GetTypeMembersTool
             return ResponseBuilder.BuildEmpty(notReady);
 
         var conn = db.GetConnection();
-        var symbolStore = new SymbolStore(conn);
+        var symbolStore = new SymbolStore(conn) { Scope = SnapshotReadScope.ForSelected(conn) };
         var relationshipStore = new RelationshipStore(conn);
         var projectStore = new ProjectStore(conn);
         var canonicalIdCache = FindSymbolTool.BuildCanonicalIdCache(projectStore);
