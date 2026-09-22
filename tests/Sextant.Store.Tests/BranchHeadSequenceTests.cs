@@ -135,12 +135,44 @@ public class BranchHeadSequenceTests
         Assert.AreEqual(1, _snapshots.GetBranchHeadSequence(_branch));
     }
 
+    [TestMethod]
+    public void DecliningReselectOfOlderSnapshot_LeavesItAttachedAndComplete_ButPointerAtNewer()
+    {
+        // Mirrors IndexOrchestrator.SelectExistingSnapshot on the SERVICE out-of-order re-select path
+        // (issue #84): an older commit A that was already indexed is now Superseded (the branch advanced to
+        // the newer commit B). A late/out-of-order ensure for A re-selects it — the orchestrator restores A
+        // to Complete (so the ensure succeeds and A stays resolvable by commit) THEN runs the forward-only
+        // gate with A's lower sequence. The gate must decline: the pointer stays at B, B is not superseded,
+        // yet A remains Complete and attached (criterion 3 — "attaches its immutable snapshot but leaves the
+        // pointer at the newer commit"). The two Completes never collide because branch selection resolves
+        // strictly via the branch pointer, and only a commit-scoped query (for A) sees A.
+        var older = Snapshot("commit-A");
+        var newer = Snapshot("commit-B");
+        _snapshots.AdvanceBranchPointerForwardOnly(_branch, newer, headSequence: 20, _now);
+        Assert.AreEqual(SnapshotStatus.Complete, _snapshots.GetById(older)!.Status,
+            "precondition: older A is Complete before it is (in a real run) superseded by advancing to B");
+
+        // Emulate the SelectExistingSnapshot composition: restore-to-Complete, then the gated advance.
+        _snapshots.MarkStatus(older, SnapshotStatus.Complete);
+        var advanced = _snapshots.AdvanceBranchPointerForwardOnly(_branch, older, headSequence: 5, _now + 1);
+
+        Assert.IsFalse(advanced, "the out-of-order lower-sequence re-select declines the pointer move");
+        Assert.AreEqual(newer, _snapshots.GetBranchSnapshotId(_branch), "the branch pointer stays at the newer commit B");
+        Assert.AreEqual(20, _snapshots.GetBranchHeadSequence(_branch), "the stored head sequence is not regressed");
+        Assert.AreEqual(SnapshotStatus.Complete, _snapshots.GetById(newer)!.Status, "the newer target B is not superseded");
+        Assert.AreEqual(SnapshotStatus.Complete, _snapshots.GetById(older)!.Status,
+            "the older snapshot A stays Complete → attached and resolvable by commit, just not the branch head");
+        Assert.AreEqual(older, _snapshots.ResolveCompleteSnapshotByCommit(_repo, "commit-A"),
+            "a commit-scoped query for A still resolves A's immutable snapshot");
+    }
+
     private long Snapshot(string commit)
     {
         var runStore = new IndexRunStore(_conn);
         var runId = runStore.BeginRun("full", _now,
             IndexProfileDescriptor.Full.ConfigurationHash, IndexProfiles.Deep, (long)IndexFeature.Deep);
         runStore.MarkComplete(runId, _now, 1);
+        var commitId = _snapshots.EnsureCommit(_repo, commit, treeSha: null, _now);
         var identity = new SnapshotIdentity
         {
             RepositoryRemoteUrl = "https://github.com/org/app",
@@ -149,7 +181,7 @@ public class BranchHeadSequenceTests
             AnalyzerVersion = "test-analyzer",
             ToolchainFingerprint = "test-toolchain"
         };
-        var (id, _, _) = _snapshots.BeginPending(identity, _repo, null, runId, _now);
+        var (id, _, _) = _snapshots.BeginPending(identity, _repo, commitId, runId, _now);
         _snapshots.MarkComplete(id, _now);
         return id;
     }
