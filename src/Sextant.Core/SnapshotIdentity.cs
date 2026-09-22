@@ -45,6 +45,19 @@ public sealed record SnapshotIdentity
     public string? WorkingTreeDelta { get; init; }
 
     /// <summary>
+    /// Discriminates an OVERLAY generation (layered on a committed base, sharing its unchanged
+    /// project-versions) from a FULL-LOCAL fallback (self-contained, no reusable base) that indexed the
+    /// same dirty working tree at the same commit with the same versions (issue #47). Both carry the same
+    /// <see cref="WorkingTreeDelta"/>, so without this discriminator they hash identically and a fallback
+    /// request could re-select — via the identity-hash dedup — an overlay whose shared base rows may since
+    /// have been garbage-collected, yielding a broken (dangling) generation. It is folded into
+    /// <see cref="Hash"/> ONLY when <see cref="WorkingTreeDelta"/> is non-null (a clean base / genuine full
+    /// index is never an overlay), so every clean committed base snapshot's identity stays byte-identical
+    /// to before this change — no mass rebuild, and only dirty overlay-vs-fallback pairs become distinct.
+    /// </summary>
+    public bool IsOverlay { get; init; }
+
+    /// <summary>
     /// The stable idempotency/compatibility hash over the identity tuple. Deterministic across
     /// machines and runs: a fixed, ordered <c>key=value;</c> pre-image hashed with SHA-256 (hex).
     /// </summary>
@@ -56,6 +69,10 @@ public sealed record SnapshotIdentity
                 $"v=1;repo={RepositoryRemoteUrl};commit={CommitSha};tree={TreeSha ?? string.Empty};" +
                 $"schema={SchemaVersion};analyzer={AnalyzerVersion};config={ConfigHash ?? string.Empty};" +
                 $"toolchain={ToolchainFingerprint};delta={WorkingTreeDelta ?? string.Empty}";
+            // Fold the overlay/fallback discriminator ONLY for a dirty tree (issue #47): a clean base's
+            // pre-image is unchanged, so its identity_hash is byte-identical to before this field existed.
+            if (WorkingTreeDelta != null)
+                canonical += $";kind={(IsOverlay ? "overlay" : "full")}";
             var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(canonical));
             return Convert.ToHexStringLower(bytes);
         }

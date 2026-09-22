@@ -17,14 +17,17 @@ public static class GetApiSurfaceTool
         if (db == null)
             return ResponseBuilder.BuildEmpty(notReady);
 
+        if (!ReadContextGate.TryResolve(db, out var readContext, out var authError))
+            return authError;
+
         var conn = db.GetConnection();
-        var projectStore = new ProjectStore(conn);
-        var symbolStore = new SymbolStore(conn) { Scope = SnapshotReadScope.ForSelected(conn) };
+        var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
+        var symbolStore = new SymbolStore(conn) { Scope = readContext.Scope };
         var apiSurfaceStore = new ApiSurfaceStore(conn);
 
         var project = projectStore.GetByCanonicalId(project_id);
         if (project == null)
-            return ResponseBuilder.BuildEmpty($"Project not found: {project_id}");
+            return ResponseBuilder.BuildEmpty($"Project not found: {project_id}", readContext.Provenance);
 
         var projectId = project.Value.id;
 
@@ -46,20 +49,22 @@ public static class GetApiSurfaceTool
                 line_start = s.LineStart
             }).ToList<object>();
 
-            return ResponseBuilder.Build(results, project.Value.lastIndexedAt);
+            return ResponseBuilder.Build(results, project.Value.lastIndexedAt, provenance: readContext.Provenance);
         }
 
         // Diff mode: compare current symbols against a previous snapshot
         var oldSnapshots = apiSurfaceStore.GetByProjectAndCommit(projectId, compare_to_commit);
         if (oldSnapshots.Count == 0)
-            return ResponseBuilder.BuildEmpty($"No snapshot found for commit: {compare_to_commit}");
+            return ResponseBuilder.BuildEmpty($"No snapshot found for commit: {compare_to_commit}", readContext.Provenance);
 
-        var oldSurface = new List<(string fqn, string signatureHash, string accessibility)>();
+        var oldSurface = new List<(string symbolKey, string fqn, string signatureHash, string accessibility)>();
         foreach (var snapshot in oldSnapshots)
         {
             // Reconstruct the historical surface from the snapshot's own stable fields rather than the
-            // live symbol row, which may have been rebuilt (new id) or removed since capture.
+            // live symbol row, which may have been rebuilt (new id) or removed since capture. Keyed by
+            // symbol_key so overloads sharing an FQN stay distinct (issue #29).
             oldSurface.Add((
+                snapshot.SymbolKey,
                 snapshot.FullyQualifiedName,
                 snapshot.SignatureHash,
                 snapshot.Accessibility
@@ -67,6 +72,7 @@ public static class GetApiSurfaceTool
         }
 
         var newSurface = publicSymbols.Select(s => (
+            s.SymbolKey,
             s.FullyQualifiedName,
             s.SignatureHash ?? s.FullyQualifiedName,
             SymbolStore.FormatAccessibility(s.Accessibility)
@@ -90,6 +96,6 @@ public static class GetApiSurfaceTool
             }
         };
 
-        return ResponseBuilder.Build(diffResults, project.Value.lastIndexedAt);
+        return ResponseBuilder.Build(diffResults, project.Value.lastIndexedAt, provenance: readContext.Provenance);
     }
 }

@@ -44,16 +44,29 @@ public class McpStdioProtocolTests
 
         var result = response.GetProperty("result");
         var tools = result.GetProperty("tools");
-        Assert.IsTrue(tools.GetArrayLength() >= 13, $"Expected >= 13 tools, got {tools.GetArrayLength()}");
 
         var toolNames = tools.EnumerateArray()
             .Select(t => t.GetProperty("name").GetString())
-            .ToList();
-        Assert.IsTrue(toolNames.Contains("find_symbol"));
-        Assert.IsTrue(toolNames.Contains("find_references"));
-        Assert.IsTrue(toolNames.Contains("get_call_hierarchy"));
-        Assert.IsTrue(toolNames.Contains("get_type_members"));
-        Assert.IsTrue(toolNames.Contains("semantic_search"));
+            .ToHashSet();
+
+        // The full advertised tool set (issue #27): the 5 original tools PLUS every tool class tagged
+        // through Phase 8, asserted by exact name so a silently dropped or unregistered tool fails here
+        // rather than slipping past a lax ">= 13" count. Kept in sync with the [McpServerTool(Name=...)]
+        // attributes across src/Sextant.Mcp/Tools.
+        var expectedTools = new[]
+        {
+            "find_symbol", "find_references", "find_by_attribute", "find_by_signature", "find_comments",
+            "find_tests", "find_unreferenced", "semantic_search",
+            "get_call_hierarchy", "get_type_members", "get_type_hierarchy", "get_type_dependents",
+            "get_implementors", "get_api_surface", "get_impact", "get_file_symbols", "get_source_context",
+            "get_namespace_tree", "get_project_dependencies", "get_index_status", "get_daemon_status",
+            "trace_value", "research_codebase"
+        };
+
+        var missing = expectedTools.Where(t => !toolNames.Contains(t)).ToList();
+        Assert.AreEqual(0, missing.Count, $"Missing advertised tools: {string.Join(", ", missing)}");
+        Assert.IsTrue(tools.GetArrayLength() >= expectedTools.Length,
+            $"Expected >= {expectedTools.Length} tools, got {tools.GetArrayLength()}");
     }
 
     [TestMethod]

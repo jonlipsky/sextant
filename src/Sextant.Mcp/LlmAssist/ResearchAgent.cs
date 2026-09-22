@@ -219,7 +219,10 @@ public sealed class ResearchAgent
         var matches = fqnPattern.Matches(answer);
 
         var conn = db.GetConnection();
-        var symbolStore = new SymbolStore(conn) { Scope = SnapshotReadScope.ForSelected(conn) };
+        // Fail closed (criterion 6): an unauthorized read cites no sources rather than reading unscoped.
+        if (!ReadContextGate.TryResolve(db, out var readContext, out _))
+            return sources;
+        var symbolStore = new SymbolStore(conn) { Scope = readContext.Scope };
 
         foreach (Match match in matches)
         {

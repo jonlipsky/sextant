@@ -242,6 +242,20 @@ public sealed class SnapshotStore(SqliteConnection connection)
         return reader.Read() ? ReadSnapshot(reader) : null;
     }
 
+    /// <summary>
+    /// The git commit SHA for a <c>commits.id</c> (a snapshot's <see cref="SnapshotRow.CommitId"/>), or
+    /// null when the id is null or unknown. Used by the Phase-11 federated read planner to stamp the base
+    /// commit into a response's provenance metadata (criterion 4) without exposing internal row ids.
+    /// </summary>
+    public string? GetCommitSha(long? commitId)
+    {
+        if (!commitId.HasValue) return null;
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT commit_sha FROM commits WHERE id = @id;";
+        cmd.Parameters.AddWithValue("@id", commitId.Value);
+        return cmd.ExecuteScalar() as string;
+    }
+
     // ---- branch pointers -----------------------------------------------------------------------
 
     /// <summary>
@@ -314,6 +328,20 @@ public sealed class SnapshotStore(SqliteConnection connection)
             """;
         cmd.Parameters.AddWithValue("@complete", SnapshotStatus.Complete);
         return cmd.ExecuteScalar() is long id ? id : null;
+    }
+
+    /// <summary>
+    /// The full <see cref="SnapshotRow"/> for the current selected snapshot (<see
+    /// cref="GetSelectedSnapshotId"/>), or null when none is selected (legacy/multi-repo/pre-first-publish
+    /// DB). The Phase-11 federated read planner resolves this ONCE per MCP request so the base snapshot,
+    /// overlay generation, completeness status, and schema/analyzer/toolchain fingerprint used for the
+    /// read-time compatibility gate all come from a single pinned generation (issue #42), and every
+    /// sub-query in the request reuses it.
+    /// </summary>
+    public SnapshotRow? GetSelectedSnapshotRow()
+    {
+        var id = GetSelectedSnapshotId();
+        return id.HasValue ? GetById(id.Value) : null;
     }
 
     /// <summary>
