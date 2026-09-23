@@ -86,7 +86,17 @@ internal static class SolutionProjectEnumerator
     private static IEnumerable<string> ParseSlnx(string solutionPath)
     {
         var paths = new List<string>();
-        using var reader = XmlReader.Create(solutionPath, new XmlReaderSettings { IgnoreComments = true, IgnoreWhitespace = true });
+        // Harden against XXE: prohibit DTD processing and disable external entity resolution outright
+        // (a solution file is repo-controlled, but the parser must never fetch external entities). Modern
+        // .NET already defaults to these, but setting them explicitly is required to be provably safe.
+        var settings = new XmlReaderSettings
+        {
+            IgnoreComments = true,
+            IgnoreWhitespace = true,
+            DtdProcessing = DtdProcessing.Prohibit,
+            XmlResolver = null
+        };
+        using var reader = XmlReader.Create(solutionPath, settings);
         while (reader.Read())
         {
             if (reader.NodeType != XmlNodeType.Element ||
