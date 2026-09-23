@@ -1,7 +1,7 @@
+using System.Net;
 using Microsoft.Data.Sqlite;
-using Sextant.Store;
 
-namespace Sextant.Service;
+namespace Sextant.Store;
 
 /// <summary>A portable symbol row from a base snapshot, keyed by its node-independent <c>symbol_key</c>.</summary>
 public sealed record SnapshotSymbolRow
@@ -50,7 +50,9 @@ public sealed record SnapshotPageRequest
 /// #51). Phase 11 built the local planner + immutable snapshot-id pinning and a base-snapshot-source seam;
 /// this is the source those slot into. A local implementation reads the durable catalog; a remote
 /// implementation pages from a peer service with caching, a timeout, and a transparent offline fallback to
-/// the cached base.
+/// the cached base. The seam lives in <c>Sextant.Store</c> (not <c>Sextant.Service</c>) so BOTH the
+/// standalone service AND the live MCP query planner (issue #60) can construct and consume it without an
+/// inverted project dependency.
 /// </summary>
 public interface IBaseSnapshotSource
 {
@@ -181,32 +183,54 @@ public sealed class SnapshotPageCache(int capacity = 1024)
 }
 
 /// <summary>
-/// Composes an ordered set of base-snapshot sources (local first, then remote peers). The first source
-/// that returns a non-empty (or known-complete) page wins; a remote source that is unreachable is skipped
-/// so a healthy peer or the local catalog still answers. This is the concrete base-snapshot seam a
-/// federated read resolves through (issue #51).
+/// Composes an ordered set of base-snapshot sources (local first, then remote peers). Peers are tried in a
+/// fixed order and a published snapshot is immutable and wholly present-or-absent on any given node, so the
+/// FIRST source that HAS the snapshot owns its entire cursor space and serves EVERY page consistently.
+/// <para>
+/// The cursor is a peer-LOCAL <c>symbols.id</c> — meaningful only to the node that produced it — so failing
+/// a <em>resumed</em> page over to a different peer would reinterpret that id in a foreign id-space and
+/// silently skip, duplicate, or prematurely end results. Two rules keep paging deterministic and safe
+/// (issue #60, hardening #51 federation):
+/// <list type="bullet">
+/// <item>A source that DEFINITIVELY lacks the snapshot — a remote 404 (<see cref="HttpRequestException"/>
+/// with <see cref="HttpStatusCode.NotFound"/>) or an empty non-complete page — never owned the cursor, so
+/// it is skipped on <em>any</em> page (first or resumed).</item>
+/// <item>A source that is merely UNREACHABLE (<see cref="RemoteSnapshotUnavailableException"/>) is skipped
+/// only on the FIRST page (cursor 0); on a resumed page it may be the peer that owns the cursor, so the
+/// failure is surfaced rather than failed over into another peer's id-space.</item>
+/// </list>
+/// </para>
 /// </summary>
 public sealed class CompositeBaseSnapshotSource(IReadOnlyList<IBaseSnapshotSource> sources) : IBaseSnapshotSource
 {
     public async Task<SnapshotSymbolPage> FetchSymbolsAsync(SnapshotPageRequest request, CancellationToken cancellationToken)
     {
-        Exception? last = null;
+        var firstPage = request.CursorId == 0;
+        RemoteSnapshotUnavailableException? lastUnavailable = null;
+
         foreach (var source in sources)
         {
             try
             {
                 var page = await source.FetchSymbolsAsync(request, cancellationToken).ConfigureAwait(false);
-                if (page.Symbols.Count > 0 || page.NextCursor is null && page.Complete)
+                if (page.Symbols.Count > 0 || (page.NextCursor is null && page.Complete))
                     return page;
+                // Empty, non-complete page ⇒ this source does not publish the snapshot: skip to the next.
             }
             catch (RemoteSnapshotUnavailableException ex)
             {
-                last = ex;
+                lastUnavailable = ex;
+                if (!firstPage)
+                    throw; // never fail a resumed cursor across peers' independent id-spaces
+            }
+            catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            {
+                // Definitive "this peer does not publish that snapshot" — safe to skip on any page.
             }
         }
 
-        if (last is not null)
-            throw last;
+        if (lastUnavailable is not null)
+            throw lastUnavailable;
 
         return new SnapshotSymbolPage { IdentityHash = request.IdentityHash, Symbols = [], NextCursor = null };
     }

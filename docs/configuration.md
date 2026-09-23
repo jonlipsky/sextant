@@ -44,6 +44,9 @@ All fields are optional — Sextant uses sensible defaults.
 | `indexing_profile` | string | `standard` | Semantic-depth profile: `core`, `standard`, or `deep` (see [Index Profiles](#index-profiles)). |
 | `generated_source_policy` | string | `exclude` | Generated-source handling; currently always `exclude` (Phase 8). |
 | `platform_routing` | string | `auto` | Service-side platform routing: `auto` or `linux_only` (Phase 15; see [Platform Routing](#platform-routing)). |
+| `peers` | string[] | `[]` | Remote peer base URLs the live MCP query planner federates to for a base snapshot the local catalog lacks (issue #60; see [Remote Federation](#remote-federation)). Empty keeps pure-local behavior. |
+| `remote_fetch_timeout_seconds` | int | `10` | Per-request timeout for a remote federation fetch before falling back to the cached base or reporting the peer unavailable (issue #60). |
+| `peer_query_token` | string | (none) | Shared Bearer query token presented to every configured peer's query plane (issue #60). Null presents no token. |
 | `retention` | object | — | Retention limits for superseded generations, API history, and source blobs (see [Retention](#retention)). |
 | `llm_assist` | object | — | LLM assist config (see [LLM Assist Configuration](#llm-assist-configuration)). |
 
@@ -73,6 +76,9 @@ Environment variables take precedence over `sextant.json`:
 | `SEXTANT_INDEXING_PROFILE` | Semantic-depth profile: `core`/`standard`/`deep` (Phase 8) | `standard` |
 | `SEXTANT_GENERATED_SOURCE_POLICY` | Generated-source policy (Phase 8) | `exclude` |
 | `SEXTANT_PLATFORM_ROUTING` | Service platform routing: `auto`/`linux_only` (Phase 15) | `auto` |
+| `SEXTANT_PEERS` | Comma-separated remote peer base URLs for live MCP federation (issue #60) | (empty) |
+| `SEXTANT_REMOTE_FETCH_TIMEOUT` | Remote federation fetch timeout, seconds (issue #60) | `10` |
+| `SEXTANT_PEER_QUERY_TOKEN` | Shared Bearer query token for configured peers (issue #60) | (none) |
 | `SEXTANT_RETENTION_KEEP_GENERATIONS` | Complete generations to retain (Phase 8) | `3` |
 | `SEXTANT_RETENTION_API_KEEP_COMMITS` | API-surface snapshot commits to retain (Phase 8) | `10` |
 | `SEXTANT_RETENTION_PRUNE_SOURCE_BLOBS` | Prune superseded source blobs (Phase 8) | `true` (set `false`/`0`/`no`/`off` to keep) |
@@ -166,6 +172,26 @@ capabilities. A local/single-node index ignores it and always evaluates in-proce
 The routing policy also carries an `allowed_native_operating_systems` set that can enable one native OS
 family while withholding another during capacity provisioning (empty = any compatible native worker). See
 [service.md](service.md#platform-specific-routing-by-worker-capability-phase-15) for the full routing model.
+
+## Remote Federation
+
+`peers` (`SEXTANT_PEERS`, default empty) wires the **live** MCP query planner to reach a configured remote
+peer for a base snapshot the local catalog lacks (issue #60, completing the #51 remote-federation transport).
+This unblocks the cross-repo workflow: a query in one repo can resolve symbols that live in another repo's
+snapshot served by a peer, without cloning it.
+
+| Field | Env | Default | Behavior |
+|---|---|---|---|
+| `peers` | `SEXTANT_PEERS` (comma-separated) | `[]` | Peer service base URLs, e.g. `https://sextant-peer.internal:3011`, each exposing `GET /query/snapshots/{identityHash}/symbols`. Empty = pure-local: no remote source is constructed and the query path never touches the network (byte-identical to before). |
+| `remote_fetch_timeout_seconds` | `SEXTANT_REMOTE_FETCH_TIMEOUT` | `10` | Per-request fetch timeout before falling back to a cached page or reporting the peer unavailable. |
+| `peer_query_token` | `SEXTANT_PEER_QUERY_TOKEN` | (none) | Shared Bearer token presented to every peer's query plane. A remote fetch never widens local authorization — the peer authorizes this token against its **own** read policy, so a local caller reads only what the peer already grants. |
+
+When peers are configured, the `get_base_snapshot_symbols` MCP tool serves a base snapshot from the **local**
+catalog when present, and otherwise **transparently federates** the fetch to a peer that publishes it. A
+warmed page is cached by immutable snapshot identity, so once fetched a base keeps answering (with
+`origin=remote`) even when the peer later goes offline (transparent offline fallback). Response provenance
+(`meta.snapshot.origin` = `local`/`remote`, `base_identity_hash`) records where the rows came from. A single
+shared token is used for all peers today; per-peer tokens are a tracked follow-up.
 
 ## LLM Assist Configuration
 

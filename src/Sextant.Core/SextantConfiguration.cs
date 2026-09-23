@@ -95,6 +95,34 @@ public sealed class SextantConfiguration
     /// </summary>
     public string PlatformRouting { get; set; } = "auto";
 
+    /// <summary>
+    /// Remote peer base URLs the live MCP query planner federates to for a base snapshot the local
+    /// catalog lacks (issue #60, completing the #51 remote-federation wiring). Each entry is a peer
+    /// service's base URL (e.g. <c>https://sextant-peer.internal:3011</c>) exposing
+    /// <c>GET /query/snapshots/{identityHash}/symbols</c>. Empty (the default) keeps today's pure-local
+    /// behavior byte-identical — no remote source is constructed and the query path never touches the
+    /// network. Overridable via <c>peers</c> in <c>sextant.json</c> or the comma-separated
+    /// <c>SEXTANT_PEERS</c> env var.
+    /// </summary>
+    public List<string> Peers { get; set; } = [];
+
+    /// <summary>
+    /// Per-request timeout (seconds) for a remote federation fetch before it falls back to the cached base
+    /// or surfaces a structured unavailability (issue #60). Non-positive resolves to the 10s default.
+    /// Overridable via <c>remote_fetch_timeout_seconds</c> in <c>sextant.json</c> or the
+    /// <c>SEXTANT_REMOTE_FETCH_TIMEOUT</c> env var.
+    /// </summary>
+    public int RemoteFetchTimeoutSeconds { get; set; } = 10;
+
+    /// <summary>
+    /// Optional shared Bearer query token presented to every configured <see cref="Peers"/> peer's query
+    /// plane (issue #60). Null/empty presents no token (a dev peer with open reads). A remote fetch never
+    /// widens local authorization: the peer authorizes the token against its OWN read policy, so a local
+    /// caller can read only what the peer already grants this token. Overridable via
+    /// <c>peer_query_token</c> in <c>sextant.json</c> or the <c>SEXTANT_PEER_QUERY_TOKEN</c> env var.
+    /// </summary>
+    public string? PeerQueryToken { get; set; }
+
     private static readonly Regex ValidProfileName = new(@"^[a-zA-Z0-9_-]+$", RegexOptions.Compiled);
 
     public string LogsPath => Path.Combine(
@@ -206,6 +234,12 @@ public sealed class SextantConfiguration
                             config.ReconcileIntervalSeconds = fileConfig.ReconcileIntervalSeconds.Value;
                         if (fileConfig.PlatformRouting != null)
                             config.PlatformRouting = fileConfig.PlatformRouting;
+                        if (fileConfig.Peers != null)
+                            config.Peers = fileConfig.Peers;
+                        if (fileConfig.RemoteFetchTimeoutSeconds.HasValue)
+                            config.RemoteFetchTimeoutSeconds = fileConfig.RemoteFetchTimeoutSeconds.Value;
+                        if (fileConfig.PeerQueryToken != null)
+                            config.PeerQueryToken = fileConfig.PeerQueryToken;
                         if (fileConfig.IndexingProfile != null)
                             config.IndexingProfile = fileConfig.IndexingProfile;
                         if (fileConfig.GeneratedSourcePolicy != null)
@@ -302,6 +336,18 @@ public sealed class SextantConfiguration
         if (!string.IsNullOrWhiteSpace(platformRouting))
             config.PlatformRouting = platformRouting;
 
+        var peers = Environment.GetEnvironmentVariable("SEXTANT_PEERS");
+        if (!string.IsNullOrWhiteSpace(peers))
+            config.Peers = [.. peers.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)];
+
+        var remoteFetchTimeout = Environment.GetEnvironmentVariable("SEXTANT_REMOTE_FETCH_TIMEOUT");
+        if (int.TryParse(remoteFetchTimeout, out var remoteTimeout))
+            config.RemoteFetchTimeoutSeconds = remoteTimeout;
+
+        var peerQueryToken = Environment.GetEnvironmentVariable("SEXTANT_PEER_QUERY_TOKEN");
+        if (!string.IsNullOrWhiteSpace(peerQueryToken))
+            config.PeerQueryToken = peerQueryToken;
+
         var indexingProfile = Environment.GetEnvironmentVariable("SEXTANT_INDEXING_PROFILE");
         if (!string.IsNullOrEmpty(indexingProfile))
             config.IndexingProfile = indexingProfile;
@@ -391,6 +437,15 @@ public sealed class SextantConfiguration
 
         [JsonPropertyName("platform_routing")]
         public string? PlatformRouting { get; set; }
+
+        [JsonPropertyName("peers")]
+        public List<string>? Peers { get; set; }
+
+        [JsonPropertyName("remote_fetch_timeout_seconds")]
+        public int? RemoteFetchTimeoutSeconds { get; set; }
+
+        [JsonPropertyName("peer_query_token")]
+        public string? PeerQueryToken { get; set; }
 
         [JsonPropertyName("indexing_profile")]
         public string? IndexingProfile { get; set; }
