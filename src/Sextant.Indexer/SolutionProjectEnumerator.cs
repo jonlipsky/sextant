@@ -17,7 +17,10 @@ internal static class SolutionProjectEnumerator
         new(StringComparer.OrdinalIgnoreCase) { ".csproj", ".vbproj", ".fsproj" };
 
     // Classic .sln project line: Project("{typeGuid}") = "Name", "relative\path.csproj", "{projectGuid}"
-    private static readonly Regex QuotedToken = new("\"([^\"]*)\"", RegexOptions.Compiled);
+    // A match timeout is passed defensively (rule S6444) so a pathological line can never hang parsing;
+    // the pattern itself is linear, so the timeout is a belt-and-braces bound, not an expected path.
+    private static readonly Regex QuotedToken =
+        new("\"([^\"]*)\"", RegexOptions.Compiled, TimeSpan.FromSeconds(1));
 
     /// <summary>
     /// Returns the absolute, de-duplicated paths of the recognized projects declared in
