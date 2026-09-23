@@ -38,6 +38,20 @@ The queue is in-memory. If the daemon is killed, background work is lost but wil
 
 When a symbol's signature changes, the daemon automatically queues dependent files for re-indexing. This ensures that references, call graph edges, and relationship data stay consistent.
 
+### Git-Aware Working-Tree Overlay (Phase 10)
+
+The daemon keeps query results in sync with your **uncommitted** working tree by maintaining a local
+*overlay* generation layered over the committed base. Beyond reacting to file-watcher events, it runs a
+periodic **authoritative git reconciliation** pass that reconstructs the working-tree state directly from
+git (independent of watcher events) and refreshes the overlay, so the overlay converges to git state even if
+a watcher event is missed. The watcher supplies only hints; a changed source content hash, a changed
+project **evaluation fingerprint**, or a create/delete/rename escalates only the affected dependency
+closure. The interval is `reconcile_interval_seconds` (env `SEXTANT_RECONCILE_INTERVAL`, default `30`; `0`
+disables the periodic pass — startup reconciliation still runs). Each pass re-resolves the solution and the
+live `sextant.json`. When a read rests on an overlay, MCP responses carry `overlay_generation` / `is_overlay`
+provenance in `meta.snapshot`; a full local fallback that could not reuse a committed base records a
+`fallback_reason` (see [mcp-tools.md](mcp-tools.md#snapshot-provenance-phases-1112)).
+
 ## Status Endpoint
 
 The daemon runs a lightweight HTTP status server on a random port. Connection details are written to `.sextant/daemon.pid`:
