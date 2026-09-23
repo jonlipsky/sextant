@@ -70,6 +70,19 @@ public class ServicePathsTests
     }
 
     [TestMethod]
+    public void RepoDirectoryName_CaseOnlyDifference_MapsToSameDirectory()
+    {
+        // Issue #92: the checkout directory and the catalog repository row share ONE identity rule, which
+        // folds case (git hosts are case-insensitive for host and owner/repo). Two case-only spellings of
+        // one repo must therefore map to the SAME directory — basename AND hash suffix — so the checkout
+        // boundary can never disagree with the catalog on "same repo".
+        var mixedCase = ServicePaths.RepoDirectoryName("https://github.com/elevenworks/MixAndMatch.git");
+        var lowerCase = ServicePaths.RepoDirectoryName("https://github.com/elevenworks/mixandmatch");
+        Assert.AreEqual(mixedCase, lowerCase, "case is not identity-bearing");
+        Assert.IsTrue(mixedCase.StartsWith("mixandmatch-", StringComparison.Ordinal), "basename is the normalized (lower) form");
+    }
+
+    [TestMethod]
     public void ReleaseScratch_DeletesAnAllocatedScratchDir()
     {
         var dir = _paths.AllocateScratch("job-2");
