@@ -184,7 +184,7 @@ public sealed class DaemonHost : IDisposable
                     ProjectIndex = 0,
                     ProjectCount = 0
                 };
-                var solution = await SolutionLoader.LoadSolutionAsync(solutionPath);
+                var solution = await SolutionLoader.LoadSolutionAsync(solutionPath, _log);
                 _currentSolution = solution;
 
                 var orchestrator = new IndexOrchestrator(_db!, _log, _useDocumentExtractor, _parallelism, _profile);
@@ -222,7 +222,7 @@ public sealed class DaemonHost : IDisposable
 
             foreach (var solutionPath in _solutionPaths)
             {
-                var solution = await SolutionLoader.LoadSolutionAsync(solutionPath);
+                var solution = await SolutionLoader.LoadSolutionAsync(solutionPath, _log);
                 _currentSolution = solution;
 
                 var changedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -368,7 +368,7 @@ public sealed class DaemonHost : IDisposable
             OverlayReconcileResult? result = null;
             for (var attempt = 1; attempt <= maxAttempts; attempt++)
             {
-                var solution = await SolutionLoader.LoadSolutionAsync(solutionPath);
+                var solution = await SolutionLoader.LoadSolutionAsync(solutionPath, _log);
                 _currentSolution = solution;
 
                 var reconciler = new LocalOverlayReconciler(_db!, _log, _useDocumentExtractor, _parallelism, _profile);
