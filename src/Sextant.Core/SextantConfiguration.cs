@@ -125,8 +125,16 @@ public sealed class SextantConfiguration
 
     private static readonly Regex ValidProfileName = new(@"^[a-zA-Z0-9_-]+$", RegexOptions.Compiled);
 
-    public string LogsPath => Path.Combine(
-        Path.GetDirectoryName(DbPath) ?? ".sextant/profiles/default", "logs");
+    public string LogsPath => LogsPathFor(DbPath);
+
+    /// <summary>
+    /// Derives the logs directory that sits next to a resolved database path, so a <c>--db</c>
+    /// override lands its logs beside the database it actually writes (issue #91) rather than
+    /// beside the config-resolved default. Two index runs pointed at different databases therefore
+    /// log to different directories instead of colliding on one fixed file.
+    /// </summary>
+    public static string LogsPathFor(string dbPath) => Path.Combine(
+        Path.GetDirectoryName(dbPath) ?? ".sextant/profiles/default", "logs");
 
     public static string ResolveDbPath(string? explicitDb, string? profileOverride, SextantConfiguration config)
     {

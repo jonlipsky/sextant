@@ -23,14 +23,14 @@ internal static class ServeHandler
 
         if (useStdio)
         {
-            var host = Mcp.McpServerSetup.CreateMcpHost([], dbPath, config.LogsPath);
+            var host = Mcp.McpServerSetup.CreateMcpHost([], dbPath, Core.SextantConfiguration.LogsPathFor(dbPath));
             await host.Build().RunAsync();
             return 0;
         }
 
         var httpPort = port ?? 3001;
         Console.WriteLine($"Starting Sextant MCP server on http://localhost:{httpPort}");
-        var app = Mcp.McpServerSetup.CreateHttpMcpHost([], httpPort, dbPath, config.LogsPath);
+        var app = Mcp.McpServerSetup.CreateHttpMcpHost([], httpPort, dbPath, Core.SextantConfiguration.LogsPathFor(dbPath));
         await app.RunAsync();
         return 0;
     }

@@ -140,4 +140,70 @@ public class FileLoggerTests
         Assert.IsTrue(allLines.Any(l => l.Contains("thread-0-msg-0")));
         Assert.IsTrue(allLines.Any(l => l.Contains("thread-9-msg-99")));
     }
+
+    [TestMethod]
+    public void Open_SecondLoggerOnSamePath_DoesNotThrowAndBothWrite()
+    {
+        // Reproduces issue #91: two processes indexing from the same CWD open the same log file.
+        // With FileShare.Read the second opener threw IOException and aborted the index.
+        var first = FileLogger.Open(_tempDir, "shared.log");
+        first.Write("from-first");
+
+        // Second concurrent opener on the same path must not throw while the first holds it open.
+        var second = FileLogger.Open(_tempDir, "shared.log");
+        Assert.IsTrue(second.IsFileBacked, "Second logger should be file-backed, not degraded");
+        second.Write("from-second"); // must not throw
+
+        // Close both handles before reading so the read isn't blocked by an open writer.
+        first.Dispose();
+        second.Dispose();
+
+        // Both writers' output survives: the second opens at EOF after the first's flush, so their
+        // appends don't overlap. Interleaving order between concurrent writers is acceptable.
+        var content = File.ReadAllText(Path.Combine(_tempDir, "shared.log"));
+        StringAssert.Contains(content, "from-first");
+        StringAssert.Contains(content, "from-second");
+    }
+
+    [TestMethod]
+    public void Open_FallsBackToConsole_WhenFileCannotBeOpened()
+    {
+        // Make the target log path an existing directory so opening it as a file fails; the logger
+        // must degrade to console-only rather than throwing and aborting the indexed operation.
+        const string blockedName = "blocked.log";
+        Directory.CreateDirectory(Path.Combine(_tempDir, blockedName));
+
+        using var logger = FileLogger.Open(_tempDir, blockedName);
+
+        Assert.IsFalse(logger.IsFileBacked, "Logger should degrade to console when the file can't be opened");
+        logger.Write("must not throw"); // fail-soft: no exception even though the file is unavailable
+    }
+
+    [TestMethod]
+    public void Open_FallsBackToConsole_WhenLogDirCannotBeCreated()
+    {
+        // Point the log directory at an existing FILE so Directory.CreateDirectory throws; Open must
+        // still return a (console-only) logger rather than propagating and aborting the caller.
+        var fileAsDir = Path.Combine(_tempDir, "not-a-dir");
+        Directory.CreateDirectory(_tempDir);
+        File.WriteAllText(fileAsDir, "x");
+
+        using var logger = FileLogger.Open(fileAsDir, "test.log");
+
+        Assert.IsFalse(logger.IsFileBacked, "Logger should degrade to console when the log dir can't be created");
+        logger.Write("must not throw");
+    }
+
+    [TestMethod]
+    public void Write_AfterDispose_DoesNotThrowOrResurrect()
+    {
+        var logger = FileLogger.Open(_tempDir, "test.log");
+        Assert.IsTrue(logger.IsFileBacked);
+        logger.Dispose();
+
+        logger.Write("after dispose"); // must not throw
+
+        // The disposed logger must not reopen the file (which Dispose would then never close).
+        Assert.IsFalse(logger.IsFileBacked, "A disposed logger must not resurrect its file writer");
+    }
 }
