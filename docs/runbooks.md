@@ -80,6 +80,22 @@ refused, or a project shape the indexer does not model).
 
 ---
 
+## Runbook: local retention (`sextant retention`)
+
+The standalone service runs its own retention/GC under the writer lease via `POST /control/retention`. A
+**local** index (CLI/daemon) reclaims its own superseded history with the `sextant retention` command.
+
+**Action.**
+1. Dry-run first — `sextant retention` reports the protected, retained, and deletable generations, API
+   history, and source blobs with reclaimable bytes, and changes nothing.
+2. Apply with `sextant retention --execute`.
+
+Retention honors the repo [`retention` policy](configuration.md#retention) (`keep_complete_generations`,
+`api_snapshot_keep_commits`, `prune_superseded_source_blobs`) and never deletes data referenced by a
+protected/default branch, an open pull request, a submodule pin, or an active overlay base.
+
+---
+
 ## Runbook: schema upgrades (with rehearsal)
 
 Migrations are **additive/forward-only** from `011` onward; `LatestSchemaVersion` auto-derives from the
