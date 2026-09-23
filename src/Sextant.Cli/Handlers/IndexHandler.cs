@@ -30,7 +30,9 @@ internal static class IndexHandler
                 Directory.CreateDirectory(dbDir);
 
             Console.WriteLine("Loading solution...");
-            var solution = await Indexer.SolutionLoader.LoadSolutionAsync(solutionPath);
+            var loadResult = await Indexer.SolutionLoader.LoadSolutionResilientlyAsync(
+                solutionPath, fileLogger.CreateCallback());
+            var solution = loadResult.Solution;
             Console.WriteLine($"  Loaded {solution.ProjectIds.Count} projects");
 
             foreach (var project in solution.Projects)
@@ -127,7 +129,12 @@ internal static class IndexHandler
                     if (attempt < maxAttempts)
                     {
                         Console.WriteLine($"  Repository changed during indexing (attempt {attempt}/{maxAttempts}); reloading and retrying...");
-                        solution = await Indexer.SolutionLoader.LoadSolutionAsync(solutionPath);
+                        // Reassign the WHOLE result, not just the Solution: the reloaded solution may have
+                        // a different skipped-project set (the on-disk state changed), and we must report
+                        // the completeness of the generation we actually publish (issue #90 accuracy).
+                        loadResult = await Indexer.SolutionLoader.LoadSolutionResilientlyAsync(
+                            solutionPath, fileLogger.CreateCallback());
+                        solution = loadResult.Solution;
                         lastPhase = "";
                     }
                 }
@@ -144,6 +151,10 @@ internal static class IndexHandler
                 return 1;
             }
 
+            // Report completeness against the generation that was actually published (loadResult is the
+            // final reload if a git-move retry occurred), so the PARTIAL warning matches the DB on disk.
+            ReportSkippedProjects(loadResult);
+
             Console.WriteLine();
             return 0;
         }
@@ -152,6 +163,19 @@ internal static class IndexHandler
             Console.Error.WriteLine($"Failed to index solution: {ex.Message}");
             return 1;
         }
+    }
+
+    private static void ReportSkippedProjects(Indexer.SolutionLoadResult loadResult)
+    {
+        if (!loadResult.IsPartial)
+            return;
+
+        Console.WriteLine();
+        Console.WriteLine(
+            $"  WARNING: {loadResult.SkippedProjects.Count} project(s) could not be loaded and were skipped. " +
+            "The index is PARTIAL — symbols from these projects are missing:");
+        foreach (var skipped in loadResult.SkippedProjects)
+            Console.WriteLine($"    - {skipped.ProjectName}: {skipped.Reason}");
     }
 
     private static void ClearLine()
