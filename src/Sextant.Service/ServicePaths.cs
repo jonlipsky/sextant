@@ -1,5 +1,7 @@
 namespace Sextant.Service;
 
+using Sextant.Core;
+
 /// <summary>
 /// Materializes and guards the service's on-disk roots (<see cref="ServiceVolumes"/>). It creates the
 /// persistent checkout/artifact/cache volumes and the ephemeral worker-scratch root, and — the load-
@@ -51,36 +53,37 @@ public sealed class ServicePaths
     /// directory would let one tenant's checkout satisfy another tenant's request (a cross-tenant
     /// isolation bug, criterion 1). So the segment is suffixed with a short stable hash of the FULL
     /// normalized remote URL: distinct URLs get distinct directories while the human-readable basename is
-    /// preserved. Trivially-equivalent spellings (trailing <c>/</c> or <c>.git</c>) normalize to the SAME
-    /// hash so the same repo always maps to the same directory.
+    /// preserved. Equivalent spellings (trailing <c>/</c>, trailing <c>.git</c>, or a different case)
+    /// normalize to the SAME hash so the same repo always maps to the same directory. Different owners
+    /// differ in text (not case), so case-folding never merges distinct tenants.
     /// </para>
     /// </summary>
     public static string RepoDirectoryName(string repositoryRemoteUrl)
     {
-        var url = repositoryRemoteUrl ?? string.Empty;
-        var trimmed = url.TrimEnd('/');
-        var lastSlash = trimmed.LastIndexOf('/');
-        var name = lastSlash >= 0 ? trimmed[(lastSlash + 1)..] : trimmed;
-        if (name.EndsWith(".git", StringComparison.OrdinalIgnoreCase))
-            name = name[..^4];
+        // Derive BOTH the human-readable basename and the hash suffix from the ONE canonical identity
+        // (issue #92): the whole directory name — not just the hash — collapses across equivalent
+        // spellings, so the checkout boundary and the catalog identity boundary agree on "same repo".
+        var normalized = RemoteUrlIdentity.Normalize(repositoryRemoteUrl);
+        var lastSlash = normalized.LastIndexOf('/');
+        var name = lastSlash >= 0 ? normalized[(lastSlash + 1)..] : normalized;
         var chars = name.Select(c => Array.IndexOf(Path.GetInvalidFileNameChars(), c) >= 0 ? '_' : c).ToArray();
         var safe = new string(chars).Trim('_', '.');
         if (safe.Length == 0)
             safe = "repo";
-        return $"{safe}-{ShortUrlHash(url)}";
+        return $"{safe}-{ShortUrlHash(repositoryRemoteUrl)}";
     }
 
     /// <summary>
-    /// A short, stable, collision-resistant hash of the identity-bearing part of a remote URL. Only the
-    /// identity-neutral trailing <c>/</c> and <c>.git</c> are normalized away (mirroring the basename
-    /// derivation) so equivalent spellings of one repo share a directory; everything else — host, owner,
-    /// path, case — is significant, so two genuinely-distinct repositories never collide.
+    /// A short, stable, collision-resistant hash of the identity-bearing part of a remote URL, derived
+    /// through the shared <see cref="RemoteUrlIdentity.Normalize"/> rule so equivalent spellings of one
+    /// repo (trailing <c>/</c> or <c>.git</c>, or a different case) share a directory while two
+    /// genuinely-distinct repositories (different host, owner, or path) never collide. Using the SAME
+    /// canonical rule as the catalog repository row keeps the checkout directory and the catalog identity
+    /// from ever disagreeing on "same repo" (issue #92).
     /// </summary>
     private static string ShortUrlHash(string repositoryRemoteUrl)
     {
-        var normalized = (repositoryRemoteUrl ?? string.Empty).Trim().TrimEnd('/');
-        if (normalized.EndsWith(".git", StringComparison.OrdinalIgnoreCase))
-            normalized = normalized[..^4];
+        var normalized = RemoteUrlIdentity.Normalize(repositoryRemoteUrl);
         var digest = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(normalized));
         return Convert.ToHexString(digest, 0, 6).ToLowerInvariant();
     }
