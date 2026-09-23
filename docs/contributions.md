@@ -6,7 +6,8 @@ it. Phase 16 lets any environment that already possesses the required toolchain 
 especially, **CI after a successful restore/build**) produce a **validated, deterministic semantic
 contribution** for committed source and upload it to the [standalone index service](service.md). The
 service authenticates, authorizes, hash-verifies against Git content, capability-verifies, and only then
-publishes it as an immutable [Phase-9 snapshot](../specs/20260919-scalable-distributed-indexing/overview.md).
+publishes it as an immutable Phase-9 snapshot (see [service.md](service.md) and
+[schema.md](schema.md#later-additive-migrations-012021)).
 
 This is how the platform-specific project versions from [Phase 15](service.md) get produced by the
 environments that can actually build them (a Windows runner builds the `net8.0-windows` project version, a
@@ -61,8 +62,8 @@ A contribution artifact is a single content-addressed container:
 ```
 
 - The **manifest** ([`ContributionManifest`](../src/Sextant.Core/Platform/ContributionManifest.cs)) is the
-  per-logical-project/TFM contract from
-  [`platform-indexing.md`](../specs/20260919-scalable-distributed-indexing/platform-indexing.md): repository
+  per-logical-project/TFM contract (see [platform routing](service.md#platform-specific-routing-by-worker-capability-phase-15)):
+  repository
   remote URL, commit/tree SHA, schema + analyzer + config + toolchain fingerprints, the producing
   **capability fingerprint**, the payload snapshot's [identity hash](service.md), and one entry per
   contributed project version carrying its canonical id, repo-relative path, TFM, per-project capability, and

@@ -53,10 +53,26 @@ of the box.
 | `SEXTANT_SERVICE_SCRATCH_ROOT` | **Ephemeral** per-job worker scratch | `<data-root>/scratch` |
 | `SEXTANT_SERVICE_CONTROL_TOKEN` | Bearer token for `/control/*` | none (open, dev only) |
 | `SEXTANT_SERVICE_QUERY_TOKEN` | Bearer token for `/mcp` + `/query/*` | none (anonymous read) |
+| `SEXTANT_SERVICE_CONTRIBUTE_TOKEN` | Least-privilege token for `/control/contribute` only (issue #71); the control token remains a superset that also authorizes it | none (falls back to control token) |
+| `SEXTANT_SERVICE_READ_POLICY` | Enforced query-plane read-authorization policy (Phase 17) | disabled (open read) |
 | `SEXTANT_SERVICE_CONTROL_PORT` | HTTP port | `3011` |
+| `SEXTANT_SERVICE_QUERY_PORT` | Optional dedicated query port (shares the control port when unset) | none (shared) |
 | `SEXTANT_SERVICE_LEASE_TTL_SECONDS` | Single-writer lease TTL | `30` |
 | `SEXTANT_SERVICE_PEERS` | Comma-separated peer base URLs for federation | none |
 | `SEXTANT_SERVICE_REMOTE_TIMEOUT_SECONDS` | Per-request remote-fetch timeout | `10` |
+| `SEXTANT_SERVICE_CONTRIB_REQUIRE_AUTH` | Require contribution authorization (Phase 16) | `false` (dev-open) |
+| `SEXTANT_SERVICE_CONTRIB_REQUIRE_GIT_VERIFY` | Require Git-content verification of uploads (Phase 16) | `false` |
+| `SEXTANT_SERVICE_CONTRIB_MAX_ARTIFACT_BYTES` | Max accepted contribution artifact size (Phase 16) | policy default |
+| `SEXTANT_SERVICE_SANDBOX_ENABLED` | Enforce the evaluation sandbox (Phase 17) | `true` |
+| `SEXTANT_SERVICE_SANDBOX_TIME_BUDGET_SECONDS` | Wall-clock evaluation time budget | policy default |
+| `SEXTANT_SERVICE_SANDBOX_MEMORY_BUDGET_BYTES` | Watchdog memory ceiling | policy default |
+| `SEXTANT_SERVICE_SANDBOX_ALLOW_NETWORK` | Allow network during evaluation | `false` |
+| `SEXTANT_SERVICE_SANDBOX_SCRUB_SECRETS` | Scrub secrets from the evaluation environment | `true` |
+
+Boolean toggles accept `1/0`, `true/false`, `yes/no`, `on/off` (case-insensitive); any other non-empty
+value **fails startup** rather than silently disabling a security-relevant control (fail-closed). The
+per-repository/profile `platform_routing` policy and the `retention` policy are read from the repo
+`sextant.json` / `SEXTANT_*` config (see [configuration.md](configuration.md)).
 
 The **wire format is snake_case** (`ServiceJson.Options` = `SnakeCaseLower` + ignore-null, matching the
 rest of Sextant's JSON). Response bodies are serialized with `ServiceJson.Options` explicitly; request
@@ -71,7 +87,8 @@ The host deliberately **separates control endpoints from query endpoints**, and 
 | --- | --- | --- | --- |
 | `GET /health` | — | open | Service **AVAILABILITY**: the process is up and the catalog is reachable. |
 | `GET /ready` | — | open | Worker **CAPACITY**: `503` when this node has no worker (query-only), so an operator can tell "up" from "can index". |
-| `POST /control/ensure` | control | control token | Idempotent ensure-snapshot (criterion 1). |
+| `POST /control/ensure` | control | control token | Idempotent ensure-snapshot (criterion 1). Accepts an optional monotonic `branch_head_sequence` for forward-only branch-head advance (Phase 14, issue #84). |
+| `POST /control/contribute` | control | control **or** contribute token | Ingest a client/CI semantic contribution (Phase 16); the least-privilege contribute token authorizes this endpoint only. |
 | `GET /control/status/{jobId}` | control | control token | Job status + per-project diagnostics (criterion 5). |
 | `GET /control/resolve` | control | control token | Resolve a repository branch to its current complete snapshot. |
 | `POST /control/retention` | control | control token | Run the service-owned retention/GC pass (`?execute=true` to apply). |
@@ -109,6 +126,15 @@ snapshot under a per-job **scratch** directory; its output is validated — a wo
 match the requested hash, is **downgraded to `failed`** — and published through the catalog, then a terminal
 status + per-project diagnostics are recorded. A job **cancelled** mid-run is requeued (transient), never
 recorded as a permanent failure.
+
+**Forward-only branch-head advance (Phase 14, issue #84).** An ensure request may carry an optional
+monotonic `branch_head_sequence`. Because the service ensures *every* delivered commit (including
+out-of-order/older ones) to build immutable content-addressed snapshots, the control plane owns commit
+ordering and supplies this sequence so Sextant advances the data-plane branch pointer **forward-only**: the
+pointer (and stored `branches.head_sequence`) advance only when the supplied sequence is strictly greater
+than the stored one; a lower/equal sequence still ensures/attaches the immutable snapshot but leaves the
+branch pointer untouched (no transient regression to a stale snapshot). A NULL sequence — the local
+CLI/daemon path — advances unconditionally and never writes the column, preserving pre-#84 behavior.
 
 ### Restart recovery (criterion 2)
 
@@ -313,8 +339,10 @@ Migration `016_service_job_catalog.sql` adds `snapshot_jobs`, `snapshot_job_diag
 `writer_lease`; `017_snapshot_capability_fingerprint.sql` adds `snapshots.capability_fingerprint`
 (Phase 15); `018_client_contributions.sql` and `019_pull_request_retention_roots.sql` are the Phase-17
 slice-1/2 additions; `020_audit_log.sql` adds the durable operational + security **audit log** (Phase 17
-slice 3, criterion 5). All are additive/forward-only. See [`schema.md`](schema.md) for the table
-definitions. `LatestSchemaVersion` auto-derives from the highest migration and is **20**.
+slice 3, criterion 5); `021_branch_head_sequence.sql` adds `branches.head_sequence` for the forward-only
+branch-head advance on the ensure path (Phase 14, issue #84). All are additive/forward-only. See
+[`schema.md`](schema.md) for the table definitions. `LatestSchemaVersion` auto-derives from the highest
+migration and is **21**.
 
 ## Testing
 

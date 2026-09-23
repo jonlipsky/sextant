@@ -46,6 +46,75 @@ Because the display FQN is no longer unique, tools that accept an FQN resolve it
 
 These fields are omitted entirely for unambiguous lookups, so existing callers see byte-identical responses. To pin a specific definition, re-issue the lookup with a narrowing `project_id`; `selected_project_id` and each candidate's `project_id` identify which projects collided. The `symbol_key` on each candidate is the stable semantic identity you can record and compare across runs (tools resolve by FQN scoped with `project_id`; there is no query-by-key tool in this phase).
 
+### Feature availability (Phase 8)
+
+Under the `core` indexing profile some optional data (documentation search, comments, tests, dataflow) is
+not built. When a capability-aware tool needs data the **active** [indexing profile](configuration.md#index-profiles)
+did not build, it returns a structured `feature_unavailable` block in `meta` — naming the missing feature,
+the active profile, and the minimum profile that would provide it — instead of crashing or returning a
+silently-empty result:
+
+```json
+{
+  "meta": {
+    "queried_at": 1709568000000,
+    "index_freshness": 0,
+    "result_count": 0,
+    "feature_unavailable": {
+      "feature": "dataflow",
+      "required_profile": "deep",
+      "active_profile": "standard",
+      "message": "Feature 'dataflow' (profile 'standard') did not build. Re-index with the 'deep' profile or higher to enable it."
+    }
+  },
+  "results": []
+}
+```
+
+### Snapshot provenance (Phases 11–12)
+
+When a query is served from a snapshot generation (a committed base, a Phase-10 working-tree overlay, or a
+federated read), `meta` carries a `snapshot` block describing the provenance of the served data. It is
+**omitted** for a pure legacy/direct-seed database, so pre-snapshot responses are byte-identical:
+
+```json
+{
+  "meta": {
+    "queried_at": 1709568000000,
+    "index_freshness": 1709567990000,
+    "result_count": 5,
+    "snapshot": {
+      "base_snapshot_id": 42,
+      "base_commit": "a1b2c3d",
+      "overlay_generation": 57,
+      "is_overlay": true,
+      "completeness": "complete",
+      "scope": "local",
+      "dirty": true,
+      "fallback_reason": null,
+      "compatible": true,
+      "incompatibilities": null,
+      "freshness": 1709567990000
+    }
+  },
+  "results": [...]
+}
+```
+
+- `base_snapshot_id` / `base_commit` — the committed base snapshot the read rests on, and its commit.
+- `overlay_generation` / `is_overlay` — the Phase-10 overlay generation layered on the base, when the read
+  includes uncommitted working-tree changes.
+- `completeness` — `complete` or `partial` for the served generation.
+- `scope` — the federation partition the results came from (e.g. `local`, `committed`).
+- `dirty` — whether the working tree had uncommitted changes.
+- `fallback_reason` — set when a full local fallback could not reuse a committed base.
+- `compatible` / `incompatibilities` — the read-time compatibility verdict; each incompatibility names the
+  `dimension`, `expected`, and `actual` value (issue #41).
+- `freshness` — the served generation's freshness timestamp.
+
+A read that fails a hard compatibility check surfaces an `error` block in `meta` (`code` + `message`)
+rather than serving mismatched data (Phase 11).
+
 ## Symbol Result Object
 
 When a tool returns symbols, each includes at minimum:
@@ -152,9 +221,19 @@ FTS5 full-text search over symbol names and documentation comments.
 
 ### get_index_status
 
-Returns the current state of the index: project count, symbol count, reference count, last indexed timestamp, and per-project details.
+Returns the current state of the index: project count, symbol count, reference count, last indexed timestamp, and per-project details. Call this first to see what data is available.
 
 No parameters.
+
+The response also includes an `index` block describing the served generation: the active `profile`
+(indexing profile), its `config_hash`, the enabled `features` (the capability names built under that
+profile), an `overlay` block when the served generation is a Phase-10 working-tree overlay or a full local
+fallback (`is_overlay`, `base_snapshot_id`, `has_working_tree_delta`, `fallback_reason`), and a `storage`
+block (`database_bytes`, `api_snapshot_count`, `file_version_count`, `complete_generation_count`,
+`total_run_count`). Under an enforced multi-tenant read policy the run metadata is scoped to the caller's
+selected snapshot and the DB-wide `storage` block is omitted (Phase 17). If the database needs a rebuild or
+a Sextant upgrade, the status surfaces an actionable readiness message instead (see
+[schema.md](schema.md#migrations)).
 
 ### get_impact
 
