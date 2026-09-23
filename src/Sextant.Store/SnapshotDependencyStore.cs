@@ -94,16 +94,19 @@ public sealed class SnapshotDependencyStore(SqliteConnection connection)
     /// </summary>
     public List<string> ResolveProviderSymbolKeysByFqn(string providerRepositoryUrl, string fullyQualifiedName)
     {
+        // Resolve the provider repository through the normalized identity key (issue #92) so any
+        // equivalent spelling (trailing .git / slash / case) binds the one canonical provider row.
+        if (new SnapshotStore(connection).GetRepositoryId(providerRepositoryUrl) is not long providerRepoId)
+            return [];
         using var cmd = connection.CreateCommand();
         cmd.CommandText = """
             SELECT DISTINCT s.symbol_key
             FROM snapshot_dependencies d
-            JOIN repositories r ON r.id = d.provider_repository_id
             JOIN symbols s ON s.project_id = d.provider_project_id
-            WHERE r.remote_url = @url AND s.fully_qualified_name = @fqn
+            WHERE d.provider_repository_id = @provider_repo_id AND s.fully_qualified_name = @fqn
             ORDER BY s.symbol_key;
             """;
-        cmd.Parameters.AddWithValue("@url", providerRepositoryUrl);
+        cmd.Parameters.AddWithValue("@provider_repo_id", providerRepoId);
         cmd.Parameters.AddWithValue("@fqn", fullyQualifiedName);
         var keys = new List<string>();
         using var reader = cmd.ExecuteReader();
@@ -121,12 +124,16 @@ public sealed class SnapshotDependencyStore(SqliteConnection connection)
     public List<(long repositoryId, string remoteUrl)> GetCandidateConsumerRepositories(
         string providerRepositoryUrl, string providerSymbolKey, CrossRepoUsageScope scope)
     {
+        // Resolve the provider repository through the normalized identity key (issue #92) so any
+        // equivalent spelling binds the one canonical provider row.
+        if (new SnapshotStore(connection).GetRepositoryId(providerRepositoryUrl) is not long providerRepoId)
+            return [];
         using var cmd = connection.CreateCommand();
         cmd.CommandText = $"""
             SELECT DISTINCT crepo.id, crepo.remote_url
             {UsageFromWhere(scope)};
             """;
-        BindUsageParameters(cmd, providerRepositoryUrl, providerSymbolKey, scope);
+        BindUsageParameters(cmd, providerRepoId, providerSymbolKey, scope);
         var rows = new List<(long, string)>();
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
@@ -144,6 +151,10 @@ public sealed class SnapshotDependencyStore(SqliteConnection connection)
     public List<SubmoduleConsumer> GetConsumersByProviderRepository(
         string providerRepositoryUrl, string? providerCommitSha, CrossRepoUsageScope scope)
     {
+        // Resolve the provider repository through the normalized identity key (issue #92) so any
+        // equivalent spelling binds the one canonical provider row.
+        if (new SnapshotStore(connection).GetRepositoryId(providerRepositoryUrl) is not long providerRepoId)
+            return [];
         using var cmd = connection.CreateCommand();
         cmd.CommandText = $"""
             SELECT DISTINCT crepo.id, crepo.remote_url, cb.name, cc.commit_sha, clp.canonical_id,
@@ -151,7 +162,7 @@ public sealed class SnapshotDependencyStore(SqliteConnection connection)
             {ConsumerFromWhere(scope)}{(providerCommitSha != null ? " AND d.provider_commit_sha = @provider_commit" : "")}
             ORDER BY crepo.remote_url, clp.canonical_id;
             """;
-        cmd.Parameters.AddWithValue("@provider_url", providerRepositoryUrl);
+        cmd.Parameters.AddWithValue("@provider_repo_id", providerRepoId);
         cmd.Parameters.AddWithValue("@published_complete", SnapshotStatus.Complete);
         cmd.Parameters.AddWithValue("@published_superseded", SnapshotStatus.Superseded);
         if (scope.ConsumerCommitSha != null)
@@ -194,6 +205,11 @@ public sealed class SnapshotDependencyStore(SqliteConnection connection)
         if (authorizedConsumerRepositoryIds is { Count: 0 })
             return [];
 
+        // Resolve the provider repository through the normalized identity key (issue #92) so any
+        // equivalent spelling binds the one canonical provider row.
+        if (new SnapshotStore(connection).GetRepositoryId(providerRepositoryUrl) is not long providerRepoId)
+            return [];
+
         var authFilter = "";
         if (authorizedConsumerRepositoryIds is { Count: > 0 })
         {
@@ -208,7 +224,7 @@ public sealed class SnapshotDependencyStore(SqliteConnection connection)
             {UsageFromWhere(scope)}{authFilter}
             ORDER BY crepo.remote_url, clp.canonical_id, cf.repo_relative_path, o.line, o.col;
             """;
-        BindUsageParameters(cmd, providerRepositoryUrl, providerSymbolKey, scope);
+        BindUsageParameters(cmd, providerRepoId, providerSymbolKey, scope);
 
         var results = new List<CrossRepositoryUsage>();
         using var reader = cmd.ExecuteReader();
@@ -261,7 +277,7 @@ public sealed class SnapshotDependencyStore(SqliteConnection connection)
 
         return $"""
             FROM snapshot_dependencies d
-            JOIN repositories prepo ON prepo.id = d.provider_repository_id AND prepo.remote_url = @provider_url
+            JOIN repositories prepo ON prepo.id = d.provider_repository_id AND prepo.id = @provider_repo_id
             JOIN symbols psym ON psym.project_id = d.provider_project_id AND psym.symbol_key = @symbol_key
             JOIN occurrences o ON o.target_symbol_id = psym.id AND o.in_project_id = d.consumer_project_id
                 AND o.source_symbol_id IS NULL
@@ -277,9 +293,9 @@ public sealed class SnapshotDependencyStore(SqliteConnection connection)
     }
 
     private static void BindUsageParameters(
-        SqliteCommand cmd, string providerRepositoryUrl, string providerSymbolKey, CrossRepoUsageScope scope)
+        SqliteCommand cmd, long providerRepositoryId, string providerSymbolKey, CrossRepoUsageScope scope)
     {
-        cmd.Parameters.AddWithValue("@provider_url", providerRepositoryUrl);
+        cmd.Parameters.AddWithValue("@provider_repo_id", providerRepositoryId);
         cmd.Parameters.AddWithValue("@symbol_key", providerSymbolKey);
         cmd.Parameters.AddWithValue("@published_complete", SnapshotStatus.Complete);
         cmd.Parameters.AddWithValue("@published_superseded", SnapshotStatus.Superseded);
@@ -306,7 +322,7 @@ public sealed class SnapshotDependencyStore(SqliteConnection connection)
 
         return $"""
             FROM snapshot_dependencies d
-            JOIN repositories prepo ON prepo.id = d.provider_repository_id AND prepo.remote_url = @provider_url
+            JOIN repositories prepo ON prepo.id = d.provider_repository_id AND prepo.id = @provider_repo_id
             JOIN snapshots cs ON cs.id = d.consumer_snapshot_id
             JOIN projects cp ON cp.id = d.consumer_project_id
             JOIN logical_projects clp ON clp.id = cp.logical_project_id
