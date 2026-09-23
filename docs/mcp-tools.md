@@ -111,6 +111,19 @@ federated read), `meta` carries a `snapshot` block describing the provenance of 
 - `compatible` / `incompatibilities` — the read-time compatibility verdict; each incompatibility names the
   `dimension`, `expected`, and `actual` value (issue #41).
 - `freshness` — the served generation's freshness timestamp.
+- `origin` — where the served base snapshot's rows came from: `local` (the local catalog) or `remote` (a
+  configured peer served a base snapshot the local catalog lacked). Omitted on the pure-local path (issue
+  #60).
+- `base_identity_hash` — the immutable identity hash of the base snapshot a remote federation fetch
+  resolved (issue #60).
+
+The transparent offline fallback still works — once a remote page is cached, it keeps answering with
+`origin=remote` even when the peer is later unreachable. There is no separate `offline_cache` flag: the
+remote source is cache-first (it serves a warm page without probing the peer), so "served because offline"
+is indistinguishable from "served because warm" and no honest signal can be produced.
+
+When a result set is cursor-paged (e.g. `get_base_snapshot_symbols`), `meta.next_cursor` carries the
+opaque cursor to pass back to fetch the next page; it is omitted on the final page.
 
 A read that fails a hard compatibility check surfaces an `error` block in `meta` (`code` + `message`)
 rather than serving mismatched data (Phase 11).
@@ -235,7 +248,31 @@ selected snapshot and the DB-wide `storage` block is omitted (Phase 17). If the 
 a Sextant upgrade, the status surfaces an actionable readiness message instead (see
 [schema.md](schema.md#migrations)).
 
-### get_impact
+### get_base_snapshot_symbols
+
+Pages the symbols of a **base snapshot** addressed by its immutable identity hash (Phase-9
+`SnapshotIdentity.Hash`). Serves the snapshot from the local catalog when present; otherwise, when remote
+peers are configured (`peers` in `sextant.json` / `SEXTANT_PEERS`), it transparently federates the fetch to
+a peer that publishes that snapshot — the marquee cross-repo path where a base snapshot lives in another
+repository's service (issue #60). Falls back to a cached page when a warmed peer later goes offline.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `identity_hash` | string | yes | Immutable identity hash of the base snapshot to page |
+| `cursor` | string | no | Resume cursor from a previous page's `meta.next_cursor` |
+| `limit` | int | no | Max symbols per page (default 500, clamped 1..5000) |
+
+`meta.snapshot.origin` (`local`/`remote`) and `base_identity_hash` record where the rows came from;
+`meta.next_cursor` continues paging. When the snapshot is neither local nor served by any peer,
+the response is an empty result with an explanatory `message` (never a silent zero-symbol answer).
+
+> **Local planner tool only.** This tool takes a caller-supplied `identity_hash` that is not bound to the
+> repository scope the read gate authorizes, so it is exposed on the local single-tenant MCP surface (stdio
+> and the local HTTP host) but **excluded** from the multi-tenant service's remote MCP allowlist. Service-to-
+> service snapshot federation uses the per-hash-authorized `/query/snapshots/{identityHash}/symbols` HTTP
+> endpoint instead (issue #60).
+
+
 
 Cross-project blast radius analysis for a symbol.
 
