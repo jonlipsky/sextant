@@ -279,9 +279,9 @@ Ask a natural language question about the indexed codebase. An LLM agent researc
 
 The response includes the synthesized `answer`, a `sources` array with FQNs and file locations, and `meta` with `tool_calls_used`, `model`, and standard freshness fields.
 
-## Research-Only Tools
+## Additional Tools
 
-The following tools are not directly exposed as MCP tools. They are available to the inner LLM agent behind `research_codebase`, which uses them to answer natural language questions about the codebase. The research agent also has access to all of the direct tools listed above.
+The following tools are also exposed as MCP tools (registered via `WithToolsFromAssembly`) and are additionally available to the inner LLM agent behind `research_codebase`, which uses them alongside the tools above to answer natural language questions about the codebase.
 
 ### get_namespace_tree
 
@@ -380,7 +380,7 @@ Finds methods/properties by signature characteristics.
 
 ### get_daemon_status
 
-Queries the daemon's HTTP status endpoint for live indexing progress. Available via CLI (`sextant daemon status`) but not exposed as an MCP tool.
+Queries the daemon's HTTP status endpoint for live indexing progress. Also available via CLI (`sextant daemon status`).
 
 No parameters. Returns daemon PID, port, state (idle/indexing), current phase, project progress, and elapsed time.
 
