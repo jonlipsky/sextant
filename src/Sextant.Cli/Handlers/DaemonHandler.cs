@@ -31,7 +31,10 @@ internal static class DaemonHandler
         Console.WriteLine($"  Solutions: {string.Join(", ", solutions.Select(Path.GetFileName))}");
         Console.WriteLine();
 
-        using var fileLogger = Core.FileLogger.Open(config.LogsPath, "daemon.log");
+        // Per-process log filename (issue #91) so a restarted or second daemon never shares one
+        // append-only file with a live process, mirroring the indexer-{pid}/mcp-{pid} convention.
+        using var fileLogger = Core.FileLogger.Open(
+            Core.SextantConfiguration.LogsPathFor(dbPath), $"daemon-{Environment.ProcessId}.log");
         var logCallback = fileLogger.CreateCallback(Console.WriteLine);
 
         using var cts = new CancellationTokenSource();
