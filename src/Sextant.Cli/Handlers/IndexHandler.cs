@@ -21,7 +21,11 @@ internal static class IndexHandler
         Console.WriteLine($"  Database: {Path.GetFullPath(dbPath)}");
         Console.WriteLine();
 
-        using var fileLogger = Core.FileLogger.Open(config.LogsPath, "indexer.log");
+        // Derive the log path from the RESOLVED db (honoring --db), and scope the filename to this
+        // process so two concurrent index runs from the same CWD never collide (issue #91), mirroring
+        // the MCP host's mcp-{ProcessId}.log convention.
+        using var fileLogger = Core.FileLogger.Open(
+            Core.SextantConfiguration.LogsPathFor(dbPath), $"indexer-{Environment.ProcessId}.log");
 
         try
         {

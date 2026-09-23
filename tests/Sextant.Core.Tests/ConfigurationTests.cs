@@ -44,6 +44,30 @@ public class ConfigurationTests
     }
 
     [TestMethod]
+    public void LogsPathFor_DerivesLogsDirNextToDb()
+    {
+        var dbPath = Path.Combine("some", "dir", "sextant.db");
+        var expected = Path.Combine("some", "dir", "logs");
+        Assert.AreEqual(expected, SextantConfiguration.LogsPathFor(dbPath));
+    }
+
+    [TestMethod]
+    public void LogsPathFor_DifferentDbs_YieldDifferentLogDirs()
+    {
+        // Issue #91: two index runs with different --db must not share a logs directory.
+        var a = SextantConfiguration.LogsPathFor(Path.Combine("a", "a.db"));
+        var b = SextantConfiguration.LogsPathFor(Path.Combine("b", "b.db"));
+        Assert.AreNotEqual(a, b);
+    }
+
+    [TestMethod]
+    public void LogsPath_UsesResolvedDbPath()
+    {
+        var config = new SextantConfiguration { DbPath = Path.Combine("x", "y", "sextant.db") };
+        Assert.AreEqual(Path.Combine("x", "y", "logs"), config.LogsPath);
+    }
+
+    [TestMethod]
     public void Load_WithJsonFile_OverridesDefaults()
     {
         var json = """
