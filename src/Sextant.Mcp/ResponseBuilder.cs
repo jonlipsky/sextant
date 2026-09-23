@@ -14,7 +14,7 @@ public static class ResponseBuilder
 
     public static string Build<T>(
         List<T> results, long? indexFreshness = null, SymbolAmbiguity? ambiguity = null,
-        SnapshotProvenance? provenance = null)
+        SnapshotProvenance? provenance = null, string? nextCursor = null)
     {
         var response = new
         {
@@ -28,7 +28,8 @@ public static class ResponseBuilder
                 SelectedProjectId = ambiguity?.SelectedProjectId,
                 SelectedSymbolKey = ambiguity?.SelectedSymbolKey,
                 Candidates = ambiguity?.Candidates,
-                Snapshot = SnapshotMeta.From(provenance)
+                Snapshot = SnapshotMeta.From(provenance),
+                NextCursor = nextCursor
             },
             Results = results
         };
@@ -231,6 +232,12 @@ public sealed class SnapshotMeta
     [JsonPropertyName("freshness")]
     public long Freshness { get; set; }
 
+    [JsonPropertyName("origin")]
+    public string? Origin { get; set; }
+
+    [JsonPropertyName("base_identity_hash")]
+    public string? BaseIdentityHash { get; set; }
+
     /// <summary>Projects planner provenance into the serializable meta block, or null to omit it.</summary>
     public static SnapshotMeta? From(SnapshotProvenance? p)
     {
@@ -249,7 +256,9 @@ public sealed class SnapshotMeta
             Incompatibilities = p.Incompatibilities?
                 .Select(i => new IncompatibilityMeta { Dimension = i.Dimension, Expected = i.Expected, Actual = i.Actual })
                 .ToList(),
-            Freshness = p.Freshness
+            Freshness = p.Freshness,
+            Origin = p.Origin,
+            BaseIdentityHash = p.BaseIdentityHash
         };
     }
 }
@@ -285,6 +294,9 @@ public sealed class MetaObject
 
     [JsonPropertyName("snapshot")]
     public SnapshotMeta? Snapshot { get; set; }
+
+    [JsonPropertyName("next_cursor")]
+    public string? NextCursor { get; set; }
 
     [JsonPropertyName("error")]
     public ErrorInfo? Error { get; set; }

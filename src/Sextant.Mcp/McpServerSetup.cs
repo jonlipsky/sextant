@@ -33,7 +33,15 @@ public static class McpServerSetup
             {
                 if (fileLogger != null)
                     services.AddSingleton(fileLogger);
-                services.AddSingleton(new DatabaseProvider(dbPath));
+                // Register via a factory so the DI container OWNS the singleton and disposes it on host
+                // shutdown — DatabaseProvider.Dispose() tears down the remote federation's owned HttpClient.
+                // A pre-built instance passed to AddSingleton would never be disposed by the container.
+                services.AddSingleton(_ =>
+                {
+                    var provider = new DatabaseProvider(dbPath);
+                    provider.AttachRemoteFederation(RemoteBaseSnapshotFederation.Create(SextantConfiguration.Load()));
+                    return provider;
+                });
                 services.AddMcpServer()
                     .WithStdioServerTransport()
                     .WithToolsFromAssembly();
@@ -58,7 +66,13 @@ public static class McpServerSetup
 
         if (fileLogger != null)
             builder.Services.AddSingleton(fileLogger);
-        builder.Services.AddSingleton(new DatabaseProvider(dbPath));
+        // Factory registration so the container owns/disposes the singleton on shutdown (see stdio host).
+        builder.Services.AddSingleton(_ =>
+        {
+            var provider = new DatabaseProvider(dbPath);
+            provider.AttachRemoteFederation(RemoteBaseSnapshotFederation.Create(SextantConfiguration.Load()));
+            return provider;
+        });
         builder.Services.AddMcpServer()
             .WithHttpTransport()
             .WithToolsFromAssembly();

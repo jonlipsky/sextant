@@ -180,4 +180,14 @@ public sealed record SnapshotProvenance
     public bool Compatible { get; init; } = true;
     public IReadOnlyList<IncompatibilityInfo>? Incompatibilities { get; init; }
     public long Freshness { get; init; }
+
+    /// <summary>
+    /// Where the served base snapshot's rows came from (issue #60): null/"local" for the local catalog,
+    /// "remote" when a configured peer served a base snapshot the local catalog lacked. Nullable so a
+    /// pure-local response is byte-identical (omitted under <c>WhenWritingNull</c>).
+    /// </summary>
+    public string? Origin { get; init; }
+
+    /// <summary>The immutable identity hash of the base snapshot a remote federation fetch resolved (issue #60).</summary>
+    public string? BaseIdentityHash { get; init; }
 }

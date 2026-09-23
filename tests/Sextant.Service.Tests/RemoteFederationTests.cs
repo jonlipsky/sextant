@@ -133,6 +133,34 @@ public class RemoteFederationTests
         Assert.AreEqual(HttpStatusCode.InternalServerError, ex.StatusCode);
     }
 
+    [TestMethod]
+    public async Task MalformedJsonBody_SurfacesStructuredUnavailable()
+    {
+        // A peer that answers 2xx with a body that is NOT a valid page must degrade to a structured
+        // unavailable — never fault the read with a raw JsonException (#60 robustness).
+        var handler = new PeerStubHandler(_db) { RawBody = "this is definitely not json" };
+        var source = NewSource(handler, new SnapshotPageCache());
+
+        await Assert.ThrowsAsync<RemoteSnapshotUnavailableException>(
+            () => source.FetchSymbolsAsync(
+                new SnapshotPageRequest { IdentityHash = _hash, Cursor = null, Limit = 2 }, CancellationToken.None),
+            "an unparseable 2xx body degrades to a structured unavailable (#60)");
+    }
+
+    [TestMethod]
+    public async Task NullSymbolsPage_SurfacesStructuredUnavailable()
+    {
+        // A 2xx page whose `symbols` is explicitly null would NRE a later `page.Symbols.Count`; the source
+        // must catch it as a malformed page and surface a structured unavailable instead (#60 robustness).
+        var handler = new PeerStubHandler(_db) { RawBody = $"{{\"identity_hash\":\"{_hash}\",\"symbols\":null}}" };
+        var source = NewSource(handler, new SnapshotPageCache());
+
+        await Assert.ThrowsAsync<RemoteSnapshotUnavailableException>(
+            () => source.FetchSymbolsAsync(
+                new SnapshotPageRequest { IdentityHash = _hash, Cursor = null, Limit = 2 }, CancellationToken.None),
+            "a page with null symbols degrades to a structured unavailable, not a later NRE (#60)");
+    }
+
     private static RemoteHttpBaseSnapshotSource NewSource(
         PeerStubHandler handler, SnapshotPageCache cache, TimeSpan? timeout = null)
     {
@@ -155,6 +183,9 @@ public class RemoteFederationTests
         public TimeSpan Delay { get; init; } = TimeSpan.Zero;
         public HttpStatusCode? ForceStatus { get; init; }
 
+        /// <summary>When set, the peer answers 2xx with this exact body (drives the malformed-page arm).</summary>
+        public string? RawBody { get; init; }
+
         protected override async Task<HttpResponseMessage> SendAsync(
             HttpRequestMessage request, CancellationToken cancellationToken)
         {
@@ -165,6 +196,11 @@ public class RemoteFederationTests
                 throw new HttpRequestException("peer offline");
             if (ForceStatus is { } forced)
                 return new HttpResponseMessage(forced);
+            if (RawBody is not null)
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(RawBody, System.Text.Encoding.UTF8, "application/json")
+                };
 
             var uri = request.RequestUri!;
             var segments = uri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
