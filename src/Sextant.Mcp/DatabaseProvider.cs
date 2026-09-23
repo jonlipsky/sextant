@@ -7,11 +7,31 @@ public sealed class DatabaseProvider : IDisposable
 {
     private readonly string _dbPath;
     private IndexDatabase? _db;
+    private RemoteBaseSnapshotFederation? _remoteFederation;
 
     public DatabaseProvider(string? dbPath = null, IReadAuthorizer? authorizer = null)
     {
         _dbPath = dbPath ?? SextantConfiguration.FromEnvironment().DbPath;
         Authorizer = authorizer ?? AllowAllReadAuthorizer.Instance;
+    }
+
+    /// <summary>
+    /// The remote base-snapshot source the query planner falls back to when a request's base snapshot is
+    /// absent from the local catalog (issue #60). Null (the default) keeps the pure-local path
+    /// byte-identical. Set once at the composition root via <see cref="AttachRemoteFederation"/>.
+    /// </summary>
+    public IBaseSnapshotSource? RemoteBaseSource { get; private set; }
+
+    /// <summary>
+    /// Attaches the composition-root remote federation so its <see cref="RemoteBaseSnapshotFederation.Source"/>
+    /// backs <see cref="RemoteBaseSource"/> and its owned <see cref="HttpClient"/> is disposed with this
+    /// provider. Idempotent-by-replacement: a previously attached federation is disposed first.
+    /// </summary>
+    public void AttachRemoteFederation(RemoteBaseSnapshotFederation federation)
+    {
+        _remoteFederation?.Dispose();
+        _remoteFederation = federation;
+        RemoteBaseSource = federation.Source;
     }
 
     /// <summary>
@@ -138,6 +158,7 @@ public sealed class DatabaseProvider : IDisposable
 
     public void Dispose()
     {
+        _remoteFederation?.Dispose();
         _db?.Dispose();
     }
 }

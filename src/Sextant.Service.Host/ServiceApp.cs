@@ -85,8 +85,14 @@ public static class ServiceApp
     /// <summary>
     /// The vetted tool types exposed over the remote HTTP MCP surface. Every one takes a
     /// <see cref="DatabaseProvider"/> and enters through <c>TryBeginRead</c> (fail-closed authz + scope).
-    /// Local-only tools that bypass that gate (<c>get_source_context</c>, <c>get_daemon_status</c>) are
-    /// deliberately EXCLUDED so they are never reachable by a remote principal.
+    /// Local-only tools that bypass or out-scope that gate are deliberately EXCLUDED so they are never
+    /// reachable by a remote principal: <c>get_source_context</c> (reads an arbitrary absolute path),
+    /// <c>get_daemon_status</c> (probes a local daemon), and <c>get_base_snapshot_symbols</c> — the last
+    /// takes a caller-supplied <c>identity_hash</c> that is NOT bound to the repository scope
+    /// <c>TryBeginRead</c> authorizes, so on the multi-tenant surface a principal scoped to repo A could
+    /// name repo B's snapshot. Cross-service snapshot federation on the service surface goes through the
+    /// per-hash-authorized <c>/query/snapshots/{identityHash}/symbols</c> HTTP endpoint instead; the tool
+    /// is a single-tenant LOCAL planner path (AllowAll authorizer) only.
     /// </summary>
     internal static readonly IReadOnlyList<Type> RemoteQueryTools =
     [

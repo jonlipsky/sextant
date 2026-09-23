@@ -1,7 +1,8 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Text.Json;
 
-namespace Sextant.Service;
+namespace Sextant.Store;
 
 /// <summary>
 /// A base-snapshot source backed by a REMOTE peer service over authenticated HTTP (issue #51). It provides
@@ -16,6 +17,9 @@ namespace Sextant.Service;
 ///   never-cached page against an unreachable peer surfaces a structured
 ///   <see cref="RemoteSnapshotUnavailableException"/>.</item>
 /// </list>
+/// Lives in <c>Sextant.Store</c> alongside the seam it implements so the live MCP query planner (issue
+/// #60) can construct it directly; the wire format is <see cref="SnapshotWireJson.Options"/>, identical to
+/// the service's response side.
 /// </summary>
 public sealed class RemoteHttpBaseSnapshotSource : IBaseSnapshotSource
 {
@@ -61,9 +65,15 @@ public sealed class RemoteHttpBaseSnapshotSource : IBaseSnapshotSource
             response.EnsureSuccessStatusCode();
 
             var page = await response.Content
-                .ReadFromJsonAsync<SnapshotSymbolPage>(ServiceJson.Options, timeoutCts.Token)
+                .ReadFromJsonAsync<SnapshotSymbolPage>(SnapshotWireJson.Options, timeoutCts.Token)
                 .ConfigureAwait(false)
                 ?? new SnapshotSymbolPage { IdentityHash = request.IdentityHash, Symbols = [], NextCursor = null };
+
+            // A 2xx body that deserialized but carries a null symbol list ({"symbols": null}) is malformed —
+            // treat it as an unavailable peer rather than letting a later `page.Symbols.Count` NRE the read.
+            if (page.Symbols is null)
+                throw new RemoteSnapshotUnavailableException(
+                    $"Remote peer '{_peerBaseUrl}' returned a malformed snapshot page (null symbols).");
 
             _cache.Set(request.CacheKey, page);
             return page;
@@ -73,6 +83,19 @@ public sealed class RemoteHttpBaseSnapshotSource : IBaseSnapshotSource
             // The caller did not cancel — this was our own timeout. No cached page exists (checked above).
             throw new RemoteSnapshotUnavailableException(
                 $"Remote peer '{_peerBaseUrl}' timed out after {_timeout.TotalSeconds:0.#}s and no cached page was available.");
+        }
+        catch (JsonException ex)
+        {
+            // A 2xx response whose body is not valid JSON / not a valid page (including a missing required
+            // property). Normalize to a structured unavailable so the tool answers empty instead of faulting.
+            throw new RemoteSnapshotUnavailableException(
+                $"Remote peer '{_peerBaseUrl}' returned a malformed snapshot page.", ex);
+        }
+        catch (NotSupportedException ex)
+        {
+            // An unreadable/unsupported content type on a 2xx response — same structured degradation.
+            throw new RemoteSnapshotUnavailableException(
+                $"Remote peer '{_peerBaseUrl}' returned an unreadable snapshot page.", ex);
         }
         catch (HttpRequestException ex) when (ex.StatusCode is null)
         {
