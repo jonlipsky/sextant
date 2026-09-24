@@ -55,6 +55,7 @@ of the box.
 | `SEXTANT_SERVICE_QUERY_TOKEN` | Bearer token for `/mcp` + `/query/*` | none (anonymous read) |
 | `SEXTANT_SERVICE_CONTRIBUTE_TOKEN` | Least-privilege token for `/control/contribute` only (issue #71); the control token remains a superset that also authorizes it | none (falls back to control token) |
 | `SEXTANT_SERVICE_READ_POLICY` | Enforced query-plane read-authorization policy (Phase 17) | disabled (open read) |
+| `SEXTANT_SERVICE_BIND_ADDRESS` | Network interface the HTTP surface binds to | `localhost` |
 | `SEXTANT_SERVICE_CONTROL_PORT` | HTTP port | `3011` |
 | `SEXTANT_SERVICE_QUERY_PORT` | Optional dedicated query port (shares the control port when unset) | none (shared) |
 | `SEXTANT_SERVICE_LEASE_TTL_SECONDS` | Single-writer lease TTL | `30` |
@@ -73,6 +74,16 @@ Boolean toggles accept `1/0`, `true/false`, `yes/no`, `on/off` (case-insensitive
 value **fails startup** rather than silently disabling a security-relevant control (fail-closed). The
 per-repository/profile `platform_routing` policy and the `retention` policy are read from the repo
 `sextant.json` / `SEXTANT_*` config (see [configuration.md](configuration.md)).
+
+`SEXTANT_SERVICE_BIND_ADDRESS` defaults to `localhost`, so out of the box the service listens on loopback
+only — safe for single-node dev. A deployment reached from **other hosts or containers** (e.g. a container
+on a Docker network) must set it to a routable interface such as `0.0.0.0`. Binding a routable address
+widens exposure, so rely on network/firewall scoping plus the control/query tokens
+(`SEXTANT_SERVICE_CONTROL_TOKEN` / `SEXTANT_SERVICE_QUERY_TOKEN`) to protect the surface. A blank or
+syntactically malformed value is rejected at startup (fail-closed) rather than handed to Kestrel, which
+would silently widen it to a bind on all interfaces. Note that Kestrel only pins a **specific** interface
+for `localhost` or an IP literal; a non-IP **hostname** binds all interfaces, so use an IP literal (e.g.
+`127.0.0.1`) when you need to restrict the service to one interface.
 
 The **wire format is snake_case** (`ServiceJson.Options` = `SnakeCaseLower` + ignore-null, matching the
 rest of Sextant's JSON). Response bodies are serialized with `ServiceJson.Options` explicitly; request
