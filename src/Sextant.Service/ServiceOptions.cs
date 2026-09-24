@@ -61,6 +61,35 @@ public sealed record ServiceOptions
     /// <summary>Optional dedicated query port; when null the query surface shares <see cref="ControlPort"/>.</summary>
     public int? QueryPort { get; init; }
 
+    /// <summary>
+    /// How the service obtains the on-disk checkout an ensure request indexes.
+    /// <see cref="ServiceCheckoutMode.Locate"/> (the DEFAULT) only LOCATES an already-provisioned checkout
+    /// on the persistent checkout volume — byte-identical to the pre-provisioning behavior, no outbound git.
+    /// <see cref="ServiceCheckoutMode.Clone"/> makes the node self-sufficient: on a locate miss it clones the
+    /// repository at the requested commit into the checkout volume (a durable cache) and then indexes it.
+    /// </summary>
+    public ServiceCheckoutMode CheckoutMode { get; init; } = ServiceCheckoutMode.Locate;
+
+    /// <summary>
+    /// An OPTIONAL access token used only in <see cref="ServiceCheckoutMode.Clone"/> mode to authenticate an
+    /// outbound clone of a PRIVATE <c>https</c> repository (injected as
+    /// <c>https://x-access-token:&lt;token&gt;@host/...</c>). Public repositories need none. It is never logged
+    /// and is only written into the transient remote URL handed to git. Null → unauthenticated clone.
+    /// </summary>
+    public string? CheckoutToken { get; init; }
+
+    /// <summary>
+    /// Upper bound on how many times an identity's job may run before a persistently-RETRYABLE provisioning
+    /// failure (a transient clone/fetch error in <see cref="ServiceCheckoutMode.Clone"/> mode — network,
+    /// DNS, timeout, remote 5xx/429) is recorded as a terminal <see cref="SnapshotJobStatus.Failed"/> instead
+    /// of being requeued for the next ensure. This is the safety bound that stops a MIS-classified permanent
+    /// failure (or a genuinely-down remote) from retrying forever. It conservatively shares the job-wide
+    /// attempt counter, so any prior cancellation re-attempts or reclaimed-snapshot regenerations for the
+    /// same identity also count toward it. DETERMINISTIC failures (no solution, commit/repo not found, auth
+    /// refused, bad URL) are never retried — they stay terminal on the FIRST ensure regardless of this bound.
+    /// </summary>
+    public int MaxProvisioningAttempts { get; init; } = 5;
+
     /// <summary>Writer-lease TTL. The service holds a single-writer lease for its lifetime (issue #38).</summary>
     public TimeSpan LeaseTtl { get; init; } = TimeSpan.FromSeconds(30);
 
@@ -147,6 +176,12 @@ public sealed record ServiceOptions
             BindAddress = EnvHost("BIND_ADDRESS") ?? "localhost",
             ControlPort = EnvInt("CONTROL_PORT") ?? 3011,
             QueryPort = EnvInt("QUERY_PORT"),
+            CheckoutMode = ParseCheckoutMode(Env("CHECKOUT_MODE")),
+            CheckoutToken = Env("CHECKOUT_TOKEN"),
+            // Bound retryable-provisioning re-attempts. Out-of-range/invalid values fall back to the default
+            // (5) rather than failing start, and are clamped to a sane ceiling so a huge configured value
+            // cannot defeat the safety bound.
+            MaxProvisioningAttempts = EnvInt("MAX_PROVISIONING_ATTEMPTS") is int a and > 0 and <= 100 ? a : 5,
             LeaseTtl = EnvInt("LEASE_TTL_SECONDS") is int ttl and > 0 ? TimeSpan.FromSeconds(ttl) : TimeSpan.FromSeconds(30),
             Peers = Env("PEERS") is { Length: > 0 } peers
                 ? peers.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
@@ -192,6 +227,28 @@ public sealed record ServiceOptions
 
     private static int? EnvInt(string name) =>
         int.TryParse(Env(name), out var v) ? v : null;
+
+    /// <summary>
+    /// Parses the checkout-provisioning mode. Unset → the safe <see cref="ServiceCheckoutMode.Locate"/>
+    /// default (no outbound git). Any nonempty value other than <c>locate</c>/<c>clone</c> THROWS rather
+    /// than silently falling back — an operator who typo'd the mode that governs outbound network access
+    /// must fail startup loudly, never quietly run in the wrong mode (fail closed, matching the boolean and
+    /// host-token conventions).
+    /// </summary>
+    private static ServiceCheckoutMode ParseCheckoutMode(string? value)
+    {
+        if (value is null)
+            return ServiceCheckoutMode.Locate;
+        return value.Trim().ToLowerInvariant() switch
+        {
+            "locate" => ServiceCheckoutMode.Locate,
+            "clone" => ServiceCheckoutMode.Clone,
+            _ => throw new InvalidOperationException(
+                $"Environment variable {EnvPrefix}CHECKOUT_MODE has an invalid value '{value}'. Use 'locate' " +
+                "(default; index only an already-provisioned checkout) or 'clone' (provision the checkout by " +
+                "cloning the requested commit). Refusing to start with an ambiguous checkout mode (fail closed).")
+        };
+    }
 
     private static long? EnvLong(string name) =>
         long.TryParse(Env(name), out var v) ? v : null;
@@ -240,6 +297,18 @@ public sealed record ServiceOptions
                 "setting (fail closed).")
         };
     }
+}
+
+/// <summary>
+/// How the service obtains the on-disk checkout an ensure request indexes.
+/// </summary>
+public enum ServiceCheckoutMode
+{
+    /// <summary>Only LOCATE an already-provisioned checkout on the persistent volume (default; no outbound git).</summary>
+    Locate,
+
+    /// <summary>On a locate miss, clone the repository at the requested commit into the checkout volume, then index it.</summary>
+    Clone
 }
 
 /// <summary>

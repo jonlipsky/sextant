@@ -208,4 +208,31 @@ public class EvaluationSandboxTests
             return true;
         }
     }
+
+    [TestMethod]
+    public async Task Worker_TransientProvisioningFailure_PropagatesInsteadOfBecomingTerminalFailed()
+    {
+        // A checkout provider that throws a TRANSIENT provisioning failure must NOT be swallowed into a
+        // terminal Failed by the worker's catch-all: the service depends on the exception propagating so it
+        // can requeue the identity for a bounded retry (the idempotency-poisoning fix).
+        var config = new SextantConfiguration();
+        using var db = new IndexDatabase(Path.Combine(_dataRoot, "catalog.db"), IndexWriteOptions.Default);
+        db.RunMigrations();
+
+        var worker = new LocalIndexerSnapshotWorker(db, config, new ThrowingCheckoutProvider());
+        var request = new EnsureSnapshotRequest
+        {
+            RepositoryRemoteUrl = "https://example/repo",
+            CommitSha = new string('a', 40)
+        };
+
+        await Assert.ThrowsExactlyAsync<TransientProvisioningException>(
+            () => worker.ProduceAsync(request, "identity-hash", _scratch, CancellationToken.None));
+    }
+
+    private sealed class ThrowingCheckoutProvider : ICheckoutProvider
+    {
+        public bool TryResolve(EnsureSnapshotRequest request, out string checkoutDir, out string solutionPath) =>
+            throw new TransientProvisioningException("git fetch failed transiently: timed out");
+    }
 }

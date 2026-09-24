@@ -131,6 +131,13 @@ public sealed class LocalIndexerSnapshotWorker(
         {
             return SnapshotWorkResult.Failed(ex.Message);
         }
+        catch (TransientProvisioningException)
+        {
+            // A RETRYABLE provisioning failure must NOT be swallowed into a terminal Failed: the service
+            // requeues the identity so a later ensure re-attempts it. (Today TryResolve runs before this
+            // try, so this is belt-and-suspenders against a future refactor that moves it inside.)
+            throw;
+        }
         catch (OperationCanceledException)
         {
             throw;

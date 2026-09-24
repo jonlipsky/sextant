@@ -200,7 +200,13 @@ public static class ServiceApp
         control.MapPost("/ensure", async (EnsureSnapshotRequest request, HttpRequest req, SnapshotService service, CancellationToken ct) =>
         {
             var result = await service.EnsureSnapshotAsync(request, ct, ExtractBearer(req));
-            return Results.Json(result, ServiceJson.Options);
+            // A non-terminal (queued) result means the ensure ran but the identity was requeued for a later
+            // re-attempt — a TRANSIENT provisioning failure bounded by the attempt cap. Surface 202 Accepted
+            // so the orchestrator polls /status rather than treating it as a settled 200 outcome.
+            var statusCode = SnapshotJobStatus.IsTerminal(result.Status)
+                ? StatusCodes.Status200OK
+                : StatusCodes.Status202Accepted;
+            return Results.Json(result, ServiceJson.Options, statusCode: statusCode);
         });
 
         control.MapGet("/status/{jobId:long}", (long jobId, SnapshotService service) =>
