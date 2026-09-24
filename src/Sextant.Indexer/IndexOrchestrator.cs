@@ -1540,8 +1540,16 @@ public sealed class IndexOrchestrator
     private static void AdvanceBranchToSnapshot(
         SnapshotStore snapshotStore, long repositoryId, SnapshotContext ctx, long snapshotId, long completedAt)
     {
-        var branchId = snapshotStore.EnsureBranch(repositoryId, ctx.BranchName, ctx.IsDefaultBranch, completedAt);
-        if (ctx.IsDefaultBranch)
+        // Decide default ownership BEFORE EnsureBranch (issue #104): whether the just-indexed branch owns
+        // the repo default is decoupled from the "no branch name" heuristic — it is the ctx flag, or the
+        // "first/sole consumer branch becomes default" safety net when the repo has no default yet (so a
+        // service ensure that named this branch still leaves a snapshot the multi-tenant read selector can
+        // resolve). Computing it first keeps the is_default transition monotonic (EnsureBranch then sets
+        // the resolved value, so a re-ensured default is never demoted-then-re-promoted). For the local
+        // path ctx.IsDefaultBranch is always true, so this short-circuits to the pre-#104 SQL byte-for-byte.
+        var ownsDefault = snapshotStore.ShouldOwnDefault(repositoryId, ctx.BranchName, ctx.IsDefaultBranch);
+        var branchId = snapshotStore.EnsureBranch(repositoryId, ctx.BranchName, ownsDefault, completedAt);
+        if (ownsDefault)
             snapshotStore.PromoteSoleDefaultBranch(repositoryId, branchId);
         // Forward-only when the service ensure path supplies a head sequence (issue #84); unconditional
         // (byte-identical to the pre-#84 behavior) when it is null, which is every local CLI/daemon run.

@@ -516,6 +516,60 @@ public sealed class SnapshotStore(SqliteConnection connection)
     }
 
     /// <summary>
+    /// Establishes <paramref name="keepBranchId"/> as the SOLE default of its repository: sets its OWN
+    /// <c>is_default = 1</c> AND clears every sibling, in ONE atomic statement. Unlike
+    /// <see cref="PromoteSoleDefaultBranch"/> — which only DEMOTES siblings and assumes the kept branch was
+    /// already inserted with <c>is_default = 1</c> — this also SETS the kept branch, so it is correct when
+    /// the row currently has <c>is_default = 0</c> (issue #104: the attach path inserts branches non-default
+    /// via <see cref="AttachBranchPointer"/>, yet the first/sole consumer branch must still become the
+    /// selectable default). Scoped to <paramref name="repositoryId"/> so it can only ever touch that repo's
+    /// rows, and guarded by an <c>EXISTS</c> ownership check so it is a genuine NO-OP when
+    /// <paramref name="keepBranchId"/> is unknown or belongs to another repository — WITHOUT the guard the
+    /// <c>is_default = 1</c> clause would still demote this repo's real default while promoting nothing,
+    /// leaving the repository with no selectable default (fail-closed <c>/mcp</c>). Run inside the
+    /// publish/attach transaction so the single-default invariant flips atomically with the pointer.
+    /// </summary>
+    public void SetSoleDefaultBranch(long repositoryId, long keepBranchId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            UPDATE branches
+            SET is_default = CASE WHEN id = @keep THEN 1 ELSE 0 END
+            WHERE repository_id = @repo
+              AND (id = @keep OR is_default = 1)
+              AND EXISTS (SELECT 1 FROM branches k WHERE k.id = @keep AND k.repository_id = @repo);
+            """;
+        cmd.Parameters.AddWithValue("@repo", repositoryId);
+        cmd.Parameters.AddWithValue("@keep", keepBranchId);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// Decides whether a branch about to be advanced should own its repository's default pointer, DECOUPLED
+    /// from the legacy "no branch name ⇒ default" heuristic (issue #104). Returns true when the caller
+    /// explicitly advances the default branch (<paramref name="isDefault"/>), OR the branch already IS the
+    /// repository's default, OR the repository has NO default branch at all. The last clause is the
+    /// "first/sole consumer branch becomes default" SAFETY NET: the multi-tenant read selector
+    /// (<see cref="GetSelectedSnapshotIdForRepository"/>) resolves ONLY a branch with <c>is_default = 1</c>,
+    /// so a service ensure that NAMES the branch it advances (the normal coordinator case, which historically
+    /// never set a default) must still leave the repo with a selectable default — otherwise every direct
+    /// <c>/mcp</c> semantic query fails closed on a fully populated catalog. It also self-heals catalogs
+    /// indexed before the fix on their next ensure. Evaluated BEFORE the <see cref="EnsureBranch"/> that
+    /// would otherwise demote a re-ensured default, so the caller passes the result to <c>EnsureBranch</c>
+    /// and the <c>is_default</c> transition is monotonic (no demote→re-promote window a concurrent reader
+    /// could observe). Pure read; <paramref name="isDefault"/> short-circuits so the local path (always
+    /// default) issues no extra query and stays byte-identical.
+    /// </summary>
+    public bool ShouldOwnDefault(long repositoryId, string branchName, bool isDefault)
+    {
+        if (isDefault)
+            return true;
+        if (GetDefaultBranchId(repositoryId) is not long currentDefault)
+            return true;
+        return GetBranchId(repositoryId, branchName) is long id && id == currentDefault;
+    }
+
+    /// <summary>
     /// The set of logical project canonical ids present in an assembled/native snapshot (issue #70 finalize
     /// gate). COALESCEs the logical-project canonical id with the physical project canonical id — the same
     /// identity the importer/validator map under — so it can be compared to a manifest's declared graph.
