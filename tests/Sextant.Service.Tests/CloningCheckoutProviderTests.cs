@@ -194,6 +194,35 @@ public class CloningCheckoutProviderTests
     }
 
     [TestMethod]
+    public void ScrubFetchHead_RemovesTokenBearingFetchRecord()
+    {
+        // Transport-independent: seed a .git/FETCH_HEAD that echoes an authenticated (token-bearing) fetch
+        // URL — exactly what an https clone with a token would leave behind — and assert the scrub removes
+        // the credential. The file:// happy-path test never injects a token, so this pins the security-
+        // relevant scrub path directly against a record git actually wrote a token into.
+        var checkoutDir = Path.Combine(Path.GetTempPath(), "sextant-scrub-" + Guid.NewGuid().ToString("N"));
+        _tempDirs.Add(checkoutDir);
+        var gitDir = Path.Combine(checkoutDir, ".git");
+        Directory.CreateDirectory(gitDir);
+        var fetchHead = Path.Combine(gitDir, "FETCH_HEAD");
+        const string token = "supersecrettoken";
+        File.WriteAllText(
+            fetchHead,
+            $"9fceb02d0ae598e95dc970b74767f19372d61af8\t\tbranch 'main' of "
+            + $"https://x-access-token:{token}@github.com/o/r\n");
+
+        var scrubbed = CloningCheckoutProvider.ScrubFetchHead(checkoutDir);
+
+        Assert.IsTrue(scrubbed, "the token-bearing fetch record must be scrubbable");
+        Assert.IsFalse(File.Exists(fetchHead),
+            "FETCH_HEAD must be gone after scrubbing so no token is published on the volume");
+        Assert.IsFalse(
+            Directory.EnumerateFiles(gitDir).Any(f =>
+                File.ReadAllText(f).Contains(token, StringComparison.Ordinal)),
+            "no token may remain anywhere in the scrubbed git directory");
+    }
+
+    [TestMethod]
     public void AuthenticatedUrl_InjectsTokenOnlyForHttpsWithoutUserInfo()
     {
         Assert.AreEqual("https://x-access-token:tok@github.com/o/r.git",
