@@ -51,6 +51,8 @@ of the box.
 | `SEXTANT_SERVICE_ARTIFACT_ROOT` | Persistent published artifacts | `<data-root>/artifacts` |
 | `SEXTANT_SERVICE_CACHE_ROOT` | Bounded local caches (federation pages) | `<data-root>/cache` |
 | `SEXTANT_SERVICE_SCRATCH_ROOT` | **Ephemeral** per-job worker scratch | `<data-root>/scratch` |
+| `SEXTANT_SERVICE_CHECKOUT_MODE` | How a checkout is obtained: `locate` (index only an already-provisioned checkout) or `clone` (provision it by cloning the requested commit) | `locate` |
+| `SEXTANT_SERVICE_CHECKOUT_TOKEN` | Access token for cloning a **private** `https` repo in `clone` mode (injected as `x-access-token`; public repos need none) | none |
 | `SEXTANT_SERVICE_CONTROL_TOKEN` | Bearer token for `/control/*` | none (open, dev only) |
 | `SEXTANT_SERVICE_QUERY_TOKEN` | Bearer token for `/mcp` + `/query/*` | none (anonymous read) |
 | `SEXTANT_SERVICE_CONTRIBUTE_TOKEN` | Least-privilege token for `/control/contribute` only (issue #71); the control token remains a superset that also authorizes it | none (falls back to control token) |
@@ -84,6 +86,41 @@ syntactically malformed value is rejected at startup (fail-closed) rather than h
 would silently widen it to a bind on all interfaces. Note that Kestrel only pins a **specific** interface
 for `localhost` or an IP literal; a non-IP **hostname** binds all interfaces, so use an IP literal (e.g.
 `127.0.0.1`) when you need to restrict the service to one interface.
+
+### Checkout provisioning — `locate` vs `clone`
+
+`POST /control/ensure` indexes an on-disk checkout of the requested commit. `SEXTANT_SERVICE_CHECKOUT_MODE`
+governs how that checkout is obtained:
+
+- **`locate` (default)** — the node only **locates** a checkout that already exists on its persistent
+  checkout volume (under `SEXTANT_SERVICE_CHECKOUT_ROOT`) and finds a `.slnx`/`.sln` to index. If none is
+  present the job terminates `unsupported`. No outbound git is performed — behavior is byte-identical to a
+  node with no provisioning at all. Use this when an external orchestrator provisions the checkout volume.
+- **`clone`** — the node becomes **self-sufficient**: on a locate miss it clones the repository at the
+  requested `commit_sha` into the checkout volume, then indexes it. The canonical checkout directory is a
+  **durable cache**, so a subsequent ensure for the same repo **at the same commit** hits the locate
+  fast-path with no re-clone. A cached checkout at a **different** commit is re-provisioned (the requested
+  commit is fetched into a temp directory and atomically swapped in) so a snapshot is never published from
+  the wrong revision. A clone lands in a temp directory under the checkout root and is published to the
+  canonical directory via an atomic rename, so a partially-cloned tree is never observed as a valid
+  checkout; a failed clone leaves no checkout and the job degrades to `unsupported` rather than indexing the
+  wrong commit. Concurrent ensures for the same repository are serialized so they clone once.
+
+Set `SEXTANT_SERVICE_CHECKOUT_TOKEN` to clone a **private** `https` repository — it is injected into the
+transient fetch URL as `https://x-access-token:<token>@…`, is never written to the published checkout's
+`.git/config` (the `origin` remote is the token-less URL) nor its fetch record, and is redacted from logs.
+Public repositories (and non-`https` remotes) need no token. A credential embedded directly in the
+`repository_remote_url` (`https://user:pass@host/…`) is **refused** — supply credentials only via the token.
+
+> **Security note.** `clone` mode performs **outbound git fetches** to the repositories it is asked to
+> ensure and stores their checkouts on the persistent volume as a cache. The commit id is validated as a
+> git object id (never an arbitrary ref/option) and the checked-out `HEAD` is verified against the request
+> before indexing; git helper transports are blocked (`GIT_ALLOW_PROTOCOL`) and prompting is disabled. The
+> token is passed to git on the fetch **argv** (not persisted and not logged), so it is visible only to a
+> process that can already inspect the service host's process list — treat the service host as trusted.
+> Prefer `locate` for nodes that must not reach the network; scope network egress and the control token
+> appropriately when enabling `clone`. Any value other than `locate`/`clone` **fails startup**
+> (fail-closed).
 
 The **wire format is snake_case** (`ServiceJson.Options` = `SnakeCaseLower` + ignore-null, matching the
 rest of Sextant's JSON). Response bodies are serialized with `ServiceJson.Options` explicitly; request
