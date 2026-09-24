@@ -111,18 +111,93 @@ public class ServiceHttpTests
         }
 
         // With the query token, the MCP transport is reachable (mapped + authorized) — proving HTTP MCP
-        // access exists without ProcessStack. The full JSON-RPC handshake is covered by McpHttpProtocolTests.
+        // access exists without ProcessStack.
         using var authed = BuildInitialize(QueryToken);
         var response = await host.Client.SendAsync(authed);
         Assert.AreNotEqual(HttpStatusCode.Unauthorized, response.StatusCode, "a valid query token authorizes the MCP plane");
         Assert.AreNotEqual(HttpStatusCode.NotFound, response.StatusCode, "the MCP endpoint is mapped");
     }
 
-    private static HttpRequestMessage BuildInitialize(string? token)
+    /// <summary>
+    /// Regression for the production gateway scenario: ProcessStack's Sextant query gateway is a "faithful
+    /// JSON-RPC proxy" that handles <c>initialize</c>/<c>notifications/initialized</c> LOCALLY and forwards
+    /// only <c>tools/list</c> + <c>tools/call</c> verbatim — it never performs an MCP session handshake and
+    /// never sends an <c>Mcp-Session-Id</c> header. With the default STATEFUL Streamable-HTTP transport a
+    /// bare <c>tools/list</c> was rejected with HTTP 400 ("A new session can only be created by an
+    /// initialize request. Include a valid Mcp-Session-Id header for non-initialize requests."), breaking
+    /// the whole cross-repo gateway. The stateless transport must answer a SINGLE bare <c>tools/list</c>
+    /// POST — no prior initialize, no session header — with 200 and the RemoteQueryTools allowlist.
+    /// </summary>
+    [TestMethod]
+    public async Task Mcp_BareToolsList_NoInitialize_NoSession_ReturnsToolsOverStatelessTransport()
     {
-        const string body = """
-            {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
-            """;
+        await using var host = await ServiceHttpHarness.StartAsync(withWorker: true, seedComplete: true);
+
+        using var request = BuildJsonRpc("""{"jsonrpc":"2.0","id":1,"method":"tools/list"}""", QueryToken);
+        var response = await host.Client.SendAsync(request);
+
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode,
+            $"a bare tools/list must succeed statelessly; got {response.StatusCode}: {await response.Content.ReadAsStringAsync()}");
+
+        using var doc = await ReadJsonRpcAsync(response);
+        var root = doc.RootElement;
+        Assert.AreEqual(1, root.GetProperty("id").GetInt32());
+        Assert.IsFalse(root.TryGetProperty("error", out var err1), $"a stateless tools/list is not a JSON-RPC error: {(err1.ValueKind == System.Text.Json.JsonValueKind.Undefined ? "" : err1.GetRawText())}");
+
+        var toolNames = root.GetProperty("result").GetProperty("tools").EnumerateArray()
+            .Select(t => t.GetProperty("name").GetString())
+            .ToList();
+        CollectionAssert.Contains(toolNames, "find_references",
+            "tools/list enumerates the RemoteQueryTools allowlist without an initialize handshake");
+        CollectionAssert.DoesNotContain(toolNames, "get_source_context",
+            "the local-only tools stay excluded from the remote allowlist under stateless mode");
+    }
+
+    /// <summary>
+    /// The gateway's other forwarded verb: a bare <c>tools/call</c> (no initialize, no session header) must
+    /// dispatch and execute a RemoteQueryTool statelessly, routing through the fail-closed authorizer.
+    /// </summary>
+    [TestMethod]
+    public async Task Mcp_BareToolsCall_NoInitialize_NoSession_DispatchesToolStatelessly()
+    {
+        await using var host = await ServiceHttpHarness.StartAsync(withWorker: true, seedComplete: true);
+
+        using var request = BuildJsonRpc(
+            """{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_index_status","arguments":{}}}""",
+            QueryToken);
+        var response = await host.Client.SendAsync(request);
+
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode,
+            $"a bare tools/call must succeed statelessly; got {response.StatusCode}: {await response.Content.ReadAsStringAsync()}");
+
+        using var doc = await ReadJsonRpcAsync(response);
+        var root = doc.RootElement;
+        Assert.AreEqual(2, root.GetProperty("id").GetInt32());
+        Assert.IsFalse(root.TryGetProperty("error", out _), "a stateless tools/call is not a JSON-RPC error");
+        Assert.IsTrue(root.GetProperty("result").TryGetProperty("content", out _),
+            "the tool executed and returned MCP content statelessly");
+    }
+
+    /// <summary>The bare gateway verbs are still auth-gated: no query token ⇒ 401, never a tool result.</summary>
+    [TestMethod]
+    public async Task Mcp_BareToolsList_WithoutToken_IsRejected()
+    {
+        await using var host = await ServiceHttpHarness.StartAsync(withWorker: true, seedComplete: true);
+
+        using var request = BuildJsonRpc("""{"jsonrpc":"2.0","id":1,"method":"tools/list"}""", token: null);
+        var response = await host.Client.SendAsync(request);
+
+        Assert.AreEqual(HttpStatusCode.Unauthorized, response.StatusCode,
+            "stateless mode must not weaken the query-token auth gate on /mcp");
+    }
+
+    private static HttpRequestMessage BuildInitialize(string? token) =>
+        BuildJsonRpc(
+            """{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}""",
+            token);
+
+    private static HttpRequestMessage BuildJsonRpc(string body, string? token)
+    {
         var request = new HttpRequestMessage(HttpMethod.Post, "/mcp")
         {
             Content = new StringContent(body, Encoding.UTF8, "application/json")
@@ -132,6 +207,28 @@ public class ServiceHttpTests
         if (token is not null)
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
         return request;
+    }
+
+    /// <summary>
+    /// Reads a JSON-RPC response from the Streamable-HTTP transport, tolerating either a plain
+    /// <c>application/json</c> body or an <c>text/event-stream</c> (SSE) framing whose <c>data:</c> line
+    /// carries the JSON-RPC message.
+    /// </summary>
+    private static async Task<System.Text.Json.JsonDocument> ReadJsonRpcAsync(HttpResponseMessage response)
+    {
+        var raw = await response.Content.ReadAsStringAsync();
+        var payload = raw;
+        if (response.Content.Headers.ContentType?.MediaType == "text/event-stream" ||
+            raw.StartsWith("event:", StringComparison.Ordinal) ||
+            raw.Contains("\ndata:", StringComparison.Ordinal) ||
+            raw.StartsWith("data:", StringComparison.Ordinal))
+        {
+            payload = string.Concat(raw
+                .Split('\n')
+                .Where(l => l.StartsWith("data:", StringComparison.Ordinal))
+                .Select(l => l["data:".Length..].Trim()));
+        }
+        return System.Text.Json.JsonDocument.Parse(payload);
     }
 
     /// <summary>An in-process service + HTTP host over TestServer, with an optional pre-published snapshot.</summary>
