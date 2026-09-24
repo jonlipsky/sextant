@@ -216,31 +216,50 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
         {
             Directory.CreateDirectory(temp);
 
-            if (!Run(temp, out _, out var initErr, "init", "--quiet"))
-                return LogGitFailure(cleanUrl, "init", initErr);
+            var init = RunGit(temp, "init", "--quiet");
+            if (!init.Ok)
+                return FailProvision(GitStage.Init, "init", cleanUrl, init);
             // `--end-of-options` keeps a URL that starts with '-' from being parsed as an option
             // (argument-injection hardening); origin is the CLEAN url, so no token lands in .git/config.
-            if (!Run(temp, out _, out var remoteErr, "remote", "add", "origin", "--end-of-options", cleanUrl))
-                return LogGitFailure(cleanUrl, "remote add", remoteErr);
+            var remote = RunGit(temp, "remote", "add", "origin", "--end-of-options", cleanUrl);
+            if (!remote.Ok)
+                return FailProvision(GitStage.RemoteAdd, "remote add", cleanUrl, remote);
 
             // Prefer a shallow fetch of the EXACT commit (minimal transfer) using the authenticated URL on
             // the argv only. Some servers reject fetch-by-sha (uploadpack.allowReachableSHA1InWant off) —
-            // fall back to a full fetch. Either way we then detach to the requested commit and verify HEAD.
-            if (!Run(temp, out _, out var shallowErr, "fetch", "--depth", "1", "--end-of-options", fetchUrl, commit)
-                && !Run(temp, out _, out var fullErr, "fetch", "--end-of-options", fetchUrl))
-                return LogGitFailure(cleanUrl, "fetch", shallowErr, fullErr);
+            // fall back to a full fetch. CLASSIFY EACH attempt: the overall fetch is DETERMINISTIC only when
+            // EVERY attempted path failed deterministically — a permanent shallow rejection followed by a
+            // TRANSIENT full-fetch failure (a network blip) is still transient (retryable), so a real
+            // connectivity failure can never be miscached as a permanent `unsupported`.
+            var shallow = RunGit(temp, "fetch", "--depth", "1", "--end-of-options", fetchUrl, commit);
+            if (!shallow.Ok)
+            {
+                var full = RunGit(temp, "fetch", "--end-of-options", fetchUrl);
+                if (!full.Ok)
+                {
+                    var shallowTransient = IsTransientGitFailure(GitStage.Fetch, shallow.Kind, shallow.Stderr);
+                    var fullTransient = IsTransientGitFailure(GitStage.Fetch, full.Kind, full.Stderr);
+                    if (shallowTransient || fullTransient)
+                        throw Transient("fetch", cleanUrl, fullTransient ? full : shallow);
+                    return LogGitFailure(cleanUrl, "fetch", shallow.Stderr, full.Stderr);
+                }
+            }
 
             // `commit` is a validated hex object id (checked at the top of this method), so it can never be
             // parsed as an option or a pathspec. `--end-of-options` is therefore unnecessary here, and some
             // git builds (e.g. Debian git in the deployment image) reject it for `checkout --detach`, parsing
             // it as a pathspec, which `--detach` forbids ("--detach does not take a path argument"). Detach
-            // directly to the verified sha.
-            if (!Run(temp, out _, out var checkoutErr, "checkout", "--detach", "--quiet", commit))
-                return LogGitFailure(cleanUrl, "checkout", checkoutErr);
+            // directly to the verified sha. (`--end-of-options` stays on `remote add`/`fetch`, which guard
+            // real URL args.) A failure AFTER a successful fetch is DETERMINISTIC (see IsTransientGitFailure):
+            // a fresh temp repo that fetched but cannot check out the object means the commit is not present.
+            var checkout = RunGit(temp, "checkout", "--detach", "--quiet", commit);
+            if (!checkout.Ok)
+                return FailProvision(GitStage.Checkout, "checkout", cleanUrl, checkout);
 
-            if (!Run(temp, out var head, out var revErr, "rev-parse", "HEAD"))
-                return LogGitFailure(cleanUrl, "rev-parse", revErr);
-            head = head.Trim();
+            var rev = RunGit(temp, "rev-parse", "HEAD");
+            if (!rev.Ok)
+                return FailProvision(GitStage.RevParse, "rev-parse", cleanUrl, rev);
+            var head = rev.Stdout.Trim();
             if (!(string.Equals(head, commit, StringComparison.OrdinalIgnoreCase)
                   || head.StartsWith(commit, StringComparison.OrdinalIgnoreCase)))
             {
@@ -324,6 +343,97 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
         _log?.Invoke($"Clone failed for '{url}' at git {step}: {(detail.Length > 0 ? detail.Trim() : "(no stderr)")}");
         return false;
     }
+
+    /// <summary>
+    /// Maps a single failed git invocation to the right outcome: THROW a
+    /// <see cref="TransientProvisioningException"/> when the failure is classified TRANSIENT (retryable —
+    /// the service requeues the identity), else log it and return false so the job degrades to a permanent
+    /// <c>unsupported</c>. Used for the single-invocation stages (init / remote add / checkout / rev-parse);
+    /// the fetch fallback classifies its two attempts together (deterministic only if BOTH are).
+    /// </summary>
+    private bool FailProvision(GitStage stage, string step, string url, GitResult result)
+    {
+        if (IsTransientGitFailure(stage, result.Kind, result.Stderr))
+            throw Transient(step, url, result);
+        return LogGitFailure(url, step, result.Stderr);
+    }
+
+    /// <summary>Builds a token-redacted, URL-sanitized <see cref="TransientProvisioningException"/> for a failed git step.</summary>
+    private TransientProvisioningException Transient(string step, string url, GitResult result)
+    {
+        var reason = result.Kind switch
+        {
+            GitFailureKind.Timeout => "timed out",
+            GitFailureKind.SpawnFailure => "git could not be started",
+            _ => FirstLine(Redact(result.Stderr)) is { Length: > 0 } s ? s : "no stderr"
+        };
+        var message = $"git {step} failed transiently for '{SanitizeUrlForLog(url)}': {reason}";
+        _log?.Invoke($"Clone will retry for '{SanitizeUrlForLog(url)}' — {message}");
+        return new TransientProvisioningException(message);
+    }
+
+    private static string FirstLine(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return string.Empty;
+        var nl = value.IndexOfAny(['\r', '\n']);
+        return (nl >= 0 ? value[..nl] : value).Trim();
+    }
+
+    /// <summary>
+    /// Decides whether a git failure at <paramref name="stage"/> is TRANSIENT (retryable) or DETERMINISTIC
+    /// (permanent). A timeout is always transient; a spawn failure (git missing / not executable) is a
+    /// permanent service-capability fault (retrying cannot conjure a git binary); the local setup stages
+    /// (init / remote add) are treated as transient (an environmental glitch, bounded by the attempt cap); a
+    /// fetch is deterministic ONLY when its stderr matches an unambiguous permanent-error pattern, else
+    /// transient (an unknown/connectivity error → transient, safe because the attempt cap bounds the cost);
+    /// a checkout / rev-parse AFTER a successful fetch is deterministic (a fresh temp repo that cannot resolve
+    /// the requested object means the commit is not really present — a wrong-revision request, not a blip).
+    /// </summary>
+    internal static bool IsTransientGitFailure(GitStage stage, GitFailureKind kind, string stderr)
+    {
+        if (kind == GitFailureKind.Timeout)
+            return true;
+        if (kind == GitFailureKind.SpawnFailure)
+            return false;
+        return stage switch
+        {
+            GitStage.Init or GitStage.RemoteAdd => true,
+            GitStage.Checkout or GitStage.RevParse => false,
+            _ => !MatchesDeterministicGitError(stderr) // Fetch
+        };
+    }
+
+    /// <summary>
+    /// True when git stderr unambiguously indicates a PERMANENT condition — the repository or commit does not
+    /// exist, or authentication was refused — so retrying the SAME request cannot succeed. Deliberately
+    /// CONSERVATIVE: an ambiguous error (a bare <c>403</c>, an interrupted/aborted transfer, an unrecognized
+    /// message) is left TRANSIENT so a recoverable commit is never permanently poisoned; the attempt cap
+    /// bounds the cost of a mis-classified-transient permanent failure.
+    /// </summary>
+    internal static bool MatchesDeterministicGitError(string stderr)
+    {
+        if (string.IsNullOrWhiteSpace(stderr))
+            return false;
+        foreach (var pattern in DeterministicGitErrors)
+            if (stderr.Contains(pattern, StringComparison.OrdinalIgnoreCase))
+                return true;
+        return false;
+    }
+
+    // Permanent-error substrings (case-insensitive). Kept tight on purpose — see MatchesDeterministicGitError.
+    private static readonly string[] DeterministicGitErrors =
+    [
+        "repository not found",
+        "does not appear to be a git repository",
+        "not found: did you run git update-server-info",
+        "authentication failed",
+        "invalid username or password",
+        "could not read username",
+        "terminal prompts disabled",
+        "couldn't find remote ref",
+        "reference is not a tree",
+    ];
 
     /// <summary>Removes any occurrence of the token from a string before it is logged.</summary>
     private string Redact(string value) =>
@@ -486,14 +596,23 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { /* best-effort */ }
     }
 
+    /// <summary>How a git invocation failed, so a caller can tell a TRANSIENT transport failure from a permanent one.</summary>
+    internal enum GitFailureKind { None, NonZeroExit, Timeout, SpawnFailure }
+
+    /// <summary>The git subcommand a failure occurred at (drives transient-vs-deterministic classification).</summary>
+    internal enum GitStage { Init, RemoteAdd, Fetch, Checkout, RevParse }
+
+    /// <summary>The outcome of a git invocation: success/kind plus the drained stdout/stderr.</summary>
+    private readonly record struct GitResult(bool Ok, GitFailureKind Kind, string Stdout, string Stderr);
+
     /// <summary>
     /// Runs a git subcommand with an argument list (no shell, so no injection), draining both pipes under a
-    /// hard deadline and killing the whole process tree on timeout. Returns true only on a clean exit.
+    /// hard deadline and killing the whole process tree on timeout. Reports WHY it failed (non-zero exit vs
+    /// timeout vs spawn failure) so provisioning can distinguish a TRANSIENT transport failure (retryable)
+    /// from a DETERMINISTIC one (permanent).
     /// </summary>
-    private bool Run(string workingDir, out string stdout, out string stderr, params string[] args)
+    private GitResult RunGit(string workingDir, params string[] args)
     {
-        stdout = string.Empty;
-        stderr = string.Empty;
         Process? process = null;
         try
         {
@@ -509,6 +628,14 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
             // Never prompt for credentials on a private/invalid remote — fail fast instead of blocking.
             psi.Environment["GIT_TERMINAL_PROMPT"] = "0";
             psi.Environment["GCM_INTERACTIVE"] = "never";
+            // Force a stable C locale so git's stderr prose is English regardless of the host's LANG/LC_*.
+            // The transient-vs-deterministic classifier substring-matches git's (untyped) fatal messages —
+            // git exits 128 for nearly every fatal, so there is no code to switch on — and a localized
+            // stderr would make a genuinely permanent "authentication failed"/"repository not found" miss the
+            // allowlist and be (safely but wastefully) retried as transient. Pinning the locale keeps the
+            // classification deterministic across deployments.
+            psi.Environment["LC_ALL"] = "C";
+            psi.Environment["LANG"] = "C";
             // Constrain transports to normal ones (+ file for local/test remotes); block helper transports
             // like ext:: that could execute arbitrary commands for a crafted repository URL.
             psi.Environment["GIT_ALLOW_PROTOCOL"] = AllowedGitProtocols;
@@ -517,7 +644,7 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
 
             process = Process.Start(psi);
             if (process is null)
-                return false;
+                return new GitResult(false, GitFailureKind.SpawnFailure, string.Empty, string.Empty);
 
             process.StandardInput.Close();
 
@@ -529,23 +656,34 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
             {
                 cts.Cancel();
                 KillTree(process);
-                return false;
+                return new GitResult(false, GitFailureKind.Timeout, string.Empty, string.Empty);
             }
 
-            stdout = SafeResult(stdoutTask);
-            stderr = SafeResult(stderrTask);
-            return process.ExitCode == 0;
+            var stdout = SafeResult(stdoutTask);
+            var stderr = SafeResult(stderrTask);
+            return process.ExitCode == 0
+                ? new GitResult(true, GitFailureKind.None, stdout, stderr)
+                : new GitResult(false, GitFailureKind.NonZeroExit, stdout, stderr);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            // git missing / spawn failure ⇒ the provider cannot provision (degrades to unsupported).
+            // git missing / spawn failure ⇒ the provider cannot provision (a permanent capability fault).
             if (process is not null) KillTree(process);
-            return false;
+            return new GitResult(false, GitFailureKind.SpawnFailure, string.Empty, string.Empty);
         }
         finally
         {
             process?.Dispose();
         }
+    }
+
+    /// <summary>Thin bool wrapper over <see cref="RunGit"/> for the callers that only need success + output.</summary>
+    private bool Run(string workingDir, out string stdout, out string stderr, params string[] args)
+    {
+        var result = RunGit(workingDir, args);
+        stdout = result.Stdout;
+        stderr = result.Stderr;
+        return result.Ok;
     }
 
     private static string SafeResult(Task<string> task)

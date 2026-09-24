@@ -53,6 +53,7 @@ of the box.
 | `SEXTANT_SERVICE_SCRATCH_ROOT` | **Ephemeral** per-job worker scratch | `<data-root>/scratch` |
 | `SEXTANT_SERVICE_CHECKOUT_MODE` | How a checkout is obtained: `locate` (index only an already-provisioned checkout) or `clone` (provision it by cloning the requested commit) | `locate` |
 | `SEXTANT_SERVICE_CHECKOUT_TOKEN` | Access token for cloning a **private** `https` repo in `clone` mode (injected as `x-access-token`; public repos need none) | none |
+| `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS` | In `clone` mode, how many times a **transient** clone/provisioning failure is retried across re-ensures before the job settles to terminal `failed` (clamped to 1–100; deterministic failures are never retried) | `5` |
 | `SEXTANT_SERVICE_CONTROL_TOKEN` | Bearer token for `/control/*` | none (open, dev only) |
 | `SEXTANT_SERVICE_QUERY_TOKEN` | Bearer token for `/mcp` + `/query/*` | none (anonymous read) |
 | `SEXTANT_SERVICE_CONTRIBUTE_TOKEN` | Least-privilege token for `/control/contribute` only (issue #71); the control token remains a superset that also authorizes it | none (falls back to control token) |
@@ -103,8 +104,38 @@ governs how that checkout is obtained:
   commit is fetched into a temp directory and atomically swapped in) so a snapshot is never published from
   the wrong revision. A clone lands in a temp directory under the checkout root and is published to the
   canonical directory via an atomic rename, so a partially-cloned tree is never observed as a valid
-  checkout; a failed clone leaves no checkout and the job degrades to `unsupported` rather than indexing the
-  wrong commit. Concurrent ensures for the same repository are serialized so they clone once.
+  checkout; a failed clone leaves no checkout and the job degrades cleanly (a **deterministic** failure to
+  terminal `unsupported`/`failed`, a **transient** one to a bounded retry — see below) rather than indexing
+  the wrong commit. Concurrent ensures for the same repository are serialized so they clone once.
+
+#### Transient vs deterministic provisioning failures
+
+Cloning is a **network** operation, so some failures are expected to recover on their own (a DNS blip, a
+fetch timeout, a connection reset, a remote 5xx, a partially-received pack). Others are permanent for the
+requested identity (the repository or commit genuinely does not exist, authentication is refused, or the
+tree is not a git repository and carries no solution). The service classifies them so it never permanently
+poisons a recoverable commit while still caching genuinely-hopeless ones:
+
+- **Transient** — the failing ensure does **not** record a suppressing terminal result. The identity is
+  requeued, so the orchestrator's natural retry (re-calling `ensure` for the same commit) re-runs the
+  worker. This is bounded by `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS` (default `5`); once exhausted the
+  job settles to terminal `failed`. Such an ensure returns **HTTP 202 Accepted** with a non-terminal
+  (`queued`) status — poll `/control/status/{jobId}`.
+- **Deterministic** — the job records a terminal `unsupported`/`failed` as before, and every later ensure
+  for that identity attaches the cached result **without** re-running the worker (so a hopeless request is
+  not re-attempted on every delivery). This is byte-identical to the pre-existing behavior.
+
+An unrecognized git error is treated as **transient** on purpose: a needless bounded retry is cheaper than
+permanently poisoning a commit that would have recovered. The attempt counter is **job-wide** (it also
+counts cancellation re-attempts and snapshot regenerations for the same identity), so it is a safety ceiling,
+not an exact transient-retry budget.
+
+> **Credential-rotation caveat.** `SEXTANT_SERVICE_CHECKOUT_TOKEN` is **not** part of the snapshot identity
+> hash, so an `authentication failed` outcome is classified **deterministic** and cached terminal. Rotating
+> the token alone will **not** revive that cached job — the token is not in the identity, so the ensure
+> re-attaches the terminal result. Advance the branch to a new commit (new identity) to retry with the new
+> token. (Folding the token into the identity is deliberately avoided so a token rotation does not
+> needlessly fork the snapshot lineage.)
 
 Set `SEXTANT_SERVICE_CHECKOUT_TOKEN` to clone a **private** `https` repository — it is injected into the
 transient fetch URL as `https://x-access-token:<token>@…`, is never written to the published checkout's

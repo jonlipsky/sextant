@@ -150,12 +150,20 @@ public class CloningCheckoutProviderTests
         Directory.CreateDirectory(outside);
         File.WriteAllText(Path.Combine(outside, "Escaped.sln"), string.Empty);
 
-        var request = ServiceTestFixtures.Request("https://host/repo/..", new string('b', 40));
+        // A crafted traversal URL pointing (via `..`) at that outside directory. It is a REAL local path but
+        // not a git repository, so the fetch fails DETERMINISTICALLY ("does not appear to be a git
+        // repository") — proving containment without depending on a network/DNS outcome. The canonical
+        // checkout directory name is derived through RepoDirectoryName, which neutralizes the traversal, so
+        // the sanitized target always stays inside the volume and the outside solution is never located.
+        var traversalUrl = new Uri(Path.Combine(dataParent, "repo")).AbsoluteUri + "/../outside";
+        var request = ServiceTestFixtures.Request(traversalUrl, new string('b', 40));
 
         Assert.IsFalse(provider.TryResolve(request, out var dir, out var sln),
             "a traversal repository url must never resolve or provision outside the checkout volume");
         Assert.AreEqual(string.Empty, dir);
         Assert.AreEqual(string.Empty, sln);
+        Assert.IsFalse(File.Exists(Path.Combine(paths.CheckoutRoot, "Escaped.sln")),
+            "the outside solution must never be copied or linked into the checkout volume");
     }
 
     [TestMethod]

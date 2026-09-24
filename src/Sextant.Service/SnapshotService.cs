@@ -270,6 +270,28 @@ public sealed class SnapshotService : IDisposable
                 jobs.Requeue(job.Id);
                 throw;
             }
+            catch (TransientProvisioningException ex)
+            {
+                // A TRANSIENT provisioning/clone failure (network blip, fetch timeout, remote 5xx) carries no
+                // durable snapshot and is EXPECTED to recover. Do NOT record a cached terminal that would
+                // suppress every later ensure for this identity (the idempotency-poisoning hole). Instead
+                // requeue — bounded by the job-wide attempt counter (incremented by MarkRunning ABOVE) — so
+                // the next ensure re-attempts; only once the bound is exhausted does it settle to terminal
+                // Failed. Distinct from cancellation: we return a QUEUED result rather than rethrowing.
+                var attempts = jobs.GetJob(job.Id)!.Attempts;
+                if (attempts < _options.MaxProvisioningAttempts)
+                {
+                    jobs.ReplaceDiagnostics(
+                        job.Id, [ProvisioningDiagnostic(job.Id, "provisioning_transient", ex.Message)]);
+                    jobs.Requeue(job.Id);
+                    return Produced(jobs.GetJob(job.Id)!);
+                }
+                var exhausted = $"provisioning failed after {attempts} attempt(s): {ex.Message}";
+                jobs.MarkResult(job.Id, SnapshotJobStatus.Failed, null, exhausted);
+                jobs.ReplaceDiagnostics(
+                    job.Id, [ProvisioningDiagnostic(job.Id, "provisioning_attempts_exhausted", exhausted)]);
+                return Produced(jobs.GetJob(job.Id)!);
+            }
             catch (Exception ex)
             {
                 jobs.MarkResult(job.Id, SnapshotJobStatus.Failed, null, ex.Message);
@@ -1032,6 +1054,29 @@ public sealed class SnapshotService : IDisposable
         Severity = JobDiagnosticSeverity.Error,
         Code = "worker_exception",
         Message = message
+    };
+
+    // A structured diagnostic for a provisioning-classified outcome. Distinct CODE from worker_exception so
+    // an operator can tell "clone will retry" (provisioning_transient) and "clone gave up after N tries"
+    // (provisioning_attempts_exhausted) apart from a generic worker crash. Message is pre-redacted.
+    private static SnapshotJobDiagnostic ProvisioningDiagnostic(long jobId, string code, string message) => new()
+    {
+        JobId = jobId,
+        Severity = JobDiagnosticSeverity.Error,
+        Code = code,
+        Message = message
+    };
+
+    // The result of an ensure that actually RAN the worker this call (as opposed to Attach, which reuses a
+    // prior terminal). Attached=false so cost is attributed and cache-reuse metrics stay honest even when
+    // the run ended in a transient requeue (status=queued) rather than a terminal outcome.
+    private EnsureSnapshotResult Produced(SnapshotJobRow job) => new()
+    {
+        JobId = job.Id,
+        IdentityHash = job.IdentityHash,
+        Status = job.Status,
+        SnapshotId = job.SnapshotId,
+        Attached = false
     };
 
     // Records the durable audit row for an ensure request (criterion 5): outcome + repository scope +

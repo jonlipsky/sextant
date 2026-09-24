@@ -17,6 +17,7 @@ public class ServiceOptionsEnvTests
     private const string BindAddress = "SEXTANT_SERVICE_BIND_ADDRESS";
     private const string CheckoutMode = "SEXTANT_SERVICE_CHECKOUT_MODE";
     private const string CheckoutToken = "SEXTANT_SERVICE_CHECKOUT_TOKEN";
+    private const string MaxProvisioningAttempts = "SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS";
 
     private static SextantConfiguration Config() => new() { DbPath = ServiceTestFixtures.NewDbPath() };
 
@@ -228,6 +229,54 @@ public class ServiceOptionsEnvTests
         finally
         {
             Environment.SetEnvironmentVariable(CheckoutToken, null);
+        }
+    }
+
+    [TestMethod]
+    public void MaxProvisioningAttempts_DefaultsToFive_WhenUnset()
+    {
+        Environment.SetEnvironmentVariable(MaxProvisioningAttempts, null);
+        var options = ServiceOptions.FromEnvironment(Config());
+        Assert.AreEqual(5, options.MaxProvisioningAttempts,
+            "the transient-provisioning retry bound defaults to 5 when unset");
+    }
+
+    [TestMethod]
+    [DataRow("1", 1)]
+    [DataRow("  10 ", 10)]
+    [DataRow("100", 100)]
+    public void MaxProvisioningAttempts_ValidValues_FlowThrough(string value, int expected)
+    {
+        Environment.SetEnvironmentVariable(MaxProvisioningAttempts, value);
+        try
+        {
+            var options = ServiceOptions.FromEnvironment(Config());
+            Assert.AreEqual(expected, options.MaxProvisioningAttempts);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(MaxProvisioningAttempts, null);
+        }
+    }
+
+    [TestMethod]
+    [DataRow("0")]
+    [DataRow("-3")]
+    [DataRow("101")]
+    [DataRow("abc")]
+    public void MaxProvisioningAttempts_OutOfRangeOrGarbage_FallsBackToDefault(string value)
+    {
+        // A non-positive, oversized, or unparseable value is clamped to the safe default rather than
+        // disabling retries (0) or allowing an unbounded retry ceiling.
+        Environment.SetEnvironmentVariable(MaxProvisioningAttempts, value);
+        try
+        {
+            var options = ServiceOptions.FromEnvironment(Config());
+            Assert.AreEqual(5, options.MaxProvisioningAttempts);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(MaxProvisioningAttempts, null);
         }
     }
 }
