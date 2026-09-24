@@ -3,6 +3,8 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using System.Net;
+using System.Net.Sockets;
 using Sextant.Core;
 using Sextant.Core.Platform;
 using Sextant.Service;
@@ -80,9 +82,7 @@ public static class ServiceHostRunner
             builder.Logging.AddConsole();
             ServiceApp.RegisterServices(builder, options, service);
 
-            var urls = new List<string> { $"http://localhost:{options.ControlPort}" };
-            if (options.QueryPort is int queryPort && queryPort != options.ControlPort)
-                urls.Add($"http://localhost:{queryPort}");
+            var urls = BuildListenUrls(options);
             builder.WebHost.UseUrls([.. urls]);
 
             var app = builder.Build();
@@ -104,6 +104,32 @@ public static class ServiceHostRunner
             database.Dispose();
         }
     }
+
+    /// <summary>
+    /// Builds the Kestrel listen URLs from the configured bind address and ports. The query surface shares
+    /// the control port unless a distinct <see cref="ServiceOptions.QueryPort"/> is set. An IPv6 literal
+    /// bind address is wrapped in brackets so the composed URL authority is well-formed
+    /// (e.g. <c>http://[::1]:3011</c>); a hostname or IPv4 literal is used verbatim.
+    /// </summary>
+    internal static IReadOnlyList<string> BuildListenUrls(ServiceOptions options)
+    {
+        var host = FormatHostForUrl(options.BindAddress);
+        var urls = new List<string> { $"http://{host}:{options.ControlPort}" };
+        if (options.QueryPort is int queryPort && queryPort != options.ControlPort)
+            urls.Add($"http://{host}:{queryPort}");
+        return urls;
+    }
+
+    /// <summary>
+    /// Wraps a bind address in brackets when it is a bare IPv6 literal so it composes into a valid URL
+    /// authority. A hostname, an IPv4 literal, or an already-bracketed IPv6 literal is returned unchanged.
+    /// </summary>
+    private static string FormatHostForUrl(string host) =>
+        !host.StartsWith('[')
+        && IPAddress.TryParse(host, out var ip)
+        && ip.AddressFamily == AddressFamily.InterNetworkV6
+            ? $"[{host}]"
+            : host;
 
     /// <summary>
     /// Offline DR backup (criterion 6): writes a consistent catalog + artifact backup into
