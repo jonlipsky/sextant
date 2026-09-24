@@ -45,6 +45,16 @@ public sealed record ServiceOptions
     /// </summary>
     public ReadAuthorizationPolicy ReadPolicy { get; init; } = ReadAuthorizationPolicy.Disabled;
 
+    /// <summary>
+    /// The network interface the HTTP surface binds to. Defaults to <c>localhost</c> (loopback only),
+    /// preserving the original dev-safe behavior. Set it to a routable address (e.g. <c>0.0.0.0</c> or a
+    /// specific IP) to make the service reachable from other hosts/containers — that widens exposure, so
+    /// pair it with network/firewall scoping and the control/query tokens. Kestrel only binds a SPECIFIC
+    /// interface for <c>localhost</c> or an IP literal; a non-IP hostname (like <c>0.0.0.0</c>) binds ALL
+    /// interfaces, so prefer an IP literal when you need to pin one interface.
+    /// </summary>
+    public string BindAddress { get; init; } = "localhost";
+
     /// <summary>Port for the control + query surface (one port hosts both when <see cref="QueryPort"/> matches or is null).</summary>
     public int ControlPort { get; init; } = 3011;
 
@@ -134,6 +144,7 @@ public sealed record ServiceOptions
             QueryToken = Env("QUERY_TOKEN"),
             ContributeToken = Env("CONTRIBUTE_TOKEN"),
             ReadPolicy = ReadAuthorizationPolicy.Parse(Env("READ_POLICY")),
+            BindAddress = EnvHost("BIND_ADDRESS") ?? "localhost",
             ControlPort = EnvInt("CONTROL_PORT") ?? 3011,
             QueryPort = EnvInt("QUERY_PORT"),
             LeaseTtl = EnvInt("LEASE_TTL_SECONDS") is int ttl and > 0 ? TimeSpan.FromSeconds(ttl) : TimeSpan.FromSeconds(30),
@@ -184,6 +195,29 @@ public sealed record ServiceOptions
 
     private static long? EnvLong(string name) =>
         long.TryParse(Env(name), out var v) ? v : null;
+
+    /// <summary>
+    /// Parses and validates a network host token (a bind address). Returns null when unset (the caller's
+    /// loopback default then applies) and THROWS on a blank or syntactically malformed value rather than
+    /// binding to an empty/ambiguous interface — a bad host token is a config error, not a silent no-op
+    /// (fail closed, matching the boolean-toggle convention). Validation uses <see cref="Uri.CheckHostName"/>
+    /// so garbage (e.g. an unclosed <c>[::1</c> or a value with whitespace) is rejected instead of being
+    /// handed to Kestrel, which would silently WIDEN such a token to a bind on ALL interfaces. A recognized
+    /// value (<c>localhost</c>, an IPv4/IPv6 literal — bracketed or not, or a hostname) is returned trimmed.
+    /// </summary>
+    private static string? EnvHost(string name)
+    {
+        var v = Env(name);
+        if (v is null)
+            return null;
+        var trimmed = v.Trim();
+        if (trimmed.Length == 0 || Uri.CheckHostName(trimmed) == UriHostNameType.Unknown)
+            throw new InvalidOperationException(
+                $"Environment variable {EnvPrefix + name} has an invalid host value '{v}'. Provide a host " +
+                "token such as 'localhost', '127.0.0.1', '0.0.0.0', a specific IP, or a hostname. Refusing " +
+                "to start with a malformed bind address that Kestrel would widen to all interfaces (fail closed).");
+        return trimmed;
+    }
 
     /// <summary>
     /// Parses a boolean env var, recognizing common true/false spellings case-insensitively. Returns null
