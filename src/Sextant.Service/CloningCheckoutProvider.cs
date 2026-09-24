@@ -230,7 +230,12 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
                 && !Run(temp, out _, out var fullErr, "fetch", "--end-of-options", fetchUrl))
                 return LogGitFailure(cleanUrl, "fetch", shallowErr, fullErr);
 
-            if (!Run(temp, out _, out var checkoutErr, "checkout", "--detach", "--quiet", "--end-of-options", commit))
+            // `commit` is a validated hex object id (checked at the top of this method), so it can never be
+            // parsed as an option or a pathspec. `--end-of-options` is therefore unnecessary here, and some
+            // git builds (e.g. Debian git in the deployment image) reject it for `checkout --detach`, parsing
+            // it as a pathspec, which `--detach` forbids ("--detach does not take a path argument"). Detach
+            // directly to the verified sha.
+            if (!Run(temp, out _, out var checkoutErr, "checkout", "--detach", "--quiet", commit))
                 return LogGitFailure(cleanUrl, "checkout", checkoutErr);
 
             if (!Run(temp, out var head, out var revErr, "rev-parse", "HEAD"))
