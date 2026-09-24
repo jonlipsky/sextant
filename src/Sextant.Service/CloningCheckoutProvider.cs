@@ -443,7 +443,7 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
     /// Deletes <c>.git/FETCH_HEAD</c> (which echoes the authenticated fetch URL). Returns true when it is
     /// gone afterward — regenerated on any later fetch — so a token can never be published on the volume.
     /// </summary>
-    private static bool ScrubFetchHead(string checkoutDir)
+    internal static bool ScrubFetchHead(string checkoutDir)
     {
         var fetchHead = Path.Combine(checkoutDir, ".git", "FETCH_HEAD");
         try
