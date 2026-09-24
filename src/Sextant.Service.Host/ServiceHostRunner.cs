@@ -40,7 +40,13 @@ public static class ServiceHostRunner
         // worker (single-node/local operation needs zero routing infrastructure — CRITICAL 2). Real native
         // Windows/macOS placements are wired by ProcessStack in Phase 14 behind this same seam.
         var nodeCapability = WorkerCapability.LocalDefault;
-        var checkoutProvider = new PersistentVolumeCheckoutProvider(paths);
+        // Checkout provisioning (clone-on-miss). In the DEFAULT `locate` mode the bare locate-only provider
+        // is used — byte-identical to before, no outbound git. In `clone` mode it is wrapped so a locate
+        // miss provisions the checkout by cloning the requested commit into the persistent volume (a cache).
+        ICheckoutProvider checkoutProvider = new PersistentVolumeCheckoutProvider(paths);
+        if (options.CheckoutMode == ServiceCheckoutMode.Clone)
+            checkoutProvider = new CloningCheckoutProvider(
+                checkoutProvider, paths, options.CheckoutToken, log: Console.Error.WriteLine);
         // Criterion 2: the service worker evaluates UNTRUSTED checkouts, so wrap its MSBuild evaluation in
         // the enforced sandbox (time/memory/secret/filesystem isolation) — applied to private and public
         // repos alike. The local CLI/daemon path does not construct this worker, so it stays byte-identical.
