@@ -78,6 +78,18 @@ public sealed record ServiceOptions
     /// </summary>
     public string? CheckoutToken { get; init; }
 
+    /// <summary>
+    /// Upper bound on how many times an identity's job may run before a persistently-RETRYABLE provisioning
+    /// failure (a transient clone/fetch error in <see cref="ServiceCheckoutMode.Clone"/> mode — network,
+    /// DNS, timeout, remote 5xx/429) is recorded as a terminal <see cref="SnapshotJobStatus.Failed"/> instead
+    /// of being requeued for the next ensure. This is the safety bound that stops a MIS-classified permanent
+    /// failure (or a genuinely-down remote) from retrying forever. It conservatively shares the job-wide
+    /// attempt counter, so any prior cancellation re-attempts or reclaimed-snapshot regenerations for the
+    /// same identity also count toward it. DETERMINISTIC failures (no solution, commit/repo not found, auth
+    /// refused, bad URL) are never retried — they stay terminal on the FIRST ensure regardless of this bound.
+    /// </summary>
+    public int MaxProvisioningAttempts { get; init; } = 5;
+
     /// <summary>Writer-lease TTL. The service holds a single-writer lease for its lifetime (issue #38).</summary>
     public TimeSpan LeaseTtl { get; init; } = TimeSpan.FromSeconds(30);
 
@@ -166,6 +178,10 @@ public sealed record ServiceOptions
             QueryPort = EnvInt("QUERY_PORT"),
             CheckoutMode = ParseCheckoutMode(Env("CHECKOUT_MODE")),
             CheckoutToken = Env("CHECKOUT_TOKEN"),
+            // Bound retryable-provisioning re-attempts. Out-of-range/invalid values fall back to the default
+            // (5) rather than failing start, and are clamped to a sane ceiling so a huge configured value
+            // cannot defeat the safety bound.
+            MaxProvisioningAttempts = EnvInt("MAX_PROVISIONING_ATTEMPTS") is int a and > 0 and <= 100 ? a : 5,
             LeaseTtl = EnvInt("LEASE_TTL_SECONDS") is int ttl and > 0 ? TimeSpan.FromSeconds(ttl) : TimeSpan.FromSeconds(30),
             Peers = Env("PEERS") is { Length: > 0 } peers
                 ? peers.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)

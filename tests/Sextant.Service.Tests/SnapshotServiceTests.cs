@@ -234,6 +234,77 @@ public class SnapshotServiceTests
     }
 
     [TestMethod]
+    public async Task Ensure_TransientProvisioningFailure_IsRequeuedAndRetried_NotPermanentFailure()
+    {
+        var db = NewDb();
+        var worker = new FakeSnapshotWorker(db, (self, request) =>
+        {
+            if (self.Calls == 1)
+                throw new TransientProvisioningException("git fetch failed transiently: timed out");
+            var snapId = ServiceTestFixtures.PublishComplete(self.Database, request);
+            return SnapshotWorkResult.Complete(snapId);
+        });
+        var service = StartWith(worker);
+        var request = ServiceTestFixtures.Request();
+
+        // A TRANSIENT provisioning failure must NOT poison the identity: the ensure returns a non-terminal
+        // queued result that ran the worker (Attached=false), not a cached terminal.
+        var first = await service.EnsureSnapshotAsync(request);
+        Assert.AreEqual(SnapshotJobStatus.Queued, first.Status,
+            "a transient clone failure requeues the identity instead of recording a terminal failure");
+        Assert.IsFalse(first.Attached, "the run executed the worker, so it is not an attach to prior work");
+
+        // The natural orchestrator retry (re-ensure) re-runs the worker and completes.
+        var retry = await service.EnsureSnapshotAsync(request);
+        Assert.AreEqual(SnapshotJobStatus.Complete, retry.Status,
+            "the next ensure re-attempts the transient-failed identity rather than attaching to a poisoned terminal");
+        Assert.AreEqual(2, worker.Calls, "the worker re-ran on the retry (the identity was not cached-terminal)");
+    }
+
+    [TestMethod]
+    public async Task Ensure_TransientProvisioningFailure_ExhaustsAttemptBound_SettlesToTerminalFailed()
+    {
+        var db = NewDb();
+        var worker = new FakeSnapshotWorker(db,
+            (_, _) => throw new TransientProvisioningException("git fetch failed transiently: timed out"));
+        _service = SnapshotService.Start(
+            ServiceTestFixtures.NewOptions(_dbPath) with { MaxProvisioningAttempts = 2 }, worker, _db);
+        var request = ServiceTestFixtures.Request();
+
+        var first = await _service.EnsureSnapshotAsync(request);
+        Assert.AreEqual(SnapshotJobStatus.Queued, first.Status, "attempt 1 of 2 requeues");
+
+        var second = await _service.EnsureSnapshotAsync(request);
+        Assert.AreEqual(SnapshotJobStatus.Failed, second.Status,
+            "once the attempt bound is exhausted the transient failure settles to a terminal Failed");
+
+        // Bound reached → subsequent ensures attach the cached terminal WITHOUT re-running the worker.
+        var third = await _service.EnsureSnapshotAsync(request);
+        Assert.AreEqual(SnapshotJobStatus.Failed, third.Status);
+        Assert.IsTrue(third.Attached, "past the bound, the terminal Failed is cached and re-used");
+        Assert.AreEqual(2, worker.Calls, "the worker ran exactly MaxProvisioningAttempts times, then stopped");
+    }
+
+    [TestMethod]
+    public async Task Ensure_DeterministicUnsupported_IsCachedTerminal_WorkerNotRerun()
+    {
+        var db = NewDb();
+        var worker = new FakeSnapshotWorker(db, FakeSnapshotWorker.Unsupported("no solution found"));
+        var service = StartWith(worker);
+        var request = ServiceTestFixtures.Request();
+
+        var first = await service.EnsureSnapshotAsync(request);
+        Assert.AreEqual(SnapshotJobStatus.Unsupported, first.Status);
+
+        // A DETERMINISTIC failure (returned, not thrown) is genuinely permanent for this identity, so the
+        // next ensure attaches the cached terminal rather than pointlessly re-running the worker.
+        var second = await service.EnsureSnapshotAsync(request);
+        Assert.AreEqual(SnapshotJobStatus.Unsupported, second.Status);
+        Assert.IsTrue(second.Attached, "a deterministic unsupported result is cached and re-used");
+        Assert.AreEqual(1, worker.Calls, "a deterministic failure is not re-run on re-ensure");
+    }
+
+    [TestMethod]
     public void ToIdentity_FallbackConfigHash_UsedOnlyWhenRequestOmitsConfigHash()
     {
         var withoutConfig = ServiceTestFixtures.Request() with { ConfigHash = null };
