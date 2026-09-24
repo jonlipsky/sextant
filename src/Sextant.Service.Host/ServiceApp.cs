@@ -77,9 +77,29 @@ public static class ServiceApp
         // arbitrary-file-read / cross-tenant leak. A default-deny allowlist also means a newly added tool is
         // NOT silently exposed remotely until it is vetted and added here. The local stdio server
         // (McpServerSetup) keeps the full assembly-wide set — it is the zero-policy single-node path.
+        // STATELESS HTTP transport (gateway-proxy contract): the remote /mcp surface is fronted by
+        // ProcessStack's Sextant query gateway, a "faithful JSON-RPC proxy" that handles `initialize` /
+        // `notifications/initialized` LOCALLY and forwards only `tools/list` + `tools/call` verbatim to
+        // this upstream — it never performs an MCP session handshake against us and never carries an
+        // Mcp-Session-Id header. The default (stateful) Streamable-HTTP transport rejects any non-initialize
+        // POST that lacks that header with HTTP 400 ("A new session can only be created by an initialize
+        // request. Include a valid Mcp-Session-Id header for non-initialize requests."), which makes the
+        // whole cross-repo query gateway non-functional in production. Stateless mode makes each POST an
+        // independent request-response needing no prior initialize and no session header, which is also the
+        // architecturally correct model for a proxied, multi-tenant, read-only query surface (no session
+        // affinity, horizontally scalable). The auth/scope middleware runs per-POST on the /mcp path BEFORE
+        // MapMcp, so it is unaffected; the local stdio server (McpServerSetup) is a separate path and stays
+        // stateful/unchanged.
         builder.Services.AddMcpServer()
-            .WithHttpTransport()
-            .WithTools(RemoteQueryTools);
+            .WithHttpTransport(transport => transport.Stateless = true)
+            // Cast to IEnumerable<Type> is REQUIRED: RemoteQueryTools is typed IReadOnlyList<Type>, and a
+            // bare `.WithTools(RemoteQueryTools)` binds to the generic overload
+            // `WithTools<TToolType>(TToolType target)` (an exact identity match beats the IEnumerable<Type>
+            // conversion the non-generic overload needs). That overload treats the LIST OBJECT itself as a
+            // tool type, finds no [McpServerTool] methods on IReadOnlyList<Type>, and registers ZERO tools —
+            // so tools/list/tools/call answer -32601. The cast selects the non-generic
+            // WithTools(IEnumerable<Type>) overload that reflects each element type's attributed methods.
+            .WithTools((IEnumerable<Type>)RemoteQueryTools);
     }
 
     /// <summary>
