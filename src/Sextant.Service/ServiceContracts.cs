@@ -1,5 +1,6 @@
 using Sextant.Core;
 using Sextant.Store;
+using System.Text.Json.Serialization;
 
 namespace Sextant.Service;
 
@@ -32,6 +33,30 @@ public sealed record EnsureSnapshotRequest
     /// different sequence is the SAME immutable snapshot. Serializes as <c>branch_head_sequence</c>.
     /// </summary>
     public long? BranchHeadSequence { get; init; }
+
+    /// <summary>
+    /// OPTIONAL control-plane assertion of whether <see cref="BranchName"/> is the repository's default
+    /// branch (issue #104). Decoupled from the legacy "no branch name ⇒ default" heuristic: a coordinator
+    /// (ProcessStack's <c>SextantEnsureSnapshot</c>) names the branch it advances even in the NORMAL
+    /// indexing case, so deriving default-ness from a null branch name never marks that named branch
+    /// default — and the multi-tenant read selector (<c>GetSelectedSnapshotIdForRepository</c>), which
+    /// requires <c>is_default = 1</c>, then fails closed on a fully populated catalog. When present this
+    /// value is authoritative for which branch owns the repository's default pointer. When <c>null</c> (the
+    /// local CLI/daemon path and any caller that omits it) it falls back via
+    /// <see cref="ResolveIsDefaultBranch"/> to the historical <c>BranchName is null</c> rule, so the local
+    /// flow is byte-identical. Deliberately NOT folded into <see cref="ToIdentity"/> — the same committed
+    /// state is the SAME immutable snapshot regardless of default designation. Serializes as
+    /// <c>default_branch</c> (matching the contribute path's query parameter).
+    /// </summary>
+    [JsonPropertyName("default_branch")]
+    public bool? IsDefaultBranch { get; init; }
+
+    /// <summary>
+    /// Resolves whether this ensure advances the repository's default branch: the explicit
+    /// <see cref="IsDefaultBranch"/> when supplied, else the legacy <c>BranchName is null</c> heuristic so
+    /// an omitted flag preserves the pre-#104 behavior byte-for-byte (the local/single-repo path).
+    /// </summary>
+    public bool ResolveIsDefaultBranch() => IsDefaultBranch ?? (BranchName is null);
 
     /// <summary>
     /// Builds the durable identity for this request using the service-side schema/analyzer/toolchain.

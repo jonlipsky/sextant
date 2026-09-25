@@ -163,7 +163,7 @@ public sealed class LocalIndexerSnapshotWorker(
         CommitSha = request.CommitSha,
         TreeSha = request.TreeSha,
         BranchName = request.BranchName ?? "main",
-        IsDefaultBranch = request.BranchName is null,
+        IsDefaultBranch = request.ResolveIsDefaultBranch(),
         // Stamp the producing node's capability fingerprint (Phase 15) so the published snapshot's
         // identity + provenance record what evaluated it. Null when unset — an ordinary local index
         // that never routes — keeping the identity byte-identical to the pre-Phase-15 path (CRITICAL 2).
