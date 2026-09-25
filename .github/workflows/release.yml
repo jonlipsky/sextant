@@ -1,0 +1,175 @@
+name: Release
+
+# Publishes the Sextant CLI to NuGet.org as a .NET global tool.
+#
+# Trigger by pushing a version tag, e.g.:
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# The package version is derived from the tag (v1.2.3 -> 1.2.3), so the
+# static <Version> in Sextant.Cli.csproj is only used for local dev builds.
+#
+# Flow: build/test/pack (once) -> verify the packed tool installs & indexes
+# on Windows/Linux/macOS -> publish the exact verified artifact to NuGet.org.
+#
+# Requires a repository secret named NUGET_API_KEY (a NuGet.org API key
+# scoped to push the Sextant.Cli package). The key is never hardcoded.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-test-pack:
+    name: Build, test & pack
+    # windows-latest matches the environment the test suite is validated
+    # against. The produced .nupkg is a portable, framework-dependent global
+    # tool and is not OS-specific.
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Derive and validate package version from tag
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag '$TAG' is not a valid v<MAJOR>.<MINOR>.<PATCH>[-prerelease] version."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Release version: $VERSION"
+
+      - name: Restore
+        run: dotnet restore Sextant.slnx
+
+      # Build + test in Debug: the CLI integration tests spawn the CLI via
+      # `dotnet run --no-build` (which defaults to the Debug output), and the
+      # repo's documented test command is `dotnet test Sextant.slnx --no-build`.
+      - name: Build
+        run: dotnet build Sextant.slnx --no-restore
+
+      - name: Test (gate before publish)
+        run: dotnet test Sextant.slnx --no-build
+
+      # Pack the CLI in Release for the published package. The version is passed
+      # via an environment variable (never interpolated into the script) and has
+      # already been validated above.
+      - name: Pack global tool
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+        run: >-
+          dotnet pack src/Sextant.Cli/Sextant.Cli.csproj
+          -c Release
+          -o artifacts/nupkg
+          -p:Version="$PACKAGE_VERSION"
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sextant-cli-nupkg
+          path: artifacts/nupkg/*.nupkg
+          if-no-files-found: error
+
+  verify:
+    name: Verify packed tool (${{ matrix.os }})
+    needs: build-test-pack
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Download package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sextant-cli-nupkg
+          path: artifacts/nupkg
+
+      - name: Install the packed tool
+        env:
+          PACKAGE_VERSION: ${{ needs.build-test-pack.outputs.version }}
+        run: >-
+          dotnet tool install Sextant.Cli
+          --tool-path ./_tools
+          --add-source artifacts/nupkg
+          --version "$PACKAGE_VERSION"
+
+      # Exercises the real installed tool from a tool store (not the build
+      # output), including MSBuildLocator discovery of the SDK and end-to-end
+      # indexing + querying of a scaffolded solution.
+      - name: Smoke test (help, index, query)
+        run: |
+          TOOL="$(cd _tools && pwd)/sextant"
+          "$TOOL" --help
+          mkdir smoke && cd smoke
+          dotnet new classlib -n MiniLib -o MiniLib
+          dotnet new sln -n Mini
+          SLN="$(ls Mini.slnx Mini.sln 2>/dev/null | head -n1)"
+          dotnet sln "$SLN" add MiniLib/MiniLib.csproj
+          "$TOOL" index "$SLN" --db test.db
+          "$TOOL" query semantic-search Class1 --db test.db | tee query.json
+          grep -q "MiniLib.Class1" query.json
+
+  publish:
+    name: Publish to NuGet.org
+    needs: verify
+    runs-on: ubuntu-latest
+    # Optional protected environment: configure required reviewers under
+    # Settings > Environments > nuget to gate publishing behind manual approval.
+    environment: nuget
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Download package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sextant-cli-nupkg
+          path: artifacts/nupkg
+
+      - name: Push to NuGet.org
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          if [ -z "$NUGET_API_KEY" ]; then
+            echo "::error::NUGET_API_KEY secret is not set. Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          dotnet nuget push "artifacts/nupkg/*.nupkg" \
+            --api-key "$NUGET_API_KEY" \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate

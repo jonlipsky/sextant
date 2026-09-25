@@ -1,18 +1,33 @@
 # Sextant
 
+[![NuGet](https://img.shields.io/nuget/v/Sextant.Cli.svg)](https://www.nuget.org/packages/Sextant.Cli)
+
 Semantic code index for .NET projects. Gives AI coding agents instant access to symbols, references, call graphs, type hierarchies, and dependency analysis — powered by Roslyn and exposed via MCP.
 
 ## Getting Started
 
 ### 1. Install Sextant
 
-Requires .NET 10 SDK.
+**Prerequisite:** the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0). Sextant loads Roslyn/MSBuild at runtime and discovers them from the installed SDK, so the full **SDK** (not just the runtime) must be present.
+
+Install the CLI as a .NET global tool from NuGet.org:
+
+```bash
+dotnet tool install -g Sextant.Cli
+```
+
+This puts a `sextant` command on your PATH. Update with `dotnet tool update -g Sextant.Cli`; remove with `dotnet tool uninstall -g Sextant.Cli`.
+
+<details>
+<summary>Or build from source</summary>
 
 ```bash
 git clone <repo-url>
 cd sextant
 ./scripts/install-cli.sh
 ```
+
+</details>
 
 ### 2. Index Your Codebase
 
@@ -78,6 +93,7 @@ Source Files → [Daemon] → [Indexer] → [SQLite] → [MCP Server] → AI Age
 | [Indexing](docs/indexing.md) | Roslyn extraction pipeline, incremental indexing, project identity |
 | [Schema](docs/schema.md) | SQLite tables, migrations, FTS5 |
 | [Contributions](docs/contributions.md) | Client/CI-assisted index contributions, supply-chain validation |
+| [Releasing](docs/releasing.md) | Publishing the CLI to NuGet.org as a global tool (maintainers) |
 
 ## Development
 
