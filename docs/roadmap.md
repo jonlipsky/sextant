@@ -2,6 +2,9 @@
 
 This document describes potential enhancements to Sextant, prioritized by their benefit to AI coding agents.
 
+> New here? Start with the [Onboarding guide](onboarding.md) to get Sextant running on your machine in
+> either the thin/server-backed or hybrid/local-overlay mode.
+
 ## Current Capabilities
 
 Sextant provides 25 MCP tools covering the semantic navigation features found in IDEs like Visual Studio and Rider, plus cross-repository analysis and index inspection:
