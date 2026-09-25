@@ -696,8 +696,8 @@ public sealed class SnapshotService : IDisposable
 
     // Ensures the requesting branch owns a pointer to the snapshot it attached to (issue #62), so a second
     // branch at the same commit both resolves and protects the shared snapshot. Raw DB write — callers must
-    // already hold the write gate. No-op when the request carries no branch, no resolved snapshot, or an
-    // unknown repository.
+    // already hold the write gate AND an open write transaction (AdvanceOrAttachBranchPointer). No-op when
+    // the request carries no branch, no resolved snapshot, or an unknown repository.
     private void EnsureAttachBranchPointer(EnsureSnapshotRequest request, long? snapshotId)
     {
         if (request.BranchName is not { Length: > 0 } branch || snapshotId is not long sid)
@@ -705,7 +705,16 @@ public sealed class SnapshotService : IDisposable
         var snapshots = new SnapshotStore(_conn);
         if (snapshots.GetRepositoryId(request.RepositoryRemoteUrl) is not long repoId)
             return;
-        snapshots.AttachBranchPointer(repoId, branch, sid, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        var branchId = snapshots.AttachBranchPointer(repoId, branch, sid, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        // Safety net (issue #104): AttachBranchPointer inserts the branch NON-default (issue #62 — a second
+        // branch must never demote the real default). But when THIS ensure's branch should own the default
+        // — the coordinator flagged it, it already is the default, or the repo has NO default yet (the
+        // first/sole consumer) — promote it so the multi-tenant read selector (GetSelectedSnapshotIdFor-
+        // Repository, which requires is_default = 1) can resolve a snapshot instead of failing closed. Uses
+        // SetSoleDefaultBranch (not PromoteSoleDefaultBranch) because the attached row is is_default = 0 and
+        // must be SET, not merely have siblings demoted; it preserves the single-default invariant.
+        if (snapshots.ShouldOwnDefault(repoId, branch, request.ResolveIsDefaultBranch()))
+            snapshots.SetSoleDefaultBranch(repoId, branchId);
     }
 
     // The branch-pointer decision for a REUSE/terminal-attach ensure — a snapshot the service attaches
@@ -716,8 +725,27 @@ public sealed class SnapshotService : IDisposable
     // reset/force-push A@10 → B@20 → A@30) and a lower/equal one still declines — never regressing the
     // branch head and always persisting the advanced sequence. When the request carries NO sequence (the
     // local/legacy path) this preserves today's forward-only attach-if-unset behavior byte-for-byte
-    // (criterion 2). Raw DB write — callers must already hold the write gate.
+    // (criterion 2). The mutation runs in ONE raw BEGIN IMMEDIATE / COMMIT transaction — this path, unlike
+    // the worker's AdvanceBranchToSnapshot and the contribution ingest, is NOT already inside a write
+    // transaction — so a concurrent reader never observes an intermediate state where the branch pointer
+    // advanced but its default was not yet set, or a re-ensured default was momentarily demoted (issue
+    // #104). Raw DB write — callers must already hold the write gate.
     private void AdvanceOrAttachBranchPointer(EnsureSnapshotRequest request, long? snapshotId)
+    {
+        ExecRaw("BEGIN IMMEDIATE;");
+        try
+        {
+            AdvanceOrAttachBranchPointerCore(request, snapshotId);
+            ExecRaw("COMMIT;");
+        }
+        catch
+        {
+            ExecRaw("ROLLBACK;");
+            throw;
+        }
+    }
+
+    private void AdvanceOrAttachBranchPointerCore(EnsureSnapshotRequest request, long? snapshotId)
     {
         if (request.BranchHeadSequence is not long seq)
         {
@@ -730,12 +758,16 @@ public sealed class SnapshotService : IDisposable
         if (snapshots.GetRepositoryId(request.RepositoryRemoteUrl) is not long repoId)
             return;
         // Mirror CreateSnapshotContext's branch/default resolution so the reuse path and the worker path
-        // advance the SAME branch under the SAME default semantics.
+        // advance the SAME branch under the SAME default semantics. Default ownership is resolved BEFORE
+        // EnsureBranch (issue #104): the request's explicit flag (ResolveIsDefaultBranch), or the
+        // first/sole-consumer safety net when the repo has no default yet — so a coordinator that names the
+        // branch it advances still leaves a selectable default, and the is_default transition stays
+        // monotonic (a re-ensured default is never demoted-then-re-promoted).
         var branchName = request.BranchName ?? "main";
-        var isDefault = request.BranchName is null;
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        var branchId = snapshots.EnsureBranch(repoId, branchName, isDefault, now);
-        if (isDefault)
+        var ownsDefault = snapshots.ShouldOwnDefault(repoId, branchName, request.ResolveIsDefaultBranch());
+        var branchId = snapshots.EnsureBranch(repoId, branchName, ownsDefault, now);
+        if (ownsDefault)
             snapshots.PromoteSoleDefaultBranch(repoId, branchId);
         snapshots.AdvanceBranchPointerForwardOnly(branchId, sid, seq, now);
     }
@@ -745,8 +777,12 @@ public sealed class SnapshotService : IDisposable
     private static void AdvanceBranch(
         SnapshotStore snapshots, long repositoryId, string branchName, bool isDefaultBranch, long snapshotId, long now)
     {
-        var branchId = snapshots.EnsureBranch(repositoryId, branchName, isDefaultBranch, now);
-        if (isDefaultBranch)
+        // Resolve default ownership BEFORE EnsureBranch (issue #104): the contribution's explicit flag, or
+        // the first/sole-consumer safety net when the repo has no default yet, so a contributed branch still
+        // yields a selectable default for the multi-tenant read selector. Monotonic is_default transition.
+        var ownsDefault = snapshots.ShouldOwnDefault(repositoryId, branchName, isDefaultBranch);
+        var branchId = snapshots.EnsureBranch(repositoryId, branchName, ownsDefault, now);
+        if (ownsDefault)
             snapshots.PromoteSoleDefaultBranch(repositoryId, branchId);
         var previous = snapshots.GetBranchSnapshotId(branchId);
         snapshots.SetBranchPointer(branchId, snapshotId, now);
