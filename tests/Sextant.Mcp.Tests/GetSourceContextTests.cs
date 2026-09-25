@@ -117,7 +117,7 @@ public class GetSourceContextTests
             // include_source reads from the symbol's file path, which would be in the index.
             // Since our test DB has synthetic file paths, we test the tool parameter is accepted
             var result = FindSymbolTool.FindSymbol(_fixture.DbProvider, "BaseService",
-                fuzzy: true, include_source: true);
+                fuzzy: true, include_source: true).GetAwaiter().GetResult();
             var doc = JsonDocument.Parse(result);
             var results = doc.RootElement.GetProperty("results");
             Assert.IsTrue(results.GetArrayLength() >= 1);

@@ -500,8 +500,10 @@ public sealed class SymbolStore(SqliteConnection connection)
             OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal);
 
     // Maps a lowercase kind name (as used by MCP filters) to its stored ordinal, or -1 when unknown so
-    // an unrecognized filter matches nothing (matching the pre-Phase-7 text-equality behavior).
-    private static int KindNameToInt(string name)
+    // an unrecognized filter matches nothing (matching the pre-Phase-7 text-equality behavior). Public
+    // (like FormatAccessibility) so a federated remote-base row can be kind-filtered with the exact same
+    // parse the FTS query uses.
+    public static int KindNameToInt(string name)
         => Enum.TryParse<SymbolKind>(name, ignoreCase: true, out var kind) ? (int)kind : -1;
 
     private static int AccessibilityNameToInt(string value) => value switch
