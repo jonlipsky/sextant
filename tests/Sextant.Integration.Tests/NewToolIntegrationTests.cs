@@ -62,7 +62,7 @@ public class NewToolIntegrationTests
         {
             var projectId = projects[0].GetProperty("canonical_id").GetString()!;
             var result = FindSymbolTool.FindSymbol(_fixture.DbProvider, "Index",
-                fuzzy: true, scope: $"project:{projectId}");
+                fuzzy: true, scope: $"project:{projectId}").GetAwaiter().GetResult();
             var doc = JsonDocument.Parse(result);
             Assert.IsTrue(doc.RootElement.TryGetProperty("results", out _));
         }

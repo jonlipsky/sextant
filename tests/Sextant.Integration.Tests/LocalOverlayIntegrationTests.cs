@@ -124,6 +124,71 @@ public class LocalOverlayIntegrationTests : IDisposable
     }
 
     [TestMethod]
+    public async Task DirtyTree_NoLocalBase_RemotePeerHasBase_StagesBaselessOverlay()
+    {
+        // Issue #108: a THIN machine — a dirty working tree with NO local committed base for HEAD, but a
+        // configured peer that DOES publish the exact committed base. The reconciler must stage a BASELESS
+        // overlay (index only the diff) instead of a full local index, so the read path federates the base.
+        var repo = CreateGitProject("Widget");
+        var dbPath = Path.Combine(_tempDir, "index.db");
+        using var db = new IndexDatabase(dbPath);
+        db.RunMigrations();
+
+        File.WriteAllText(repo.SourceFile, "namespace App;\npublic class Widget { public int Value() => 42; }\n");
+        var peer = new StubBaseSource(publishesBase: true);
+
+        var result = await ReconcileAsync(db, repo.SolutionPath, peer);
+        Assert.AreEqual(OverlayReconcileKind.Overlay, result.Kind,
+            "no local base but a peer publishes the committed base ⇒ a baseless overlay is staged, not a full local index (criteria 1/5)");
+
+        var conn = db.GetConnection();
+        var store = new SnapshotStore(conn);
+        var selected = store.GetSelectedSnapshotId();
+        Assert.IsNotNull(selected, "the baseless overlay is selected");
+        var overlayRow = store.GetById(selected.Value)!;
+        Assert.IsTrue(overlayRow.IsOverlay, "the selected generation is an overlay");
+        Assert.IsNull(overlayRow.BaseSnapshotId,
+            "the overlay is BASELESS — its committed base lives only on the peer, never pinned to a local snapshot id (issue #108)");
+        Assert.IsTrue(SnapshotHasSymbol(conn, selected.Value, "Widget"),
+            "the overlay re-extracts the touched project's working-tree state (the diff)");
+
+        // Three-way base-identity-hash agreement: the reconciler probed the peer with EXACTLY the hash the
+        // read path reconstructs from the overlay row, so a query fetches the SAME committed base.
+        var remoteUrl = store.GetRepositoryRemoteUrl(overlayRow.RepositoryId)!;
+        var commitSha = store.GetCommitSha(overlayRow.CommitId)!;
+        Assert.AreEqual(BaseSnapshotIdentity.ForRemoteOverlay(overlayRow, remoteUrl, commitSha).Hash, peer.LastRequestedHash,
+            "the write-path probe hash equals the read-side reconstruction — one committed-base identity across resolution, probe, and read (issue #108)");
+    }
+
+    [TestMethod]
+    public async Task DirtyTree_NoLocalBase_RemotePeerLacksBase_FallsBackWithPeerReason()
+    {
+        // Issue #108: a dirty tree with NO local base AND no configured peer that publishes the committed
+        // base ⇒ the pre-#108 explicit full local fallback, with a reason that records the peer was consulted.
+        var repo = CreateGitProject("Widget");
+        var dbPath = Path.Combine(_tempDir, "index.db");
+        using var db = new IndexDatabase(dbPath);
+        db.RunMigrations();
+
+        File.WriteAllText(repo.SourceFile, "namespace App;\npublic class Widget { public int Value() => 42; }\n");
+        var peer = new StubBaseSource(publishesBase: false);
+
+        var result = await ReconcileAsync(db, repo.SolutionPath, peer);
+        Assert.AreEqual(OverlayReconcileKind.FullFallback, result.Kind,
+            "no local base and no peer publishing it ⇒ the explicit full local fallback (criterion 3/5)");
+        Assert.IsFalse(string.IsNullOrEmpty(result.FallbackReason), "the fallback records an EXPLICIT reason");
+        StringAssert.Contains(result.FallbackReason!, "peer",
+            "the reason notes the configured peer was consulted before falling back (criterion 3/6)");
+
+        var conn = db.GetConnection();
+        var store = new SnapshotStore(conn);
+        var selected = store.GetSelectedSnapshotId();
+        Assert.IsNotNull(selected);
+        Assert.IsFalse(store.GetById(selected.Value)!.IsOverlay, "the fallback is a full local index, not an overlay");
+        Assert.IsTrue(SnapshotHasSymbol(conn, selected.Value, "Widget"), "the fallback fully indexes the dirty tree");
+    }
+
+    [TestMethod]
     public async Task Daemon_LiveConfigEdit_ExtractorToggleForcesRebuild()
     {
         // #28 (daemon re-resolves config on the authoritative pass, not just watcher events) + #39 (the
@@ -602,6 +667,50 @@ public class LocalOverlayIntegrationTests : IDisposable
             parallelism: ExtractionParallelismOptions.Default,
             profile: IndexProfileDescriptor.For(IndexProfiles.Standard));
         return await reconciler.ReconcileAsync(solution);
+    }
+
+    /// <summary>Reconcile with a configured remote base source (issue #108 thin-machine path).</summary>
+    private async Task<OverlayReconcileResult> ReconcileAsync(
+        IndexDatabase db, string solutionPath, IBaseSnapshotSource remoteBaseSource)
+    {
+        var solution = await SolutionLoader.LoadSolutionAsync(solutionPath);
+        var reconciler = new LocalOverlayReconciler(
+            db, log: null, useDocumentExtractor: true,
+            parallelism: ExtractionParallelismOptions.Default,
+            profile: IndexProfileDescriptor.For(IndexProfiles.Standard),
+            remoteBaseSource: remoteBaseSource);
+        return await reconciler.ReconcileAsync(solution);
+    }
+
+    /// <summary>
+    /// A minimal <see cref="IBaseSnapshotSource"/> that either publishes a one-row base page or an empty
+    /// terminal page, recording the identity hash it was probed with (issue #108 reconciler decision test).
+    /// </summary>
+    private sealed class StubBaseSource(bool publishesBase) : IBaseSnapshotSource
+    {
+        public string? LastRequestedHash { get; private set; }
+
+        public Task<SnapshotSymbolPage> FetchSymbolsAsync(SnapshotPageRequest request, CancellationToken cancellationToken)
+        {
+            LastRequestedHash = request.IdentityHash;
+            IReadOnlyList<SnapshotSymbolRow> rows = publishesBase
+                ? new List<SnapshotSymbolRow>
+                {
+                    new()
+                    {
+                        Cursor = 1, SymbolKey = "K:App.BaseType", FullyQualifiedName = "global::App.BaseType",
+                        DisplayName = "BaseType", Kind = 0, Accessibility = 0, ProjectCanonicalId = "logical_base"
+                    }
+                }
+                : [];
+            return Task.FromResult(new SnapshotSymbolPage
+            {
+                IdentityHash = request.IdentityHash,
+                Symbols = rows,
+                NextCursor = null,
+                Complete = true
+            });
+        }
     }
 
     private static void WriteConfig(string path, bool documentExtractor, int reconcileIntervalSeconds) =>

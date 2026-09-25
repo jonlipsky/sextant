@@ -85,7 +85,7 @@ public class McpToolTests
     [TestMethod]
     public void FindSymbol_ExactMatch_ReturnsCorrectSymbol()
     {
-        var result = FindSymbolTool.FindSymbol(_dbProvider, "global::TestNamespace.TestClass");
+        var result = FindSymbolTool.FindSymbol(_dbProvider, "global::TestNamespace.TestClass").GetAwaiter().GetResult();
         var doc = JsonDocument.Parse(result);
         var meta = doc.RootElement.GetProperty("meta");
         Assert.AreEqual(1, meta.GetProperty("result_count").GetInt32());
@@ -97,7 +97,7 @@ public class McpToolTests
     [TestMethod]
     public void FindSymbol_FuzzyMatch_ReturnsFtsRankedResults()
     {
-        var result = FindSymbolTool.FindSymbol(_dbProvider, "TestClass", fuzzy: true);
+        var result = FindSymbolTool.FindSymbol(_dbProvider, "TestClass", fuzzy: true).GetAwaiter().GetResult();
         var doc = JsonDocument.Parse(result);
         var meta = doc.RootElement.GetProperty("meta");
         Assert.IsTrue(meta.GetProperty("result_count").GetInt32() >= 1);
@@ -145,7 +145,7 @@ public class McpToolTests
     {
         var results = new[]
         {
-            FindSymbolTool.FindSymbol(_dbProvider, "global::TestNamespace.TestClass"),
+            FindSymbolTool.FindSymbol(_dbProvider, "global::TestNamespace.TestClass").GetAwaiter().GetResult(),
             FindReferencesTool.FindReferences(_dbProvider, "global::TestNamespace.TestClass.DoWork(string)"),
             GetFileSymbolsTool.GetFileSymbols(_dbProvider, "src/TestClass.cs"),
             GetTypeMembersTool.GetTypeMembers(_dbProvider, "global::TestNamespace.TestClass")
@@ -167,7 +167,7 @@ public class McpToolTests
         var nonExistentPath = Path.Combine(Path.GetTempPath(), $"nonexistent_{Guid.NewGuid():N}.db");
         using var emptyProvider = new DatabaseProvider(nonExistentPath);
 
-        var result = FindSymbolTool.FindSymbol(emptyProvider, "anything");
+        var result = FindSymbolTool.FindSymbol(emptyProvider, "anything").GetAwaiter().GetResult();
         var doc = JsonDocument.Parse(result);
         var meta = doc.RootElement.GetProperty("meta");
         Assert.AreEqual(0, meta.GetProperty("result_count").GetInt32());
@@ -639,7 +639,7 @@ public class McpToolTests
     [TestMethod]
     public void FindSymbol_ReturnsCanonicalIdAsProjectId()
     {
-        var result = FindSymbolTool.FindSymbol(_dbProvider, "global::TestNamespace.TestClass");
+        var result = FindSymbolTool.FindSymbol(_dbProvider, "global::TestNamespace.TestClass").GetAwaiter().GetResult();
         var doc = JsonDocument.Parse(result);
         var results = doc.RootElement.GetProperty("results");
         var projectId = results[0].GetProperty("project_id").GetString();
@@ -649,7 +649,7 @@ public class McpToolTests
     [TestMethod]
     public void UnambiguousLookup_OmitsAmbiguityMetadata()
     {
-        var result = FindSymbolTool.FindSymbol(_dbProvider, "global::TestNamespace.TestClass");
+        var result = FindSymbolTool.FindSymbol(_dbProvider, "global::TestNamespace.TestClass").GetAwaiter().GetResult();
         var doc = JsonDocument.Parse(result);
         var meta = doc.RootElement.GetProperty("meta");
 
@@ -691,7 +691,7 @@ public class McpToolTests
             LastIndexedAt = 1000
         });
 
-        var result = FindSymbolTool.FindSymbol(_dbProvider, "global::TestNamespace.TestClass.Run");
+        var result = FindSymbolTool.FindSymbol(_dbProvider, "global::TestNamespace.TestClass.Run").GetAwaiter().GetResult();
         var doc = JsonDocument.Parse(result);
         var meta = doc.RootElement.GetProperty("meta");
 

@@ -12,6 +12,16 @@ public sealed record SnapshotSymbolRow
     public required string DisplayName { get; init; }
     public required int Kind { get; init; }
     public required int Accessibility { get; init; }
+
+    /// <summary>
+    /// The COMMIT-INVARIANT logical project identity (<c>git_remote_url | repo_relative_path | tfm</c>)
+    /// this symbol belongs to (issue #108). It is stable across machines for the same logical project, so
+    /// a federated read planner can shadow the overlay's touched project-versions across the remote
+    /// boundary — a base symbol whose project a local overlay re-extracted must NOT resurface. Nullable
+    /// for wire compatibility: a page from a peer predating this field deserializes with null (the planner
+    /// then cannot exclude it, a documented degradation), while the current peer always populates it.
+    /// </summary>
+    public string? ProjectCanonicalId { get; init; }
 }
 
 /// <summary>
@@ -87,11 +97,18 @@ public sealed class LocalBaseSnapshotSource(SqliteConnection connection) : IBase
         var limit = Math.Clamp(request.Limit, 1, 5000);
         var inList = string.Join(",", projectIds);
         using var cmd = connection.CreateCommand();
+        // The logical (commit-invariant) canonical id is carried per symbol so a federated read planner can
+        // shadow the overlay's touched project-versions across the remote boundary (issue #108). It lives on
+        // logical_projects for a snapshot-tagged project row, falling back to the mutable row's own
+        // canonical_id for a legacy row — the same COALESCE ProjectStore surfaces to clients.
         cmd.CommandText = $"""
-            SELECT id, symbol_key, fully_qualified_name, display_name, kind, accessibility
-            FROM symbols
-            WHERE project_id IN ({inList}) AND id > @cursor
-            ORDER BY id
+            SELECT s.id, s.symbol_key, s.fully_qualified_name, s.display_name, s.kind, s.accessibility,
+                   COALESCE(lp.canonical_id, p.canonical_id) AS project_canonical_id
+            FROM symbols s
+            JOIN projects p ON p.id = s.project_id
+            LEFT JOIN logical_projects lp ON lp.id = p.logical_project_id
+            WHERE s.project_id IN ({inList}) AND s.id > @cursor
+            ORDER BY s.id
             LIMIT @limit;
             """;
         cmd.Parameters.AddWithValue("@cursor", request.CursorId);
@@ -108,7 +125,8 @@ public sealed class LocalBaseSnapshotSource(SqliteConnection connection) : IBase
                     FullyQualifiedName = reader.GetString(2),
                     DisplayName = reader.GetString(3),
                     Kind = reader.GetInt32(4),
-                    Accessibility = reader.GetInt32(5)
+                    Accessibility = reader.GetInt32(5),
+                    ProjectCanonicalId = reader.IsDBNull(6) ? null : reader.GetString(6)
                 });
         }
 

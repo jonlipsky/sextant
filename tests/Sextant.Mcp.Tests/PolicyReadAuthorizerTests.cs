@@ -241,7 +241,7 @@ public class PolicyReadAuthorizerTests
             // Zero-policy local path (AllowAll, IsEnforcing=false): the raw declaration IS read off disk,
             // byte-identical to pre-Phase-17 behavior.
             using var local = new DatabaseProvider(dbPath, AllowAllReadAuthorizer.Instance);
-            var localJson = FindSymbolTool.FindSymbol(local, "global::Secret", include_source: true);
+            var localJson = FindSymbolTool.FindSymbol(local, "global::Secret", include_source: true).GetAwaiter().GetResult();
             StringAssert.Contains(localJson, "source_context", "the local path serves source declarations");
             StringAssert.Contains(localJson, "public class Secret", "the on-disk declaration is returned locally");
 
@@ -249,7 +249,7 @@ public class PolicyReadAuthorizerTests
             // suppressed so a reconstructed absolute path can never expose service-host file contents. The
             // authorized caller still gets the symbol metadata — just locations, no snippet (criteria 1 & 2).
             using var enforced = new DatabaseProvider(dbPath, new PolicyReadAuthorizer(policy, () => "tok-a", resolver));
-            var enforcedJson = FindSymbolTool.FindSymbol(enforced, "global::Secret", include_source: true);
+            var enforcedJson = FindSymbolTool.FindSymbol(enforced, "global::Secret", include_source: true).GetAwaiter().GetResult();
             Assert.IsFalse(enforcedJson.Contains("source_context"), "source snippet is suppressed under enforcement");
             Assert.IsFalse(enforcedJson.Contains("sensitive host file"), "no host-file contents leak under enforcement");
             StringAssert.Contains(enforcedJson, "Secret", "the authorized caller still receives the symbol metadata");

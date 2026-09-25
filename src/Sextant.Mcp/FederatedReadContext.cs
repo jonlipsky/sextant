@@ -15,16 +15,25 @@ public sealed class FederatedReadContext
 {
     private FederatedReadContext(
         SnapshotReadScope scope, SnapshotProvenance? provenance, ReadAuthorization authorization,
-        long? selectedSnapshotId)
+        long? selectedSnapshotId, RemoteBaseDescriptor? remoteBase)
     {
         Scope = scope;
         Provenance = provenance;
         Authorization = authorization;
         SelectedSnapshotId = selectedSnapshotId;
+        RemoteBase = remoteBase;
     }
 
     /// <summary>The pinned read scope reused by every store in this request.</summary>
     public SnapshotReadScope Scope { get; }
+
+    /// <summary>
+    /// Present (non-null) only when the pinned generation is a REMOTE-base overlay (issue #108): an overlay
+    /// whose committed base is absent from the local catalog and must be federated from a configured peer by
+    /// its immutable identity hash. Null for every pure-local read (a full index, a clean base, or a
+    /// local-base overlay), so a read with no remote base is byte-identical to the pre-#108 path.
+    /// </summary>
+    public RemoteBaseDescriptor? RemoteBase { get; }
 
     /// <summary>
     /// The id of the single snapshot generation this request pinned (Phase 11 issue #42), or null for a
@@ -81,11 +90,21 @@ public sealed class FederatedReadContext
         // reads Scope without consulting Authorization leaks nothing; the gate additionally turns the
         // denial into the uniform not-found. No provenance/scope work is done for a denied read.
         if (!authorization.Allowed)
-            return new FederatedReadContext(SnapshotReadScope.DenyAll, provenance: null, authorization, selectedSnapshotId: null);
+            return new FederatedReadContext(SnapshotReadScope.DenyAll, provenance: null, authorization, selectedSnapshotId: null, remoteBase: null);
 
         var scope = ResolveScope(snapshots, selected, mode);
         var provenance = selected == null ? null : BuildProvenance(snapshots, selected, mode, compatibility);
-        return new FederatedReadContext(scope, provenance, authorization, selected?.Id);
+
+        // Issue #108: a remote-base overlay (is_overlay=1, base_snapshot_id IS NULL) pins a committed base
+        // that lives only on a configured peer. Expose its recomputed identity hash so find_symbol can
+        // federate the base from the peer and union it with the local overlay. Null for every pure-local
+        // generation, so a read with no remote base is byte-identical to the pre-#108 path.
+        var remoteBase = selected is { IsOverlay: true, BaseSnapshotId: null }
+            && provenance?.BaseIdentityHash is { Length: > 0 } hash
+                ? new RemoteBaseDescriptor { BaseIdentityHash = hash }
+                : null;
+
+        return new FederatedReadContext(scope, provenance, authorization, selected?.Id, remoteBase);
     }
 
     private static SnapshotReadScope ResolveScope(
@@ -118,7 +137,10 @@ public sealed class FederatedReadContext
     private static SnapshotProvenance BuildProvenance(
         SnapshotStore snapshots, SnapshotRow selected, FederationMode mode, CompatibilityInputs? compatibility)
     {
-        // The committed base the read rests on: the overlay's base, or the selected row itself.
+        // The committed base the read rests on: the overlay's base, or the selected row itself. For a
+        // REMOTE-base overlay (issue #108) the base is not in the local catalog (base_snapshot_id IS NULL),
+        // so there is no local base id/row — the base is addressed by its recomputed identity hash below.
+        var remoteBaseOverlay = selected is { IsOverlay: true, BaseSnapshotId: null };
         var baseId = selected.IsOverlay ? selected.BaseSnapshotId : selected.Id;
         var baseRow = selected.IsOverlay && selected.BaseSnapshotId is { } bid
             ? snapshots.GetById(bid) ?? selected
@@ -127,10 +149,22 @@ public sealed class FederatedReadContext
         // #41: check the committed base (the generation that can predate the running binary) at READ time.
         var incompatibilities = ReadCompatibility.Evaluate(baseRow, compatibility ?? CompatibilityInputs.Current);
 
+        // Recompute the peer-addressable base identity hash for a remote-base overlay from the overlay's own
+        // stored fields (mirrors the reconciler's probe identity), so meta.snapshot states which committed
+        // base the federated read rests on even though it never touched the local catalog.
+        string? baseIdentityHash = null;
+        if (remoteBaseOverlay
+            && snapshots.GetRepositoryRemoteUrl(selected.RepositoryId) is { Length: > 0 } remoteUrl
+            && snapshots.GetCommitSha(selected.CommitId) is { Length: > 0 } commitSha)
+        {
+            baseIdentityHash = BaseSnapshotIdentity.ForRemoteOverlay(selected, remoteUrl, commitSha).Hash;
+        }
+
         return new SnapshotProvenance
         {
             BaseSnapshotId = baseId,
             BaseCommit = snapshots.GetCommitSha(baseRow.CommitId),
+            BaseIdentityHash = baseIdentityHash,
             OverlayGeneration = selected.IsOverlay ? selected.Id : null,
             IsOverlay = selected.IsOverlay,
             Completeness = selected.Status,
@@ -147,4 +181,15 @@ public sealed class FederatedReadContext
             Freshness = selected.PublishedAt ?? selected.CreatedAt
         };
     }
+}
+
+/// <summary>
+/// Describes the committed BASE a remote-base overlay federates from (issue #108): the immutable identity
+/// hash by which a configured peer addresses that base snapshot. Produced once per request by
+/// <see cref="FederatedReadContext"/> and consumed by a read tool (e.g. <c>find_symbol</c>) to page the
+/// base from the peer and union it with the local overlay.
+/// </summary>
+public sealed record RemoteBaseDescriptor
+{
+    public required string BaseIdentityHash { get; init; }
 }
