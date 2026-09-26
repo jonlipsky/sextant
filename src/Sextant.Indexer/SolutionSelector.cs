@@ -257,7 +257,11 @@ public static class SolutionSelector
     // separator is rewritten — on Linux a '\' is a legal file-name character and must not be
     // reinterpreted as a directory boundary.
     private static string RepoRelative(string root, string fullPath) =>
-        Path.GetRelativePath(root, fullPath).Replace(Path.DirectorySeparatorChar, '/');
+        ToSlashSeparated(Path.GetRelativePath(root, fullPath), Path.DirectorySeparatorChar);
+
+    // Pure so the Windows branch is testable on any OS (the CI gate runs on Linux, where it is a no-op).
+    internal static string ToSlashSeparated(string relative, char hostSeparator) =>
+        hostSeparator == '/' ? relative : relative.Replace(hostSeparator, '/');
 
     // True when <paramref name="candidate"/> is the root itself or a descendant of it, computed on the
     // normalized full paths so "..", traversal, and separator differences cannot escape the checkout.

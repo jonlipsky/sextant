@@ -193,6 +193,22 @@ public sealed class SolutionSelectorTests
     }
 
     [TestMethod]
+    public void ToSlashSeparated_NormalizesAWindowsHostSeparator_OnEveryOs()
+    {
+        // Exercises the Windows branch on every OS: the CI gate runs on Linux, where the host separator is
+        // already '/', so the discovery-level test above cannot catch a regression there.
+        var ab = SolutionSelector.ToSlashSeparated(@"x\a\b.slnx", '\\');
+        var a0c = SolutionSelector.ToSlashSeparated(@"x\a0\c.slnx", '\\');
+        Assert.AreEqual("x/a/b.slnx", ab);
+        Assert.AreEqual("x/a0/c.slnx", a0c);
+        Assert.IsTrue(string.CompareOrdinal(ab, a0c) < 0, "normalized keys order a/ before a0/ as on Linux");
+        Assert.IsTrue(string.CompareOrdinal(@"x\a\b.slnx", @"x\a0\c.slnx") > 0,
+            "sanity: the raw Windows keys order the other way, which is what normalization prevents");
+        // On a '/' host a '\' is a legal file-name character and must not be reinterpreted as a separator.
+        Assert.AreEqual(@"x/we\ird.slnx", SolutionSelector.ToSlashSeparated(@"x/we\ird.slnx", '/'));
+    }
+
+    [TestMethod]
     public void NoConfig_ExcludesObjAndBinDirectories()
     {
         Plant("obj/Generated.slnx");

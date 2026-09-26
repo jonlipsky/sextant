@@ -99,7 +99,7 @@ public static class SnapshotCoverageBuilder
             // each project's load failure is in the `project_skipped` job diagnostics.
             var sample = load.SkippedProjects
                 .Take(MaxNamedInReason)
-                .Select(s => RepoRelative(checkoutDir, s.ProjectPath));
+                .Select(s => ReasonPath(checkoutDir, s.ProjectPath));
             var more = load.SkippedProjects.Count > MaxNamedInReason
                 ? $", +{load.SkippedProjects.Count - MaxNamedInReason} more"
                 : string.Empty;
@@ -224,6 +224,15 @@ public static class SnapshotCoverageBuilder
     {
         var root = Path.GetFullPath(checkoutDir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
         return message.Replace(root, ".", StringComparison.OrdinalIgnoreCase).Replace('\\', '/');
+    }
+
+    // A coverage reason is persisted in the immutable record and surfaced to query clients (MCP meta,
+    // /control/resolve), so it must never carry a worker volume path. A declared project OUTSIDE the
+    // checkout (a solution entry like `../../other/X.csproj`) is named by its file name only.
+    private static string ReasonPath(string checkoutDir, string fullPath)
+    {
+        var relative = RepoRelative(checkoutDir, fullPath);
+        return Path.IsPathRooted(relative) ? $"<outside checkout>/{Path.GetFileName(fullPath)}" : relative;
     }
 
     private static string RepoRelative(string checkoutDir, string fullPath)
