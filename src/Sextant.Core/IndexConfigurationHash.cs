@@ -33,7 +33,14 @@ public static class IndexConfigurationHash
     /// profile. Bump it when a change to extraction would make an otherwise identically-configured
     /// index produce different rows, so the daemon rebuilds. Part of the hashed input.
     /// </summary>
-    public const string AnalyzerVersion = "1";
+    /// <remarks>
+    /// <c>"1"</c> → <c>"2"</c> (issue #109): the service checkout worker no longer indexes a single
+    /// nondeterministically-picked solution but the deterministic union of the selected solution set. For a
+    /// multi-solution monorepo that changes which projects (and therefore which rows) an otherwise
+    /// identically-configured index produces, so a pre-#109 snapshot must not be reused for the same
+    /// identity — the bump invalidates it and forces the new loader to run.
+    /// </remarks>
+    public const string AnalyzerVersion = "2";
 
     /// <summary>
     /// Computes the configuration hash for a resolved profile. The canonical pre-image is a fixed,

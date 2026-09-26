@@ -193,6 +193,54 @@ public sealed class SextantConfiguration
     };
 
     /// <summary>
+    /// Strictly reads ONLY the per-repo <c>solutions</c> list from a checkout's own <c>sextant.json</c>,
+    /// WITHOUT the lenient fall-through that <see cref="Load"/> applies (it swallows a malformed file and
+    /// returns defaults). Distinguishing an ABSENT config (no scoping intent) from a MALFORMED one (a
+    /// scoping intent the operator got wrong) is what lets the service checkout provider refuse to silently
+    /// fall back to a default-root pick — and thus never report PARTIAL coverage as COMPLETE — when a
+    /// checkout's config is broken (issue #109).
+    /// </summary>
+    /// <param name="checkoutDir">The checkout root that may contain a <c>sextant.json</c>.</param>
+    /// <param name="solutions">The configured solution list (empty when the file is absent or lists none).</param>
+    /// <param name="error">A human-readable reason the file could not be read/parsed, or null on success/absence.</param>
+    /// <returns>False when the file EXISTS but could not be read/parsed; true otherwise (including when absent).</returns>
+    public static bool TryReadCheckoutSolutions(
+        string checkoutDir, out IReadOnlyList<string> solutions, out string? error)
+    {
+        solutions = [];
+        error = null;
+
+        var configPath = Path.Combine(checkoutDir, "sextant.json");
+        if (!File.Exists(configPath))
+            return true;
+
+        string json;
+        try
+        {
+            json = File.ReadAllText(configPath);
+        }
+        catch (Exception ex)
+        {
+            error = $"sextant.json could not be read: {ex.Message}";
+            return false;
+        }
+
+        SextantConfigFile? fileConfig;
+        try
+        {
+            fileConfig = JsonSerializer.Deserialize<SextantConfigFile>(json, JsonOptions);
+        }
+        catch (JsonException ex)
+        {
+            error = $"sextant.json is not valid JSON: {ex.Message}";
+            return false;
+        }
+
+        solutions = fileConfig?.Solutions ?? [];
+        return true;
+    }
+
+    /// <summary>
     /// Load configuration with priority: defaults → sextant.json → environment variables.
     /// </summary>
     public static SextantConfiguration Load(string? repoRoot = null)
