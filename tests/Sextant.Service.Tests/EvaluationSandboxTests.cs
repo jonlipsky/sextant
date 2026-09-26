@@ -1,5 +1,6 @@
 using Sextant.Core;
 using Sextant.Core.Platform;
+using Sextant.Indexer;
 using Sextant.Service;
 using Sextant.Service.Sandbox;
 using Sextant.Store;
@@ -201,10 +202,14 @@ public class EvaluationSandboxTests
 
     private sealed class StubCheckoutProvider(string checkoutDir) : ICheckoutProvider
     {
-        public bool TryResolve(EnsureSnapshotRequest request, out string resolvedCheckoutDir, out string solutionPath)
+        public bool TryResolve(EnsureSnapshotRequest request, out CheckoutResolution resolution)
         {
-            resolvedCheckoutDir = checkoutDir;
-            solutionPath = Path.Combine(checkoutDir, "Solution.slnx");
+            resolution = new CheckoutResolution
+            {
+                CheckoutDir = checkoutDir,
+                SelectedSolutions = [Path.Combine(checkoutDir, "Solution.slnx")],
+                Source = SolutionSelectionSource.DefaultRoot
+            };
             return true;
         }
     }
@@ -232,7 +237,7 @@ public class EvaluationSandboxTests
 
     private sealed class ThrowingCheckoutProvider : ICheckoutProvider
     {
-        public bool TryResolve(EnsureSnapshotRequest request, out string checkoutDir, out string solutionPath) =>
+        public bool TryResolve(EnsureSnapshotRequest request, out CheckoutResolution resolution) =>
             throw new TransientProvisioningException("git fetch failed transiently: timed out");
     }
 }

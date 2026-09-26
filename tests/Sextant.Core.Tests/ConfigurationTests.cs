@@ -52,6 +52,39 @@ public class ConfigurationTests
     }
 
     [TestMethod]
+    public void TryReadCheckoutSolutions_NoFile_SucceedsWithEmpty()
+    {
+        // No sextant.json = no scoping intent → success with an empty list (falls back to a default root).
+        Assert.IsTrue(SextantConfiguration.TryReadCheckoutSolutions(_tempDir, out var solutions, out var error));
+        Assert.AreEqual(0, solutions.Count);
+        Assert.IsNull(error);
+    }
+
+    [TestMethod]
+    public void TryReadCheckoutSolutions_ValidConfig_ReturnsListedSolutions()
+    {
+        File.WriteAllText(Path.Combine(_tempDir, "sextant.json"),
+            "{ \"solutions\": [ \"Root.slnx\", \"nested/Other.sln\" ] }");
+
+        Assert.IsTrue(SextantConfiguration.TryReadCheckoutSolutions(_tempDir, out var solutions, out var error));
+        Assert.IsNull(error);
+        CollectionAssert.AreEqual(new[] { "Root.slnx", "nested/Other.sln" }, solutions.ToList());
+    }
+
+    [TestMethod]
+    public void TryReadCheckoutSolutions_MalformedJson_FailsWithReasonNotSwallowed()
+    {
+        // Unlike Load (which swallows a malformed file into defaults), the strict read must REPORT the error
+        // so the service never silently indexes a default-root subset as if it were the configured coverage.
+        File.WriteAllText(Path.Combine(_tempDir, "sextant.json"), "{ not valid json ]");
+
+        Assert.IsFalse(SextantConfiguration.TryReadCheckoutSolutions(_tempDir, out var solutions, out var error));
+        Assert.AreEqual(0, solutions.Count);
+        Assert.IsNotNull(error);
+        StringAssert.Contains(error!, "json");
+    }
+
+    [TestMethod]
     public void LogsPathFor_DifferentDbs_YieldDifferentLogDirs()
     {
         // Issue #91: two index runs with different --db must not share a logs directory.
