@@ -291,6 +291,10 @@ public sealed class IndexOrchestrator
                     // this still-open write transaction, commit, and abandon the (empty) staging run on
                     // dispose so the reused snapshot keeps its original generation.
                     SelectExistingSnapshot(snapshotStore, repositoryId.Value, effectiveCtx, snapId, now);
+                    // Reuse never touches the immutable snapshot, so coverage is NOT backfilled from the
+                    // current checkout (it may describe different bytes). A recorded verdict that disagrees
+                    // with the freshly computed one is logged; the recorded verdict stays authoritative.
+                    WarnOnCoverageMismatch(conn, snapId, effectiveCtx);
                     session.Complete();
                     _log?.Invoke($"Snapshot {snapId} for commit {effectiveCtx.CommitSha} already indexed; " +
                                  $"re-selected for branch '{effectiveCtx.BranchName}' without rebuild (idempotent).");
@@ -303,6 +307,10 @@ public sealed class IndexOrchestrator
                 // succeeds instead of tripping the "was not pending at publish" guard.
                 if (existed && status != SnapshotStatus.Pending)
                     snapshotStore.MarkStatus(snapId, SnapshotStatus.Pending);
+                // Any coverage recorded for an earlier generation of this identity describes data that is
+                // about to be rebuilt; drop it so the publish records the coverage of THIS build.
+                if (existed)
+                    new SnapshotCoverageStore(conn).Delete(snapId);
             }
             else
             {
@@ -349,6 +357,10 @@ public sealed class IndexOrchestrator
                     isOverlayRun = true;
                     if (overlayExisted && overlayStatus != SnapshotStatus.Pending)
                         snapshotStore.MarkStatus(overlayId, SnapshotStatus.Pending);
+                    // A baseless overlay carries its remote base's coverage (issue #119); an earlier
+                    // generation's row is about to be superseded by this build's publish.
+                    if (overlayExisted)
+                        new SnapshotCoverageStore(conn).Delete(overlayId);
                 }
                 else
                 {
@@ -1376,6 +1388,10 @@ public sealed class IndexOrchestrator
                 throw new InvalidOperationException(
                     $"Snapshot {publishId} was not pending at publish; aborting to avoid a false completion.");
 
+            // Record the worker-computed coverage in the SAME transaction as the publish (issue #119), so
+            // no reader or crash can observe this service snapshot published without its coverage.
+            RecordCoverage(conn, publishId, effectiveCtx, completedAt);
+
             AdvanceBranchToSnapshot(snapshotStore, publishRepoId, effectiveCtx, publishId, completedAt);
 
             // Reclaim the now-superseded pre-Phase-9 mutable rows (snapshot_id IS NULL) so the database
@@ -1396,6 +1412,12 @@ public sealed class IndexOrchestrator
             if (snapshotStore.MarkComplete(overlayPublishId, completedAt) != 1)
                 throw new InvalidOperationException(
                     $"Overlay snapshot {overlayPublishId} was not pending at publish; aborting to avoid a false completion.");
+
+            // Issue #119: a BASELESS (remote-base) overlay has no local base row to read coverage from, so
+            // the peer-reported base coverage is recorded on the overlay itself, in the publish transaction.
+            // A local-base overlay reads its base's row instead and never records its own.
+            if (overlay?.BaseSnapshotId is null)
+                RecordCoverage(conn, overlayPublishId, effectiveCtx, completedAt);
 
             AdvanceBranchToOverlay(snapshotStore, overlayRepoId, effectiveCtx, overlayPublishId, completedAt);
         }
@@ -1605,6 +1627,28 @@ public sealed class IndexOrchestrator
     {
         snapshotStore.MarkStatus(snapshotId, SnapshotStatus.Complete);
         AdvanceBranchToSnapshot(snapshotStore, repositoryId, ctx, snapshotId, completedAt);
+    }
+
+    // Persists the caller-computed coverage (issue #119) for a NEWLY published snapshot, inside the publish
+    // transaction. A no-op when the caller computed none (local CLI/daemon). A fresh publish has no row yet,
+    // so an existing one is an invariant violation (the snapshot id was reused under a stale row).
+    private static void RecordCoverage(SqliteConnection conn, long snapshotId, SnapshotContext ctx, long recordedAt)
+    {
+        if (ctx.Coverage is { } coverage && !new SnapshotCoverageStore(conn).Record(snapshotId, coverage, recordedAt))
+            throw new InvalidOperationException(
+                $"Snapshot {snapshotId} already has a recorded coverage row at first publish (issue #119 invariant).");
+    }
+
+    private void WarnOnCoverageMismatch(SqliteConnection conn, long snapshotId, SnapshotContext ctx)
+    {
+        if (ctx.Coverage is not { } computed)
+            return;
+        var recorded = new SnapshotCoverageStore(conn).Get(snapshotId);
+        if (recorded is null)
+            _log?.Invoke($"Snapshot {snapshotId} was reused without a recorded coverage verdict; coverage is unknown.");
+        else if (!string.Equals(recorded.Verdict, computed.Verdict, StringComparison.Ordinal))
+            _log?.Invoke($"Snapshot {snapshotId} recorded coverage '{recorded.Verdict}' but the current checkout " +
+                         $"computes '{computed.Verdict}'; keeping the recorded (immutable) verdict.");
     }
 
     /// <summary>

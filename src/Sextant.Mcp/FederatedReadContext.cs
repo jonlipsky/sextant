@@ -93,7 +93,9 @@ public sealed class FederatedReadContext
             return new FederatedReadContext(SnapshotReadScope.DenyAll, provenance: null, authorization, selectedSnapshotId: null, remoteBase: null);
 
         var scope = ResolveScope(snapshots, selected, mode);
-        var provenance = selected == null ? null : BuildProvenance(snapshots, selected, mode, compatibility);
+        var provenance = selected == null
+            ? null
+            : BuildProvenance(snapshots, new SnapshotCoverageStore(conn), selected, mode, compatibility);
 
         // Issue #108: a remote-base overlay (is_overlay=1, base_snapshot_id IS NULL) pins a committed base
         // that lives only on a configured peer. Expose its recomputed identity hash so find_symbol can
@@ -135,7 +137,8 @@ public sealed class FederatedReadContext
     }
 
     private static SnapshotProvenance BuildProvenance(
-        SnapshotStore snapshots, SnapshotRow selected, FederationMode mode, CompatibilityInputs? compatibility)
+        SnapshotStore snapshots, SnapshotCoverageStore coverageStore, SnapshotRow selected, FederationMode mode,
+        CompatibilityInputs? compatibility)
     {
         // The committed base the read rests on: the overlay's base, or the selected row itself. For a
         // REMOTE-base overlay (issue #108) the base is not in the local catalog (base_snapshot_id IS NULL),
@@ -160,6 +163,17 @@ public sealed class FederatedReadContext
             baseIdentityHash = BaseSnapshotIdentity.ForRemoteOverlay(selected, remoteUrl, commitSha).Hash;
         }
 
+        // Issue #119: the committed base's durable checkout coverage. A published-complete base whose
+        // recorded coverage is partial is served as completeness "partial" (with the reasons), never as
+        // complete. No recorded coverage (local index, pre-022) keeps the snapshot status as-is. A
+        // remote-base overlay has no local base row, so its publish recorded the peer's base coverage on
+        // the overlay itself.
+        var coverageId = remoteBaseOverlay ? selected.Id : baseId;
+        var coverage = coverageId is long cid ? coverageStore.Get(cid) : null;
+        var completeness = selected.Status == SnapshotStatus.Complete && coverage is { IsPartial: true }
+            ? SnapshotStatus.Partial
+            : selected.Status;
+
         return new SnapshotProvenance
         {
             BaseSnapshotId = baseId,
@@ -167,7 +181,7 @@ public sealed class FederatedReadContext
             BaseIdentityHash = baseIdentityHash,
             OverlayGeneration = selected.IsOverlay ? selected.Id : null,
             IsOverlay = selected.IsOverlay,
-            Completeness = selected.Status,
+            Completeness = completeness,
             Scope = mode switch
             {
                 FederationMode.BaseOnly => "base_only",
@@ -178,7 +192,8 @@ public sealed class FederatedReadContext
             FallbackReason = selected.FallbackReason,
             Compatible = incompatibilities.Count == 0,
             Incompatibilities = incompatibilities.Count == 0 ? null : incompatibilities,
-            Freshness = selected.PublishedAt ?? selected.CreatedAt
+            Freshness = selected.PublishedAt ?? selected.CreatedAt,
+            Coverage = coverage
         };
     }
 }

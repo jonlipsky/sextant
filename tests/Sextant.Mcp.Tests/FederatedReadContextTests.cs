@@ -80,6 +80,64 @@ public class FederatedReadContextTests
             "an explicit diagnostic partition is surfaced in provenance");
     }
 
+    // ==== Issue #119: a partial-coverage base is never presented as complete ======================
+
+    [TestMethod]
+    public void FindReferences_OverlayOnPartialCoverageBase_StampsPartialCompletenessAndCoverage()
+    {
+        var s = SeedBaseAndOverlay();
+        new SnapshotCoverageStore(_db.GetConnection()).Record(s.BaseId, new SnapshotCoverage
+        {
+            Verdict = SnapshotCoverageVerdict.Partial,
+            Reasons = ["1 of 2 declared submodule(s) are not populated"],
+            SubmodulesDeclared = 2,
+            SubmodulesUnpopulated = 1
+        }, 1);
+
+        var result = FindReferencesTool.FindReferences(_dbProvider, "global::A.Widget");
+        var snap = JsonDocument.Parse(result).RootElement.GetProperty("meta").GetProperty("snapshot");
+
+        Assert.AreEqual("partial", snap.GetProperty("completeness").GetString(),
+            "a base whose durable coverage is partial is surfaced as partial, never complete (#119)");
+        var coverage = snap.GetProperty("coverage");
+        Assert.AreEqual("partial", coverage.GetProperty("verdict").GetString());
+        Assert.AreEqual(1, coverage.GetProperty("submodules_unpopulated").GetInt32());
+        Assert.IsFalse(coverage.TryGetProperty("is_partial", out _), "computed flags stay off the wire");
+    }
+
+    [TestMethod]
+    public void FindReferences_BaseWithoutRecordedCoverage_OmitsCoverageAndStaysComplete()
+    {
+        SeedBaseAndOverlay();
+
+        var result = FindReferencesTool.FindReferences(_dbProvider, "global::A.Widget");
+        var snap = JsonDocument.Parse(result).RootElement.GetProperty("meta").GetProperty("snapshot");
+
+        Assert.AreEqual("complete", snap.GetProperty("completeness").GetString());
+        Assert.IsFalse(snap.TryGetProperty("coverage", out _), "no recorded coverage ⇒ no coverage block");
+    }
+
+    [TestMethod]
+    public void GetIndexStatus_SurfacesTheSelectedBaseCoverage()
+    {
+        var s = SeedBaseAndOverlay();
+        new SnapshotCoverageStore(_db.GetConnection()).Record(s.BaseId, new SnapshotCoverage
+        {
+            Verdict = SnapshotCoverageVerdict.Partial,
+            Reasons = ["3 of 4 discovered solution(s) were not selected"],
+            SolutionsDiscovered = 4,
+            SolutionsNotSelected = 3
+        }, 1);
+
+        var index = JsonDocument.Parse(GetIndexStatusTool.GetIndexStatus(_dbProvider)).RootElement
+            .GetProperty("index");
+
+        var coverage = index.GetProperty("coverage");
+        Assert.AreEqual("partial", coverage.GetProperty("verdict").GetString(),
+            "an overlay reports its committed base's coverage (#119)");
+        Assert.AreEqual(3, coverage.GetProperty("solutions_not_selected").GetInt32());
+    }
+
     // ==== Legacy parity: no snapshot ⇒ no snapshot meta block ======================================
 
     [TestMethod]
@@ -309,6 +367,49 @@ public class FederatedReadContextTests
         Assert.AreEqual(pinnedRowId, new ProjectStore(conn) { Scope = ctx.Scope }.GetByCanonicalId("logical_A")!.Value.id,
             "a ProjectStore pinned to the request scope never splices a mid-request publish (#42)");
         Assert.AreNotEqual(pANew, pinnedRowId, "the pin and the new generation are genuinely different rows");
+    }
+
+    [TestMethod]
+    public void RemoteBaseOverlay_LocalHit_ReportsThePeerBaseCoverageRecordedOnTheOverlay()
+    {
+        // A BASELESS (remote-base, #108) overlay has no local base row; its publish records the peer's base
+        // coverage on the overlay itself. A local overlay hit (which never contacts the peer) and
+        // get_index_status must still report that partial base as partial, never complete.
+        var conn = _db.GetConnection();
+        var store = new SnapshotStore(conn);
+        var repoId = store.EnsureRepository(RepoUrl, now: 1);
+        var commitId = store.EnsureCommit(repoId, "commit_base", "tree_base", now: 1);
+        var logicalA = store.EnsureLogicalProject(repoId, "logical_A", "src/A/A.csproj", "net10.0", now: 1);
+        var overlayId = store.BeginPending(
+            OverlayIdentity("delta_remote"), repoId, commitId, runId: null, now: 2, baseSnapshotId: null).id;
+        var pA = new ProjectStore(conn).UpsertSnapshotProject(ProjA, overlayId, logicalA, 2);
+        store.MapProject(overlayId, pA);
+        SeedSymbolWithReference(conn, pA, "sig_remote");
+        store.MarkComplete(overlayId, publishedAt: 2);
+        store.SetBranchPointer(store.EnsureBranch(repoId, "main", isDefault: true, now: 2), overlayId, now: 2);
+        Assert.AreEqual("complete", JsonDocument.Parse(FindReferencesTool.FindReferences(_dbProvider, "global::A.Widget"))
+                .RootElement.GetProperty("meta").GetProperty("snapshot").GetProperty("completeness").GetString(),
+            "control: without a recorded coverage row the remote-base overlay reads as complete");
+        new SnapshotCoverageStore(conn).Record(overlayId, new SnapshotCoverage
+        {
+            Verdict = SnapshotCoverageVerdict.Partial,
+            Reasons = ["1 of 2 declared submodule(s) are not populated"],
+            SubmodulesDeclared = 2,
+            SubmodulesUnpopulated = 1
+        }, 2);
+
+        var snap = JsonDocument.Parse(FindReferencesTool.FindReferences(_dbProvider, "global::A.Widget"))
+            .RootElement.GetProperty("meta").GetProperty("snapshot");
+        Assert.AreEqual(JsonValueKind.Null, snap.TryGetProperty("base_snapshot_id", out var b) ? b.ValueKind : JsonValueKind.Null,
+            "a remote-base overlay has no local base id");
+        Assert.AreEqual("partial", snap.GetProperty("completeness").GetString(),
+            "the peer base's partial coverage recorded on the overlay degrades the local read to partial (#119)");
+        Assert.AreEqual(1, snap.GetProperty("coverage").GetProperty("submodules_unpopulated").GetInt32());
+
+        var coverage = JsonDocument.Parse(GetIndexStatusTool.GetIndexStatus(_dbProvider)).RootElement
+            .GetProperty("index").GetProperty("coverage");
+        Assert.AreEqual("partial", coverage.GetProperty("verdict").GetString(),
+            "get_index_status reports the remote base's coverage from the overlay row (#119)");
     }
 
     // ==== helpers =================================================================================

@@ -191,9 +191,16 @@ public static class FindSymbolTool
         {
             Origin = outcome.Rows.Count > 0 ? "remote" : "local",
             Completeness = outcome.Complete ? baseProvenance.Completeness : "partial",
-            FallbackReason = outcome.FromOfflineCache ? "remote base served from offline cache" : baseProvenance.FallbackReason
+            FallbackReason = outcome.FromOfflineCache ? "remote base served from offline cache" : baseProvenance.FallbackReason,
+            Coverage = WorstCoverage(outcome.Coverage, baseProvenance.Coverage)
         };
     }
+
+    // Issue #119: the live peer page and the coverage recorded on the remote-base overlay at publish can
+    // disagree (a different peer answered, or one recorded none). Never let a "complete" verdict mask a
+    // "partial" one — the partial record wins, so `completeness` and `coverage` stay consistent.
+    private static SnapshotCoverage? WorstCoverage(SnapshotCoverage? live, SnapshotCoverage? recorded)
+        => recorded is { IsPartial: true } && live is not { IsPartial: true } ? recorded : live ?? recorded;
 
     internal static Dictionary<long, string> BuildCanonicalIdCache(ProjectStore projectStore)
     {

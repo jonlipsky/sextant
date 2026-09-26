@@ -93,6 +93,18 @@ public sealed record EnsureSnapshotResult
 
     /// <summary>True when this request ATTACHED to an already-existing job rather than creating one (criterion 1).</summary>
     public required bool Attached { get; init; }
+
+    /// <summary>
+    /// Why the job is not complete (the job's recorded reason): the partial-coverage reasons for a
+    /// <c>partial</c> job, the error for a <c>failed</c>/<c>unsupported</c> one; null for a complete job.
+    /// </summary>
+    public string? Reason { get; init; }
+
+    /// <summary>
+    /// The durable checkout coverage recorded for the snapshot (issue #119); null when none was recorded
+    /// (no snapshot, or a snapshot from a path that does not compute coverage).
+    /// </summary>
+    public SnapshotCoverage? Coverage { get; init; }
 }
 
 /// <summary>
@@ -103,6 +115,9 @@ public sealed record JobStatusResult
 {
     public required SnapshotJobRow Job { get; init; }
     public IReadOnlyList<SnapshotJobDiagnostic> Diagnostics { get; init; } = [];
+
+    /// <summary>The durable checkout coverage recorded for the job's snapshot (issue #119), or null.</summary>
+    public SnapshotCoverage? Coverage { get; init; }
 }
 
 /// <summary>A single per-project outcome a worker reports back for job diagnostics.</summary>
@@ -139,19 +154,31 @@ public sealed record SnapshotWorkResult
     public string? Error { get; init; }
     public IReadOnlyList<ProjectOutcome> Projects { get; init; } = [];
 
-    public static SnapshotWorkResult Complete(long snapshotId, IReadOnlyList<ProjectOutcome>? projects = null) =>
-        new() { Status = SnapshotJobStatus.Complete, SnapshotId = snapshotId, Projects = projects ?? [] };
+    /// <summary>
+    /// The checkout coverage of the published snapshot (issue #119), or null when the worker does not
+    /// compute coverage. Informational on the result: the durable record is the one the orchestrator
+    /// persisted in the publish transaction.
+    /// </summary>
+    public SnapshotCoverage? Coverage { get; init; }
+
+    public static SnapshotWorkResult Complete(
+        long snapshotId, IReadOnlyList<ProjectOutcome>? projects = null, SnapshotCoverage? coverage = null) =>
+        new() { Status = SnapshotJobStatus.Complete, SnapshotId = snapshotId, Projects = projects ?? [], Coverage = coverage };
 
     /// <summary>
-    /// A servable-but-incomplete outcome (issue #109): a COMPLETE snapshot was published (the loadable
-    /// projects across every selected solution were indexed), but some projects/solutions were skipped
-    /// with a reason (e.g. platform heads that cannot load on this worker). The validator still requires
+    /// A servable-but-incomplete outcome (issues #109/#119): a COMPLETE snapshot was published (the loadable
+    /// projects across every selected solution were indexed), but the checkout is not fully covered —
+    /// solutions/projects/submodules were left out or skipped with a reason. The validator still requires
     /// that a complete snapshot was actually published — Partial never masks an empty/absent publish — so
     /// PARTIAL coverage is recorded honestly instead of being reported as COMPLETE.
     /// </summary>
     public static SnapshotWorkResult Partial(
-        long snapshotId, string message, IReadOnlyList<ProjectOutcome>? projects = null) =>
-        new() { Status = SnapshotJobStatus.Partial, SnapshotId = snapshotId, Error = message, Projects = projects ?? [] };
+        long snapshotId, string message, IReadOnlyList<ProjectOutcome>? projects = null, SnapshotCoverage? coverage = null) =>
+        new()
+        {
+            Status = SnapshotJobStatus.Partial, SnapshotId = snapshotId, Error = message, Projects = projects ?? [],
+            Coverage = coverage
+        };
 
     public static SnapshotWorkResult Unsupported(string message, IReadOnlyList<ProjectOutcome>? projects = null) =>
         new() { Status = SnapshotJobStatus.Unsupported, Error = message, Projects = projects ?? [] };

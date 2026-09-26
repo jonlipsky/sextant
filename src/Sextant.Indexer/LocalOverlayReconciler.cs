@@ -206,13 +206,19 @@ public sealed class LocalOverlayReconciler
             // local base would use). If it does, stage a BASELESS overlay (base_snapshot_id NULL) carrying
             // only the working-tree delta; the read path federates overlay ⊕ remote-base transparently. A
             // thin machine thus indexes only its diff and never builds the unchanged base locally.
-            if (_remoteBaseSource != null
-                && await RemotePeerHasBaseAsync(BuildRemoteBaseIdentity(ctx).Hash, cancellationToken).ConfigureAwait(false))
+            var remoteBase = _remoteBaseSource != null
+                ? await ProbeRemoteBaseAsync(BuildRemoteBaseIdentity(ctx).Hash, cancellationToken).ConfigureAwait(false)
+                : default;
+            if (remoteBase.Published)
             {
                 _log?.Invoke($"Overlay reconcile: {changeSet.Changes.Count} working-tree change(s) over a REMOTE base for HEAD {ctx.CommitSha}; staging baseless overlay.");
                 var remoteOverlay = new OverlayContext { BaseSnapshotId = null, WorkingTreeDelta = delta };
+                // Issue #119: a baseless overlay has no local base row to read coverage from, so the peer's
+                // (immutable) base coverage is recorded on the overlay itself at publish. Local hits and
+                // get_index_status then report the remote base's partiality instead of "complete".
+                var overlayCtx = ctx with { Coverage = remoteBase.Coverage };
                 await new IncrementalIndexer(_db, _log, _useDocumentExtractor, _parallelism, _profile, _gitStateProbe)
-                    .IndexChangedFilesAsync(solution, changeSet.TouchedAbsolutePaths(), cancellationToken, remoteOverlay, ctx, pin);
+                    .IndexChangedFilesAsync(solution, changeSet.TouchedAbsolutePaths(), cancellationToken, remoteOverlay, overlayCtx, pin);
                 return new OverlayReconcileResult
                 {
                     Kind = OverlayReconcileKind.Overlay,
@@ -310,26 +316,30 @@ public sealed class LocalOverlayReconciler
 
     /// <summary>
     /// Probes a configured remote peer for the committed base addressed by <paramref name="baseIdentityHash"/>
-    /// (issue #108). Returns true only when a peer definitively PUBLISHES the base (a non-empty first page);
+    /// (issue #108). Returns true only when a peer definitively PUBLISHES the base (a non-empty first page, or
+    /// an explicit <c>published</c> flag from a current peer — a published base may be legitimately empty);
     /// a reachable peer that does not publish it, or an unreachable/timed-out peer, returns false so the
     /// caller falls back to a full local index. Never throws — a transport failure is a "no" here, and the
-    /// read path re-attempts the fetch (with its own cache-first fallback) at query time.
+    /// read path re-attempts the fetch (with its own cache-first fallback) at query time. When the base is
+    /// published, also returns the peer's recorded checkout coverage for it (issue #119; null from a
+    /// pre-#119 peer or when none was recorded).
     /// </summary>
-    private async Task<bool> RemotePeerHasBaseAsync(string baseIdentityHash, CancellationToken cancellationToken)
+    private async Task<(bool Published, SnapshotCoverage? Coverage)> ProbeRemoteBaseAsync(
+        string baseIdentityHash, CancellationToken cancellationToken)
     {
         if (_remoteBaseSource is null)
-            return false;
+            return (false, null);
         try
         {
             var page = await _remoteBaseSource.FetchSymbolsAsync(
                 new SnapshotPageRequest { IdentityHash = baseIdentityHash, Cursor = null, Limit = 1 },
                 cancellationToken).ConfigureAwait(false);
-            return page.Symbols.Count > 0;
+            return page.Symbols.Count > 0 || page.IsProvenPublished ? (true, page.Coverage) : (false, null);
         }
         catch (Exception ex) when (ex is RemoteSnapshotUnavailableException or HttpRequestException)
         {
             _log?.Invoke($"Overlay reconcile: remote base probe failed ({ex.Message}); using full local fallback.");
-            return false;
+            return (false, null);
         }
     }
 

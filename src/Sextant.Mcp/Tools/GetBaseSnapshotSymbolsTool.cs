@@ -56,9 +56,10 @@ public static class GetBaseSnapshotSymbolsTool
                 BaseCommit = snapshots.GetCommitSha(local.CommitId),
                 BaseIdentityHash = identity_hash,
                 Origin = "local",
-                Completeness = SnapshotStatus.Complete,
+                Completeness = localPage.Complete ? SnapshotStatus.Complete : SnapshotStatus.Partial,
                 Scope = "federated",
-                Freshness = local.PublishedAt ?? local.CreatedAt
+                Freshness = local.PublishedAt ?? local.CreatedAt,
+                Coverage = localPage.Coverage
             };
             return BuildPage(localPage, localProvenance);
         }
@@ -75,11 +76,12 @@ public static class GetBaseSnapshotSymbolsTool
         {
             var remotePage = await remote.FetchSymbolsAsync(request, CancellationToken.None);
 
-            // A reachable peer that simply does NOT publish this snapshot returns an empty FIRST page.
-            // Collapse that to the same structured "not found" as the no-peer case rather than a silent
-            // zero-symbol answer an agent would misread as "no such symbols". (An empty page on a RESUMED
-            // cursor is a normal end-of-stream and is served as an ordinary terminal page.)
-            if (cursor is null && remotePage.Symbols.Count == 0)
+            // A reachable peer that simply does NOT publish this snapshot returns an empty FIRST page without
+            // proof of publication (a pre-#119 peer never sends that proof). Collapse that to the same
+            // structured "not found" as the no-peer case rather than a silent zero-symbol answer an agent
+            // would misread as "no such symbols". (An empty page on a RESUMED cursor, or from a peer that
+            // affirmatively publishes an empty snapshot, is served as an ordinary page.)
+            if (cursor is null && remotePage.Symbols.Count == 0 && !remotePage.IsProvenPublished)
                 return ResponseBuilder.BuildEmpty(
                     $"Base snapshot '{identity_hash}' is not in the local catalog and no configured peer publishes it.",
                     readContext.Provenance);
@@ -90,7 +92,8 @@ public static class GetBaseSnapshotSymbolsTool
                 Origin = "remote",
                 Completeness = remotePage.Complete ? SnapshotStatus.Complete : SnapshotStatus.Partial,
                 Scope = "federated",
-                Freshness = readContext.Provenance?.Freshness ?? 0
+                Freshness = readContext.Provenance?.Freshness ?? 0,
+                Coverage = remotePage.Coverage
             };
             return BuildPage(remotePage, remoteProvenance);
         }

@@ -153,7 +153,7 @@ public static class SolutionSelector
         // no per-directory predicate, so a manual stack walk is the only way to skip a subtree ENTIRELY.
         // Recognized solutions are de-duplicated and returned in a stable ordinal-by-repo-relative-path order
         // so discovery is deterministic regardless of the walk order.
-        foreach (var match in EnumerateSolutionFilesPruned(root))
+        foreach (var match in CheckoutInventory.EnumerateFilesPruned(root, IsRecognizedSolution))
         {
             var full = Path.GetFullPath(match);
             if (IsExcluded(root, full) || !seen.Add(full))
@@ -163,48 +163,6 @@ public static class SolutionSelector
 
         found.Sort((a, b) => string.CompareOrdinal(RepoRelative(root, a), RepoRelative(root, b)));
         return found;
-    }
-
-    /// <summary>
-    /// Depth-first walk that yields the recognized solution files under <paramref name="root"/> while never
-    /// descending an excluded (obj/bin/.git) or reparse-point (symlink/junction) directory — so the walk can
-    /// neither cycle nor escape the checkout. A per-directory I/O error (e.g. permission denied) skips that
-    /// one subtree instead of faulting discovery, mirroring the old <c>IgnoreInaccessible</c> behavior.
-    /// </summary>
-    private static IEnumerable<string> EnumerateSolutionFilesPruned(string root)
-    {
-        var stack = new Stack<string>();
-        stack.Push(root);
-        while (stack.Count > 0)
-        {
-            var dir = stack.Pop();
-
-            string[] files;
-            try { files = Directory.GetFiles(dir); }
-            catch { files = []; }
-            foreach (var file in files)
-                if (IsRecognizedSolution(file))
-                    yield return file;
-
-            string[] subdirs;
-            try { subdirs = Directory.GetDirectories(dir); }
-            catch { subdirs = []; }
-            foreach (var subdir in subdirs)
-            {
-                if (ExcludedSegments.Contains(Path.GetFileName(subdir)))
-                    continue;
-                try
-                {
-                    if ((File.GetAttributes(subdir) & FileAttributes.ReparsePoint) != 0)
-                        continue;
-                }
-                catch
-                {
-                    continue; // cannot stat the directory — do not descend into it
-                }
-                stack.Push(subdir);
-            }
-        }
     }
 
     private static string? ResolveConfigured(string root, string entry)

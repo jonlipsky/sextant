@@ -7,6 +7,7 @@ using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Sextant.Core;
 using Sextant.Service.Host;
 using Sextant.Store;
 
@@ -96,6 +97,58 @@ public class ServiceHttpTests
         Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
         var result = await response.Content.ReadFromJsonAsync<EnsureSnapshotResult>(ServiceJson.Options);
         Assert.AreEqual(SnapshotJobStatus.Complete, result!.Status);
+    }
+
+    [TestMethod]
+    public async Task PartialCoverageSnapshot_IsPartialOnEnsure_PageAndResolve()
+    {
+        // Issue #119 acceptance: a published snapshot with partial coverage answers partial everywhere a
+        // client can see it — ensure (status + reason + coverage), the symbol page (complete=false,
+        // published=true, coverage), and resolve (additive coverage block).
+        var coverage = new SnapshotCoverage
+        {
+            Verdict = SnapshotCoverageVerdict.Partial,
+            Reasons = ["1 of 2 discovered solution(s) were not selected"],
+            SolutionsDiscovered = 2,
+            SolutionsNotSelected = 1
+        };
+        await using var host = await ServiceHttpHarness.StartAsync(withWorker: true, seedComplete: true, coverage);
+
+        using var ensure = new HttpRequestMessage(HttpMethod.Post, "/control/ensure")
+        {
+            Content = JsonContent.Create(ServiceTestFixtures.Request(branch: "main"), options: ServiceJson.Options)
+        };
+        ensure.Headers.Authorization = new AuthenticationHeaderValue("Bearer", ControlToken);
+        var ensureResponse = await host.Client.SendAsync(ensure);
+        var ensureJson = await ensureResponse.Content.ReadAsStringAsync();
+        Assert.AreEqual(HttpStatusCode.OK, ensureResponse.StatusCode, ensureJson);
+        using (var doc = System.Text.Json.JsonDocument.Parse(ensureJson))
+        {
+            Assert.AreEqual("partial", doc.RootElement.GetProperty("status").GetString());
+            StringAssert.Contains(doc.RootElement.GetProperty("reason").GetString(), "not selected");
+            Assert.AreEqual("partial", doc.RootElement.GetProperty("coverage").GetProperty("verdict").GetString());
+            Assert.AreEqual(1, doc.RootElement.GetProperty("coverage").GetProperty("solutions_not_selected").GetInt32());
+        }
+
+        using var pageRequest = new HttpRequestMessage(HttpMethod.Get, $"/query/snapshots/{host.SeededIdentityHash}/symbols");
+        pageRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", QueryToken);
+        var pageJson = await (await host.Client.SendAsync(pageRequest)).Content.ReadAsStringAsync();
+        using (var doc = System.Text.Json.JsonDocument.Parse(pageJson))
+        {
+            Assert.IsTrue(doc.RootElement.GetProperty("symbols").GetArrayLength() > 0, "partial rows are still served");
+            Assert.IsFalse(doc.RootElement.GetProperty("complete").GetBoolean());
+            Assert.IsTrue(doc.RootElement.GetProperty("published").GetBoolean());
+            Assert.AreEqual("partial", doc.RootElement.GetProperty("coverage").GetProperty("verdict").GetString());
+        }
+
+        using var resolve = new HttpRequestMessage(HttpMethod.Get,
+            $"/control/resolve?repository={Uri.EscapeDataString(ServiceTestFixtures.Request().RepositoryRemoteUrl)}&branch=main");
+        resolve.Headers.Authorization = new AuthenticationHeaderValue("Bearer", ControlToken);
+        var resolveResponse = await host.Client.SendAsync(resolve);
+        var resolveJson = await resolveResponse.Content.ReadAsStringAsync();
+        Assert.AreEqual(HttpStatusCode.OK, resolveResponse.StatusCode, resolveJson);
+        using (var doc = System.Text.Json.JsonDocument.Parse(resolveJson))
+            Assert.AreEqual("partial", doc.RootElement.GetProperty("coverage").GetProperty("verdict").GetString());
     }
 
     [TestMethod]
@@ -241,7 +294,8 @@ public class ServiceHttpTests
         private IndexDatabase Db { get; init; } = null!;
         private string DbPath { get; init; } = "";
 
-        public static async Task<ServiceHttpHarness> StartAsync(bool withWorker, bool seedComplete)
+        public static async Task<ServiceHttpHarness> StartAsync(
+            bool withWorker, bool seedComplete, SnapshotCoverage? seedCoverage = null)
         {
             var dbPath = ServiceTestFixtures.NewDbPath();
             var db = new IndexDatabase(dbPath);
@@ -249,7 +303,11 @@ public class ServiceHttpTests
 
             var request = ServiceTestFixtures.Request();
             if (seedComplete)
-                ServiceTestFixtures.PublishComplete(db, request);
+            {
+                var snapId = ServiceTestFixtures.PublishComplete(db, request);
+                if (seedCoverage is not null)
+                    new SnapshotCoverageStore(db.GetConnection()).Record(snapId, seedCoverage, 1);
+            }
 
             var options = ServiceTestFixtures.NewOptions(dbPath, controlToken: ControlToken, queryToken: QueryToken);
             var worker = withWorker ? new FakeSnapshotWorker(db) : null;

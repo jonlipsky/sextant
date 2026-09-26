@@ -171,6 +171,24 @@ public class LiveMcpFederationTests
         StringAssert.Contains(doc.RootElement.GetProperty("message").GetString()!, "no configured peer publishes it");
     }
 
+    [TestMethod]
+    public async Task LegacyPeer_EmptyCompletePageWithoutPublished_SaysNotPublished()
+    {
+        // A pre-#119 peer answered `complete: true` (no `published` field) for ANY known identity — including
+        // a superseded/pending base it no longer serves — with no symbols. With a single configured peer the
+        // raw remote source is used directly; that page must NOT be served as an empty "complete" base.
+        const string legacyBody = """{"identity_hash":"legacy-hash","symbols":[],"complete":true}""";
+        using var node = LocalNode.Federated(
+            peerUrl: "http://peer.local", peerClient: new HttpClient(new RawBodyPeerHandler(legacyBody)), token: QueryToken);
+
+        var json = await GetBaseSnapshotSymbolsTool.GetBaseSnapshotSymbols(node.Provider, "legacy-hash");
+        using var doc = JsonDocument.Parse(json);
+
+        Assert.AreEqual(0, doc.RootElement.GetProperty("results").GetArrayLength());
+        StringAssert.Contains(doc.RootElement.GetProperty("message").GetString()!, "no configured peer publishes it",
+            "a legacy peer's `complete` is not proof of publication (#119 review)");
+    }
+
     // ---- regression: peers unset keeps the local path byte-identical --------------------------------
 
     [TestMethod]
@@ -201,6 +219,59 @@ public class LiveMcpFederationTests
 
         Assert.AreEqual(0, doc.RootElement.GetProperty("results").GetArrayLength());
         StringAssert.Contains(doc.RootElement.GetProperty("message").GetString()!, "no remote peers are configured");
+    }
+
+    // ---- issue #119: a published-but-partial base snapshot is served AND labeled partial -------------
+
+    private static SnapshotCoverage PartialCoverage() => new()
+    {
+        Verdict = SnapshotCoverageVerdict.Partial,
+        Reasons = ["2 of 3 discovered solution(s) were not selected for indexing (b.slnx, c.slnx)."],
+        SelectionSource = "default_root",
+        SolutionsDiscovered = 3,
+        SolutionsSelected = 1,
+        SolutionsNotSelected = 2
+    };
+
+    [TestMethod]
+    public async Task PartialCoverageBase_ServedLocally_IsLabeledPartialWithCoverage()
+    {
+        using var node = LocalNode.PureLocal(
+            ServiceTestFixtures.Request(repo: "https://github.com/org/appA", commit: "commit-aaaa"),
+            symbolCount: 3, PartialCoverage());
+
+        var json = await GetBaseSnapshotSymbolsTool.GetBaseSnapshotSymbols(node.Provider, node.LocalIdentityHash);
+        using var doc = JsonDocument.Parse(json);
+
+        Assert.AreEqual(3, doc.RootElement.GetProperty("results").GetArrayLength(),
+            "a published partial snapshot's rows are still served (#119)");
+        var snapshot = doc.RootElement.GetProperty("meta").GetProperty("snapshot");
+        Assert.AreEqual("local", snapshot.GetProperty("origin").GetString());
+        Assert.AreEqual("partial", snapshot.GetProperty("completeness").GetString(),
+            "a partial-coverage base is never labeled complete (#119)");
+        var coverage = snapshot.GetProperty("coverage");
+        Assert.AreEqual("partial", coverage.GetProperty("verdict").GetString());
+        Assert.AreEqual(2, coverage.GetProperty("solutions_not_selected").GetInt32());
+    }
+
+    [TestMethod]
+    public async Task PartialCoverageBase_ServedByRemotePeer_CarriesCoverageAcrossTheWire()
+    {
+        await using var peer = await RemotePeer.StartAsync(
+            ServiceTestFixtures.Request(repo: "https://github.com/org/appB", commit: "commit-bbbb"),
+            symbolCount: 4, PartialCoverage());
+        using var node = LocalNode.Federated(peerUrl: "http://peer.local", peerClient: peer.Client, token: QueryToken);
+
+        var json = await GetBaseSnapshotSymbolsTool.GetBaseSnapshotSymbols(node.Provider, peer.IdentityHash);
+        using var doc = JsonDocument.Parse(json);
+
+        Assert.AreEqual(4, doc.RootElement.GetProperty("results").GetArrayLength(),
+            "the peer's published partial snapshot is served, not skipped as unpublished (#119)");
+        var snapshot = doc.RootElement.GetProperty("meta").GetProperty("snapshot");
+        Assert.AreEqual("remote", snapshot.GetProperty("origin").GetString());
+        Assert.AreEqual("partial", snapshot.GetProperty("completeness").GetString(),
+            "the peer's coverage verdict survives the HTTP page wire (#119)");
+        Assert.AreEqual("partial", snapshot.GetProperty("coverage").GetProperty("verdict").GetString());
     }
 
     [TestMethod]
@@ -245,9 +316,10 @@ public class LiveMcpFederationTests
             return new LocalNode(localDb, provider);
         }
 
-        public static LocalNode PureLocal(EnsureSnapshotRequest request, int symbolCount)
+        public static LocalNode PureLocal(
+            EnsureSnapshotRequest request, int symbolCount, SnapshotCoverage? coverage = null)
         {
-            var localDb = new SeededDb(request, symbolCount);
+            var localDb = new SeededDb(request, symbolCount, coverage);
             return new LocalNode(localDb, new DatabaseProvider(localDb.Path));
         }
 
@@ -265,12 +337,14 @@ public class LiveMcpFederationTests
         public IndexDatabase Db { get; }
         public string IdentityHash { get; }
 
-        public SeededDb(EnsureSnapshotRequest request, int symbolCount)
+        public SeededDb(EnsureSnapshotRequest request, int symbolCount, SnapshotCoverage? coverage = null)
         {
             Path = ServiceTestFixtures.NewDbPath();
             Db = new IndexDatabase(Path);
             Db.RunMigrations();
-            ServiceTestFixtures.PublishComplete(Db, request, symbolCount);
+            var snapId = ServiceTestFixtures.PublishComplete(Db, request, symbolCount);
+            if (coverage is not null)
+                new SnapshotCoverageStore(Db.GetConnection()).Record(snapId, coverage, 1);
             IdentityHash = request.ToIdentity().Hash;
         }
 
@@ -287,12 +361,15 @@ public class LiveMcpFederationTests
         private IndexDatabase Db { get; init; } = null!;
         private string DbPath { get; init; } = "";
 
-        public static async Task<RemotePeer> StartAsync(EnsureSnapshotRequest request, int symbolCount)
+        public static async Task<RemotePeer> StartAsync(
+            EnsureSnapshotRequest request, int symbolCount, SnapshotCoverage? coverage = null)
         {
             var dbPath = ServiceTestFixtures.NewDbPath();
             var db = new IndexDatabase(dbPath);
             db.RunMigrations();
-            ServiceTestFixtures.PublishComplete(db, request, symbolCount);
+            var snapId = ServiceTestFixtures.PublishComplete(db, request, symbolCount);
+            if (coverage is not null)
+                new SnapshotCoverageStore(db.GetConnection()).Record(snapId, coverage, 1);
 
             var options = ServiceTestFixtures.NewOptions(dbPath, queryToken: QueryToken);
             var service = SnapshotService.Start(options, worker: null, db);
@@ -373,5 +450,15 @@ public class LiveMcpFederationTests
             }
             return result;
         }
+    }
+
+    /// <summary>A peer that answers every page request with a fixed JSON body (e.g. a pre-#119 page shape).</summary>
+    private sealed class RawBodyPeerHandler(string body) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct) =>
+            Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json")
+            });
     }
 }

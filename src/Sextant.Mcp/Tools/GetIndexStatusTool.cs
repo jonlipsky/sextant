@@ -97,11 +97,27 @@ public static class GetIndexStatusTool
             config_hash = run?.ConfigHash,
             features = IndexProfiles.FeatureNames(features),
             overlay = BuildOverlayInfo(conn, selectedSnapshotId),
+            coverage = BuildCoverageInfo(conn, selectedSnapshotId),
             // Storage is a DB-WIDE (all-tenant) aggregate; omit it under an enforced multi-tenant policy so
             // a per-repository authorized caller cannot read another tenant's storage/existence counts
             // (Phase 17, criterion 1). The zero-policy local path keeps reporting it (byte-identical).
             storage = policyEnforced ? null : BuildStorageInfo(conn)
         };
+    }
+
+    /// <summary>
+    /// Issue #119: the durable checkout coverage of the selected generation's committed base (the selected
+    /// snapshot itself, or an overlay's base; a remote-base overlay carries its peer base's coverage on its
+    /// own row) — which solutions/projects/submodules it covers and, when partial, why. Null (and so
+    /// omitted) when no coverage was recorded (a local index or pre-022 DB).
+    /// </summary>
+    private static SnapshotCoverage? BuildCoverageInfo(Microsoft.Data.Sqlite.SqliteConnection conn, long? selectedSnapshotId)
+    {
+        if (selectedSnapshotId is not long id || new SnapshotStore(conn).GetById(id) is not { } snap)
+            return null;
+
+        var coverageId = snap.IsOverlay ? snap.BaseSnapshotId ?? snap.Id : snap.Id;
+        return new SnapshotCoverageStore(conn).Get(coverageId);
     }
 
     /// <summary>

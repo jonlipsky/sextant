@@ -129,6 +129,22 @@ public class RetentionSnapshotGcTests
         Assert.AreEqual(1, BlobCount(_bpBlob), "branch-pointed snapshot's blob retained");
     }
 
+    [TestMethod]
+    public void Execute_GcdSnapshot_CascadesItsCoverageRow_RetainedSnapshotKeepsIt()
+    {
+        var coverage = new SnapshotCoverageStore(_conn);
+        var partial = new SnapshotCoverage { Verdict = SnapshotCoverageVerdict.Partial, Reasons = ["gap"] };
+        coverage.Record(_consumerOld, partial, _now);
+        coverage.Record(_consumerNew, partial, _now);
+
+        new RetentionService(_conn, Policy()).Execute();
+
+        Assert.IsNull(_snapshots.GetById(_consumerOld));
+        Assert.AreEqual(0, ScalarLong($"SELECT COUNT(*) FROM snapshot_coverage WHERE snapshot_id = {_consumerOld};"),
+            "a GC'd snapshot's coverage row cascades with it (#119)");
+        Assert.IsNotNull(coverage.Get(_consumerNew), "a retained snapshot keeps its coverage");
+    }
+
     // === seeding helpers =========================================================================
 
     private long CompleteRun(long ord)
