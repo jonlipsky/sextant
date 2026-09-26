@@ -1,0 +1,56 @@
+name: CI
+
+# Build + full correctness test suite as a fail-closed PR gate.
+# Runs on every PR targeting main and on pushes to main. This is the automated
+# gate that compiles the solution and runs the test suite before merge — the
+# only other PR check (SonarCloud) neither builds nor tests the code.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs for the same ref (e.g. a new push to a PR branch)
+# so only the latest commit is gated and CI minutes aren't wasted.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: the gate only needs to read the repository contents.
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: Build & Test
+    # The product's primary target is the Linux ProcessStack server, so the
+    # required gate runs on Linux only to stay fast and deterministic.
+    # A windows/macos matrix could be added later for cross-platform coverage,
+    # but is intentionally omitted here to keep the required check lean.
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Install a .NET 10 SDK. The repo's global.json (when present) is
+      # intentionally relaxed to roll forward on 10.0.x, so any 10.0 SDK is
+      # compatible with it.
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore Sextant.slnx
+
+      - name: Build
+        run: dotnet build Sextant.slnx --configuration Debug --no-restore
+
+      # Runs the default correctness suite across all assemblies (~1080 tests).
+      # The env-gated real-MSBuild integration tests stay skipped because
+      # SEXTANT_RUN_MULTISLN is left unset — they're too slow/nondeterministic
+      # for the required gate. Any test failure fails the job (default behavior).
+      - name: Test
+        run: dotnet test Sextant.slnx --no-build --configuration Debug
