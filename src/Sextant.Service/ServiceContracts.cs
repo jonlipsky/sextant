@@ -142,6 +142,17 @@ public sealed record SnapshotWorkResult
     public static SnapshotWorkResult Complete(long snapshotId, IReadOnlyList<ProjectOutcome>? projects = null) =>
         new() { Status = SnapshotJobStatus.Complete, SnapshotId = snapshotId, Projects = projects ?? [] };
 
+    /// <summary>
+    /// A servable-but-incomplete outcome (issue #109): a COMPLETE snapshot was published (the loadable
+    /// projects across every selected solution were indexed), but some projects/solutions were skipped
+    /// with a reason (e.g. platform heads that cannot load on this worker). The validator still requires
+    /// that a complete snapshot was actually published — Partial never masks an empty/absent publish — so
+    /// PARTIAL coverage is recorded honestly instead of being reported as COMPLETE.
+    /// </summary>
+    public static SnapshotWorkResult Partial(
+        long snapshotId, string message, IReadOnlyList<ProjectOutcome>? projects = null) =>
+        new() { Status = SnapshotJobStatus.Partial, SnapshotId = snapshotId, Error = message, Projects = projects ?? [] };
+
     public static SnapshotWorkResult Unsupported(string message, IReadOnlyList<ProjectOutcome>? projects = null) =>
         new() { Status = SnapshotJobStatus.Unsupported, Error = message, Projects = projects ?? [] };
 

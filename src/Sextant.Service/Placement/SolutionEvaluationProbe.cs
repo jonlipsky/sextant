@@ -23,18 +23,29 @@ public sealed class SolutionEvaluationProbe(ICheckoutProvider checkoutProvider) 
     public async Task<ProbeResult> ProbeAsync(
         EnsureSnapshotRequest request, string scratchDir, CancellationToken cancellationToken)
     {
-        if (!checkoutProvider.TryResolve(request, out _, out var solutionPath))
+        if (!checkoutProvider.TryResolve(request, out var resolution))
             return ProbeResult.Unavailable(
                 $"No provisioned checkout with a solution found for '{request.RepositoryRemoteUrl}'.");
+
+        // Config-error state (issue #109): the checkout resolved but its own sextant.json expressed a
+        // scoping intent that could not be honored, so no solution was selected. Nothing to probe — surface
+        // the reason as unavailable rather than loading an empty union.
+        if (!resolution.HasSelectedSolutions)
+            return ProbeResult.Unavailable(
+                resolution.ConfigurationError
+                ?? $"No indexable solution could be selected for '{request.RepositoryRemoteUrl}'.");
 
         // WorkspaceFailed can be raised from multiple MSBuild worker threads during the load, so the
         // diagnostic sink must be thread-safe.
         var diagnostics = new ConcurrentQueue<string>();
-        Solution solution;
+        MultiSolutionLoadResult load;
         try
         {
-            solution = await SolutionLoader.LoadSolutionAsync(
-                solutionPath, onDiagnostic: d => diagnostics.Enqueue(d), cancellationToken).ConfigureAwait(false);
+            // Probe the UNION of the deterministically-selected solutions (#109) so platform-aware routing
+            // sees every project across every selected solution, not one arbitrary solution's slice.
+            load = await MultiSolutionLoader.LoadAsync(
+                resolution.SelectedSolutions, onDiagnostic: d => diagnostics.Enqueue(d), cancellationToken)
+                .ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -44,8 +55,11 @@ public sealed class SolutionEvaluationProbe(ICheckoutProvider checkoutProvider) 
         {
             // A hard load failure of the whole solution is treated as unavailable rather than a false
             // "everything is fine" — the routing worker fails the job closed with this reason.
-            return ProbeResult.Unavailable($"failed to load solution '{solutionPath}': {ex.Message}");
+            return ProbeResult.Unavailable(
+                $"failed to load solution '{resolution.PrimarySolution}': {ex.Message}");
         }
+
+        var solution = load.Solution;
 
         // Snapshot the concurrent sink once the load has completed and no more diagnostics can arrive.
         var loadDiagnostics = diagnostics.ToArray();
@@ -62,6 +76,21 @@ public sealed class SolutionEvaluationProbe(ICheckoutProvider checkoutProvider) 
                 TargetPlatform = ParseTargetPlatform(project.Name),
                 Loaded = true,
                 MissingCapabilityDiagnostics = AttributeDiagnostics(fileName, loadDiagnostics)
+            });
+        }
+
+        // A project DECLARED in a selected solution but skipped-with-reason (e.g. a platform head that will
+        // not load on Linux) never appears in solution.Projects — surface it as an explicitly not-loaded
+        // project so the analyzer can route it rather than silently omitting it from the probe (#109/#89).
+        foreach (var skipped in load.SkippedProjects)
+        {
+            infos.Add(new ProjectEvaluationInfo
+            {
+                ProjectId = Path.GetFileNameWithoutExtension(skipped.ProjectPath),
+                ProjectPath = skipped.ProjectPath,
+                TargetPlatform = ParseTargetPlatform(Path.GetFileNameWithoutExtension(skipped.ProjectPath)),
+                Loaded = false,
+                MissingCapabilityDiagnostics = [skipped.Reason]
             });
         }
 

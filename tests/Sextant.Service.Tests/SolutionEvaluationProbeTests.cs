@@ -1,3 +1,4 @@
+using Sextant.Indexer;
 using Sextant.Service.Placement;
 
 namespace Sextant.Service.Tests;
@@ -14,10 +15,16 @@ public class SolutionEvaluationProbeTests
 {
     private sealed class FakeCheckoutProvider(bool resolves) : ICheckoutProvider
     {
-        public bool TryResolve(EnsureSnapshotRequest request, out string checkoutDir, out string solutionPath)
+        public bool TryResolve(EnsureSnapshotRequest request, out CheckoutResolution resolution)
         {
-            checkoutDir = resolves ? "/checkouts/app" : string.Empty;
-            solutionPath = resolves ? "/checkouts/app/App.sln" : string.Empty;
+            resolution = resolves
+                ? new CheckoutResolution
+                {
+                    CheckoutDir = "/checkouts/app",
+                    SelectedSolutions = ["/checkouts/app/App.sln"],
+                    Source = SolutionSelectionSource.DefaultRoot
+                }
+                : null!;
             return resolves;
         }
     }
