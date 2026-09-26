@@ -190,4 +190,11 @@ public sealed record SnapshotProvenance
 
     /// <summary>The immutable identity hash of the base snapshot a remote federation fetch resolved (issue #60).</summary>
     public string? BaseIdentityHash { get; init; }
+
+    /// <summary>
+    /// The served base snapshot's durable checkout coverage (issue #119): which solutions/projects/
+    /// submodules the snapshot covers and, when partial, why. Null when none was recorded (a local index,
+    /// overlay, or pre-022 snapshot), so a response without recorded coverage is byte-identical.
+    /// </summary>
+    public SnapshotCoverage? Coverage { get; init; }
 }

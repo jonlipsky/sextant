@@ -1,5 +1,6 @@
 using System.Net;
 using Microsoft.Data.Sqlite;
+using Sextant.Core;
 
 namespace Sextant.Store;
 
@@ -35,7 +36,52 @@ public sealed record SnapshotSymbolPage
     public required string IdentityHash { get; init; }
     public required IReadOnlyList<SnapshotSymbolRow> Symbols { get; init; }
     public string? NextCursor { get; init; }
+
+    /// <summary>
+    /// True when the page comes from a published snapshot that is not known to be partial: the snapshot is
+    /// published (complete status) AND its durable coverage is not partial (issue #119). A published
+    /// snapshot whose recorded coverage is partial serves its rows with <c>complete=false</c> so a consumer
+    /// never presents a partial index as complete. A snapshot with NO recorded coverage (a local index or a
+    /// pre-#119 snapshot) keeps <c>complete=true</c> with <c>coverage</c> absent — its coverage is unknown.
+    /// Whether the source publishes the snapshot at all is <see cref="Published"/>.
+    /// </summary>
+    /// <remarks>
+    /// Wire-semantic change (issue #119): before, <c>complete</c> meant "this source knows the snapshot"
+    /// (true even for a pending/superseded identity with no rows). A pre-#119 CLIENT could misread an empty
+    /// partial page as "not published", but identity hashes fold in the schema version, so such a client can
+    /// only address pre-022 snapshots (no coverage row ⇒ <c>complete</c> = published). Peers and their
+    /// clients should still be upgraded together.
+    /// </remarks>
     public bool Complete { get; init; } = true;
+
+    /// <summary>
+    /// True when this source publishes the snapshot (its status is complete) and therefore owns its cursor
+    /// space; false when the identity is unknown or not yet published here. Null on a page from a peer
+    /// predating issue #119. Such a peer's <see cref="Complete"/> was true for any KNOWN identity (published
+    /// or still pending/failed/superseded), so it is NOT proof of publication: absence detection on an empty
+    /// first page must require <c>Published == true</c> (see <see cref="IsProvenPublished"/>), while
+    /// <see cref="CompositeBaseSnapshotSource"/> RESUMED-cursor ownership keeps the pre-#119
+    /// <see cref="Complete"/> fallback via <see cref="IsPublished"/>.
+    /// </summary>
+    public bool? Published { get; init; }
+
+    /// <summary>The snapshot's durable checkout coverage (issue #119); null when none was recorded.</summary>
+    public SnapshotCoverage? Coverage { get; init; }
+
+    /// <summary>
+    /// Resumed-cursor ownership test for <see cref="CompositeBaseSnapshotSource"/>, tolerating pre-#119 peers
+    /// exactly as routing did before (their <see cref="Complete"/>). Not proof the snapshot is published.
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool IsPublished => Published ?? Complete;
+
+    /// <summary>
+    /// True only when the source affirmatively reports publishing the snapshot. An empty first page without
+    /// this proof (including every page from a pre-#119 peer) means "no source publishes the base" — the
+    /// pre-#119 absence rule, so a legacy peer's empty page for a superseded base is never served as complete.
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool IsProvenPublished => Published == true;
 
     /// <summary>True when this page was served from cache after the source became unreachable (offline fallback).</summary>
     public bool FromOfflineCache { get; init; }
@@ -73,7 +119,8 @@ public interface IBaseSnapshotSource
 /// Reads a base snapshot's symbols from the local durable catalog. Pages are stable and deterministic:
 /// symbols are ordered by their monotonic id and the cursor is the last id returned, so
 /// <c>WHERE id &gt; cursor</c> resumes exactly where the previous page ended (immutable snapshot ⇒ stable
-/// paging, issue #51). An unknown or not-yet-complete identity yields an empty, complete page.
+/// paging, issue #51). An unknown or not-yet-published identity yields an empty, unpublished page. A
+/// published snapshot's pages are <c>complete</c> unless its recorded coverage is partial (issue #119).
 /// </summary>
 public sealed class LocalBaseSnapshotSource(SqliteConnection connection) : IBaseSnapshotSource
 {
@@ -87,12 +134,20 @@ public sealed class LocalBaseSnapshotSource(SqliteConnection connection) : IBase
                 IdentityHash = request.IdentityHash,
                 Symbols = [],
                 NextCursor = null,
-                Complete = snapshot is not null
+                Complete = false,
+                Published = false
             });
+
+        var coverage = new SnapshotCoverageStore(connection).Get(snapshot.Id);
+        var complete = coverage is not { IsPartial: true };
 
         var projectIds = snapshots.GetSnapshotProjectIds(snapshot.Id);
         if (projectIds.Count == 0)
-            return Task.FromResult(new SnapshotSymbolPage { IdentityHash = request.IdentityHash, Symbols = [], NextCursor = null });
+            return Task.FromResult(new SnapshotSymbolPage
+            {
+                IdentityHash = request.IdentityHash, Symbols = [], NextCursor = null,
+                Complete = complete, Published = true, Coverage = coverage
+            });
 
         var limit = Math.Clamp(request.Limit, 1, 5000);
         var inList = string.Join(",", projectIds);
@@ -135,7 +190,10 @@ public sealed class LocalBaseSnapshotSource(SqliteConnection connection) : IBase
         {
             IdentityHash = request.IdentityHash,
             Symbols = rows,
-            NextCursor = next
+            NextCursor = next,
+            Complete = complete,
+            Published = true,
+            Coverage = coverage
         });
     }
 }
@@ -211,8 +269,9 @@ public sealed class SnapshotPageCache(int capacity = 1024)
 /// (issue #60, hardening #51 federation):
 /// <list type="bullet">
 /// <item>A source that DEFINITIVELY lacks the snapshot — a remote 404 (<see cref="HttpRequestException"/>
-/// with <see cref="HttpStatusCode.NotFound"/>) or an empty non-complete page — never owned the cursor, so
-/// it is skipped on <em>any</em> page (first or resumed).</item>
+/// with <see cref="HttpStatusCode.NotFound"/>) or an empty unpublished page — never owned the cursor, so
+/// it is skipped on <em>any</em> page (first or resumed). On the first page an empty page must carry
+/// <c>published == true</c> to end routing (a pre-#119 peer's <c>complete</c> is not proof).</item>
 /// <item>A source that is merely UNREACHABLE (<see cref="RemoteSnapshotUnavailableException"/>) is skipped
 /// only on the FIRST page (cursor 0); on a resumed page it may be the peer that owns the cursor, so the
 /// failure is surfaced rather than failed over into another peer's id-space.</item>
@@ -231,9 +290,14 @@ public sealed class CompositeBaseSnapshotSource(IReadOnlyList<IBaseSnapshotSourc
             try
             {
                 var page = await source.FetchSymbolsAsync(request, cancellationToken).ConfigureAwait(false);
-                if (page.Symbols.Count > 0 || (page.NextCursor is null && page.Complete))
+                // An empty FIRST page only ends routing with PROOF this source publishes the snapshot: a
+                // pre-#119 peer answered complete=true for any KNOWN identity (pending/superseded), which
+                // must not mask a later peer that actually publishes it. A RESUMED empty page keeps the legacy
+                // ownership rule (IsPublished) — the cursor came from this source's id-space.
+                var ownsEmptyPage = firstPage ? page.IsProvenPublished : page.IsPublished;
+                if (page.Symbols.Count > 0 || (page.NextCursor is null && ownsEmptyPage))
                     return page;
-                // Empty, non-complete page ⇒ this source does not publish the snapshot: skip to the next.
+                // Empty, unpublished page ⇒ this source does not publish the snapshot: skip to the next.
             }
             catch (RemoteSnapshotUnavailableException ex)
             {
@@ -250,7 +314,10 @@ public sealed class CompositeBaseSnapshotSource(IReadOnlyList<IBaseSnapshotSourc
         if (lastUnavailable is not null)
             throw lastUnavailable;
 
-        return new SnapshotSymbolPage { IdentityHash = request.IdentityHash, Symbols = [], NextCursor = null };
+        return new SnapshotSymbolPage
+        {
+            IdentityHash = request.IdentityHash, Symbols = [], NextCursor = null, Complete = false, Published = false
+        };
     }
 }
 

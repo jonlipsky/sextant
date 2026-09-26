@@ -118,7 +118,7 @@ public sealed class PersistentVolumeCheckoutProvider(ServicePaths paths) : IChec
                 Source = selection.Source,
                 SkippedSolutions = selection.SkippedSolutions,
                 DiscoveredButNotSelected = selection.DiscoveredSolutions
-                    .Where(d => !selection.SolutionPaths.Contains(d, StringComparer.OrdinalIgnoreCase))
+                    .Where(d => !selection.SolutionPaths.Contains(d, CheckoutInventory.PathComparer))
                     .ToList()
             };
             return true;
@@ -226,6 +226,13 @@ public sealed class LocalIndexerSnapshotWorker(
                 return SnapshotWorkResult.Failed(reason, BuildDiagnostics(checkoutDir, resolution, load));
             }
 
+            // Coverage (issue #119) depends only on the selection, the load, and the checkout's file tree —
+            // all known BEFORE indexing — so it rides on the snapshot context and is recorded in the SAME
+            // transaction that publishes the snapshot.
+            var coverage = SnapshotCoverageBuilder.Build(
+                checkoutDir, resolution, load, SnapshotCoverageBuilder.Inventory.Scan(checkoutDir));
+            var indexContext = context with { Coverage = coverage.Coverage };
+
             var orchestrator = new IndexOrchestrator(
                 database, log, configuration.DocumentExtractor,
                 ExtractionParallelismOptions.FromConfiguration(configuration),
@@ -233,7 +240,7 @@ public sealed class LocalIndexerSnapshotWorker(
 
             await orchestrator.IndexSolutionAsync(
                 load.Solution, progress: null, metrics: null, cancellationToken: token,
-                snapshotContext: context).ConfigureAwait(false);
+                snapshotContext: indexContext).ConfigureAwait(false);
 
             var published = new SnapshotStore(database.GetConnection()).GetByIdentityHash(identityHash);
             if (published is not { Status: SnapshotStatus.Complete })
@@ -243,7 +250,11 @@ public sealed class LocalIndexerSnapshotWorker(
                     "(the checkout's committed state may differ from the requested commit).");
             }
 
-            return BuildResult(published.Id, checkoutDir, resolution, load);
+            // The verdict follows the coverage DURABLY recorded for the snapshot. It normally equals the one
+            // just computed; it differs only when this identity was already published with a recorded
+            // verdict (immutable), which then stays authoritative.
+            var recorded = new SnapshotCoverageStore(database.GetConnection()).Get(published.Id) ?? coverage.Coverage;
+            return BuildResult(published.Id, checkoutDir, resolution, load, coverage with { Coverage = recorded });
         }
 
         try
@@ -279,36 +290,29 @@ public sealed class LocalIndexerSnapshotWorker(
     }
 
     /// <summary>
-    /// Turns a published snapshot + the multi-solution load outcome into the terminal work result. The
-    /// result is <see cref="SnapshotWorkResult.Partial"/> — never Complete — whenever a declared project
-    /// failed to load, a configured solution could not be selected, a selected solution declared no loadable
-    /// projects (unreadable/empty), or the selected set produced ZERO loaded projects, so PARTIAL coverage
-    /// (and an empty index) is never presented as complete. A default-root pick that leaves other discovered
-    /// solutions unindexed is recorded transparently (info) but is NOT partial: it is the specified
-    /// deterministic default, and the loadable projects it covers were fully indexed.
+    /// Turns a published snapshot + its checkout coverage into the terminal work result. The result is
+    /// <see cref="SnapshotWorkResult.Partial"/> — never Complete — whenever the coverage verdict is partial
+    /// (issue #119): a discovered solution left unselected, a configured solution skipped, a declared project
+    /// that failed to load, a selected solution with no readable projects, zero loaded projects, an
+    /// unpopulated submodule, or (no-config default) an on-disk project file in no selected solution. The
+    /// Partial reason carries every coverage reason, so a partial snapshot is never presented as complete.
     /// </summary>
     internal static SnapshotWorkResult BuildResult(
-        long snapshotId, string checkoutDir, CheckoutResolution resolution, MultiSolutionLoadResult load)
+        long snapshotId, string checkoutDir, CheckoutResolution resolution, MultiSolutionLoadResult load,
+        SnapshotCoverageBuilder.Result coverage)
     {
         var diagnostics = BuildDiagnostics(checkoutDir, resolution, load);
+        diagnostics.AddRange(coverage.Diagnostics);
 
-        var totalLoaded = load.Solutions.Sum(c => c.LoadedProjectCount);
-        var hasEmptySelectedSolution = load.Solutions.Any(c => c.DeclaredProjectCount == 0);
-        var hasCoverageGap =
-            load.SkippedProjects.Count > 0
-            || resolution.SkippedSolutions.Count > 0
-            || hasEmptySelectedSolution
-            || totalLoaded == 0;
-
-        if (hasCoverageGap)
+        if (coverage.Coverage.IsPartial)
         {
             var reason =
-                $"{load.SkippedProjects.Count} project(s) and {resolution.SkippedSolutions.Count} configured " +
-                "solution(s) were skipped-with-reason; snapshot coverage is partial (see diagnostics).";
-            return SnapshotWorkResult.Partial(snapshotId, reason, diagnostics);
+                "snapshot coverage is partial: " + string.Join(" ", coverage.Coverage.Reasons) +
+                " (see diagnostics).";
+            return SnapshotWorkResult.Partial(snapshotId, reason, diagnostics, coverage.Coverage);
         }
 
-        return SnapshotWorkResult.Complete(snapshotId, diagnostics);
+        return SnapshotWorkResult.Complete(snapshotId, diagnostics, coverage.Coverage);
     }
 
     /// <summary>
@@ -348,10 +352,11 @@ public sealed class LocalIndexerSnapshotWorker(
 
     /// <summary>
     /// Builds the provenance diagnostics for a multi-solution load: which solutions were indexed and at what
-    /// coverage, which discovered solutions a default pick left unselected (info), and every skipped
-    /// configured solution / unreadable-or-empty selected solution / skipped project (warning). Shared by the
-    /// Complete/Partial result path AND the empty-load Failed path so a run that indexed nothing still
-    /// records WHY every project was skipped (criteria 2 &amp; 3 — coverage gaps are never silent).
+    /// coverage, and every skipped configured solution / unreadable-or-empty selected solution / skipped
+    /// project (warning). Shared by the Complete/Partial result path AND the empty-load Failed path so a run
+    /// that indexed nothing still records WHY every project was skipped (criteria 2 &amp; 3 — coverage gaps
+    /// are never silent). Checkout-level gaps (unselected solutions, unpopulated submodules, unreferenced
+    /// project files) come from <see cref="SnapshotCoverageBuilder"/>.
     /// </summary>
     private static List<ProjectOutcome> BuildDiagnostics(
         string checkoutDir, CheckoutResolution resolution, MultiSolutionLoadResult load)
@@ -393,19 +398,8 @@ public sealed class LocalIndexerSnapshotWorker(
             });
         }
 
-        if (resolution.DiscoveredButNotSelected.Count > 0)
-        {
-            var others = string.Join(
-                ", ", resolution.DiscoveredButNotSelected.Select(s => RepoRelative(checkoutDir, s)));
-            diagnostics.Add(new ProjectOutcome
-            {
-                Severity = JobDiagnosticSeverity.Info,
-                Code = "solutions_not_selected",
-                Message =
-                    $"{resolution.DiscoveredButNotSelected.Count} other solution(s) were discovered but not " +
-                    $"selected by the default-root pick; configure `solutions` in sextant.json to index them: {others}."
-            });
-        }
+        // Discovered-but-unselected solutions are coverage gaps; SnapshotCoverageBuilder records one warning
+        // per solution (issue #119), so they are not repeated here.
 
         foreach (var skippedSolution in resolution.SkippedSolutions)
         {

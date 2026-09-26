@@ -29,6 +29,12 @@ public sealed record MultiSolutionLoadResult(
 {
     /// <summary>True when at least one declared project across the selected solutions failed to load.</summary>
     public bool IsPartial => SkippedProjects.Count > 0;
+
+    /// <summary>
+    /// The distinct (full-path) project files declared across ALL selected solutions, in first-appearance
+    /// order — the denominator for checkout coverage (issue #119).
+    /// </summary>
+    public IReadOnlyList<string> DeclaredProjects { get; init; } = [];
 }
 
 /// <summary>
@@ -72,6 +78,7 @@ public static class MultiSolutionLoader
             .ToList();
 
         SolutionLoadResult loaded;
+        var union = ComputeUnion(perSolutionDeclared);
         if (solutionPaths.Count == 1)
         {
             // Preserve the byte-identical single-solution fast path (OpenSolutionAsync) so the common and
@@ -81,13 +88,15 @@ public static class MultiSolutionLoader
         }
         else
         {
-            var union = ComputeUnion(perSolutionDeclared);
             loaded = await SolutionLoader.LoadProjectsResilientlyAsync(
                 union, onDiagnostic, cancellationToken).ConfigureAwait(false);
         }
 
         var coverage = BuildCoverage(perSolutionDeclared, loaded.SkippedProjects);
-        return new MultiSolutionLoadResult(loaded.Solution, loaded.SkippedProjects, coverage);
+        return new MultiSolutionLoadResult(loaded.Solution, loaded.SkippedProjects, coverage)
+        {
+            DeclaredProjects = union
+        };
     }
 
     /// <summary>

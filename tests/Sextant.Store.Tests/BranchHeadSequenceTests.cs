@@ -40,10 +40,10 @@ public class BranchHeadSequenceTests
     public void TestCleanup() => SqliteTestDatabase.Delete(_dbPath, _db);
 
     [TestMethod]
-    public void Migration021_LatestSchemaVersion_DerivesTo21()
+    public void Migration021_IsApplied_AndLatestSchemaVersionIsAtLeast21()
     {
-        Assert.AreEqual(21, IndexDatabase.LatestSchemaVersion,
-            "migration 021 is the last on disk, so the auto-derived latest schema version is 21 (criterion 4)");
+        Assert.IsTrue(IndexDatabase.LatestSchemaVersion >= 21,
+            "migration 021 is on disk, so the auto-derived latest schema version is at least 21 (criterion 4)");
     }
 
     [TestMethod]

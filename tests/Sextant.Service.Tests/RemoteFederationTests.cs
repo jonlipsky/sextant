@@ -161,6 +161,28 @@ public class RemoteFederationTests
             "a page with null symbols degrades to a structured unavailable, not a later NRE (#60)");
     }
 
+    [TestMethod]
+    public async Task UnpublishedEmptyPage_IsNotCached_SoALaterPublishIsSeen()
+    {
+        // Issue #119 review: "not published yet" is MUTABLE state. A probe that lands while the peer is still
+        // building the base must not pin that negative in the cache — the next fetch has to reach the peer.
+        var handler = new PeerStubHandler(_db);
+        var source = NewSource(handler, new SnapshotPageCache());
+        var later = ServiceTestFixtures.Request(commit: "commit_published_later");
+        var request = new SnapshotPageRequest { IdentityHash = later.ToIdentity().Hash, Cursor = null, Limit = 2 };
+
+        var before = await source.FetchSymbolsAsync(request, CancellationToken.None);
+        Assert.AreEqual(0, before.Symbols.Count);
+        Assert.IsFalse(before.IsProvenPublished, "the peer reports the identity as not published");
+
+        ServiceTestFixtures.PublishComplete(_db, later, symbolCount: 3);
+
+        var after = await source.FetchSymbolsAsync(request, CancellationToken.None);
+        Assert.AreEqual(2, handler.Calls, "the unpublished page was not cached, so the second fetch reached the peer");
+        Assert.IsTrue(after.IsProvenPublished, "the newly published base is seen instead of a stale cached negative");
+        Assert.AreEqual(2, after.Symbols.Count);
+    }
+
     private static RemoteHttpBaseSnapshotSource NewSource(
         PeerStubHandler handler, SnapshotPageCache cache, TimeSpan? timeout = null)
     {

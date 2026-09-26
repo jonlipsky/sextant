@@ -99,6 +99,82 @@ public class CompositeBaseSnapshotSourceTests
         var page = await composite.FetchSymbolsAsync(new SnapshotPageRequest { IdentityHash = "h" }, CancellationToken.None);
 
         Assert.AreEqual(0, page.Symbols.Count, "no peer publishes the snapshot ⇒ a plain empty page, not a fault (#60)");
+        Assert.IsFalse(page.IsPublished);
+    }
+
+    [TestMethod]
+    public async Task EmptyPublishedPartialPage_IsServed_NotSkippedToTheNextPeer()
+    {
+        // Issue #119: a partial snapshot's final page (or a zero-symbol snapshot) is empty with
+        // complete=false — but the peer still PUBLISHES it and owns the cursor, so it must be served, never
+        // failed over into another peer's id-space.
+        var p0 = new FakeSource(r => new SnapshotSymbolPage
+        {
+            IdentityHash = r.IdentityHash, Symbols = [], NextCursor = null, Complete = false, Published = true
+        });
+        var p1 = new FakeSource(r => Page(r.IdentityHash, 7, next: null));
+        var composite = new CompositeBaseSnapshotSource([p0, p1]);
+
+        var first = await composite.FetchSymbolsAsync(new SnapshotPageRequest { IdentityHash = "h" }, CancellationToken.None);
+        var resumed = await composite.FetchSymbolsAsync(new SnapshotPageRequest { IdentityHash = "h", Cursor = "500" }, CancellationToken.None);
+
+        Assert.AreEqual(0, first.Symbols.Count);
+        Assert.IsTrue(first.IsPublished);
+        Assert.AreEqual(0, resumed.Symbols.Count, "an exact page-boundary end stays with the owning peer");
+        Assert.AreEqual(0, p1.Calls, "the owning peer answered — the next peer is never consulted");
+    }
+
+    [TestMethod]
+    public async Task LegacyPeerWithoutPublishedField_CompleteEmptyPage_StillOwnsTheSnapshot()
+    {
+        var p0 = new FakeSource(r => new SnapshotSymbolPage
+        {
+            IdentityHash = r.IdentityHash, Symbols = [], NextCursor = null, Complete = true
+        });
+        var p1 = new FakeSource(r => Page(r.IdentityHash, 2, next: null));
+        var composite = new CompositeBaseSnapshotSource([p0, p1]);
+
+        var page = await composite.FetchSymbolsAsync(new SnapshotPageRequest { IdentityHash = "h", Cursor = "9" }, CancellationToken.None);
+
+        Assert.AreEqual(0, page.Symbols.Count, "a pre-#119 peer's complete=true empty page means 'published, last page'");
+        Assert.AreEqual(0, p1.Calls);
+    }
+
+    [TestMethod]
+    public async Task LegacyPeerEmptyCompleteFirstPage_DoesNotMaskALaterPublishingPeer()
+    {
+        // A pre-#119 peer answered complete=true (no `published`) for a pending/superseded identity with no
+        // rows. On the FIRST page that is not proof of publication, so routing continues to the peer that
+        // actually publishes the snapshot (#119 review).
+        var p0 = new FakeSource(r => new SnapshotSymbolPage
+        {
+            IdentityHash = r.IdentityHash, Symbols = [], NextCursor = null, Complete = true
+        });
+        var p1 = new FakeSource(r => Page(r.IdentityHash, 2, next: null) with { Published = true });
+        var composite = new CompositeBaseSnapshotSource([p0, p1]);
+
+        var page = await composite.FetchSymbolsAsync(new SnapshotPageRequest { IdentityHash = "h" }, CancellationToken.None);
+
+        Assert.AreEqual(2, page.Symbols.Count, "the publishing peer answers, not the legacy peer's empty page");
+        Assert.AreEqual(1, p1.Calls);
+    }
+
+    [TestMethod]
+    public async Task UnpublishedFirstPeer_FallsThroughToThePublishingPeer()
+    {
+        // A local catalog that only has the identity pending answers unpublished; a peer that publishes it wins.
+        var p0 = new FakeSource(r => new SnapshotSymbolPage
+        {
+            IdentityHash = r.IdentityHash, Symbols = [], NextCursor = null, Complete = false, Published = false
+        });
+        var p1 = new FakeSource(r => Page(r.IdentityHash, 3, next: null) with { Complete = false, Published = true });
+        var composite = new CompositeBaseSnapshotSource([p0, p1]);
+
+        var page = await composite.FetchSymbolsAsync(new SnapshotPageRequest { IdentityHash = "h" }, CancellationToken.None);
+
+        Assert.AreEqual(3, page.Symbols.Count);
+        Assert.IsFalse(page.Complete, "the serving peer's partial coverage verdict is preserved");
+        Assert.AreEqual(1, p1.Calls);
     }
 
     private static SnapshotSymbolPage Page(string hash, int count, string? next) => new()
