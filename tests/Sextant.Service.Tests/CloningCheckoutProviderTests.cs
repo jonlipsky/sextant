@@ -32,8 +32,10 @@ public class CloningCheckoutProviderTests
         var provider = NewCloneProvider(paths);
         var request = ServiceTestFixtures.Request(remoteUrl, commit);
 
-        Assert.IsTrue(provider.TryResolve(request, out var dir, out var sln),
+        Assert.IsTrue(provider.TryResolve(request, out var resolution),
             "a clone-on-miss should provision the checkout and then locate its solution");
+        var dir = resolution.CheckoutDir;
+        var sln = resolution.PrimarySolution;
 
         var canonical = Path.Combine(paths.CheckoutRoot, ServicePaths.RepoDirectoryName(remoteUrl));
         Assert.AreEqual(Path.GetFullPath(canonical), Path.GetFullPath(dir));
@@ -61,8 +63,10 @@ public class CloningCheckoutProviderTests
         var provider = new CloningCheckoutProvider(
             new PersistentVolumeCheckoutProvider(paths), paths, token: null, gitExecutable: "definitely-not-git");
 
-        Assert.IsTrue(provider.TryResolve(request, out var dir, out var sln),
+        Assert.IsTrue(provider.TryResolve(request, out var resolution),
             "an already-provisioned checkout resolves with no clone");
+        var dir = resolution.CheckoutDir;
+        var sln = resolution.PrimarySolution;
         Assert.AreEqual(Path.GetFullPath(canonical), Path.GetFullPath(dir));
         Assert.IsTrue(sln.EndsWith("App.slnx", StringComparison.Ordinal));
     }
@@ -77,10 +81,9 @@ public class CloningCheckoutProviderTests
         // The DEFAULT locate-only provider (what the service uses in `locate` mode) must never provision.
         var provider = new PersistentVolumeCheckoutProvider(paths);
 
-        Assert.IsFalse(provider.TryResolve(request, out var dir, out var sln),
+        Assert.IsFalse(provider.TryResolve(request, out var resolution),
             "locate mode must not clone on a miss");
-        Assert.AreEqual(string.Empty, dir);
-        Assert.AreEqual(string.Empty, sln);
+        Assert.IsNull(resolution);
         var canonical = Path.Combine(paths.CheckoutRoot, ServicePaths.RepoDirectoryName(remoteUrl));
         Assert.IsFalse(Directory.Exists(canonical), "locate mode must not create a checkout directory");
     }
@@ -94,10 +97,9 @@ public class CloningCheckoutProviderTests
         // A well-formed but nonexistent commit id: fetch/checkout fails, so we must not index the wrong commit.
         var request = ServiceTestFixtures.Request(remoteUrl, new string('a', 40));
 
-        Assert.IsFalse(provider.TryResolve(request, out var dir, out var sln),
+        Assert.IsFalse(provider.TryResolve(request, out var resolution),
             "an unfetchable commit must degrade cleanly (no checkout published)");
-        Assert.AreEqual(string.Empty, dir);
-        Assert.AreEqual(string.Empty, sln);
+        Assert.IsNull(resolution);
         var canonical = Path.Combine(paths.CheckoutRoot, ServicePaths.RepoDirectoryName(remoteUrl));
         Assert.IsFalse(Directory.Exists(canonical), "a failed clone must leave no canonical checkout");
         Assert.IsFalse(Directory.EnumerateDirectories(paths.CheckoutRoot, ".tmp-clone-*").Any(),
@@ -112,7 +114,7 @@ public class CloningCheckoutProviderTests
         var provider = NewCloneProvider(paths);
         var request = ServiceTestFixtures.Request(remoteUrl, "main"); // a ref name, not a git object id
 
-        Assert.IsFalse(provider.TryResolve(request, out _, out _),
+        Assert.IsFalse(provider.TryResolve(request, out _),
             "a non-oid commit is rejected (argument-injection hardening) and never provisions");
         var canonical = Path.Combine(paths.CheckoutRoot, ServicePaths.RepoDirectoryName(remoteUrl));
         Assert.IsFalse(Directory.Exists(canonical));
@@ -128,8 +130,8 @@ public class CloningCheckoutProviderTests
 
         // Two parallel ensures for the SAME repo → the per-repo lock serializes them; one clones, the other
         // re-locates the winner's checkout. Both resolve to the same directory.
-        var t1 = Task.Run(() => { var ok = provider.TryResolve(request, out var d, out _); return (ok, d); });
-        var t2 = Task.Run(() => { var ok = provider.TryResolve(request, out var d, out _); return (ok, d); });
+        var t1 = Task.Run(() => { var ok = provider.TryResolve(request, out var r); return (ok, d: ok ? r.CheckoutDir : null); });
+        var t2 = Task.Run(() => { var ok = provider.TryResolve(request, out var r); return (ok, d: ok ? r.CheckoutDir : null); });
         var results = await Task.WhenAll(t1, t2);
 
         Assert.IsTrue(results[0].ok && results[1].ok, "both concurrent resolves succeed");
@@ -158,10 +160,9 @@ public class CloningCheckoutProviderTests
         var traversalUrl = new Uri(Path.Combine(dataParent, "repo")).AbsoluteUri + "/../outside";
         var request = ServiceTestFixtures.Request(traversalUrl, new string('b', 40));
 
-        Assert.IsFalse(provider.TryResolve(request, out var dir, out var sln),
+        Assert.IsFalse(provider.TryResolve(request, out var resolution),
             "a traversal repository url must never resolve or provision outside the checkout volume");
-        Assert.AreEqual(string.Empty, dir);
-        Assert.AreEqual(string.Empty, sln);
+        Assert.IsNull(resolution);
         Assert.IsFalse(File.Exists(Path.Combine(paths.CheckoutRoot, "Escaped.sln")),
             "the outside solution must never be copied or linked into the checkout volume");
     }
@@ -177,8 +178,9 @@ public class CloningCheckoutProviderTests
             new PersistentVolumeCheckoutProvider(paths), paths, token: "supersecrettoken");
         var request = ServiceTestFixtures.Request(remoteUrl, commit);
 
-        Assert.IsTrue(provider.TryResolve(request, out var dir, out _),
+        Assert.IsTrue(provider.TryResolve(request, out var resolution),
             "a token-authenticated clone of a reachable commit still resolves");
+        var dir = resolution.CheckoutDir;
 
         var config = Path.Combine(dir, ".git", "config");
         Assert.IsTrue(File.Exists(config));
@@ -246,16 +248,19 @@ public class CloningCheckoutProviderTests
         var provider = NewCloneProvider(paths);
 
         // First ensure clones the repo at its initial commit.
-        Assert.IsTrue(provider.TryResolve(ServiceTestFixtures.Request(remoteUrl, first), out var dir1, out _),
+        Assert.IsTrue(provider.TryResolve(ServiceTestFixtures.Request(remoteUrl, first), out var resolution1),
             "the first ensure clones the repo at the initial commit");
+        var dir1 = resolution1.CheckoutDir;
         Assert.AreEqual(first, GitHead(dir1));
 
         // The branch advances on the remote; a later ensure asks for the NEW commit against the SAME repo.
         var second = CommitMore(repoDir);
         Assert.AreNotEqual(first, second);
 
-        Assert.IsTrue(provider.TryResolve(ServiceTestFixtures.Request(remoteUrl, second), out var dir2, out var sln2),
+        Assert.IsTrue(provider.TryResolve(ServiceTestFixtures.Request(remoteUrl, second), out var resolution2),
             "an ensure for a different commit must re-provision rather than reuse the stale checkout");
+        var dir2 = resolution2.CheckoutDir;
+        var sln2 = resolution2.PrimarySolution;
         Assert.AreEqual(Path.GetFullPath(dir1), Path.GetFullPath(dir2), "the canonical checkout dir is unchanged");
         Assert.AreEqual(second, GitHead(dir2),
             "the cached checkout must be replaced with the requested commit — never index the wrong revision");
@@ -272,12 +277,14 @@ public class CloningCheckoutProviderTests
 
         // Clone once with a real git provider, then swap in a bogus git exe: a re-ensure for the SAME commit
         // must be a pure cache hit (HEAD already matches) and never shell out to git again.
-        Assert.IsTrue(NewCloneProvider(paths).TryResolve(ServiceTestFixtures.Request(remoteUrl, commit), out _, out _));
+        Assert.IsTrue(NewCloneProvider(paths).TryResolve(ServiceTestFixtures.Request(remoteUrl, commit), out _));
 
         var cacheOnly = new CloningCheckoutProvider(
             new PersistentVolumeCheckoutProvider(paths), paths, token: null, gitExecutable: "definitely-not-git");
-        Assert.IsTrue(cacheOnly.TryResolve(ServiceTestFixtures.Request(remoteUrl, commit), out var dir, out var sln),
+        Assert.IsTrue(cacheOnly.TryResolve(ServiceTestFixtures.Request(remoteUrl, commit), out var resolution),
             "a same-commit re-ensure resolves from cache");
+        var dir = resolution.CheckoutDir;
+        var sln = resolution.PrimarySolution;
         Assert.AreEqual(commit, GitHead(dir));
         Assert.IsTrue(sln.EndsWith("App.slnx", StringComparison.Ordinal));
     }
@@ -291,10 +298,9 @@ public class CloningCheckoutProviderTests
         // outright (credentials belong in SEXTANT_SERVICE_CHECKOUT_TOKEN). Returns before any git runs.
         var request = ServiceTestFixtures.Request("https://user:secret@host/o/r.git", new string('a', 40));
 
-        Assert.IsFalse(provider.TryResolve(request, out var dir, out var sln),
+        Assert.IsFalse(provider.TryResolve(request, out var resolution),
             "an http(s) URL embedding userinfo must be refused");
-        Assert.AreEqual(string.Empty, dir);
-        Assert.AreEqual(string.Empty, sln);
+        Assert.IsNull(resolution);
         var canonical = Path.Combine(paths.CheckoutRoot, ServicePaths.RepoDirectoryName(request.RepositoryRemoteUrl));
         Assert.IsFalse(Directory.Exists(canonical), "a refused clone must leave no checkout directory");
     }

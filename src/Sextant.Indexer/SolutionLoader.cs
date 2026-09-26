@@ -81,6 +81,42 @@ public static class SolutionLoader
     }
 
     /// <summary>
+    /// Loads a UNION of individually-named project paths (across one or more solutions) into ONE workspace
+    /// with the same per-project fault isolation + skipped-project reconciliation as the solution loader
+    /// (issue #109 multi-solution aggregation). Projects already pulled in transitively by an earlier
+    /// project's reference graph are opened once (de-duplicated by the caller and again via
+    /// <see cref="IWorkspaceProjectLoader.IsLoaded"/>). The workspace is intentionally NOT disposed on the
+    /// success path so the returned <see cref="Solution"/> stays usable (mirroring
+    /// <see cref="LoadSolutionResilientlyAsync"/>).
+    /// </summary>
+    internal static async Task<SolutionLoadResult> LoadProjectsResilientlyAsync(
+        IReadOnlyList<string> projectPaths,
+        Action<string>? onDiagnostic = null,
+        CancellationToken cancellationToken = default)
+    {
+        var failures = new ConcurrentQueue<LoadFailure>();
+        var workspace = MSBuildWorkspace.Create();
+        RegisterFailureSink(workspace, failures, onDiagnostic);
+
+        Solution solution;
+        List<SkippedProject> thrownSkipped;
+        try
+        {
+            var loader = new MSBuildWorkspaceProjectLoader(workspace);
+            (solution, thrownSkipped) =
+                await LoadProjectsIndividuallyAsync(projectPaths, loader, onDiagnostic, cancellationToken);
+        }
+        catch
+        {
+            workspace.Dispose();
+            throw;
+        }
+
+        var skipped = ReconcileSkipped(projectPaths, solution, failures, thrownSkipped, onDiagnostic);
+        return new SolutionLoadResult(solution, skipped);
+    }
+
+    /// <summary>
     /// Opens each declared project individually, isolating a per-project load failure. Factored out
     /// (over the <see cref="IWorkspaceProjectLoader"/> seam) so the isolation logic is unit-testable
     /// without a real crashing MSBuild toolchain.

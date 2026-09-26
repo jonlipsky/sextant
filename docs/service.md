@@ -94,8 +94,9 @@ for `localhost` or an IP literal; a non-IP **hostname** binds all interfaces, so
 governs how that checkout is obtained:
 
 - **`locate` (default)** — the node only **locates** a checkout that already exists on its persistent
-  checkout volume (under `SEXTANT_SERVICE_CHECKOUT_ROOT`) and finds a `.slnx`/`.sln` to index. If none is
-  present the job terminates `unsupported`. No outbound git is performed — behavior is byte-identical to a
+  checkout volume (under `SEXTANT_SERVICE_CHECKOUT_ROOT`) and selects the solution(s) to index (see
+  [Solution selection](#solution-selection--which-solutions-get-indexed) below). If no checkout or solution
+  is present the job terminates `unsupported`. No outbound git is performed — behavior is byte-identical to a
   node with no provisioning at all. Use this when an external orchestrator provisions the checkout volume.
 - **`clone`** — the node becomes **self-sufficient**: on a locate miss it clones the repository at the
   requested `commit_sha` into the checkout volume, then indexes it. The canonical checkout directory is a
@@ -107,6 +108,34 @@ governs how that checkout is obtained:
   checkout; a failed clone leaves no checkout and the job degrades cleanly (a **deterministic** failure to
   terminal `unsupported`/`failed`, a **transient** one to a bounded retry — see below) rather than indexing
   the wrong commit. Concurrent ensures for the same repository are serialized so they clone once.
+
+#### Solution selection — which solution(s) get indexed
+
+A monorepo commonly carries **many** solutions (MAUI/iOS/Android/Mac/Windows/Unity heads, vendored
+externals). The worker chooses the set to index **explicitly and deterministically** — never the historical
+"first-enumerated `.slnx`/`.sln`", which indexed one arbitrary solution and silently ignored the rest:
+
+- **Configured (authoritative).** A `solutions` list in the checkout's **own** `sextant.json` (repo-relative
+  paths) selects that exact set, **in listed order**. All configured solutions are indexed into **one**
+  repository snapshot: their projects are unioned and **de-duplicated by project identity** (a project shared
+  by several solution heads is indexed **once**, never per solution). A listed entry that is missing, is not
+  a `.sln`/`.slnx`, or escapes the checkout is recorded **skipped-with-reason** (it is never silently
+  dropped) and makes the snapshot **partial**.
+- **Default (no config).** All solutions under the checkout are discovered (build-output/VCS dirs excluded)
+  and **one** deterministic default is chosen, preferring a root-level, **Linux-loadable** solution (e.g. a
+  `*-no-macos.slnx`-style root) over a nested one or a platform head. The other discovered solutions are
+  **recorded** (not silently ignored) so an operator can see them and opt into a wider set via `solutions`.
+
+Because selection is a pure function of the committed checkout tree + committed `sextant.json` (both pinned
+by the commit), it is **stable across runs** for a given commit.
+
+**Coverage reporting (partial never reported as complete).** Every selected solution, every skipped
+configured solution, and every project that could not be loaded on this worker (e.g. an iOS/Android/Mac/WPF
+head on a Linux worker — per-project failure isolation from #90) is recorded in the job's per-project
+diagnostics. Any skipped project or skipped configured solution — or a selected set that loads **zero**
+projects — yields a **`partial`** job status, so a partial-coverage snapshot is never presented as complete.
+Routing platform heads to a native Windows/macOS worker is a separate concern (issue #89); here they are
+recorded skipped-with-reason.
 
 #### Transient vs deterministic provisioning failures
 

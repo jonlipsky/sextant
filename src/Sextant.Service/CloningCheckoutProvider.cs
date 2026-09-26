@@ -97,7 +97,7 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
         SweepOrphanedTempClones();
     }
 
-    public bool TryResolve(EnsureSnapshotRequest request, out string checkoutDir, out string solutionPath)
+    public bool TryResolve(EnsureSnapshotRequest request, out CheckoutResolution resolution)
     {
         // Cache hit / idempotency: an already-provisioned checkout with a solution short-circuits with NO
         // git — BUT ONLY when it is at the requested commit. A checkout at a DIFFERENT commit must never be
@@ -105,12 +105,11 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
         // so a VERIFIED mismatch of our own cache falls through to re-provisioning below. An UNVERIFIABLE
         // checkout (e.g. an externally-provisioned non-git tree) keeps the locate provider's
         // trust-what-is-on-disk semantics — we neither re-clone nor clobber it.
-        if (_inner.TryResolve(request, out checkoutDir, out solutionPath)
-            && CheckoutCommitState(checkoutDir, request.CommitSha) != CommitState.Mismatch)
+        if (_inner.TryResolve(request, out resolution)
+            && CheckoutCommitState(resolution.CheckoutDir, request.CommitSha) != CommitState.Mismatch)
             return true;
 
-        checkoutDir = string.Empty;
-        solutionPath = string.Empty;
+        resolution = null!;
 
         var dirName = ServicePaths.RepoDirectoryName(request.RepositoryRemoteUrl);
         var root = Path.GetFullPath(_paths.CheckoutRoot);
@@ -123,12 +122,11 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
         {
             // Re-check under the lock: a concurrent ensure for the same repo may have just published it AT
             // the requested commit.
-            if (_inner.TryResolve(request, out checkoutDir, out solutionPath)
-                && CheckoutCommitState(checkoutDir, request.CommitSha) != CommitState.Mismatch)
+            if (_inner.TryResolve(request, out resolution)
+                && CheckoutCommitState(resolution.CheckoutDir, request.CommitSha) != CommitState.Mismatch)
                 return true;
 
-            checkoutDir = string.Empty;
-            solutionPath = string.Empty;
+            resolution = null!;
 
             // Decide whether a pre-existing canonical directory may be REPLACED. Only a VERIFIED commit
             // mismatch of a checkout we manage is safe to swap (the service serializes ALL production behind
@@ -147,7 +145,7 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
                 return false;
 
             // Publish succeeded → the inner provider now locates the freshly-cloned checkout + solution.
-            return _inner.TryResolve(request, out checkoutDir, out solutionPath);
+            return _inner.TryResolve(request, out resolution);
         }
     }
 
