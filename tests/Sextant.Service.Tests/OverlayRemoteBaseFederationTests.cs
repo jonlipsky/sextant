@@ -197,6 +197,86 @@ public class OverlayRemoteBaseFederationTests
             "an unresolvable base with no peers records an actionable reason (criterion 3/6)");
     }
 
+    // ---- #119 review: a pre-#119 peer's empty `complete` page is not proof it publishes the base ------
+
+    [TestMethod]
+    public async Task FindSymbol_LegacyPeerEmptyCompletePage_ReportsBaseUnpublished_NotComplete()
+    {
+        // A pre-#119 peer answered `complete: true` with no `published` field for ANY known identity —
+        // including a base it has since superseded — with no symbols. The overlay read must treat that as
+        // "no peer publishes the base" (partial + reason), never as an empty complete base. The symbol lives
+        // only in the base, so the read must reach the peer.
+        using var local = new ThinMachine();
+        var legacyBody = $$"""{"identity_hash":"{{BaseHash()}}","symbols":[],"complete":true}""";
+        using var node = local.FederatedTo(new HttpClient(new RawBodyPeerHandler(legacyBody)), QueryToken);
+
+        var json = await FindSymbolTool.FindSymbol(node, "global::Shared.BaseType");
+        using var doc = JsonDocument.Parse(json);
+
+        Assert.AreEqual(0, doc.RootElement.GetProperty("results").GetArrayLength(),
+            "the base-only symbol cannot be federated from a peer that does not prove it publishes the base");
+        var snapshot = doc.RootElement.GetProperty("meta").GetProperty("snapshot");
+        Assert.AreEqual("local", snapshot.GetProperty("origin").GetString());
+        Assert.AreEqual("partial", snapshot.GetProperty("completeness").GetString(),
+            "an unproven remote base is never presented as complete");
+        StringAssert.Contains(snapshot.GetProperty("fallback_reason").GetString()!, "no configured peer publishes",
+            "the read explains the base is unpublished rather than silently serving zero base rows");
+    }
+
+    // ---- #119 review: recorded vs live remote-base coverage never contradict ----------------------------
+
+    [TestMethod]
+    public async Task FindSymbol_OverlayRecordedPartialCoverage_PeerServesComplete_StaysPartialAndConsistent()
+    {
+        // The overlay recorded a PARTIAL base coverage at publish (from the peer it probed), but the peer
+        // answering this read reports the same base as complete. The partial record must win for BOTH
+        // `completeness` and `coverage`, never "partial" completeness beside a "complete" coverage verdict.
+        using var local = new ThinMachine(overlayCoverage: new SnapshotCoverage
+        {
+            Verdict = SnapshotCoverageVerdict.Partial,
+            Reasons = ["1 of 2 declared submodule(s) are not populated"],
+            SubmodulesDeclared = 2,
+            SubmodulesUnpopulated = 1
+        });
+        await using var peer = await PeerServer.StartAsync(token: QueryToken,
+            baseCoverage: new SnapshotCoverage { Verdict = SnapshotCoverageVerdict.Complete, SubmodulesDeclared = 2 });
+        using var node = local.FederatedTo(peer.Client, QueryToken);
+
+        var json = await FindSymbolTool.FindSymbol(node, "global::Shared.BaseType");
+        using var doc = JsonDocument.Parse(json);
+        Assert.AreEqual(1, doc.RootElement.GetProperty("results").GetArrayLength(), "the base symbol is federated");
+        var snapshot = doc.RootElement.GetProperty("meta").GetProperty("snapshot");
+        Assert.AreEqual("remote", snapshot.GetProperty("origin").GetString());
+        Assert.AreEqual("partial", snapshot.GetProperty("completeness").GetString());
+        Assert.AreEqual("partial", snapshot.GetProperty("coverage").GetProperty("verdict").GetString(),
+            "the recorded partial coverage is not masked by the live peer's complete verdict");
+    }
+
+    [TestMethod]
+    public async Task FindSymbol_NoRecordedCoverage_PeerServesPartial_IsPartialAndConsistent()
+    {
+        // The inverse: the overlay recorded no coverage, and the live peer reports the base as partial. The
+        // live partial verdict must drive BOTH `completeness` and `coverage`.
+        using var local = new ThinMachine();
+        await using var peer = await PeerServer.StartAsync(token: QueryToken, baseCoverage: new SnapshotCoverage
+        {
+            Verdict = SnapshotCoverageVerdict.Partial,
+            Reasons = ["3 of 4 discovered solution(s) were not selected"],
+            SolutionsDiscovered = 4,
+            SolutionsNotSelected = 3
+        });
+        using var node = local.FederatedTo(peer.Client, QueryToken);
+
+        var json = await FindSymbolTool.FindSymbol(node, "global::Shared.BaseType");
+        using var doc = JsonDocument.Parse(json);
+        Assert.AreEqual(1, doc.RootElement.GetProperty("results").GetArrayLength(), "the partial base's rows are still served");
+        var snapshot = doc.RootElement.GetProperty("meta").GetProperty("snapshot");
+        Assert.AreEqual("partial", snapshot.GetProperty("completeness").GetString());
+        var coverage = snapshot.GetProperty("coverage");
+        Assert.AreEqual("partial", coverage.GetProperty("verdict").GetString());
+        Assert.AreEqual(3, coverage.GetProperty("solutions_not_selected").GetInt32());
+    }
+
     // ---- provenance freshness (criterion 6) ---------------------------------------------------------
 
     [TestMethod]
@@ -282,12 +362,12 @@ public class OverlayRemoteBaseFederationTests
         public string Path { get; }
         private readonly IndexDatabase _db;
 
-        public ThinMachine()
+        public ThinMachine(SnapshotCoverage? overlayCoverage = null)
         {
             Path = ServiceTestFixtures.NewDbPath();
             _db = new IndexDatabase(Path);
             _db.RunMigrations();
-            SeedBaselessOverlay(_db.GetConnection());
+            SeedBaselessOverlay(_db.GetConnection(), overlayCoverage);
         }
 
         public DatabaseProvider FederatedTo(HttpClient peerClient, string? token)
@@ -303,7 +383,7 @@ public class OverlayRemoteBaseFederationTests
             return provider;
         }
 
-        private static void SeedBaselessOverlay(SqliteConnection conn)
+        private static void SeedBaselessOverlay(SqliteConnection conn, SnapshotCoverage? overlayCoverage)
         {
             var store = new SnapshotStore(conn);
             var repoId = store.EnsureRepository(RepoUrl, now: 1);
@@ -339,6 +419,9 @@ public class OverlayRemoteBaseFederationTests
             // matches the base's "BaseType" — so ONE fuzzy query proves the local⊕remote union.
             InsertSymbol(conn, touchedProject, "K:Touched.Base", "global::Touched.Base", "Base");
             store.MarkComplete(overlayId, publishedAt: 2);
+            // Issue #119: a baseless overlay's publish records the peer-probed base coverage on its own row.
+            if (overlayCoverage is not null)
+                new SnapshotCoverageStore(conn).Record(overlayId, overlayCoverage, 2);
 
             var branchId = store.EnsureBranch(repoId, "main", isDefault: true, now: 2);
             store.SetBranchPointer(branchId, overlayId, now: 2);
@@ -385,15 +468,15 @@ public class OverlayRemoteBaseFederationTests
         public string Path { get; }
         public IndexDatabase Db { get; }
 
-        public PeerCatalog()
+        public PeerCatalog(SnapshotCoverage? baseCoverage = null)
         {
             Path = ServiceTestFixtures.NewDbPath();
             Db = new IndexDatabase(Path);
             Db.RunMigrations();
-            PublishBase(Db.GetConnection());
+            PublishBase(Db.GetConnection(), baseCoverage);
         }
 
-        private static void PublishBase(SqliteConnection conn)
+        private static void PublishBase(SqliteConnection conn, SnapshotCoverage? baseCoverage)
         {
             var store = new SnapshotStore(conn);
             var repoId = store.EnsureRepository(RepoUrl, now: 1);
@@ -434,6 +517,8 @@ public class OverlayRemoteBaseFederationTests
             // A STALE row in the touched project — the overlay re-extracted this project, so it must be shadowed.
             InsertSymbol(conn, touchedProject, "K:Touched.StaleType", "global::Touched.StaleType", "StaleType");
             store.MarkComplete(baseId, publishedAt: 1);
+            if (baseCoverage is not null)
+                new SnapshotCoverageStore(conn).Record(baseId, baseCoverage, 1);
         }
 
         private static ProjectIdentity Ident(string canonical, string path) => new()
@@ -455,9 +540,9 @@ public class OverlayRemoteBaseFederationTests
         private SnapshotService Service { get; init; } = null!;
         private PeerCatalog Catalog { get; init; } = null!;
 
-        public static async Task<PeerServer> StartAsync(string? token)
+        public static async Task<PeerServer> StartAsync(string? token, SnapshotCoverage? baseCoverage = null)
         {
-            var catalog = new PeerCatalog();
+            var catalog = new PeerCatalog(baseCoverage);
             var options = ServiceTestFixtures.NewOptions(catalog.Path, queryToken: token);
             var service = SnapshotService.Start(options, worker: null, catalog.Db);
 
@@ -536,6 +621,16 @@ public class OverlayRemoteBaseFederationTests
             }
             return result;
         }
+    }
+
+    /// <summary>A peer that answers every page request with a fixed JSON body (e.g. a pre-#119 page shape).</summary>
+    private sealed class RawBodyPeerHandler(string body) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct) =>
+            Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json")
+            });
     }
 
     private static void InsertSymbol(SqliteConnection conn, long projectId, string symbolKey, string fqn, string displayName)

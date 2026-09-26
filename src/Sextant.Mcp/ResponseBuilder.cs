@@ -238,6 +238,10 @@ public sealed class SnapshotMeta
     [JsonPropertyName("base_identity_hash")]
     public string? BaseIdentityHash { get; set; }
 
+    /// <summary>The served base snapshot's durable checkout coverage (issue #119); omitted when not recorded.</summary>
+    [JsonPropertyName("coverage")]
+    public Sextant.Core.SnapshotCoverage? Coverage { get; set; }
+
     /// <summary>Projects planner provenance into the serializable meta block, or null to omit it.</summary>
     public static SnapshotMeta? From(SnapshotProvenance? p)
     {
@@ -258,7 +262,8 @@ public sealed class SnapshotMeta
                 .ToList(),
             Freshness = p.Freshness,
             Origin = p.Origin,
-            BaseIdentityHash = p.BaseIdentityHash
+            BaseIdentityHash = p.BaseIdentityHash,
+            Coverage = p.Coverage
         };
     }
 }

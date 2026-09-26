@@ -9,8 +9,9 @@ namespace Sextant.Store;
 /// the four remote-federation behaviors Phase 11 deferred to the service:
 /// <list type="bullet">
 ///   <item><b>Paging</b> — forwards the stable cursor so a large base snapshot streams page by page.</item>
-///   <item><b>Caching by snapshot id</b> — every fetched page is cached by (identity hash, cursor); an
-///   immutable published snapshot never changes, so the cache never goes stale.</item>
+///   <item><b>Caching by snapshot id</b> — every fetched page of a PUBLISHED snapshot is cached by (identity
+///   hash, cursor); an immutable published snapshot never changes, so the cache never goes stale. An empty
+///   page that does not prove publication ("not published yet") is never cached (issue #119).</item>
 ///   <item><b>Timeout</b> — each fetch is bounded by <see cref="_timeout"/> via a linked cancellation.</item>
 ///   <item><b>Transparent offline fallback</b> — a page already in the cache is served WITHOUT contacting
 ///   the peer, so once warmed a federated read keeps working when the peer is unreachable; only a
@@ -75,7 +76,12 @@ public sealed class RemoteHttpBaseSnapshotSource : IBaseSnapshotSource
                 throw new RemoteSnapshotUnavailableException(
                     $"Remote peer '{_peerBaseUrl}' returned a malformed snapshot page (null symbols).");
 
-            _cache.Set(request.CacheKey, page);
+            // Cache only pages that are PROVEN immutable: a page with rows (a peer serves rows only for a
+            // published snapshot) or one the peer affirmatively marks published. An empty unproven page —
+            // "unknown / not yet published" (issue #119) — describes MUTABLE state: the same identity may
+            // publish moments later, so caching it would pin a stale negative for the process lifetime.
+            if (page.Symbols.Count > 0 || page.IsProvenPublished)
+                _cache.Set(request.CacheKey, page);
             return page;
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
