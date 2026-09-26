@@ -41,4 +41,16 @@ public sealed record SnapshotContext
     /// caller) preserves the unconditional-advance behavior byte-for-byte.
     /// </summary>
     public long? BranchHeadSequence { get; init; }
+
+    /// <summary>
+    /// The checkout coverage the producing worker computed for this snapshot (issue #119), or <c>null</c>
+    /// when the caller does not compute coverage (the local CLI/daemon path). For a baseless remote-base
+    /// overlay (#108) the local reconciler sets it to the peer-reported coverage of the committed base.
+    /// When set, the orchestrator
+    /// records it (migration 022) inside the SAME transaction that publishes the snapshot, so a published
+    /// service snapshot is never observable without its coverage. Re-selecting an already-published
+    /// snapshot never backfills or rewrites its coverage (the snapshot is immutable). Not part of snapshot
+    /// identity: coverage is derived from the same commit + configuration the identity already pins.
+    /// </summary>
+    public SnapshotCoverage? Coverage { get; init; }
 }

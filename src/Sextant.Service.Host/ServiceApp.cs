@@ -238,7 +238,15 @@ public static class ServiceApp
         control.MapGet("/resolve", (string repository, string? branch, SnapshotService service) =>
         {
             var row = service.ResolveBranch(repository, branch);
-            return row is null ? Results.NotFound() : Results.Json(row, ServiceJson.Options);
+            if (row is null)
+                return Results.NotFound();
+
+            // Additive (issue #119): the snapshot's durable coverage rides alongside the snapshot row so a
+            // caller can tell a partial snapshot from a complete one without a second request.
+            var body = System.Text.Json.JsonSerializer.SerializeToNode(row, ServiceJson.Options)!.AsObject();
+            if (service.GetCoverage(row.Id) is { } coverage)
+                body["coverage"] = System.Text.Json.JsonSerializer.SerializeToNode(coverage, ServiceJson.Options);
+            return Results.Json(body, ServiceJson.Options);
         });
 
         control.MapPost("/retention", (bool? execute, HttpRequest req, SnapshotService service) =>

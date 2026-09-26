@@ -161,6 +161,37 @@ public class LocalOverlayIntegrationTests : IDisposable
     }
 
     [TestMethod]
+    public async Task DirtyTree_RemotePartialBase_RecordsThePeerCoverageOnTheBaselessOverlay()
+    {
+        // Issue #119: the peer's committed base covers only part of the checkout. The baseless overlay has
+        // no local base row to read coverage from, so the reconciler records the probed base coverage on the
+        // overlay at publish — a local overlay hit must never present that partial base as complete.
+        var repo = CreateGitProject("Widget");
+        var dbPath = Path.Combine(_tempDir, "index.db");
+        using var db = new IndexDatabase(dbPath);
+        db.RunMigrations();
+
+        File.WriteAllText(repo.SourceFile, "namespace App;\npublic class Widget { public int Value() => 42; }\n");
+        var peer = new StubBaseSource(publishesBase: true, coverage: new SnapshotCoverage
+        {
+            Verdict = SnapshotCoverageVerdict.Partial,
+            Reasons = ["3 of 4 discovered solution(s) were not selected"],
+            SolutionsDiscovered = 4,
+            SolutionsNotSelected = 3
+        });
+
+        var result = await ReconcileAsync(db, repo.SolutionPath, peer);
+        Assert.AreEqual(OverlayReconcileKind.Overlay, result.Kind);
+
+        var conn = db.GetConnection();
+        var overlayId = new SnapshotStore(conn).GetSelectedSnapshotId()!.Value;
+        var recorded = new SnapshotCoverageStore(conn).Get(overlayId);
+        Assert.IsNotNull(recorded, "the baseless overlay carries its remote base's coverage (#119)");
+        Assert.IsTrue(recorded.IsPartial);
+        Assert.AreEqual(3, recorded.SolutionsNotSelected);
+    }
+
+    [TestMethod]
     public async Task DirtyTree_NoLocalBase_RemotePeerLacksBase_FallsBackWithPeerReason()
     {
         // Issue #108: a dirty tree with NO local base AND no configured peer that publishes the committed
@@ -686,7 +717,7 @@ public class LocalOverlayIntegrationTests : IDisposable
     /// A minimal <see cref="IBaseSnapshotSource"/> that either publishes a one-row base page or an empty
     /// terminal page, recording the identity hash it was probed with (issue #108 reconciler decision test).
     /// </summary>
-    private sealed class StubBaseSource(bool publishesBase) : IBaseSnapshotSource
+    private sealed class StubBaseSource(bool publishesBase, SnapshotCoverage? coverage = null) : IBaseSnapshotSource
     {
         public string? LastRequestedHash { get; private set; }
 
@@ -708,7 +739,9 @@ public class LocalOverlayIntegrationTests : IDisposable
                 IdentityHash = request.IdentityHash,
                 Symbols = rows,
                 NextCursor = null,
-                Complete = true
+                Complete = coverage is not { IsPartial: true },
+                Published = publishesBase ? true : null,
+                Coverage = publishesBase ? coverage : null
             });
         }
     }

@@ -124,18 +124,69 @@ externals). The worker chooses the set to index **explicitly and deterministical
 - **Default (no config).** All solutions under the checkout are discovered (build-output/VCS dirs excluded)
   and **one** deterministic default is chosen, preferring a root-level, **Linux-loadable** solution (e.g. a
   `*-no-macos.slnx`-style root) over a nested one or a platform head. The other discovered solutions are
-  **recorded** (not silently ignored) so an operator can see them and opt into a wider set via `solutions`.
+  **recorded** as `solution_not_selected` warnings and make the snapshot **partial** (issue #119) — list them
+  in `solutions` to index them.
 
 Because selection is a pure function of the committed checkout tree + committed `sextant.json` (both pinned
 by the commit), it is **stable across runs** for a given commit.
 
-**Coverage reporting (partial never reported as complete).** Every selected solution, every skipped
-configured solution, and every project that could not be loaded on this worker (e.g. an iOS/Android/Mac/WPF
-head on a Linux worker — per-project failure isolation from #90) is recorded in the job's per-project
-diagnostics. Any skipped project or skipped configured solution — or a selected set that loads **zero**
-projects — yields a **`partial`** job status, so a partial-coverage snapshot is never presented as complete.
-Routing platform heads to a native Windows/macOS worker is a separate concern (issue #89); here they are
-recorded skipped-with-reason.
+**Coverage reporting (partial never reported as complete, issue #119).** Before indexing, the worker computes
+a durable **coverage** record for the checkout from the selection, the multi-solution load, and a pure
+file-system inventory (project files on disk, excluding `obj`/`bin`/`.git`; submodules declared by
+`.gitmodules`, recursing through populated ones). The snapshot is **`partial`** when any of these hold:
+
+| Gap | Diagnostic `code` |
+| --- | --- |
+| a discovered solution was not selected (no-config default) | `solution_not_selected` |
+| a configured solution is missing/invalid/outside the checkout | `solution_skipped` |
+| a declared project could not load on this worker (e.g. an iOS/Android/Mac/WPF head on Linux, #90) | `project_skipped` |
+| a selected solution declared no readable project, or nothing loaded at all | `solution_no_projects` / `no_projects_loaded` |
+| a declared submodule is not populated (no `.git` at its path) | `submodule_unpopulated` |
+| a project file on disk is in no selected solution and was not pulled in by a `ProjectReference` | `project_file_unreferenced` |
+| part of the tree could not be inspected (unreadable dir, `.gitmodules` entry escaping the checkout) | `coverage_scan_incomplete` |
+
+Under an explicit `solutions` list, project files outside that scope are reported as `info` and do **not**
+make the snapshot partial (the operator chose the scope). Per-item diagnostics are capped at 200 per code
+with a summary row; the coverage counts are never capped. Diagnostic paths are checkout-relative.
+
+The coverage record is persisted in `snapshot_coverage` (migration `022`) **in the same transaction that
+publishes the snapshot**, and the job verdict is derived from it: a partial snapshot is still **published
+and served** (its `snapshots.status` is `complete`, i.e. servable), but the job is `partial`, its `reason`
+says why, and every surface carries the `coverage` block:
+
+- `POST /control/ensure` and `GET /control/status/{jobId}` — `status: "partial"`, `reason`, `coverage`.
+- `GET /control/resolve` — the snapshot row plus an additive `coverage` object. The row's own `status`
+  stays `complete` (servable); read `coverage.verdict` for completeness.
+- `GET /query/snapshots/{identityHash}/symbols` — `complete` is `true` only when the snapshot is published
+  **and** not coverage-partial; the new `published` flag says whether this node publishes the snapshot;
+  `coverage` carries the record. **Wire change:** before #119 `complete` meant "this node knows the
+  snapshot" (it was `true` even for a pending or superseded identity with no rows). Current clients follow
+  a resumed multi-peer cursor on `published` (falling back to `complete` for a peer that predates it, as
+  before), but treat an empty FIRST page as "not published" unless `published` is `true` — so an older
+  peer's empty page is never served as an empty complete base and never masks a later peer that does
+  publish it. A pre-#119 client paging a current server could only misread an empty partial page, and in
+  practice it cannot address one: identity hashes fold in the schema version, so an old (schema ≤ 21)
+  client only computes hashes of pre-022 snapshots, which carry no coverage row and keep `complete` =
+  published. Still, upgrade peers and their clients together. Empty "not published" pages are never
+  cached by `RemoteHttpBaseSnapshotSource` (that state is mutable), so a base published after a probe
+  is seen on the next fetch. Multi-peer source affinity (binding a resumed cursor, or an overlay's
+  recorded base coverage, to the peer that produced it) is tracked in #122.
+- MCP `meta.snapshot.completeness` is `partial` and `meta.snapshot.coverage` is set; `get_index_status`
+  reports `index.coverage` (an overlay reports its committed base's coverage; a baseless remote-base
+  overlay records the peer's probed base coverage on its own row at publish, so a local hit that never
+  contacts the peer still reports a partial remote base as partial).
+
+A snapshot with **no** coverage row (a local CLI/daemon index, a local-base overlay's own row, a remote-base
+overlay over a pre-#119 peer, or a snapshot published before migration `022`) has coverage *not recorded*: its
+surfaces omit `coverage` and keep their previous
+completeness. Re-selecting an already-published snapshot never backfills coverage. Because migration `022`
+bumps the schema version (folded into the snapshot identity), every repository is re-indexed — and gets a
+coverage row — on its next ensure. The Phase-10 `snapshots.fallback_reason` column is **not** used for
+coverage; the reason lives on the job and in the coverage record.
+
+Clone mode does **not** initialize submodules yet, so a repository with submodules is honestly reported
+`partial` (`submodule_unpopulated`) until submodule provisioning lands. Routing platform heads to a native
+Windows/macOS worker is a separate concern (issue #89); here they are recorded skipped-with-reason.
 
 #### Transient vs deterministic provisioning failures
 
@@ -197,8 +248,8 @@ The host deliberately **separates control endpoints from query endpoints**, and 
 | `GET /ready` | — | open | Worker **CAPACITY**: `503` when this node has no worker (query-only), so an operator can tell "up" from "can index". |
 | `POST /control/ensure` | control | control token | Idempotent ensure-snapshot (criterion 1). Accepts an optional monotonic `branch_head_sequence` for forward-only branch-head advance (Phase 14, issue #84). |
 | `POST /control/contribute` | control | control **or** contribute token | Ingest a client/CI semantic contribution (Phase 16); the least-privilege contribute token authorizes this endpoint only. |
-| `GET /control/status/{jobId}` | control | control token | Job status + per-project diagnostics (criterion 5). |
-| `GET /control/resolve` | control | control token | Resolve a repository branch to its current complete snapshot. |
+| `GET /control/status/{jobId}` | control | control token | Job status + per-project diagnostics (criterion 5) + checkout `coverage` (#119). |
+| `GET /control/resolve` | control | control token | Resolve a repository branch to its current published snapshot (+ its `coverage`, #119). |
 | `POST /control/retention` | control | control token | Run the service-owned retention/GC pass (`?execute=true` to apply). |
 | `GET /control/metrics` | control | control token | Observability snapshot (criterion 5); `?format=prometheus` for text exposition, else JSON. |
 | `GET /control/audit` | control | control token | Durable audit log (criterion 5); optional `action`/`repository`/`limit` filters. **Operator-only.** |
@@ -448,9 +499,10 @@ Migration `016_service_job_catalog.sql` adds `snapshot_jobs`, `snapshot_job_diag
 (Phase 15); `018_client_contributions.sql` and `019_pull_request_retention_roots.sql` are the Phase-17
 slice-1/2 additions; `020_audit_log.sql` adds the durable operational + security **audit log** (Phase 17
 slice 3, criterion 5); `021_branch_head_sequence.sql` adds `branches.head_sequence` for the forward-only
-branch-head advance on the ensure path (Phase 14, issue #84). All are additive/forward-only. See
+branch-head advance on the ensure path (Phase 14, issue #84); `022_snapshot_coverage.sql` adds the durable
+per-snapshot `snapshot_coverage` record (issue #119). All are additive/forward-only. See
 [`schema.md`](schema.md) for the table definitions. `LatestSchemaVersion` auto-derives from the highest
-migration and is **21**.
+migration and is **22**.
 
 ## Testing
 
@@ -468,7 +520,9 @@ catalog, and a `FakeSnapshotWorker`. The suite maps to the acceptance criteria:
 
 Plus store-level regressions: `RetentionSnapshotGcTests` (#46/#37/#54), `WriterLeaseTests` (#38),
 `ProviderGrowthImmutabilityTests` (#53), and `RemoteFederationTests` (#51 paging/caching/offline/timeout/
-auth).
+auth). Coverage integrity (#119): `SnapshotCoverageBuilderTests`, `CheckoutInventoryTests`,
+`SnapshotCoverageStoreTests`, `OrchestratorCoverageTests`, `SnapshotServiceCoverageTests`, and the
+`CoverageRegressionFixtureTests` clone of a two-solution repo with an uninitialized submodule.
 
 ### Phase 15 — platform routing tests
 

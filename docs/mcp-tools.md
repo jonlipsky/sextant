@@ -104,7 +104,13 @@ federated read), `meta` carries a `snapshot` block describing the provenance of 
 - `base_snapshot_id` / `base_commit` — the committed base snapshot the read rests on, and its commit.
 - `overlay_generation` / `is_overlay` — the Phase-10 overlay generation layered on the base, when the read
   includes uncommitted working-tree changes.
-- `completeness` — `complete` or `partial` for the served generation.
+- `completeness` — `complete` or `partial` for the served generation. A generation whose committed base
+  has a recorded **partial** checkout coverage (issue #119) is `partial` even though it is published.
+- `coverage` — the committed base's durable checkout coverage (issue #119): `verdict` (`complete` /
+  `partial`), `reasons`, `selection_source`, and the solution / project / submodule counts behind the
+  verdict (`solutions_not_selected`, `projects_skipped`, `project_files_unreferenced`,
+  `submodules_unpopulated`, `scan_errors`, …). Omitted when no coverage was recorded (a local CLI/daemon
+  index or a pre-022 snapshot). `get_index_status` reports the same object as `index.coverage`.
 - `scope` — the federation partition the results came from (e.g. `local`, `committed`).
 - `dirty` — whether the working tree had uncommitted changes.
 - `fallback_reason` — set when a full local fallback could not reuse a committed base.
@@ -263,8 +269,10 @@ repository's service (issue #60). Falls back to a cached page when a warmed peer
 | `limit` | int | no | Max symbols per page (default 500, clamped 1..5000) |
 
 `meta.snapshot.origin` (`local`/`remote`) and `base_identity_hash` record where the rows came from;
-`meta.next_cursor` continues paging. When the snapshot is neither local nor served by any peer,
-the response is an empty result with an explanatory `message` (never a silent zero-symbol answer).
+`meta.snapshot.completeness` / `coverage` report the snapshot's checkout coverage (a partial snapshot's rows
+are still served, with `completeness: "partial"`, issue #119); `meta.next_cursor` continues paging. When the
+snapshot is neither local nor served by any peer, the response is an empty result with an explanatory
+`message` (never a silent zero-symbol answer).
 
 > **Local planner tool only.** This tool takes a caller-supplied `identity_hash` that is not bound to the
 > repository scope the read gate authorizes, so it is exposed on the local single-tenant MCP surface (stdio

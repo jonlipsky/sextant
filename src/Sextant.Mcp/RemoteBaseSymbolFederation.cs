@@ -34,6 +34,9 @@ internal static class RemoteBaseSymbolFederation
         /// <summary>The completeness of the last served page (false ⇒ the base itself is partial upstream).</summary>
         public bool Complete { get; init; } = true;
 
+        /// <summary>The base snapshot's durable checkout coverage as reported by the peer (issue #119), or null.</summary>
+        public SnapshotCoverage? Coverage { get; init; }
+
         /// <summary>True when at least one served page came from the transparent offline cache.</summary>
         public bool FromOfflineCache { get; init; }
 
@@ -67,6 +70,7 @@ internal static class RemoteBaseSymbolFederation
         var matched = new List<SnapshotSymbolRow>();
         var seenKeys = new HashSet<string>(StringComparer.Ordinal);
         var complete = true;
+        SnapshotCoverage? coverage = null;
         var droppedUnattributed = false;
         var fromCache = false;
         string? cursor = null;
@@ -80,17 +84,20 @@ internal static class RemoteBaseSymbolFederation
                     cancellationToken).ConfigureAwait(false);
 
                 complete = page.Complete;
+                coverage = page.Coverage ?? coverage;
                 fromCache |= page.FromOfflineCache;
 
-                // A reachable source that returns an empty, terminal FIRST page does not publish this base
-                // (mirrors CompositeBaseSnapshotSource's "skip a 404/empty peer" contract). Report it so the
-                // read serves the overlay only with a clear reason instead of a silent zero-symbol answer.
-                if (cursor is null && page.Symbols.Count == 0 && page.NextCursor is null)
+                // A reachable source that returns an empty, terminal FIRST page without proof of publication
+                // (a pre-#119 peer never sends that proof) does not publish this base (mirrors
+                // CompositeBaseSnapshotSource's "skip a 404/empty peer" contract). Report it so the read serves
+                // the overlay only with a clear reason instead of a silent zero-symbol answer. A base the
+                // source affirmatively publishes but that is empty is a legitimate (empty) answer.
+                if (cursor is null && page.Symbols.Count == 0 && page.NextCursor is null && !page.IsProvenPublished)
                     return new Outcome
                     {
                         Rows = matched,
                         ServedRemote = true,
-                        Complete = complete,
+                        Complete = false,
                         FromOfflineCache = fromCache,
                         UnavailableReason = "no configured peer publishes the committed base snapshot"
                     };
@@ -121,7 +128,8 @@ internal static class RemoteBaseSymbolFederation
                     if (maxMatches > 0 && matched.Count >= maxMatches)
                         return new Outcome
                         {
-                            Rows = matched, ServedRemote = true, Complete = complete && !droppedUnattributed, FromOfflineCache = fromCache
+                            Rows = matched, ServedRemote = true, Complete = complete && !droppedUnattributed,
+                            FromOfflineCache = fromCache, Coverage = coverage
                         };
                 }
 
@@ -130,7 +138,11 @@ internal static class RemoteBaseSymbolFederation
                 cursor = page.NextCursor;
             }
 
-            return new Outcome { Rows = matched, ServedRemote = true, Complete = complete && !droppedUnattributed, FromOfflineCache = fromCache };
+            return new Outcome
+            {
+                Rows = matched, ServedRemote = true, Complete = complete && !droppedUnattributed,
+                FromOfflineCache = fromCache, Coverage = coverage
+            };
         }
         catch (Exception ex) when (ex is RemoteSnapshotUnavailableException or HttpRequestException)
         {

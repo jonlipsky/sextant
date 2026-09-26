@@ -1,4 +1,5 @@
 using Microsoft.Data.Sqlite;
+using Sextant.Core;
 using Sextant.Core.Platform;
 using Sextant.Service.Backup;
 using Sextant.Service.Contributions;
@@ -220,8 +221,12 @@ public sealed class SnapshotService : IDisposable
 
         if (SnapshotJobStatus.IsTerminal(job.Status) && terminalUsable)
         {
-            WithWrite(() => { AdvanceOrAttachBranchPointer(request, job.SnapshotId); return 0; });
-            return Attach(job, existed);
+            var attachedCoverage = WithWrite(() =>
+            {
+                AdvanceOrAttachBranchPointer(request, job.SnapshotId);
+                return CoverageFor(job.SnapshotId);
+            });
+            return Attach(job, existed, attachedCoverage);
         }
 
         // Serialize production so only ONE worker runs per identity; concurrent callers attach.
@@ -236,17 +241,28 @@ public sealed class SnapshotService : IDisposable
             if (SnapshotJobStatus.IsTerminal(current.Status) && TerminalResultUsable(current, hash, snapshots))
             {
                 AdvanceOrAttachBranchPointer(request, current.SnapshotId);
-                return Attach(current, existed);
+                return Attach(current, existed, CoverageFor(current.SnapshotId));
             }
 
             // A complete snapshot may already be published for this identity (produced by an earlier run
-            // whose job row predates migration 016, or a race we lost). Attach to it without re-indexing.
+            // whose job row predates migration 016, or a race we lost). Attach to it without re-indexing —
+            // but take the job's verdict from the snapshot's DURABLE coverage record (issue #119): a
+            // published snapshot whose recorded coverage is partial must never be reported complete.
             var published = snapshots.GetByIdentityHash(hash);
             if (published is { Status: SnapshotStatus.Complete })
             {
-                jobs.MarkResult(job.Id, SnapshotJobStatus.Complete, published.Id);
+                var publishedCoverage = CoverageFor(published.Id);
+                if (publishedCoverage is { IsPartial: true })
+                {
+                    jobs.MarkResult(
+                        job.Id, SnapshotJobStatus.Partial, published.Id, PartialCoverageReason(publishedCoverage));
+                }
+                else
+                {
+                    jobs.MarkResult(job.Id, SnapshotJobStatus.Complete, published.Id);
+                }
                 AdvanceOrAttachBranchPointer(request, published.Id);
-                return Attach(jobs.GetJob(job.Id)!, existed);
+                return Attach(jobs.GetJob(job.Id)!, existed, publishedCoverage);
             }
 
             // A STALE terminal result (a complete/partial job whose published snapshot was reclaimed by
@@ -304,9 +320,17 @@ public sealed class SnapshotService : IDisposable
             }
 
             var validated = ValidateWorkerResult(result, hash, snapshots);
+
+            // Defense in depth (issue #119): the job verdict never contradicts the snapshot's durable
+            // coverage record — a worker that reports Complete over a snapshot recorded as partial is
+            // downgraded to Partial with the recorded reasons.
+            var producedCoverage = CoverageFor(validated.SnapshotId);
+            if (validated.Status == SnapshotJobStatus.Complete && producedCoverage is { IsPartial: true })
+                validated = validated with { Status = SnapshotJobStatus.Partial, Error = PartialCoverageReason(producedCoverage) };
+
             jobs.ReplaceDiagnostics(job.Id, validated.Projects.Select(p => p.ToDiagnostic(job.Id)));
             jobs.MarkResult(job.Id, validated.Status, validated.SnapshotId, validated.Error);
-            return Attach(jobs.GetJob(job.Id)!, existed);
+            return Attach(jobs.GetJob(job.Id)!, existed, producedCoverage);
         }
         finally
         {
@@ -816,7 +840,7 @@ public sealed class SnapshotService : IDisposable
         {
             var jobs = new SnapshotJobStore(_conn);
             var job = jobs.GetJob(jobId);
-            return job is null ? null : new JobStatusResult { Job = job, Diagnostics = jobs.GetDiagnostics(jobId) };
+            return job is null ? null : StatusOf(jobs, job);
         });
     }
 
@@ -827,9 +851,23 @@ public sealed class SnapshotService : IDisposable
         {
             var jobs = new SnapshotJobStore(_conn);
             var job = jobs.GetJobByIdentity(identityHash);
-            return job is null ? null : new JobStatusResult { Job = job, Diagnostics = jobs.GetDiagnostics(job.Id) };
+            return job is null ? null : StatusOf(jobs, job);
         });
     }
+
+    // Caller holds the write gate. Like Attach, the reported verdict never contradicts the durable coverage.
+    private JobStatusResult StatusOf(SnapshotJobStore jobs, SnapshotJobRow job)
+    {
+        var coverage = CoverageFor(job.SnapshotId);
+        if (job.Status == SnapshotJobStatus.Complete && coverage is { IsPartial: true })
+            job = job with { Status = SnapshotJobStatus.Partial, LastError = PartialCoverageReason(coverage) };
+        return new JobStatusResult { Job = job, Diagnostics = jobs.GetDiagnostics(job.Id), Coverage = coverage };
+    }
+
+    /// <summary>
+    /// The durable checkout coverage recorded for a snapshot (issue #119), or null when none was recorded.
+    /// </summary>
+    public SnapshotCoverage? GetCoverage(long snapshotId) => WithWrite(() => CoverageFor(snapshotId));
 
     /// <summary>
     /// Resolves a repository branch (or its default branch when <paramref name="branchName"/> is null) to
@@ -1036,14 +1074,33 @@ public sealed class SnapshotService : IDisposable
     /// </summary>
     public bool HasWorkerCapacity => _worker is not UnavailableSnapshotWorker;
 
-    private EnsureSnapshotResult Attach(SnapshotJobRow job, bool existed) => new()
+    private EnsureSnapshotResult Attach(SnapshotJobRow job, bool existed, SnapshotCoverage? coverage = null)
     {
-        JobId = job.Id,
-        IdentityHash = job.IdentityHash,
-        Status = job.Status,
-        SnapshotId = job.SnapshotId,
-        Attached = existed
-    };
+        // The reported verdict never contradicts the snapshot's durable coverage (issue #119), even for a
+        // terminal job recorded before the coverage was reconciled.
+        var partialByCoverage = job.Status == SnapshotJobStatus.Complete && coverage is { IsPartial: true };
+        var status = partialByCoverage ? SnapshotJobStatus.Partial : job.Status;
+        return new EnsureSnapshotResult
+        {
+            JobId = job.Id,
+            IdentityHash = job.IdentityHash,
+            Status = status,
+            SnapshotId = job.SnapshotId,
+            Attached = existed,
+            Reason = status == SnapshotJobStatus.Complete
+                ? null
+                : partialByCoverage ? PartialCoverageReason(coverage!) : job.LastError,
+            Coverage = coverage
+        };
+    }
+
+    // The durable coverage record for a snapshot (issue #119), or null when none was recorded. Reads the
+    // writer connection, so the caller MUST hold the write gate.
+    private SnapshotCoverage? CoverageFor(long? snapshotId) =>
+        snapshotId is long id ? new SnapshotCoverageStore(_conn).Get(id) : null;
+
+    private static string PartialCoverageReason(SnapshotCoverage coverage) =>
+        "snapshot coverage is partial: " + string.Join(" ", coverage.Reasons);
 
     // A terminal job is only safe to attach to when its recorded outcome is still backed by durable state:
     // a complete/partial job MUST still point at a published COMPLETE snapshot that carries this exact
@@ -1112,7 +1169,8 @@ public sealed class SnapshotService : IDisposable
         IdentityHash = job.IdentityHash,
         Status = job.Status,
         SnapshotId = job.SnapshotId,
-        Attached = false
+        Attached = false,
+        Reason = job.Status == SnapshotJobStatus.Complete ? null : job.LastError
     };
 
     // Records the durable audit row for an ensure request (criterion 5): outcome + repository scope +
