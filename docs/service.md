@@ -121,14 +121,33 @@ externals). The worker chooses the set to index **explicitly and deterministical
   by several solution heads is indexed **once**, never per solution). A listed entry that is missing, is not
   a `.sln`/`.slnx`, or escapes the checkout is recorded **skipped-with-reason** (it is never silently
   dropped) and makes the snapshot **partial**.
-- **Default (no config).** All solutions under the checkout are discovered (build-output/VCS dirs excluded)
-  and **one** deterministic default is chosen, preferring a root-level, **Linux-loadable** solution (e.g. a
-  `*-no-macos.slnx`-style root) over a nested one or a platform head. The other discovered solutions are
-  **recorded** as `solution_not_selected` warnings and make the snapshot **partial** (issue #119) — list them
-  in `solutions` to index them.
+- **Default (no config) — the union of every solution (issue #124).** All solutions under the checkout are
+  discovered (build-output/VCS dirs excluded) and **every** one is selected. They are loaded through the
+  same multi-solution union path as a configured list, into **one** snapshot, with the same per-identity
+  de-duplication: a project declared by N solutions is evaluated and indexed **once per target framework**
+  (identity = remote + repo-relative path + TFM). The loader opens one project at a time and the Phase-6
+  extraction pipeline keeps one compilation live at a time, so memory stays bounded. The order is
+  deterministic and independent of file-system enumeration order: shallowest first, then solutions with a
+  Linux-loadable marker in the name (e.g. a `*-no-macos.slnx`-style root), then neutral names, then
+  **platform heads last** (iOS/Android/Mac/Windows/WPF/Unity/…), then `.slnx` before `.sln`, then ordinal
+  `/`-separated repo-relative path. **Platform-head solutions are included**, not ranked out: their
+  loadable projects (shared libraries, and anything that evaluates on this worker) are indexed, and each
+  project that cannot load here is recorded **skipped-with-reason** (`project_skipped`, per-project fault
+  isolation from #90) and makes the snapshot **partial**. It never fails the snapshot. A checkout whose
+  discovered solutions all load is **complete**. With a single discovered solution this is just that
+  solution, loaded as before. Nothing is "discovered but not selected" any more. Before #124 the default
+  picked **one** solution and reported the rest as `solution_not_selected`; that kept a monorepo with no
+  root solution (issue #119) mostly unindexed.
 
 Because selection is a pure function of the committed checkout tree + committed `sextant.json` (both pinned
-by the commit), it is **stable across runs** for a given commit.
+by the commit), it is **stable across runs** for a given commit. The selection policy itself is not part of
+the snapshot identity, so changing it bumps `IndexConfigurationHash.AnalyzerVersion` (`"3"` for #124): a
+narrow pre-#124 snapshot of the same commit is never reused as the union snapshot. The recorded
+`coverage.selection_source` is `configured`, `default_union`, or `none` (rows written before #124 may still
+say `default_root`).
+
+To narrow the scope (for example, to skip platform heads that cannot load on this worker and avoid the
+`partial` verdict they cause), list the wanted solutions in `solutions`.
 
 **Coverage reporting (partial never reported as complete, issue #119).** Before indexing, the worker computes
 a durable **coverage** record for the checkout from the selection, the multi-solution load, and a pure
@@ -137,7 +156,7 @@ file-system inventory (project files on disk, excluding `obj`/`bin`/`.git`; subm
 
 | Gap | Diagnostic `code` |
 | --- | --- |
-| a discovered solution was not selected (no-config default) | `solution_not_selected` |
+| a discovered solution was not selected (defensive; the no-config default selects all of them since #124) | `solution_not_selected` |
 | a configured solution is missing/invalid/outside the checkout | `solution_skipped` |
 | a declared project could not load on this worker (e.g. an iOS/Android/Mac/WPF head on Linux, #90) | `project_skipped` |
 | a selected solution declared no readable project, or nothing loaded at all | `solution_no_projects` / `no_projects_loaded` |

@@ -9,8 +9,12 @@ public enum SolutionSelectionSource
     /// <summary>An explicit per-repo <c>solutions</c> list (from <c>sextant.json</c>) selected the set.</summary>
     Configured,
 
-    /// <summary>No explicit config; a single deterministic, preferably Linux-loadable root solution was chosen.</summary>
-    DefaultRoot
+    /// <summary>
+    /// No explicit config; the deterministic UNION of every discovered solution was selected (issue #124).
+    /// Replaces the historical single-solution <c>DefaultRoot</c> pick — coverage rows recorded before
+    /// #124 may still carry the wire name <c>default_root</c>.
+    /// </summary>
+    DefaultUnion
 }
 
 /// <summary>
@@ -30,9 +34,11 @@ public sealed record SkippedSolution(string RequestedPath, string Reason);
 /// <param name="SkippedSolutions">Configured entries that were skipped, with reasons.</param>
 /// <param name="DiscoveredSolutions">
 /// Every solution discovered under the checkout during a default (unconfigured) selection, in stable
-/// order. Populated only for <see cref="SolutionSelectionSource.DefaultRoot"/> (and
-/// <see cref="SolutionSelectionSource.None"/>); empty when an explicit config drove selection. Lets the
-/// worker RECORD which discovered solutions were NOT selected instead of silently ignoring them.
+/// ordinal-by-repo-relative-path order. Populated only for <see cref="SolutionSelectionSource.DefaultUnion"/>
+/// (and <see cref="SolutionSelectionSource.None"/>); empty when an explicit config drove selection. Under
+/// the default union every discovered solution is also selected, so "discovered but not selected" is empty
+/// by construction; the worker still derives it defensively so a future narrowing selector could never
+/// silently hide a gap (issue #119).
 /// </param>
 public sealed record SolutionSelection(
     IReadOnlyList<string> SolutionPaths,
@@ -53,11 +59,16 @@ public sealed record SolutionSelection(
 ///   <item>An explicit per-repo <c>solutions</c> list (from the checkout's own <c>sextant.json</c>)
 ///   selects that exact set, in listed order; a listed entry that is missing / not a solution / escapes
 ///   the checkout is recorded as a <see cref="SkippedSolution"/> rather than dropped.</item>
-///   <item>With no config, all <c>.slnx</c>/<c>.sln</c> under the checkout are discovered and ONE
-///   deterministic default is chosen — preferring a root-level, Linux-loadable solution (e.g. a
-///   <c>*-no-macos.slnx</c>-style root) so a Linux worker indexes the broadest loadable slice. A total
-///   ordering (with a path-ordinal final tiebreak) makes the choice stable across runs regardless of
-///   filesystem enumeration order.</item>
+///   <item>With no config, all <c>.slnx</c>/<c>.sln</c> under the checkout are discovered and ALL of them
+///   are selected — the deterministic UNION (issue #124), loaded as one workspace by
+///   <see cref="MultiSolutionLoader"/> so a project shared by several solutions is evaluated once per
+///   target framework. Platform-head solutions are included: their loadable projects are indexed and an
+///   unloadable head is skipped-with-reason by the loader's per-project fault isolation, so coverage is
+///   maximal AND honestly partial. The union is ordered by a total ranking (shallow first, then
+///   explicitly-Linux, neutral, platform heads last; <c>.slnx</c> before <c>.sln</c>; a
+///   separator-normalized ordinal path tiebreak) so it is stable across runs and operating systems
+///   regardless of filesystem enumeration order, the first entry is the historical "best" default, and
+///   fragile platform heads load last.</item>
 /// </list>
 ///
 /// The selection is a pure function of the checkout's file tree + its committed <c>sextant.json</c> — both
@@ -71,19 +82,20 @@ public static class SolutionSelector
     private static readonly HashSet<string> ExcludedSegments =
         new(StringComparer.OrdinalIgnoreCase) { "obj", "bin", ".git" };
 
-    // Name fragments that mark a solution head as EXPLICITLY Linux-loadable — preferred as the default.
+    // Name fragments that mark a solution head as EXPLICITLY Linux-loadable — ordered first in the union.
     private static readonly string[] PreferLinuxMarkers = ["no-macos", "no-mac", "linux", "server"];
 
     // Name fragments that mark a cross-platform head that will NOT load on a Linux worker (iOS/Android/
-    // Mac/Windows/Unity heads) — deprioritized as the default. Routing them to a native worker is #89.
+    // Mac/Windows/Unity heads) — still selected, but ordered last in the union so the broadly-loadable
+    // solutions are loaded first. Routing them to a native worker is #89.
     private static readonly string[] PlatformHeadMarkers =
         ["maccatalyst", "macos", "ios", "tvos", "android", "windows", "winui", "wpf", "unity", "tizen", "mac"];
 
     /// <summary>
     /// Selects the solution set for <paramref name="checkoutDir"/>. When
     /// <paramref name="configuredSolutions"/> is non-empty it is authoritative (each entry resolved
-    /// relative to the checkout unless already an absolute path inside it); otherwise a single
-    /// deterministic default root solution is chosen from what is discovered on disk.
+    /// relative to the checkout unless already an absolute path inside it); otherwise EVERY solution
+    /// discovered on disk is selected, in the deterministic union order of <see cref="OrderForUnion"/>.
     /// </summary>
     public static SolutionSelection Select(string checkoutDir, IReadOnlyList<string>? configuredSolutions)
     {
@@ -96,9 +108,23 @@ public static class SolutionSelector
         if (discovered.Count == 0)
             return new SolutionSelection([], SolutionSelectionSource.None, [], []);
 
-        // A total ordering with a path-ordinal final tiebreak → a single, stable default.
-        var best = discovered.OrderBy(p => RankKey(root, p), RankComparer.Instance).First();
-        return new SolutionSelection([best], SolutionSelectionSource.DefaultRoot, [], discovered);
+        return new SolutionSelection(OrderForUnion(root, discovered), SolutionSelectionSource.DefaultUnion, [], discovered);
+    }
+
+    /// <summary>
+    /// Orders discovered solutions for the default union: a TOTAL ordering (depth, platform rank,
+    /// extension, then a separator-normalized ordinal repo-relative path) so the result depends only on
+    /// the SET of paths — never on the input/enumeration order or the host's directory separator. The
+    /// union's first-appearance project order (and hence the persisted project order) follows from it.
+    /// </summary>
+    internal static IReadOnlyList<string> OrderForUnion(string checkoutDir, IEnumerable<string> solutionPaths)
+    {
+        var root = Path.GetFullPath(checkoutDir);
+        return solutionPaths
+            .Select(Path.GetFullPath)
+            .Distinct(PathComparer)
+            .OrderBy(p => RankKey(root, p), RankComparer.Instance)
+            .ToList();
     }
 
     private static SolutionSelection SelectConfigured(string root, IReadOnlyList<string> configured)
@@ -139,7 +165,8 @@ public static class SolutionSelector
 
     /// <summary>
     /// Discovers every recognized solution under <paramref name="checkoutDir"/> (build-output and VCS
-    /// directories excluded), de-duplicated and returned in a stable ordinal-by-repo-relative-path order.
+    /// directories excluded), de-duplicated and returned in a stable ordinal order of the '/'-normalized
+    /// repo-relative path (identical on every OS).
     /// </summary>
     public static IReadOnlyList<string> DiscoverSolutions(string checkoutDir)
     {
@@ -190,7 +217,7 @@ public static class SolutionSelector
     private static bool IsExcluded(string root, string solutionPath)
     {
         var relative = RepoRelative(root, solutionPath);
-        var segments = relative.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var segments = relative.Split('/');
         // The last segment is the file name; only directory segments gate exclusion.
         for (var i = 0; i < segments.Length - 1; i++)
             if (ExcludedSegments.Contains(segments[i]))
@@ -198,13 +225,13 @@ public static class SolutionSelector
         return false;
     }
 
-    // The deterministic ranking key for the default choice: prefer shallow (root) solutions, then
-    // explicitly-Linux over neutral over platform-head names, then .slnx over .sln, and finally an
-    // ordinal path tiebreak so the choice is total and stable regardless of enumeration order.
+    // The deterministic ranking key for the union order: shallow (root) solutions first, then
+    // explicitly-Linux over neutral over platform-head names, then .slnx over .sln, and finally an ordinal
+    // tiebreak on the '/'-normalized repo-relative path so the order is total and identical on every OS.
     private static (int Depth, int PlatformRank, int ExtRank, string Path) RankKey(string root, string solutionPath)
     {
         var relative = RepoRelative(root, solutionPath);
-        var depth = relative.Count(c => c == Path.DirectorySeparatorChar || c == Path.AltDirectorySeparatorChar);
+        var depth = relative.Count(c => c == '/');
         var extRank = string.Equals(Path.GetExtension(solutionPath), ".slnx", StringComparison.OrdinalIgnoreCase) ? 0 : 1;
         return (depth, PlatformRank(solutionPath), extRank, relative);
     }
@@ -224,11 +251,13 @@ public static class SolutionSelector
         return 1;
     }
 
-    private static string RepoRelative(string root, string fullPath)
-    {
-        var relative = Path.GetRelativePath(root, fullPath);
-        return relative;
-    }
+    // The repo-relative path with the host directory separator normalized to '/', so ordering keys (and
+    // the ordinal discovery sort) are identical on Windows and Linux: with '\' a sibling "a0" dir would
+    // sort BEFORE "a\..." on Windows ('0' < '\') but AFTER "a/..." on Linux ('/' < '0'). Only the HOST
+    // separator is rewritten — on Linux a '\' is a legal file-name character and must not be
+    // reinterpreted as a directory boundary.
+    private static string RepoRelative(string root, string fullPath) =>
+        Path.GetRelativePath(root, fullPath).Replace(Path.DirectorySeparatorChar, '/');
 
     // True when <paramref name="candidate"/> is the root itself or a descendant of it, computed on the
     // normalized full paths so "..", traversal, and separator differences cannot escape the checkout.
