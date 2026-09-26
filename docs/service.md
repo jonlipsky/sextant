@@ -135,7 +135,10 @@ externals). The worker chooses the set to index **explicitly and deterministical
   project that cannot load here is recorded **skipped-with-reason** (`project_skipped`, per-project fault
   isolation from #90) and makes the snapshot **partial**. It never fails the snapshot. A checkout whose
   discovered solutions all load is **complete**. With a single discovered solution this is just that
-  solution, loaded as before. Nothing is "discovered but not selected" any more. Before #124 the default
+  solution, loaded as before. With several, each project is opened individually (that is what isolates a
+  per-project load fault), so no solution sets `$(SolutionDir)`: a project that imports
+  `$(SolutionDir)…` with no fallback may be skipped-with-reason on this path. Nothing is "discovered but
+  not selected" any more. Before #124 the default
   picked **one** solution and reported the rest as `solution_not_selected`; that kept a monorepo with no
   root solution (issue #119) mostly unindexed.
 

@@ -43,8 +43,11 @@ public sealed record MultiSolutionLoadResult(
 /// DE-DUPLICATED by project file path (a project shared by several solution heads is loaded once), which —
 /// because one checkout's absolute project path is 1:1 with its project identity
 /// <c>(git-remote, repo-relative path)</c> — yields the union-of-projects-by-identity the acceptance
-/// criteria require. A single selected solution preserves the existing fast whole-solution load path
-/// byte-for-byte, so the common (and default) single-solution case is unchanged.
+/// criteria require. A single selected solution (a one-solution checkout, or a one-entry config) preserves
+/// the existing fast whole-solution load path byte-for-byte. Several solutions — an explicit list, or the
+/// no-config default union of every discovered solution (issue #124) — take the per-project union path,
+/// which opens each project individually (no solution context, so <c>$(SolutionDir)</c> is not set by a
+/// solution) to isolate per-project load faults.
 /// </summary>
 public static class MultiSolutionLoader
 {
@@ -81,8 +84,10 @@ public static class MultiSolutionLoader
         var union = ComputeUnion(perSolutionDeclared);
         if (solutionPaths.Count == 1)
         {
-            // Preserve the byte-identical single-solution fast path (OpenSolutionAsync) so the common and
-            // default case — and its determinism/parity test coverage — is unchanged.
+            // Preserve the byte-identical single-solution fast path (OpenSolutionAsync) when exactly ONE
+            // solution is selected (a one-solution checkout or a one-entry config), so that case — and its
+            // determinism/parity test coverage — is unchanged. A multi-solution no-config checkout selects the
+            // union (#124) and takes the per-project branch below.
             loaded = await SolutionLoader.LoadSolutionResilientlyAsync(
                 solutionPaths[0], onDiagnostic, cancellationToken).ConfigureAwait(false);
         }

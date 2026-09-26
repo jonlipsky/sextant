@@ -164,7 +164,9 @@ public class SnapshotWorkerVerdictTests
         Assert.AreEqual(2, result.Coverage.SolutionsDiscovered);
         Assert.AreEqual(2, result.Coverage.SolutionsSelected);
         Assert.AreEqual(0, result.Coverage.SolutionsNotSelected);
-        Assert.AreEqual(3, result.Coverage.ProjectsDeclared, "the shared project counts once across the union");
+        Assert.AreEqual(3, result.Coverage.ProjectsDeclared,
+            "the builder counts the (already de-duplicated) union it is given; the dedup itself is covered by " +
+            "MultiSolutionLoaderTests.ComputeUnion_* and DefaultUnionSnapshotIntegrationTests");
         Assert.AreEqual(2, result.Projects.Count(p => p.Code == "solution_indexed"));
         Assert.IsTrue(result.Projects.All(p => p.Severity == JobDiagnosticSeverity.Info));
     }

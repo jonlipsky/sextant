@@ -177,6 +177,30 @@ public class SnapshotCoverageBuilderTests
         Assert.IsFalse(reason.Contains(CheckoutDir, StringComparison.OrdinalIgnoreCase), "no worker volume paths");
     }
 
+    [TestMethod]
+    public void SkippedProjectOutsideCheckout_ReasonNamesFileOnly_NeverAVolumePath()
+    {
+        // A solution entry may point outside the checkout (`../../other/X.csproj`); the reason is persisted and
+        // surfaced to query clients, so it names only the file — never the worker's absolute volume layout.
+        var outside = Path.GetFullPath(Path.Combine(CheckoutDir, "..", "sibling-checkout", "Ext", "Ext.iOS.csproj"));
+        var skipped = new List<SkippedProject> { new(outside, "project not found") };
+        var load = new MultiSolutionLoadResult(new AdhocWorkspace().CurrentSolution, skipped,
+            [new SolutionCoverage(At("App.slnx"), 2, 1, skipped)])
+        {
+            DeclaredProjects = [At("src/App/App.csproj"), outside]
+        };
+
+        var result = SnapshotCoverageBuilder.Build(
+            CheckoutDir, Resolution(), load, new SnapshotCoverageBuilder.Inventory([], []));
+
+        var reason = result.Coverage.Reasons.Single(r => r.Contains("could not be loaded", StringComparison.Ordinal));
+        StringAssert.Contains(reason, "<outside checkout>/Ext.iOS.csproj");
+        Assert.IsFalse(reason.Contains("sibling-checkout", StringComparison.OrdinalIgnoreCase),
+            "no path outside the checkout is recorded: " + reason);
+        Assert.IsFalse(reason.Contains(Path.GetTempPath().TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase),
+            "no worker volume paths: " + reason);
+    }
+
     private static void AddProject(AdhocWorkspace workspace, string name, string filePath) =>
         workspace.AddProject(ProjectInfo.Create(
             ProjectId.CreateNewId(), VersionStamp.Default, name, name, LanguageNames.CSharp, filePath: filePath));
