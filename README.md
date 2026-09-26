@@ -71,6 +71,7 @@ Source Files → [Daemon] → [Indexer] → [SQLite] → [MCP Server] → AI Age
 
 | Doc | Contents |
 |---|---|
+| [Onboarding](docs/onboarding.md) | Per-machine setup for both modes: thin/server-backed and hybrid/local overlay |
 | [Configuration](docs/configuration.md) | `sextant.json`, env vars, LLM setup, CLI reference, AI tool install details |
 | [MCP Tools](docs/mcp-tools.md) | Full tool parameters, response formats, query examples |
 | [Daemon](docs/daemon.md) | File watching, incremental indexing, status endpoints, auto-start setup |
