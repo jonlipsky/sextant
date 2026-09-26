@@ -32,6 +32,7 @@
     <ProjectReference Include="..\..\src\Sextant.Indexer\Sextant.Indexer.csproj" />
     <ProjectReference Include="..\..\src\Sextant.Mcp\Sextant.Mcp.csproj" />
     <ProjectReference Include="..\..\src\Sextant.Daemon\Sextant.Daemon.csproj" />
+    <ProjectReference Include="..\..\src\Sextant.Service\Sextant.Service.csproj" />
   </ItemGroup>
 
   <ItemGroup>

@@ -41,7 +41,8 @@ public static class SnapshotCoverageBuilder
     public sealed record Result(SnapshotCoverage Coverage, IReadOnlyList<ProjectOutcome> Diagnostics);
 
     public static Result Build(
-        string checkoutDir, CheckoutResolution resolution, MultiSolutionLoadResult load, Inventory inventory)
+        string checkoutDir, CheckoutResolution resolution, MultiSolutionLoadResult load, Inventory inventory,
+        IReadOnlyList<SdkPinOverride>? sdkPinOverrides = null)
     {
         var comparer = CheckoutInventory.PathComparer;
         var reasons = new List<string>();
@@ -86,7 +87,28 @@ public static class SnapshotCoverageBuilder
             reasons.Add($"{resolution.SkippedSolutions.Count} configured solution(s) could not be used.");
 
         if (load.SkippedProjects.Count > 0)
-            reasons.Add($"{load.SkippedProjects.Count} declared project(s) could not be loaded on this worker.");
+        {
+            // A project skipped because hostfxr could not resolve the SDK its global.json pins (issue #113) is
+            // named as such, with the pin, so the operator sees the actionable cause rather than a generic skip.
+            var sdkSkips = load.SkippedProjects
+                .Select(s => (Skip: s, Ok: HostFxrSdkResolutionError.TryParse(s.Reason, out var e), Error: e))
+                .Where(x => x.Ok)
+                .ToList();
+            var otherSkips = load.SkippedProjects.Count - sdkSkips.Count;
+            if (otherSkips > 0)
+                reasons.Add($"{otherSkips} declared project(s) could not be loaded on this worker.");
+            if (sdkSkips.Count > 0)
+            {
+                var pins = sdkSkips
+                    .Select(x => DescribePin(checkoutDir, x.Error!))
+                    .Distinct(StringComparer.Ordinal)
+                    .ToList();
+                reasons.Add(
+                    $"{sdkSkips.Count} declared project(s) could not be loaded because the .NET SDK their " +
+                    $"global.json pins is not installed on this worker ({string.Join("; ", pins.Take(10))}" +
+                    $"{(pins.Count > 10 ? "; …" : string.Empty)}).");
+            }
+        }
 
         if (emptySolutions > 0)
             reasons.Add($"{emptySolutions} selected solution(s) declared no readable projects.");
@@ -166,10 +188,21 @@ public static class SnapshotCoverageBuilder
             ProjectFilesUnreferenced = unreferenced.Count,
             SubmodulesDeclared = inventory.Submodules.Count,
             SubmodulesUnpopulated = unpopulated.Count,
-            ScanErrors = scanErrors.Count
+            ScanErrors = scanErrors.Count,
+            SdkPinOverrides = sdkPinOverrides is { Count: > 0 } ? sdkPinOverrides : null
         };
 
         return new Result(coverage, diagnostics);
+    }
+
+    /// <summary>
+    /// "'&lt;repo-relative global.json&gt;' requests SDK &lt;version&gt;" for a classified hostfxr failure —
+    /// checkout-relative so the job ledger never records the worker's volume layout.
+    /// </summary>
+    internal static string DescribePin(string checkoutDir, HostFxrSdkResolutionError error)
+    {
+        var path = error.GlobalJsonPath is { } p ? RepoRelative(checkoutDir, p) : "global.json";
+        return error.RequestedVersion is { } v ? $"'{path}' requests SDK {v}" : $"'{path}'";
     }
 
     /// <summary>The snake_case wire name of a selection source.</summary>

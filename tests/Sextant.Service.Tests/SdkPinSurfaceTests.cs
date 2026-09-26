@@ -1,0 +1,262 @@
+using System.Text.Json;
+using Microsoft.CodeAnalysis;
+using Sextant.Core;
+using Sextant.Indexer;
+using Sextant.Service.SdkPin;
+using Sextant.Store;
+
+namespace Sextant.Service.Tests;
+
+/// <summary>
+/// Issue #113 — how an unsatisfiable <c>global.json</c> SDK pin is SURFACED: typed job diagnostics
+/// (<c>sdk_pin_overridden</c> / <c>sdk_resolution_failed</c>), a typed failure instead of a bare message,
+/// coverage reasons + <c>sdk_pin_overrides</c> provenance, the audit flag, and the operator knob.
+/// </summary>
+[TestClass]
+public sealed class SdkPinSurfaceTests
+{
+    private const string CheckoutDir = "/checkout/repo";
+
+    // The coverage store's wire options (snake_case, nulls omitted).
+    private static readonly JsonSerializerOptions CoverageJson = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+    };
+
+    private static string HostFxrMessage(string globalJson, string version = "10.0.999") =>
+        "An exception of type System.InvalidOperationException was thrown: Error while calling hostfxr function " +
+        $"hostfxr_resolve_sdk2. Error code: -2147450725 Detailed error: A compatible .NET SDK was not found.\n\n" +
+        $"Requested SDK version: {version}\nglobal.json file: {globalJson}\n\nInstalled SDKs:\n";
+
+    private static SdkPinFinding Finding(bool applied, string? reason = null) => new()
+    {
+        GlobalJsonPath = "global.json",
+        FullPath = $"{CheckoutDir}/global.json",
+        InsideCheckout = true,
+        RequestedVersion = "10.0.300",
+        RollForward = "disable",
+        InstalledSdks = ["10.0.401"],
+        ResolvedSdkVersion = applied ? "10.0.401" : null,
+        OverrideApplied = applied,
+        NotOverriddenReason = reason
+    };
+
+    private static CheckoutResolution Resolution() => new()
+    {
+        CheckoutDir = CheckoutDir,
+        SelectedSolutions = [$"{CheckoutDir}/App.slnx", $"{CheckoutDir}/tools/Tools.slnx"],
+        Source = SolutionSelectionSource.Configured,
+        SkippedSolutions = [],
+        DiscoveredButNotSelected = []
+    };
+
+    [TestMethod]
+    public void OverriddenPin_IsAWarningNamingRequestedAndSubstitutedSdk()
+    {
+        var diagnostic = LocalIndexerSnapshotWorker.SdkPinDiagnostics([Finding(applied: true)], published: true).Single();
+
+        Assert.AreEqual(LocalIndexerSnapshotWorker.SdkPinOverriddenCode, diagnostic.Code);
+        Assert.AreEqual(JobDiagnosticSeverity.Warning, diagnostic.Severity);
+        Assert.AreEqual("global.json", diagnostic.ProjectPath);
+        StringAssert.Contains(diagnostic.Message, "pins .NET SDK 10.0.300 (rollForward: disable)");
+        StringAssert.Contains(diagnostic.Message, "installed SDK(s): 10.0.401");
+        StringAssert.Contains(diagnostic.Message, "Override applied");
+        StringAssert.Contains(diagnostic.Message, "substituted SDK");
+    }
+
+    [TestMethod]
+    public void PinNotOverridden_IsTypedWithTheReason_ErrorOnlyWhenNothingPublished()
+    {
+        var pin = Finding(applied: false, reason: "the service's SDK-pin override is disabled");
+
+        var published = LocalIndexerSnapshotWorker.SdkPinDiagnostics([pin], published: true).Single();
+        var failed = LocalIndexerSnapshotWorker.SdkPinDiagnostics([pin], published: false).Single();
+
+        Assert.AreEqual(LocalIndexerSnapshotWorker.SdkResolutionFailedCode, published.Code);
+        Assert.AreEqual(JobDiagnosticSeverity.Warning, published.Severity);
+        Assert.AreEqual(JobDiagnosticSeverity.Error, failed.Severity);
+        StringAssert.Contains(failed.Message, "Override not applied: the service's SDK-pin override is disabled");
+    }
+
+    [TestMethod]
+    public void WholeLoadSdkFailure_IsATypedFailure_NotABareMessage()
+    {
+        Assert.IsTrue(HostFxrSdkResolutionError.TryParse(HostFxrMessage($"{CheckoutDir}/global.json"), out var error));
+
+        var result = LocalIndexerSnapshotWorker.SdkResolutionFailed(CheckoutDir, error, [], ["10.0.401", "9.0.305"]);
+
+        Assert.AreEqual(SnapshotJobStatus.Failed, result.Status);
+        StringAssert.Contains(result.Error, "'global.json' requests SDK 10.0.999");
+        StringAssert.Contains(result.Error, "installed SDK(s): 10.0.401, 9.0.305");
+        Assert.IsFalse(result.Error!.Contains(CheckoutDir, StringComparison.Ordinal), "the worker's volume layout is redacted");
+        var diagnostic = result.Projects.Single();
+        Assert.AreEqual(LocalIndexerSnapshotWorker.SdkResolutionFailedCode, diagnostic.Code);
+        Assert.AreEqual(JobDiagnosticSeverity.Error, diagnostic.Severity);
+        Assert.AreEqual("global.json", diagnostic.ProjectPath);
+    }
+
+    [TestMethod]
+    public void WholeLoadSdkFailure_ForAKnownPin_SaysWhyItWasNotOverridden_WithoutDuplicating()
+    {
+        Assert.IsTrue(HostFxrSdkResolutionError.TryParse(HostFxrMessage($"{CheckoutDir}/global.json", "10.0.300"), out var error));
+        var pin = Finding(applied: false, reason: "the global.json is a symbolic link, so the service does not modify it");
+
+        var result = LocalIndexerSnapshotWorker.SdkResolutionFailed(CheckoutDir, error, [pin], ["10.0.401"]);
+
+        StringAssert.Contains(result.Error, "(rollForward: disable)");
+        StringAssert.Contains(result.Error, "The pin was not overridden: the global.json is a symbolic link");
+        Assert.AreEqual(1, result.Projects.Count, "the pin's own diagnostic already names it");
+        Assert.AreEqual(JobDiagnosticSeverity.Error, result.Projects[0].Severity);
+    }
+
+    [TestMethod]
+    public void ProjectSkippedForAnSdkPin_IsTypedAndNamedInTheCoverageReason()
+    {
+        // Multi-solution isolation (#90 parity): only tools/ pins a missing band, so its project is skipped
+        // with the hostfxr failure and the rest of the checkout still publishes — as PARTIAL, with the cause.
+        var skipped = new[]
+        {
+            new SkippedProject($"{CheckoutDir}/tools/Tool/Tool.csproj", HostFxrMessage($"{CheckoutDir}/tools/global.json"))
+        };
+        var load = new MultiSolutionLoadResult(new AdhocWorkspace().CurrentSolution, skipped,
+        [
+            new SolutionCoverage($"{CheckoutDir}/App.slnx", 1, 1, []),
+            new SolutionCoverage($"{CheckoutDir}/tools/Tools.slnx", 1, 0, skipped)
+        ]);
+        var resolution = Resolution();
+        var coverage = SnapshotCoverageBuilder.Build(CheckoutDir, resolution, load, new SnapshotCoverageBuilder.Inventory([], []));
+
+        var result = LocalIndexerSnapshotWorker.BuildResult(9, CheckoutDir, resolution, load, coverage, [], ["10.0.401"]);
+
+        Assert.AreEqual(SnapshotJobStatus.Partial, result.Status);
+        StringAssert.Contains(result.Error,
+            "1 declared project(s) could not be loaded because the .NET SDK their global.json pins is not installed " +
+            "on this worker ('tools/global.json' requests SDK 10.0.999)");
+        var diagnostic = result.Projects.Single(p => p.ProjectPath?.Replace('\\', '/') == "tools/Tool/Tool.csproj");
+        Assert.AreEqual(LocalIndexerSnapshotWorker.SdkResolutionFailedCode, diagnostic.Code, "typed, not a generic project_skipped");
+        Assert.AreEqual(JobDiagnosticSeverity.Warning, diagnostic.Severity);
+        StringAssert.Contains(diagnostic.Message, "installed SDK(s): 10.0.401");
+        Assert.IsFalse(result.Projects.Any(p => p.Code == "project_skipped"));
+    }
+
+    [TestMethod]
+    public void NonSdkSkip_KeepsTheExistingCoverageReason()
+    {
+        var skipped = new[] { new SkippedProject($"{CheckoutDir}/src/Ios/Ios.csproj", "iOS workload not available") };
+        var load = new MultiSolutionLoadResult(new AdhocWorkspace().CurrentSolution, skipped,
+            [new SolutionCoverage($"{CheckoutDir}/App.slnx", 2, 1, skipped)]);
+
+        var coverage = SnapshotCoverageBuilder.Build(CheckoutDir, Resolution(), load, new SnapshotCoverageBuilder.Inventory([], []));
+
+        CollectionAssert.Contains(coverage.Coverage.Reasons.ToList(), "1 declared project(s) could not be loaded on this worker.");
+        Assert.IsFalse(coverage.Coverage.Reasons.Any(r => r.Contains("SDK", StringComparison.Ordinal)));
+    }
+
+    [TestMethod]
+    public void CoverageProvenance_RecordsTheOverride_AndIsByteIdenticalWithoutOne()
+    {
+        var load = new MultiSolutionLoadResult(new AdhocWorkspace().CurrentSolution, [],
+            [new SolutionCoverage($"{CheckoutDir}/App.slnx", 1, 1, [])]);
+        var inventory = new SnapshotCoverageBuilder.Inventory([], []);
+
+        var plain = SnapshotCoverageBuilder.Build(CheckoutDir, Resolution(), load, inventory).Coverage;
+        var overridden = SnapshotCoverageBuilder.Build(
+            CheckoutDir, Resolution(), load, inventory, [Finding(applied: true).ToCoverageOverride()]).Coverage;
+
+        Assert.IsNull(plain.SdkPinOverrides);
+        Assert.IsFalse(JsonSerializer.Serialize(plain, CoverageJson).Contains("sdk_pin", StringComparison.Ordinal),
+            "a snapshot built without an override serializes exactly as before #113");
+        Assert.AreEqual(SnapshotCoverageVerdict.Complete, overridden.Verdict,
+            "the override restores full coverage; it is provenance, not a coverage gap");
+        var json = JsonSerializer.Serialize(overridden, CoverageJson);
+        StringAssert.Contains(json, "\"sdk_pin_overrides\":[{\"global_json_path\":\"global.json\",\"requested_version\":\"10.0.300\"");
+
+        var dbPath = ServiceTestFixtures.NewDbPath();
+        var db = new IndexDatabase(dbPath);
+        try
+        {
+            db.RunMigrations();
+            var snapId = ServiceTestFixtures.PublishComplete(db, ServiceTestFixtures.Request());
+            var store = new SnapshotCoverageStore(db.GetConnection());
+            Assert.IsTrue(store.Record(snapId, overridden, 1));
+
+            var roundTripped = store.Get(snapId)!.SdkPinOverrides!.Single();
+            Assert.AreEqual("global.json", roundTripped.GlobalJsonPath);
+            Assert.AreEqual("10.0.300", roundTripped.RequestedVersion);
+            Assert.AreEqual("disable", roundTripped.RollForward);
+            Assert.AreEqual("10.0.401", roundTripped.ResolvedSdkVersion);
+            CollectionAssert.AreEqual(new[] { "10.0.401" }, roundTripped.InstalledSdks.ToArray());
+        }
+        finally
+        {
+            SqliteTestDatabase.Delete(dbPath, db);
+        }
+    }
+
+    [TestMethod]
+    public void AuditSuffix_FlagsOnlySdkPinOutcomes()
+    {
+        static SnapshotJobDiagnostic D(string code) => new() { JobId = 1, Severity = "warning", Code = code, Message = "m" };
+
+        Assert.AreEqual(string.Empty, SnapshotService.SdkPinAuditSuffix([]));
+        Assert.AreEqual(string.Empty, SnapshotService.SdkPinAuditSuffix([D("project_skipped"), D("solution_indexed")]));
+        Assert.AreEqual(";sdk_pin_overridden", SnapshotService.SdkPinAuditSuffix([D("sdk_pin_overridden"), D("sdk_pin_overridden")]));
+        Assert.AreEqual(";sdk_pin_overridden;sdk_resolution_failed",
+            SnapshotService.SdkPinAuditSuffix([D("sdk_resolution_failed"), D("sdk_pin_overridden")]));
+    }
+
+    [TestMethod]
+    public async Task OverriddenJob_IsVisibleInControlStatusAndTheAuditTrail()
+    {
+        var dbPath = ServiceTestFixtures.NewDbPath();
+        var db = new IndexDatabase(dbPath);
+        db.RunMigrations();
+        var worker = new FakeSnapshotWorker(db, (self, request) =>
+        {
+            var snapId = ServiceTestFixtures.PublishComplete(self.Database, request);
+            return SnapshotWorkResult.Complete(snapId,
+                LocalIndexerSnapshotWorker.SdkPinDiagnostics([Finding(applied: true)], published: true));
+        });
+        var service = SnapshotService.Start(ServiceTestFixtures.NewOptions(dbPath), worker, db);
+        try
+        {
+            var result = await service.EnsureSnapshotAsync(ServiceTestFixtures.Request());
+
+            Assert.AreEqual(SnapshotJobStatus.Complete, result.Status, "an overridden pin still yields a snapshot");
+            var status = service.GetStatus(result.JobId)!;
+            var diagnostic = status.Diagnostics.Single(d => d.Code == LocalIndexerSnapshotWorker.SdkPinOverriddenCode);
+            StringAssert.Contains(diagnostic.Message, "10.0.300");
+            Assert.AreEqual("global.json", diagnostic.ProjectPath);
+
+            var audit = new AuditLogStore(db.GetConnection()).Recent(action: AuditAction.Ensure).Single();
+            Assert.AreEqual($"job_{result.JobId};sdk_pin_overridden", audit.Detail);
+        }
+        finally
+        {
+            service.Dispose();
+            SqliteTestDatabase.Delete(dbPath, db);
+        }
+    }
+
+    [TestMethod]
+    public void SdkPinOverride_DefaultsOn_AndCanBeDisabled()
+    {
+        const string name = "SEXTANT_SERVICE_SDK_PIN_OVERRIDE";
+        var config = new SextantConfiguration { DbPath = ServiceTestFixtures.NewDbPath() };
+        Environment.SetEnvironmentVariable(name, null);
+        Assert.IsTrue(ServiceOptions.FromEnvironment(config).SdkPinOverride);
+        try
+        {
+            Environment.SetEnvironmentVariable(name, "false");
+            Assert.IsFalse(ServiceOptions.FromEnvironment(config).SdkPinOverride);
+            Environment.SetEnvironmentVariable(name, "nope");
+            Assert.ThrowsExactly<InvalidOperationException>(() => ServiceOptions.FromEnvironment(config),
+                "a malformed toggle fails closed like every other service boolean");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(name, null);
+        }
+    }
+}

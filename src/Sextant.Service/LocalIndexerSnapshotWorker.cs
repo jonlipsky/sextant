@@ -2,6 +2,7 @@ using Sextant.Core;
 using Sextant.Core.Platform;
 using Sextant.Indexer;
 using Sextant.Service.Sandbox;
+using Sextant.Service.SdkPin;
 using Sextant.Store;
 
 namespace Sextant.Service;
@@ -171,11 +172,19 @@ public sealed class LocalIndexerSnapshotWorker(
     ICheckoutProvider checkoutProvider,
     Action<string>? log = null,
     WorkerCapability? capability = null,
-    IEvaluationSandbox? sandbox = null) : ISnapshotWorker
+    IEvaluationSandbox? sandbox = null,
+    SdkPinGuard? sdkPinGuard = null) : ISnapshotWorker
 {
+    // Issue #113: neutralizes an unsatisfiable global.json SDK pin for the duration of the MSBuild load only.
+    private readonly SdkPinGuard _sdkPinGuard = sdkPinGuard ?? new SdkPinGuard(log: log);
+
     public async Task<SnapshotWorkResult> ProduceAsync(
         EnsureSnapshotRequest request, string identityHash, string scratchDir, CancellationToken cancellationToken)
     {
+        // Repair any checkout an interrupted job left with a neutralized SDK pin BEFORE the provider decides to
+        // reuse a cached checkout (reuse only checks HEAD, never the working tree).
+        _sdkPinGuard.RecoverAll();
+
         if (!checkoutProvider.TryResolve(request, out var resolution))
         {
             return SnapshotWorkResult.Unsupported(
@@ -184,6 +193,15 @@ public sealed class LocalIndexerSnapshotWorker(
         }
 
         var checkoutDir = resolution.CheckoutDir;
+
+        // Never index over a checkout whose committed global.json could not be put back after a crash.
+        if (!_sdkPinGuard.Recover(checkoutDir))
+        {
+            return SnapshotWorkResult.Failed(
+                "a previous job left this checkout's global.json SDK pin neutralized and it could not be restored; " +
+                "the checkout is not indexed until it is repaired (see the service log).",
+                [SdkPinRestoreFailedDiagnostic("the leftover SDK-pin restore journal could not be replayed")]);
+        }
 
         // Config-error state: the checkout's own sextant.json expressed an explicit scoping intent that
         // could not be honored (malformed JSON, or every configured `solutions` entry skipped-with-reason).
@@ -198,6 +216,7 @@ public sealed class LocalIndexerSnapshotWorker(
         }
 
         var context = CreateSnapshotContext(request, capability);
+        SdkPinOverlay? pinOverlay = null;
 
         // The untrusted region: loading the solution EVALUATES its MSBuild projects (arbitrary imported
         // targets / SDK resolvers / inline tasks), so — private repo or not — it runs under the evaluation
@@ -205,11 +224,29 @@ public sealed class LocalIndexerSnapshotWorker(
         // With no sandbox (the byte-identical single-node local default) it runs directly.
         async Task<SnapshotWorkResult> EvaluateAsync(CancellationToken token)
         {
-            // Load the DETERMINISTIC selected solution set into ONE workspace (union of projects,
-            // de-duplicated by project path/identity). A single selected solution keeps the byte-identical
-            // whole-solution fast path; multiple solutions aggregate into one repository snapshot (#109).
-            var load = await MultiSolutionLoader.LoadAsync(
-                resolution.SelectedSolutions, log, token).ConfigureAwait(false);
+            // Issue #113: a global.json pin hostfxr cannot satisfy (e.g. rollForward "disable" on an SDK band
+            // this worker lacks) would fail the BuildHost before any project evaluates. Neutralize ONLY such
+            // pins for the load, and put the committed bytes back before anything else reads the checkout —
+            // coverage scan, EvaluationFingerprint, indexing — so the published checkout never diverges.
+            pinOverlay = _sdkPinGuard.Apply(checkoutDir, resolution.SelectedSolutions);
+            MultiSolutionLoadResult load;
+            try
+            {
+                // Load the DETERMINISTIC selected solution set into ONE workspace (union of projects,
+                // de-duplicated by project path/identity). A single selected solution keeps the byte-identical
+                // whole-solution fast path; multiple solutions aggregate into one repository snapshot (#109).
+                load = await MultiSolutionLoader.LoadAsync(
+                    resolution.SelectedSolutions, log, token).ConfigureAwait(false);
+            }
+            finally
+            {
+                pinOverlay.Restore();
+            }
+
+            if (pinOverlay.RestoreError is { } restoreError)
+                return SdkPinRestoreFailed(restoreError, pinOverlay);
+
+            var pins = pinOverlay.Findings;
 
             // Guard (coordinator constraint / issue #90 parity): if EVERY project across the selected set was
             // skipped — e.g. an operator scoped this Linux worker to only platform (iOS/Android/Mac/WPF)
@@ -219,18 +256,23 @@ public sealed class LocalIndexerSnapshotWorker(
             // multi-project path the same protection. The skip reasons ride along as diagnostics.
             if (!load.Solution.Projects.Any(p => p.Documents.Any()))
             {
+                var sdkSkips = load.SkippedProjects.Count(s => HostFxrSdkResolutionError.TryParse(s.Reason, out _));
                 var reason =
                     $"no project across the {resolution.SelectedSolutions.Count} selected solution(s) could be " +
-                    $"loaded on this worker ({load.SkippedProjects.Count} project(s) skipped-with-reason); " +
-                    "nothing was indexed and no snapshot was published.";
-                return SnapshotWorkResult.Failed(reason, BuildDiagnostics(checkoutDir, resolution, load));
+                    $"loaded on this worker ({load.SkippedProjects.Count} project(s) skipped-with-reason" +
+                    (sdkSkips > 0 ? $", {sdkSkips} of them because the .NET SDK their global.json pins is not installed" : string.Empty) +
+                    "); nothing was indexed and no snapshot was published.";
+                return SnapshotWorkResult.Failed(
+                    reason,
+                    BuildDiagnostics(checkoutDir, resolution, load, pins, InstalledSdks(pins, load: load), published: false));
             }
 
             // Coverage (issue #119) depends only on the selection, the load, and the checkout's file tree —
             // all known BEFORE indexing — so it rides on the snapshot context and is recorded in the SAME
             // transaction that publishes the snapshot.
             var coverage = SnapshotCoverageBuilder.Build(
-                checkoutDir, resolution, load, SnapshotCoverageBuilder.Inventory.Scan(checkoutDir));
+                checkoutDir, resolution, load, SnapshotCoverageBuilder.Inventory.Scan(checkoutDir),
+                pins.Where(p => p.OverrideApplied).Select(p => p.ToCoverageOverride()).ToList());
             var indexContext = context with { Coverage = coverage.Coverage };
 
             var orchestrator = new IndexOrchestrator(
@@ -254,8 +296,17 @@ public sealed class LocalIndexerSnapshotWorker(
             // just computed; it differs only when this identity was already published with a recorded
             // verdict (immutable), which then stays authoritative.
             var recorded = new SnapshotCoverageStore(database.GetConnection()).Get(published.Id) ?? coverage.Coverage;
-            return BuildResult(published.Id, checkoutDir, resolution, load, coverage with { Coverage = recorded });
+            return BuildResult(
+                published.Id, checkoutDir, resolution, load, coverage with { Coverage = recorded },
+                pins, InstalledSdks(pins, load: load));
         }
+
+        // A failed restore outranks every other outcome: the checkout no longer matches its commit, so the job
+        // must report THAT (the journal is kept and the next job repairs the checkout before reusing it).
+        SnapshotWorkResult Fail(string message) =>
+            pinOverlay?.RestoreError is { } restoreError
+                ? SdkPinRestoreFailed(restoreError, pinOverlay)
+                : SnapshotWorkResult.Failed(message);
 
         try
         {
@@ -266,11 +317,11 @@ public sealed class LocalIndexerSnapshotWorker(
         catch (SandboxLimitExceededException ex)
         {
             // A budget breach aborts the job cleanly — Failed (retryable), never a partial/complete publish.
-            return SnapshotWorkResult.Failed(ex.Message);
+            return Fail(ex.Message);
         }
         catch (SandboxViolationException ex)
         {
-            return SnapshotWorkResult.Failed(ex.Message);
+            return Fail(ex.Message);
         }
         catch (TransientProvisioningException)
         {
@@ -283,10 +334,33 @@ public sealed class LocalIndexerSnapshotWorker(
         {
             throw;
         }
+        catch (Exception ex) when (pinOverlay?.RestoreError is null
+                                   && HostFxrSdkResolutionError.TryClassify(ex, out var sdkError))
+        {
+            // Issue #113 fallback: the whole load died on hostfxr SDK resolution (a pin the service could not
+            // or was not allowed to override). Fail with a TYPED, actionable diagnostic — never a bare message.
+            var pins = pinOverlay?.Findings ?? [];
+            return SdkResolutionFailed(checkoutDir, sdkError, pins, InstalledSdks(pins, sdkError));
+        }
         catch (Exception ex)
         {
-            return SnapshotWorkResult.Failed(ex.Message);
+            return Fail(ex.Message);
         }
+    }
+
+    /// <summary>The installed SDKs to report: from the pin findings when known, else a fresh probe.</summary>
+    private IReadOnlyList<string> InstalledSdks(
+        IReadOnlyList<SdkPinFinding> pins, HostFxrSdkResolutionError? error = null, MultiSolutionLoadResult? load = null)
+    {
+        var known = pins.Select(p => p.InstalledSdks).FirstOrDefault(l => l.Count > 0);
+        if (known is not null)
+            return known;
+        var needed = pins.Count > 0 || error is not null
+            || load?.SkippedProjects.Any(s => HostFxrSdkResolutionError.TryParse(s.Reason, out _)) == true;
+        if (!needed)
+            return [];
+        var probed = _sdkPinGuard.ListInstalledSdks();
+        return probed.Count > 0 ? probed : error?.InstalledSdks ?? [];
     }
 
     /// <summary>
@@ -299,9 +373,11 @@ public sealed class LocalIndexerSnapshotWorker(
     /// </summary>
     internal static SnapshotWorkResult BuildResult(
         long snapshotId, string checkoutDir, CheckoutResolution resolution, MultiSolutionLoadResult load,
-        SnapshotCoverageBuilder.Result coverage)
+        SnapshotCoverageBuilder.Result coverage,
+        IReadOnlyList<SdkPinFinding>? sdkPins = null, IReadOnlyList<string>? installedSdks = null)
     {
-        var diagnostics = BuildDiagnostics(checkoutDir, resolution, load);
+        var diagnostics = BuildDiagnostics(
+            checkoutDir, resolution, load, sdkPins ?? [], installedSdks ?? [], published: true);
         diagnostics.AddRange(coverage.Diagnostics);
 
         if (coverage.Coverage.IsPartial)
@@ -359,9 +435,10 @@ public sealed class LocalIndexerSnapshotWorker(
     /// project files) come from <see cref="SnapshotCoverageBuilder"/>.
     /// </summary>
     private static List<ProjectOutcome> BuildDiagnostics(
-        string checkoutDir, CheckoutResolution resolution, MultiSolutionLoadResult load)
+        string checkoutDir, CheckoutResolution resolution, MultiSolutionLoadResult load,
+        IReadOnlyList<SdkPinFinding> sdkPins, IReadOnlyList<string> installedSdks, bool published)
     {
-        var diagnostics = new List<ProjectOutcome>();
+        var diagnostics = SdkPinDiagnostics(sdkPins, published);
 
         foreach (var coverage in load.Solutions)
         {
@@ -414,6 +491,23 @@ public sealed class LocalIndexerSnapshotWorker(
 
         foreach (var skippedProject in load.SkippedProjects)
         {
+            if (HostFxrSdkResolutionError.TryParse(skippedProject.Reason, out var sdkError))
+            {
+                // Issue #113: the project's directory is governed by a global.json pin hostfxr cannot satisfy.
+                // A typed code + the pin details replace the raw BuildHost exception text.
+                diagnostics.Add(new ProjectOutcome
+                {
+                    Severity = published ? JobDiagnosticSeverity.Warning : JobDiagnosticSeverity.Error,
+                    Code = SdkResolutionFailedCode,
+                    ProjectPath = RepoRelative(checkoutDir, skippedProject.ProjectPath),
+                    Message =
+                        $"Project '{skippedProject.ProjectName}' could not be loaded on this worker because the .NET " +
+                        $"SDK its global.json pins is not installed: {SnapshotCoverageBuilder.DescribePin(checkoutDir, sdkError)} " +
+                        $"(installed SDK(s): {InstalledList(installedSdks.Count > 0 ? installedSdks : sdkError.InstalledSdks)})."
+                });
+                continue;
+            }
+
             diagnostics.Add(new ProjectOutcome
             {
                 Severity = JobDiagnosticSeverity.Warning,
@@ -441,6 +535,121 @@ public sealed class LocalIndexerSnapshotWorker(
 
         return diagnostics;
     }
+
+    /// <summary>Diagnostic code: an unsatisfiable global.json SDK pin was neutralized for the load (issue #113).</summary>
+    public const string SdkPinOverriddenCode = "sdk_pin_overridden";
+
+    /// <summary>Diagnostic code: hostfxr could not resolve the SDK a global.json pins, and it was not overridden.</summary>
+    public const string SdkResolutionFailedCode = "sdk_resolution_failed";
+
+    /// <summary>Diagnostic code: a neutralized global.json could not be restored to its committed bytes.</summary>
+    public const string SdkPinRestoreFailedCode = "sdk_pin_restore_failed";
+
+    /// <summary>
+    /// One diagnostic per unsatisfiable <c>global.json</c> pin (issue #113): <c>sdk_pin_overridden</c>
+    /// (warning — the snapshot was built with a substituted SDK) when it was neutralized, else
+    /// <c>sdk_resolution_failed</c> with why it was not (warning when the job still published, error when not).
+    /// </summary>
+    internal static List<ProjectOutcome> SdkPinDiagnostics(IReadOnlyList<SdkPinFinding> pins, bool published)
+    {
+        var diagnostics = new List<ProjectOutcome>();
+        foreach (var pin in pins)
+        {
+            var requested =
+                $"global.json '{pin.GlobalJsonPath}' pins .NET SDK {pin.RequestedVersion ?? "(unspecified)"} " +
+                $"(rollForward: {pin.RollForward ?? "default"}), which is not installed on this worker " +
+                $"(installed SDK(s): {InstalledList(pin.InstalledSdks)})";
+            diagnostics.Add(pin.OverrideApplied
+                ? new ProjectOutcome
+                {
+                    Severity = JobDiagnosticSeverity.Warning,
+                    Code = SdkPinOverriddenCode,
+                    ProjectPath = pin.GlobalJsonPath,
+                    Message =
+                        $"{requested}. Override applied: the service temporarily removed the pin and evaluated the " +
+                        $"checkout with installed SDK {pin.ResolvedSdkVersion ?? "(newest)"}; the committed " +
+                        "global.json was restored before indexing. This snapshot was built with a substituted SDK."
+                }
+                : new ProjectOutcome
+                {
+                    Severity = published ? JobDiagnosticSeverity.Warning : JobDiagnosticSeverity.Error,
+                    Code = SdkResolutionFailedCode,
+                    ProjectPath = pin.GlobalJsonPath,
+                    Message =
+                        $"{requested}. Override not applied: {pin.NotOverriddenReason ?? "unknown reason"}. Install " +
+                        "the pinned SDK on the worker or relax the pin's rollForward policy."
+                });
+        }
+        return diagnostics;
+    }
+
+    /// <summary>
+    /// The typed failure for a load that died on hostfxr SDK resolution (issue #113 fallback): the reason
+    /// names the pin, the requested and installed SDKs and why the pin was not overridden, and the
+    /// diagnostics carry a <c>sdk_resolution_failed</c> error — never a bare exception message.
+    /// </summary>
+    internal static SnapshotWorkResult SdkResolutionFailed(
+        string checkoutDir, HostFxrSdkResolutionError error, IReadOnlyList<SdkPinFinding> pins,
+        IReadOnlyList<string> installedSdks)
+    {
+        var diagnostics = SdkPinDiagnostics(pins, published: false);
+        var installed = installedSdks.Count > 0 ? installedSdks : error.InstalledSdks;
+        var matching = error.GlobalJsonPath is { } failedPath
+            ? pins.FirstOrDefault(p => string.Equals(
+                Path.GetFullPath(p.FullPath), Path.GetFullPath(failedPath),
+                OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
+            : null;
+
+        if (matching is null)
+        {
+            diagnostics.Add(new ProjectOutcome
+            {
+                Severity = JobDiagnosticSeverity.Error,
+                Code = SdkResolutionFailedCode,
+                ProjectPath = error.GlobalJsonPath is { } p ? RepoRelative(checkoutDir, p).Replace('\\', '/') : null,
+                Message =
+                    $"The .NET SDK could not be resolved on this worker: {SnapshotCoverageBuilder.DescribePin(checkoutDir, error)} " +
+                    $"(installed SDK(s): {InstalledList(installed)}). Install the pinned SDK on the worker or relax " +
+                    "the pin's rollForward policy."
+            });
+        }
+
+        var why = matching switch
+        {
+            { OverrideApplied: false, NotOverriddenReason: { } notOverridden } => $" The pin was not overridden: {notOverridden}.",
+            { OverrideApplied: true } => " The pin was overridden, but the load still failed SDK resolution.",
+            _ => string.Empty
+        };
+        var reason =
+            $"the .NET SDK required by the checkout's global.json could not be resolved on this worker: " +
+            $"{SnapshotCoverageBuilder.DescribePin(checkoutDir, error)}" +
+            (matching?.RollForward is { } rollForward ? $" (rollForward: {rollForward})" : string.Empty) +
+            $"; installed SDK(s): {InstalledList(installed)}.{why} Nothing was indexed and no snapshot was published.";
+        return SnapshotWorkResult.Failed(reason, diagnostics);
+    }
+
+    private static SnapshotWorkResult SdkPinRestoreFailed(string restoreError, SdkPinOverlay overlay)
+    {
+        var diagnostics = SdkPinDiagnostics(overlay.Findings, published: false);
+        var root = Path.TrimEndingDirectorySeparator(overlay.CheckoutDir);
+        diagnostics.Add(SdkPinRestoreFailedDiagnostic(
+            restoreError.Replace(root, ".", StringComparison.OrdinalIgnoreCase).Replace('\\', '/')));
+        return SnapshotWorkResult.Failed(
+            "the service neutralized an unsatisfiable global.json SDK pin for the MSBuild load but could not restore " +
+            "the committed file afterwards, so the checkout was NOT indexed (it no longer matches its commit). The " +
+            "restore journal was kept and the next job repairs the checkout before reusing it.",
+            diagnostics);
+    }
+
+    private static ProjectOutcome SdkPinRestoreFailedDiagnostic(string detail) => new()
+    {
+        Severity = JobDiagnosticSeverity.Error,
+        Code = SdkPinRestoreFailedCode,
+        Message = $"The committed global.json could not be restored after its SDK pin was neutralized: {detail}."
+    };
+
+    private static string InstalledList(IReadOnlyList<string> installed) =>
+        installed.Count > 0 ? string.Join(", ", installed) : "unknown";
 
     private static string SourceLabel(SolutionSelectionSource source) => source switch
     {

@@ -72,6 +72,7 @@ of the box.
 | `SEXTANT_SERVICE_SANDBOX_MEMORY_BUDGET_BYTES` | Watchdog memory ceiling | policy default |
 | `SEXTANT_SERVICE_SANDBOX_ALLOW_NETWORK` | Allow network during evaluation | `false` |
 | `SEXTANT_SERVICE_SANDBOX_SCRUB_SECRETS` | Scrub secrets from the evaluation environment | `true` |
+| `SEXTANT_SERVICE_SDK_PIN_OVERRIDE` | Temporarily neutralize a checkout `global.json` SDK pin that no installed SDK satisfies, so the checkout still indexes with an installed SDK (issue #113; see [SDK pins](#repository-globaljson-sdk-pins-issue-113)). `false` leaves such pins alone and the job fails / goes partial with a typed `sdk_resolution_failed` diagnostic. An unparseable value **fails startup** | `true` |
 
 Boolean toggles accept `1/0`, `true/false`, `yes/no`, `on/off` (case-insensitive); any other non-empty
 value **fails startup** rather than silently disabling a security-relevant control (fail-closed). The
@@ -139,7 +140,7 @@ file-system inventory (project files on disk, excluding `obj`/`bin`/`.git`; subm
 | --- | --- |
 | a discovered solution was not selected (no-config default) | `solution_not_selected` |
 | a configured solution is missing/invalid/outside the checkout | `solution_skipped` |
-| a declared project could not load on this worker (e.g. an iOS/Android/Mac/WPF head on Linux, #90) | `project_skipped` |
+| a declared project could not load on this worker (e.g. an iOS/Android/Mac/WPF head on Linux, #90) | `project_skipped` (`sdk_resolution_failed` when its `global.json` pins an SDK this worker lacks and the pin was not overridden, #113) |
 | a selected solution declared no readable project, or nothing loaded at all | `solution_no_projects` / `no_projects_loaded` |
 | a declared submodule is not populated (no `.git` at its path) | `submodule_unpopulated` |
 | a project file on disk is in no selected solution and was not pulled in by a `ProjectReference` | `project_file_unreferenced` |
@@ -187,6 +188,73 @@ coverage; the reason lives on the job and in the coverage record.
 Clone mode does **not** initialize submodules yet, so a repository with submodules is honestly reported
 `partial` (`submodule_unpopulated`) until submodule provisioning lands. Routing platform heads to a native
 Windows/macOS worker is a separate concern (issue #89); here they are recorded skipped-with-reason.
+
+#### Repository `global.json` SDK pins (issue #113)
+
+Roslyn's MSBuild BuildHost picks its .NET SDK through hostfxr, which honors the checkout's `global.json`.
+If a repository pins an SDK band the worker does not have **and** forbids roll-forward (e.g.
+`{"sdk": {"version": "10.0.300", "rollForward": "disable"}}` on an image that only ships 10.0.401), the
+load dies before any project evaluates (`hostfxr_resolve_sdk2 … A compatible .NET SDK was not found`),
+even though the code builds fine with the installed SDK. No environment variable or MSBuildLocator/
+MSBuildWorkspace option makes hostfxr ignore a `global.json`, and copying the checkout to scratch would
+cost a full copy per job and break checkout-relative paths. So the service handles it like this:
+
+1. **Detect.** Before loading, the worker asks hostfxr (the same resolver the BuildHost uses) whether the
+   nearest `global.json` for each selected solution's directory and each declared project's directory
+   resolves. A pin that resolves is **never touched**, so repositories that work today behave exactly as
+   before. For example, `10.0.100` with `latestFeature` rolls forward to 10.0.401 and is left alone.
+2. **Neutralize, only for the load.** With `SEXTANT_SERVICE_SDK_PIN_OVERRIDE` on (the default), each
+   failing pin inside the checkout has its `sdk` section removed **in place**. Other sections such as
+   `msbuild-sdks` are kept. hostfxr then resolves the newest installed SDK, which is re-probed and
+   recorded. The committed bytes, last-write time and unix mode are **restored in a `finally` immediately
+   after the MSBuild load**, before the coverage scan, the `EvaluationFingerprint`, or any indexing reads
+   the checkout. The persistent, reused checkout therefore never diverges from its commit (`git status`
+   stays clean).
+3. **Crash-safe.** Before any file is modified, the original bytes are journaled atomically (and fsynced)
+   to `<checkout-root>/.sextant-sdk-pin/<checkout>-<hash>.json`, outside every working tree. Every job
+   replays leftover journals **before** a cached checkout is resolved or reused. A file is restored only if
+   it still holds exactly the neutralized content; original or foreign content is left alone. If a restore
+   fails, the job fails with `sdk_pin_restore_failed`, the journal is kept, and that checkout is not
+   indexed until it is repaired.
+4. **Refusals.** A pin is left alone and reported as not overridden, with the reason, when:
+   - the override is disabled;
+   - the `global.json` lies outside the checkout or is reached through a symlink;
+   - it cannot be read or parsed, or it has no `sdk` section;
+   - the journal cannot be written;
+   - neutralizing it still leaves no resolvable SDK (for example, a parent pin outside the checkout also
+     fails). In that case it is restored at once.
+
+Outcomes and diagnostics. All paths are checkout-relative, and every diagnostic names the repo-relative
+`global.json`, the requested version and `rollForward`, and the installed SDK(s):
+
+| Situation | Job status | Diagnostic `code` |
+| --- | --- | --- |
+| pin overridden, checkout loaded | `complete` (unless another coverage gap applies) | `sdk_pin_overridden` (warning; also the substituted SDK) |
+| pin not overridden and the **whole** load failed SDK resolution | `failed` with a typed reason (requested vs installed, pin path, why not overridden) — never a bare exception message | `sdk_resolution_failed` (error) |
+| pin not overridden, but only **some** solutions/projects are governed by it (#90-style isolation, e.g. a `tools/global.json` in one of several solutions) | `partial`; the reason names the pin | `sdk_resolution_failed` (warning) for the pin and for each project it kept from loading |
+| a neutralized pin could not be restored | `failed`; nothing indexed | `sdk_pin_restore_failed` (error) |
+
+An overridden snapshot is **complete**, because the override restored full coverage, but it is never
+silent:
+
+- `GET /control/status/{jobId}` lists the `sdk_pin_overridden` diagnostic.
+- The snapshot's durable `coverage` block (in ensure/status/resolve, query pages, and MCP
+  `meta.snapshot.coverage`) carries
+  `sdk_pin_overrides: [{ global_json_path, requested_version, roll_forward, resolved_sdk_version, installed_sdks }]`.
+- The ensure audit row's `detail` gains a suffix, e.g. `job_42;sdk_pin_overridden`. The suffixes are
+  `;sdk_resolution_failed` and `;sdk_pin_restore_failed` for the other two outcomes.
+
+**Identity and fingerprints stay deterministic.** The snapshot identity is computed from the request and
+the service toolchain before the worker runs, and does not read `global.json`.
+`EvaluationFingerprint.Compute` does hash `global.json`, but it runs at index time, after the restore. It
+therefore records the **committed** checkout's value, the same value a worker that has the pinned SDK would
+record. The override needs no `AnalyzerVersion` bump.
+
+**Operator options.** Install the pinned SDK band in the worker image, which makes the pin resolve so the
+override never engages. Alternatively, have the repository relax `rollForward` (e.g. `latestFeature`). Set
+`SEXTANT_SERVICE_SDK_PIN_OVERRIDE=false` to prefer an honest `failed`/`partial` over a substituted SDK. The
+local CLI/daemon path is unaffected: it evaluates with the developer's own SDK and never rewrites
+`global.json`.
 
 #### Transient vs deterministic provisioning failures
 
@@ -380,6 +448,11 @@ separate from the persistent checkout/artifact/cache volumes**:
 So a botched worker-scratch cleanup can **never** reach — let alone delete — a published snapshot's durable
 data. This extends the Phase-8 retention servable guard + Phase-9 `BranchPointerProtection`.
 
+The checkout volume also holds `.sextant-sdk-pin/`, the SDK-pin restore journals (issue #113). It is a
+sibling of the checkouts, never inside a working tree, and is empty except while a job has a `global.json`
+pin neutralized or after a crash in that window. Keep it on the same persistent volume as the checkouts:
+it is what lets the next job put a neutralized `global.json` back.
+
 ## Untrusted evaluation sandbox (Phase 17, criterion 2)
 
 MSBuild project evaluation is an **untrusted execution boundary — even for a private repo** (imported
@@ -522,7 +595,15 @@ Plus store-level regressions: `RetentionSnapshotGcTests` (#46/#37/#54), `WriterL
 `ProviderGrowthImmutabilityTests` (#53), and `RemoteFederationTests` (#51 paging/caching/offline/timeout/
 auth). Coverage integrity (#119): `SnapshotCoverageBuilderTests`, `CheckoutInventoryTests`,
 `SnapshotCoverageStoreTests`, `OrchestratorCoverageTests`, `SnapshotServiceCoverageTests`, and the
-`CoverageRegressionFixtureTests` clone of a two-solution repo with an uninitialized submodule.
+`CoverageRegressionFixtureTests` clone of a two-solution repo with an uninitialized submodule. SDK pins
+(#113): `HostFxrSdkResolutionErrorTests` (classifying the hostfxr SDK-not-found error), `SdkPinGuardTests`
+(detect/neutralize/restore/journal recovery/refusals over a fake hostfxr probe), `SdkPinSurfaceTests`
+(diagnostics, coverage provenance, audit suffix, status), and the real-MSBuild
+`SdkPinOverrideIntegrationTests`. The integration tests cover a `10.0.999` + `disable` pin that is
+overridden (with and without the sandboxed worker; the checkout bytes, mtime, `git status` and
+`EvaluationFingerprint` are unchanged afterwards), the override disabled (typed failure), a resolvable pin
+(untouched), crash recovery, and a multi-solution repo where one solution's pin yields `partial` (override
+off) or `complete` (override on).
 
 ### Phase 15 — platform routing tests
 
