@@ -54,7 +54,8 @@ public class ConfigurationTests
     [TestMethod]
     public void TryReadCheckoutSolutions_NoFile_SucceedsWithEmpty()
     {
-        // No sextant.json = no scoping intent → success with an empty list (falls back to a default root).
+        // No sextant.json = no scoping intent → success with an empty list (the service then selects the
+        // default union of every discovered solution, #124).
         Assert.IsTrue(SextantConfiguration.TryReadCheckoutSolutions(_tempDir, out var solutions, out var error));
         Assert.AreEqual(0, solutions.Count);
         Assert.IsNull(error);
@@ -75,7 +76,7 @@ public class ConfigurationTests
     public void TryReadCheckoutSolutions_MalformedJson_FailsWithReasonNotSwallowed()
     {
         // Unlike Load (which swallows a malformed file into defaults), the strict read must REPORT the error
-        // so the service never silently indexes a default-root subset as if it were the configured coverage.
+        // so the service never silently indexes the default selection as if it were the configured coverage.
         File.WriteAllText(Path.Combine(_tempDir, "sextant.json"), "{ not valid json ]");
 
         Assert.IsFalse(SextantConfiguration.TryReadCheckoutSolutions(_tempDir, out var solutions, out var error));

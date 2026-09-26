@@ -22,8 +22,9 @@ public class SnapshotWorkerVerdictTests
     // never the Solution graph itself (that was consumed during indexing, before the verdict is built).
     private static Solution EmptySolution() => new AdhocWorkspace().CurrentSolution;
 
+    // Default updated for #124: the no-config source is now DefaultUnion (the DefaultRoot value is retired).
     private static CheckoutResolution Resolution(
-        SolutionSelectionSource source = SolutionSelectionSource.DefaultRoot,
+        SolutionSelectionSource source = SolutionSelectionSource.DefaultUnion,
         IReadOnlyList<SkippedSolution>? skippedSolutions = null,
         IReadOnlyList<string>? discoveredButNotSelected = null,
         string? configurationError = null) =>
@@ -108,14 +109,17 @@ public class SnapshotWorkerVerdictTests
         Assert.IsTrue(result.Projects.Any(p => p.Code == "solution_no_projects" && p.Severity == JobDiagnosticSeverity.Warning));
     }
 
+    // Was "BuildResult_DefaultRootLeavesOtherSolutions_IsPartialNotComplete" (#119). Since #124 the
+    // no-config selector selects EVERY discovered solution, so it never produces discovered-but-unselected
+    // solutions; the builder still honors the list as a defensive invariant, which this test locks down.
     [TestMethod]
-    public void BuildResult_DefaultRootLeavesOtherSolutions_IsPartialNotComplete()
+    public void BuildResult_DiscoveredButNotSelected_DefensiveInvariant_IsPartialNotComplete()
     {
-        // Issue #119: a default pick that leaves other DISCOVERED solutions unindexed is a coverage gap — the
-        // monorepo that indexed 5 of 415 projects was reported COMPLETE this way. It must be Partial, with a
-        // per-solution warning naming every unselected solution and a reason on the durable coverage.
+        // Issue #119: leaving other DISCOVERED solutions unindexed is a coverage gap — the monorepo that
+        // indexed 5 of 415 projects was reported COMPLETE this way. It must be Partial, with a per-solution
+        // warning naming every unselected solution and a reason on the durable coverage.
         var resolution = Resolution(
-            source: SolutionSelectionSource.DefaultRoot,
+            source: SolutionSelectionSource.DefaultUnion,
             discoveredButNotSelected: [$"{CheckoutDir}/heads/Ios.slnx", $"{CheckoutDir}/heads/Android.slnx"]);
         var load = Load([new SolutionCoverage($"{CheckoutDir}/App.slnx", DeclaredProjectCount: 3, LoadedProjectCount: 3, [])]);
 
@@ -131,6 +135,68 @@ public class SnapshotWorkerVerdictTests
         Assert.AreEqual(SnapshotCoverageVerdict.Partial, result.Coverage.Verdict);
         Assert.AreEqual(2, result.Coverage.SolutionsNotSelected);
         StringAssert.Contains(result.Error, "2 of 3 discovered solution(s) were not selected");
+    }
+
+    [TestMethod]
+    public void BuildResult_DefaultUnionOfSeveralSolutions_AllLoaded_IsComplete()
+    {
+        // #124 criterion: a multi-solution checkout whose projects all load reports COMPLETE — the union
+        // leaves nothing unselected, and a project shared by both heads (Core) is declared once.
+        var core = $"{CheckoutDir}/src/Core/Core.csproj";
+        var app = $"{CheckoutDir}/src/App/App.csproj";
+        var tool = $"{CheckoutDir}/tools/Tool/Tool.csproj";
+        var resolution = Resolution() with
+        {
+            SelectedSolutions = [$"{CheckoutDir}/App.slnx", $"{CheckoutDir}/tools/Tools.slnx"]
+        };
+        var load = Load(
+            [
+                new SolutionCoverage($"{CheckoutDir}/App.slnx", DeclaredProjectCount: 2, LoadedProjectCount: 2, []),
+                new SolutionCoverage($"{CheckoutDir}/tools/Tools.slnx", DeclaredProjectCount: 2, LoadedProjectCount: 2, [])
+            ]) with { DeclaredProjects = [core, app, tool] };
+        var inventory = new SnapshotCoverageBuilder.Inventory([core, app, tool], []);
+
+        var result = Verdict(21, resolution, load, inventory);
+
+        Assert.AreEqual(SnapshotJobStatus.Complete, result.Status);
+        Assert.AreEqual(SnapshotCoverageVerdict.Complete, result.Coverage!.Verdict);
+        Assert.AreEqual("default_union", result.Coverage.SelectionSource);
+        Assert.AreEqual(2, result.Coverage.SolutionsDiscovered);
+        Assert.AreEqual(2, result.Coverage.SolutionsSelected);
+        Assert.AreEqual(0, result.Coverage.SolutionsNotSelected);
+        Assert.AreEqual(3, result.Coverage.ProjectsDeclared, "the shared project counts once across the union");
+        Assert.AreEqual(2, result.Projects.Count(p => p.Code == "solution_indexed"));
+        Assert.IsTrue(result.Projects.All(p => p.Severity == JobDiagnosticSeverity.Info));
+    }
+
+    [TestMethod]
+    public void BuildResult_DefaultUnionWithUnloadablePlatformHead_IsPartialNamingTheHead()
+    {
+        // #124 criterion: a platform head that cannot load on this worker does not fail the snapshot — it is
+        // skipped-with-reason, the loadable projects are published, and the partial reason names the head.
+        var head = $"{CheckoutDir}/heads/Mobile.iOS/Mobile.iOS.csproj";
+        var skipped = new[] { new SkippedProject(head, "The imported project 'Xamarin.iOS.targets' was not found") };
+        var resolution = Resolution() with
+        {
+            SelectedSolutions = [$"{CheckoutDir}/App.slnx", $"{CheckoutDir}/heads/Mobile-ios.slnx"]
+        };
+        var load = Load(
+            [
+                new SolutionCoverage($"{CheckoutDir}/App.slnx", DeclaredProjectCount: 1, LoadedProjectCount: 1, []),
+                new SolutionCoverage($"{CheckoutDir}/heads/Mobile-ios.slnx", DeclaredProjectCount: 2, LoadedProjectCount: 1, skipped)
+            ],
+            skipped);
+
+        var result = Verdict(22, resolution, load);
+
+        Assert.AreEqual(SnapshotJobStatus.Partial, result.Status);
+        Assert.AreEqual(22, result.SnapshotId, "the loadable union is still published");
+        StringAssert.Contains(result.Error, "heads/Mobile.iOS/Mobile.iOS.csproj",
+            "the coverage reason names the unloadable head so the gap is actionable");
+        StringAssert.Contains(result.Error, "project_skipped");
+        var diagnostic = result.Projects.Single(p => p.Code == "project_skipped");
+        StringAssert.Contains(diagnostic.Message, "Xamarin.iOS.targets", "the per-project diagnostic carries the load failure");
+        Assert.AreEqual(0, result.Coverage!.SolutionsNotSelected);
     }
 
     [TestMethod]

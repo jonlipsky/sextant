@@ -39,8 +39,15 @@ public static class IndexConfigurationHash
     /// multi-solution monorepo that changes which projects (and therefore which rows) an otherwise
     /// identically-configured index produces, so a pre-#109 snapshot must not be reused for the same
     /// identity — the bump invalidates it and forces the new loader to run.
+    /// <para>
+    /// <c>"2"</c> → <c>"3"</c> (issue #124): with no <c>solutions</c> config the service worker no longer
+    /// selects ONE default-root solution but the deterministic union of EVERY discovered solution. Selection
+    /// policy is not otherwise part of the snapshot identity, so a pre-#124 narrow snapshot at the same commit
+    /// must not be reused — the bump invalidates it. (Like every bump, it also makes a local daemon's index
+    /// rebuild once on upgrade.)
+    /// </para>
     /// </remarks>
-    public const string AnalyzerVersion = "2";
+    public const string AnalyzerVersion = "3";
 
     /// <summary>
     /// Computes the configuration hash for a resolved profile. The canonical pre-image is a fixed,

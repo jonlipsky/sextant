@@ -32,20 +32,21 @@ public sealed record CheckoutResolution
     /// The solutions to index, in a stable deterministic order. Non-empty for a normally-resolved checkout;
     /// EMPTY only for the config-error state (see <see cref="ConfigurationError"/>), where the operator's
     /// per-repo config is present but broken so no solution could be selected and the worker must fail
-    /// with reasons rather than silently fall back to a default-root pick (issue #109).
+    /// with reasons rather than silently fall back to the no-config default selection (issue #109).
     /// </summary>
     public required IReadOnlyList<string> SelectedSolutions { get; init; }
 
-    /// <summary>How the solution set was chosen (configured vs deterministic default).</summary>
+    /// <summary>How the solution set was chosen (configured vs the deterministic default union).</summary>
     public required SolutionSelectionSource Source { get; init; }
 
     /// <summary>Configured solution entries that could not be selected, with reasons (coverage gaps).</summary>
     public IReadOnlyList<SkippedSolution> SkippedSolutions { get; init; } = [];
 
     /// <summary>
-    /// Solutions discovered under the checkout but NOT selected by the deterministic default (empty when an
-    /// explicit config drove selection). Recorded for transparency so a default pick never SILENTLY ignores
-    /// the rest of a multi-solution repo.
+    /// Solutions discovered under the checkout but NOT selected (empty when an explicit config drove
+    /// selection). The no-config default selects the UNION of every discovered solution (issue #124), so
+    /// this is empty by construction today; it is still derived and honored by coverage as a defensive
+    /// invariant, so a future narrowing selector could never SILENTLY ignore part of a multi-solution repo.
     /// </summary>
     public IReadOnlyList<string> DiscoveredButNotSelected { get; init; } = [];
 
@@ -53,7 +54,7 @@ public sealed record CheckoutResolution
     /// Non-null when the checkout's own <c>sextant.json</c> expressed an explicit scoping intent that could
     /// not be honored — malformed JSON, or every configured <c>solutions</c> entry skipped-with-reason. In
     /// that case <see cref="SelectedSolutions"/> is empty and the worker fails the job with this reason
-    /// (plus <see cref="SkippedSolutions"/>) INSTEAD of falling back to a default-root pick, so a broken
+    /// (plus <see cref="SkippedSolutions"/>) INSTEAD of falling back to the default selection, so a broken
     /// operator config never lets partial/unintended coverage be published as complete (issue #109).
     /// </summary>
     public string? ConfigurationError { get; init; }
@@ -68,8 +69,8 @@ public sealed record CheckoutResolution
 /// <summary>
 /// Locates a checkout under the persistent checkout volume by a sanitized repository-url directory name,
 /// then selects the DETERMINISTIC solution set to index via <see cref="SolutionSelector"/> — honoring the
-/// checkout's own <c>sextant.json</c> <c>solutions</c> list, else a single Linux-loadable root solution
-/// (issue #109). Returns false (→ the job is <see cref="SnapshotJobStatus.Unsupported"/>) when no checkout
+/// checkout's own <c>sextant.json</c> <c>solutions</c> list, else the deterministic UNION of every
+/// discovered solution (issues #109, #124). Returns false (→ the job is <see cref="SnapshotJobStatus.Unsupported"/>) when no checkout
 /// or solution is present, so a query-only node degrades cleanly instead of failing hard.
 /// </summary>
 public sealed class PersistentVolumeCheckoutProvider(ServicePaths paths) : ICheckoutProvider
@@ -90,11 +91,11 @@ public sealed class PersistentVolumeCheckoutProvider(ServicePaths paths) : IChec
         // Read the CHECKOUT's own sextant.json (not the host's config) so a per-repo `solutions` list is
         // authoritative for what to index. Use the STRICT reader — unlike SextantConfiguration.Load it does
         // NOT swallow a malformed file into defaults: a broken config is an explicit scoping intent we must
-        // surface, never silently discard by falling back to a default-root pick (issue #109 / criterion 3).
+        // surface, never silently discard by falling back to the default selection (issue #109 / criterion 3).
         if (!SextantConfiguration.TryReadCheckoutSolutions(candidate, out var configured, out var configError))
         {
             // Malformed/unreadable sextant.json: resolve the checkout but carry the error so the worker
-            // fails the job WITH a reason instead of indexing a default-root subset as if it were complete.
+            // fails the job WITH a reason instead of indexing a default selection as if it were intended.
             resolution = new CheckoutResolution
             {
                 CheckoutDir = candidate,
@@ -106,7 +107,7 @@ public sealed class PersistentVolumeCheckoutProvider(ServicePaths paths) : IChec
         }
 
         // Selection is pure over the committed checkout → stable across runs (criterion 2). When the config
-        // is absent SolutionSelector falls back to a deterministic default root.
+        // is absent SolutionSelector selects the deterministic union of every discovered solution (#124).
         var selection = SolutionSelector.Select(candidate, configured);
 
         if (selection.HasSolutions)
@@ -126,7 +127,7 @@ public sealed class PersistentVolumeCheckoutProvider(ServicePaths paths) : IChec
 
         // No solution selected. Distinguish an EXPLICIT-but-unusable config (operator listed solutions but
         // every entry was skipped-with-reason) from "no config and nothing on disk". The former is a config
-        // error we must report WITH the per-entry reasons — never silently fall back to a default root; the
+        // error we must report WITH the per-entry reasons — never silently fall back to the default union; the
         // latter is a genuinely unsupported checkout (query-only node / non-.NET repo) → degrade cleanly.
         if (configured.Count > 0)
         {
@@ -187,7 +188,7 @@ public sealed class LocalIndexerSnapshotWorker(
 
         // Config-error state: the checkout's own sextant.json expressed an explicit scoping intent that
         // could not be honored (malformed JSON, or every configured `solutions` entry skipped-with-reason).
-        // Fail the job WITH the reason — never silently fall back to a default-root pick and report it as
+        // Fail the job WITH the reason — never silently fall back to the default selection and report it as
         // complete coverage (issue #109 / criterion 3). Nothing is indexed or published.
         if (!resolution.HasSelectedSolutions)
         {
@@ -207,7 +208,8 @@ public sealed class LocalIndexerSnapshotWorker(
         {
             // Load the DETERMINISTIC selected solution set into ONE workspace (union of projects,
             // de-duplicated by project path/identity). A single selected solution keeps the byte-identical
-            // whole-solution fast path; multiple solutions aggregate into one repository snapshot (#109).
+            // whole-solution fast path; multiple solutions — an explicit list, or the no-config default
+            // union of every discovered solution (#124) — aggregate into one repository snapshot (#109).
             var load = await MultiSolutionLoader.LoadAsync(
                 resolution.SelectedSolutions, log, token).ConfigureAwait(false);
 
@@ -292,10 +294,12 @@ public sealed class LocalIndexerSnapshotWorker(
     /// <summary>
     /// Turns a published snapshot + its checkout coverage into the terminal work result. The result is
     /// <see cref="SnapshotWorkResult.Partial"/> — never Complete — whenever the coverage verdict is partial
-    /// (issue #119): a discovered solution left unselected, a configured solution skipped, a declared project
-    /// that failed to load, a selected solution with no readable projects, zero loaded projects, an
-    /// unpopulated submodule, or (no-config default) an on-disk project file in no selected solution. The
-    /// Partial reason carries every coverage reason, so a partial snapshot is never presented as complete.
+    /// (issue #119): a configured solution skipped, a declared project that failed to load (e.g. a platform
+    /// head in the no-config default union, #124), a selected solution with no readable projects, zero loaded
+    /// projects, an unpopulated submodule, (no-config default) an on-disk project file in no selected
+    /// solution, or — defensively, since the default union selects every discovered solution — a discovered
+    /// solution left unselected. The Partial reason carries every coverage reason, so a partial snapshot is
+    /// never presented as complete.
     /// </summary>
     internal static SnapshotWorkResult BuildResult(
         long snapshotId, string checkoutDir, CheckoutResolution resolution, MultiSolutionLoadResult load,
@@ -319,7 +323,7 @@ public sealed class LocalIndexerSnapshotWorker(
     /// Builds the diagnostics for the config-error state (malformed <c>sextant.json</c> or every configured
     /// <c>solutions</c> entry unusable): an error carrying the configuration reason plus one warning per
     /// skipped configured solution, so the failed job records WHY the operator's scoping intent could not be
-    /// honored rather than silently falling back to a default-root pick (issue #109).
+    /// honored rather than silently falling back to the default selection (issue #109).
     /// </summary>
     internal static List<ProjectOutcome> BuildConfigErrorDiagnostics(
         string checkoutDir, CheckoutResolution resolution)
@@ -398,8 +402,8 @@ public sealed class LocalIndexerSnapshotWorker(
             });
         }
 
-        // Discovered-but-unselected solutions are coverage gaps; SnapshotCoverageBuilder records one warning
-        // per solution (issue #119), so they are not repeated here.
+        // Discovered-but-unselected solutions (empty under the default union, #124) are coverage gaps;
+        // SnapshotCoverageBuilder records one warning per solution (issue #119), so they are not repeated here.
 
         foreach (var skippedSolution in resolution.SkippedSolutions)
         {
@@ -445,7 +449,7 @@ public sealed class LocalIndexerSnapshotWorker(
     private static string SourceLabel(SolutionSelectionSource source) => source switch
     {
         SolutionSelectionSource.Configured => "configured (sextant.json)",
-        SolutionSelectionSource.DefaultRoot => "default root (no config)",
+        SolutionSelectionSource.DefaultUnion => "default union of all discovered solutions, no config",
         _ => "none"
     };
 

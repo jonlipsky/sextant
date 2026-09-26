@@ -17,8 +17,9 @@ public class SnapshotCoverageBuilderTests
 
     private static string At(string relative) => Path.Combine(CheckoutDir, relative);
 
+    // Default updated for #124: the no-config source is now DefaultUnion (the DefaultRoot value is retired).
     private static CheckoutResolution Resolution(
-        SolutionSelectionSource source = SolutionSelectionSource.DefaultRoot,
+        SolutionSelectionSource source = SolutionSelectionSource.DefaultUnion,
         IReadOnlyList<string>? notSelected = null) => new()
         {
             CheckoutDir = CheckoutDir,
@@ -143,7 +144,37 @@ public class SnapshotCoverageBuilderTests
         Assert.AreEqual(0, result.Coverage.Reasons.Count);
         Assert.AreEqual(1, result.Coverage.SubmodulesDeclared);
         Assert.AreEqual(0, result.Coverage.SubmodulesUnpopulated);
-        Assert.AreEqual("default_root", result.Coverage.SelectionSource);
+        Assert.AreEqual("default_union", result.Coverage.SelectionSource, "wire name updated for #124 (was default_root)");
+    }
+
+    [TestMethod]
+    public void SkippedProjects_ReasonNamesABoundedSample_AndPointsAtDiagnostics()
+    {
+        // #124: in the default union an unloadable platform head is skipped-with-reason; the coverage reason
+        // names the skipped projects (bounded so the record surfaced in MCP meta stays compact).
+        var skipped = Enumerable.Range(0, SnapshotCoverageBuilder.MaxNamedInReason + 3)
+            .Select(i => new SkippedProject(At($"heads/H{i:D2}.iOS/H{i:D2}.iOS.csproj"), "workload missing"))
+            .ToList();
+        var load = new MultiSolutionLoadResult(new AdhocWorkspace().CurrentSolution, skipped,
+            [new SolutionCoverage(At("App.slnx"), skipped.Count + 1, 1, skipped)])
+        {
+            DeclaredProjects = [At("src/App/App.csproj"), .. skipped.Select(s => s.ProjectPath)]
+        };
+
+        var result = SnapshotCoverageBuilder.Build(
+            CheckoutDir, Resolution(), load, new SnapshotCoverageBuilder.Inventory([], []));
+
+        Assert.AreEqual(SnapshotCoverageVerdict.Partial, result.Coverage.Verdict);
+        Assert.AreEqual(skipped.Count, result.Coverage.ProjectsSkipped);
+        var reason = result.Coverage.Reasons.Single(r => r.Contains("could not be loaded", StringComparison.Ordinal));
+        StringAssert.StartsWith(reason, $"{skipped.Count} declared project(s)");
+        StringAssert.Contains(reason, "heads/H00.iOS/H00.iOS.csproj", "checkout-relative, '/'-separated");
+        StringAssert.Contains(reason, $"heads/H{SnapshotCoverageBuilder.MaxNamedInReason - 1:D2}.iOS");
+        Assert.IsFalse(reason.Contains($"heads/H{SnapshotCoverageBuilder.MaxNamedInReason:D2}.iOS", StringComparison.Ordinal),
+            "only the first MaxNamedInReason projects are named");
+        StringAssert.Contains(reason, "+3 more");
+        StringAssert.Contains(reason, "project_skipped");
+        Assert.IsFalse(reason.Contains(CheckoutDir, StringComparison.OrdinalIgnoreCase), "no worker volume paths");
     }
 
     private static void AddProject(AdhocWorkspace workspace, string name, string filePath) =>
