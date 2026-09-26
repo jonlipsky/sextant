@@ -1180,7 +1180,8 @@ public sealed class SnapshotService : IDisposable
     {
         WithWrite(() =>
         {
-            var job = new SnapshotJobStore(_conn).GetJob(result.JobId);
+            var jobs = new SnapshotJobStore(_conn);
+            var job = jobs.GetJob(result.JobId);
             long? costMs = !result.Attached && job is { StartedAt: long s, CompletedAt: long c } && c >= s
                 ? c - s
                 : null;
@@ -1189,10 +1190,25 @@ public sealed class SnapshotService : IDisposable
                 MapOutcome(result.Status),
                 actor: AuditLogStore.HashActor(principal),
                 repositoryScope: request.RepositoryRemoteUrl,
-                detail: $"job_{result.JobId}",
+                detail: $"job_{result.JobId}{SdkPinAuditSuffix(jobs.GetDiagnostics(result.JobId))}",
                 costIndexMs: costMs);
             return 0;
         });
+    }
+
+    // Issue #113: the audit row flags a job whose snapshot was built with a substituted SDK (or that failed
+    // SDK resolution / could not restore a neutralized global.json), e.g. "job_42;sdk_pin_overridden", so the
+    // audit trail — not just the job's diagnostics — shows it. Empty for every other job (detail unchanged).
+    internal static string SdkPinAuditSuffix(IReadOnlyList<SnapshotJobDiagnostic> diagnostics)
+    {
+        string[] flagged =
+        [
+            LocalIndexerSnapshotWorker.SdkPinOverriddenCode,
+            LocalIndexerSnapshotWorker.SdkResolutionFailedCode,
+            LocalIndexerSnapshotWorker.SdkPinRestoreFailedCode
+        ];
+        var present = flagged.Where(code => diagnostics.Any(d => string.Equals(d.Code, code, StringComparison.Ordinal)));
+        return string.Concat(present.Select(code => ";" + code));
     }
 
     // Maps a job status to an audit outcome. Non-terminal (queued/running) is recorded as accepted;

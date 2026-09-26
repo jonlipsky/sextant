@@ -147,6 +147,16 @@ public sealed record ServiceOptions
     /// </summary>
     public SandboxPolicy Sandbox { get; init; } = SandboxPolicy.Enforced;
 
+    /// <summary>
+    /// Issue #113: when true (the default) the worker temporarily neutralizes a checkout's <c>global.json</c>
+    /// SDK pin that hostfxr cannot satisfy on this node (e.g. <c>"rollForward": "disable"</c> on an SDK band
+    /// the container lacks) for the MSBuild load only, restoring the committed file before indexing, and
+    /// records a <c>sdk_pin_overridden</c> diagnostic. When false such a pin fails the load (or skips the
+    /// projects it governs) with a typed <c>sdk_resolution_failed</c> diagnostic. A pin that resolves is
+    /// never touched either way. <c>SEXTANT_SERVICE_SDK_PIN_OVERRIDE</c>.
+    /// </summary>
+    public bool SdkPinOverride { get; init; } = true;
+
     private const string EnvPrefix = "SEXTANT_SERVICE_";
 
     /// <summary>
@@ -218,7 +228,8 @@ public sealed record ServiceOptions
                     ? mem : SandboxPolicy.Enforced.MemoryBudgetBytes,
                 AllowNetwork = EnvBool("SANDBOX_ALLOW_NETWORK") ?? false,
                 ScrubSecrets = EnvBool("SANDBOX_SCRUB_SECRETS") ?? true
-            }
+            },
+            SdkPinOverride = EnvBool("SDK_PIN_OVERRIDE") ?? true
         };
     }
 

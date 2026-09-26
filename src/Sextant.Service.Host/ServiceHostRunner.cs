@@ -12,6 +12,7 @@ using Sextant.Service.Backup;
 using Sextant.Service.Contributions;
 using Sextant.Service.Placement;
 using Sextant.Service.Sandbox;
+using Sextant.Service.SdkPin;
 using Sextant.Store;
 
 namespace Sextant.Service.Host;
@@ -51,8 +52,17 @@ public static class ServiceHostRunner
         // the enforced sandbox (time/memory/secret/filesystem isolation) — applied to private and public
         // repos alike. The local CLI/daemon path does not construct this worker, so it stays byte-identical.
         var sandbox = new EvaluationSandbox(options.Sandbox, paths, Console.Error.WriteLine);
+        // Issue #113: an unsatisfiable global.json SDK pin is neutralized for the MSBuild load only; the restore
+        // journal lives beside (never inside) the checkouts so a crashed job is repaired by the next one.
+        var sdkPinGuard = new SdkPinGuard(
+            new SdkPinOptions
+            {
+                OverrideEnabled = options.SdkPinOverride,
+                JournalRoot = Path.Combine(paths.CheckoutRoot, SdkPinOptions.JournalDirectoryName)
+            },
+            log: Console.Error.WriteLine);
         var localWorker = new LocalIndexerSnapshotWorker(
-            database, config, checkoutProvider, Console.Error.WriteLine, nodeCapability, sandbox);
+            database, config, checkoutProvider, Console.Error.WriteLine, nodeCapability, sandbox, sdkPinGuard);
         var defaultPlacement = new LocalPlacement(nodeCapability, localWorker);
         var worker = new CapabilityRoutingSnapshotWorker(
             defaultPlacement,
