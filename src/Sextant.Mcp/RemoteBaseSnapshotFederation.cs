@@ -43,37 +43,10 @@ public sealed class RemoteBaseSnapshotFederation : IDisposable
     /// </summary>
     public static RemoteBaseSnapshotFederation Create(SextantConfiguration config, HttpClient? httpClient = null)
     {
-        var peers = (config.Peers ?? [])
-            .Where(p => !string.IsNullOrWhiteSpace(p))
-            .Select(p => p.Trim())
-            .ToList();
-
-        if (peers.Count == 0)
-            return new RemoteBaseSnapshotFederation(null, null);
-
-        var ownsHttp = httpClient is null;
-        // A process-lifetime singleton HttpClient must refresh pooled connections so peer DNS changes are
-        // honored in a long-running MCP server (peers are addressed by hostname). Bound the pooled
-        // connection lifetime; an injected client (e.g. a test's TestServer handler) is used as-is.
-        var http = httpClient ?? new HttpClient(new SocketsHttpHandler
-        {
-            PooledConnectionLifetime = TimeSpan.FromMinutes(2)
-        });
-        var timeout = TimeSpan.FromSeconds(config.RemoteFetchTimeoutSeconds > 0 ? config.RemoteFetchTimeoutSeconds : 10);
-
-        // Each peer gets its OWN cache: the paging cursor is a peer-local symbols.id, so a shared cache
-        // could serve peer A's cached page under peer B's identical (identity, cursor, limit) key and
-        // corrupt a failover's id-space. Per-peer caches keep every cached page bound to its producer.
-        var sources = peers
-            .Select(peer => (IBaseSnapshotSource)new RemoteHttpBaseSnapshotSource(
-                http, peer, config.PeerQueryToken, timeout, new SnapshotPageCache()))
-            .ToList();
-
-        IBaseSnapshotSource source = sources.Count == 1
-            ? sources[0]
-            : new CompositeBaseSnapshotSource(sources);
-
-        return new RemoteBaseSnapshotFederation(source, ownsHttp ? http : null);
+        // Delegate source construction to the Store-level factory so the daemon's overlay reconciler (which
+        // cannot depend on Sextant.Mcp) builds the identical per-peer transport (issue #108).
+        var result = RemoteBaseSourceFactory.Create(config, httpClient);
+        return new RemoteBaseSnapshotFederation(result.Source, result.OwnedHttp);
     }
 
     public void Dispose() => _ownedHttp?.Dispose();

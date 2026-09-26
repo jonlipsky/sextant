@@ -507,10 +507,25 @@ public sealed class IndexOrchestrator
                 var logicalId = snapshotStore.EnsureLogicalProject(
                     repoId, identity.CanonicalId, identity.RepoRelativePath, identity.TargetFramework, now);
 
-                if (overlay != null && !inFilter
-                    && projectStore.GetSnapshotProjectRow(overlay.BaseSnapshotId, logicalId) is long baseRowId)
+                if (overlay != null && !inFilter && overlay.BaseSnapshotId is null)
                 {
-                    // Out-of-closure project in an overlay run: SHARE the base snapshot's existing,
+                    // Remote-base overlay (issue #108): the committed base lives on a configured peer, not
+                    // in this local catalog, so there is NO local base project-version row to SHARE for an
+                    // unchanged, out-of-closure project. Omit it from this overlay entirely — no fresh row,
+                    // no mapping into snapshot_projects, no extraction, and no projectRoslynToId entry — so
+                    // a thin machine indexes ONLY its touched working-tree diff. The federated read planner
+                    // unions this unchanged project from the remote base at query time. Skipping it from
+                    // projectRoslynToId is safe: by the undirected-closure property every processed
+                    // consumer's dependency endpoints are themselves in-closure, so no WRITTEN dependency
+                    // edge or intra-closure occurrence target references an omitted project.
+                    _log?.Invoke($"  Project (remote base, out-of-closure — federated from peer): {project.Name}");
+                    continue;
+                }
+
+                if (overlay != null && !inFilter && overlay.BaseSnapshotId is long localBaseId
+                    && projectStore.GetSnapshotProjectRow(localBaseId, logicalId) is long baseRowId)
+                {
+                    // Out-of-closure project in a LOCAL-base overlay run: SHARE the base snapshot's existing,
                     // unchanged project-version row by mapping it into the overlay's snapshot_projects.
                     // No new row and no re-extraction, so the base snapshot stays byte-identical (issue
                     // #44). Safe because the undirected closure guarantees no reference edge crosses the

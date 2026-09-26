@@ -90,7 +90,7 @@ public class SnapshotIntegrationTests
     {
         // Backward-compatible default (criterion 6): existing MCP tools take no scope yet resolve the
         // current selected snapshot transparently and return results.
-        var result = FindSymbolTool.FindSymbol(_fixture.DbProvider, "global::Sextant.Store.IndexDatabase");
+        var result = FindSymbolTool.FindSymbol(_fixture.DbProvider, "global::Sextant.Store.IndexDatabase").GetAwaiter().GetResult();
         var meta = JsonDocument.Parse(result).RootElement.GetProperty("meta");
         Assert.IsTrue(meta.GetProperty("result_count").GetInt32() >= 1,
             "a scope-less query returns the selected snapshot's rows");

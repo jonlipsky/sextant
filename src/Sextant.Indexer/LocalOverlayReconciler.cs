@@ -1,4 +1,5 @@
 using Sextant.Core;
+using Sextant.Core.Platform;
 using Sextant.Store;
 using Microsoft.CodeAnalysis;
 
@@ -74,6 +75,7 @@ public sealed class LocalOverlayReconciler
     private readonly ExtractionParallelismOptions _parallelism;
     private readonly IndexProfileDescriptor? _profile;
     private readonly IGitStateProbe _gitStateProbe;
+    private readonly IBaseSnapshotSource? _remoteBaseSource;
 
     public LocalOverlayReconciler(
         IndexDatabase db,
@@ -81,7 +83,8 @@ public sealed class LocalOverlayReconciler
         bool useDocumentExtractor = false,
         ExtractionParallelismOptions? parallelism = null,
         IndexProfileDescriptor? profile = null,
-        IGitStateProbe? gitStateProbe = null)
+        IGitStateProbe? gitStateProbe = null,
+        IBaseSnapshotSource? remoteBaseSource = null)
     {
         _db = db;
         _log = log;
@@ -92,6 +95,11 @@ public sealed class LocalOverlayReconciler
         // the working-tree status read below) so a move any time between this capture and the pre-publish
         // re-verification aborts the pass. Defaults to the real git probe; tests inject a fake.
         _gitStateProbe = gitStateProbe ?? GitStateProbe.Default;
+        // Issue #108: when configured, the committed base can be resolved from a remote peer instead of a
+        // LOCAL complete snapshot, so a thin machine that indexed only its working-tree diff builds a
+        // baseless overlay (base_snapshot_id NULL) that the read path federates over the peer. Null keeps
+        // the pre-#108 behavior (a missing local base falls back to a full local index).
+        _remoteBaseSource = remoteBaseSource;
     }
 
     /// <summary>Runs a single authoritative reconciliation pass over <paramref name="solution"/>.</summary>
@@ -193,8 +201,30 @@ public sealed class LocalOverlayReconciler
 
         if (baseId == null)
         {
-            var reason = $"no compatible committed base snapshot for HEAD {ctx.CommitSha} " +
-                         "(base not indexed, or schema/analyzer/config/toolchain mismatch); indexed the dirty working tree fully";
+            // Issue #108: no LOCAL committed base for HEAD. Before indexing the whole tree locally, ask a
+            // configured peer whether it publishes the exact committed base (by the same identity hash a
+            // local base would use). If it does, stage a BASELESS overlay (base_snapshot_id NULL) carrying
+            // only the working-tree delta; the read path federates overlay ⊕ remote-base transparently. A
+            // thin machine thus indexes only its diff and never builds the unchanged base locally.
+            if (_remoteBaseSource != null
+                && await RemotePeerHasBaseAsync(BuildRemoteBaseIdentity(ctx).Hash, cancellationToken).ConfigureAwait(false))
+            {
+                _log?.Invoke($"Overlay reconcile: {changeSet.Changes.Count} working-tree change(s) over a REMOTE base for HEAD {ctx.CommitSha}; staging baseless overlay.");
+                var remoteOverlay = new OverlayContext { BaseSnapshotId = null, WorkingTreeDelta = delta };
+                await new IncrementalIndexer(_db, _log, _useDocumentExtractor, _parallelism, _profile, _gitStateProbe)
+                    .IndexChangedFilesAsync(solution, changeSet.TouchedAbsolutePaths(), cancellationToken, remoteOverlay, ctx, pin);
+                return new OverlayReconcileResult
+                {
+                    Kind = OverlayReconcileKind.Overlay,
+                    ChangeCount = changeSet.Changes.Count
+                };
+            }
+
+            var reason = _remoteBaseSource != null
+                ? $"no compatible committed base snapshot for HEAD {ctx.CommitSha} in the local catalog or any configured peer " +
+                  "(base not indexed, unreachable, or schema/analyzer/config/toolchain mismatch); indexed the dirty working tree fully"
+                : $"no compatible committed base snapshot for HEAD {ctx.CommitSha} " +
+                  "(base not indexed, or schema/analyzer/config/toolchain mismatch); indexed the dirty working tree fully";
             _log?.Invoke($"Overlay reconcile: {reason}.");
             await RunFullAsync(solution, cancellationToken, workingTreeDelta: delta, fallbackReason: reason,
                 ctx: ctx, gitStatePin: pin);
@@ -227,21 +257,80 @@ public sealed class LocalOverlayReconciler
     {
         var conn = _db.GetConnection();
         var snapshotStore = new SnapshotStore(conn);
-        var baseIdentity = new SnapshotIdentity
-        {
-            RepositoryRemoteUrl = ctx.RepositoryRemoteUrl,
-            CommitSha = ctx.CommitSha,
-            TreeSha = ctx.TreeSha,
-            SchemaVersion = IndexDatabase.LatestSchemaVersion,
-            AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
-            ConfigHash = _profile?.ConfigurationHash,
-            ToolchainFingerprint = ToolchainFingerprint.Current,
-            WorkingTreeDelta = null
-        };
-        var row = snapshotStore.GetByIdentityHash(baseIdentity.Hash);
+        var row = snapshotStore.GetByIdentityHash(BuildBaseIdentity(ctx).Hash);
         if (row is { Status: SnapshotStatus.Complete, IsOverlay: false })
             return row.Id;
         return null;
+    }
+
+    /// <summary>
+    /// The clean-HEAD committed base identity for LOCAL resolution: the commit/tree/schema/analyzer/config/
+    /// toolchain with NO working-tree delta and not an overlay, and — like every locally-produced snapshot
+    /// (<c>TryResolveSnapshotContext</c> leaves it unset) — NO capability fingerprint. Its
+    /// <see cref="SnapshotIdentity.Hash"/> is the key a LOCALLY-built base is looked up by
+    /// (<see cref="ResolveCompatibleBaseId"/>); keeping it capability-free preserves the pure-local write/read
+    /// identity byte-for-byte (criterion 4). The peer-addressable variant is <see cref="BuildRemoteBaseIdentity"/>.
+    /// </summary>
+    private SnapshotIdentity BuildBaseIdentity(SnapshotContext ctx) => new()
+    {
+        RepositoryRemoteUrl = ctx.RepositoryRemoteUrl,
+        CommitSha = ctx.CommitSha,
+        TreeSha = ctx.TreeSha,
+        SchemaVersion = IndexDatabase.LatestSchemaVersion,
+        AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
+        ConfigHash = _profile?.ConfigurationHash,
+        ToolchainFingerprint = ToolchainFingerprint.Current,
+        WorkingTreeDelta = null
+    };
+
+    /// <summary>
+    /// The peer-addressable committed base identity (issue #108): identical to <see cref="BuildBaseIdentity"/>
+    /// but folding this machine's <see cref="WorkerCapability.LocalDefault"/> fingerprint, because a peer
+    /// (the standalone index service) publishes its committed bases under the PRODUCING node's default
+    /// capability (<c>ServiceContracts.ToIdentity</c> ← <c>ServiceOptions.DefaultCapabilityFingerprint</c> =
+    /// <see cref="WorkerCapability.LocalDefault"/>). A capability-free hash would therefore never match a real
+    /// service base. <see cref="WorkerCapability.LocalDefault"/> is deterministic per (OS, architecture), so a
+    /// SAME-PLATFORM peer's base is addressable; a genuinely different-capability base (e.g. a Linux service
+    /// base fetched by a Windows client) yields a distinct hash and safely falls through to the full-local
+    /// build — a capability incompatibility, not a mere addressing miss. This MUST stay byte-identical to the
+    /// read-side <c>BaseSnapshotIdentity.ForRemoteOverlay</c> reconstruction, which folds the same value.
+    /// </summary>
+    private SnapshotIdentity BuildRemoteBaseIdentity(SnapshotContext ctx) => new()
+    {
+        RepositoryRemoteUrl = ctx.RepositoryRemoteUrl,
+        CommitSha = ctx.CommitSha,
+        TreeSha = ctx.TreeSha,
+        SchemaVersion = IndexDatabase.LatestSchemaVersion,
+        AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
+        ConfigHash = _profile?.ConfigurationHash,
+        ToolchainFingerprint = ToolchainFingerprint.Current,
+        WorkingTreeDelta = null,
+        CapabilityFingerprint = WorkerCapability.LocalDefault.Fingerprint
+    };
+
+    /// <summary>
+    /// Probes a configured remote peer for the committed base addressed by <paramref name="baseIdentityHash"/>
+    /// (issue #108). Returns true only when a peer definitively PUBLISHES the base (a non-empty first page);
+    /// a reachable peer that does not publish it, or an unreachable/timed-out peer, returns false so the
+    /// caller falls back to a full local index. Never throws — a transport failure is a "no" here, and the
+    /// read path re-attempts the fetch (with its own cache-first fallback) at query time.
+    /// </summary>
+    private async Task<bool> RemotePeerHasBaseAsync(string baseIdentityHash, CancellationToken cancellationToken)
+    {
+        if (_remoteBaseSource is null)
+            return false;
+        try
+        {
+            var page = await _remoteBaseSource.FetchSymbolsAsync(
+                new SnapshotPageRequest { IdentityHash = baseIdentityHash, Cursor = null, Limit = 1 },
+                cancellationToken).ConfigureAwait(false);
+            return page.Symbols.Count > 0;
+        }
+        catch (Exception ex) when (ex is RemoteSnapshotUnavailableException or HttpRequestException)
+        {
+            _log?.Invoke($"Overlay reconcile: remote base probe failed ({ex.Message}); using full local fallback.");
+            return false;
+        }
     }
 
     private Task RunFullAsync(Solution solution, CancellationToken cancellationToken, string? workingTreeDelta,

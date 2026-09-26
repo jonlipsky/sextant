@@ -266,7 +266,15 @@ public sealed class SnapshotStore(SqliteConnection connection)
         cmd.Parameters.AddWithValue("@status", SnapshotStatus.Pending);
         cmd.Parameters.AddWithValue("@now", now);
         cmd.Parameters.AddWithValue("@base", (object?)baseSnapshotId ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@is_overlay", baseSnapshotId.HasValue ? 1 : 0);
+        // A snapshot is an overlay when EITHER it layers on a local committed base (base_snapshot_id set —
+        // the pre-#108 signal) OR its identity declares an overlay (which folds the overlay/full
+        // discriminator into its hash for a dirty tree — issue #47). The union is what lets a REMOTE-base
+        // overlay (issue #108) — a genuine overlay whose committed base lives on a peer — be flagged
+        // is_overlay = 1 even though its base_snapshot_id is NULL. For every pre-#108 caller the two
+        // signals agreed (a local base was always passed with an overlay identity), so this is
+        // byte-identical for them.
+        var isOverlay = identity.IsOverlay || baseSnapshotId.HasValue;
+        cmd.Parameters.AddWithValue("@is_overlay", isOverlay ? 1 : 0);
         cmd.Parameters.AddWithValue("@delta", (object?)identity.WorkingTreeDelta ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@fallback", (object?)fallbackReason ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@is_provider", isProvider ? 1 : 0);
@@ -392,6 +400,21 @@ public sealed class SnapshotStore(SqliteConnection connection)
         using var cmd = connection.CreateCommand();
         cmd.CommandText = "SELECT commit_sha FROM commits WHERE id = @id;";
         cmd.Parameters.AddWithValue("@id", commitId.Value);
+        return cmd.ExecuteScalar() as string;
+    }
+
+    /// <summary>
+    /// The normalized git remote URL for a <c>repositories.id</c> (a snapshot's
+    /// <see cref="SnapshotRow.RepositoryId"/>), or null when unknown. Used by the Phase-11 federated read
+    /// planner to recompute a remote-base overlay's committed base identity hash (issue #108) from the
+    /// overlay generation's own stored fields, so the planner can address the peer's base snapshot without
+    /// a second stored column.
+    /// </summary>
+    public string? GetRepositoryRemoteUrl(long repositoryId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT remote_url FROM repositories WHERE id = @id;";
+        cmd.Parameters.AddWithValue("@id", repositoryId);
         return cmd.ExecuteScalar() as string;
     }
 
