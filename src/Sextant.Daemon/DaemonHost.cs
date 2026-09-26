@@ -36,6 +36,13 @@ public sealed class DaemonHost : IDisposable
     private Task? _periodicTask;
     private volatile OverlayReconcileResult? _lastReconcileResult;
 
+    // Issue #108: when peers are configured, the daemon can resolve a committed base from a remote peer,
+    // so a thin machine builds a baseless overlay over its working-tree diff instead of a full local base
+    // index. Null when no peers are configured (the pre-#108 full-local-fallback behavior is unchanged).
+    // The daemon owns the HttpClient for its whole lifetime and disposes it on shutdown.
+    private IBaseSnapshotSource? _remoteBaseSource;
+    private HttpClient? _remoteBaseHttp;
+
     public int StatusPort => _statusServer?.Port ?? 0;
 
     public DaemonHost(string repoRoot, string dbPath, string[] solutionPaths, Action<string>? log = null)
@@ -61,6 +68,16 @@ public sealed class DaemonHost : IDisposable
         _parallelism = Indexer.ExtractionParallelismOptions.FromConfiguration(config);
         _profile = IndexProfileDescriptor.FromConfiguration(config);
         _reconcileIntervalSeconds = config.ReconcileIntervalSeconds;
+
+        // Issue #108: build the remote base-snapshot source once for the daemon's lifetime (null when no
+        // peers are configured). When present, a missing LOCAL committed base resolves from a peer so a
+        // thin machine builds a baseless overlay over its diff instead of a full local base index. Owned
+        // here (its HttpClient is disposed on shutdown); a peer-config change takes effect on daemon restart.
+        var remoteFederation = RemoteBaseSourceFactory.Create(config);
+        _remoteBaseSource = remoteFederation.Source;
+        _remoteBaseHttp = remoteFederation.OwnedHttp;
+        if (_remoteBaseSource != null)
+            _log?.Invoke($"Remote base federation enabled ({config.Peers.Count} peer(s)); a missing local base resolves from peers.");
 
         // Single-writer lease (issue #38 / #59): the daemon is a long-lived writer, so it holds the lease
         // for its whole lifetime and fails closed if another writer (a second daemon, the index service, or
@@ -371,7 +388,7 @@ public sealed class DaemonHost : IDisposable
                 var solution = await SolutionLoader.LoadSolutionAsync(solutionPath, _log);
                 _currentSolution = solution;
 
-                var reconciler = new LocalOverlayReconciler(_db!, _log, _useDocumentExtractor, _parallelism, _profile);
+                var reconciler = new LocalOverlayReconciler(_db!, _log, _useDocumentExtractor, _parallelism, _profile, gitStateProbe: null, remoteBaseSource: _remoteBaseSource);
                 result = await reconciler.ReconcileAsync(solution, ct);
                 if (result.Kind != OverlayReconcileKind.Aborted)
                     break;
@@ -605,5 +622,7 @@ public sealed class DaemonHost : IDisposable
         // immediately on a clean shutdown (a crash leaves it to expire).
         _lease?.Dispose();
         _db?.Dispose();
+        // Issue #108: dispose the HttpClient the daemon owns for remote base federation (null when no peers).
+        _remoteBaseHttp?.Dispose();
     }
 }

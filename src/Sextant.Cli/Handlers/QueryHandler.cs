@@ -93,7 +93,7 @@ internal static class QueryHandler
         var name = GetArg(args, 0, "<name>");
         var fuzzy = HasFlag(args, "--fuzzy");
         var kind = GetOption(args, "--kind");
-        return Mcp.Tools.FindSymbolTool.FindSymbol(db, name, kind, null, fuzzy);
+        return Mcp.Tools.FindSymbolTool.FindSymbol(db, name, kind, null, fuzzy).GetAwaiter().GetResult();
     }
 
     private static string RunFindReferences(Mcp.DatabaseProvider db, string[] args)

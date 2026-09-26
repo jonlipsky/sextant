@@ -16,7 +16,7 @@ public class ExistingToolIntegrationTests
     [TestMethod]
     public void FindSymbol_DatabaseProvider_ReturnsExactMatch()
     {
-        var result = FindSymbolTool.FindSymbol(_fixture.DbProvider, "global::Sextant.Mcp.DatabaseProvider");
+        var result = FindSymbolTool.FindSymbol(_fixture.DbProvider, "global::Sextant.Mcp.DatabaseProvider").GetAwaiter().GetResult();
         var doc = JsonDocument.Parse(result);
         var meta = doc.RootElement.GetProperty("meta");
         Assert.IsTrue(meta.GetProperty("result_count").GetInt32() >= 1);
@@ -26,7 +26,7 @@ public class ExistingToolIntegrationTests
     public void FindSymbol_Fuzzy_ReturnsResults()
     {
         // Use a display name that must exist since we found DatabaseProvider by exact match
-        var result = FindSymbolTool.FindSymbol(_fixture.DbProvider, "DatabaseProvider", fuzzy: true);
+        var result = FindSymbolTool.FindSymbol(_fixture.DbProvider, "DatabaseProvider", fuzzy: true).GetAwaiter().GetResult();
         var doc = JsonDocument.Parse(result);
         var meta = doc.RootElement.GetProperty("meta");
         Assert.IsTrue(meta.GetProperty("result_count").GetInt32() >= 1);
@@ -47,7 +47,7 @@ public class ExistingToolIntegrationTests
     {
         // First find a real class FQN from the index
         var symbolResult = FindSymbolTool.FindSymbol(_fixture.DbProvider,
-            "global::Sextant.Store.IndexDatabase");
+            "global::Sextant.Store.IndexDatabase").GetAwaiter().GetResult();
         var symbolDoc = JsonDocument.Parse(symbolResult);
         var resultCount = symbolDoc.RootElement.GetProperty("meta").GetProperty("result_count").GetInt32();
         if (resultCount == 0)

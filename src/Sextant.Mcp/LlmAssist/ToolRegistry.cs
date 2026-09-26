@@ -66,7 +66,7 @@ public sealed class ToolRegistry
                 GetOptionalBool(args, "fuzzy") ?? false,
                 GetOptionalBool(args, "include_source") ?? false,
                 GetOptionalString(args, "scope")
-            ));
+            ).GetAwaiter().GetResult());
 
         Register("semantic_search",
             "FTS5 search over symbol names and documentation.",

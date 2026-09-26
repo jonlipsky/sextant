@@ -11,7 +11,7 @@ public class ScopeFilterTests
     [TestMethod]
     public void FindSymbol_NullScope_ReturnsResults()
     {
-        var result = FindSymbolTool.FindSymbol(_fixture.DbProvider, "BaseService", fuzzy: true);
+        var result = FindSymbolTool.FindSymbol(_fixture.DbProvider, "BaseService", fuzzy: true).GetAwaiter().GetResult();
         var doc = JsonDocument.Parse(result);
         var meta = doc.RootElement.GetProperty("meta");
         Assert.IsTrue(meta.GetProperty("result_count").GetInt32() >= 1);
@@ -21,13 +21,13 @@ public class ScopeFilterTests
     public void FindSymbol_ScopeProject_FiltersToProject()
     {
         var result = FindSymbolTool.FindSymbol(_fixture.DbProvider, "Consumer",
-            fuzzy: true, scope: "project:proj_alpha_123456");
+            fuzzy: true, scope: "project:proj_alpha_123456").GetAwaiter().GetResult();
         var doc = JsonDocument.Parse(result);
         var meta = doc.RootElement.GetProperty("meta");
         Assert.AreEqual(0, meta.GetProperty("result_count").GetInt32());
 
         result = FindSymbolTool.FindSymbol(_fixture.DbProvider, "Consumer",
-            fuzzy: true, scope: "project:proj_beta_7890ab");
+            fuzzy: true, scope: "project:proj_beta_7890ab").GetAwaiter().GetResult();
         doc = JsonDocument.Parse(result);
         meta = doc.RootElement.GetProperty("meta");
         Assert.IsTrue(meta.GetProperty("result_count").GetInt32() >= 1);
@@ -54,7 +54,7 @@ public class ScopeFilterTests
     public void FindSymbol_ScopeFile_FiltersToSingleFile()
     {
         var result = FindSymbolTool.FindSymbol(_fixture.DbProvider, "BaseService",
-            fuzzy: true, scope: "file:src/Alpha/BaseService.cs");
+            fuzzy: true, scope: "file:src/Alpha/BaseService.cs").GetAwaiter().GetResult();
         var doc = JsonDocument.Parse(result);
         var results = doc.RootElement.GetProperty("results");
         // All results should be from that file
@@ -70,7 +70,7 @@ public class ScopeFilterTests
     {
         // Invalid scope format should degrade gracefully (return all results)
         var result = FindSymbolTool.FindSymbol(_fixture.DbProvider, "BaseService",
-            fuzzy: true, scope: "invalid_format");
+            fuzzy: true, scope: "invalid_format").GetAwaiter().GetResult();
         var doc = JsonDocument.Parse(result);
         var meta = doc.RootElement.GetProperty("meta");
         // Should not crash; may return all results or empty depending on implementation
