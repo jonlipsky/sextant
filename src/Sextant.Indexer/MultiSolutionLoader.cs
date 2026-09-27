@@ -18,6 +18,16 @@ public sealed record SolutionCoverage(
     IReadOnlyList<SkippedProject> SkippedProjects);
 
 /// <summary>
+/// The projects one selected solution DECLARES (absolute paths, declaration order). A multi-solution load
+/// opens projects individually, so the combined <see cref="Solution"/> has no solution file of its own;
+/// the orchestrator uses this to record each selected solution's <c>solution → project</c> mapping (the
+/// <c>solution:</c> query scope) exactly as the single-solution path does from <see cref="Solution.FilePath"/>.
+/// </summary>
+/// <param name="SolutionPath">The absolute solution path.</param>
+/// <param name="DeclaredProjects">The absolute paths of the projects the solution declares.</param>
+public sealed record SolutionMembership(string SolutionPath, IReadOnlyList<string> DeclaredProjects);
+
+/// <summary>
 /// The outcome of loading one or more solutions into a single workspace: the combined (possibly partial)
 /// <see cref="Solution"/> spanning the UNION of all solutions' projects (de-duplicated by project
 /// identity), the union of skipped projects, and per-solution coverage.
@@ -35,6 +45,13 @@ public sealed record MultiSolutionLoadResult(
     /// order — the denominator for checkout coverage (issue #119).
     /// </summary>
     public IReadOnlyList<string> DeclaredProjects { get; init; } = [];
+
+    /// <summary>
+    /// Each selected solution's declared projects, in selection order. Passed to
+    /// <see cref="IndexOrchestrator.IndexSolutionAsync"/> so a multi-solution snapshot keeps its
+    /// <c>solution → project</c> mappings (issue #124).
+    /// </summary>
+    public IReadOnlyList<SolutionMembership> Membership { get; init; } = [];
 }
 
 /// <summary>
@@ -52,6 +69,9 @@ public sealed record MultiSolutionLoadResult(
 public static class MultiSolutionLoader
 {
     private static readonly StringComparer PathComparer = StringComparer.OrdinalIgnoreCase;
+
+    /// <summary>The comparer the union uses to de-duplicate project files (shared with membership mapping).</summary>
+    internal static StringComparer ProjectPathComparer => PathComparer;
 
     /// <summary>
     /// Loads <paramref name="solutionPaths"/> (already selected + deterministically ordered by
@@ -100,7 +120,10 @@ public static class MultiSolutionLoader
         var coverage = BuildCoverage(perSolutionDeclared, loaded.SkippedProjects);
         return new MultiSolutionLoadResult(loaded.Solution, loaded.SkippedProjects, coverage)
         {
-            DeclaredProjects = union
+            DeclaredProjects = union,
+            Membership = perSolutionDeclared
+                .Select(p => new SolutionMembership(Path.GetFullPath(p.Solution), p.Declared))
+                .ToList()
         };
     }
 

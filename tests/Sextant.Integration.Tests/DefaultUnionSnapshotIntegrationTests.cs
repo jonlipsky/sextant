@@ -88,6 +88,19 @@ public sealed class DefaultUnionSnapshotIntegrationTests : IDisposable
             Assert.AreEqual(1, coverage.Reasons.Count, "the unloadable head is the only gap");
 
             AssertSharedProjectStoredOncePerTfm(db.GetConnection(), result.SnapshotId.Value);
+            // Solution scope (#124 review): the union workspace has no solution file of its own, yet each
+            // selected solution keeps its OWN solution → project mapping; the shared project maps to every
+            // solution that declares it (once per TFM), and no solution picks up another's projects.
+            var app = SolutionMembers(db.GetConnection(), Path.Combine(checkout, "App.slnx"));
+            CollectionAssert.AreEqual(
+                new[] { "App.csproj", "Core.csproj", "Core.csproj" }, app, string.Join(", ", app));
+            var tools = SolutionMembers(db.GetConnection(), Path.Combine(checkout, "Build.Linux", "Tools-server.slnx"));
+            CollectionAssert.AreEqual(
+                new[] { "Core.csproj", "Core.csproj", "Tool.csproj" }, tools, string.Join(", ", tools));
+            var mobile = SolutionMembers(db.GetConnection(), Path.Combine(checkout, "Build.Mac", "Mobile-ios.slnx"));
+            Assert.AreEqual(2, mobile.Count(p => p == "Core.csproj"), string.Join(", ", mobile));
+            Assert.IsTrue(mobile.All(p => p is "Core.csproj" or "Mobile.iOS.csproj"),
+                "the head solution maps only its own declared projects: " + string.Join(", ", mobile));
             // MSBuild keeps an empty, document-less stub for a project it could not evaluate (#90), so the
             // head may still get a project row; what matters is that it contributes no indexed content.
             Assert.AreEqual(0, ScalarInt(db.GetConnection(), $"""
@@ -166,6 +179,25 @@ public sealed class DefaultUnionSnapshotIntegrationTests : IDisposable
         JOIN snapshot_projects sp ON sp.project_id = p.id
         WHERE sp.snapshot_id = {snapshotId} AND p.repo_relative_path LIKE '{likePattern}';
         """;
+
+    // The file names of the projects mapped to one solution (one entry per per-TFM project row). File names,
+    // not repo-relative paths: this fixture checkout is not a git repo, so no repo root anchors the path.
+    private static string[] SolutionMembers(SqliteConnection conn, string solutionPath)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT p.repo_relative_path FROM solution_projects sp
+            JOIN solutions s ON s.id = sp.solution_id
+            JOIN projects p ON p.id = sp.project_id
+            WHERE s.file_path = @path;
+            """;
+        cmd.Parameters.AddWithValue("@path", solutionPath);
+        var members = new List<string>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            members.Add(Path.GetFileName(reader.GetString(0).Replace('\\', '/')));
+        return members.Order(StringComparer.Ordinal).ToArray();
+    }
 
     private static EnsureSnapshotRequest Request() => new()
     {
@@ -276,9 +308,19 @@ public sealed class DefaultUnionSnapshotIntegrationTests : IDisposable
         };
         using var process = System.Diagnostics.Process.Start(psi)!;
         var stdoutTask = process.StandardOutput.ReadToEndAsync();
-        var stderr = process.StandardError.ReadToEnd();
+        var stderrTask = process.StandardError.ReadToEndAsync();
+        // Bounded (review): a hung restore must not stall the whole Integration run. Kill only THIS process
+        // (and its children) — never dotnet/MSBuild by name, other sessions share the machine.
+        if (!process.WaitForExit(TimeSpan.FromMinutes(5)))
+        {
+            try { process.Kill(entireProcessTree: true); } catch (InvalidOperationException) { /* already exited */ }
+            Assert.Inconclusive($"restore of '{Path.GetFileName(projectPath)}' did not finish within 5 minutes");
+        }
         var stdout = stdoutTask.GetAwaiter().GetResult();
-        process.WaitForExit();
+        var stderr = stderrTask.GetAwaiter().GetResult();
+        // Inconclusive (not failed) on a restore failure, matching every other generated-corpus integration
+        // test in this repo (e.g. MultiSolutionIndexingIntegrationTests): an offline machine without the
+        // netstandard2.0 reference pack cached cannot restore, which is not a product regression.
         if (process.ExitCode != 0)
             Assert.Inconclusive(
                 $"restore of '{Path.GetFileName(projectPath)}' failed (exit {process.ExitCode}): {stderr}{stdout}");

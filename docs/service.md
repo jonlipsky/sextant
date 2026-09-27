@@ -133,11 +133,15 @@ externals). The worker chooses the set to index **explicitly and deterministical
   `/`-separated repo-relative path. **Platform-head solutions are included**, not ranked out: their
   loadable projects (shared libraries, and anything that evaluates on this worker) are indexed, and each
   project that cannot load here is recorded **skipped-with-reason** (`project_skipped`, per-project fault
-  isolation from #90) and makes the snapshot **partial**. It never fails the snapshot. A checkout whose
+  isolation from #90) and makes the snapshot **partial**. A partly-unloadable union never fails the
+  snapshot; only a union in which **no** project loads at all fails the job, so an empty snapshot is never
+  published. A checkout whose
   discovered solutions all load is **complete**. With a single discovered solution this is just that
   solution, loaded as before. With several, each project is opened individually (that is what isolates a
   per-project load fault), so no solution sets `$(SolutionDir)`: a project that imports
-  `$(SolutionDir)…` with no fallback may be skipped-with-reason on this path. Nothing is "discovered but
+  `$(SolutionDir)…` with no fallback may be skipped-with-reason on this path. Each selected solution still
+  gets its own `solution → project` mapping (the `solution:` query scope), taken from the projects that
+  solution declares. Nothing is "discovered but
   not selected" any more. Before #124 the default
   picked **one** solution and reported the rest as `solution_not_selected`; that kept a monorepo with no
   root solution (issue #119) mostly unindexed.

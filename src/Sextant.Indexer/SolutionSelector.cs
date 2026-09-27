@@ -76,7 +76,10 @@ public sealed record SolutionSelection(
 /// </summary>
 public static class SolutionSelector
 {
-    private static readonly StringComparer PathComparer = StringComparer.OrdinalIgnoreCase;
+    // Host-aware (issue #124 review): case-insensitive on Windows/macOS, ordinal on case-sensitive file systems,
+    // so two distinct solution files differing only by case on Linux are both discovered/selected rather than
+    // one silently hidden from the union and from coverage.
+    private static StringComparer PathComparer => CheckoutInventory.PathComparer;
 
     // Directory segments whose contents are never a repo's real solution set (build output / VCS).
     private static readonly HashSet<string> ExcludedSegments =
