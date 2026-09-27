@@ -53,7 +53,7 @@ of the box.
 | `SEXTANT_SERVICE_SCRATCH_ROOT` | **Ephemeral** per-job worker scratch | `<data-root>/scratch` |
 | `SEXTANT_SERVICE_CHECKOUT_MODE` | How a checkout is obtained: `locate` (index only an already-provisioned checkout) or `clone` (provision it by cloning the requested commit) | `locate` |
 | `SEXTANT_SERVICE_CHECKOUT_TOKEN` | Access token for cloning a **private** `https` repo in `clone` mode (injected as `x-access-token`; public repos need none) | none |
-| `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS` | In `clone` mode, how many times a **transient** clone/provisioning failure is retried across re-ensures before the job settles to terminal `failed` (clamped to 1–100; deterministic failures are never retried) | `5` |
+| `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS` | In `clone` mode, how many times a **transient** clone/provisioning failure is retried across re-ensures before the job settles to terminal `failed` (clamped to 1–100; deterministic failures are never retried). Also bounds the requeue of a checkout whose neutralized `global.json` SDK pin could not be restored (`sdk_pin_restore_failed`, #113), in any checkout mode | `5` |
 | `SEXTANT_SERVICE_CONTROL_TOKEN` | Bearer token for `/control/*` | none (open, dev only) |
 | `SEXTANT_SERVICE_QUERY_TOKEN` | Bearer token for `/mcp` + `/query/*` | none (anonymous read) |
 | `SEXTANT_SERVICE_CONTRIBUTE_TOKEN` | Least-privilege token for `/control/contribute` only (issue #71); the control token remains a superset that also authorizes it | none (falls back to control token) |
@@ -210,16 +210,37 @@ cost a full copy per job and break checkout-relative paths. So the service handl
    after the MSBuild load**, before the coverage scan, the `EvaluationFingerprint`, or any indexing reads
    the checkout. The persistent, reused checkout therefore never diverges from its commit (`git status`
    stays clean).
-3. **Crash-safe.** Before any file is modified, the original bytes are journaled atomically (and fsynced)
-   to `<checkout-root>/.sextant-sdk-pin/<checkout>-<hash>.json`, outside every working tree. Every job
-   replays leftover journals **before** a cached checkout is resolved or reused. A file is restored only if
-   it still holds exactly the neutralized content; original or foreign content is left alone. If a restore
-   fails, the job fails with `sdk_pin_restore_failed`, the journal is kept, and that checkout is not
-   indexed until it is repaired.
+3. **Crash-safe.** Before any file is modified, the original bytes and the checkout's `HEAD` commit are
+   journaled atomically (fsynced, and the directory flushed on Unix) to
+   `<checkout-root>/.sextant-sdk-pin/<checkout>-<hash>.json`, outside every working tree. Each rewrite goes
+   through a uniquely named sibling temp file created exclusively, so no repository file (whatever its
+   name) is ever overwritten or deleted. Every job replays leftover journals **before** a cached checkout is
+   resolved or reused:
+   - a file that still holds exactly the neutralized content is restored; one that already holds the
+     committed content is left alone;
+   - a file that is **missing or holds foreign content** fails closed while the checkout is still at the
+     journaled commit: the journal is kept and the checkout is not indexed. Repair it by restoring the
+     committed `global.json` (e.g. `git checkout -- global.json`) or by deleting the checkout so it is
+     re-cloned; the journal then retires itself. Once the checkout has moved to another commit (or is
+     gone), the journal is simply retired;
+   - a journal is replayed only when it is well formed and confined: it must be the journal of the checkout
+     it names, that checkout must be on the checkout volume, and every entry must be a non-symlinked
+     `global.json` inside it whose journaled bytes match their checksum. Anything else is logged and left
+     for inspection.
+
+   If a restore fails during a job (even a cancelled one), or a leftover journal cannot be replayed, the
+   checkout is not indexed, the journal is kept, and the job is **requeued** with an `sdk_pin_restore_failed`
+   diagnostic rather than recorded as a terminal failure. The checkout's state is the problem, not the commit,
+   so it must not poison the identity: once the checkout is repaired, the next ensure retries. Like a transient
+   clone failure, this is bounded by `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS`. Once the attempts are used
+   up the job settles to `failed`, still carrying `sdk_pin_restore_failed` next to
+   `provisioning_attempts_exhausted`.
 4. **Refusals.** A pin is left alone and reported as not overridden, with the reason, when:
    - the override is disabled;
+   - hostfxr failed for a reason **other than a missing SDK version** (only its "compatible .NET SDK was
+     not found" outcome, status `0x8000809B`, is overridden — never a malformed file or another error);
    - the `global.json` lies outside the checkout or is reached through a symlink;
-   - it cannot be read or parsed, or it has no `sdk` section;
+   - it cannot be read or parsed, it has no `sdk` section, or its `sdk` section pins no version;
    - the journal cannot be written;
    - neutralizing it still leaves no resolvable SDK (for example, a parent pin outside the checkout also
      fails). In that case it is restored at once.
@@ -230,9 +251,9 @@ Outcomes and diagnostics. All paths are checkout-relative, and every diagnostic 
 | Situation | Job status | Diagnostic `code` |
 | --- | --- | --- |
 | pin overridden, checkout loaded | `complete` (unless another coverage gap applies) | `sdk_pin_overridden` (warning; also the substituted SDK) |
-| pin not overridden and the **whole** load failed SDK resolution | `failed` with a typed reason (requested vs installed, pin path, why not overridden) — never a bare exception message | `sdk_resolution_failed` (error) |
+| pin not overridden and the **whole** load failed SDK resolution | `failed` with a typed reason (requested vs installed, pin path, why not overridden) — never a bare exception message. This also applies when the load fails with an error that names no hostfxr function (e.g. every project came back empty) while a pin it depends on is known not to resolve; the reason then carries the load error too | `sdk_resolution_failed` (error) |
 | pin not overridden, but only **some** solutions/projects are governed by it (#90-style isolation, e.g. a `tools/global.json` in one of several solutions) | `partial`; the reason names the pin | `sdk_resolution_failed` (warning) for the pin and for each project it kept from loading |
-| a neutralized pin could not be restored | `failed`; nothing indexed | `sdk_pin_restore_failed` (error) |
+| a neutralized pin could not be restored (or a leftover journal could not be replayed) | `queued` (requeued; HTTP 202), nothing indexed; `failed` once `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS` is exhausted | `sdk_pin_restore_failed` (error) |
 
 An overridden snapshot is **complete**, because the override restored full coverage, but it is never
 silent:
@@ -249,6 +270,13 @@ the service toolchain before the worker runs, and does not read `global.json`.
 `EvaluationFingerprint.Compute` does hash `global.json`, but it runs at index time, after the restore. It
 therefore records the **committed** checkout's value, the same value a worker that has the pinned SDK would
 record. The override needs no `AnalyzerVersion` bump.
+
+**The override policy is not part of the snapshot identity.** Like the clone credential, the
+`SEXTANT_SERVICE_SDK_PIN_OVERRIDE` toggle and the worker's installed SDK bands are operator/worker
+configuration, not snapshot inputs. A terminal `failed` job is reused for its identity, so a commit that
+already failed SDK resolution (e.g. on a worker from before this feature, or with the override off) is not
+retried just because the override is now on or a new SDK band was installed. Pushing a new commit (or an
+`AnalyzerVersion` bump) produces a new identity that is evaluated afresh.
 
 **Operator options.** Install the pinned SDK band in the worker image, which makes the pin resolve so the
 override never engages. Alternatively, have the repository relax `rollForward` (e.g. `latestFeature`). Set

@@ -250,9 +250,55 @@ public sealed class SdkPinGuardTests
         Assert.AreEqual(foreign, File.ReadAllText(GlobalJson), "foreign content is left as-is");
         Assert.AreEqual(1, Directory.GetFiles(JournalDir).Length, "the journal is kept for inspection/recovery");
 
-        // Recovery logs and leaves the foreign content alone, then retires the journal.
-        Assert.IsTrue(guard.Recover(_checkout));
+        // Recovery FAILS CLOSED: the checkout is still at the same commit, so it must not be reused/indexed.
+        Assert.IsFalse(guard.Recover(_checkout));
         Assert.AreEqual(foreign, File.ReadAllText(GlobalJson));
+        Assert.AreEqual(1, Directory.GetFiles(JournalDir).Length, "the journal keeps blocking the checkout");
+    }
+
+    [TestMethod]
+    public void Recovery_AfterTheCheckoutMovedToAnotherCommit_RetiresTheJournal()
+    {
+        WriteHead("1111111111111111111111111111111111111111");
+        WritePin(GlobalJson);
+        var projectPin = Path.Combine(_checkout, "src", "App", "global.json");
+        WritePin(projectPin);
+        _ = new SdkPinGuard(probe: new FakeHostFxr()).Apply(_checkout, [_solution]); // "crash"
+
+        // The checkout was then re-checked-out at another commit, whose global.json differs / does not exist.
+        WriteHead("2222222222222222222222222222222222222222");
+        const string nextCommit = "{ \"sdk\": { \"version\": \"10.0.401\" } }";
+        File.WriteAllText(GlobalJson, nextCommit);
+        File.Delete(projectPin);
+
+        Assert.IsTrue(new SdkPinGuard(probe: new FakeHostFxr()).Recover(_checkout));
+        Assert.AreEqual(nextCommit, File.ReadAllText(GlobalJson), "the other commit's content is left alone");
+        Assert.IsFalse(File.Exists(projectPin), "recovery never recreates a file that is gone");
+        Assert.AreEqual(0, Directory.GetFiles(JournalDir).Length);
+    }
+
+    [TestMethod]
+    public void Recovery_OfAMissingFileAtTheSameCommit_FailsClosed()
+    {
+        WriteHead("1111111111111111111111111111111111111111");
+        WritePin(GlobalJson);
+        _ = new SdkPinGuard(probe: new FakeHostFxr()).Apply(_checkout, [_solution]); // "crash"
+        File.Delete(GlobalJson);
+
+        Assert.IsFalse(new SdkPinGuard(probe: new FakeHostFxr()).Recover(_checkout));
+        Assert.IsFalse(File.Exists(GlobalJson), "recovery never recreates a file that is gone");
+        Assert.AreEqual(1, Directory.GetFiles(JournalDir).Length);
+    }
+
+    [TestMethod]
+    public void Recovery_OfADeletedCheckout_RetiresTheJournal()
+    {
+        var options = new SdkPinOptions { JournalRoot = JournalDir };
+        WritePin(GlobalJson);
+        _ = new SdkPinGuard(options, new FakeHostFxr()).Apply(_checkout, [_solution]); // "crash"
+        Directory.Delete(_checkout, recursive: true); // an operator removed it; the next clone is fresh
+
+        Assert.AreEqual(1, new SdkPinGuard(options, new FakeHostFxr()).RecoverAll());
         Assert.AreEqual(0, Directory.GetFiles(JournalDir).Length);
     }
 
@@ -301,20 +347,146 @@ public sealed class SdkPinGuardTests
         Assert.AreEqual(0, new SdkPinGuard(probe: new FakeHostFxr()).RecoverAll());
 
     [TestMethod]
-    public void Recovery_LeavesOriginalContentAlone_AndNeverRecreatesAMissingFile()
+    public void Recovery_LeavesOriginalContentAlone()
     {
         var original = WritePin(GlobalJson);
-        var projectPin = Path.Combine(_checkout, "src", "App", "global.json");
-        WritePin(projectPin);
         _ = new SdkPinGuard(probe: new FakeHostFxr()).Apply(_checkout, [_solution]); // "crash"
 
         File.WriteAllBytes(GlobalJson, original); // e.g. an operator already restored it
-        File.Delete(projectPin);                  // e.g. the checkout was re-cloned without it
 
         Assert.IsTrue(new SdkPinGuard(probe: new FakeHostFxr()).Recover(_checkout));
         CollectionAssert.AreEqual(original, File.ReadAllBytes(GlobalJson));
-        Assert.IsFalse(File.Exists(projectPin), "recovery never recreates a file that is gone");
         Assert.AreEqual(0, Directory.GetFiles(JournalDir).Length);
+    }
+
+    [TestMethod]
+    public void RepositoryFilesNamedLikeATempFile_AreNeverTouched()
+    {
+        // A repository may legitimately contain any file name — including the guard's own temp-file shapes.
+        var legacyName = Path.Combine(_checkout, ".global.json.sextant-sdk-pin.tmp");
+        var lookalike = Path.Combine(_checkout, ".global.json.sextant-sdk-pin-0123456789abcdef0123456789abcdef.tmp");
+        File.WriteAllText(legacyName, "tracked");
+        File.WriteAllText(lookalike, "tracked too");
+        var original = WritePin(GlobalJson);
+
+        var overlay = new SdkPinGuard(probe: new FakeHostFxr()).Apply(_checkout, [_solution]);
+        Assert.IsTrue(overlay.Findings.Single().OverrideApplied);
+        overlay.Restore();
+
+        CollectionAssert.AreEqual(original, File.ReadAllBytes(GlobalJson));
+        Assert.AreEqual("tracked", File.ReadAllText(legacyName));
+        Assert.AreEqual("tracked too", File.ReadAllText(lookalike));
+        Assert.AreEqual(2, Directory.GetFiles(_checkout, "*.tmp").Length, "only the repository's own files remain");
+    }
+
+    [TestMethod]
+    public void NonMissingSdkFailure_IsReported_NotOverridden()
+    {
+        // hostfxr failed for some other reason (e.g. a malformed sdk section) — removing the section would
+        // "fix" something that is not an absent SDK band, so the guard refuses.
+        var original = WritePin(GlobalJson);
+        var overlay = new SdkPinGuard(probe: new FakeHostFxr { MissingSdk = false }).Apply(_checkout, [_solution]);
+
+        var finding = overlay.Findings.Single();
+        Assert.IsFalse(finding.OverrideApplied);
+        StringAssert.Contains(finding.NotOverriddenReason, "other than a missing SDK version");
+        CollectionAssert.AreEqual(original, File.ReadAllBytes(GlobalJson));
+        Assert.IsFalse(Directory.Exists(JournalDir));
+    }
+
+    [TestMethod]
+    [DataRow("""{ "sdk": "10.0.999" }""")]
+    [DataRow("""{ "sdk": { "rollForward": "disable" } }""")]
+    public void SdkSectionWithoutAVersion_IsReported_NotOverridden(string json)
+    {
+        var original = WritePin(GlobalJson, json);
+        var overlay = new SdkPinGuard(probe: new FakeHostFxr { AlwaysFails = { _checkout } }).Apply(_checkout, [_solution]);
+
+        var finding = overlay.Findings.Single();
+        Assert.IsFalse(finding.OverrideApplied);
+        StringAssert.Contains(finding.NotOverriddenReason, "does not pin a version");
+        CollectionAssert.AreEqual(original, File.ReadAllBytes(GlobalJson));
+    }
+
+    [TestMethod]
+    public void TamperedJournal_IsNeverReplayed()
+    {
+        var guard = new SdkPinGuard(probe: new FakeHostFxr());
+        var victim = Path.Combine(_root, "outside.txt");
+        File.WriteAllText(victim, "keep me");
+        var repoFile = Path.Combine(_checkout, "README.md");
+        File.WriteAllText(repoFile, "tracked");
+        var content = Convert.ToBase64String(Encoding.UTF8.GetBytes("pwned"));
+        var sha = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes("pwned")));
+        var victimSha = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(victim)));
+
+        void WriteJournal(string checkoutDir, string entryPath, string tempPath)
+        {
+            var journal = guard.JournalPathFor(_checkout);
+            Directory.CreateDirectory(Path.GetDirectoryName(journal)!);
+            File.WriteAllText(journal, System.Text.Json.JsonSerializer.Serialize(new
+            {
+                version = 1,
+                checkout_dir = checkoutDir,
+                entries = new[]
+                {
+                    new
+                    {
+                        path = entryPath, temp_path = tempPath, original_base64 = content, original_sha256 = sha,
+                        neutralized_sha256 = victimSha
+                    }
+                }
+            }));
+        }
+
+        var ownTemp = Path.Combine(_checkout, ".global.json.sextant-sdk-pin-0123456789abcdef0123456789abcdef.tmp");
+        WriteJournal(_checkout, victim, ownTemp); // an entry outside the checkout
+        Assert.IsFalse(guard.Recover(_checkout));
+        WriteJournal(_checkout, Path.Combine(_checkout, "global.json"), repoFile); // a temp path that is a repo file
+        Assert.IsFalse(guard.Recover(_checkout));
+        WriteJournal(_root, Path.Combine(_root, "global.json"), Path.Combine(_root, Path.GetFileName(ownTemp))); // wrong checkout
+        Assert.IsFalse(guard.Recover(_checkout));
+
+        Assert.AreEqual("keep me", File.ReadAllText(victim), "nothing outside the checkout is ever written");
+        Assert.AreEqual("tracked", File.ReadAllText(repoFile), "a journaled temp path never deletes a repository file");
+        Assert.IsFalse(File.Exists(Path.Combine(_root, "global.json")));
+    }
+
+    [TestMethod]
+    public void CheckoutHead_ReadsDetachedLooseAndPackedRefs()
+    {
+        const string a = "1111111111111111111111111111111111111111";
+        const string b = "2222222222222222222222222222222222222222";
+        Assert.IsNull(CheckoutHead.TryRead(_checkout), "not a git checkout");
+
+        WriteHead(a.ToUpperInvariant());
+        Assert.AreEqual(a, CheckoutHead.TryRead(_checkout), "a detached HEAD, normalized to lowercase");
+
+        var gitDir = Path.Combine(_checkout, ".git");
+        File.WriteAllText(Path.Combine(gitDir, "HEAD"), "ref: refs/heads/main\n");
+        Assert.IsNull(CheckoutHead.TryRead(_checkout), "an unresolvable ref");
+        File.WriteAllText(Path.Combine(gitDir, "packed-refs"), $"# pack-refs with: peeled\n{b} refs/heads/main\n");
+        Assert.AreEqual(b, CheckoutHead.TryRead(_checkout), "a packed ref");
+        Directory.CreateDirectory(Path.Combine(gitDir, "refs", "heads"));
+        File.WriteAllText(Path.Combine(gitDir, "refs", "heads", "main"), a + "\n");
+        Assert.AreEqual(a, CheckoutHead.TryRead(_checkout), "a loose ref wins over the packed one");
+
+        File.WriteAllText(Path.Combine(gitDir, "HEAD"), "ref: refs/../../escape\n");
+        Assert.IsNull(CheckoutHead.TryRead(_checkout), "a ref that escapes .git is refused");
+
+        // A worktree-style ".git" file pointing at the real git directory.
+        var worktree = Path.Combine(_root, "wt");
+        Directory.CreateDirectory(worktree);
+        File.WriteAllText(Path.Combine(gitDir, "HEAD"), b + "\n");
+        File.WriteAllText(Path.Combine(worktree, ".git"), $"gitdir: {gitDir}\n");
+        Assert.AreEqual(b, CheckoutHead.TryRead(worktree));
+    }
+
+    private void WriteHead(string sha)
+    {
+        var gitDir = Path.Combine(_checkout, ".git");
+        Directory.CreateDirectory(gitDir);
+        File.WriteAllText(Path.Combine(gitDir, "HEAD"), sha + "\n");
     }
 
     [TestMethod]
@@ -424,6 +596,7 @@ public sealed class SdkPinGuardTests
 
         public HashSet<string> AlwaysFails { get; } = new(StringComparer.OrdinalIgnoreCase);
         public bool Throws { get; init; }
+        public bool MissingSdk { get; init; } = true;
         public int ListCalls { get; private set; }
 
         public SdkResolutionProbeResult Probe(string workingDirectory)
@@ -441,7 +614,10 @@ public sealed class SdkPinGuardTests
             return fails
                 ? new SdkResolutionProbeResult
                 {
-                    Error = new HostFxrSdkResolutionError { RequestedVersion = pin.Version ?? "10.0.999", GlobalJsonPath = pinPath }
+                    Error = new HostFxrSdkResolutionError
+                    {
+                        RequestedVersion = pin.Version ?? "10.0.999", GlobalJsonPath = pinPath, IsMissingSdk = MissingSdk
+                    }
                 }
                 : new SdkResolutionProbeResult { ResolvedSdkVersion = Installed[0] };
         }

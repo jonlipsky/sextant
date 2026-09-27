@@ -91,6 +91,33 @@ public sealed class HostFxrSdkResolutionErrorTests
         Assert.AreEqual("9.0.999", error.RequestedVersion);
         Assert.AreEqual("/r/global.json", error.GlobalJsonPath);
         Assert.IsTrue(error.IsGlobalJsonPin);
+        Assert.IsTrue(error.IsMissingSdk, "the install hint is hostfxr's missing-SDK wording");
+    }
+
+    [TestMethod]
+    public void IsMissingSdk_IsTrueForEveryMissingSdkShape()
+    {
+        foreach (var message in new[]
+        {
+            BuildHostMessage, LocatorMessage,
+            "A compatible installed .NET SDK for global.json version [6.0.100] from [/src/app/global.json] was not found.",
+            "hostfxr returned 0x8000809B (SdkResolveFailure)"
+        })
+        {
+            Assert.IsTrue(HostFxrSdkResolutionError.TryParse(message, out var error), message);
+            Assert.IsTrue(error.IsMissingSdk, message);
+        }
+    }
+
+    [TestMethod]
+    [DataRow("Error while calling hostfxr function hostfxr_resolve_sdk2. Error code: -2147450730")]
+    [DataRow("Error while calling hostfxr function hostfxr_resolve_sdk2. Error code: -2147450749 Detailed error: invalid global.json")]
+    public void IsMissingSdk_IsFalseForOtherResolveSdk2Failures(string message)
+    {
+        // Still a hostfxr SDK-resolution failure (so it is reported typed), but not the missing-SDK outcome the
+        // service's override may act on — e.g. a malformed global.json or an invalid argument.
+        Assert.IsTrue(HostFxrSdkResolutionError.TryParse(message, out var error));
+        Assert.IsFalse(error.IsMissingSdk);
     }
 
     [TestMethod]

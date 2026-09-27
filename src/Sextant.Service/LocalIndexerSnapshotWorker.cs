@@ -197,10 +197,9 @@ public sealed class LocalIndexerSnapshotWorker(
         // Never index over a checkout whose committed global.json could not be put back after a crash.
         if (!_sdkPinGuard.Recover(checkoutDir))
         {
-            return SnapshotWorkResult.Failed(
-                "a previous job left this checkout's global.json SDK pin neutralized and it could not be restored; " +
-                "the checkout is not indexed until it is repaired (see the service log).",
-                [SdkPinRestoreFailedDiagnostic("the leftover SDK-pin restore journal could not be replayed")]);
+            throw SdkPinRestoreFailure(
+                "a previous job left this checkout's global.json SDK pin neutralized and its restore journal could not " +
+                "be replayed; see the service log for the file and the journal");
         }
 
         // Config-error state: the checkout's own sextant.json expressed an explicit scoping intent that
@@ -217,6 +216,7 @@ public sealed class LocalIndexerSnapshotWorker(
 
         var context = CreateSnapshotContext(request, capability);
         SdkPinOverlay? pinOverlay = null;
+        var loadCompleted = false;
 
         // The untrusted region: loading the solution EVALUATES its MSBuild projects (arbitrary imported
         // targets / SDK resolvers / inline tasks), so — private repo or not — it runs under the evaluation
@@ -242,9 +242,10 @@ public sealed class LocalIndexerSnapshotWorker(
             {
                 pinOverlay.Restore();
             }
+            loadCompleted = true;
 
             if (pinOverlay.RestoreError is { } restoreError)
-                return SdkPinRestoreFailed(restoreError, pinOverlay);
+                throw SdkPinRestoreFailure(pinOverlay, restoreError);
 
             var pins = pinOverlay.Findings;
 
@@ -305,7 +306,7 @@ public sealed class LocalIndexerSnapshotWorker(
         // must report THAT (the journal is kept so the next job can repair the checkout before reusing it).
         SnapshotWorkResult Fail(string message) =>
             pinOverlay?.RestoreError is { } restoreError
-                ? SdkPinRestoreFailed(restoreError, pinOverlay)
+                ? throw SdkPinRestoreFailure(pinOverlay, restoreError)
                 : SnapshotWorkResult.Failed(message);
 
         try
@@ -326,9 +327,14 @@ public sealed class LocalIndexerSnapshotWorker(
         catch (TransientProvisioningException)
         {
             // A RETRYABLE provisioning failure must NOT be swallowed into a terminal Failed: the service
-            // requeues the identity so a later ensure re-attempts it. (Today TryResolve runs before this
-            // try, so this is belt-and-suspenders against a future refactor that moves it inside.)
+            // requeues the identity so a later ensure re-attempts it. This includes an SDK-pin restore failure
+            // thrown from inside the evaluation (issue #113).
             throw;
+        }
+        catch (OperationCanceledException) when (pinOverlay?.RestoreError is { } restoreError)
+        {
+            // Even a cancelled job must report a checkout it could not put back, typed (it is still requeued).
+            throw SdkPinRestoreFailure(pinOverlay, restoreError);
         }
         catch (OperationCanceledException)
         {
@@ -341,6 +347,22 @@ public sealed class LocalIndexerSnapshotWorker(
             // or was not allowed to override). Fail with a TYPED, actionable diagnostic — never a bare message.
             var pins = pinOverlay?.Findings ?? [];
             return SdkResolutionFailed(checkoutDir, sdkError, pins, InstalledSdks(pins, sdkError));
+        }
+        catch (Exception ex) when (!loadCompleted
+                                   && pinOverlay is { RestoreError: null } overlay
+                                   && overlay.Findings.FirstOrDefault(f => !f.OverrideApplied) is { } unresolved)
+        {
+            // The load died with an error that does not itself name hostfxr (e.g. every project came back as an
+            // empty stub), while a pin this load depends on is known NOT to resolve. Report that pin, typed,
+            // alongside the load error, rather than a bare exception message.
+            var pinError = new HostFxrSdkResolutionError
+            {
+                RequestedVersion = unresolved.RequestedVersion,
+                GlobalJsonPath = unresolved.FullPath,
+                InstalledSdks = unresolved.InstalledSdks
+            };
+            return SdkResolutionFailed(
+                checkoutDir, pinError, overlay.Findings, InstalledSdks(overlay.Findings, pinError), loadError: ex.Message);
         }
         catch (Exception ex)
         {
@@ -544,7 +566,11 @@ public sealed class LocalIndexerSnapshotWorker(
     /// <summary>Diagnostic code: hostfxr could not resolve the SDK a global.json pins, and it was not overridden.</summary>
     public const string SdkResolutionFailedCode = "sdk_resolution_failed";
 
-    /// <summary>Diagnostic code: a neutralized global.json could not be restored to its committed bytes.</summary>
+    /// <summary>
+    /// Diagnostic code: a neutralized global.json could not be restored to its committed bytes (or a leftover
+    /// restore journal could not be replayed). Carried by a <see cref="TransientProvisioningException"/>, so the
+    /// service requeues the identity (bounded) instead of caching a terminal failure.
+    /// </summary>
     public const string SdkPinRestoreFailedCode = "sdk_pin_restore_failed";
 
     /// <summary>
@@ -592,7 +618,7 @@ public sealed class LocalIndexerSnapshotWorker(
     /// </summary>
     internal static SnapshotWorkResult SdkResolutionFailed(
         string checkoutDir, HostFxrSdkResolutionError error, IReadOnlyList<SdkPinFinding> pins,
-        IReadOnlyList<string> installedSdks)
+        IReadOnlyList<string> installedSdks, string? loadError = null)
     {
         var diagnostics = SdkPinDiagnostics(pins, published: false);
         var installed = installedSdks.Count > 0 ? installedSdks : error.InstalledSdks;
@@ -615,9 +641,8 @@ public sealed class LocalIndexerSnapshotWorker(
         }
 
         var matching = error.GlobalJsonPath is { } failedPath
-            ? pins.FirstOrDefault(p => string.Equals(
-                Path.GetFullPath(p.FullPath), Path.GetFullPath(failedPath),
-                OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
+            ? pins.FirstOrDefault(p => GlobalJsonLocator.PathComparer.Equals(
+                Path.GetFullPath(p.FullPath), Path.GetFullPath(failedPath)))
             : null;
 
         if (matching is null)
@@ -641,36 +666,37 @@ public sealed class LocalIndexerSnapshotWorker(
             _ => string.Empty
         };
         var reason =
-            $"the .NET SDK required by the checkout's global.json could not be resolved on this worker: " +
+            (loadError is null
+                ? "the .NET SDK required by the checkout's global.json could not be resolved on this worker: "
+                : $"the checkout could not be loaded ({ScrubCheckoutRoot(checkoutDir, loadError)}) and the .NET SDK " +
+                  "required by its global.json could not be resolved on this worker: ") +
             $"{SnapshotCoverageBuilder.DescribePin(checkoutDir, error)}" +
             (matching?.RollForward is { } rollForward ? $" (rollForward: {rollForward})" : string.Empty) +
             $"; installed SDK(s): {InstalledList(installed)}.{why} Nothing was indexed and no snapshot was published.";
         return SnapshotWorkResult.Failed(reason, diagnostics);
     }
 
-    private static SnapshotWorkResult SdkPinRestoreFailed(string restoreError, SdkPinOverlay overlay)
-    {
-        var diagnostics = SdkPinDiagnostics(overlay.Findings, published: false);
-        var root = Path.TrimEndingDirectorySeparator(overlay.CheckoutDir);
-        diagnostics.Add(SdkPinRestoreFailedDiagnostic(
-            restoreError.Replace(root, ".", StringComparison.OrdinalIgnoreCase).Replace('\\', '/')));
-        return SnapshotWorkResult.Failed(
-            "the service neutralized an unsatisfiable global.json SDK pin for the MSBuild load but could not restore " +
-            "the committed file afterwards, so the checkout was NOT indexed (it no longer matches its commit). The " +
-            "restore journal was kept so the next job can put the committed file back before reusing the checkout " +
-            "(a file that something else changed meanwhile is left as-is).",
-            diagnostics);
-    }
+    // A checkout that could not be returned to its committed state is a CHECKOUT-STATE problem that an operator
+    // repair resolves, not a property of the commit. It is therefore a typed, bounded-retry provisioning failure
+    // (the service requeues the identity under the sdk_pin_restore_failed code) — never a terminal Failed that
+    // would poison the identity for every later ensure, even after the checkout is repaired.
+    private static TransientProvisioningException SdkPinRestoreFailure(string detail) => new(
+        "the service neutralized an unsatisfiable global.json SDK pin for the MSBuild load but could not restore the " +
+        $"committed file afterwards ({detail}), so the checkout was NOT indexed (it no longer matches its commit). The " +
+        "restore journal was kept: restore the committed global.json (or delete the checkout so it is re-cloned) and " +
+        "the next ensure retries.",
+        diagnosticCode: SdkPinRestoreFailedCode);
 
-    private static ProjectOutcome SdkPinRestoreFailedDiagnostic(string detail) => new()
-    {
-        Severity = JobDiagnosticSeverity.Error,
-        Code = SdkPinRestoreFailedCode,
-        Message = $"The committed global.json could not be restored after its SDK pin was neutralized: {detail}."
-    };
+    private static TransientProvisioningException SdkPinRestoreFailure(SdkPinOverlay overlay, string restoreError) =>
+        SdkPinRestoreFailure(ScrubCheckoutRoot(overlay.CheckoutDir, restoreError));
 
     private static string InstalledList(IReadOnlyList<string> installed) =>
         installed.Count > 0 ? string.Join(", ", installed) : "unknown";
+
+    // Operator-facing text never names the worker's volume layout: the checkout root becomes ".".
+    private static string ScrubCheckoutRoot(string checkoutDir, string text) =>
+        text.Replace(Path.TrimEndingDirectorySeparator(checkoutDir), ".", StringComparison.OrdinalIgnoreCase)
+            .Replace('\\', '/');
 
     private static string SourceLabel(SolutionSelectionSource source) => source switch
     {

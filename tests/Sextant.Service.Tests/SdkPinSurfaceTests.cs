@@ -158,7 +158,7 @@ public sealed class SdkPinSurfaceTests
     }
 
     [TestMethod]
-    public async Task UnreplayableLeftoverJournal_FailsTheJobBeforeAnyLoad_AndKeepsTheJournal()
+    public async Task UnreplayableLeftoverJournal_RequeuesTypedBeforeAnyLoad_AndKeepsTheJournal()
     {
         var root = Path.Combine(Path.GetTempPath(), $"sextant_sdkpin_gate_{Guid.NewGuid():N}");
         var checkout = Path.Combine(root, "checkouts", "repo");
@@ -182,14 +182,14 @@ public sealed class SdkPinSurfaceTests
             var worker = new LocalIndexerSnapshotWorker(
                 db, new SextantConfiguration(), new FixedCheckoutProvider(resolution), sdkPinGuard: guard);
 
-            var result = await worker.ProduceAsync(ServiceTestFixtures.Request(), "identity", root, CancellationToken.None);
+            var ex = await Assert.ThrowsExactlyAsync<TransientProvisioningException>(
+                () => worker.ProduceAsync(ServiceTestFixtures.Request(), "identity", root, CancellationToken.None));
 
-            Assert.AreEqual(SnapshotJobStatus.Failed, result.Status);
-            StringAssert.Contains(result.Error, "could not be restored");
-            Assert.AreEqual(LocalIndexerSnapshotWorker.SdkPinRestoreFailedCode, result.Projects.Single().Code);
-            Assert.AreEqual(JobDiagnosticSeverity.Error, result.Projects.Single().Severity);
+            Assert.AreEqual(LocalIndexerSnapshotWorker.SdkPinRestoreFailedCode, ex.DiagnosticCode);
+            StringAssert.Contains(ex.Message, "could not restore");
+            StringAssert.Contains(ex.Message, "restore journal could not be replayed");
+            Assert.IsFalse(ex.Message.Contains(root, StringComparison.OrdinalIgnoreCase), "no worker volume paths");
             Assert.IsTrue(File.Exists(journal), "the journal is kept for inspection");
-            Assert.IsNull(result.SnapshotId);
         }
         finally
         {
@@ -328,6 +328,72 @@ public sealed class SdkPinSurfaceTests
 
             var audit = new AuditLogStore(db.GetConnection()).Recent(action: AuditAction.Ensure).Single();
             Assert.AreEqual($"job_{result.JobId};sdk_pin_overridden", audit.Detail);
+        }
+        finally
+        {
+            service.Dispose();
+            SqliteTestDatabase.Delete(dbPath, db);
+        }
+    }
+
+    [TestMethod]
+    public async Task RestoreFailure_IsRequeuedWithATypedDiagnostic_NotCachedAsATerminalFailure()
+    {
+        // A checkout that could not be put back is a checkout-state problem an operator repair resolves — it must
+        // not poison the commit's identity. The service requeues it (bounded), typed as sdk_pin_restore_failed.
+        var dbPath = ServiceTestFixtures.NewDbPath();
+        var db = new IndexDatabase(dbPath);
+        db.RunMigrations();
+        var worker = new FakeSnapshotWorker(db, (self, request) =>
+        {
+            if (self.Calls == 1)
+                throw new TransientProvisioningException(
+                    "could not restore the committed file", diagnosticCode: LocalIndexerSnapshotWorker.SdkPinRestoreFailedCode);
+            return SnapshotWorkResult.Complete(ServiceTestFixtures.PublishComplete(self.Database, request));
+        });
+        var service = SnapshotService.Start(ServiceTestFixtures.NewOptions(dbPath), worker, db);
+        try
+        {
+            var request = ServiceTestFixtures.Request();
+            var first = await service.EnsureSnapshotAsync(request);
+
+            Assert.AreEqual(SnapshotJobStatus.Queued, first.Status, "requeued, not a cached terminal failure");
+            var diagnostic = service.GetStatus(first.JobId)!.Diagnostics.Single();
+            Assert.AreEqual(LocalIndexerSnapshotWorker.SdkPinRestoreFailedCode, diagnostic.Code);
+            StringAssert.Contains(diagnostic.Message, "could not restore the committed file");
+            var audit = new AuditLogStore(db.GetConnection()).Recent(action: AuditAction.Ensure).Single();
+            Assert.AreEqual($"job_{first.JobId};sdk_pin_restore_failed", audit.Detail);
+
+            // Once the checkout is repaired, the next ensure re-runs the worker and publishes.
+            var retry = await service.EnsureSnapshotAsync(request);
+            Assert.AreEqual(SnapshotJobStatus.Complete, retry.Status);
+            Assert.AreEqual(2, worker.Calls);
+        }
+        finally
+        {
+            service.Dispose();
+            SqliteTestDatabase.Delete(dbPath, db);
+        }
+    }
+
+    [TestMethod]
+    public async Task RestoreFailure_PastTheAttemptBound_SettlesFailed_AndKeepsTheTypedCode()
+    {
+        var dbPath = ServiceTestFixtures.NewDbPath();
+        var db = new IndexDatabase(dbPath);
+        db.RunMigrations();
+        var worker = new FakeSnapshotWorker(db, (_, _) => throw new TransientProvisioningException(
+            "could not restore the committed file", diagnosticCode: LocalIndexerSnapshotWorker.SdkPinRestoreFailedCode));
+        var service = SnapshotService.Start(
+            ServiceTestFixtures.NewOptions(dbPath) with { MaxProvisioningAttempts = 1 }, worker, db);
+        try
+        {
+            var result = await service.EnsureSnapshotAsync(ServiceTestFixtures.Request());
+
+            Assert.AreEqual(SnapshotJobStatus.Failed, result.Status);
+            var codes = service.GetStatus(result.JobId)!.Diagnostics.Select(d => d.Code).ToArray();
+            CollectionAssert.AreEquivalent(
+                new[] { LocalIndexerSnapshotWorker.SdkPinRestoreFailedCode, "provisioning_attempts_exhausted" }, codes);
         }
         finally
         {
