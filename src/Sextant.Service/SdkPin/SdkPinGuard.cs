@@ -95,8 +95,10 @@ public sealed record SdkPinFinding
 /// CLOSED (the journal is kept and the checkout is not indexed) unless the checkout's HEAD has moved to
 /// another commit since, or the checkout is gone — then the difference is legitimate and the journal retires.
 /// A journal is only replayed when it is confined to its own checkout on the checkout volume. The override
-/// is only applied to a checkout whose git HEAD can be read: the journaled commit (not the content) is what
-/// tells the neutralized tree apart from a re-provisioned one.
+/// is only applied to a checkout whose git HEAD can be read — the journaled commit (not the content) is what
+/// tells the neutralized tree apart from a re-provisioned one — and only to a <c>global.json</c> that git
+/// confirms is exactly its committed content (<see cref="ICheckoutContentVerifier"/>), so the journal only
+/// ever holds the commit's bytes.
 /// </para>
 /// <para>
 /// In-place modification is safe because the service runs one worker at a time behind its write gate and
@@ -119,9 +121,18 @@ public sealed class SdkPinGuard
 
     private readonly SdkPinOptions _options;
     private readonly ISdkResolutionProbe _probe;
+    private readonly ICheckoutContentVerifier _verifier;
     private readonly Action<string>? _log;
 
-    public SdkPinGuard(SdkPinOptions? options = null, ISdkResolutionProbe? probe = null, Action<string>? log = null)
+    /// <param name="options">The override toggle and journal root.</param>
+    /// <param name="probe">hostfxr SDK resolution (the real one by default).</param>
+    /// <param name="log">Operator log sink.</param>
+    /// <param name="verifier">
+    /// Proves a pin holds its committed content before it is overridden (git by default).
+    /// </param>
+    public SdkPinGuard(
+        SdkPinOptions? options = null, ISdkResolutionProbe? probe = null, Action<string>? log = null,
+        ICheckoutContentVerifier? verifier = null)
     {
         var configured = options ?? new SdkPinOptions();
         // Journal paths are compared against absolute paths during recovery, so a relative root is anchored once.
@@ -129,6 +140,7 @@ public sealed class SdkPinGuard
             ? configured with { JournalRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root)) }
             : configured;
         _probe = probe ?? HostFxrSdkResolutionProbe.Instance;
+        _verifier = verifier ?? GitCheckoutContentVerifier.Instance;
         _log = log;
     }
 
@@ -236,6 +248,16 @@ public sealed class SdkPinGuard
         {
             // Recovery would refuse this journal, so a crash could never be repaired: do not modify anything.
             var reason = $"the SDK-pin restore journal could not be replayed safely after a crash ({unrecoverable}), so the checkout was not modified";
+            findings.AddRange(candidates.Select(c => c.Finding with { NotOverriddenReason = reason }));
+            return new SdkPinOverlay(this, checkout, journalPath: null, [], findings);
+        }
+
+        // The journal must hold the COMMIT's bytes: a same-commit recovery then only ever restores committed
+        // content, never a local edit or an untracked file onto a tree re-provisioned at the same commit.
+        var uncommitted = VerifyCommitted(checkout, head!, candidates.Select(c => c.Entry.Path).ToList());
+        if (uncommitted is not null)
+        {
+            var reason = $"the global.json is not verifiably the checkout's committed content ({uncommitted}), so the service does not override it";
             findings.AddRange(candidates.Select(c => c.Finding with { NotOverriddenReason = reason }));
             return new SdkPinOverlay(this, checkout, journalPath: null, [], findings);
         }
@@ -429,6 +451,18 @@ public sealed class SdkPinGuard
                 failing.Add((honored, result.Error));
         }
         return failing;
+    }
+
+    private string? VerifyCommitted(string checkout, string head, IReadOnlyList<string> files)
+    {
+        try
+        {
+            return _verifier.Problem(checkout, head, files);
+        }
+        catch (Exception ex)
+        {
+            return $"verification failed ({ex.GetType().Name}: {ex.Message})";
+        }
     }
 
     private SdkResolutionProbeResult? SafeProbe(string directory)

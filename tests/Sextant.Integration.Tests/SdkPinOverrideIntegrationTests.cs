@@ -177,6 +177,27 @@ public class SdkPinOverrideIntegrationTests
     }
 
     [TestMethod]
+    public async Task AnUncommittedPin_IsNeverOverridden_AndFailsTyped()
+    {
+        // A locate-mode checkout is indexed as found. A local edit that ADDS an unsatisfiable pin is not the
+        // commit's content, so the guard refuses it: the restore journal must only ever hold committed bytes.
+        var commit = CreateRepo(("global.json", ResolvablePin));
+        var globalJson = Path.Combine(_checkout, "global.json");
+        File.WriteAllText(globalJson, UnsatisfiablePin);
+        var dirty = File.ReadAllBytes(globalJson);
+
+        var (result, _) = await ProduceAsync(commit, [Path.Combine(_checkout, "App.slnx")], overrideEnabled: true);
+
+        Assert.AreEqual(SnapshotJobStatus.Failed, result.Status, string.Join('\n', _log));
+        StringAssert.Contains(result.Error, "not verifiably the checkout's committed content");
+        StringAssert.Contains(result.Error, "'global.json' differs from its committed content");
+        Assert.AreEqual(1, result.Projects.Count(p => p.Code == LocalIndexerSnapshotWorker.SdkResolutionFailedCode));
+        Assert.IsFalse(result.Projects.Any(p => p.Code == LocalIndexerSnapshotWorker.SdkPinOverriddenCode));
+        CollectionAssert.AreEqual(dirty, File.ReadAllBytes(globalJson), "the local edit is left exactly as found");
+        Assert.IsFalse(Directory.Exists(_journalRoot), "a refused pin never writes a journal");
+    }
+
+    [TestMethod]
     public async Task LeftoverNeutralizedPin_FromAnInterruptedJob_IsRepairedBeforeTheCheckoutIsReused()
     {
         var commit = CreateRepo(("global.json", UnsatisfiablePin));
