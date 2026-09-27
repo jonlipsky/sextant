@@ -182,7 +182,7 @@ CREATE INDEX ix_symbols_kind ON symbols(kind);
 CREATE UNIQUE INDEX ix_files_path ON files(project_id, repo_relative_path);
 CREATE UNIQUE INDEX ix_file_versions_file ON file_versions(file_id, content_hash);
 CREATE INDEX ix_occ_target ON occurrences(target_symbol_id);
-CREATE INDEX ix_occ_source ON occurrences(source_symbol_id);
+CREATE INDEX ix_occ_source ON occurrences(source_symbol_id) WHERE source_symbol_id IS NOT NULL; -- partial since migration 023
 CREATE INDEX ix_occ_project ON occurrences(in_project_id);
 CREATE INDEX ix_occ_file_version ON occurrences(file_version_id);
 CREATE INDEX ix_relationships_from ON relationships(from_symbol_id, kind);
@@ -195,12 +195,12 @@ CREATE INDEX ix_comments_symbol ON comments(enclosing_symbol_id);
 
 **`occurrences` index rationale (Phase 7, `EXPLAIN QUERY PLAN`-verified).** Each of the four `ix_occ_*` indexes backs a foreign-key column so the `ON DELETE CASCADE` from a replaced project/symbol/file-version is index-driven (never a full scan), and each also serves a hot read:
 
-- `ix_occ_target` — `GetBySymbolId` (references to a declaration) + the target cascade.
-- `ix_occ_source` — the cross-project-pair closure query (`source_symbol_id IS NULL`) and `GetByCaller` (call edges); backs the source cascade.
+- `ix_occ_target` — `GetBySymbolId` (references to a declaration), the cross-repository usage/candidate queries (target-driven, issue #160), and the target cascade.
+- `ix_occ_source` — **partial** (`WHERE source_symbol_id IS NOT NULL`, migration `023`): only call edges are indexed. It serves `GetByCaller` (`source_symbol_id = ?`) and backs the source cascade (a partial index whose predicate is implied by `= ?` is still used for the FK child lookup). A `source_symbol_id IS NULL` predicate can never select it: before `023`, `IS NULL` matched roughly two thirds of the table through this index and let the planner drive whole-table walks from it (issue #160). The cross-project-pair closure query and the index-metrics DISTINCT pass read every pure reference, so they pin one sequential scan with `NOT INDEXED`.
 - `ix_occ_project` — project scoping + `DeleteByProject`.
 - `ix_occ_file_version` — `DeleteByFile` / per-file replacement.
 
-No wall-clock index assertions remain; `PerformanceTests` asserts the chosen plan via `EXPLAIN QUERY PLAN` (deterministic).
+`PerformanceTests`, `OccurrenceIndexPlanTests`, and `CrossRepositoryUsageQueryPlanTests` assert the chosen plans via `EXPLAIN QUERY PLAN` (deterministic). The one deliberate wall-clock bound is `CrossRepositoryUsageScaleTests`: a generous 5 s backstop (enforced with `sqlite3_interrupt`) on the authorized cross-repository usage query at synthetic monorepo scale (issue #160). The fixed query runs in milliseconds, so a failure there means a plan regression, not CI noise.
 
 ## Migrations
 
@@ -226,9 +226,9 @@ Migration `011_normalize_files_and_occurrences.sql` is the Phase-7 compaction. I
 
 **Rebuild gate.** Because the old row shapes cannot be reinterpreted, the migration runs `DELETE FROM index_runs`, dropping the last-complete-generation pointer so an upgraded-but-not-reindexed database is **not** mistaken for a complete index. `IndexDatabase.CheckReadiness()` reports an actionable message in three cases: an older schema ("built by an older Sextant schema … rebuild"), a newer schema ("newer schema … upgrade Sextant"), and a current-schema database with no complete generation and no symbols ("no complete index generation … run a full index"). The CLI query handler, `serve`, and the `get_index_status` MCP tool surface this instead of failing on a missing table. Re-run a full index after upgrading.
 
-### Later additive migrations (`012`–`022`)
+### Later additive migrations (`012`–`023`)
 
-Migrations `012` through `022` are all **additive / forward-only** (new tables, indices, or columns only; nothing is dropped and `index_runs` is never cleared), so they are *not* rebuild-required in the destructive sense of `007`/`011`. Each still advances `schema_version`, and because the Phase-9 snapshot-identity hash folds the schema version in, an existing lower-schema base is treated as schema-incompatible and rebuilt into the current schema on the next full run (the safe, expected upgrade path via `IndexDatabase.CheckReadiness`). `LatestSchemaVersion` auto-derives from `LoadMigrations().Max()` and is currently **22**.
+Migrations `012` through `023` are all **additive / forward-only** (new tables, indices, or columns only — `023` rebuilds one index in place; no table or row is dropped and `index_runs` is never cleared), so they are *not* rebuild-required in the destructive sense of `007`/`011`. Each still advances `schema_version`, and because the Phase-9 snapshot-identity hash folds the schema version in, an existing lower-schema base is treated as schema-incompatible and rebuilt into the current schema on the next full run (the safe, expected upgrade path via `IndexDatabase.CheckReadiness`). `LatestSchemaVersion` auto-derives from `LoadMigrations().Max()` and is currently **23**.
 
 - `012_index_run_configuration.sql` — per-run indexing profile + configuration hash (Phase 8).
 - `013_immutable_snapshots.sql` — the Phase-9 immutable snapshot catalog: `snapshots` (identity-hashed generations), `branches`, `commits`, branch/commit pointers.
@@ -241,6 +241,7 @@ Migrations `012` through `022` are all **additive / forward-only** (new tables, 
 - `020_audit_log.sql` — Phase-17 (slice 3) durable operational + security `audit_log`: who did what to which repository scope, with what outcome and worker cost. The actor is stored as a **non-reversible hash**, never the raw token.
 - `021_branch_head_sequence.sql` — Phase-14 (issue #84) forward-only branch-head advance on the service `/control/ensure` path: adds the nullable `branches.head_sequence` (the highest control-plane head sequence the branch pointer has advanced to). The service advances the pointer + stores the sequence only when the supplied `branch_head_sequence` is strictly greater, so a late/older out-of-order ensure attaches to the immutable snapshot without regressing the branch pointer; a NULL supplied sequence (the local CLI/daemon path) advances unconditionally and never writes the column.
 - `022_snapshot_coverage.sql` — issue #119 durable per-snapshot checkout coverage: `snapshot_coverage(snapshot_id PK → snapshots(id) ON DELETE CASCADE, verdict CHECK IN ('complete','partial'), summary_json, recorded_at)`. One immutable row per service-published snapshot (or per baseless remote-base overlay, carrying the peer's probed base coverage), written by the orchestrator in the SAME transaction as the publish from `SnapshotContext.Coverage`; re-selecting an already-published snapshot never backfills or rewrites it. The `verdict` column is authoritative (a corrupt `summary_json` still reads as that verdict). No row means *coverage not recorded* (a local CLI/daemon index, a local-base overlay — which reads its base's row — or a pre-022 snapshot) — not "complete". `snapshots.status = complete` keeps meaning *published/servable*; this table says whether the published data covers the whole checkout. Retention GC cascades the row with its snapshot. Bumping the schema to 22 changes every snapshot identity hash, so each repository is re-indexed (and gets a coverage row) on its next ensure.
+- `023_partial_occurrence_source_index.sql` — issue #160: drops `ix_occ_source` and recreates it as a **partial** index `ON occurrences(source_symbol_id) WHERE source_symbol_id IS NOT NULL`, so only call edges are indexed. A pure-reference predicate (`source_symbol_id IS NULL`, about two thirds of the table) can no longer select it. On the prod catalog the planner had driven `find_cross_repository_usages` from that index once per consumer logical project (~410 s per call). Call-edge lookups (`source_symbol_id = ?`: `GetByCaller`, the `ON DELETE CASCADE` child lookup) still use it. No table or row changes; `index_runs` is kept. The rebuild is one pass over `occurrences` inside the migration's transaction (seconds on a monorepo-sized catalog). Bumping the schema to 23 changes every snapshot identity hash, so each repository is re-indexed on its next ensure.
 
 ### Standalone index service catalog (migration `016`)
 
