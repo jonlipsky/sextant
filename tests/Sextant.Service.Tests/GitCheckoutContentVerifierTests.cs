@@ -320,6 +320,140 @@ public sealed class GitCheckoutContentVerifierTests
         Assert.IsFalse(File.Exists(index + ".lock"));
     }
 
+    [TestMethod]
+    public void ASubmoduleAtItsGitlink_IsVouchedFor_AndItsFileIsVerifiedInItsOwnRepository()
+    {
+        var (sub, subHead, head) = AddSubmodule();
+        var subPin = Path.Combine(sub, "global.json");
+
+        Assert.IsNull(Verifier.GitlinkProblem(_checkout, head, sub, subHead));
+        Assert.IsNull(Verifier.GitlinkProblem(_checkout, head.ToUpperInvariant(), sub, subHead.ToUpperInvariant()));
+        Assert.IsNull(Verifier.Problem(sub, subHead, OnDisk(subPin)), "the submodule's own repository vouches for it");
+        // Issue #171's root cause: from the superproject, the submodule's file is simply not tracked.
+        StringAssert.Contains(Verifier.Problem(_checkout, head, OnDisk(subPin)), "is not tracked by git");
+    }
+
+    [TestMethod]
+    public void ASubmoduleCheckedOutAwayFromItsGitlink_IsRefused()
+    {
+        var (sub, subHead, head) = AddSubmodule();
+        File.WriteAllText(Path.Combine(sub, "extra.txt"), "drift");
+        Git(sub, "add", "-A");
+        Git(sub, "commit", "--quiet", "-m", "drift");
+        var drifted = Git(sub, "rev-parse", "HEAD").Trim();
+
+        var problem = Verifier.GitlinkProblem(_checkout, head, sub, drifted);
+
+        StringAssert.Contains(problem, $"the submodule 'libs/sub' is checked out at {drifted}, not the commit {subHead}");
+    }
+
+    [TestMethod]
+    public void ADirectoryThatIsNotAGitlink_IsNotASubmodule()
+    {
+        var tools = Path.Combine(_checkout, "tools");
+        Directory.CreateDirectory(tools);
+        File.WriteAllText(Path.Combine(tools, "global.json"), Pin);
+        Git(_checkout, "add", "-A");
+        Git(_checkout, "commit", "--quiet", "-m", "tools");
+        var head = Git(_checkout, "rev-parse", "HEAD").Trim();
+
+        StringAssert.Contains(Verifier.GitlinkProblem(_checkout, head, tools, _head), "is not a submodule in the commit");
+        StringAssert.Contains(Verifier.GitlinkProblem(_checkout, head, tools, _head), "(mode 040000 tree)");
+        StringAssert.Contains(Verifier.GitlinkProblem(_checkout, head, Path.Combine(_checkout, "absent"), _head), "'absent' is not a submodule in the commit");
+        StringAssert.Contains(Verifier.GitlinkProblem(_checkout, head, _root, _head), "is not inside the repository");
+    }
+
+    [TestMethod]
+    public void AGitlinkCheck_AgainstAnotherParentCommit_IsRefused()
+    {
+        var (sub, subHead, _) = AddSubmodule();
+
+        StringAssert.Contains(Verifier.GitlinkProblem(_checkout, _head, sub, subHead), "git resolves HEAD to");
+    }
+
+    [TestMethod]
+    public void TheGuard_OverridesARootAndASubmodulePin_AndLeavesGitMetadataAndBothTreesClean()
+    {
+        // Issue #171 end to end with real git: a root pin and a pin inside an absorbed submodule both fail, both
+        // are verified (the submodule's at its gitlink) and overridden, and nothing git owns is ever written.
+        var (sub, _, _) = AddSubmodule();
+        var subPin = Path.Combine(sub, "global.json");
+        var rootBytes = File.ReadAllBytes(GlobalJson);
+        var subBytes = File.ReadAllBytes(subPin);
+        var gitDigest = Digest(Path.Combine(_checkout, ".git"));
+        var journalRoot = Path.Combine(_root, "journal");
+        var guard = new SdkPinGuard(new SdkPinOptions { JournalRoot = journalRoot }, new SdkPinGuardTests.FakeHostFxr(), verifier: Verifier);
+
+        var overlay = guard.Apply(_checkout, [Path.Combine(_checkout, "Repo.slnx"), Path.Combine(sub, "Sub.slnx")]);
+
+        Assert.AreEqual(2, overlay.Findings.Count);
+        Assert.IsTrue(overlay.Findings.All(f => f.OverrideApplied), string.Join("; ", overlay.Findings.Select(f => f.NotOverriddenReason)));
+        CollectionAssert.AreEquivalent(new[] { "global.json", "libs/sub/global.json" }, overlay.Findings.Select(f => f.GlobalJsonPath).ToArray());
+        overlay.Restore();
+        Assert.IsNull(overlay.RestoreError);
+
+        CollectionAssert.AreEqual(rootBytes, File.ReadAllBytes(GlobalJson));
+        CollectionAssert.AreEqual(subBytes, File.ReadAllBytes(subPin));
+        Assert.AreEqual(gitDigest, Digest(Path.Combine(_checkout, ".git")), ".git and .git/modules are never written");
+        Assert.AreEqual(string.Empty, Git(_checkout, "status", "--porcelain", "--ignore-submodules=none"));
+        Assert.AreEqual(string.Empty, Git(sub, "status", "--porcelain"));
+        Assert.AreEqual(0, Directory.GetFiles(journalRoot).Length);
+    }
+
+    [TestMethod]
+    public void TheGuard_RefusesOnlyADriftedSubmodulesPin_AndStillOverridesTheRoot()
+    {
+        var (sub, _, _) = AddSubmodule();
+        File.WriteAllText(Path.Combine(sub, "extra.txt"), "drift");
+        Git(sub, "add", "-A");
+        Git(sub, "commit", "--quiet", "-m", "drift");
+        var subPin = Path.Combine(sub, "global.json");
+        var subBytes = File.ReadAllBytes(subPin);
+        var guard = new SdkPinGuard(new SdkPinOptions { JournalRoot = Path.Combine(_root, "journal") }, new SdkPinGuardTests.FakeHostFxr(), verifier: Verifier);
+
+        var overlay = guard.Apply(_checkout, [Path.Combine(_checkout, "Repo.slnx"), Path.Combine(sub, "Sub.slnx")]);
+
+        Assert.IsTrue(overlay.Findings.Single(f => f.GlobalJsonPath == "global.json").OverrideApplied);
+        var refused = overlay.Findings.Single(f => f.GlobalJsonPath == "libs/sub/global.json");
+        Assert.IsFalse(refused.OverrideApplied);
+        StringAssert.Contains(refused.NotOverriddenReason, "the submodule 'libs/sub' is checked out at");
+        CollectionAssert.AreEqual(subBytes, File.ReadAllBytes(subPin));
+        overlay.Restore();
+        Assert.IsNull(overlay.RestoreError);
+        Assert.AreEqual(string.Empty, Git(sub, "status", "--porcelain"));
+    }
+
+    // A committed superproject (root global.json + Repo.slnx) with an absorbed submodule at libs/sub whose own
+    // commit holds a failing pin and Sub.slnx. Returns the submodule directory, its commit, and the superproject's.
+    private (string Sub, string SubHead, string Head) AddSubmodule()
+    {
+        File.WriteAllText(Path.Combine(_checkout, "Repo.slnx"), "<Solution />");
+        var source = Path.Combine(_root, "sub-source");
+        Directory.CreateDirectory(source);
+        File.WriteAllText(Path.Combine(source, "global.json"), Pin.Replace("10.0.999", "9.0.999", StringComparison.Ordinal));
+        File.WriteAllText(Path.Combine(source, "Sub.slnx"), "<Solution />");
+        var subHead = InitRepo(source);
+
+        Git(_checkout, "-c", "protocol.file.allow=always", "submodule", "add", "--quiet", source, "libs/sub");
+        var sub = Path.Combine(_checkout, "libs", "sub");
+        Git(sub, "config", "core.autocrlf", "false");
+        Git(_checkout, "add", "-A");
+        Git(_checkout, "commit", "--quiet", "-m", "submodule");
+        Assert.IsTrue(File.Exists(Path.Combine(sub, ".git")), "the submodule is absorbed (.git is a gitdir file)");
+        Assert.IsTrue(Directory.Exists(Path.Combine(_checkout, ".git", "modules", "libs", "sub")));
+        return (sub, subHead, Git(_checkout, "rev-parse", "HEAD").Trim());
+    }
+
+    private static string Digest(string dir)
+    {
+        var builder = new StringBuilder();
+        foreach (var file in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal))
+            builder.Append(Path.GetRelativePath(dir, file)).Append(':')
+                .Append(Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(file))))
+                .Append(':').Append(File.GetLastWriteTimeUtc(file).Ticks).Append('\n');
+        return builder.ToString();
+    }
+
     private static string InitRepo(string dir)
     {
         try

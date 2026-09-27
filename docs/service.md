@@ -312,7 +312,11 @@ cost a full copy per job and break checkout-relative paths. So the service handl
    authority (see the evaluation sandbox; OS-hard isolation is #76).
 3. **Crash-safe.** Before any file is modified, the original bytes and the checkout's `HEAD` commit are
    journaled atomically (fsynced, with the rename and a newly created journal directory flushed on Unix) to
-   `<checkout-root>/.sextant-sdk-pin/<checkout>-<hash>.json`, outside every working tree. Each rewrite goes
+   `<checkout-root>/.sextant-sdk-pin/<checkout>-<hash>.json`, outside every working tree. For a pin inside a
+   populated submodule (issue #171) the entry also records the submodule's work tree and the commit it was
+   checked out at, and the journal is written as version `2`: a binary from before #171 cannot read it, so
+   it fails closed instead of replaying it without the submodule check (a journal with no submodule entry
+   stays version `1`). Nothing is ever written under `.git` or `.git/modules`. Each rewrite goes
    through a uniquely named sibling temp file created exclusively, so no repository file (whatever its
    name) is ever overwritten or deleted. A restored file (including its mode and mtime) is flushed before
    its journal is deleted, and the deletion is flushed too. Every job replays leftover journals **before** a
@@ -328,10 +332,18 @@ cost a full copy per job and break checkout-relative paths. So the service handl
      anything** in the checkout — even a file whose bytes happen to equal the neutralized form, or one at
      the journaled temp-file path, belongs to the new commit. If the
      journaled commit can no longer be confirmed (the checkout's `HEAD` is unreadable), it fails closed;
+   - a submodule entry is restored only while that submodule is **still at its journaled commit**. A
+     submodule that has moved to another commit, or is no longer populated and its `global.json` is gone,
+     holds nothing of the neutralized tree: its entry is retired without writing anything, and the
+     checkout's other entries are still restored. A submodule whose commit cannot be confirmed (its `HEAD` is
+     unreadable, or its `.git` is gone while the `global.json` remains) fails closed like the checkout's own
+     unreadable `HEAD`: nothing is written, the journal is kept and the checkout is not indexed;
    - a journal is replayed only when it is well formed and confined: it must be the journal of the checkout
      it names, that checkout must be on the checkout volume (the journal directory's parent), and it must
-     list at least one entry, each a distinct `global.json` inside it whose journaled bytes match their
-     checksum and whose recorded commit, timestamp and mode are valid. Before a checkout that is still at
+     list at least one entry, each a distinct `global.json` inside it (never under `.git`) whose journaled
+     bytes match their checksum and whose recorded commit, timestamp and mode are valid. A submodule entry
+     must name both an absolute work tree inside the checkout that contains its `global.json` and a commit
+     id, and only a version-`2` journal may carry one. Before a checkout that is still at
      the journaled commit is restored, neither the `global.json`, nor the checkout directory, nor any
      directory between them and the checkout volume may be a symlink/junction (checked for every entry
      before any is written). A moved checkout's links belong to the new commit and never block retiring its
@@ -350,7 +362,10 @@ cost a full copy per job and break checkout-relative paths. So the service handl
    transient clone failure, this is bounded by `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS`. Once the attempts
    are used up the job settles to `failed`, still carrying `sdk_pin_restore_failed` next to
    `provisioning_attempts_exhausted`.
-4. **Refusals.** A pin is left alone and reported as not overridden, with the reason, when:
+4. **Refusals.** Each failing pin is judged **on its own** (issue #171): a refused pin is reported with its
+   own reason and never keeps another pin from being overridden, so a root pin is still overridden when a
+   pin in a submodule is refused (that pin's projects then fail per project, below). A pin is left alone
+   and reported as not overridden, with the reason, when:
    - the override is disabled;
    - hostfxr failed for a reason **other than a missing SDK version**. Only its "A compatible .NET SDK was
      not found" wording is overridden; the bare `0x8000809B` status is not enough, because hostfxr returns it
@@ -358,8 +373,9 @@ cost a full copy per job and break checkout-relative paths. So the service handl
    - the pinned version is not a well-formed SDK version (`major.minor.patch` with a feature band of at
      least 100, e.g. `10.0.300`). hostfxr words a malformed `1.2.0` pin exactly like an absent band, so this
      keeps the override to pins that name a real SDK band;
-   - the `global.json` lies outside the checkout, or is reached through a symlink/junction (including a
-     symlinked checkout directory);
+   - the `global.json` lies outside the checkout, inside git metadata (`.git`, including an absorbed
+     submodule's `.git/modules/…`), or is reached through a symlink/junction (including a symlinked checkout
+     directory);
    - it cannot be read or parsed, it has no `sdk` section, or its `sdk` section pins no version;
    - the checkout's git `HEAD` commit cannot be read (e.g. a non-git directory placed by an external
      provisioner in `locate` mode). The journaled commit, not the file content, is what lets recovery tell
@@ -379,6 +395,14 @@ cost a full copy per job and break checkout-relative paths. So the service handl
      `core.fsmonitor` off and optional locks off (it never rewrites `.git/index` or writes objects). If git
      is missing, times out, or refuses the checkout (e.g. its `safe.directory` ownership check), the pin is
      refused;
+   - the pin is inside a populated submodule (a directory with its own `.git`, e.g. from #125's recursive
+     checkout) and that submodule is not provably the one the checkout's commit pins. A submodule's file
+     belongs to the **submodule's** repository (from the superproject it is simply untracked), so it is
+     verified there, as above, at the submodule's own `HEAD` — but only after every enclosing submodule,
+     outermost first, is shown by `git ls-tree` of its parent's verified commit to be a gitlink (mode
+     `160000`) pinned to exactly that `HEAD`. A submodule checked out away from its gitlink, one whose `HEAD`
+     cannot be read, or a nested repository the commit does not record as a submodule is refused (e.g.
+     `the submodule 'libs/sub' is checked out at <sha>, not the commit <gitlink> that <commit> pins for it`);
    - the journal cannot be written, or is laid out so recovery could never replay it: inside the checkout,
      or in a directory whose parent does not contain the checkout (the service always uses
      `<checkout-root>/.sextant-sdk-pin`);
@@ -392,7 +416,7 @@ Outcomes and diagnostics. All paths are checkout-relative, and every diagnostic 
 | --- | --- | --- |
 | pin overridden, checkout loaded | `complete` (unless another coverage gap applies) | `sdk_pin_overridden` (warning; also the substituted SDK) |
 | pin not overridden and the **whole** load failed SDK resolution | `failed` with a typed reason (requested vs installed, pin path, why not overridden) — never a bare exception message. This also applies when the load fails with an error that names no hostfxr function (e.g. every project came back empty) while a pin it depends on is known not to resolve; the reason then carries the load error too | `sdk_resolution_failed` (error) |
-| pin not overridden, but only **some** solutions/projects are governed by it (#90-style isolation, e.g. a `tools/global.json` in one of several solutions) | `partial`; the reason names the pin | `sdk_resolution_failed` (warning) for the pin and for each project it kept from loading |
+| pin not overridden, but only **some** solutions/projects are governed by it (#90-style isolation, e.g. a `tools/global.json` in one of several solutions, or a refused pin inside one submodule while the root pin is overridden) | `partial`; the reason names the pin | `sdk_resolution_failed` (warning) for the pin and for each project it kept from loading |
 | a neutralized pin could not be restored (or a leftover journal could not be replayed, or its presence ruled out) | `queued` (requeued; HTTP 202 — re-call ensure to retry), nothing indexed; `failed` once `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS` is exhausted | `sdk_pin_restore_failed` (error) |
 
 An overridden snapshot is **complete**, because the override restored full coverage, but it is never

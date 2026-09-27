@@ -12,7 +12,7 @@ namespace Sextant.Service.Tests;
 /// <c>rollForward: disable</c> pin naming an SDK that is not "installed".
 /// </summary>
 [TestClass]
-public sealed class SdkPinGuardTests
+public sealed partial class SdkPinGuardTests
 {
     private const string UnsatisfiablePin = """
         {
@@ -71,10 +71,30 @@ public sealed class SdkPinGuardTests
     {
         public List<(string Checkout, string Head, IReadOnlyList<CheckoutFileContent> Files)> Calls { get; } = [];
 
+        public List<(string Parent, string ParentHead, string Submodule, string SubmoduleHead)> GitlinkCalls { get; } = [];
+
+        /// <summary>Per-file problems (by absolute path), in addition to the blanket <c>problem</c>.</summary>
+        public Dictionary<string, string> FileProblems { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Per-submodule gitlink problems (by absolute submodule directory).</summary>
+        public Dictionary<string, string> GitlinkProblems { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        public Exception? GitlinkFailure { get; init; }
+
         public string? Problem(string checkoutDir, string head, IReadOnlyList<CheckoutFileContent> files)
         {
             Calls.Add((checkoutDir, head, files));
-            return failure is null ? problem : throw failure;
+            if (failure is not null)
+                throw failure;
+            return files.Select(f => FileProblems.GetValueOrDefault(f.Path)).FirstOrDefault(p => p is not null) ?? problem;
+        }
+
+        public string? GitlinkProblem(string parentDir, string parentHead, string submoduleDir, string submoduleHead)
+        {
+            GitlinkCalls.Add((parentDir, parentHead, submoduleDir, submoduleHead));
+            if (GitlinkFailure is not null)
+                throw GitlinkFailure;
+            return GitlinkProblems.GetValueOrDefault(submoduleDir);
         }
     }
 
@@ -90,13 +110,16 @@ public sealed class SdkPinGuardTests
 
         var overlay = NewGuard(probe: new FakeHostFxr(), verifier: verifier).Apply(_checkout, [_solution, toolsSolution]);
 
-        var call = verifier.Calls.Single();
-        Assert.AreEqual(Path.GetFullPath(_checkout), call.Checkout);
-        Assert.AreEqual(DefaultHead, call.Head);
-        CollectionAssert.AreEquivalent(new[] { GlobalJson, nested }, call.Files.Select(f => f.Path).ToArray());
+        // Each pin is verified on its own (issue #171), at the checkout's commit.
+        Assert.AreEqual(2, verifier.Calls.Count);
+        Assert.IsTrue(verifier.Calls.All(c => c.Checkout == Path.GetFullPath(_checkout) && c.Head == DefaultHead));
+        Assert.IsTrue(verifier.Calls.All(c => c.Files.Count == 1));
+        var files = verifier.Calls.Select(c => c.Files.Single()).ToList();
+        CollectionAssert.AreEquivalent(new[] { GlobalJson, nested }, files.Select(f => f.Path).ToArray());
         // The verifier checks the exact bytes the journal will hold, not whatever is on disk later.
-        CollectionAssert.AreEqual(rootBytes, call.Files.Single(f => f.Path == GlobalJson).Content.ToArray());
-        CollectionAssert.AreEqual(nestedBytes, call.Files.Single(f => f.Path == nested).Content.ToArray());
+        CollectionAssert.AreEqual(rootBytes, files.Single(f => f.Path == GlobalJson).Content.ToArray());
+        CollectionAssert.AreEqual(nestedBytes, files.Single(f => f.Path == nested).Content.ToArray());
+        Assert.AreEqual(0, verifier.GitlinkCalls.Count, "no submodule is involved");
         Assert.IsTrue(overlay.Findings.All(f => f.OverrideApplied));
         overlay.Restore();
         Assert.IsNull(overlay.RestoreError);
