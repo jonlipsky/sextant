@@ -25,10 +25,12 @@ public sealed record CrossRepoUsageScope
 /// <summary>
 /// The Phase-12 reverse-dependency catalog (<c>snapshot_dependencies</c>): one immutable edge per
 /// (consumer project version -> deduplicated submodule PROVIDER project version), carrying the parent's
-/// exact pin and dirty state. It is the narrowing index for cross-repository usage queries — an
-/// authorized-consumer filter is applied through this catalog BEFORE the provider symbol's occurrences
-/// are searched — and the retention anchor that keeps a shared provider alive while any parent pins it.
-/// A thin adapter over parameterized SQL on the caller's connection.
+/// exact pin and dirty state. It is the narrowing index for cross-repository usage queries: only
+/// occurrences that some edge links from a consumer project to the pinned provider project are usages,
+/// and only authorized consumers' rows are returned. The query is driven by the provider symbol's own
+/// occurrences, never by the authorization filter (issue #160). The catalog is also the retention anchor
+/// that keeps a shared provider alive while any parent pins it. A thin adapter over parameterized SQL on
+/// the caller's connection.
 /// </summary>
 public sealed class SnapshotDependencyStore(SqliteConnection connection)
 {
@@ -128,12 +130,7 @@ public sealed class SnapshotDependencyStore(SqliteConnection connection)
         // equivalent spelling binds the one canonical provider row.
         if (new SnapshotStore(connection).GetRepositoryId(providerRepositoryUrl) is not long providerRepoId)
             return [];
-        using var cmd = connection.CreateCommand();
-        cmd.CommandText = $"""
-            SELECT DISTINCT crepo.id, crepo.remote_url
-            {UsageFromWhere(scope)};
-            """;
-        BindUsageParameters(cmd, providerRepoId, providerSymbolKey, scope);
+        using var cmd = CreateCandidateConsumerRepositoriesCommand(providerRepoId, providerSymbolKey, scope);
         var rows = new List<(long, string)>();
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
@@ -210,21 +207,8 @@ public sealed class SnapshotDependencyStore(SqliteConnection connection)
         if (new SnapshotStore(connection).GetRepositoryId(providerRepositoryUrl) is not long providerRepoId)
             return [];
 
-        var authFilter = "";
-        if (authorizedConsumerRepositoryIds is { Count: > 0 })
-        {
-            var ids = string.Join(",", authorizedConsumerRepositoryIds);
-            authFilter = $" AND crepo.id IN ({ids})";
-        }
-
-        using var cmd = connection.CreateCommand();
-        cmd.CommandText = $"""
-            SELECT crepo.remote_url, cb.name, cc.commit_sha, clp.canonical_id,
-                   cf.repo_relative_path, o.line, o.col, o.kind, d.provider_commit_sha, d.submodule_dirty
-            {UsageFromWhere(scope)}{authFilter}
-            ORDER BY crepo.remote_url, clp.canonical_id, cf.repo_relative_path, o.line, o.col;
-            """;
-        BindUsageParameters(cmd, providerRepoId, providerSymbolKey, scope);
+        using var cmd = CreateCrossRepositoryUsagesCommand(
+            providerRepoId, providerSymbolKey, scope, authorizedConsumerRepositoryIds);
 
         var results = new List<CrossRepositoryUsage>();
         using var reader = cmd.ExecuteReader();
@@ -248,47 +232,119 @@ public sealed class SnapshotDependencyStore(SqliteConnection connection)
         return results;
     }
 
-    // The shared FROM/WHERE for both the candidate-repo pre-query and the usage query. Joins the
-    // dependency catalog to the provider symbol (by stable key) and to the consumer occurrences that
-    // target it, then to the consumer project's logical identity / repository / file / branch|commit for
-    // the scope filter. A default-heads scope joins the consumer's default branch pointer; a branch scope
-    // its named branch pointer; a commit scope filters the consumer snapshot's commit directly. The
-    // occurrence join is restricted to PURE references (source_symbol_id IS NULL): a cross-project call
-    // site emits BOTH a pure-reference row and an additional call-graph row at the same (file, line, col),
-    // so counting both would double-count one usage. The pure-reference rows are the complete set of
-    // usage locations (every call/inheritance also emits one), and they carry the reference kind, so this
-    // filter yields exactly one row per usage without losing any. The consumer snapshot is also restricted
-    // to a PUBLISHED status (complete or a retained superseded generation): a default-heads/branch scope is
-    // already limited to live branch pointers (only ever set on a complete snapshot), but an explicit
-    // commit scope must not match a still-staging or abandoned snapshot sharing that commit.
+    /// <summary>
+    /// Builds the candidate-consumer-repository command (<see cref="GetCandidateConsumerRepositories"/>)
+    /// for an already-resolved provider repository id. Exposed to the store tests so the query-plan gate
+    /// (issue #160) runs <c>EXPLAIN QUERY PLAN</c> over the exact SQL the store executes.
+    /// </summary>
+    internal SqliteCommand CreateCandidateConsumerRepositoriesCommand(
+        long providerRepositoryId, string providerSymbolKey, CrossRepoUsageScope scope)
+    {
+        var cmd = connection.CreateCommand();
+        cmd.CommandText = $"""
+            SELECT DISTINCT crepo.id, crepo.remote_url
+            {UsageFromWhere(scope)};
+            """;
+        BindUsageParameters(cmd, providerRepositoryId, providerSymbolKey, scope);
+        return cmd;
+    }
+
+    /// <summary>
+    /// Builds the usage command (<see cref="FindCrossRepositoryUsages"/>) for an already-resolved provider
+    /// repository id. A non-empty <paramref name="authorizedConsumerRepositoryIds"/> appends the consumer
+    /// repository filter; null applies none; an empty set fails closed (matches nothing), so the builder
+    /// never widens authorization even if a caller skips the early deny-all return.
+    /// Exposed to the store tests for the query-plan gate (issue #160).
+    /// </summary>
+    internal SqliteCommand CreateCrossRepositoryUsagesCommand(
+        long providerRepositoryId, string providerSymbolKey, CrossRepoUsageScope scope,
+        IReadOnlyCollection<long>? authorizedConsumerRepositoryIds)
+    {
+        // The ids are database row ids (longs), never caller text, so inlining them is injection-safe. The
+        // forced join order in UsageFromWhere keeps this filter a per-row check on crepo, reached by primary
+        // key from the target-driven loop. It can never become the plan's leading term (issue #160).
+        var authFilter = authorizedConsumerRepositoryIds switch
+        {
+            null => "",
+            { Count: 0 } => " AND 0",
+            _ => $" AND crepo.id IN ({string.Join(",", authorizedConsumerRepositoryIds)})"
+        };
+
+        // o.id then cb.name only break ties the documented keys leave open (two occurrences at one
+        // location, or two branches pointing at one commit-scope snapshot), so the order is total and
+        // independent of the plan.
+        var cmd = connection.CreateCommand();
+        cmd.CommandText = $"""
+            SELECT crepo.remote_url, cb.name, cc.commit_sha, clp.canonical_id,
+                   cf.repo_relative_path, o.line, o.col, o.kind, d.provider_commit_sha, d.submodule_dirty
+            {UsageFromWhere(scope)}{authFilter}
+            ORDER BY crepo.remote_url, clp.canonical_id, cf.repo_relative_path, o.line, o.col, o.id, cb.name;
+            """;
+        BindUsageParameters(cmd, providerRepositoryId, providerSymbolKey, scope);
+        return cmd;
+    }
+
+    // The shared FROM/WHERE for both the candidate-repo pre-query and the usage query. Joins the provider
+    // symbol (by stable key, in a provider project some dependency edge pins) to the consumer occurrences
+    // that target it, then to the dependency edge that makes the occurrence a cross-repository usage, then
+    // to the consumer project's logical identity / repository / file / branch|commit for the scope
+    // filter. A default-heads scope joins the consumer's default branch pointer; a branch scope its named
+    // branch pointer; a commit scope filters the consumer snapshot's commit directly. The occurrence join
+    // is restricted to PURE references (source_symbol_id IS NULL): a cross-project call site emits BOTH a
+    // pure-reference row and an additional call-graph row at the same (file, line, col), so counting both
+    // would double-count one usage. The pure-reference rows are the complete set of usage locations (every
+    // call/inheritance also emits one), and they carry the reference kind, so this filter yields exactly
+    // one row per usage without losing any. The consumer snapshot is also restricted to a PUBLISHED status
+    // (complete or a retained superseded generation): a default-heads/branch scope is already limited to
+    // live branch pointers (only ever set on a complete snapshot), but an explicit commit scope must not
+    // match a still-staging or abandoned snapshot sharing that commit.
+    //
+    // JOIN ORDER IS FORCED (issue #160). SQLite never moves the table on the right of a CROSS JOIN (or a
+    // LEFT JOIN) ahead of any table on its left, so this FROM list is the loop nesting:
+    //   psym  ix_symbols_key (project_id IN <pinned provider projects>, symbol_key = @symbol_key)
+    //   o     ix_occ_target (target_symbol_id = psym.id): only this symbol's occurrences
+    //   d     UNIQUE (consumer_project_id, provider_project_id): the one edge per occurrence
+    //   cs, cb/cc, cp, clp, crepo, cfv, cf: primary-key / scope lookups
+    // Without statistics the planner had led with the authorization filter (crepo.id IN (...)) and walked
+    // every consumer logical project into all pure references (logical projects x pure references, ~410 s
+    // in prod). The work is now bounded by the target's own occurrence count, whatever the authorization
+    // filter, scope, or index statistics. CrossRepositoryUsageQueryPlanTests pins this plan.
+    //
+    // Row-set parity with the edge-driven form: an edge-driven row (d, psym, o) has psym pinned by d, so
+    // psym passes the IN filter. A row here satisfies every original predicate, and psym is one row per
+    // id, so no row is added, dropped, or duplicated.
     private static string UsageFromWhere(CrossRepoUsageScope scope)
     {
         var scopeJoin = scope.ConsumerCommitSha != null
             // Historical commit scope: bind the consumer snapshot's own commit; branch pointer optional.
             ? """
-              JOIN commits cc ON cc.id = cs.commit_id AND cc.commit_sha = @consumer_commit
+              CROSS JOIN commits cc ON cc.id = cs.commit_id AND cc.commit_sha = @consumer_commit
               LEFT JOIN branches cb ON cb.snapshot_id = d.consumer_snapshot_id
               """
             // Branch-head scope (default): the consumer snapshot must be a live branch head.
             : $"""
-              JOIN branches cb ON cb.snapshot_id = d.consumer_snapshot_id {(scope.Branch != null ? "AND cb.name = @branch" : "AND cb.is_default = 1")}
+              CROSS JOIN branches cb ON cb.snapshot_id = d.consumer_snapshot_id {(scope.Branch != null ? "AND cb.name = @branch" : "AND cb.is_default = 1")}
               LEFT JOIN commits cc ON cc.id = cs.commit_id
               """;
 
         return $"""
-            FROM snapshot_dependencies d
-            JOIN repositories prepo ON prepo.id = d.provider_repository_id AND prepo.id = @provider_repo_id
-            JOIN symbols psym ON psym.project_id = d.provider_project_id AND psym.symbol_key = @symbol_key
-            JOIN occurrences o ON o.target_symbol_id = psym.id AND o.in_project_id = d.consumer_project_id
-                AND o.source_symbol_id IS NULL
-            JOIN snapshots cs ON cs.id = d.consumer_snapshot_id
-            JOIN projects cp ON cp.id = d.consumer_project_id
-            JOIN logical_projects clp ON clp.id = cp.logical_project_id
-            JOIN repositories crepo ON crepo.id = clp.repository_id
-            JOIN file_versions cfv ON cfv.id = o.file_version_id
-            JOIN files cf ON cf.id = cfv.file_id
+            FROM symbols psym
+            CROSS JOIN occurrences o ON o.target_symbol_id = psym.id AND o.source_symbol_id IS NULL
+            CROSS JOIN snapshot_dependencies d ON d.consumer_project_id = o.in_project_id
+                AND d.provider_project_id = psym.project_id
+            CROSS JOIN repositories prepo ON prepo.id = d.provider_repository_id AND prepo.id = @provider_repo_id
+            CROSS JOIN snapshots cs ON cs.id = d.consumer_snapshot_id
             {scopeJoin}
-            WHERE cs.status IN (@published_complete, @published_superseded)
+            CROSS JOIN projects cp ON cp.id = d.consumer_project_id
+            CROSS JOIN logical_projects clp ON clp.id = cp.logical_project_id
+            CROSS JOIN repositories crepo ON crepo.id = clp.repository_id
+            CROSS JOIN file_versions cfv ON cfv.id = o.file_version_id
+            CROSS JOIN files cf ON cf.id = cfv.file_id
+            WHERE psym.symbol_key = @symbol_key
+              AND psym.project_id IN (
+                  SELECT pd.provider_project_id FROM snapshot_dependencies pd
+                  WHERE pd.provider_repository_id = @provider_repo_id)
+              AND cs.status IN (@published_complete, @published_superseded)
             """;
     }
 
