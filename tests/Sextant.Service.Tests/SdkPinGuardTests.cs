@@ -69,9 +69,9 @@ public sealed class SdkPinGuardTests
 
     private sealed class RecordingVerifier(string? problem = null, Exception? failure = null) : ICheckoutContentVerifier
     {
-        public List<(string Checkout, string Head, IReadOnlyList<string> Files)> Calls { get; } = [];
+        public List<(string Checkout, string Head, IReadOnlyList<CheckoutFileContent> Files)> Calls { get; } = [];
 
-        public string? Problem(string checkoutDir, string head, IReadOnlyList<string> files)
+        public string? Problem(string checkoutDir, string head, IReadOnlyList<CheckoutFileContent> files)
         {
             Calls.Add((checkoutDir, head, files));
             return failure is null ? problem : throw failure;
@@ -81,9 +81,9 @@ public sealed class SdkPinGuardTests
     [TestMethod]
     public void ThePinsToOverride_AreVerifiedAgainstTheCommit_AtTheCheckoutsReadableHead()
     {
-        WritePin(GlobalJson);
+        var rootBytes = WritePin(GlobalJson);
         var nested = Path.Combine(_checkout, "tools", "global.json");
-        WritePin(nested);
+        var nestedBytes = WritePin(nested, """{ "sdk": { "version": "9.0.999", "rollForward": "disable" } }""");
         var toolsSolution = Path.Combine(_checkout, "tools", "Tools.slnx");
         File.WriteAllText(toolsSolution, "<Solution />");
         var verifier = new RecordingVerifier();
@@ -93,7 +93,10 @@ public sealed class SdkPinGuardTests
         var call = verifier.Calls.Single();
         Assert.AreEqual(Path.GetFullPath(_checkout), call.Checkout);
         Assert.AreEqual(DefaultHead, call.Head);
-        CollectionAssert.AreEquivalent(new[] { GlobalJson, nested }, call.Files.ToArray());
+        CollectionAssert.AreEquivalent(new[] { GlobalJson, nested }, call.Files.Select(f => f.Path).ToArray());
+        // The verifier checks the exact bytes the journal will hold, not whatever is on disk later.
+        CollectionAssert.AreEqual(rootBytes, call.Files.Single(f => f.Path == GlobalJson).Content.ToArray());
+        CollectionAssert.AreEqual(nestedBytes, call.Files.Single(f => f.Path == nested).Content.ToArray());
         Assert.IsTrue(overlay.Findings.All(f => f.OverrideApplied));
         overlay.Restore();
         Assert.IsNull(overlay.RestoreError);

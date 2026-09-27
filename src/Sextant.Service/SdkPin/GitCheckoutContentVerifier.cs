@@ -14,14 +14,22 @@ public interface ICheckoutContentVerifier
     /// <summary>
     /// Null when <paramref name="checkoutDir"/>'s HEAD resolves to the commit <paramref name="head"/> and every file
     /// in <paramref name="files"/> (absolute paths inside the checkout) is tracked, is not flagged
-    /// assume-unchanged/skip-worktree, and has no staged or unstaged change; otherwise why not. Never throws.
+    /// assume-unchanged/skip-worktree, has no staged or unstaged change, and its <see cref="CheckoutFileContent.Content"/>
+    /// — the exact bytes the caller read and will journal — is the committed content; otherwise why not. Never throws.
     /// </summary>
-    string? Problem(string checkoutDir, string head, IReadOnlyList<string> files);
+    string? Problem(string checkoutDir, string head, IReadOnlyList<CheckoutFileContent> files);
 }
+
+/// <summary>A file the SDK-pin override would journal: its absolute path and the exact bytes read from it.</summary>
+public readonly record struct CheckoutFileContent(string Path, ReadOnlyMemory<byte> Content);
 
 /// <summary>
 /// The git-backed <see cref="ICheckoutContentVerifier"/>: <c>rev-parse HEAD^{commit}</c>, <c>ls-files -v</c> and
-/// <c>status --porcelain</c> over just the candidate paths. git is run hardened against the checkout's own
+/// <c>status --porcelain</c> over just the candidate paths, then <c>ls-tree</c> of the verified commit and
+/// <c>hash-object --stdin --path</c> over the bytes read. <c>status</c> alone is not proof: git may call a file
+/// clean from its cached stat data (e.g. <c>core.checkStat=minimal</c> and a same-size edit that kept its
+/// mtime), so the bytes to be journaled are hashed — with the path's eol/filter conversion, as <c>git add</c>
+/// would — and must equal the commit's blob. git is run hardened against the checkout's own
 /// configuration and the worker's environment — inherited <c>GIT_*</c> variables are dropped, repository
 /// discovery cannot climb above the checkout, pathspecs are literal, <c>core.fsmonitor</c> is disabled, and
 /// <c>GIT_OPTIONAL_LOCKS=0</c> keeps <c>status</c> from rewriting the index. Any failure — git missing, a
@@ -42,7 +50,7 @@ public sealed class GitCheckoutContentVerifier : ICheckoutContentVerifier
 
     public static GitCheckoutContentVerifier Instance { get; } = new();
 
-    public string? Problem(string checkoutDir, string head, IReadOnlyList<string> files)
+    public string? Problem(string checkoutDir, string head, IReadOnlyList<CheckoutFileContent> files)
     {
         try
         {
@@ -54,14 +62,14 @@ public sealed class GitCheckoutContentVerifier : ICheckoutContentVerifier
         }
     }
 
-    private string? ProblemCore(string checkout, string head, IReadOnlyList<string> files)
+    private string? ProblemCore(string checkout, string head, IReadOnlyList<CheckoutFileContent> files)
     {
         var relative = new List<string>(files.Count);
         foreach (var file in files)
         {
-            var path = Path.GetRelativePath(checkout, Path.GetFullPath(file));
+            var path = Path.GetRelativePath(checkout, Path.GetFullPath(file.Path));
             if (path == "." || path.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(path))
-                return $"'{file}' is not inside the checkout";
+                return $"'{file.Path}' is not inside the checkout";
             relative.Add(path.Replace('\\', '/'));
         }
         if (relative.Count == 0)
@@ -98,15 +106,49 @@ public sealed class GitCheckoutContentVerifier : ICheckoutContentVerifier
         if (status.Problem is not null)
             return status.Problem.Length > 0 ? status.Problem : "git status failed";
         var changed = status.Stdout.Split('\0', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
-        return changed is null
-            ? null
-            : $"'{(changed.Length > 3 ? changed[3..] : changed)}' differs from its committed content (git status '{changed[..Math.Min(2, changed.Length)]}')";
+        if (changed is not null)
+            return $"'{(changed.Length > 3 ? changed[3..] : changed)}' differs from its committed content (git status '{changed[..Math.Min(2, changed.Length)]}')";
+
+        return ContentProblem(checkout, resolved, files, relative);
+    }
+
+    /// <summary>Hashes each file's bytes as git would store them and compares with the verified commit's blob.</summary>
+    private string? ContentProblem(string checkout, string commit, IReadOnlyList<CheckoutFileContent> files, List<string> relative)
+    {
+        var tree = Run(checkout, ["ls-tree", "-z", "--full-tree", commit, "--", .. relative]);
+        if (tree.Problem is not null)
+            return tree.Problem.Length > 0 ? tree.Problem : "git ls-tree failed";
+        var blobs = new Dictionary<string, (string Mode, string Type, string Id)>(StringComparer.Ordinal);
+        foreach (var record in tree.Stdout.Split('\0', StringSplitOptions.RemoveEmptyEntries))
+        {
+            // "<mode> SP <type> SP <object> TAB <path>"
+            var tab = record.IndexOf('\t', StringComparison.Ordinal);
+            var meta = tab > 0 ? record[..tab].Split(' ') : [];
+            if (meta.Length == 3)
+                blobs[record[(tab + 1)..]] = (meta[0], meta[1], meta[2]);
+        }
+
+        for (var i = 0; i < files.Count; i++)
+        {
+            var path = relative[i];
+            if (!blobs.TryGetValue(path, out var blob))
+                return $"'{path}' is not in the commit {commit}";
+            if (blob.Type != "blob" || blob.Mode is not ("100644" or "100755"))
+                return $"'{path}' is not a regular file in the commit {commit} (mode {blob.Mode} {blob.Type})";
+            var hashed = Run(checkout, ["hash-object", "--stdin", $"--path={path}"], files[i].Content);
+            if (hashed.Problem is not null)
+                return hashed.Problem.Length > 0 ? hashed.Problem : "git hash-object failed";
+            var id = hashed.Stdout.Trim();
+            if (!string.Equals(id, blob.Id, StringComparison.OrdinalIgnoreCase))
+                return $"the bytes read from '{path}' are not its committed content (they hash to {FirstLine(id)}; the commit has {blob.Id})";
+        }
+        return null;
     }
 
     /// <summary>The drained stdout, or a problem: empty for a silent non-zero exit, else a description.</summary>
     private readonly record struct GitRun(string Stdout, string? Problem);
 
-    private GitRun Run(string checkout, IReadOnlyList<string> args)
+    private GitRun Run(string checkout, IReadOnlyList<string> args, ReadOnlyMemory<byte> stdin = default)
     {
         var psi = new ProcessStartInfo(_gitExecutable)
         {
@@ -138,9 +180,9 @@ public sealed class GitCheckoutContentVerifier : ICheckoutContentVerifier
         using var process = Process.Start(psi);
         if (process is null)
             return new GitRun(string.Empty, "git could not be started");
-        process.StandardInput.Close();
         var stdout = process.StandardOutput.ReadToEndAsync();
         var stderr = process.StandardError.ReadToEndAsync();
+        var input = WriteInputAsync(process.StandardInput, stdin);
         if (!process.WaitForExit(_timeout))
         {
             try { process.Kill(entireProcessTree: true); } catch (InvalidOperationException) { /* already exited */ }
@@ -149,9 +191,29 @@ public sealed class GitCheckoutContentVerifier : ICheckoutContentVerifier
         process.WaitForExit();
         var output = stdout.GetAwaiter().GetResult();
         var error = stderr.GetAwaiter().GetResult();
-        return process.ExitCode == 0
+        if (process.ExitCode != 0)
+            return new GitRun(output, string.IsNullOrWhiteSpace(error) ? string.Empty : $"git {args[0]} failed ({FirstLine(error)})");
+        // git exited cleanly, but if it did not take all the input its answer is not about these bytes.
+        var inputError = input.Wait(_timeout) ? input.Result : "timed out";
+        return inputError is null
             ? new GitRun(output, null)
-            : new GitRun(output, string.IsNullOrWhiteSpace(error) ? string.Empty : $"git {args[0]} failed ({FirstLine(error)})");
+            : new GitRun(output, $"git {args[0]} did not read its input ({inputError})");
+    }
+
+    /// <summary>Writes the raw bytes to git's stdin and closes it; null on success, else why not. Never throws.</summary>
+    private static async Task<string?> WriteInputAsync(StreamWriter stdin, ReadOnlyMemory<byte> bytes)
+    {
+        try
+        {
+            if (!bytes.IsEmpty)
+                await stdin.BaseStream.WriteAsync(bytes).ConfigureAwait(false);
+            stdin.Close();
+            return null;
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        {
+            return ex.Message;
+        }
     }
 
     private static string FirstLine(string value)
