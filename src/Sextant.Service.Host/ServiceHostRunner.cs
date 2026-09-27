@@ -54,7 +54,9 @@ public static class ServiceHostRunner
         // repos alike. The local CLI/daemon path does not construct this worker, so it stays byte-identical.
         var sandbox = new EvaluationSandbox(options.Sandbox, paths, Console.Error.WriteLine);
         // Issue #113: an unsatisfiable global.json SDK pin is neutralized for the MSBuild load only; the restore
-        // journal lives beside (never inside) the checkouts so a crashed job is repaired by the next one.
+        // journal lives beside (never inside) the checkouts so a crashed job is repaired by the next one. The
+        // guard's toggle MUST be options.SdkPinOverride: it also sets the SnapshotService's request identity
+        // (ServiceOptions.SdkPinIdentityComponent), and the worker publishes under the guard's IdentityComponent.
         var sdkPinGuard = new SdkPinGuard(
             new SdkPinOptions
             {

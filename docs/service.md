@@ -73,7 +73,7 @@ of the box.
 | `SEXTANT_SERVICE_SANDBOX_MEMORY_BUDGET_BYTES` | Watchdog memory ceiling | policy default |
 | `SEXTANT_SERVICE_SANDBOX_ALLOW_NETWORK` | Allow network during evaluation | `false` |
 | `SEXTANT_SERVICE_SANDBOX_SCRUB_SECRETS` | Scrub secrets from the evaluation environment | `true` |
-| `SEXTANT_SERVICE_SDK_PIN_OVERRIDE` | Temporarily neutralize a checkout `global.json` SDK pin that no installed SDK satisfies, so the checkout still indexes with an installed SDK (issue #113; see [SDK pins](#repository-globaljson-sdk-pins-issue-113)). `false` leaves such pins alone and the job fails / goes partial with a typed `sdk_resolution_failed` diagnostic. An unparseable value **fails startup** | `true` |
+| `SEXTANT_SERVICE_SDK_PIN_OVERRIDE` | Temporarily neutralize a checkout `global.json` SDK pin that no installed SDK satisfies, so the checkout still indexes with an installed SDK (issue #113; see [SDK pins](#repository-globaljson-sdk-pins-issue-113)). `false` leaves such pins alone and the job fails / goes partial with a typed `sdk_resolution_failed` diagnostic. `false` is part of the snapshot identity, so flipping the toggle re-indexes a commit instead of reusing a result built under the other policy. An unparseable value **fails startup** | `true` |
 
 Boolean toggles accept `1/0`, `true/false`, `yes/no`, `on/off` (case-insensitive); any other non-empty
 value **fails startup** rather than silently disabling a security-relevant control (fail-closed). The
@@ -406,17 +406,35 @@ silent:
   `;sdk_resolution_failed` and `;sdk_pin_restore_failed` for the other two outcomes.
 
 **Identity and fingerprints stay deterministic.** The snapshot identity is computed from the request and
-the service toolchain before the worker runs, and does not read `global.json`.
+the service configuration before the worker runs, and does not read `global.json`.
 `EvaluationFingerprint.Compute` does hash `global.json`, but it runs at index time, after the restore. It
 therefore records the **committed** checkout's value, the same value a worker that has the pinned SDK would
 record. The override needs no `AnalyzerVersion` bump.
 
-**The override policy is not part of the snapshot identity.** Like the clone credential, the
-`SEXTANT_SERVICE_SDK_PIN_OVERRIDE` toggle and the worker's installed SDK bands are operator/worker
-configuration, not snapshot inputs. A terminal `failed` job is reused for its identity, so a commit that
-already failed SDK resolution (e.g. on a worker from before this feature, or with the override off) is not
-retried just because the override is now on or a new SDK band was installed. Pushing a new commit (or an
-`AnalyzerVersion` bump) produces a new identity that is evaluated afresh.
+**The override policy is part of the snapshot identity.** The toggle decides what a node publishes for a
+pinned commit: `complete` with the substituted SDK, or `partial`/`failed` with the override off. An
+already-published snapshot is never rebuilt, and a terminal `failed` job is reused as recorded. If the policy
+were not in the identity, a commit ensured with the override off would therefore be silently reused after the
+operator turned it on, and the other way round. So a node with `SEXTANT_SERVICE_SDK_PIN_OVERRIDE=false` folds
+`sdkpin=strict` into every identity it computes and publishes, for the repository snapshot and its submodule
+provider snapshots. Both the ensure request identity (`ServiceOptions.SdkPinIdentityComponent`) and the
+worker's published identity (`SdkPinGuard.IdentityComponent`) derive it from that one toggle. A mismatch
+still fails closed, as any worker/config identity mismatch does. Details:
+
+- **Flipping the toggle (and restarting) re-indexes.** The next ensure of a commit gets a new identity and
+  rebuilds it under the new policy. Flipping it back re-attaches to the earlier policy's snapshot or job
+  without a rebuild.
+- **The default policy (override on) folds nothing.** Its identities stay byte-identical to before #113, so
+  enabling this costs no rebuild. The local CLI/daemon path, which never overrides a pin, is unchanged too, as
+  are contribution identities and the remote-base addressing a local client uses (#108). That addressing
+  assumes the peer's default policy, so an override-off peer's bases are not addressable. The client then
+  falls back to a full local build.
+- **The worker's installed SDK bands are not in the identity.** Neither is the clone credential. A commit
+  that already failed SDK resolution on a node is not retried just because a new SDK band was installed there.
+  Pushing a new commit, or an `AnalyzerVersion` bump, produces a new identity that is evaluated afresh.
+- **Pre-#113 identities.** A job that failed on a worker from before this feature has the default (unfolded)
+  identity. It is only re-evaluated because the same deploy also bumps `AnalyzerVersion`, to `4` for #125.
+  Retrying failed identities after an environment change is tracked in #153.
 
 **Operator options.** Install the pinned SDK band in the worker image, which makes the pin resolve so the
 override never engages. Alternatively, have the repository relax `rollForward` (e.g. `latestFeature`). Set
@@ -888,14 +906,18 @@ git dir, pre-change cache upgrade, transient failure retried then degraded on th
 `git status` cannot see from stat data, through an `ident` clean filter, or through a `filter` driver;
 staged changes; untracked/ignored files; index flags; CRLF and stored-form checkouts; a replace ref; a moved
 or unborn `HEAD`; a timeout; no discovery above the checkout; and no index writes), `SdkPinSurfaceTests`
-(diagnostics, coverage provenance, audit suffix, status), and the real-MSBuild
+(diagnostics, coverage provenance, audit suffix, status, and the override policy's identity component),
+`SnapshotIdentityTests` (the `sdkpin` fold leaves a null-policy identity byte-identical), and the real-MSBuild
 `SdkPinOverrideIntegrationTests`. The integration tests cover a `10.0.999` + `disable` pin that is
 overridden (with and without the sandboxed worker; the checkout bytes, mtime, `git status` and
 `EvaluationFingerprint` are unchanged afterwards), the override disabled (typed failure), a resolvable pin
 (untouched), an uncommitted local pin (refused, typed failure, left as found), crash recovery, and
 multi-solution repos where one pin yields `partial` (override off) or `complete` (override on). One of those
 repos pins a solution's directory; the other uses the #124 default union, with the pin in a nested project's
-directory.
+directory. Through a real `SnapshotService` over one shared catalog, a commit ensured with the override off
+(`failed`, or `partial` for the multi-solution repo) is rebuilt with complete coverage under a new identity
+once the override is on, instead of being reused. A re-ensure under the unchanged policy then attaches without
+a rebuild.
 
 ### Phase 15 — platform routing tests
 
