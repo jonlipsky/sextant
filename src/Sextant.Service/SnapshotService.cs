@@ -730,17 +730,26 @@ public sealed class SnapshotService : IDisposable
     };
 
     // Ensures the requesting branch owns a pointer to the snapshot it attached to (issue #62), so a second
-    // branch at the same commit both resolves and protects the shared snapshot. Raw DB write — callers must
-    // already hold the write gate AND an open write transaction (AdvanceOrAttachBranchPointer). No-op when
-    // the request carries no branch, no resolved snapshot, or an unknown repository.
+    // branch at the same commit both resolves and protects the shared snapshot. For a NULL-sequence request
+    // an EXISTING pointer is re-pointed only when that cannot regress commit history (issue #162): the
+    // current target is at the same commit (a pure identity change, e.g. an AnalyzerVersion bump or a
+    // Phase-12 provider snapshot reused by a direct ensure) or it is no longer usable. Anything else stays
+    // attach-if-unset. Raw DB write — callers must already hold the write gate AND an open write transaction
+    // (AdvanceOrAttachBranchPointer). A request with no branch targets "main", exactly as the worker path
+    // (CreateSnapshotContext) and the sequence-bearing reuse path resolve it, so a branchless ensure reaches
+    // the same branch state whether or not its identity was pre-built. No-op when the request names an empty
+    // branch, has no resolved snapshot, or an unknown repository.
     private void EnsureAttachBranchPointer(EnsureSnapshotRequest request, long? snapshotId)
     {
-        if (request.BranchName is not { Length: > 0 } branch || snapshotId is not long sid)
+        if ((request.BranchName ?? "main") is not { Length: > 0 } branch || snapshotId is not long sid)
             return;
         var snapshots = new SnapshotStore(_conn);
         if (snapshots.GetRepositoryId(request.RepositoryRemoteUrl) is not long repoId)
             return;
-        var branchId = snapshots.AttachBranchPointer(repoId, branch, sid, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        // A repository ensured in its own right is a consumer, exactly as the worker path's EnsureRepository
+        // makes it, so a provider-only repository whose provider snapshot this ensure reuses stays selectable.
+        snapshots.MarkConsumerRepository(repoId);
+        var branchId = snapshots.AttachOrUpgradeBranchPointer(repoId, branch, sid, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
         // Safety net (issue #104): AttachBranchPointer inserts the branch NON-default (issue #62 — a second
         // branch must never demote the real default). But when THIS ensure's branch should own the default
         // — the coordinator flagged it, it already is the default, or the repo has NO default yet (the
@@ -759,8 +768,10 @@ public sealed class SnapshotService : IDisposable
     // higher-sequence re-ensure of an already-published commit still advances the pointer (e.g. a
     // reset/force-push A@10 → B@20 → A@30) and a lower/equal one still declines — never regressing the
     // branch head and always persisting the advanced sequence. When the request carries NO sequence (the
-    // local/legacy path) this preserves today's forward-only attach-if-unset behavior byte-for-byte
-    // (criterion 2). The mutation runs in ONE raw BEGIN IMMEDIATE / COMMIT transaction — this path, unlike
+    // local/legacy path) the pointer stays attach-if-unset except for the non-regressing same-commit /
+    // unusable-target re-point of issue #162 (EnsureAttachBranchPointer), so identical requests reach the
+    // same branch state whether or not the identity was pre-built. The mutation runs in ONE raw
+    // BEGIN IMMEDIATE / COMMIT transaction — this path, unlike
     // the worker's AdvanceBranchToSnapshot and the contribution ingest, is NOT already inside a write
     // transaction — so a concurrent reader never observes an intermediate state where the branch pointer
     // advanced but its default was not yet set, or a re-ensured default was momentarily demoted (issue
@@ -800,6 +811,7 @@ public sealed class SnapshotService : IDisposable
         // monotonic (a re-ensured default is never demoted-then-re-promoted).
         var branchName = request.BranchName ?? "main";
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        snapshots.MarkConsumerRepository(repoId);
         var ownsDefault = snapshots.ShouldOwnDefault(repoId, branchName, request.ResolveIsDefaultBranch());
         var branchId = snapshots.EnsureBranch(repoId, branchName, ownsDefault, now);
         if (ownsDefault)

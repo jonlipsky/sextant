@@ -52,8 +52,13 @@ internal static class ServiceTestFixtures
     /// <c>snapshot_projects</c> + <paramref name="symbolCount"/> symbols) for the request's identity, using
     /// the caller's writer connection. Mirrors what a real worker's orchestrator run leaves behind, so the
     /// snapshot is queryable through <see cref="LocalBaseSnapshotSource"/> and the HTTP query plane.
+    /// <paramref name="recordCommit"/> links the snapshot to its <c>commits</c> row as the orchestrator does
+    /// (a same-commit comparison needs it); <paramref name="isProvider"/> publishes it as a Phase-12 provider
+    /// snapshot of a provider-only repository instead.
     /// </summary>
-    public static long PublishComplete(IndexDatabase db, EnsureSnapshotRequest request, int symbolCount = 3)
+    public static long PublishComplete(
+        IndexDatabase db, EnsureSnapshotRequest request, int symbolCount = 3, bool recordCommit = false,
+        bool isProvider = false)
     {
         var conn = db.GetConnection();
         var snapshots = new SnapshotStore(conn);
@@ -63,13 +68,16 @@ internal static class ServiceTestFixtures
         var existing = snapshots.GetByIdentityHash(identity.Hash);
         if (existing is { Status: SnapshotStatus.Complete }) return existing.Id;
 
-        var repoId = snapshots.EnsureRepository(request.RepositoryRemoteUrl, now);
+        var repoId = isProvider
+            ? snapshots.EnsureProviderRepository(request.RepositoryRemoteUrl, now)
+            : snapshots.EnsureRepository(request.RepositoryRemoteUrl, now);
+        long? commitId = recordCommit || isProvider ? snapshots.EnsureCommit(repoId, request.CommitSha, null, now) : null;
         var runStore = new IndexRunStore(conn);
         var runId = runStore.BeginRun("full", now,
             IndexProfileDescriptor.Full.ConfigurationHash, IndexProfiles.Deep, (long)IndexFeature.Deep);
         runStore.MarkComplete(runId, now, 1);
 
-        var (snapId, _, _) = snapshots.BeginPending(identity, repoId, null, runId, now);
+        var (snapId, _, _) = snapshots.BeginPending(identity, repoId, commitId, runId, now, isProvider: isProvider);
 
         long projectId;
         using (var cmd = conn.CreateCommand())

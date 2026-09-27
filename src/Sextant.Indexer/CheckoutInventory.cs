@@ -20,6 +20,9 @@ public static class CheckoutInventory
     private static readonly HashSet<string> ProjectExtensions =
         new(StringComparer.OrdinalIgnoreCase) { ".csproj", ".vbproj", ".fsproj" };
 
+    private static readonly HashSet<string> SolutionExtensions =
+        new(StringComparer.OrdinalIgnoreCase) { ".sln", ".slnx" };
+
     private const int MaxSubmoduleDepth = 8;
 
     /// <summary>
@@ -84,6 +87,22 @@ public static class CheckoutInventory
     {
         var root = Path.GetFullPath(checkoutDir);
         var found = EnumerateFilesPruned(root, f => ProjectExtensions.Contains(Path.GetExtension(f)), errors)
+            .Select(Path.GetFullPath)
+            .Distinct(PathComparer)
+            .ToList();
+        found.Sort(StringComparer.Ordinal);
+        return found;
+    }
+
+    /// <summary>
+    /// Every recognized solution file (<c>.sln</c>/<c>.slnx</c>) under <paramref name="dir"/>, as full paths
+    /// in ordinal order, pruning build-output/VCS directories exactly like solution discovery. Unreadable
+    /// subtrees are reported to <paramref name="errors"/>.
+    /// </summary>
+    public static IReadOnlyList<string> FindSolutionFiles(string dir, ICollection<string>? errors = null)
+    {
+        var root = Path.GetFullPath(dir);
+        var found = EnumerateFilesPruned(root, f => SolutionExtensions.Contains(Path.GetExtension(f)), errors)
             .Select(Path.GetFullPath)
             .Distinct(PathComparer)
             .ToList();
