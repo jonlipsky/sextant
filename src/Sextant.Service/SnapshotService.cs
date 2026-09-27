@@ -21,8 +21,17 @@ namespace Sextant.Service;
 /// async gate (a raw <see cref="SqliteConnection"/> is not thread-safe), so concurrent ensure requests
 /// attach to ONE durable job (criterion 1) and never corrupt the connection. QUERY reads use a SEPARATE
 /// connection (the HTTP MCP host's own <c>DatabaseProvider</c>), so low-latency queries never block behind
-/// a running index. On construction the service acquires the lease, runs recovery, and reconciles any job
-/// a dead worker left <c>running</c> back to <c>queued</c> (criterion 2).
+/// a running index; control-plane READS (job status, coverage, branch resolution) likewise use an
+/// independent read connection rather than the write gate (issue #148). On construction the service
+/// acquires the lease, runs recovery, and reconciles any job a dead worker left <c>running</c> back to
+/// <c>queued</c> (criterion 2).
+///
+/// Ensure lifecycle (issue #148): an ensure runs on a SERVICE-OWNED lifetime, never on the caller's
+/// cancellation token. The caller only awaits it; a caller disconnect/timeout ends that wait and nothing
+/// else — production continues, the job stays <c>running</c>, and it later publishes normally. Productions
+/// are tracked in an in-flight registry keyed by identity hash, so a later ensure of the same identity
+/// attaches to the running production (the worker runs once). Only service shutdown
+/// (<see cref="StopProduction"/> / <see cref="Dispose"/>) cancels a worker, and that requeues the job.
 /// </summary>
 public sealed class SnapshotService : IDisposable
 {
@@ -38,7 +47,18 @@ public sealed class SnapshotService : IDisposable
     private readonly IGitContentProvider _gitContent;
     private readonly ContributionPolicy _contributionPolicy;
     private readonly ServiceMetrics _metrics = new();
-    private bool _disposed;
+
+    // Issue #148: the service-owned lifetime every ensure operation + worker run is bound to (cancelled only
+    // by StopProduction/Dispose), the in-flight production registry keyed by identity hash, and the set of
+    // live ensure operations Dispose drains. _inFlightLock guards both collections and _disposed's transition
+    // (admission and Dispose's drain snapshot are atomic under it); it is only ever taken AFTER the write gate
+    // (never the reverse), so it cannot deadlock against a production.
+    private readonly CancellationTokenSource _lifetime = new();
+    private readonly Lock _inFlightLock = new();
+    private readonly Dictionary<string, InFlightProduction> _inFlight = new(StringComparer.Ordinal);
+    private readonly HashSet<Task> _operations = [];
+    private volatile bool _leaseReleased;
+    private volatile bool _disposed;
 
     private SnapshotService(
         ServiceOptions options, ISnapshotWorker worker, ServicePaths paths,
@@ -58,6 +78,14 @@ public sealed class SnapshotService : IDisposable
     }
 
     public ServicePaths Paths => _paths;
+
+    /// <summary>
+    /// False once <see cref="Dispose"/> gave up waiting for an in-flight production that ignored cancellation
+    /// past <see cref="ServiceOptions.ShutdownDrainTimeout"/> (issue #148). The straggler may still be using
+    /// the shared catalog <see cref="IndexDatabase"/>, so a host that passed one in must leave it open (process
+    /// exit reclaims it) rather than dispose it under the straggler. True while running and after a clean drain.
+    /// </summary>
+    public bool ProductionDrained { get; private set; } = true;
 
     /// <summary>The live in-process metric counters (criterion 5), shared with the host query-timing middleware.</summary>
     public ServiceMetrics Metrics => _metrics;
@@ -183,173 +211,433 @@ public sealed class SnapshotService : IDisposable
     /// (criterion 5, cache reuse), and a durable audit row attributing the outcome and worker cost to the
     /// requested repository scope (criterion 5, audit + cost attribution). <paramref name="principal"/> is
     /// the control-plane bearer the host authenticated; it is stored ONLY as a non-reversible hash.
+    ///
+    /// Issue #148: the ensure itself runs on the service-owned lifetime; <paramref name="cancellationToken"/>
+    /// only bounds how long THIS caller waits. Cancelling it throws <see cref="OperationCanceledException"/>
+    /// to the caller while the ensure (job registration, worker run, publish, audit) carries on in the
+    /// background — so a caller whose timeout is shorter than the index still gets a snapshot, and a
+    /// re-ensure attaches to the running production. <see cref="BeginEnsureSnapshotAsync"/> is the
+    /// non-blocking variant.
     /// </summary>
     public async Task<EnsureSnapshotResult> EnsureSnapshotAsync(
         EnsureSnapshotRequest request, CancellationToken cancellationToken = default, string? principal = null)
+    {
+        var (_, completion) = StartEnsureOperation(request, principal);
+        return await WaitForCallerAsync(completion, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The non-blocking ensure (issue #148, <c>POST /control/ensure?wait=false</c>): starts the same
+    /// service-owned ensure as <see cref="EnsureSnapshotAsync"/> but returns as soon as the job is registered —
+    /// a <c>queued</c>/<c>running</c> result carrying the <c>job_id</c> to poll, or the full result when the
+    /// identity was already terminal. Registering a NEW identity still needs the single writer, so while
+    /// ANOTHER identity is producing this waits for the writer (an identity that is itself already producing
+    /// is attached without waiting). <paramref name="cancellationToken"/> only bounds this caller's wait.
+    /// </summary>
+    public async Task<EnsureSnapshotResult> BeginEnsureSnapshotAsync(
+        EnsureSnapshotRequest request, string? principal = null, CancellationToken cancellationToken = default)
+    {
+        var (accepted, _) = StartEnsureOperation(request, principal);
+        return await WaitForCallerAsync(accepted, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Begins service shutdown (issue #148): cancels the service-owned production lifetime, so every in-flight
+    /// worker run is cancelled and its job requeued (never recorded as a failure) and any later ensure fails
+    /// fast. The host calls this on <c>ApplicationStopping</c>; <see cref="Dispose"/> calls it too. Idempotent.
+    /// </summary>
+    public void StopProduction()
+    {
+        try
+        {
+            _lifetime.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Already disposed after a full drain: nothing is left to cancel.
+        }
+    }
+
+    // Starts one ensure as a service-owned background operation and returns (accepted, completion): the
+    // completion is the ensure's final result; accepted settles as soon as the job is registered (wait=false).
+    // The operation is tracked so Dispose can drain it, and neither task can ever surface as an unobserved
+    // exception when no caller is left waiting (the caller disconnected). Admission is atomic with Dispose's
+    // drain snapshot (both under _inFlightLock): an operation either starts before shutdown closes admission
+    // and is drained, or is refused, so none can run on against a released lease or a closed catalog.
+    private (Task<EnsureSnapshotResult> Accepted, Task<EnsureSnapshotResult> Completion) StartEnsureOperation(
+        EnsureSnapshotRequest request, string? principal)
+    {
+        var accepted = new TaskCompletionSource<EnsureSnapshotResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task<EnsureSnapshotResult> completion;
+        lock (_inFlightLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            ThrowIfStopping();
+            completion = Task.Run(() => RunEnsureAsync(request, principal, accepted), CancellationToken.None);
+            _operations.Add(completion);
+        }
+        completion.ContinueWith(
+            t =>
+            {
+                lock (_inFlightLock)
+                    _operations.Remove(t);
+                SettleAccepted(accepted, t);
+            },
+            CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        return (accepted.Task, completion);
+    }
+
+    // Service shutdown refuses new work with an OperationCanceledException on the SERVICE lifetime token, which
+    // the host maps to 503 (the caller's own token is not cancelled).
+    private void ThrowIfStopping()
+    {
+        if (_lifetime.IsCancellationRequested)
+            throw new OperationCanceledException(ShutdownMessage, _lifetime.Token);
+    }
+
+    private const string ShutdownMessage =
+        "The index service is shutting down; retry the ensure against the restarted service.";
+
+    private static void SettleAccepted(
+        TaskCompletionSource<EnsureSnapshotResult> accepted, Task<EnsureSnapshotResult> completion)
+    {
+        if (completion.IsCompletedSuccessfully)
+            accepted.TrySetResult(completion.Result);
+        else if (completion.IsCanceled)
+            accepted.TrySetCanceled();
+        else
+            accepted.TrySetException(completion.Exception!.InnerExceptions);
+
+        // Observe both: the job's outcome is already durable (MarkResult/Requeue), and a disconnected caller
+        // must never turn it into an UnobservedTaskException.
+        _ = completion.Exception;
+        _ = accepted.Task.Exception;
+    }
+
+    // Awaits a service-owned task on behalf of ONE caller. Cancelling the caller's token ends only this wait
+    // (throwing OperationCanceledException) and never the task itself; once the task has completed its own
+    // outcome — result or original exception — is returned/rethrown unchanged.
+    private static async Task<T> WaitForCallerAsync<T>(Task<T> task, CancellationToken cancellationToken)
+    {
+        if (!task.IsCompleted)
+        {
+            await ((Task)task).WaitAsync(cancellationToken).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+            if (!task.IsCompleted)
+                cancellationToken.ThrowIfCancellationRequested();
+        }
+        return await task.ConfigureAwait(false);
+    }
+
+    private async Task<EnsureSnapshotResult> RunEnsureAsync(
+        EnsureSnapshotRequest request, string? principal, TaskCompletionSource<EnsureSnapshotResult> accepted)
     {
         using var activity = ServiceTelemetry.Source.StartActivity("ensure_snapshot");
         activity?.SetTag("sextant.repository", request.RepositoryRemoteUrl);
         activity?.SetTag("sextant.commit", request.CommitSha);
 
-        var result = await EnsureSnapshotCoreAsync(request, cancellationToken).ConfigureAwait(false);
+        var result = await EnsureSnapshotCoreAsync(request, principal, accepted).ConfigureAwait(false);
 
         _metrics.RecordEnsure(result.Attached);
         activity?.SetTag("sextant.status", result.Status);
         activity?.SetTag("sextant.attached", result.Attached);
-        RecordEnsureAudit(request, result, principal);
         return result;
     }
 
-    // The idempotent-ensure core (unchanged behavior). Wrapped by EnsureSnapshotAsync for observability.
+    // The idempotent-ensure core. Every durable step (and the request's audit row) runs under the single
+    // write gate; the only long step — the worker — is a shared, service-owned production per identity.
     private async Task<EnsureSnapshotResult> EnsureSnapshotCoreAsync(
-        EnsureSnapshotRequest request, CancellationToken cancellationToken = default)
+        EnsureSnapshotRequest request, string? principal, TaskCompletionSource<EnsureSnapshotResult> accepted)
     {
         // Issue #113: the non-default SDK-pin policy is part of the identity, so flipping
         // SEXTANT_SERVICE_SDK_PIN_OVERRIDE never reuses a snapshot (or failed job) built under the other policy.
         var identity = request.ToIdentity(
             _options.DefaultConfigHash, _options.DefaultCapabilityFingerprint, _options.SdkPinIdentityComponent);
         var hash = identity.Hash;
+        var lifetime = _lifetime.Token;
+        var rejoined = false;
 
-        // Idempotent attach: create-or-return the ONE durable job for this identity (criterion 1), and in
-        // the SAME write check whether a terminal result is still backed by durable data (a complete job
-        // whose snapshot retention has since reclaimed must NOT be reported complete forever). A usable
-        // terminal result is attached — branch pointer advanced — in that SAME gate hold: releasing the gate
-        // between the check and the advance would let a concurrent ensure supersede the snapshot in between,
-        // leaving the branch head on a Superseded snapshot (issue #85).
-        var (job, existed, terminalAttached, attachedCoverage) = await WithWriteAsync(() =>
+        while (true)
         {
-            var jobs = new SnapshotJobStore(_conn);
-            var (row, wasExisting) = jobs.EnsureJob(hash, request.RepositoryRemoteUrl, request.CommitSha, request.BranchName);
-            if (!SnapshotJobStatus.IsTerminal(row.Status) || !TerminalResultUsable(row, hash, new SnapshotStore(_conn)))
-                return Task.FromResult((row, wasExisting, false, (SnapshotCoverage?)null));
-            AdvanceOrAttachBranchPointer(request, row.SnapshotId);
-            return Task.FromResult((row, wasExisting, true, CoverageFor(row.SnapshotId)));
-        }).ConfigureAwait(false);
+            // Shutdown began: never attach to (or report as running) a production that is being cancelled.
+            ThrowIfStopping();
 
-        if (terminalAttached)
-            return Attach(job, existed, attachedCoverage);
+            Task<EnsureSnapshotResult> production;
+            bool existed;
+            var owner = false;
 
-        // Serialize production so only ONE worker runs per identity; concurrent callers attach.
-        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            if (FindInFlight(hash) is { } inFlight)
+            {
+                // The identity is already producing (it holds the write gate for the whole worker run):
+                // attach to that production WITHOUT waiting on the gate, so a re-ensure — e.g. the retry of a
+                // caller that timed out — returns its job id immediately and never starts a second worker.
+                existed = true;
+                accepted.TrySetResult(PendingResult(inFlight.JobId, hash));
+                production = inFlight.Production;
+            }
+            else
+            {
+                // Idempotent attach: create-or-return the ONE durable job for this identity (criterion 1), and
+                // in the SAME write check whether a terminal result is still backed by durable data (a complete
+                // job whose snapshot retention has since reclaimed must NOT be reported complete forever). A
+                // usable terminal result is attached — branch pointer advanced — in that SAME gate hold:
+                // releasing the gate between the check and the advance would let a concurrent ensure supersede
+                // the snapshot in between, leaving the branch head on a Superseded snapshot (issue #85).
+                var (job, wasExisting, attached) = await WithWriteAsync(
+                    () => Task.FromResult(TryAttachTerminal(request, hash, principal)), lifetime).ConfigureAwait(false);
+                if (attached is not null)
+                    return attached;
+
+                existed = wasExisting;
+                accepted.TrySetResult(PendingResult(job, wasExisting));
+                (production, owner) = GetOrStartProduction(request, hash, job.Id, wasExisting, principal);
+            }
+
+            var result = await production.ConfigureAwait(false);
+            if (owner)
+                return result;
+
+            // Attached to a production another request started. A terminal outcome is re-attached once through
+            // the terminal path above so THIS request's own branch pointer is advanced/attached (the identity
+            // excludes the branch, so the producing request's branch may differ). A non-terminal (transient
+            // requeue) outcome is shared as-is rather than immediately re-running the worker.
+            if (rejoined || !SnapshotJobStatus.IsTerminal(result.Status))
+            {
+                var shared = result with { Attached = existed };
+                await WithWriteAsync(() =>
+                {
+                    RecordEnsureAuditLocked(request, shared, principal);
+                    return Task.FromResult(0);
+                }, lifetime).ConfigureAwait(false);
+                return shared;
+            }
+            rejoined = true;
+        }
+    }
+
+    // Terminal-attach step, run under the write gate: registers (or attaches to) the identity's durable job and,
+    // when its terminal result is still usable, advances/attaches this request's branch pointer and records the
+    // request's audit row in the SAME gate hold. Returns the attach result, or null when production is needed.
+    private (SnapshotJobRow Job, bool Existed, EnsureSnapshotResult? Attached) TryAttachTerminal(
+        EnsureSnapshotRequest request, string hash, string? principal)
+    {
+        var jobs = new SnapshotJobStore(_conn);
+        var (row, wasExisting) = jobs.EnsureJob(hash, request.RepositoryRemoteUrl, request.CommitSha, request.BranchName);
+        if (!SnapshotJobStatus.IsTerminal(row.Status) || !TerminalResultUsable(row, hash, new SnapshotStore(_conn)))
+            return (row, wasExisting, null);
+        AdvanceOrAttachBranchPointer(request, row.SnapshotId);
+        var attached = Attach(row, wasExisting, CoverageFor(row.SnapshotId));
+        RecordEnsureAuditLocked(request, attached, principal);
+        return (row, wasExisting, attached);
+    }
+
+    private InFlightProduction? FindInFlight(string hash)
+    {
+        lock (_inFlightLock)
+            return _inFlight.GetValueOrDefault(hash);
+    }
+
+    // Returns the identity's in-flight production, starting (and registering) one when none is running. The
+    // starter is the OWNER: the production runs with its request (branch, sequence) and principal.
+    private (Task<EnsureSnapshotResult> Production, bool Owner) GetOrStartProduction(
+        EnsureSnapshotRequest request, string hash, long jobId, bool existed, string? principal)
+    {
+        lock (_inFlightLock)
+        {
+            if (_inFlight.TryGetValue(hash, out var running))
+                return (running.Production, false);
+
+            // Registered under the lock BEFORE the production can deregister itself (it takes the same lock).
+            var entry = new InFlightProduction(jobId);
+            entry.Production = Task.Run(
+                () => RunProductionAsync(request, hash, jobId, existed, principal, entry), CancellationToken.None);
+            _inFlight[hash] = entry;
+            return (entry.Production, true);
+        }
+    }
+
+    // A non-terminal snapshot of a job whose production is pending or running (the wait=false response): queued
+    // while the production waits for the writer, running once the worker holds it. A stale terminal row about
+    // to be requeued is reported queued, never as its phantom terminal status.
+    private EnsureSnapshotResult PendingResult(SnapshotJobRow job, bool existed) => new()
+    {
+        JobId = job.Id,
+        IdentityHash = job.IdentityHash,
+        Status = job.Status == SnapshotJobStatus.Running ? SnapshotJobStatus.Running : SnapshotJobStatus.Queued,
+        Attached = existed
+    };
+
+    private EnsureSnapshotResult PendingResult(long jobId, string hash)
+    {
+        var job = ReadCatalog(conn => new SnapshotJobStore(conn).GetJob(jobId));
+        return job is not null
+            ? PendingResult(job, existed: true)
+            : new EnsureSnapshotResult { JobId = jobId, IdentityHash = hash, Status = SnapshotJobStatus.Queued, Attached = true };
+    }
+
+    // One identity's shared production: waits for the single writer on the SERVICE lifetime (never a caller's
+    // token), runs the worker, records the result and the owner's audit row, then deregisters itself BEFORE
+    // releasing the gate — so any request that can observe the new durable state (which needs the gate) never
+    // attaches to this already-finished production.
+    private async Task<EnsureSnapshotResult> RunProductionAsync(
+        EnsureSnapshotRequest request, string hash, long jobId, bool existed, string? principal, InFlightProduction entry)
+    {
+        var gateHeld = false;
         try
         {
+            await _writeGate.WaitAsync(_lifetime.Token).ConfigureAwait(false);
+            gateHeld = true;
             EnsureLeaseHeld();
-            var jobs = new SnapshotJobStore(_conn);
-            var snapshots = new SnapshotStore(_conn);
-
-            var current = jobs.GetJob(job.Id)!;
-            if (SnapshotJobStatus.IsTerminal(current.Status) && TerminalResultUsable(current, hash, snapshots))
-            {
-                AdvanceOrAttachBranchPointer(request, current.SnapshotId);
-                return Attach(current, existed, CoverageFor(current.SnapshotId));
-            }
-
-            // A complete snapshot may already be published for this identity (produced by an earlier run
-            // whose job row predates migration 016, or a race we lost). Attach to it without re-indexing —
-            // but take the job's verdict from the snapshot's DURABLE coverage record (issue #119): a
-            // published snapshot whose recorded coverage is partial must never be reported complete.
-            var published = snapshots.GetByIdentityHash(hash);
-            if (published is { Status: SnapshotStatus.Complete })
-            {
-                var publishedCoverage = CoverageFor(published.Id);
-                RecordPublishedVerdict(jobs, job.Id, published.Id, publishedCoverage);
-                AdvanceOrAttachBranchPointer(request, published.Id);
-                return Attach(jobs.GetJob(job.Id)!, existed, publishedCoverage);
-            }
-
-            // Branch reset / force-push A→B→A (issue #85): the identity's snapshot was published but a later
-            // advance superseded it. When the request carries a head sequence, re-select it WITHOUT running
-            // the worker — mirroring the orchestrator's SelectExistingSnapshot — provided it is still intact;
-            // a data-less/unservable one is demoted so the worker below genuinely rebuilds it. A NULL
-            // sequence (the local/legacy path) keeps today's worker path byte-for-byte (#84 criterion 2).
-            if (request.BranchHeadSequence is long && published is { Status: SnapshotStatus.Superseded })
-            {
-                var (reselected, reselectedCoverage) =
-                    ReselectOrDemoteSupersededSnapshot(request, job.Id, published.Id, jobs, snapshots);
-                if (reselected)
-                    return Attach(jobs.GetJob(job.Id)!, existed, reselectedCoverage);
-            }
-
-            // A STALE terminal result (a complete/partial job whose published snapshot was reclaimed by
-            // retention) must be reset to queued before MarkRunning, whose guard only advances a
-            // queued/running job — otherwise the job would be stuck reporting a phantom-complete.
-            if (SnapshotJobStatus.IsTerminal(current.Status))
-                jobs.Requeue(job.Id);
-
-            jobs.MarkRunning(job.Id, _lease.OwnerToken);
-
-            // Issue #125: on the LAST attempt the bound allows, tell the worker so a clone-mode checkout degrades
-            // a persistently-transient SUBMODULE failure to partial coverage instead of failing the whole job.
-            var workRequest = jobs.GetJob(job.Id)!.Attempts >= _options.MaxProvisioningAttempts
-                ? request with { IsFinalProvisioningAttempt = true }
-                : request;
-
-            var scratch = _paths.AllocateScratch($"job-{job.Id}");
-            SnapshotWorkResult result;
-            try
-            {
-                result = await _worker.ProduceAsync(workRequest, hash, scratch, cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                // Cancellation is not a durable failure: requeue so a later ensure re-attempts this
-                // identity rather than attaching to a permanent failed/cancelled terminal state.
-                jobs.Requeue(job.Id);
-                throw;
-            }
-            catch (TransientProvisioningException ex)
-            {
-                // A TRANSIENT provisioning/clone failure (network blip, fetch timeout, remote 5xx) carries no
-                // durable snapshot and is EXPECTED to recover. Do NOT record a cached terminal that would
-                // suppress every later ensure for this identity (the idempotency-poisoning hole). Instead
-                // requeue — bounded by the job-wide attempt counter (incremented by MarkRunning ABOVE) — so
-                // the next ensure re-attempts; only once the bound is exhausted does it settle to terminal
-                // Failed. Distinct from cancellation: we return a QUEUED result rather than rethrowing.
-                var attempts = jobs.GetJob(job.Id)!.Attempts;
-                if (attempts < _options.MaxProvisioningAttempts)
-                {
-                    jobs.ReplaceDiagnostics(
-                        job.Id, [ProvisioningDiagnostic(job.Id, ex.DiagnosticCode ?? "provisioning_transient", ex.Message)]);
-                    jobs.Requeue(job.Id);
-                    return Produced(jobs.GetJob(job.Id)!);
-                }
-                var exhausted = $"provisioning failed after {attempts} attempt(s): {ex.Message}";
-                jobs.MarkResult(job.Id, SnapshotJobStatus.Failed, null, exhausted);
-                SnapshotJobDiagnostic[] exhaustedDiagnostics = ex.DiagnosticCode is { } code
-                    ? [ProvisioningDiagnostic(job.Id, code, ex.Message),
-                       ProvisioningDiagnostic(job.Id, "provisioning_attempts_exhausted", exhausted)]
-                    : [ProvisioningDiagnostic(job.Id, "provisioning_attempts_exhausted", exhausted)];
-                jobs.ReplaceDiagnostics(job.Id, exhaustedDiagnostics);
-                return Produced(jobs.GetJob(job.Id)!);
-            }
-            catch (Exception ex)
-            {
-                jobs.MarkResult(job.Id, SnapshotJobStatus.Failed, null, ex.Message);
-                jobs.ReplaceDiagnostics(job.Id, [FailureDiagnostic(job.Id, ex.Message)]);
-                return Attach(jobs.GetJob(job.Id)!, existed);
-            }
-            finally
-            {
-                _paths.ReleaseScratch(scratch);
-            }
-
-            var validated = ValidateWorkerResult(result, hash, snapshots);
-
-            // Defense in depth (issue #119): the job verdict never contradicts the snapshot's durable
-            // coverage record — a worker that reports Complete over a snapshot recorded as partial is
-            // downgraded to Partial with the recorded reasons.
-            var producedCoverage = CoverageFor(validated.SnapshotId);
-            if (validated.Status == SnapshotJobStatus.Complete && producedCoverage is { IsPartial: true })
-                validated = validated with { Status = SnapshotJobStatus.Partial, Error = PartialCoverageReason(producedCoverage) };
-
-            jobs.ReplaceDiagnostics(job.Id, validated.Projects.Select(p => p.ToDiagnostic(job.Id)));
-            jobs.MarkResult(job.Id, validated.Status, validated.SnapshotId, validated.Error);
-            return Attach(jobs.GetJob(job.Id)!, existed, producedCoverage);
+            var result = await ProduceLockedAsync(request, hash, jobId, existed).ConfigureAwait(false);
+            RecordEnsureAuditLocked(request, result, principal);
+            return result;
         }
         finally
         {
-            _writeGate.Release();
+            lock (_inFlightLock)
+            {
+                if (_inFlight.TryGetValue(hash, out var current) && ReferenceEquals(current, entry))
+                    _inFlight.Remove(hash);
+            }
+            if (gateHeld)
+                _writeGate.Release();
         }
+    }
+
+    // The production critical section. The caller holds the write gate (and has checked the lease).
+    private async Task<EnsureSnapshotResult> ProduceLockedAsync(
+        EnsureSnapshotRequest request, string hash, long jobId, bool existed)
+    {
+        var jobs = new SnapshotJobStore(_conn);
+        var snapshots = new SnapshotStore(_conn);
+
+        var current = jobs.GetJob(jobId)!;
+        if (SnapshotJobStatus.IsTerminal(current.Status) && TerminalResultUsable(current, hash, snapshots))
+        {
+            AdvanceOrAttachBranchPointer(request, current.SnapshotId);
+            return Attach(current, existed, CoverageFor(current.SnapshotId));
+        }
+
+        // A complete snapshot may already be published for this identity (produced by an earlier run
+        // whose job row predates migration 016, or a race we lost). Attach to it without re-indexing —
+        // but take the job's verdict from the snapshot's DURABLE coverage record (issue #119): a
+        // published snapshot whose recorded coverage is partial must never be reported complete.
+        var published = snapshots.GetByIdentityHash(hash);
+        if (published is { Status: SnapshotStatus.Complete })
+        {
+            var publishedCoverage = CoverageFor(published.Id);
+            RecordPublishedVerdict(jobs, jobId, published.Id, publishedCoverage);
+            AdvanceOrAttachBranchPointer(request, published.Id);
+            return Attach(jobs.GetJob(jobId)!, existed, publishedCoverage);
+        }
+
+        // Branch reset / force-push A→B→A (issue #85): the identity's snapshot was published but a later
+        // advance superseded it. When the request carries a head sequence, re-select it WITHOUT running
+        // the worker — mirroring the orchestrator's SelectExistingSnapshot — provided it is still intact;
+        // a data-less/unservable one is demoted so the worker below genuinely rebuilds it. A NULL
+        // sequence (the local/legacy path) keeps today's worker path byte-for-byte (#84 criterion 2).
+        if (request.BranchHeadSequence is long && published is { Status: SnapshotStatus.Superseded })
+        {
+            var (reselected, reselectedCoverage) =
+                ReselectOrDemoteSupersededSnapshot(request, jobId, published.Id, jobs, snapshots);
+            if (reselected)
+                return Attach(jobs.GetJob(jobId)!, existed, reselectedCoverage);
+        }
+
+        // A STALE terminal result (a complete/partial job whose published snapshot was reclaimed by
+        // retention) must be reset to queued before MarkRunning, whose guard only advances a
+        // queued/running job — otherwise the job would be stuck reporting a phantom-complete.
+        if (SnapshotJobStatus.IsTerminal(current.Status))
+            jobs.Requeue(jobId);
+
+        jobs.MarkRunning(jobId, _lease.OwnerToken);
+
+        // Issue #125: on the LAST attempt the bound allows, tell the worker so a clone-mode checkout degrades
+        // a persistently-transient SUBMODULE failure to partial coverage instead of failing the whole job.
+        var workRequest = jobs.GetJob(jobId)!.Attempts >= _options.MaxProvisioningAttempts
+            ? request with { IsFinalProvisioningAttempt = true }
+            : request;
+
+        var scratch = _paths.AllocateScratch($"job-{jobId}");
+        SnapshotWorkResult result;
+        try
+        {
+            // Issue #148: the worker runs on the SERVICE lifetime, never a caller's token — a caller that
+            // disconnects or times out must not throw away a long index run. Only shutdown cancels it.
+            result = await _worker.ProduceAsync(workRequest, hash, scratch, _lifetime.Token).ConfigureAwait(false);
+        }
+        // Every catch below writes the job row, so each is skipped once the lease is lost (issue #38): the
+        // exception propagates and the job stays running for the NEW owner's startup reconcile to requeue.
+        catch (Exception ex) when (!LeaseLost && (ex is OperationCanceledException || _lifetime.IsCancellationRequested))
+        {
+            // Cancellation (service shutdown) is not a durable failure: requeue so a later ensure re-attempts
+            // this identity rather than attaching to a permanent failed/cancelled terminal state. Once shutdown
+            // began, ANY worker failure is treated the same way — cancellation often surfaces as another
+            // exception (a killed build process, a torn-down pipe) that must not be cached as terminal.
+            jobs.Requeue(jobId);
+            if (ex is OperationCanceledException)
+                throw;
+            throw new OperationCanceledException(ShutdownMessage, ex, _lifetime.Token);
+        }
+        catch (TransientProvisioningException ex) when (!LeaseLost)
+        {
+            // A TRANSIENT provisioning/clone failure (network blip, fetch timeout, remote 5xx) carries no
+            // durable snapshot and is EXPECTED to recover. Do NOT record a cached terminal that would
+            // suppress every later ensure for this identity (the idempotency-poisoning hole). Instead
+            // requeue — bounded by the job-wide attempt counter (incremented by MarkRunning ABOVE) — so
+            // the next ensure re-attempts; only once the bound is exhausted does it settle to terminal
+            // Failed. Distinct from cancellation: we return a QUEUED result rather than rethrowing.
+            var attempts = jobs.GetJob(jobId)!.Attempts;
+            if (attempts < _options.MaxProvisioningAttempts)
+            {
+                jobs.ReplaceDiagnostics(
+                    jobId, [ProvisioningDiagnostic(jobId, ex.DiagnosticCode ?? "provisioning_transient", ex.Message)]);
+                jobs.Requeue(jobId);
+                return Produced(jobs.GetJob(jobId)!);
+            }
+            var exhausted = $"provisioning failed after {attempts} attempt(s): {ex.Message}";
+            jobs.MarkResult(jobId, SnapshotJobStatus.Failed, null, exhausted);
+            SnapshotJobDiagnostic[] exhaustedDiagnostics = ex.DiagnosticCode is { } code
+                ? [ProvisioningDiagnostic(jobId, code, ex.Message),
+                   ProvisioningDiagnostic(jobId, "provisioning_attempts_exhausted", exhausted)]
+                : [ProvisioningDiagnostic(jobId, "provisioning_attempts_exhausted", exhausted)];
+            jobs.ReplaceDiagnostics(jobId, exhaustedDiagnostics);
+            return Produced(jobs.GetJob(jobId)!);
+        }
+        catch (Exception ex) when (!LeaseLost)
+        {
+            jobs.MarkResult(jobId, SnapshotJobStatus.Failed, null, ex.Message);
+            jobs.ReplaceDiagnostics(jobId, [FailureDiagnostic(jobId, ex.Message)]);
+            return Attach(jobs.GetJob(jobId)!, existed);
+        }
+        finally
+        {
+            _paths.ReleaseScratch(scratch);
+        }
+
+        // The worker may have run for a long time: re-check the lease before recording its result.
+        EnsureLeaseHeld();
+
+        // A worker that returned after shutdown cancelled it (it ignored or swallowed the cancellation) may
+        // report a failure that is only an artifact of the shutdown: requeue rather than cache it. Nothing is
+        // lost — a snapshot it did publish is attached, with its durable coverage verdict, by the next ensure.
+        if (_lifetime.IsCancellationRequested)
+        {
+            jobs.Requeue(jobId);
+            throw new OperationCanceledException(ShutdownMessage, _lifetime.Token);
+        }
+
+        var validated = ValidateWorkerResult(result, hash, snapshots);
+
+        // Defense in depth (issue #119): the job verdict never contradicts the snapshot's durable
+        // coverage record — a worker that reports Complete over a snapshot recorded as partial is
+        // downgraded to Partial with the recorded reasons.
+        var producedCoverage = CoverageFor(validated.SnapshotId);
+        if (validated.Status == SnapshotJobStatus.Complete && producedCoverage is { IsPartial: true })
+            validated = validated with { Status = SnapshotJobStatus.Partial, Error = PartialCoverageReason(producedCoverage) };
+
+        jobs.ReplaceDiagnostics(jobId, validated.Projects.Select(p => p.ToDiagnostic(jobId)));
+        jobs.MarkResult(jobId, validated.Status, validated.SnapshotId, validated.Error);
+        return Attach(jobs.GetJob(jobId)!, existed, producedCoverage);
     }
 
     /// <summary>
@@ -443,8 +731,8 @@ public sealed class SnapshotService : IDisposable
             payloadConn = OpenReadOnly(payloadPath);
 
             return await WithWriteAsync(() =>
-                Task.FromResult(IngestUnderWriteLock(artifact, manifest, assemblyIdentity, identityHash, contentHash, payloadConn, request)))
-                .ConfigureAwait(false);
+                Task.FromResult(IngestUnderWriteLock(artifact, manifest, assemblyIdentity, identityHash, contentHash, payloadConn, request)),
+                cancellationToken).ConfigureAwait(false);
         }
         catch (SqliteException ex)
         {
@@ -888,32 +1176,38 @@ public sealed class SnapshotService : IDisposable
         return conn;
     }
 
-    /// <summary>The full status of a job (with diagnostics) by durable job id — null when unknown.</summary>
+    /// <summary>
+    /// The full status of a job (with diagnostics) by durable job id — null when unknown. Served from an
+    /// independent read connection (issue #148), so it returns promptly while a worker holds the writer.
+    /// </summary>
     public JobStatusResult? GetStatus(long jobId)
     {
-        return WithWrite(() =>
+        return ReadCatalog(conn =>
         {
-            var jobs = new SnapshotJobStore(_conn);
+            var jobs = new SnapshotJobStore(conn);
             var job = jobs.GetJob(jobId);
-            return job is null ? null : StatusOf(jobs, job);
+            return job is null ? null : StatusOf(conn, jobs, job);
         });
     }
 
-    /// <summary>The full status of a job (with diagnostics) by snapshot identity hash — null when unknown.</summary>
+    /// <summary>
+    /// The full status of a job (with diagnostics) by snapshot identity hash — null when unknown. Served from
+    /// an independent read connection (issue #148).
+    /// </summary>
     public JobStatusResult? GetStatusByIdentity(string identityHash)
     {
-        return WithWrite(() =>
+        return ReadCatalog(conn =>
         {
-            var jobs = new SnapshotJobStore(_conn);
+            var jobs = new SnapshotJobStore(conn);
             var job = jobs.GetJobByIdentity(identityHash);
-            return job is null ? null : StatusOf(jobs, job);
+            return job is null ? null : StatusOf(conn, jobs, job);
         });
     }
 
-    // Caller holds the write gate. Like Attach, the reported verdict never contradicts the durable coverage.
-    private JobStatusResult StatusOf(SnapshotJobStore jobs, SnapshotJobRow job)
+    // Like Attach, the reported verdict never contradicts the durable coverage.
+    private static JobStatusResult StatusOf(SqliteConnection conn, SnapshotJobStore jobs, SnapshotJobRow job)
     {
-        var coverage = CoverageFor(job.SnapshotId);
+        var coverage = CoverageOn(conn, job.SnapshotId);
         if (job.Status == SnapshotJobStatus.Complete && coverage is { IsPartial: true })
             job = job with { Status = SnapshotJobStatus.Partial, LastError = PartialCoverageReason(coverage) };
         return new JobStatusResult { Job = job, Diagnostics = jobs.GetDiagnostics(job.Id), Coverage = coverage };
@@ -921,19 +1215,21 @@ public sealed class SnapshotService : IDisposable
 
     /// <summary>
     /// The durable checkout coverage recorded for a snapshot (issue #119), or null when none was recorded.
+    /// Served from an independent read connection (issue #148).
     /// </summary>
-    public SnapshotCoverage? GetCoverage(long snapshotId) => WithWrite(() => CoverageFor(snapshotId));
+    public SnapshotCoverage? GetCoverage(long snapshotId) => ReadCatalog(conn => CoverageOn(conn, snapshotId));
 
     /// <summary>
     /// Resolves a repository branch (or its default branch when <paramref name="branchName"/> is null) to
     /// the complete snapshot it currently points at — null when the repo/branch/pointer is absent or the
-    /// pointed snapshot is not complete. Read-only; never creates catalog rows.
+    /// pointed snapshot is not complete. Read-only; never creates catalog rows. Served from an independent
+    /// read connection (issue #148), so branch resolution never waits behind a running index.
     /// </summary>
     public SnapshotRow? ResolveBranch(string repositoryRemoteUrl, string? branchName)
     {
-        return WithWrite(() =>
+        return ReadCatalog(conn =>
         {
-            var snapshots = new SnapshotStore(_conn);
+            var snapshots = new SnapshotStore(conn);
             if (snapshots.GetRepositoryId(repositoryRemoteUrl) is not long repoId)
                 return null;
 
@@ -958,18 +1254,34 @@ public sealed class SnapshotService : IDisposable
     {
         using var activity = ServiceTelemetry.Source.StartActivity("retention");
         activity?.SetTag("sextant.execute", execute);
-        return WithWrite(() =>
-        {
-            var retention = new RetentionService(_conn, _options.Retention);
-            var report = execute ? retention.Execute() : retention.Plan();
-            // Service-wide audit row (no single repository scope). Records the operator + whether it was a
-            // dry-run plan or an executed GC pass (criterion 5, audit).
-            new AuditLogStore(_conn).Append(
-                AuditAction.Retention, AuditOutcome.Complete,
-                actor: AuditLogStore.HashActor(principal),
-                detail: execute ? "execute" : "plan");
-            return report;
-        });
+        return WithWrite(() => RunRetentionLocked(execute, principal));
+    }
+
+    /// <summary>
+    /// <see cref="RunRetention"/> for request threads (issue #148): waits for the writer asynchronously —
+    /// never blocking a thread-pool thread behind a running index — and gives up when
+    /// <paramref name="cancellationToken"/> fires before the writer is acquired.
+    /// </summary>
+    public async Task<RetentionReport> RunRetentionAsync(
+        bool execute, string? principal = null, CancellationToken cancellationToken = default)
+    {
+        using var activity = ServiceTelemetry.Source.StartActivity("retention");
+        activity?.SetTag("sextant.execute", execute);
+        return await WithWriteAsync(
+            () => Task.FromResult(RunRetentionLocked(execute, principal)), cancellationToken).ConfigureAwait(false);
+    }
+
+    private RetentionReport RunRetentionLocked(bool execute, string? principal)
+    {
+        var retention = new RetentionService(_conn, _options.Retention);
+        var report = execute ? retention.Execute() : retention.Plan();
+        // Service-wide audit row (no single repository scope). Records the operator + whether it was a
+        // dry-run plan or an executed GC pass (criterion 5, audit).
+        new AuditLogStore(_conn).Append(
+            AuditAction.Retention, AuditOutcome.Complete,
+            actor: AuditLogStore.HashActor(principal),
+            detail: execute ? "execute" : "plan");
+        return report;
     }
 
     /// <summary>
@@ -1014,17 +1326,31 @@ public sealed class SnapshotService : IDisposable
     public BackupManifest CreateBackup(string destinationDir, string? principal = null)
     {
         using var activity = ServiceTelemetry.Source.StartActivity("backup");
-        return WithWrite(() =>
-        {
-            var manifest = ServiceBackup.Create(
-                _conn, IndexDatabase.LatestSchemaVersion, _paths, destinationDir,
-                configFingerprint: _options.DefaultConfigHash ?? "none");
-            new AuditLogStore(_conn).Append(
-                AuditAction.Backup, AuditOutcome.Complete,
-                actor: AuditLogStore.HashActor(principal),
-                detail: $"schema_{manifest.SchemaVersion}");
-            return manifest;
-        });
+        return WithWrite(() => CreateBackupLocked(destinationDir, principal));
+    }
+
+    /// <summary>
+    /// <see cref="CreateBackup"/> for request threads (issue #148): waits for the writer asynchronously and
+    /// gives up when <paramref name="cancellationToken"/> fires before the writer is acquired.
+    /// </summary>
+    public async Task<BackupManifest> CreateBackupAsync(
+        string destinationDir, string? principal = null, CancellationToken cancellationToken = default)
+    {
+        using var activity = ServiceTelemetry.Source.StartActivity("backup");
+        return await WithWriteAsync(
+            () => Task.FromResult(CreateBackupLocked(destinationDir, principal)), cancellationToken).ConfigureAwait(false);
+    }
+
+    private BackupManifest CreateBackupLocked(string destinationDir, string? principal)
+    {
+        var manifest = ServiceBackup.Create(
+            _conn, IndexDatabase.LatestSchemaVersion, _paths, destinationDir,
+            configFingerprint: _options.DefaultConfigHash ?? "none");
+        new AuditLogStore(_conn).Append(
+            AuditAction.Backup, AuditOutcome.Complete,
+            actor: AuditLogStore.HashActor(principal),
+            detail: $"schema_{manifest.SchemaVersion}");
+        return manifest;
     }
 
     /// <summary>
@@ -1151,8 +1477,10 @@ public sealed class SnapshotService : IDisposable
 
     // The durable coverage record for a snapshot (issue #119), or null when none was recorded. Reads the
     // writer connection, so the caller MUST hold the write gate.
-    private SnapshotCoverage? CoverageFor(long? snapshotId) =>
-        snapshotId is long id ? new SnapshotCoverageStore(_conn).Get(id) : null;
+    private SnapshotCoverage? CoverageFor(long? snapshotId) => CoverageOn(_conn, snapshotId);
+
+    private static SnapshotCoverage? CoverageOn(SqliteConnection conn, long? snapshotId) =>
+        snapshotId is long id ? new SnapshotCoverageStore(conn).Get(id) : null;
 
     private static string PartialCoverageReason(SnapshotCoverage coverage) =>
         "snapshot coverage is partial: " + string.Join(" ", coverage.Reasons);
@@ -1242,25 +1570,23 @@ public sealed class SnapshotService : IDisposable
 
     // Records the durable audit row for an ensure request (criterion 5): outcome + repository scope +
     // worker cost (index milliseconds), attributed to the requesting principal's non-reversible hash. Cost
-    // is recorded only for a job that actually RAN (an attach reuses prior work and has no new cost).
-    private void RecordEnsureAudit(EnsureSnapshotRequest request, EnsureSnapshotResult result, string? principal)
+    // is recorded only for a job that actually RAN (an attach reuses prior work and has no new cost). The
+    // caller holds the write gate — the row is written in the same hold that settled the result, so it is
+    // durable before any caller observes the result, even one that already disconnected (issue #148).
+    private void RecordEnsureAuditLocked(EnsureSnapshotRequest request, EnsureSnapshotResult result, string? principal)
     {
-        WithWrite(() =>
-        {
-            var jobs = new SnapshotJobStore(_conn);
-            var job = jobs.GetJob(result.JobId);
-            long? costMs = !result.Attached && job is { StartedAt: long s, CompletedAt: long c } && c >= s
-                ? c - s
-                : null;
-            new AuditLogStore(_conn).Append(
-                AuditAction.Ensure,
-                MapOutcome(result.Status),
-                actor: AuditLogStore.HashActor(principal),
-                repositoryScope: request.RepositoryRemoteUrl,
-                detail: $"job_{result.JobId}{SdkPinAuditSuffix(jobs.GetDiagnostics(result.JobId))}",
-                costIndexMs: costMs);
-            return 0;
-        });
+        var jobs = new SnapshotJobStore(_conn);
+        var job = jobs.GetJob(result.JobId);
+        long? costMs = !result.Attached && job is { StartedAt: long s, CompletedAt: long c } && c >= s
+            ? c - s
+            : null;
+        new AuditLogStore(_conn).Append(
+            AuditAction.Ensure,
+            MapOutcome(result.Status),
+            actor: AuditLogStore.HashActor(principal),
+            repositoryScope: request.RepositoryRemoteUrl,
+            detail: $"job_{result.JobId}{SdkPinAuditSuffix(jobs.GetDiagnostics(result.JobId))}",
+            costIndexMs: costMs);
     }
 
     // Issue #113: the audit row flags a job whose snapshot was built with a substituted SDK (or that failed
@@ -1290,9 +1616,9 @@ public sealed class SnapshotService : IDisposable
         _ => AuditOutcome.Accepted
     };
 
-    // An independent, short-lived READ connection to the catalog for metrics/audit reads, so operator
-    // observability never contends with the writer (WAL supports concurrent readers). Read-only mode so a
-    // metrics read can never mutate the catalog.
+    // An independent, short-lived READ connection to the catalog for metrics/audit/control-plane reads, so
+    // operator observability and job-status polling never contend with the writer (WAL supports concurrent
+    // readers). Read-only mode so a read can never mutate the catalog.
     private SqliteConnection OpenReadConnection()
     {
         var connectionString = new SqliteConnectionStringBuilder
@@ -1309,9 +1635,37 @@ public sealed class SnapshotService : IDisposable
         return conn;
     }
 
+    // Runs a control-plane read on an independent read connection inside ONE read transaction (issue #148):
+    // a consistent WAL snapshot of the last COMMITTED catalog state, never waiting on the write gate — so
+    // status/coverage/resolve stay prompt while a worker holds the writer for a long index. Every durable
+    // ensure step commits before its result is returned, so a read after an ensure returns sees that result
+    // (read-your-writes).
+    private T ReadCatalog<T>(Func<SqliteConnection, T> read)
+    {
+        using var conn = OpenReadConnection();
+        ExecOn(conn, "BEGIN;");
+        try
+        {
+            return read(conn);
+        }
+        finally
+        {
+            ExecOn(conn, "COMMIT;");
+        }
+    }
+
+    private static void ExecOn(SqliteConnection conn, string sql)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = sql;
+        cmd.ExecuteNonQuery();
+    }
+
     private T WithWrite<T>(Func<T> work)
     {
-        _writeGate.Wait();
+        // Synchronous callers only (startup reconcile, the sync retention/backup/PR-root APIs): request threads
+        // use WithWriteAsync with their own token (issue #148), so this explicitly opts out of cancellation.
+        _writeGate.Wait(CancellationToken.None);
         try
         {
             EnsureLeaseHeld();
@@ -1323,9 +1677,9 @@ public sealed class SnapshotService : IDisposable
         }
     }
 
-    private async Task<T> WithWriteAsync<T>(Func<Task<T>> work)
+    private async Task<T> WithWriteAsync<T>(Func<Task<T>> work, CancellationToken cancellationToken = default)
     {
-        await _writeGate.WaitAsync().ConfigureAwait(false);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             EnsureLeaseHeld();
@@ -1337,24 +1691,80 @@ public sealed class SnapshotService : IDisposable
         }
     }
 
+    // True once this instance may no longer write: the lease was stolen (issue #38) or released by Dispose.
+    internal bool LeaseLost => _lease.IsLost || _leaseReleased;
+
     // Fail closed if this instance lost the single-writer lease (it expired and another writer stole it):
     // writing anyway would race the new owner on one SQLite database (issue #38).
     private void EnsureLeaseHeld()
     {
-        if (_lease.IsLost)
+        if (LeaseLost)
             throw new InvalidOperationException(
                 "This service lost the single-writer lease (it expired and was stolen by another writer); " +
                 "refusing to write to avoid racing the new owner (issue #38).");
     }
 
+    /// <summary>
+    /// Shuts the data plane down (issue #148 ordering): close admission, stop production (cancel the service
+    /// lifetime, so each in-flight worker is cancelled and its job requeued), drain the in-flight ensure
+    /// operations — bounded by <see cref="ServiceOptions.ShutdownDrainTimeout"/> — so their requeue/result
+    /// writes land while the lease is still held, THEN release the lease and close the catalog. A worker that
+    /// ignores cancellation past the bound may still be writing, so the lease is then ABANDONED rather than
+    /// released (see <see cref="ProductionDrained"/>).
+    /// </summary>
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
+        lock (_inFlightLock)
+        {
+            if (_disposed) return;
+            _disposed = true;
+        }
+        StopProduction();
+        if (!DrainOperations(_options.ShutdownDrainTimeout))
+        {
+            // A straggler outlived the drain and may still commit through the shared writer connection.
+            // Releasing the lease row now would let another writer start while it can: abandon it instead —
+            // every write probe fails closed (its write session aborts at the next batch boundary) and the row
+            // expires by its TTL, as for a crashed holder, after which the next owner's startup reconcile
+            // requeues the still-running job. The catalog, write gate and lifetime stay open for the straggler
+            // (process exit reclaims them); the host reports the timeout via ProductionDrained.
+            ProductionDrained = false;
+            _lease.Abandon();
+            _lease.Dispose();
+            return;
+        }
+        _leaseReleased = true;
         _lease.Dispose();
         if (_ownsDatabase)
             _db.Dispose();
         _writeGate.Dispose();
+        _lifetime.Dispose();
+    }
+
+    private bool DrainOperations(TimeSpan timeout)
+    {
+        Task[] pending;
+        lock (_inFlightLock)
+            pending = [.. _operations];
+        if (pending.Length == 0)
+            return true;
+        try
+        {
+            return Task.WhenAll(pending).Wait(timeout, CancellationToken.None);
+        }
+        catch (AggregateException)
+        {
+            // Faulted/cancelled operations have finished — their outcome is already durable.
+            return true;
+        }
+    }
+
+    // One identity's in-flight production (issue #148). Production is assigned under _inFlightLock before the
+    // entry is published to the registry, so readers (who take the same lock) always see it set.
+    private sealed class InFlightProduction(long jobId)
+    {
+        public long JobId { get; } = jobId;
+        public Task<EnsureSnapshotResult> Production { get; set; } = null!;
     }
 }
 

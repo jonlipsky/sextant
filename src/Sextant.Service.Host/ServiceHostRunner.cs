@@ -107,6 +107,11 @@ public static class ServiceHostRunner
             var app = builder.Build();
             ServiceApp.MapEndpoints(app, options);
 
+            // Issue #148: production runs on the service's own lifetime, not a request's. Stop it as soon as
+            // the host begins shutting down so in-flight workers are cancelled + requeued (and waiting ensure
+            // requests answer 503) instead of holding graceful shutdown open for a whole index run.
+            app.Lifetime.ApplicationStopping.Register(service.StopProduction);
+
             Console.WriteLine($"Sextant index service listening on {string.Join(", ", urls)}");
             Console.WriteLine($"  Catalog:   {Path.GetFullPath(options.CatalogDbPath)}");
             Console.WriteLine($"  Checkouts: {options.Volumes.CheckoutRoot}");
@@ -120,7 +125,14 @@ public static class ServiceHostRunner
         finally
         {
             service.Dispose();
-            database.Dispose();
+            // A production that ignored cancellation past the drain bound may still be using the shared
+            // catalog: leave it open for process exit rather than dispose it under the straggler (issue #148).
+            if (service.ProductionDrained)
+                database.Dispose();
+            else
+                await Console.Error.WriteLineAsync(
+                    $"An in-flight snapshot production did not stop within {options.ShutdownDrainTimeout}; the " +
+                    "writer lease was abandoned (it expires by its TTL) instead of released.");
         }
     }
 
