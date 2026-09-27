@@ -204,7 +204,10 @@ public sealed class SnapshotService : IDisposable
     private async Task<EnsureSnapshotResult> EnsureSnapshotCoreAsync(
         EnsureSnapshotRequest request, CancellationToken cancellationToken = default)
     {
-        var identity = request.ToIdentity(_options.DefaultConfigHash, _options.DefaultCapabilityFingerprint);
+        // Issue #113: the non-default SDK-pin policy is part of the identity, so flipping
+        // SEXTANT_SERVICE_SDK_PIN_OVERRIDE never reuses a snapshot (or failed job) built under the other policy.
+        var identity = request.ToIdentity(
+            _options.DefaultConfigHash, _options.DefaultCapabilityFingerprint, _options.SdkPinIdentityComponent);
         var hash = identity.Hash;
 
         // Idempotent attach: create-or-return the ONE durable job for this identity (criterion 1), and in

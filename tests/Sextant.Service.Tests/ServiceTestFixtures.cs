@@ -52,18 +52,20 @@ internal static class ServiceTestFixtures
     /// <c>snapshot_projects</c> + <paramref name="symbolCount"/> symbols) for the request's identity, using
     /// the caller's writer connection. Mirrors what a real worker's orchestrator run leaves behind, so the
     /// snapshot is queryable through <see cref="LocalBaseSnapshotSource"/> and the HTTP query plane.
-    /// <paramref name="recordCommit"/> links the snapshot to its <c>commits</c> row as the orchestrator does
-    /// (a same-commit comparison needs it); <paramref name="isProvider"/> publishes it as a Phase-12 provider
-    /// snapshot of a provider-only repository instead.
+    /// <paramref name="sdkPinPolicy"/> publishes under a non-default SDK-pin identity component (issue #113),
+    /// as a real worker on an override-disabled node does. <paramref name="recordCommit"/> links the snapshot
+    /// to its <c>commits</c> row as the orchestrator does (a same-commit comparison needs it);
+    /// <paramref name="isProvider"/> publishes it as a Phase-12 provider snapshot of a provider-only
+    /// repository instead.
     /// </summary>
     public static long PublishComplete(
-        IndexDatabase db, EnsureSnapshotRequest request, int symbolCount = 3, bool recordCommit = false,
-        bool isProvider = false)
+        IndexDatabase db, EnsureSnapshotRequest request, int symbolCount = 3, string? sdkPinPolicy = null,
+        bool recordCommit = false, bool isProvider = false)
     {
         var conn = db.GetConnection();
         var snapshots = new SnapshotStore(conn);
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        var identity = request.ToIdentity();
+        var identity = request.ToIdentity(sdkPinPolicy: sdkPinPolicy);
 
         var existing = snapshots.GetByIdentityHash(identity.Hash);
         if (existing is { Status: SnapshotStatus.Complete }) return existing.Id;
