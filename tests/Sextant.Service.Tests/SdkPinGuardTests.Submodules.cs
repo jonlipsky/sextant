@@ -311,7 +311,6 @@ public sealed partial class SdkPinGuardTests
     [DataRow("v1-with-submodule")]
     [DataRow("work-tree-outside")]
     [DataRow("work-tree-not-containing")]
-    [DataRow("work-tree-in-git-metadata")]
     [DataRow("work-tree-relative")]
     [DataRow("head-missing")]
     [DataRow("head-malformed")]
@@ -333,7 +332,6 @@ public sealed partial class SdkPinGuardTests
             case "v1-with-submodule": journal["version"] = SdkPinJournal.CurrentVersion; break;
             case "work-tree-outside": entry["work_tree"] = _root; break;
             case "work-tree-not-containing": entry["work_tree"] = Path.Combine(_checkout, "src"); break;
-            case "work-tree-in-git-metadata": entry["work_tree"] = Path.Combine(_checkout, ".git", "modules", "libs", "sub"); break;
             case "work-tree-relative": entry["work_tree"] = "libs/sub"; break;
             case "head-missing": entry.Remove("work_tree_head"); break;
             case "head-malformed": entry["work_tree_head"] = "HEAD"; break;
@@ -350,6 +348,32 @@ public sealed partial class SdkPinGuardTests
         Assert.IsFalse(guard.Recover(_checkout), $"{mutation}: an invalid journal must keep blocking the checkout");
         Assert.IsTrue(File.Exists(journalPath), $"{mutation}: kept for an operator to inspect");
         CollectionAssert.AreEqual(neutralized, File.ReadAllBytes(SubmoduleGlobalJson), $"{mutation}: nothing was written");
+    }
+
+    [TestMethod]
+    public void ARootJournalEntryRedirectedIntoGitMetadata_IsKept_AndNeverReplayed()
+    {
+        // A root-owned (version 1) entry records no work tree, so the entry's own path is its only guard against a
+        // tampered journal directing a restore into .git.
+        WritePin(GlobalJson);
+        var logs = new List<string>();
+        var guard = NewGuard(probe: new FakeHostFxr(), log: logs.Add);
+        _ = guard.Apply(_checkout, [_solution]); // "crash"
+        var journalPath = guard.JournalPathFor(_checkout);
+        var journal = JsonNode.Parse(File.ReadAllText(journalPath))!.AsObject();
+        Assert.AreEqual(SdkPinJournal.CurrentVersion, (int)journal["version"]!);
+        var entry = journal["entries"]!.AsArray().Single()!.AsObject();
+        Assert.IsFalse(entry.ContainsKey("work_tree"));
+        var target = Path.Combine(_checkout, ".git", "modules", "libs", "sub", "global.json");
+        entry["path"] = target;
+        entry["temp_path"] = Path.Combine(Path.GetDirectoryName(target)!, Path.GetFileName((string)entry["temp_path"]!));
+        File.WriteAllText(journalPath, journal.ToJsonString());
+
+        Assert.IsFalse(guard.Recover(_checkout), "an invalid journal must keep blocking the checkout");
+        Assert.IsTrue(File.Exists(journalPath), "kept for an operator to inspect");
+        Assert.IsFalse(File.Exists(target), "nothing is written under .git");
+        Assert.IsTrue(logs.Any(l => l.Contains("an entry lies inside git metadata", StringComparison.Ordinal)),
+            string.Join(Environment.NewLine, logs));
     }
 
     [TestMethod]
