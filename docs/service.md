@@ -303,7 +303,9 @@ cost a full copy per job and break checkout-relative paths. So the service handl
    - git cannot confirm the `global.json` is exactly its **committed** content. `HEAD` must resolve to that
      commit, and the file must be tracked, carry no assume-unchanged/skip-worktree flag, and have no staged
      or unstaged change. The exact bytes to be journaled must also equal, byte for byte, the commit's blob
-     as stored or git's checkout rendering of it (eol/smudge conversion). This matters because `git status`
+     as stored or git's checkout rendering of it (eol/`ident`/`working-tree-encoding` conversion). A path
+     that goes through a `filter` driver (e.g. LFS) must match the stored blob, because a driver's smudge
+     output is the program's, not the blob's. This matters because `git status`
      can call an edit clean from cached stat data alone, and clean conversions such as `ident` are
      many-to-one, so hashing the bytes would not be proof. The rule covers an untracked or locally edited
      `global.json` in a `locate`-mode checkout. The journal therefore only ever holds the commit's content, and a
@@ -730,9 +732,9 @@ auth). Coverage integrity (#119): `SnapshotCoverageBuilderTests`, `CheckoutInven
 (#113): `HostFxrSdkResolutionErrorTests` (classifying the hostfxr SDK-not-found error), `SdkPinGuardTests`
 (detect/neutralize/restore/journal recovery/refusals over a fake hostfxr probe),
 `GitCheckoutContentVerifierTests` (the committed-content check over real git: edits, including ones
-`git status` cannot see from stat data or through an `ident` clean filter; staged changes; untracked/ignored
-files; index flags; CRLF and stored-form checkouts; a replace ref; a moved or unborn `HEAD`; no discovery
-above the checkout; and no index writes), `SdkPinSurfaceTests`
+`git status` cannot see from stat data, through an `ident` clean filter, or through a `filter` driver;
+staged changes; untracked/ignored files; index flags; CRLF and stored-form checkouts; a replace ref; a moved
+or unborn `HEAD`; a timeout; no discovery above the checkout; and no index writes), `SdkPinSurfaceTests`
 (diagnostics, coverage provenance, audit suffix, status), and the real-MSBuild
 `SdkPinOverrideIntegrationTests`. The integration tests cover a `10.0.999` + `disable` pin that is
 overridden (with and without the sandboxed worker; the checkout bytes, mtime, `git status` and
