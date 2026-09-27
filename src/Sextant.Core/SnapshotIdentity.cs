@@ -17,6 +17,8 @@ namespace Sextant.Core;
 ///   (<see cref="IndexProfileDescriptor.ConfigurationHash"/>).</item>
 ///   <item><see cref="ToolchainFingerprint"/> — the runtime that produced it
 ///   (<see cref="Core.ToolchainFingerprint.Current"/>).</item>
+///   <item>Optional components folded only when set: the working-tree delta + overlay discriminator,
+///   the <see cref="CapabilityFingerprint"/>, and the non-default <see cref="SdkPinPolicy"/>.</item>
 /// </list>
 /// Two runs with the same tuple produce the same <see cref="Hash"/>, so a duplicate publish attaches
 /// to the existing snapshot instead of creating a second one (acceptance criterion 3). A difference in
@@ -70,6 +72,18 @@ public sealed record SnapshotIdentity
     public string? CapabilityFingerprint { get; init; }
 
     /// <summary>
+    /// The service worker's <c>global.json</c> SDK-pin handling policy (issue #113) when it is NOT the default,
+    /// or <c>null</c>. Whether an unsatisfiable pin is overridden decides WHAT the worker publishes for the same
+    /// commit (a complete snapshot built with the installed SDK, versus a partial one or a failed job). Reuse of
+    /// a published snapshot never rebuilds it, so without this component a snapshot built under one policy
+    /// would be silently reused after the operator flipped the policy. It is folded into <see cref="Hash"/>
+    /// ONLY when non-null. The service sets it only for the non-default policy (override disabled). Every other
+    /// identity keeps a pre-image byte-identical to before this field existed: the default override-on service,
+    /// the local CLI/daemon path (which never overrides a pin), contributions, and remote-base addressing.
+    /// </summary>
+    public string? SdkPinPolicy { get; init; }
+
+    /// <summary>
     /// The stable idempotency/compatibility hash over the identity tuple. Deterministic across
     /// machines and runs: a fixed, ordered <c>key=value;</c> pre-image hashed with SHA-256 (hex).
     /// </summary>
@@ -89,6 +103,10 @@ public sealed record SnapshotIdentity
             // null, keeping their identity byte-identical to before this field existed (CRITICAL 2).
             if (CapabilityFingerprint != null)
                 canonical += $";capability={CapabilityFingerprint}";
+            // Fold the SDK-pin policy ONLY when set (issue #113): the default policy and every local run leave
+            // it null, keeping their identity byte-identical to before this field existed.
+            if (SdkPinPolicy != null)
+                canonical += $";sdkpin={SdkPinPolicy}";
             var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(canonical));
             return Convert.ToHexStringLower(bytes);
         }

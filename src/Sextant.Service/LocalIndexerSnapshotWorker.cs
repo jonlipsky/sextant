@@ -222,7 +222,7 @@ public sealed class LocalIndexerSnapshotWorker(
                 BuildConfigErrorDiagnostics(checkoutDir, resolution));
         }
 
-        var context = CreateSnapshotContext(request, capability);
+        var context = CreateSnapshotContext(request, capability, _sdkPinGuard.IdentityComponent);
         var pinState = new SdkPinLoadState();
 
         // The untrusted region: loading the solution EVALUATES its MSBuild projects (arbitrary imported
@@ -745,9 +745,11 @@ public sealed class LocalIndexerSnapshotWorker(
     /// becomes forward-only on the service path (issue #84); a null sequence flows through unchanged, so a
     /// non-sequence ensure (and every local CLI/daemon run, which never reaches this worker) keeps the
     /// unconditional-advance behavior byte-for-byte. Internal + static so it is unit-testable without a
-    /// real checkout/MSBuild.
+    /// real checkout/MSBuild. <paramref name="sdkPinPolicy"/> is the guard's non-default SDK-pin identity
+    /// component (issue #113); the orchestrator folds it into the identity of every snapshot it publishes.
     /// </summary>
-    internal static SnapshotContext CreateSnapshotContext(EnsureSnapshotRequest request, WorkerCapability? capability) => new()
+    internal static SnapshotContext CreateSnapshotContext(
+        EnsureSnapshotRequest request, WorkerCapability? capability, string? sdkPinPolicy = null) => new()
     {
         RepositoryRemoteUrl = request.RepositoryRemoteUrl,
         CommitSha = request.CommitSha,
@@ -759,6 +761,9 @@ public sealed class LocalIndexerSnapshotWorker(
         // that never routes — keeping the identity byte-identical to the pre-Phase-15 path (CRITICAL 2).
         CapabilityFingerprint = capability?.Fingerprint,
         // The control-plane forward-only head sequence (issue #84); null preserves unconditional advance.
-        BranchHeadSequence = request.BranchHeadSequence
+        BranchHeadSequence = request.BranchHeadSequence,
+        // Issue #113: must equal the service's ServiceOptions.SdkPinIdentityComponent, or the service's
+        // ValidateWorkerResult fails the job closed (published identity != requested identity).
+        SdkPinPolicy = sdkPinPolicy
     };
 }

@@ -80,8 +80,12 @@ public sealed record EnsureSnapshotRequest
     /// (Phase 15): the client cannot know the post-routing capability, so the request identity uses the
     /// node's default capability — the SAME value the worker stamps into the published snapshot — keeping
     /// request identity == published identity so idempotent attachment is preserved. Null in tests/local.
+    /// <paramref name="sdkPinPolicy"/> is the node's non-default SDK-pin policy component (issue #113,
+    /// <see cref="ServiceOptions.SdkPinIdentityComponent"/>), the SAME value the worker publishes under. Null
+    /// (the default override-on policy, tests, local) leaves the identity byte-identical.
     /// </summary>
-    public SnapshotIdentity ToIdentity(string? fallbackConfigHash = null, string? fallbackCapability = null) => new()
+    public SnapshotIdentity ToIdentity(
+        string? fallbackConfigHash = null, string? fallbackCapability = null, string? sdkPinPolicy = null) => new()
     {
         RepositoryRemoteUrl = RepositoryRemoteUrl,
         CommitSha = CommitSha,
@@ -90,7 +94,8 @@ public sealed record EnsureSnapshotRequest
         AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
         ConfigHash = ConfigHash ?? fallbackConfigHash,
         ToolchainFingerprint = ToolchainFingerprint.Current,
-        CapabilityFingerprint = fallbackCapability
+        CapabilityFingerprint = fallbackCapability,
+        SdkPinPolicy = sdkPinPolicy
     };
 }
 
