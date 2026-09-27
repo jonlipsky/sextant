@@ -18,6 +18,14 @@ public interface ICheckoutContentVerifier
     /// — the exact bytes the caller read and will journal — is the committed content; otherwise why not. Never throws.
     /// </summary>
     string? Problem(string checkoutDir, string head, IReadOnlyList<CheckoutFileContent> files);
+
+    /// <summary>
+    /// Null when <paramref name="parentDir"/>'s HEAD resolves to the commit <paramref name="parentHead"/> and that
+    /// commit records a submodule (a gitlink) at <paramref name="submoduleDir"/> pinned to exactly
+    /// <paramref name="submoduleHead"/>; otherwise why not. Never throws. Issue #171: a <c>global.json</c> inside a
+    /// submodule is only overridden when the submodule is checked out at the commit its parent's commit pins.
+    /// </summary>
+    string? GitlinkProblem(string parentDir, string parentHead, string submoduleDir, string submoduleHead);
 }
 
 /// <summary>A file the SDK-pin override would journal: its absolute path and the exact bytes read from it.</summary>
@@ -29,7 +37,8 @@ public readonly record struct CheckoutFileContent(string Path, ReadOnlyMemory<by
 /// <c>check-attr filter</c> and <c>cat-file</c> of each blob. <c>status</c> alone is not proof: git may call a file clean from its cached
 /// stat data (e.g. <c>core.checkStat=minimal</c> and a same-size edit that kept its mtime), so the bytes to be
 /// journaled must equal, byte for byte, the commit's blob as stored or git's checkout rendering (smudge/eol
-/// conversion) of it. git is run hardened against the checkout's own
+/// conversion) of it. <see cref="GitlinkProblem"/> reads the gitlink a verified commit records for a submodule
+/// (<c>ls-tree</c>, issue #171). git is run hardened against the checkout's own
 /// configuration and the worker's environment — inherited <c>GIT_*</c> variables are dropped, replace refs are
 /// ignored, repository discovery cannot climb above the checkout, pathspecs are literal, <c>core.fsmonitor</c>
 /// is disabled, and <c>GIT_OPTIONAL_LOCKS=0</c> keeps <c>status</c> from rewriting the index. Any failure — git missing, a
@@ -75,12 +84,8 @@ public sealed class GitCheckoutContentVerifier : ICheckoutContentVerifier
         if (relative.Count == 0)
             return null;
 
-        var rev = Run(checkout, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
-        if (rev.Problem is not null)
-            return rev.Problem.Length > 0 ? rev.Problem : "git cannot resolve the checkout's HEAD to a commit";
-        var resolved = rev.Text.Trim();
-        if (!string.Equals(resolved, head, StringComparison.OrdinalIgnoreCase))
-            return $"git resolves HEAD to '{FirstLine(resolved)}', not the commit {head} the checkout's metadata names";
+        if (HeadProblem(checkout, head, out var resolved) is { } headProblem)
+            return headProblem;
 
         var listed = Run(checkout, ["ls-files", "-z", "-v", "--", .. relative]);
         if (listed.Problem is not null)
@@ -110,6 +115,62 @@ public sealed class GitCheckoutContentVerifier : ICheckoutContentVerifier
             return $"'{(changed.Length > 3 ? changed[3..] : changed)}' differs from its committed content (git status '{changed[..Math.Min(2, changed.Length)]}')";
 
         return ContentProblem(checkout, resolved, files, relative);
+    }
+
+    public string? GitlinkProblem(string parentDir, string parentHead, string submoduleDir, string submoduleHead)
+    {
+        try
+        {
+            return GitlinkProblemCore(
+                Path.TrimEndingDirectorySeparator(Path.GetFullPath(parentDir)), parentHead,
+                Path.TrimEndingDirectorySeparator(Path.GetFullPath(submoduleDir)), submoduleHead);
+        }
+        catch (Exception ex)
+        {
+            return $"git could not verify it ({ex.GetType().Name}: {ex.Message})";
+        }
+    }
+
+    private string? GitlinkProblemCore(string parent, string parentHead, string submodule, string submoduleHead)
+    {
+        var relative = Path.GetRelativePath(parent, submodule);
+        if (relative == "." || relative.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relative))
+            return $"'{submodule}' is not inside the repository '{parent}'";
+        relative = relative.Replace('\\', '/');
+
+        if (HeadProblem(parent, parentHead, out var resolved) is { } headProblem)
+            return headProblem;
+
+        var tree = Run(parent, ["ls-tree", "-z", "--full-tree", resolved, "--", relative]);
+        if (tree.Problem is not null)
+            return tree.Problem.Length > 0 ? tree.Problem : "git ls-tree failed";
+        foreach (var record in tree.Text.Split('\0', StringSplitOptions.RemoveEmptyEntries))
+        {
+            // "<mode> SP <type> SP <object> TAB <path>"; a submodule is a mode-160000 "commit" entry (a gitlink).
+            var tab = record.IndexOf('\t', StringComparison.Ordinal);
+            var meta = tab > 0 ? record[..tab].Split(' ') : [];
+            if (meta.Length != 3 || !string.Equals(record[(tab + 1)..], relative, StringComparison.Ordinal))
+                continue;
+            if (meta[0] != "160000" || meta[1] != "commit")
+                return $"'{relative}' is not a submodule in the commit {resolved} (mode {meta[0]} {meta[1]})";
+            return string.Equals(meta[2], submoduleHead, StringComparison.OrdinalIgnoreCase)
+                ? null
+                : $"the submodule '{relative}' is checked out at {submoduleHead}, not the commit {meta[2]} that {resolved} pins for it";
+        }
+        return $"'{relative}' is not a submodule in the commit {resolved}";
+    }
+
+    // HEAD must resolve, through git itself, to the commit the caller read from the checkout's metadata.
+    private string? HeadProblem(string checkout, string head, out string resolved)
+    {
+        resolved = string.Empty;
+        var rev = Run(checkout, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
+        if (rev.Problem is not null)
+            return rev.Problem.Length > 0 ? rev.Problem : "git cannot resolve the checkout's HEAD to a commit";
+        resolved = rev.Text.Trim();
+        return string.Equals(resolved, head, StringComparison.OrdinalIgnoreCase)
+            ? null
+            : $"git resolves HEAD to '{FirstLine(resolved)}', not the commit {head} the checkout's metadata names";
     }
 
     /// <summary>

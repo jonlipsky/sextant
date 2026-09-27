@@ -57,6 +57,22 @@ internal static class CheckoutHead
         }
     }
 
+    /// <summary>
+    /// The git directory <paramref name="workTreeDir"/>'s <c>.git</c> entry resolves to (the directory itself, or a
+    /// <c>.git</c> file's <c>gitdir:</c> target), or null when it cannot be determined.
+    /// </summary>
+    public static string? TryReadGitDirectory(string workTreeDir)
+    {
+        try
+        {
+            return GitDirectory(workTreeDir);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            return null;
+        }
+    }
+
     private static string? GitDirectory(string checkoutDir)
     {
         var dotGit = Path.Combine(checkoutDir, ".git");
