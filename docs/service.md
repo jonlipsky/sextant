@@ -227,8 +227,12 @@ depth/count bounds leaves that submodule **unpopulated** and records a token-red
 reports the snapshot `partial` with a `submodule_unpopulated` diagnostic per submodule whose message and the
 job `reason` say why, e.g. `libs/X (url refused: host 'example.com' is not the repository host …)`,
 `libs/Y (fetch failed: …)`, `libs/Z (pinned commit not found: …)`, `libs/W (no gitlink: …)`. A
-**transient** failure (timeout, connection reset, 5xx) still follows the transient classification below
-(the whole provisioning is retried). In tests only, `AllowFileTransportForTesting` permits `file://`
+**transient** submodule failure (timeout, connection refused/reset, DNS, 5xx) follows the transient
+classification below — the whole staged provisioning is discarded and retried — **except on the job's final
+allowed attempt** (`SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS`): there it too is left unpopulated
+(`fetch failed: transient failure persisted through the final provisioning attempt: …`), so one persistently
+unreachable submodule host degrades the snapshot to `partial` instead of making the whole repository
+un-indexable. In tests only, `AllowFileTransportForTesting` permits `file://`
 submodule fixtures; production never allows a `file://` submodule from an untrusted `.gitmodules`.
 
 **Checkout layout marker + cached-checkout upgrade.** A provisioned checkout records
@@ -237,7 +241,8 @@ marker is reused as-is (its recorded outcomes feed coverage again). A cached che
 change (no marker) that has a declared-but-unpopulated submodule is **re-provisioned into a fresh temp
 directory and atomically swapped in** — the same stage-then-rename publish as a commit change, so a reader
 never observes a half-upgraded tree (and ensures for one repository are serialized). If the upgrade fails
-deterministically the cached tree keeps being served (honestly partial); a transient failure is retried. A
+deterministically the cached tree keeps being served (honestly partial); a transient failure is retried, and
+on the final allowed attempt the cached tree is served too. A
 pre-change checkout with no submodules is reused untouched. Separately, `AnalyzerVersion` is bumped to `4`,
 so a pre-change snapshot indexed without submodules at the same commit is never reused.
 
@@ -282,12 +287,15 @@ submodule recursion, so a host-level credential helper can neither supply nor **
 service fetch. **Behavior change (#125):** before this, a host credential helper could silently authenticate
 a clone; now only `SEXTANT_SERVICE_CHECKOUT_TOKEN` does. An authenticated clone requires git ≥ 2.31 (it is
 probed once; an older git fails the provisioning closed rather than fetching without its hardening). Public
-repositories (and non-`https` remotes) need no token. A credential embedded directly in the
+repositories (and non-`https` remotes) need no token. The header can only be scoped to a plain DNS host name,
+so for an `https` remote whose host is not one (an `_`, a trailing `.`, an IPv6 literal) the token is **not
+sent** and a warning says so (the fetch proceeds anonymously). A credential embedded directly in the
 `repository_remote_url` (any userinfo) is **refused** — supply credentials only via the token.
 
 **Scrub + verify before publish (fail closed).** After the tree (and its submodules) is provisioned, every
 git dir in the staged checkout — the top-level `.git`, every absorbed `.git/modules/**` dir, and any embedded
-submodule `.git` — has its `FETCH_HEAD` removed, and every remaining non-object file (config, refs, logs,
+submodule `.git` or gitfile (discovered by walking the work tree, not from recorded paths) — has its
+`FETCH_HEAD` removed, and every remaining non-object file (config, refs, logs,
 packed-refs, hooks, markers, …) is scanned for the raw, base64 and basic-credential forms of the token. A hit
 **fails the provisioning closed**: the staged tree is discarded and nothing is published.
 
@@ -301,7 +309,6 @@ packed-refs, hooks, markers, …) is scanned for the raw, base64 and basic-crede
 > drops the `Authorization` header on a cross-host redirect. Prefer `locate` for nodes that must not reach
 > the network; scope network egress and the control token appropriately when enabling `clone`. Any value
 > other than `locate`/`clone` **fails startup** (fail-closed).
-> (fail-closed).
 
 The **wire format is snake_case** (`ServiceJson.Options` = `SnakeCaseLower` + ignore-null, matching the
 rest of Sextant's JSON). Response bodies are serialized with `ServiceJson.Options` explicitly; request
@@ -595,7 +602,8 @@ auth). Coverage integrity (#119): `SnapshotCoverageBuilderTests`, `CheckoutInven
 `CoverageRegressionFixtureTests` clone of a two-solution repo with a refused-host submodule. Submodule
 provisioning (#125): `CloningCheckoutProviderSubmoduleTests` (local `file://` fixtures, no network:
 absolute/relative/nested pins, unfetchable → partial with reasons, sentinel-token non-persistence across every
-git dir, pre-change cache upgrade), `SubmoduleUrlPolicyTests`, `SubmoduleProvisioningHelperTests`, and the
+git dir, pre-change cache upgrade, transient failure retried then degraded on the final attempt),
+`SubmoduleUrlPolicyTests`, `SubmoduleProvisioningHelperTests`, and the
 `SubmoduleCheckoutIntegrationTests` end-to-end Phase-12 provider-snapshot test.
 
 ### Phase 15 — platform routing tests

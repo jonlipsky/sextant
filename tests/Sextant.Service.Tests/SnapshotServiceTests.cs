@@ -286,6 +286,34 @@ public class SnapshotServiceTests
     }
 
     [TestMethod]
+    public async Task Ensure_OnlyTheLastAllowedProvisioningAttempt_IsFlaggedFinal()
+    {
+        // Issue #125: the worker is told when it runs the LAST attempt the bound allows, so a clone-mode
+        // checkout can degrade a persistently-transient SUBMODULE failure to partial coverage instead of the
+        // whole job settling to a terminal Failed.
+        var db = NewDb();
+        var seen = new List<bool>();
+        var worker = new FakeSnapshotWorker(db, (self, request) =>
+        {
+            seen.Add(request.IsFinalProvisioningAttempt);
+            if (!request.IsFinalProvisioningAttempt)
+                throw new TransientProvisioningException("git fetch failed transiently: timed out");
+            var snapId = ServiceTestFixtures.PublishComplete(self.Database, request);
+            return SnapshotWorkResult.Complete(snapId);
+        });
+        _service = SnapshotService.Start(
+            ServiceTestFixtures.NewOptions(_dbPath) with { MaxProvisioningAttempts = 3 }, worker, _db);
+        var request = ServiceTestFixtures.Request();
+
+        Assert.AreEqual(SnapshotJobStatus.Queued, (await _service.EnsureSnapshotAsync(request)).Status);
+        Assert.AreEqual(SnapshotJobStatus.Queued, (await _service.EnsureSnapshotAsync(request)).Status);
+        Assert.AreEqual(SnapshotJobStatus.Complete, (await _service.EnsureSnapshotAsync(request)).Status,
+            "the final attempt degraded instead of throwing, so the job completes");
+        CollectionAssert.AreEqual(new[] { false, false, true }, seen);
+        Assert.IsFalse(request.IsFinalProvisioningAttempt, "the caller's request is never mutated");
+    }
+
+    [TestMethod]
     public async Task Ensure_DeterministicUnsupported_IsCachedTerminal_WorkerNotRerun()
     {
         var db = NewDb();
