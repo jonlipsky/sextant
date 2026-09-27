@@ -40,8 +40,14 @@ public static class IndexConfigurationHash
     /// identically-configured index produces, so a pre-#109 snapshot must not be reused for the same
     /// identity — the bump invalidates it and forces the new loader to run.
     /// <para>
-    /// <c>"3"</c> is reserved by the parallel union-of-solutions-default change (W1b). <c>"3"</c>/<c>"2"</c>
-    /// → <c>"4"</c> (issue #125): the service's cloning checkout provider now recursively initializes
+    /// <c>"2"</c> → <c>"3"</c> (issue #124): with no <c>solutions</c> config the service worker no longer
+    /// selects ONE default-root solution but the deterministic union of EVERY discovered solution. Selection
+    /// policy is not otherwise part of the snapshot identity, so a pre-#124 narrow snapshot at the same commit
+    /// must not be reused — the bump invalidates it. (Like every bump, it also makes a local daemon's index
+    /// rebuild once on upgrade.)
+    /// </para>
+    /// <para>
+    /// <c>"3"</c> → <c>"4"</c> (issue #125): the service's cloning checkout provider now recursively initializes
     /// submodules at their pinned gitlink commits. The checkout policy is not otherwise part of the snapshot
     /// identity, so without this bump a pre-#125 snapshot of the SAME commit — indexed with every submodule
     /// unpopulated (missing the submodule-provided projects and their Phase-12 provider snapshots /
