@@ -19,9 +19,10 @@ public sealed record SdkPinOptions
     public bool OverrideEnabled { get; init; } = true;
 
     /// <summary>
-    /// Where restore journals are written. Must be outside every checkout working tree. Null derives
-    /// <c>&lt;parent of the checkout&gt;/.sextant-sdk-pin</c> — for a service checkout that is
-    /// <c>&lt;CheckoutRoot&gt;/.sextant-sdk-pin</c>, the same directory the host configures explicitly.
+    /// Where restore journals are written. Must be outside every checkout working tree, and its PARENT must
+    /// contain the checkouts (recovery only replays a journal laid out that way; <see cref="SdkPinGuard.Apply"/>
+    /// refuses to override otherwise). Null derives <c>&lt;parent of the checkout&gt;/.sextant-sdk-pin</c> — for
+    /// a service checkout that is <c>&lt;CheckoutRoot&gt;/.sextant-sdk-pin</c>, the directory the host configures.
     /// </summary>
     public string? JournalRoot { get; init; }
 }
@@ -224,12 +225,10 @@ public sealed class SdkPinGuard
         // Journal FIRST (atomic + fsynced, outside the working tree) so a crash after any file is modified
         // can always be repaired by the next run.
         var journalPath = JournalPathFor(checkout);
-        if (IsContained(checkout, journalPath))
+        if (JournalLayoutProblem(checkout, journalPath) is { } layoutProblem)
         {
-            // E.g. a checkout at a filesystem root (no parent to hold the journal) or a journal root configured
-            // inside it: recovery refuses such a journal, so a crash could never be repaired — do not modify.
-            const string reason = "the SDK-pin restore journal would be inside the checkout's working tree " +
-                "(a checkout at a filesystem root, or a journal root configured inside it), so the checkout was not modified";
+            // Recovery would refuse this journal, so a crash could never be repaired: do not modify anything.
+            var reason = $"the SDK-pin restore journal could not be replayed after a crash ({layoutProblem}), so the checkout was not modified";
             findings.AddRange(candidates.Select(c => c.Finding with { NotOverriddenReason = reason }));
             return new SdkPinOverlay(this, checkout, journalPath: null, [], findings);
         }
@@ -656,11 +655,22 @@ public sealed class SdkPinGuard
         }
 
         var errors = new List<string>();
-        var volume = Path.GetDirectoryName(Path.GetDirectoryName(Path.GetFullPath(journalPath)));
+        var volume = JournalVolume(journalPath);
+        // Links are checked against the CURRENT tree only now that it is known to be the journaled commit (a
+        // moved checkout's links belong to the new commit and must never block retiring the journal). All
+        // entries are checked before any is written, and RestoreEntry re-checks each right before its write.
         foreach (var entry in journal.Entries)
         {
-            if (RestoreEntry(entry, checkout, volume, recovering: true) is { } error)
-                errors.Add(error);
+            if (LinkRefusal(checkout, Path.GetFullPath(entry.Path), volume) is { } refusal)
+                errors.Add($"'{entry.Path}' was not restored: {refusal}");
+        }
+        if (errors.Count == 0)
+        {
+            foreach (var entry in journal.Entries)
+            {
+                if (RestoreEntry(entry, checkout, volume, recovering: true) is { } error)
+                    errors.Add(error);
+            }
         }
 
         if (errors.Count > 0)
@@ -678,9 +688,10 @@ public sealed class SdkPinGuard
     }
 
     // A journal is only replayed when it is well-formed and confined: it must be the journal for the checkout
-    // it names, that checkout must lie on the checkout volume the journal directory belongs to, and every
-    // entry must be a distinct, non-symlinked global.json inside that checkout whose journaled bytes match
-    // their hash and whose metadata is in range. Validation is total: any malformed shape is a problem string.
+    // it names, laid out as Apply writes it (see JournalLayoutProblem), and every entry must be a distinct
+    // global.json lexically inside that checkout whose journaled bytes match their hash and whose metadata is
+    // in range. This is STRUCTURAL validation only (total: any malformed shape is a problem string); symlinks
+    // in the current tree are checked just before a same-commit restore writes, never before retiring.
     private string? JournalProblem(string journalPath, SdkPinJournal? journal)
     {
         try
@@ -707,9 +718,8 @@ public sealed class SdkPinGuard
         var checkout = Path.TrimEndingDirectorySeparator(Path.GetFullPath(journal.CheckoutDir));
         if (!PathEquals(JournalPathFor(checkout), Path.GetFullPath(journalPath)))
             return "it is not the journal of the checkout it names";
-        var volume = Path.GetDirectoryName(Path.GetDirectoryName(Path.GetFullPath(journalPath)));
-        if (volume is null || !IsContained(volume, checkout))
-            return "the checkout it names is outside the checkout volume";
+        if (JournalLayoutProblem(checkout, journalPath) is { } layoutProblem)
+            return layoutProblem;
         if (journal.Entries is not { Count: > 0 } entries)
             return "it lists no entries";
 
@@ -717,7 +727,7 @@ public sealed class SdkPinGuard
         var temps = new HashSet<string>(GlobalJsonLocator.PathComparer);
         foreach (var entry in entries)
         {
-            if (EntryProblem(checkout, volume, entry) is { } problem)
+            if (EntryProblem(checkout, entry) is { } problem)
                 return problem;
             if (!paths.Add(Path.GetFullPath(entry.Path)) || !temps.Add(Path.GetFullPath(entry.TempPath)))
                 return "it lists the same file twice";
@@ -725,7 +735,22 @@ public sealed class SdkPinGuard
         return null;
     }
 
-    private static string? EntryProblem(string checkout, string volume, SdkPinJournalEntry? entry)
+    // Recovery only replays a journal that lies OUTSIDE its checkout, in a journal directory whose parent (the
+    // checkout volume) contains the checkout — e.g. <CheckoutRoot>/.sextant-sdk-pin. Apply refuses to write a
+    // journal recovery would reject, so a crash is always repairable.
+    private static string? JournalLayoutProblem(string checkout, string journalPath)
+    {
+        if (IsContained(checkout, Path.GetFullPath(journalPath)))
+            return "the journal would be inside the checkout's working tree";
+        if (JournalVolume(journalPath) is not { } volume || !IsContained(volume, checkout))
+            return "the checkout is not under the journal directory's parent (the checkout volume)";
+        return null;
+    }
+
+    private static string? JournalVolume(string journalPath) =>
+        Path.GetDirectoryName(Path.GetDirectoryName(Path.GetFullPath(journalPath)));
+
+    private static string? EntryProblem(string checkout, SdkPinJournalEntry? entry)
     {
         if (entry is null)
             return "an entry is empty";
@@ -752,7 +777,7 @@ public sealed class SdkPinGuard
             return "an entry's timestamp is out of range";
         if (entry.UnixMode is < 0 or > MaxUnixMode)
             return "an entry's file mode is out of range";
-        return LinkRefusal(checkout, Path.GetFullPath(entry.Path), volume);
+        return null;
     }
 
     private static bool IsSha256(string? value) =>

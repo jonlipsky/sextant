@@ -232,11 +232,14 @@ cost a full copy per job and break checkout-relative paths. So the service handl
      the journaled temp-file path, belongs to the new commit. If the
      journaled commit can no longer be confirmed (the checkout's `HEAD` is unreadable), it fails closed;
    - a journal is replayed only when it is well formed and confined: it must be the journal of the checkout
-     it names, that checkout must be on the checkout volume, and it must list at least one entry, each a
-     distinct, non-symlinked `global.json` inside it whose journaled bytes match their checksum and whose
-     recorded commit, timestamp and mode are valid. Neither the checkout directory nor any directory
-     between it and the checkout volume may be a symlink/junction. Anything else is logged and left for
-     inspection, and one bad journal never stops the others from being replayed;
+     it names, that checkout must be on the checkout volume (the journal directory's parent), and it must
+     list at least one entry, each a distinct `global.json` inside it whose journaled bytes match their
+     checksum and whose recorded commit, timestamp and mode are valid. Before a checkout that is still at
+     the journaled commit is restored, neither the `global.json`, nor the checkout directory, nor any
+     directory between them and the checkout volume may be a symlink/junction (checked for every entry
+     before any is written). A moved checkout's links belong to the new commit and never block retiring its
+     journal. Anything else is logged and left for inspection, and one bad journal never stops the others
+     from being replayed;
    - if the journal directory cannot be read (e.g. after a restart under another UID), the service cannot
      rule out a leftover journal, so the checkout is not indexed — an access failure is never read as "no
      journal".
@@ -261,8 +264,9 @@ cost a full copy per job and break checkout-relative paths. So the service handl
    - the `global.json` lies outside the checkout, or is reached through a symlink/junction (including a
      symlinked checkout directory);
    - it cannot be read or parsed, it has no `sdk` section, or its `sdk` section pins no version;
-   - the journal cannot be written, or would land inside the checkout (a checkout at a filesystem root, or
-     a journal root configured inside it), where recovery could never replay it;
+   - the journal cannot be written, or is laid out so recovery could never replay it: inside the checkout,
+     or in a directory whose parent does not contain the checkout (the service always uses
+     `<checkout-root>/.sextant-sdk-pin`);
    - neutralizing it still leaves no resolvable SDK (for example, a parent pin outside the checkout also
      fails). In that case it is restored at once.
 

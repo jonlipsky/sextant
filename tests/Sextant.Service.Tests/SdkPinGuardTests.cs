@@ -598,6 +598,52 @@ public sealed class SdkPinGuardTests
     }
 
     [TestMethod]
+    [DataRow("disjoint")]
+    [DataRow("filesystem-root")]
+    public void JournalRootRecoveryCouldNotReplay_IsRefused_WithoutModifyingTheFile(string layout)
+    {
+        var original = WritePin(GlobalJson);
+        var root = layout == "disjoint" ? Path.Combine(_root, "state", "journals") : Path.GetPathRoot(_root)!;
+        var guard = new SdkPinGuard(new SdkPinOptions { JournalRoot = root }, new FakeHostFxr());
+
+        var overlay = guard.Apply(_checkout, [_solution]);
+
+        var finding = overlay.Findings.Single();
+        Assert.IsFalse(finding.OverrideApplied, layout);
+        StringAssert.Contains(finding.NotOverriddenReason, "not under the journal directory's parent");
+        CollectionAssert.AreEqual(original, File.ReadAllBytes(GlobalJson));
+        Assert.IsFalse(File.Exists(guard.JournalPathFor(_checkout)), "no journal recovery would reject is written");
+    }
+
+    [TestMethod]
+    public void Recovery_AfterTheCheckoutMoved_IsNeverBlockedByTheNewCommitsSymlinks()
+    {
+        WriteHead("1111111111111111111111111111111111111111");
+        var projectDir = Path.Combine(_checkout, "src", "App");
+        WritePin(Path.Combine(projectDir, "global.json"));
+        _ = new SdkPinGuard(probe: new FakeHostFxr()).Apply(_checkout, [_solution]); // "crash"
+
+        // The new commit turns the journaled pin's directory into a symlink.
+        WriteHead("2222222222222222222222222222222222222222");
+        var outside = Path.Combine(_root, "outside");
+        Directory.CreateDirectory(outside);
+        Directory.Delete(projectDir, recursive: true);
+        try
+        {
+            Directory.CreateSymbolicLink(projectDir, outside);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            Assert.Inconclusive($"symbolic links cannot be created here: {ex.Message}");
+            return;
+        }
+
+        Assert.IsTrue(new SdkPinGuard(probe: new FakeHostFxr()).Recover(_checkout), "a moved checkout's journal retires");
+        Assert.AreEqual(0, Directory.GetFiles(JournalDir).Length);
+        Assert.AreEqual(0, Directory.GetFileSystemEntries(outside).Length, "nothing is written through the new commit's link");
+    }
+
+    [TestMethod]
     public void Recovery_WhenTheJournaledHeadCanNoLongerBeRead_FailsClosed()
     {
         WriteHead("1111111111111111111111111111111111111111");
