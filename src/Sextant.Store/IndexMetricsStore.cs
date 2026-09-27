@@ -33,13 +33,18 @@ public sealed class IndexMetricsStore(SqliteConnection connection)
     /// </summary>
     public (long total, long distinct) ReferenceOccurrences()
     {
+        // Issue #160: ix_occ_source is partial (source_symbol_id IS NOT NULL, migration 023), so it cannot
+        // count NULL keys. The total is all occurrences minus call edges: both counts are covering-index
+        // scans. The DISTINCT pass must read every pure reference, so NOT INDEXED pins one sequential
+        // table scan instead of an index walk with a random table lookup per row.
         using var cmd = connection.CreateCommand();
         cmd.CommandText = """
             SELECT
-                (SELECT COUNT(*) FROM occurrences WHERE source_symbol_id IS NULL),
+                (SELECT COUNT(*) FROM occurrences)
+                    - (SELECT COUNT(*) FROM occurrences WHERE source_symbol_id IS NOT NULL),
                 (SELECT COUNT(*) FROM (
                     SELECT DISTINCT target_symbol_id, file_version_id, line, kind
-                    FROM occurrences WHERE source_symbol_id IS NULL
+                    FROM occurrences NOT INDEXED WHERE source_symbol_id IS NULL
                 ));
             """;
         using var reader = cmd.ExecuteReader();
