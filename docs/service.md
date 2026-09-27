@@ -264,6 +264,9 @@ cost a full copy per job and break checkout-relative paths. So the service handl
    - the `global.json` lies outside the checkout, or is reached through a symlink/junction (including a
      symlinked checkout directory);
    - it cannot be read or parsed, it has no `sdk` section, or its `sdk` section pins no version;
+   - the checkout's git `HEAD` commit cannot be read (e.g. a non-git directory placed by an external
+     provisioner in `locate` mode). The journaled commit, not the file content, is what lets recovery tell
+     the neutralized tree apart from a re-provisioned one that happens to hold the same bytes;
    - the journal cannot be written, or is laid out so recovery could never replay it: inside the checkout,
      or in a directory whose parent does not contain the checkout (the service always uses
      `<checkout-root>/.sextant-sdk-pin`);
