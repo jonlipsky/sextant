@@ -8,12 +8,12 @@ namespace Sextant.Service.Tests;
 
 /// <summary>
 /// Issue #119 regression fixture: the elevenworks/monorepo shape that was indexed 5 of 415 projects yet
-/// reported COMPLETE. A real git "remote" (file:// — no network) with TWO solutions, a project file only the
-/// second solution declares, and a declared-but-uninitialized submodule is cloned through the real
-/// <see cref="CloningCheckoutProvider"/>; the real selection + real checkout inventory then feed the
-/// coverage verdict. The MSBuild load is synthetic (the selected solution's one project loaded) so the test
-/// runs on every <c>dotnet test</c>; the real-MSBuild union load is covered by the env-gated
-/// <c>MultiSolutionIndexingIntegrationTests</c>.
+/// reported COMPLETE. A real git "remote" (file:// — no network) with TWO solutions, a project file no
+/// solution declares, and a declared-but-uninitialized submodule is cloned through the real
+/// <see cref="CloningCheckoutProvider"/>; the real selection (the no-config default union, #124) + real
+/// checkout inventory then feed the coverage verdict. The MSBuild load is synthetic (each selected
+/// solution's one project loaded) so the test runs on every <c>dotnet test</c>; the real-MSBuild union load
+/// is covered by <c>DefaultUnionSnapshotIntegrationTests</c>.
 /// </summary>
 [TestClass]
 public class CoverageRegressionFixtureTests
@@ -36,8 +36,12 @@ public class CoverageRegressionFixtureTests
         }
     }
 
+    // Updated for #124: before it, no sextant.json selected ONE of the two solutions and the other was a
+    // `solution_not_selected` gap. The default is now the union, so BOTH are selected and nothing is left
+    // unselected; the remaining #119 gaps (an uninitialized submodule and a project file no solution
+    // declares — added to the fixture so the orphan gap is still exercised) keep the snapshot partial.
     [TestMethod]
-    public void TwoSolutionsAndAnUninitializedSubmodule_ClonedCheckout_IsPartialWithEveryReason()
+    public void TwoSolutionsAndAnUninitializedSubmodule_ClonedCheckout_UnionSelectsBoth_PartialForRemainingGaps()
     {
         var (remoteUrl, commit) = NewMonorepoRemote();
         var dataRoot = Temp("sextant_covfix_data");
@@ -45,19 +49,23 @@ public class CoverageRegressionFixtureTests
         var provider = new CloningCheckoutProvider(new PersistentVolumeCheckoutProvider(paths), paths);
 
         Assert.IsTrue(provider.TryResolve(ServiceTestFixtures.Request(remoteUrl, commit), out var resolution));
-        Assert.AreEqual(SolutionSelectionSource.DefaultRoot, resolution.Source);
-        Assert.AreEqual(1, resolution.SelectedSolutions.Count, "no sextant.json ⇒ the default picks one solution");
-        Assert.AreEqual(1, resolution.DiscoveredButNotSelected.Count, "the other solution is discovered, not selected");
+        Assert.AreEqual(SolutionSelectionSource.DefaultUnion, resolution.Source);
+        Assert.AreEqual(2, resolution.SelectedSolutions.Count, "no sextant.json ⇒ the default selects every solution");
+        Assert.AreEqual(0, resolution.DiscoveredButNotSelected.Count, "the union leaves nothing discovered-but-unselected");
 
         var checkout = resolution.CheckoutDir;
-        var selected = resolution.SelectedSolutions[0];
-        var declaredProject = Path.GetFileName(selected) == "App.slnx"
-            ? Path.Combine(checkout, "src", "App", "App.csproj")
-            : Path.Combine(checkout, "tools", "Tool", "Tool.csproj");
+        Assert.AreEqual("App.slnx", Path.GetFileName(resolution.SelectedSolutions[0]), "deterministic union order");
+        Assert.AreEqual("Tools.slnx", Path.GetFileName(resolution.SelectedSolutions[1]));
+        var appProject = Path.Combine(checkout, "src", "App", "App.csproj");
+        var toolProject = Path.Combine(checkout, "tools", "Tool", "Tool.csproj");
         var load = new MultiSolutionLoadResult(
-            new AdhocWorkspace().CurrentSolution, [], [new SolutionCoverage(selected, 1, 1, [])])
+            new AdhocWorkspace().CurrentSolution, [],
+            [
+                new SolutionCoverage(resolution.SelectedSolutions[0], 1, 1, []),
+                new SolutionCoverage(resolution.SelectedSolutions[1], 1, 1, [])
+            ])
         {
-            DeclaredProjects = [declaredProject]
+            DeclaredProjects = [appProject, toolProject]
         };
 
         var inventory = SnapshotCoverageBuilder.Inventory.Scan(checkout);
@@ -69,23 +77,26 @@ public class CoverageRegressionFixtureTests
 
         var c = result.Coverage!;
         Assert.AreEqual(SnapshotCoverageVerdict.Partial, c.Verdict);
+        Assert.AreEqual("default_union", c.SelectionSource);
         Assert.AreEqual(2, c.SolutionsDiscovered);
-        Assert.AreEqual(1, c.SolutionsNotSelected);
-        Assert.AreEqual(2, c.ProjectFilesOnDisk);
-        Assert.AreEqual(1, c.ProjectFilesUnreferenced, "the other solution's project is on disk but not indexed");
+        Assert.AreEqual(2, c.SolutionsSelected);
+        Assert.AreEqual(0, c.SolutionsNotSelected);
+        Assert.AreEqual(3, c.ProjectFilesOnDisk);
+        Assert.AreEqual(1, c.ProjectFilesUnreferenced, "only the orphan project is on disk but in no solution");
         Assert.AreEqual(1, c.SubmodulesDeclared);
         Assert.AreEqual(1, c.SubmodulesUnpopulated, "a plain clone never initializes submodules");
         Assert.AreEqual(0, c.ScanErrors);
-        Assert.AreEqual(3, c.Reasons.Count, "one reason per gap: unselected solution, unpopulated submodule, orphan project");
+        Assert.AreEqual(2, c.Reasons.Count, "one reason per remaining gap: unpopulated submodule, orphan project");
 
-        Assert.IsTrue(result.Projects.Any(p => p.Code == "solution_not_selected"));
+        Assert.IsFalse(result.Projects.Any(p => p.Code == "solution_not_selected"));
         Assert.IsTrue(result.Projects.Any(p => p.Code == "submodule_unpopulated" && p.ProjectPath == "libs/shared"));
-        Assert.IsTrue(result.Projects.Any(p => p.Code == "project_file_unreferenced"));
+        Assert.IsTrue(result.Projects.Any(p => p.Code == "project_file_unreferenced" && p.ProjectPath == "orphans/Orphan/Orphan.csproj"));
         StringAssert.Contains(result.Error, "snapshot coverage is partial");
     }
 
-    // A monorepo-shaped remote: App.slnx → src/App/App.csproj, Tools.slnx → tools/Tool/Tool.csproj, and a
-    // gitlink at libs/shared declared in .gitmodules (never initialized, exactly like a fresh clone).
+    // A monorepo-shaped remote: App.slnx → src/App/App.csproj, Tools.slnx → tools/Tool/Tool.csproj, a project
+    // file no solution declares (orphans/Orphan), and a gitlink at libs/shared declared in .gitmodules (never
+    // initialized, exactly like a fresh clone).
     private (string url, string commit) NewMonorepoRemote()
     {
         var repo = Temp("sextant_covfix_remote");
@@ -93,6 +104,7 @@ public class CoverageRegressionFixtureTests
         Write(repo, "Tools.slnx", "<Solution>\n  <Project Path=\"tools/Tool/Tool.csproj\" />\n</Solution>\n");
         Write(repo, "src/App/App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />\n");
         Write(repo, "tools/Tool/Tool.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />\n");
+        Write(repo, "orphans/Orphan/Orphan.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />\n");
         Write(repo, ".gitmodules",
             "[submodule \"libs/shared\"]\n\tpath = libs/shared\n\turl = https://example.invalid/shared.git\n");
 

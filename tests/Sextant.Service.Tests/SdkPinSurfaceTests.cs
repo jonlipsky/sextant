@@ -177,7 +177,7 @@ public sealed class SdkPinSurfaceTests
             {
                 CheckoutDir = checkout,
                 SelectedSolutions = [Path.Combine(checkout, "App.slnx")],
-                Source = SolutionSelectionSource.DefaultRoot
+                Source = SolutionSelectionSource.DefaultUnion
             };
             var worker = new LocalIndexerSnapshotWorker(
                 db, new SextantConfiguration(), new FixedCheckoutProvider(resolution), sdkPinGuard: guard);
@@ -246,7 +246,8 @@ public sealed class SdkPinSurfaceTests
 
         var coverage = SnapshotCoverageBuilder.Build(CheckoutDir, Resolution(), load, new SnapshotCoverageBuilder.Inventory([], []));
 
-        CollectionAssert.Contains(coverage.Coverage.Reasons.ToList(), "1 declared project(s) could not be loaded on this worker.");
+        CollectionAssert.Contains(coverage.Coverage.Reasons.ToList(),
+            "1 declared project(s) could not be loaded on this worker (src/Ios/Ios.csproj); see the `project_skipped` diagnostics for each reason.");
         Assert.IsFalse(coverage.Coverage.Reasons.Any(r => r.Contains("SDK", StringComparison.Ordinal)));
     }
 

@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Sextant.Mcp.Tools;
+using Sextant.Store;
 
 namespace Sextant.Mcp.Tests;
 
@@ -64,6 +65,49 @@ public class ScopeFilterTests
                 Assert.AreEqual("src/Alpha/BaseService.cs", fp.GetString());
         }
     }
+
+    [TestMethod]
+    public void FindSymbol_ScopeSolution_FiltersToTheSolutionsMappedProjects()
+    {
+        var solutionPath = SeedSolution(_fixture.ProjectId);
+
+        var alpha = FindSymbolTool.FindSymbol(_fixture.DbProvider, "BaseService",
+            fuzzy: true, scope: $"solution:{solutionPath}").GetAwaiter().GetResult();
+        Assert.IsTrue(ResultCount(alpha) >= 1, "a symbol in a mapped project is in scope");
+
+        var beta = FindSymbolTool.FindSymbol(_fixture.DbProvider, "Consumer",
+            fuzzy: true, scope: $"solution:{solutionPath}").GetAwaiter().GetResult();
+        Assert.AreEqual(0, ResultCount(beta), "a symbol in an unmapped project is out of scope");
+    }
+
+    [TestMethod]
+    public void FindSymbol_ScopeKnownSolutionWithNoMappedProject_FailsClosed()
+    {
+        // Issue #124: a selected multi-solution head none of whose projects loaded is recorded with NO project
+        // mapping. Scoping to it must return nothing — not degrade to an unfiltered whole-repository query.
+        var solutionPath = SeedSolution();
+
+        var result = FindSymbolTool.FindSymbol(_fixture.DbProvider, "BaseService",
+            fuzzy: true, scope: $"solution:{solutionPath}").GetAwaiter().GetResult();
+        Assert.AreEqual(0, ResultCount(result));
+
+        var refs = FindReferencesTool.FindReferences(_fixture.DbProvider,
+            "global::Alpha.BaseService.Process(string)", scope: $"solution:{solutionPath}");
+        Assert.AreEqual(0, ResultCount(refs));
+    }
+
+    private static string SeedSolution(params long[] projectIds)
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"sextant_scope_{Guid.NewGuid():N}", "Head.slnx");
+        var store = new SolutionStore(_fixture.Db.GetConnection());
+        var solutionId = store.Upsert(path, "Head", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        foreach (var projectId in projectIds)
+            store.AddProjectMapping(solutionId, projectId);
+        return path;
+    }
+
+    private static int ResultCount(string json) =>
+        JsonDocument.Parse(json).RootElement.GetProperty("meta").GetProperty("result_count").GetInt32();
 
     [TestMethod]
     public void FindSymbol_InvalidScopeFormat_ReturnsResults()

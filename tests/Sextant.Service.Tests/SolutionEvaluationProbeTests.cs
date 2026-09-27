@@ -22,7 +22,7 @@ public class SolutionEvaluationProbeTests
                 {
                     CheckoutDir = "/checkouts/app",
                     SelectedSolutions = ["/checkouts/app/App.sln"],
-                    Source = SolutionSelectionSource.DefaultRoot
+                    Source = SolutionSelectionSource.DefaultUnion // renamed from the retired DefaultRoot (#124)
                 }
                 : null!;
             return resolves;

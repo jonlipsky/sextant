@@ -208,7 +208,7 @@ public class EvaluationSandboxTests
             {
                 CheckoutDir = checkoutDir,
                 SelectedSolutions = [Path.Combine(checkoutDir, "Solution.slnx")],
-                Source = SolutionSelectionSource.DefaultRoot
+                Source = SolutionSelectionSource.DefaultUnion // renamed from the retired DefaultRoot (#124)
             };
             return true;
         }

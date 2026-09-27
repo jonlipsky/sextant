@@ -360,14 +360,16 @@ public class SdkPinOverrideIntegrationTests
 
     private async Task<(SnapshotWorkResult Result, string IdentityHash)> ProduceAsync(
         string commit, IReadOnlyList<string> solutions, bool overrideEnabled, bool sandboxed = false,
-        ISdkResolutionProbe? probe = null, CancellationToken cancellationToken = default)
+        ISdkResolutionProbe? probe = null, SolutionSelectionSource? source = null,
+        CancellationToken cancellationToken = default)
     {
         var config = new SextantConfiguration();
         var resolution = new CheckoutResolution
         {
             CheckoutDir = _checkout,
             SelectedSolutions = solutions,
-            Source = solutions.Count > 1 ? SolutionSelectionSource.Configured : SolutionSelectionSource.DefaultRoot
+            Source = source
+                     ?? (solutions.Count > 1 ? SolutionSelectionSource.Configured : SolutionSelectionSource.DefaultUnion)
         };
         var guard = new SdkPinGuard(
             new SdkPinOptions { OverrideEnabled = overrideEnabled, JournalRoot = _journalRoot }, probe, _log.Add);
