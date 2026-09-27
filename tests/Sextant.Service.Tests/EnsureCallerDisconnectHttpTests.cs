@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Sextant.Core;
 using Sextant.Service.Host;
 using Sextant.Store;
 
@@ -152,10 +153,63 @@ public class EnsureCallerDisconnectHttpTests
         Assert.AreEqual(HttpStatusCode.ServiceUnavailable, late.StatusCode);
     }
 
+    [TestMethod]
+    public async Task ReEnsureOfAnIndexedBranch_ResolveReturnsTheCurrentHeadWithCoverage_Promptly()
+    {
+        // The prod shape (2026-09-27): the repository's branch already points at a published snapshot, and a
+        // re-ensure of a NEW commit on that branch is indexing. /control/resolve must return 200 with the
+        // current head snapshot plus its coverage block promptly — pre-#148 it waited on the writer held by the
+        // worker and stalled for the whole index — and /control/status must report the re-index running.
+        await using var host = await StartAsync();
+        var client = host.GetTestClient();
+
+        var head = ServiceTestFixtures.Request(commit: "commit-aaaa", branch: "main");
+        var headSnapshot = ServiceTestFixtures.PublishComplete(_db!, head);
+        new SnapshotCoverageStore(_db!.GetConnection()).Record(headSnapshot, new SnapshotCoverage
+        {
+            Verdict = SnapshotCoverageVerdict.Complete,
+            SelectionSource = "default_union"
+        }, 1);
+        var attached = await client.PostAsync("/control/ensure", Body(head)).WaitAsync(Settle);
+        Assert.AreEqual(HttpStatusCode.OK, attached.StatusCode, "the published head attaches without a worker run");
+        Assert.AreEqual(0, _worker!.Calls);
+
+        var reEnsure = await client.PostAsync("/control/ensure?wait=false",
+            Body(ServiceTestFixtures.Request(commit: "commit-bbbb", branch: "main"))).WaitAsync(Settle);
+        Assert.AreEqual(HttpStatusCode.Accepted, reEnsure.StatusCode);
+        var jobId = (await reEnsure.Content.ReadFromJsonAsync<EnsureSnapshotResult>(ServiceJson.Options))!.JobId;
+        await WaitUntilAsync(() => _worker.Calls == 1);
+
+        var sw = Stopwatch.StartNew();
+        var resolve = await client.GetAsync("/control/resolve?repository=https://github.com/org/app&branch=main")
+            .WaitAsync(TimeSpan.FromSeconds(10));
+        sw.Stop();
+        Assert.AreEqual(HttpStatusCode.OK, resolve.StatusCode);
+        Assert.IsTrue(sw.Elapsed < Prompt, $"GET /control/resolve took {sw.Elapsed} while the branch was re-indexing");
+        using (var json = JsonDocument.Parse(await resolve.Content.ReadAsStringAsync()))
+        {
+            Assert.AreEqual(headSnapshot, json.RootElement.GetProperty("id").GetInt64(),
+                "resolve serves the branch's current head while its next commit indexes");
+            Assert.AreEqual(SnapshotCoverageVerdict.Complete,
+                json.RootElement.GetProperty("coverage").GetProperty("verdict").GetString(),
+                "the coverage block (a second catalog read) is served off the writer too");
+        }
+
+        sw.Restart();
+        var status = await client.GetAsync($"/control/status/{jobId}").WaitAsync(TimeSpan.FromSeconds(10));
+        sw.Stop();
+        Assert.AreEqual(HttpStatusCode.OK, status.StatusCode);
+        Assert.IsTrue(sw.Elapsed < Prompt, $"GET /control/status took {sw.Elapsed} while the branch was re-indexing");
+        Assert.AreEqual(SnapshotJobStatus.Running, await JobStatusOf(status));
+
+        _worker.Gate.SetResult();
+        await WaitUntilAsync(() => _service!.GetStatus(jobId)?.Job.Status == SnapshotJobStatus.Complete);
+    }
+
     // ---- harness --------------------------------------------------------------------------------
 
-    private static JsonContent Body() =>
-        JsonContent.Create(ServiceTestFixtures.Request(), options: ServiceJson.Options);
+    private static JsonContent Body(EnsureSnapshotRequest? request = null) =>
+        JsonContent.Create(request ?? ServiceTestFixtures.Request(), options: ServiceJson.Options);
 
     private static async Task<string?> JobStatusOf(HttpResponseMessage response)
     {
