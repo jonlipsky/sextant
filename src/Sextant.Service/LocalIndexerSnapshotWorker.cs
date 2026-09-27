@@ -58,6 +58,13 @@ public sealed record CheckoutResolution
     /// </summary>
     public string? ConfigurationError { get; init; }
 
+    /// <summary>
+    /// How each <c>.gitmodules</c>-declared submodule was provisioned when the cloning provider produced this
+    /// checkout (issue #125) — empty for a locate-only / externally-provisioned checkout. Coverage uses it to
+    /// explain WHY a declared submodule is unpopulated (url refused, fetch failed, pinned commit missing, …).
+    /// </summary>
+    public IReadOnlyList<SubmoduleProvisioningOutcome> SubmoduleProvisioning { get; init; } = [];
+
     /// <summary>True when a solution was selected to index (false only in the config-error state).</summary>
     public bool HasSelectedSolutions => SelectedSolutions.Count > 0;
 

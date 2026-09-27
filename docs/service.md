@@ -52,7 +52,8 @@ of the box.
 | `SEXTANT_SERVICE_CACHE_ROOT` | Bounded local caches (federation pages) | `<data-root>/cache` |
 | `SEXTANT_SERVICE_SCRATCH_ROOT` | **Ephemeral** per-job worker scratch | `<data-root>/scratch` |
 | `SEXTANT_SERVICE_CHECKOUT_MODE` | How a checkout is obtained: `locate` (index only an already-provisioned checkout) or `clone` (provision it by cloning the requested commit) | `locate` |
-| `SEXTANT_SERVICE_CHECKOUT_TOKEN` | Access token for cloning a **private** `https` repo in `clone` mode (injected as `x-access-token`; public repos need none) | none |
+| `SEXTANT_SERVICE_CHECKOUT_TOKEN` | Access token for cloning a **private** `https` repo in `clone` mode (sent transiently as an env-scoped `Authorization` header to the repository's own host and same-host submodules only; public repos need none) | none |
+| `SEXTANT_SERVICE_SUBMODULE_HOSTS` | In `clone` mode, comma-separated `host[:port]` list of **additional** hosts submodules may be fetched from — **anonymously** (the token is never sent to them). Invalid entries fail startup | none (same host only) |
 | `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS` | In `clone` mode, how many times a **transient** clone/provisioning failure is retried across re-ensures before the job settles to terminal `failed` (clamped to 1–100; deterministic failures are never retried) | `5` |
 | `SEXTANT_SERVICE_CONTROL_TOKEN` | Bearer token for `/control/*` | none (open, dev only) |
 | `SEXTANT_SERVICE_QUERY_TOKEN` | Bearer token for `/mcp` + `/query/*` | none (anonymous read) |
@@ -184,9 +185,61 @@ bumps the schema version (folded into the snapshot identity), every repository i
 coverage row — on its next ensure. The Phase-10 `snapshots.fallback_reason` column is **not** used for
 coverage; the reason lives on the job and in the coverage record.
 
-Clone mode does **not** initialize submodules yet, so a repository with submodules is honestly reported
-`partial` (`submodule_unpopulated`) until submodule provisioning lands. Routing platform heads to a native
-Windows/macOS worker is a separate concern (issue #89); here they are recorded skipped-with-reason.
+Routing platform heads to a native Windows/macOS worker is a separate concern (issue #89); here they are
+recorded skipped-with-reason.
+
+#### Submodules — recursive, pinned, credential-scoped (#125)
+
+In `clone` mode the provisioner initializes every submodule **recursively at the commit the parent pins**
+(the gitlink), so monorepo projects that live in — or `ProjectReference` into — a submodule are indexed, and
+the Phase-12 submodule dedup fires (each populated, clean submodule becomes a **provider snapshot** at its
+pinned commit, with a `snapshot_dependencies` edge and cross-repository usage edges from the consumer).
+
+It does **not** run `git submodule update`. It reads `.gitmodules` from the committed tree
+(`git config --blob HEAD:.gitmodules`, honouring only each entry's `path` and `url` — `update`, `branch`,
+`shallow`, and any other key are ignored), reads the gitlink from `git ls-tree`, and for each submodule runs
+the same hardened sequence as the top level: `init` → `remote add origin --end-of-options <clean-url>` →
+`fetch --depth 1 --no-tags --end-of-options origin <gitlink>` (a full fetch as fallback when the pin is not
+advertised shallowly) → `checkout --detach` → verify `HEAD` equals the gitlink. The child's git dir is then
+absorbed into the parent (`.git/modules/<name>`), and nesting recurses (bounded to depth 8 and 256
+submodules). Submodule names/paths are validated (no `..`, no absolute or `.git` segments, no escape from the
+parent).
+
+**URL policy (per `.gitmodules` entry).**
+
+| `url` shape | Handling |
+| --- | --- |
+| absolute `https://host/…` | fetched when `host` is the repository's host (with the token) or an allowlisted submodule host (anonymously); otherwise refused. Username-only userinfo such as `https://user@github.com/…` is stripped |
+| relative `../X.git`, `./X` | resolved against the parent's **clean** origin URL (never climbing above the host), then treated as above |
+| `git@host:org/repo.git`, `ssh://[user@]host[:port]/…` | rewritten to `https://<repository-host>/org/repo.git` **only** when `host` is the repository's host; otherwise refused |
+| a URL carrying a **password** (`https://user:secret@…`) | refused — credentials come only from the service token |
+| `http://`, `git://`, `file://`, `ext::`/helper transports, local paths, a leading `-`, whitespace/control/backslash characters, a query/fragment, dot segments, a URL over 2048 chars | refused |
+
+**Who gets the token.** The token is sent **only** to a submodule on the **top-level repository's own https
+host** (the same env-scoped header as the top level). `SEXTANT_SERVICE_SUBMODULE_HOSTS` (comma-separated
+`host[:port]` list) additionally allows submodules on other hosts, fetched **anonymously** (the token is never
+sent to them). Any other host is refused. When the top-level remote is not `https` (ssh/scp) no host is
+authenticated, so only allowlisted-host https submodules are fetched.
+
+**An unfetchable submodule never fails the checkout.** A refused URL, an auth/404/unreachable fetch, a pinned
+commit that is not on the remote, an invalid entry, a `.gitmodules` entry with no gitlink, or exceeding the
+depth/count bounds leaves that submodule **unpopulated** and records a token-redacted outcome. Coverage then
+reports the snapshot `partial` with a `submodule_unpopulated` diagnostic per submodule whose message and the
+job `reason` say why, e.g. `libs/X (url refused: host 'example.com' is not the repository host …)`,
+`libs/Y (fetch failed: …)`, `libs/Z (pinned commit not found: …)`, `libs/W (no gitlink: …)`. A
+**transient** failure (timeout, connection reset, 5xx) still follows the transient classification below
+(the whole provisioning is retried). In tests only, `AllowFileTransportForTesting` permits `file://`
+submodule fixtures; production never allows a `file://` submodule from an untrusted `.gitmodules`.
+
+**Checkout layout marker + cached-checkout upgrade.** A provisioned checkout records
+`.git/sextant-checkout.json` (layout `2`, with each submodule's outcome). A cached checkout that carries the
+marker is reused as-is (its recorded outcomes feed coverage again). A cached checkout from **before** this
+change (no marker) that has a declared-but-unpopulated submodule is **re-provisioned into a fresh temp
+directory and atomically swapped in** — the same stage-then-rename publish as a commit change, so a reader
+never observes a half-upgraded tree (and ensures for one repository are serialized). If the upgrade fails
+deterministically the cached tree keeps being served (honestly partial); a transient failure is retried. A
+pre-change checkout with no submodules is reused untouched. Separately, `AnalyzerVersion` is bumped to `4`,
+so a pre-change snapshot indexed without submodules at the same commit is never reused.
 
 #### Transient vs deterministic provisioning failures
 
@@ -217,20 +270,37 @@ not an exact transient-retry budget.
 > token. (Folding the token into the identity is deliberately avoided so a token rotation does not
 > needlessly fork the snapshot lineage.)
 
-Set `SEXTANT_SERVICE_CHECKOUT_TOKEN` to clone a **private** `https` repository — it is injected into the
-transient fetch URL as `https://x-access-token:<token>@…`, is never written to the published checkout's
-`.git/config` (the `origin` remote is the token-less URL) nor its fetch record, and is redacted from logs.
-Public repositories (and non-`https` remotes) need no token. A credential embedded directly in the
-`repository_remote_url` (`https://user:pass@host/…`) is **refused** — supply credentials only via the token.
+Set `SEXTANT_SERVICE_CHECKOUT_TOKEN` to clone a **private** `https` repository. The token reaches git **only
+through the child process's environment**: `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n`
+carry an `http.https://<repository-host>/.extraheader` entry (`AUTHORIZATION: basic` over
+`x-access-token:<token>`, preceded by an empty entry that resets any inherited header), **scoped to the
+repository's own host** (scheme + host + port). It is therefore never on git's argv, never written to any git
+config file (`.git/config`, `.git/modules/**/config`), never in a fetch record, and is redacted — raw and
+base64 forms — from every log line and exception. Every service git invocation also resets credential
+helpers and askpass (`credential.helper=` / `core.askPass=` through the same channel) and disables implicit
+submodule recursion, so a host-level credential helper can neither supply nor **store** a credential for a
+service fetch. **Behavior change (#125):** before this, a host credential helper could silently authenticate
+a clone; now only `SEXTANT_SERVICE_CHECKOUT_TOKEN` does. An authenticated clone requires git ≥ 2.31 (it is
+probed once; an older git fails the provisioning closed rather than fetching without its hardening). Public
+repositories (and non-`https` remotes) need no token. A credential embedded directly in the
+`repository_remote_url` (any userinfo) is **refused** — supply credentials only via the token.
+
+**Scrub + verify before publish (fail closed).** After the tree (and its submodules) is provisioned, every
+git dir in the staged checkout — the top-level `.git`, every absorbed `.git/modules/**` dir, and any embedded
+submodule `.git` — has its `FETCH_HEAD` removed, and every remaining non-object file (config, refs, logs,
+packed-refs, hooks, markers, …) is scanned for the raw, base64 and basic-credential forms of the token. A hit
+**fails the provisioning closed**: the staged tree is discarded and nothing is published.
 
 > **Security note.** `clone` mode performs **outbound git fetches** to the repositories it is asked to
 > ensure and stores their checkouts on the persistent volume as a cache. The commit id is validated as a
 > git object id (never an arbitrary ref/option) and the checked-out `HEAD` is verified against the request
-> before indexing; git helper transports are blocked (`GIT_ALLOW_PROTOCOL`) and prompting is disabled. The
-> token is passed to git on the fetch **argv** (not persisted and not logged), so it is visible only to a
-> process that can already inspect the service host's process list — treat the service host as trusted.
-> Prefer `locate` for nodes that must not reach the network; scope network egress and the control token
-> appropriately when enabling `clone`. Any value other than `locate`/`clone` **fails startup**
+> before indexing; git helper transports are blocked (`GIT_ALLOW_PROTOCOL`; submodules are further limited
+> to `https`) and prompting is disabled. The token lives only in the git child's **environment** (not
+> persisted, not logged, not on argv), so it is visible only to a process that can already read the service
+> process's environment — treat the service host as trusted. Git's default redirect policy is kept; libcurl
+> drops the `Authorization` header on a cross-host redirect. Prefer `locate` for nodes that must not reach
+> the network; scope network egress and the control token appropriately when enabling `clone`. Any value
+> other than `locate`/`clone` **fails startup** (fail-closed).
 > (fail-closed).
 
 The **wire format is snake_case** (`ServiceJson.Options` = `SnakeCaseLower` + ignore-null, matching the
@@ -522,7 +592,11 @@ Plus store-level regressions: `RetentionSnapshotGcTests` (#46/#37/#54), `WriterL
 `ProviderGrowthImmutabilityTests` (#53), and `RemoteFederationTests` (#51 paging/caching/offline/timeout/
 auth). Coverage integrity (#119): `SnapshotCoverageBuilderTests`, `CheckoutInventoryTests`,
 `SnapshotCoverageStoreTests`, `OrchestratorCoverageTests`, `SnapshotServiceCoverageTests`, and the
-`CoverageRegressionFixtureTests` clone of a two-solution repo with an uninitialized submodule.
+`CoverageRegressionFixtureTests` clone of a two-solution repo with a refused-host submodule. Submodule
+provisioning (#125): `CloningCheckoutProviderSubmoduleTests` (local `file://` fixtures, no network:
+absolute/relative/nested pins, unfetchable → partial with reasons, sentinel-token non-persistence across every
+git dir, pre-change cache upgrade), `SubmoduleUrlPolicyTests`, `SubmoduleProvisioningHelperTests`, and the
+`SubmoduleCheckoutIntegrationTests` end-to-end Phase-12 provider-snapshot test.
 
 ### Phase 15 — platform routing tests
 
