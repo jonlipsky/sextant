@@ -298,14 +298,17 @@ public sealed class SnapshotService : IDisposable
                 if (attempts < _options.MaxProvisioningAttempts)
                 {
                     jobs.ReplaceDiagnostics(
-                        job.Id, [ProvisioningDiagnostic(job.Id, "provisioning_transient", ex.Message)]);
+                        job.Id, [ProvisioningDiagnostic(job.Id, ex.DiagnosticCode ?? "provisioning_transient", ex.Message)]);
                     jobs.Requeue(job.Id);
                     return Produced(jobs.GetJob(job.Id)!);
                 }
                 var exhausted = $"provisioning failed after {attempts} attempt(s): {ex.Message}";
                 jobs.MarkResult(job.Id, SnapshotJobStatus.Failed, null, exhausted);
-                jobs.ReplaceDiagnostics(
-                    job.Id, [ProvisioningDiagnostic(job.Id, "provisioning_attempts_exhausted", exhausted)]);
+                SnapshotJobDiagnostic[] exhaustedDiagnostics = ex.DiagnosticCode is { } code
+                    ? [ProvisioningDiagnostic(job.Id, code, ex.Message),
+                       ProvisioningDiagnostic(job.Id, "provisioning_attempts_exhausted", exhausted)]
+                    : [ProvisioningDiagnostic(job.Id, "provisioning_attempts_exhausted", exhausted)];
+                jobs.ReplaceDiagnostics(job.Id, exhaustedDiagnostics);
                 return Produced(jobs.GetJob(job.Id)!);
             }
             catch (Exception ex)

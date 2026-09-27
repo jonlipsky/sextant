@@ -87,10 +87,13 @@ public sealed record SdkPinFinding
 /// <c>global.json</c> at index time — sees the committed content.
 /// </para>
 /// <para>
-/// <b>Crash safety.</b> The original bytes are journaled (atomically, fsynced) OUTSIDE every working tree
-/// before any file is modified. <see cref="RecoverAll"/>/<see cref="Recover"/> replay a leftover journal on
-/// the next run: a file is restored only when it still holds exactly the neutralized content; a file holding
-/// the original or foreign content (e.g. someone re-checked-out the tree) is left alone.
+/// <b>Crash safety.</b> The original bytes are journaled (atomically; the file and, on Unix, its directory
+/// are flushed) OUTSIDE every working tree before any file is modified. <see cref="RecoverAll"/>/<see cref="Recover"/>
+/// replay a leftover journal on the next run, BEFORE the checkout is reused: a file still holding exactly
+/// the neutralized content is restored; the original content needs nothing. A missing or foreign file FAILS
+/// CLOSED (the journal is kept and the checkout is not indexed) unless the checkout's HEAD has moved to
+/// another commit since, or the checkout is gone — then the difference is legitimate and the journal retires.
+/// A journal is only replayed when it is confined to its own checkout on the checkout volume.
 /// </para>
 /// <para>
 /// In-place modification is safe because the service runs one worker at a time behind its write gate and
@@ -99,7 +102,11 @@ public sealed record SdkPinFinding
 /// </summary>
 public sealed class SdkPinGuard
 {
-    private const string TempFileName = ".global.json.sextant-sdk-pin.tmp";
+    // A neutralize/restore writes a uniquely-named sibling temp file (created exclusively, so a repository
+    // file can never be overwritten or deleted) and renames it over global.json. Its name is journaled so a
+    // crash mid-write can be cleaned up; recovery only ever deletes a temp file matching this exact shape.
+    private const string TempFilePrefix = ".global.json.sextant-sdk-pin-";
+    private const string TempFileSuffix = ".tmp";
 
     private static readonly JsonSerializerOptions JournalJson = new()
     {
@@ -171,10 +178,16 @@ public sealed class SdkPinGuard
                 InstalledSdks = Installed(error)
             };
 
-            var refusal = readError ?? Refusal(checkout, path, inside);
+            var refusal = readError
+                ?? Refusal(checkout, path, inside)
+                ?? (error.IsMissingSdk
+                    ? null
+                    : "hostfxr failed to resolve an SDK for a reason other than a missing SDK version, so the pin is not overridden");
             byte[] neutralized = [];
             if (refusal is null && !GlobalJsonSdkPin.TryNeutralize(original!, out neutralized, out var neutralizeError))
                 refusal = neutralizeError;
+            if (refusal is null && pin.Version is null)
+                refusal = "the global.json's \"sdk\" section does not pin a version, so the service does not override it";
 
             SdkPinJournalEntry? entry = null;
             if (refusal is null)
@@ -209,6 +222,7 @@ public sealed class SdkPinGuard
             WriteJournal(journalPath, new SdkPinJournal
             {
                 CheckoutDir = checkout,
+                Head = CheckoutHead.TryRead(checkout),
                 CreatedUtc = DateTimeOffset.UtcNow,
                 Entries = candidates.Select(c => c.Entry).ToList()
             });
@@ -225,11 +239,10 @@ public sealed class SdkPinGuard
         {
             try
             {
-                WriteAtomically(entry.Path, neutralized, entry.UnixMode);
+                WriteAtomically(entry.Path, entry.TempPath, neutralized, entry.UnixMode);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                TryDelete(Path.Combine(Path.GetDirectoryName(entry.Path)!, TempFileName));
                 findings.Add(finding with { NotOverriddenReason = $"global.json could not be rewritten ({ex.Message})" });
                 continue;
             }
@@ -341,7 +354,7 @@ public sealed class SdkPinGuard
     private List<(string Path, HostFxrSdkResolutionError Error)> FindFailingPins(IReadOnlyList<string> solutionPaths)
     {
         var pins = new List<string>();
-        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var seen = new HashSet<string>(GlobalJsonLocator.PathComparer);
         foreach (var directory in GlobalJsonLocator.EvaluationDirectories(solutionPaths))
         {
             if (GlobalJsonLocator.FindNearest(directory) is { } pin && seen.Add(pin))
@@ -349,7 +362,7 @@ public sealed class SdkPinGuard
         }
 
         var failing = new List<(string, HostFxrSdkResolutionError)>();
-        var failingSeen = new HashSet<string>(StringComparer.Ordinal);
+        var failingSeen = new HashSet<string>(GlobalJsonLocator.PathComparer);
         foreach (var pin in pins)
         {
             if (SafeProbe(Path.GetDirectoryName(pin)!) is not { Resolved: false } result)
@@ -398,7 +411,13 @@ public sealed class SdkPinGuard
             return "the service's SDK-pin override is disabled (SEXTANT_SERVICE_SDK_PIN_OVERRIDE=false)";
         if (!inside)
             return "the global.json is outside the checkout, so the service does not modify it";
+        return LinkRefusal(checkout, path);
+    }
 
+    // The service never writes through a symbolic link: not the global.json itself, nor any directory between
+    // it and the checkout root (either could redirect the write outside the checkout).
+    private static string? LinkRefusal(string checkout, string path)
+    {
         try
         {
             if (new FileInfo(path).LinkTarget is not null)
@@ -426,6 +445,7 @@ public sealed class SdkPinGuard
         return new SdkPinJournalEntry
         {
             Path = path,
+            TempPath = Path.Combine(Path.GetDirectoryName(path)!, $"{TempFilePrefix}{Guid.NewGuid():N}{TempFileSuffix}"),
             OriginalBase64 = Convert.ToBase64String(original),
             OriginalSha256 = Sha256(original),
             NeutralizedSha256 = Sha256(neutralized),
@@ -434,48 +454,70 @@ public sealed class SdkPinGuard
         };
     }
 
+    // True only for the exact temp-file shape NewEntry generates, beside the entry's global.json — so a
+    // tampered journal can never make recovery delete an arbitrary file.
+    private static bool IsOwnTempPath(string globalJsonPath, string? tempPath)
+    {
+        if (string.IsNullOrEmpty(tempPath)
+            || !PathEquals(Path.GetDirectoryName(Path.GetFullPath(tempPath)) ?? string.Empty,
+                Path.GetDirectoryName(Path.GetFullPath(globalJsonPath)) ?? string.Empty))
+            return false;
+        var name = Path.GetFileName(tempPath);
+        if (!name.StartsWith(TempFilePrefix, StringComparison.Ordinal) || !name.EndsWith(TempFileSuffix, StringComparison.Ordinal))
+            return false;
+        var token = name[TempFilePrefix.Length..^TempFileSuffix.Length];
+        return token.Length == 32 && token.All(c => c is (>= '0' and <= '9') or (>= 'a' and <= 'f'));
+    }
+
     // Restores one entry. Normal restore puts the committed bytes back unless the file now holds FOREIGN
     // content (neither neutralized nor original — someone else changed it; never clobber). Recovery after a
-    // crash is stricter about a missing file: it is not recreated (the checkout may have been replaced).
+    // crash never recreates a missing file, and it FAILS CLOSED on a missing or foreign file — keeping the
+    // journal so the checkout is not indexed — unless the checkout has since moved to another commit
+    // (<paramref name="checkoutMoved"/>: re-checked-out or replaced, so the file legitimately differs).
     // Returns null on success, else the error.
-    private string? RestoreEntry(SdkPinJournalEntry entry, bool recovering)
+    private string? RestoreEntry(SdkPinJournalEntry entry, bool recovering, bool checkoutMoved = false)
     {
         try
         {
-            TryDelete(Path.Combine(Path.GetDirectoryName(entry.Path)!, TempFileName));
+            if (IsOwnTempPath(entry.Path, entry.TempPath))
+                TryDelete(entry.TempPath);
             var original = Convert.FromBase64String(entry.OriginalBase64);
 
             if (!File.Exists(entry.Path))
             {
-                if (recovering)
+                if (!recovering)
                 {
-                    _log?.Invoke($"sdk-pin: '{entry.Path}' no longer exists; nothing to restore.");
+                    WriteAtomically(entry.Path, entry.TempPath, original, entry.UnixMode);
+                    SetMetadata(entry);
                     return null;
                 }
-                WriteAtomically(entry.Path, original, entry.UnixMode);
-                SetMetadata(entry);
-                return null;
+                if (checkoutMoved)
+                {
+                    _log?.Invoke($"sdk-pin: '{entry.Path}' no longer exists and the checkout has moved to another commit; nothing to restore.");
+                    return null;
+                }
+                return $"'{entry.Path}' is missing although the checkout is still at the commit whose SDK pin was neutralized; it was not recreated";
             }
 
             var current = Sha256(File.ReadAllBytes(entry.Path));
             if (string.Equals(current, entry.OriginalSha256, StringComparison.Ordinal))
             {
-                SetMetadata(entry);
+                if (!checkoutMoved)
+                    SetMetadata(entry);
                 return null;
             }
 
             if (!string.Equals(current, entry.NeutralizedSha256, StringComparison.Ordinal))
             {
-                var message = $"'{entry.Path}' was changed by something else while its SDK pin was neutralized; it was left as-is";
-                if (recovering)
+                if (recovering && checkoutMoved)
                 {
-                    _log?.Invoke($"sdk-pin: {message}.");
+                    _log?.Invoke($"sdk-pin: '{entry.Path}' changed since its SDK pin was neutralized, but the checkout has moved to another commit; left as-is.");
                     return null;
                 }
-                return message;
+                return $"'{entry.Path}' was changed by something else while its SDK pin was neutralized; it was left as-is";
             }
 
-            WriteAtomically(entry.Path, original, entry.UnixMode);
+            WriteAtomically(entry.Path, entry.TempPath, original, entry.UnixMode);
             SetMetadata(entry);
             if (recovering)
                 _log?.Invoke($"sdk-pin: recovered the committed '{entry.Path}' left neutralized by an interrupted job.");
@@ -500,17 +542,39 @@ public sealed class SdkPinGuard
             return false;
         }
 
-        var errors = new List<string>();
-        foreach (var entry in journal?.Entries ?? [])
+        if (JournalProblem(journalPath, journal) is { } problem)
         {
-            if (RestoreEntry(entry, recovering: true) is { } error)
+            _log?.Invoke($"sdk-pin: restore journal '{journalPath}' is not valid ({problem}); leaving it for inspection.");
+            return false;
+        }
+
+        var checkout = Path.GetFullPath(journal!.CheckoutDir);
+        if (!Directory.Exists(checkout))
+        {
+            // The checkout is gone (deleted by an operator): a later clone is fresh, so there is nothing to repair.
+            _log?.Invoke($"sdk-pin: checkout '{checkout}' no longer exists; retiring its restore journal.");
+            TryDelete(journalPath);
+            return true;
+        }
+
+        var head = CheckoutHead.TryRead(checkout);
+        var moved = journal.Head is not null && head is not null
+            && !string.Equals(journal.Head, head, StringComparison.OrdinalIgnoreCase);
+
+        var errors = new List<string>();
+        foreach (var entry in journal.Entries)
+        {
+            if (RestoreEntry(entry, recovering: true, moved) is { } error)
                 errors.Add(error);
         }
 
         if (errors.Count > 0)
         {
             foreach (var error in errors)
-                _log?.Invoke($"sdk-pin: recovery: {error}");
+                _log?.Invoke($"sdk-pin: recovery: {error}.");
+            _log?.Invoke(
+                $"sdk-pin: checkout '{checkout}' is not indexed until an operator restores its committed global.json " +
+                $"(or deletes the checkout so it is re-cloned); the restore journal '{journalPath}' is kept and retires itself then.");
             return false;
         }
 
@@ -518,21 +582,85 @@ public sealed class SdkPinGuard
         return true;
     }
 
+    // A journal is only replayed when it is well-formed and confined: it must be the journal for the checkout
+    // it names, that checkout must lie on the checkout volume the journal directory belongs to, and every
+    // entry must be a non-symlinked global.json inside that checkout whose journaled bytes match their hash.
+    private string? JournalProblem(string journalPath, SdkPinJournal? journal)
+    {
+        if (journal is null)
+            return "it is empty";
+        if (journal.Version != SdkPinJournal.CurrentVersion)
+            return $"unsupported journal version {journal.Version}";
+        if (string.IsNullOrWhiteSpace(journal.CheckoutDir) || !Path.IsPathFullyQualified(journal.CheckoutDir))
+            return "it names no absolute checkout path";
+
+        var checkout = Path.TrimEndingDirectorySeparator(Path.GetFullPath(journal.CheckoutDir));
+        if (!PathEquals(JournalPathFor(checkout), Path.GetFullPath(journalPath)))
+            return "it is not the journal of the checkout it names";
+        var volume = Path.GetDirectoryName(Path.GetDirectoryName(Path.GetFullPath(journalPath)));
+        if (volume is null || !IsContained(volume, checkout))
+            return "the checkout it names is outside the checkout volume";
+
+        foreach (var entry in journal.Entries)
+        {
+            if (string.IsNullOrEmpty(entry.Path) || !Path.IsPathFullyQualified(entry.Path)
+                || !string.Equals(Path.GetFileName(entry.Path), GlobalJsonLocator.FileName, StringComparison.Ordinal)
+                || !IsContained(checkout, Path.GetFullPath(entry.Path)))
+                return "an entry is not a global.json inside the checkout";
+            if (!IsOwnTempPath(entry.Path, entry.TempPath))
+                return "an entry names an unexpected temporary file";
+            try
+            {
+                if (!string.Equals(Sha256(Convert.FromBase64String(entry.OriginalBase64)), entry.OriginalSha256, StringComparison.Ordinal))
+                    return "an entry's journaled content does not match its checksum";
+            }
+            catch (FormatException)
+            {
+                return "an entry's journaled content is not valid base64";
+            }
+            // Recovery only ever rewrites a file that still exists, so only an existing one needs the link check
+            // (LinkTarget throws for a missing path on Unix — a deleted checkout must still retire its journal).
+            var full = Path.GetFullPath(entry.Path);
+            if (File.Exists(full) && LinkRefusal(checkout, full) is { } link)
+                return link;
+        }
+        return null;
+    }
+
     private static void WriteJournal(string journalPath, SdkPinJournal journal)
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(journalPath)!);
+        var directory = Path.GetDirectoryName(journalPath)!;
+        Directory.CreateDirectory(directory);
         var temp = journalPath + ".tmp";
         WriteDurably(temp, JsonSerializer.SerializeToUtf8Bytes(journal, JournalJson));
         File.Move(temp, journalPath, overwrite: true);
+        // The journal must be durable BEFORE global.json is touched, so flush the rename too.
+        _ = DurableDirectory.TryFlush(directory);
     }
 
-    private static void WriteAtomically(string path, byte[] content, int? unixMode)
+    private static void WriteAtomically(string path, string temp, byte[] content, int? unixMode)
     {
-        var temp = Path.Combine(Path.GetDirectoryName(path)!, TempFileName);
-        WriteDurably(temp, content);
-        if (unixMode is { } mode && !OperatingSystem.IsWindows())
-            File.SetUnixFileMode(temp, (UnixFileMode)mode);
-        File.Move(temp, path, overwrite: true);
+        var created = false;
+        try
+        {
+            // CreateNew: never overwrite (or later delete) a file this guard did not create.
+            using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                created = true;
+                stream.Write(content);
+                stream.Flush(flushToDisk: true);
+            }
+            if (unixMode is { } mode && !OperatingSystem.IsWindows())
+                File.SetUnixFileMode(temp, (UnixFileMode)mode);
+            File.Move(temp, path, overwrite: true);
+            created = false;
+        }
+        finally
+        {
+            if (created)
+                DeleteQuietly(temp);
+        }
+        _ = DurableDirectory.TryFlush(Path.GetDirectoryName(path)!);
     }
 
     private static void WriteDurably(string path, byte[] content)
@@ -562,6 +690,18 @@ public sealed class SdkPinGuard
         }
     }
 
+    private static void DeleteQuietly(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Best effort: a stray temp file is journaled and removed by the next restore/recovery.
+        }
+    }
+
     private static string Sha256(byte[] content) => Convert.ToHexStringLower(SHA256.HashData(content));
 
     private static string DisplayPath(string checkout, string path, bool inside) =>
@@ -577,9 +717,7 @@ public sealed class SdkPinGuard
     }
 
     private static bool PathEquals(string a, string b) =>
-        string.Equals(
-            Path.TrimEndingDirectorySeparator(a), Path.TrimEndingDirectorySeparator(b),
-            OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal);
+        GlobalJsonLocator.PathComparer.Equals(Path.TrimEndingDirectorySeparator(a), Path.TrimEndingDirectorySeparator(b));
 }
 
 /// <summary>
@@ -629,8 +767,14 @@ public sealed class SdkPinOverlay
 
 internal sealed record SdkPinJournal
 {
-    public int Version { get; init; } = 1;
+    public const int CurrentVersion = 1;
+
+    public int Version { get; init; } = CurrentVersion;
     public required string CheckoutDir { get; init; }
+
+    /// <summary>The commit the checkout's HEAD pointed at when the pin was neutralized (null when unknown).</summary>
+    public string? Head { get; init; }
+
     public DateTimeOffset CreatedUtc { get; init; }
     public List<SdkPinJournalEntry> Entries { get; init; } = [];
 }
@@ -638,6 +782,10 @@ internal sealed record SdkPinJournal
 internal sealed record SdkPinJournalEntry
 {
     public required string Path { get; init; }
+
+    /// <summary>The uniquely-named sibling temp file used to rewrite <see cref="Path"/> atomically.</summary>
+    public required string TempPath { get; init; }
+
     public required string OriginalBase64 { get; init; }
     public required string OriginalSha256 { get; init; }
     public required string NeutralizedSha256 { get; init; }

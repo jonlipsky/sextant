@@ -11,6 +11,14 @@ public static class GlobalJsonLocator
 {
     public const string FileName = "global.json";
 
+    /// <summary>
+    /// The path comparer matching the host file system's usual case sensitivity (case-insensitive on Windows
+    /// and macOS, case-sensitive elsewhere), so distinct directories are never merged on Linux and one
+    /// physical file is never reported twice on Windows.
+    /// </summary>
+    public static StringComparer PathComparer { get; } =
+        OperatingSystem.IsWindows() || OperatingSystem.IsMacOS() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+
     /// <summary>The full path of the nearest <c>global.json</c> at or above <paramref name="directory"/>, or null.</summary>
     public static string? FindNearest(string directory)
     {
@@ -35,7 +43,7 @@ public static class GlobalJsonLocator
     /// </summary>
     public static IReadOnlyList<string> EvaluationDirectories(IEnumerable<string> solutionPaths)
     {
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var seen = new HashSet<string>(PathComparer);
         var result = new List<string>();
         foreach (var solution in solutionPaths)
         {
