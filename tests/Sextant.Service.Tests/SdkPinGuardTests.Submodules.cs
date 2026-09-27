@@ -37,6 +37,27 @@ public sealed partial class SdkPinGuardTests
         File.WriteAllText(Path.Combine(gitDir, "HEAD"), head + "\n");
     }
 
+    private string SubmoduleGitDir => Path.Combine(_checkout, ".git", "modules", "libs", "sub");
+
+    private const string InnerHead = "5555555555555555555555555555555555555555";
+
+    // A submodule nested in libs/sub (absorbed into the superproject's .git/modules/libs/sub/modules/…).
+    private (string Inner, string InnerGitDir, string Solution, string Pin) AddNestedSubmodule()
+    {
+        AddSubmodule();
+        var inner = Path.Combine(Submodule, "deps", "inner");
+        Directory.CreateDirectory(inner);
+        File.WriteAllText(Path.Combine(inner, ".git"), "gitdir: ../../../../.git/modules/libs/sub/modules/deps/inner\n");
+        var innerGitDir = Path.Combine(SubmoduleGitDir, "modules", "deps", "inner");
+        Directory.CreateDirectory(innerGitDir);
+        File.WriteAllText(Path.Combine(innerGitDir, "HEAD"), InnerHead + "\n");
+        var solution = Path.Combine(inner, "Inner.slnx");
+        File.WriteAllText(solution, "<Solution />");
+        var pin = Path.Combine(inner, "global.json");
+        WritePin(pin, SubmodulePin);
+        return (inner, innerGitDir, solution, pin);
+    }
+
     [TestMethod]
     public void AnUnverifiablePin_NeverSuppressesTheOverrideOfAnotherPin()
     {
@@ -94,6 +115,7 @@ public sealed partial class SdkPinGuardTests
         var subEntry = entries.Single(e => (string)e["path"]! == SubmoduleGlobalJson);
         Assert.AreEqual(Submodule, (string)subEntry["work_tree"]!);
         Assert.AreEqual(SubmoduleHead, (string)subEntry["work_tree_head"]!);
+        Assert.AreEqual(SubmoduleGitDir, (string)subEntry["work_tree_git_dir"]!);
         var rootEntry = entries.Single(e => (string)e["path"]! == GlobalJson);
         Assert.IsFalse(rootEntry.ContainsKey("work_tree"), "a checkout-owned entry carries no submodule fields");
 
@@ -172,18 +194,7 @@ public sealed partial class SdkPinGuardTests
     [TestMethod]
     public void ANestedSubmodulePin_IsVerifiedThroughEveryGitlink()
     {
-        AddSubmodule();
-        var inner = Path.Combine(Submodule, "deps", "inner");
-        Directory.CreateDirectory(inner);
-        File.WriteAllText(Path.Combine(inner, ".git"), "gitdir: ../../../../.git/modules/libs/sub/modules/deps/inner\n");
-        var innerGitDir = Path.Combine(_checkout, ".git", "modules", "libs", "sub", "modules", "deps", "inner");
-        Directory.CreateDirectory(innerGitDir);
-        const string innerHead = "5555555555555555555555555555555555555555";
-        File.WriteAllText(Path.Combine(innerGitDir, "HEAD"), innerHead + "\n");
-        var innerSolution = Path.Combine(inner, "Inner.slnx");
-        File.WriteAllText(innerSolution, "<Solution />");
-        var innerPin = Path.Combine(inner, "global.json");
-        WritePin(innerPin, SubmodulePin);
+        var (inner, innerGitDir, innerSolution, _) = AddNestedSubmodule();
         var verifier = new RecordingVerifier();
         var guard = NewGuard(probe: new FakeHostFxr(), verifier: verifier);
 
@@ -194,14 +205,74 @@ public sealed partial class SdkPinGuardTests
             new[]
             {
                 (Path.GetFullPath(_checkout), DefaultHead, Submodule, SubmoduleHead),
-                (Submodule, SubmoduleHead, inner, innerHead)
+                (Submodule, SubmoduleHead, inner, InnerHead)
             },
             verifier.GitlinkCalls.ToArray(), "outermost first, each against its parent's verified commit");
         var call = verifier.Calls.Single();
-        Assert.AreEqual((inner, innerHead), (call.Checkout, call.Head), "verified in the innermost repository");
+        Assert.AreEqual((inner, InnerHead), (call.Checkout, call.Head), "verified in the innermost repository");
         var entry = JsonNode.Parse(File.ReadAllText(guard.JournalPathFor(_checkout)))!["entries"]![0]!.AsObject();
         Assert.AreEqual(inner, (string)entry["work_tree"]!);
-        Assert.AreEqual(innerHead, (string)entry["work_tree_head"]!);
+        Assert.AreEqual(InnerHead, (string)entry["work_tree_head"]!);
+        Assert.AreEqual(innerGitDir, (string)entry["work_tree_git_dir"]!);
+        overlay.Restore();
+        Assert.IsNull(overlay.RestoreError);
+    }
+
+    [TestMethod]
+    [DataRow("outside-absolute", DisplayName = "an absolute gitdir outside the checkout")]
+    [DataRow("outside-relative", DisplayName = "a relative gitdir that escapes the checkout")]
+    [DataRow("not-git-metadata", DisplayName = "a gitdir inside the checkout but not under a .git directory")]
+    public void ASubmoduleWhoseGitMetadataIsNotTheCheckoutsOwn_IsRefused(string pointer)
+    {
+        // Its HEAD would describe some other repository (e.g. another checkout's), not this work tree.
+        var subSolution = AddSubmodule();
+        WritePin(GlobalJson);
+        var subBytes = WritePin(SubmoduleGlobalJson, SubmodulePin);
+        var elsewhere = pointer == "not-git-metadata"
+            ? Path.Combine(_checkout, "src", "modules", "sub")
+            : Path.Combine(_root, "other-checkout", ".git", "modules", "libs", "sub");
+        Directory.CreateDirectory(elsewhere);
+        File.WriteAllText(Path.Combine(elsewhere, "HEAD"), SubmoduleHead + "\n");
+        var target = pointer == "outside-absolute" ? elsewhere : Path.GetRelativePath(Submodule, elsewhere);
+        File.WriteAllText(Path.Combine(Submodule, ".git"), $"gitdir: {target}\n");
+        var verifier = new RecordingVerifier();
+
+        var overlay = NewGuard(probe: new FakeHostFxr(), verifier: verifier).Apply(_checkout, [_solution, subSolution]);
+
+        var refused = overlay.Findings.Single(f => f.GlobalJsonPath == "libs/sub/global.json");
+        Assert.IsFalse(refused.OverrideApplied);
+        StringAssert.Contains(refused.NotOverriddenReason, "keeps its git metadata outside the checkout's own git directories");
+        Assert.IsTrue(overlay.Findings.Single(f => f.GlobalJsonPath == "global.json").OverrideApplied);
+        Assert.AreEqual(0, verifier.GitlinkCalls.Count);
+        Assert.IsFalse(verifier.Calls.Any(c => c.Files.Any(f => f.Path == SubmoduleGlobalJson)));
+        CollectionAssert.AreEqual(subBytes, File.ReadAllBytes(SubmoduleGlobalJson));
+        overlay.Restore();
+        Assert.IsNull(overlay.RestoreError);
+    }
+
+    [TestMethod]
+    public void ASubmoduleWhoseDotGitIsASymbolicLink_IsRefused()
+    {
+        var subSolution = AddSubmodule();
+        WritePin(GlobalJson);
+        var subBytes = WritePin(SubmoduleGlobalJson, SubmodulePin);
+        var dotGit = Path.Combine(Submodule, ".git");
+        File.Delete(dotGit);
+        try
+        {
+            Directory.CreateSymbolicLink(dotGit, SubmoduleGitDir);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            Assert.Inconclusive($"symbolic links cannot be created here: {ex.Message}");
+        }
+
+        var overlay = NewGuard(probe: new FakeHostFxr()).Apply(_checkout, [_solution, subSolution]);
+
+        StringAssert.Contains(overlay.Findings.Single(f => f.GlobalJsonPath == "libs/sub/global.json").NotOverriddenReason,
+            "is a symbolic link");
+        Assert.IsTrue(overlay.Findings.Single(f => f.GlobalJsonPath == "global.json").OverrideApplied);
+        CollectionAssert.AreEqual(subBytes, File.ReadAllBytes(SubmoduleGlobalJson));
         overlay.Restore();
         Assert.IsNull(overlay.RestoreError);
     }
@@ -308,6 +379,88 @@ public sealed partial class SdkPinGuardTests
     }
 
     [TestMethod]
+    [DataRow("other-git-dir", DisplayName = "repointed at another git directory of the checkout, at another commit")]
+    [DataRow("outside-checkout", DisplayName = "repointed at a git directory outside the checkout")]
+    public void Recovery_AfterTheSubmodulesGitMetadataWasRepointed_FailsClosed(string pointer)
+    {
+        // Its HEAD no longer describes the journaled work tree, so a different commit there proves nothing — the
+        // entry must not be retired as "moved" (which would leave the pin neutralized), nor restored.
+        var subSolution = AddSubmodule();
+        WritePin(GlobalJson);
+        WritePin(SubmoduleGlobalJson, SubmodulePin);
+        _ = NewGuard(probe: new FakeHostFxr()).Apply(_checkout, [_solution, subSolution]); // "crash"
+        var neutralized = File.ReadAllBytes(SubmoduleGlobalJson);
+        var other = pointer == "other-git-dir"
+            ? Path.Combine(_checkout, ".git", "modules", "other")
+            : Path.Combine(_root, "other-checkout", ".git", "modules", "libs", "sub");
+        Directory.CreateDirectory(other);
+        File.WriteAllText(Path.Combine(other, "HEAD"), "4444444444444444444444444444444444444444\n");
+        File.WriteAllText(Path.Combine(Submodule, ".git"), $"gitdir: {other}\n");
+        var logs = new List<string>();
+
+        Assert.IsFalse(NewGuard(probe: new FakeHostFxr(), log: logs.Add).Recover(_checkout), "the checkout must not be indexed");
+
+        CollectionAssert.AreEqual(neutralized, File.ReadAllBytes(SubmoduleGlobalJson), "nothing is written");
+        Assert.AreEqual(1, Directory.GetFiles(JournalDir).Length, "the journal keeps blocking the checkout");
+        Assert.IsFalse(logs.Any(l => l.Contains("moved from", StringComparison.Ordinal)), string.Join(Environment.NewLine, logs));
+        StringAssert.Contains(string.Join(Environment.NewLine, logs),
+            pointer == "other-git-dir" ? "now keeps its git metadata in" : "keeps its git metadata outside the checkout's own git directories");
+    }
+
+    [TestMethod]
+    public void Recovery_OfACheckoutEntryThatLiesInsideAPopulatedSubmodule_FailsClosed()
+    {
+        // A version-1 (checkout-owned) entry is replayed after only the checkout's HEAD check; a global.json inside a
+        // populated submodule belongs to the submodule's commit, which such an entry never recorded.
+        var subSolution = AddSubmodule();
+        WritePin(GlobalJson);
+        WritePin(SubmoduleGlobalJson, SubmodulePin);
+        var guard = NewGuard(probe: new FakeHostFxr());
+        _ = guard.Apply(_checkout, [_solution, subSolution]); // "crash"
+        var neutralized = File.ReadAllBytes(SubmoduleGlobalJson);
+        var journalPath = guard.JournalPathFor(_checkout);
+        var journal = JsonNode.Parse(File.ReadAllText(journalPath))!.AsObject();
+        journal["version"] = SdkPinJournal.CurrentVersion;
+        var entry = journal["entries"]!.AsArray().Select(e => e!.AsObject()).Single(e => e.ContainsKey("work_tree"));
+        entry.Remove("work_tree");
+        entry.Remove("work_tree_head");
+        entry.Remove("work_tree_git_dir");
+        File.WriteAllText(journalPath, journal.ToJsonString());
+        var logs = new List<string>();
+
+        Assert.IsFalse(NewGuard(probe: new FakeHostFxr(), log: logs.Add).Recover(_checkout));
+
+        CollectionAssert.AreEqual(neutralized, File.ReadAllBytes(SubmoduleGlobalJson), "nothing is written");
+        Assert.IsTrue(File.Exists(journalPath));
+        Assert.IsTrue(logs.Any(l => l.Contains("records no submodule commit", StringComparison.Ordinal)), string.Join(Environment.NewLine, logs));
+    }
+
+    [TestMethod]
+    public void Recovery_OfAnEntryNamingAnOuterSubmodule_FailsClosed()
+    {
+        // The file lies in a nested submodule; an entry recording only the OUTER one would replay after checking the
+        // wrong repository's commit.
+        var (_, _, innerSolution, innerPin) = AddNestedSubmodule();
+        var guard = NewGuard(probe: new FakeHostFxr());
+        _ = guard.Apply(_checkout, [innerSolution]); // "crash"
+        var neutralized = File.ReadAllBytes(innerPin);
+        var journalPath = guard.JournalPathFor(_checkout);
+        var journal = JsonNode.Parse(File.ReadAllText(journalPath))!.AsObject();
+        var entry = journal["entries"]![0]!.AsObject();
+        entry["work_tree"] = Submodule;
+        entry["work_tree_head"] = SubmoduleHead;
+        entry["work_tree_git_dir"] = SubmoduleGitDir;
+        File.WriteAllText(journalPath, journal.ToJsonString());
+        var logs = new List<string>();
+
+        Assert.IsFalse(NewGuard(probe: new FakeHostFxr(), log: logs.Add).Recover(_checkout));
+
+        CollectionAssert.AreEqual(neutralized, File.ReadAllBytes(innerPin), "nothing is written");
+        Assert.IsTrue(File.Exists(journalPath));
+        Assert.IsTrue(logs.Any(l => l.Contains("the innermost submodule containing it is not", StringComparison.Ordinal)), string.Join(Environment.NewLine, logs));
+    }
+
+    [TestMethod]
     [DataRow("v1-with-submodule")]
     [DataRow("work-tree-outside")]
     [DataRow("work-tree-not-containing")]
@@ -315,6 +468,10 @@ public sealed partial class SdkPinGuardTests
     [DataRow("head-missing")]
     [DataRow("head-malformed")]
     [DataRow("work-tree-missing")]
+    [DataRow("git-dir-missing")]
+    [DataRow("git-dir-relative")]
+    [DataRow("git-dir-not-git-metadata")]
+    [DataRow("v2-without-submodule-entry")]
     [DataRow("entry-in-git-metadata")]
     public void MalformedSubmoduleJournal_IsKept_AndNeverReplayed(string mutation)
     {
@@ -336,6 +493,13 @@ public sealed partial class SdkPinGuardTests
             case "head-missing": entry.Remove("work_tree_head"); break;
             case "head-malformed": entry["work_tree_head"] = "HEAD"; break;
             case "work-tree-missing": entry.Remove("work_tree"); break;
+            case "git-dir-missing": entry.Remove("work_tree_git_dir"); break;
+            case "git-dir-relative": entry["work_tree_git_dir"] = ".git/modules/libs/sub"; break;
+            case "git-dir-not-git-metadata": entry["work_tree_git_dir"] = Path.Combine(_checkout, "src"); break;
+            case "v2-without-submodule-entry":
+                // Only the checkout-owned entry is left, under the version Apply writes only with a submodule entry.
+                journal["entries"]!.AsArray().Remove(entry);
+                break;
             case "entry-in-git-metadata":
                 entry["path"] = Path.Combine(_checkout, ".git", "modules", "libs", "sub", "global.json");
                 entry["temp_path"] = Path.Combine(_checkout, ".git", "modules", "libs", "sub", Path.GetFileName((string)entry["temp_path"]!));

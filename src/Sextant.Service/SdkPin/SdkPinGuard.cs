@@ -116,8 +116,9 @@ public sealed record SdkPinFinding
 /// confirms is exactly its committed content (<see cref="ICheckoutContentVerifier"/>), so the journal only
 /// ever holds the commit's bytes. Each pin is verified on its own, against the repository that owns it
 /// (issue #171): the checkout, or — for a pin inside a populated submodule — the innermost submodule, which
-/// must be checked out at exactly the gitlink its parent's verified commit records. Such an entry also
-/// journals the submodule's commit, and recovery restores it only while the submodule is still there. An
+/// must keep its git metadata inside the checkout's own and be checked out at exactly the gitlink its parent's
+/// verified commit records. Such an entry also journals the submodule's commit and git directory, and
+/// recovery restores it only while the submodule is still there. An
 /// unverifiable pin is refused with its own reason and never stops another pin from being overridden.
 /// </para>
 /// <para>
@@ -299,7 +300,7 @@ public sealed class SdkPinGuard
                 });
                 continue;
             }
-            verified.Add((finding, owner is null ? entry : entry with { WorkTree = owner.Dir, WorkTreeHead = owner.Head }, neutralized));
+            verified.Add((finding, owner is null ? entry : entry with { WorkTree = owner.Dir, WorkTreeHead = owner.Head, WorkTreeGitDir = owner.GitDir }, neutralized));
         }
         if (verified.Count == 0)
             return new SdkPinOverlay(this, checkout, journalPath: null, [], findings);
@@ -500,14 +501,16 @@ public sealed class SdkPinGuard
         return failing;
     }
 
-    // The repository that owns a pin: its work tree and the commit it is checked out at.
-    private sealed record PinOwner(string Dir, string Head);
+    // The repository that owns a pin: its work tree, the commit it is checked out at, and — for a submodule — the
+    // git directory its `.git` entry resolves to.
+    private sealed record PinOwner(string Dir, string Head, string? GitDir = null);
 
     // Issue #171: a pin is verified against the repository that owns it. That is the checkout itself, or, for a
     // global.json inside a populated submodule, the INNERMOST submodule containing it, reached through a chain
-    // of gitlinks: each submodule must be checked out at exactly the commit its parent's verified commit pins,
-    // so the file is still the superproject commit's content. `submodule` is set only in the submodule case;
-    // the journal records it so recovery can tell a submodule that moved since from one modified in place.
+    // of gitlinks: each submodule must keep its git metadata inside the checkout's own git directories and be
+    // checked out at exactly the commit its parent's verified commit pins, so the file is still the superproject
+    // commit's content. `submodule` is set only in the submodule case; the journal records it so recovery can
+    // tell a submodule that moved since from one modified in place.
     private string? VerifyCandidate(string checkout, string head, SdkPinJournalEntry entry, out PinOwner? submodule)
     {
         submodule = null;
@@ -518,12 +521,15 @@ public sealed class SdkPinGuard
         var owner = new PinOwner(checkout, head);
         foreach (var dir in chain)
         {
+            var gitDir = SubmoduleGitDirectory(checkout, dir, out var gitDirProblem);
+            if (gitDir is null)
+                return gitDirProblem;
             var dirHead = CheckoutHead.TryRead(dir);
             if (dirHead is null)
                 return $"the git HEAD of the submodule '{DisplayPath(checkout, dir, inside: true)}' that contains it cannot be read";
             if (VerifyGitlink(owner, dir, dirHead) is { } gitlink)
                 return gitlink;
-            owner = new PinOwner(dir, dirHead);
+            owner = new PinOwner(dir, dirHead, gitDir);
         }
 
         if (VerifyCommitted(owner.Dir, owner.Head, [new CheckoutFileContent(entry.Path, Convert.FromBase64String(entry.OriginalBase64))]) is { } content)
@@ -554,6 +560,58 @@ public sealed class SdkPinGuard
         trees.Reverse();
         return trees;
     }
+
+    // Issue #171: a submodule's HEAD — and the journal entry recording it — only describes THIS work tree when its
+    // git metadata is the checkout's own: an embedded `.git` directory, or an absorbed git dir under a `.git`
+    // directory inside the checkout (`.git/modules/…`), reached through no symbolic link or junction. A `.git`
+    // file pointing anywhere else (another checkout's repository, a path outside the checkout) is refused.
+    private static string? SubmoduleGitDirectory(string checkout, string workTree, out string? problem)
+    {
+        var display = DisplayPath(checkout, workTree, inside: true);
+        try
+        {
+            var dotGit = Path.Combine(workTree, ".git");
+            FileSystemInfo entry = Directory.Exists(dotGit) ? new DirectoryInfo(dotGit) : new FileInfo(dotGit);
+            if (IsLink(entry))
+            {
+                problem = $"the '.git' entry of the submodule '{display}' is a symbolic link";
+                return null;
+            }
+            if (CheckoutHead.TryReadGitDirectory(workTree) is not { } resolved)
+            {
+                problem = $"the git metadata of the submodule '{display}' cannot be read";
+                return null;
+            }
+            var gitDir = Path.TrimEndingDirectorySeparator(Path.GetFullPath(resolved));
+            if (!IsInsideCheckoutGitMetadata(checkout, gitDir))
+            {
+                problem = $"the submodule '{display}' keeps its git metadata outside the checkout's own git directories";
+                return null;
+            }
+            for (var dir = gitDir; dir is not null && IsContained(checkout, dir); dir = Path.GetDirectoryName(dir))
+            {
+                if (IsLink(new DirectoryInfo(dir)))
+                {
+                    problem = $"the git metadata of the submodule '{display}' is reached through a symbolic link";
+                    return null;
+                }
+            }
+            problem = null;
+            return gitDir;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            problem = $"the git metadata of the submodule '{display}' could not be inspected ({ex.Message})";
+            return null;
+        }
+    }
+
+    // A directory inside the checkout with a `.git` segment: the checkout's own git metadata (or a submodule's).
+    private static bool IsInsideCheckoutGitMetadata(string checkout, string dir) =>
+        IsContained(checkout, dir)
+        && Path.GetRelativePath(checkout, dir)
+            .Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries)
+            .Any(segment => string.Equals(segment, ".git", StringComparison.OrdinalIgnoreCase));
 
     private string? VerifyGitlink(PinOwner parent, string submoduleDir, string submoduleHead)
     {
@@ -825,7 +883,7 @@ public sealed class SdkPinGuard
         var current = new List<SdkPinJournalEntry>();
         foreach (var entry in journal.Entries)
         {
-            var state = SubmoduleEntryState(entry, out var submoduleProblem);
+            var state = SubmoduleEntryState(checkout, entry, out var submoduleProblem);
             if (state == EntryState.Current)
                 current.Add(entry);
             else if (state == EntryState.Unconfirmed)
@@ -865,15 +923,28 @@ public sealed class SdkPinGuard
 
     private enum EntryState { Current, Moved, Unconfirmed }
 
-    // Whether a journal entry still belongs to the tree whose pin was neutralized. A checkout-owned entry always
-    // does (the checkout's HEAD was already confirmed); a submodule entry only while the submodule is still at the
-    // journaled commit. A submodule whose HEAD cannot be read — or that is no longer a work tree although its
-    // global.json remains — FAILS CLOSED, exactly like the checkout's own unreadable HEAD.
-    private EntryState SubmoduleEntryState(SdkPinJournalEntry entry, out string? problem)
+    // Whether a journal entry still belongs to the tree whose pin was neutralized. A checkout-owned entry does (the
+    // checkout's HEAD was already confirmed) unless its global.json now lies inside a populated submodule; a
+    // submodule entry only while its file's innermost submodule is still the journaled one, with the same git
+    // metadata, at the journaled commit. A submodule whose HEAD or git metadata cannot be confirmed — or that is
+    // no longer a work tree although its global.json remains — FAILS CLOSED, exactly like the checkout's own
+    // unreadable HEAD.
+    private EntryState SubmoduleEntryState(string checkout, SdkPinJournalEntry entry, out string? problem)
     {
         problem = null;
+        var enclosing = EnclosingSubmodules(checkout, Path.GetFullPath(entry.Path), out var enclosingProblem);
+        if (enclosingProblem is not null)
+        {
+            problem = $"'{entry.Path}' was not restored: {enclosingProblem}";
+            return EntryState.Unconfirmed;
+        }
         if (entry.WorkTree is null)
-            return EntryState.Current;
+        {
+            if (enclosing.Count == 0)
+                return EntryState.Current;
+            problem = $"'{entry.Path}' was not restored: it lies inside the submodule '{enclosing[^1]}', but its journal entry records no submodule commit";
+            return EntryState.Unconfirmed;
+        }
 
         var workTree = Path.GetFullPath(entry.WorkTree);
         var git = PresenceOf(Path.Combine(workTree, ".git"), out var error);
@@ -893,6 +964,23 @@ public sealed class SdkPinGuard
         if (git == Presence.Unknown)
         {
             problem = $"could not access the submodule '{workTree}' ({error}); '{entry.Path}' was not restored";
+            return EntryState.Unconfirmed;
+        }
+        if (enclosing.Count == 0 || !PathEquals(enclosing[^1], workTree))
+        {
+            problem = $"'{entry.Path}' was not restored: the innermost submodule containing it is not '{workTree}', the one its journal entry records";
+            return EntryState.Unconfirmed;
+        }
+        var gitDir = SubmoduleGitDirectory(checkout, workTree, out var gitDirProblem);
+        if (gitDir is null)
+        {
+            problem = $"'{entry.Path}' was not restored: {gitDirProblem}";
+            return EntryState.Unconfirmed;
+        }
+        if (!PathEquals(gitDir, entry.WorkTreeGitDir!))
+        {
+            problem = $"'{entry.Path}' was not restored: the submodule '{workTree}' now keeps its git metadata in '{gitDir}', " +
+                $"not '{entry.WorkTreeGitDir}', so its commit cannot be confirmed";
             return EntryState.Unconfirmed;
         }
 
@@ -957,9 +1045,13 @@ public sealed class SdkPinGuard
             if (!paths.Add(Path.GetFullPath(entry.Path)) || !temps.Add(Path.GetFullPath(entry.TempPath)))
                 return "it lists the same file twice";
         }
-        // A version-1 journal predates submodule entries; one that names a submodule was not written by Apply.
-        if (journal.Version == SdkPinJournal.CurrentVersion && entries.Any(e => e.WorkTree is not null))
+        // A version-1 journal predates submodule entries, and Apply writes version 2 only for a journal with one: a
+        // journal whose version and entries disagree was not written by Apply.
+        var hasSubmoduleEntry = entries.Any(e => e.WorkTree is not null);
+        if (journal.Version == SdkPinJournal.CurrentVersion && hasSubmoduleEntry)
             return "a version-1 journal lists a submodule entry";
+        if (journal.Version == SdkPinJournal.SubmoduleVersion && !hasSubmoduleEntry)
+            return "a version-2 journal lists no submodule entry";
         return null;
     }
 
@@ -1010,20 +1102,22 @@ public sealed class SdkPinGuard
         return SubmoduleEntryProblem(checkout, entry);
     }
 
-    // A submodule entry names both its work tree and that work tree's commit, and the work tree lies inside the
-    // checkout and contains the entry's global.json.
+    // A submodule entry names its work tree, that work tree's commit, and its git directory; the work tree lies
+    // inside the checkout and contains the entry's global.json, and the git directory is checkout git metadata.
     private static string? SubmoduleEntryProblem(string checkout, SdkPinJournalEntry entry)
     {
-        if (entry.WorkTree is null && entry.WorkTreeHead is null)
+        if (entry.WorkTree is null && entry.WorkTreeHead is null && entry.WorkTreeGitDir is null)
             return null;
-        if (entry.WorkTree is null || entry.WorkTreeHead is null)
+        if (entry.WorkTree is null || entry.WorkTreeHead is null || entry.WorkTreeGitDir is null)
             return "an entry records its submodule incompletely";
-        if (!Path.IsPathFullyQualified(entry.WorkTree))
+        if (!Path.IsPathFullyQualified(entry.WorkTree) || !Path.IsPathFullyQualified(entry.WorkTreeGitDir))
             return "an entry's submodule is not an absolute path";
         var workTree = Path.GetFullPath(entry.WorkTree);
         // (A work tree under .git would put the entry there too, which EntryProblem has already refused.)
         if (!IsContained(checkout, workTree) || !IsContained(workTree, Path.GetFullPath(entry.Path)))
             return "an entry's submodule is not inside the checkout, or does not contain its global.json";
+        if (!IsInsideCheckoutGitMetadata(checkout, Path.GetFullPath(entry.WorkTreeGitDir)))
+            return "an entry's submodule git directory is not inside the checkout's git metadata";
         if (!CheckoutHead.IsObjectId(entry.WorkTreeHead))
             return "an entry's submodule HEAD is not a commit id";
         return null;
@@ -1269,4 +1363,11 @@ internal sealed record SdkPinJournalEntry
     /// <summary>The commit <see cref="WorkTree"/> was checked out at when the pin was neutralized.</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? WorkTreeHead { get; init; }
+
+    /// <summary>
+    /// The git directory <see cref="WorkTree"/>'s <c>.git</c> entry resolved to (inside the checkout's own git
+    /// metadata); recovery refuses an entry whose submodule now resolves to any other.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? WorkTreeGitDir { get; init; }
 }
