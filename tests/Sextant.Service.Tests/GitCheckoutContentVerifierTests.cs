@@ -152,13 +152,17 @@ public sealed class GitCheckoutContentVerifierTests
     }
 
     [TestMethod]
-    public void ACheckoutRenderedByAFilterDriver_IsNeverVouchedFor()
+    [DataRow("swap", "global.json filter=swap\n", DisplayName = "a named driver")]
+    [DataRow("unspecified", "global.json filter=unspecified\n", DisplayName = "a driver named like an unspecified attribute")]
+    [DataRow("unset", "global.json filter=unset\n", DisplayName = "a driver named like an unset attribute")]
+    [DataRow("swap", "[attr]swapped filter=swap\nglobal.json swapped\n", DisplayName = "a driver set through a macro")]
+    public void ACheckoutRenderedByAFilterDriver_IsNeverVouchedFor(string driver, string attributes)
     {
         // The driver's clean hides the edit from `git status`, and its smudge renders exactly the bytes on disk,
         // but that output is the program's, not the blob's.
-        Git(_checkout, "config", "filter.swap.clean", "sed -e s/10.0.998/10.0.999/");
-        Git(_checkout, "config", "filter.swap.smudge", "sed -e s/10.0.999/10.0.998/");
-        File.WriteAllText(Path.Combine(_checkout, ".gitattributes"), "global.json filter=swap\n");
+        Git(_checkout, "config", $"filter.{driver}.clean", @"sed -e s/10\.0\.998/10.0.999/");
+        Git(_checkout, "config", $"filter.{driver}.smudge", @"sed -e s/10\.0\.999/10.0.998/");
+        File.WriteAllText(Path.Combine(_checkout, ".gitattributes"), attributes);
         Git(_checkout, "add", ".gitattributes");
         Git(_checkout, "commit", "--quiet", "-m", "filter");
         var head = Git(_checkout, "rev-parse", "HEAD").Trim();
@@ -168,7 +172,7 @@ public sealed class GitCheckoutContentVerifierTests
         Assert.AreEqual(string.Empty, Git(_checkout, "status", "--porcelain", "--untracked-files=no"),
             "precondition: git status sees no change");
 
-        StringAssert.Contains(Verifier.Problem(_checkout, head, OnDisk(GlobalJson)), "through the 'swap' filter driver");
+        StringAssert.Contains(Verifier.Problem(_checkout, head, OnDisk(GlobalJson)), $"through the '{driver}' filter driver");
     }
 
     [TestMethod]
