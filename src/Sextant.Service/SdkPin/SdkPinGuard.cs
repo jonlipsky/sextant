@@ -1021,8 +1021,8 @@ public sealed class SdkPinGuard
         if (!Path.IsPathFullyQualified(entry.WorkTree))
             return "an entry's submodule is not an absolute path";
         var workTree = Path.GetFullPath(entry.WorkTree);
-        if (!IsContained(checkout, workTree) || !IsContained(workTree, Path.GetFullPath(entry.Path))
-            || IsUnderGitMetadata(checkout, Path.Combine(workTree, GlobalJsonLocator.FileName)))
+        // (A work tree under .git would put the entry there too, which EntryProblem has already refused.)
+        if (!IsContained(checkout, workTree) || !IsContained(workTree, Path.GetFullPath(entry.Path)))
             return "an entry's submodule is not inside the checkout, or does not contain its global.json";
         if (!CheckoutHead.IsObjectId(entry.WorkTreeHead))
             return "an entry's submodule HEAD is not a commit id";
