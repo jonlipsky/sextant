@@ -144,18 +144,31 @@ public static class SnapshotCoverageBuilder
 
         if (unpopulated.Count > 0)
         {
+            // Explain WHY each gap exists when the cloning provider recorded it (issue #125): url refused,
+            // fetch failed, pinned commit missing, … — keyed by the SAME checkout-relative path the scan uses.
+            var provisioning = new Dictionary<string, SubmoduleProvisioningOutcome>(comparer);
+            foreach (var outcome in resolution.SubmoduleProvisioning)
+                provisioning.TryAdd(outcome.Path, outcome);
+            string Describe(DeclaredSubmodule s) =>
+                provisioning.TryGetValue(s.Path, out var o) && !o.IsPopulated
+                    ? $"{s.Path} ({SubmoduleProvisioningStatus.Describe(o.Status)}{(o.Reason is { Length: > 0 } r ? ": " + r : string.Empty)})"
+                    : s.Path;
+
             reasons.Add(
                 $"{unpopulated.Count} of {inventory.Submodules.Count} declared submodule(s) are not populated " +
-                $"in the checkout ({string.Join(", ", unpopulated.Take(10).Select(s => s.Path))}" +
+                $"in the checkout ({string.Join(", ", unpopulated.Take(10).Select(Describe))}" +
                 $"{(unpopulated.Count > 10 ? ", …" : string.Empty)}); their projects are not indexed.");
             AddCapped(diagnostics, unpopulated, s => new ProjectOutcome
             {
                 Severity = JobDiagnosticSeverity.Warning,
                 Code = "submodule_unpopulated",
                 ProjectPath = s.Path,
-                Message =
-                    $"Submodule '{s.Path}' is declared in .gitmodules but is not populated in the checkout, so " +
-                    "none of its projects were indexed."
+                Message = provisioning.TryGetValue(s.Path, out var o) && !o.IsPopulated
+                    ? $"Submodule '{s.Path}' is declared in .gitmodules but was not populated " +
+                      $"({SubmoduleProvisioningStatus.Describe(o.Status)}" +
+                      $"{(o.Reason is { Length: > 0 } r ? ": " + r : string.Empty)}), so none of its projects were indexed."
+                    : $"Submodule '{s.Path}' is declared in .gitmodules but is not populated in the checkout, so " +
+                      "none of its projects were indexed."
             }, "submodule_unpopulated", "declared submodule(s) are not populated");
         }
 

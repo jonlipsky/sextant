@@ -47,7 +47,8 @@ public static class ServiceHostRunner
         ICheckoutProvider checkoutProvider = new PersistentVolumeCheckoutProvider(paths);
         if (options.CheckoutMode == ServiceCheckoutMode.Clone)
             checkoutProvider = new CloningCheckoutProvider(
-                checkoutProvider, paths, options.CheckoutToken, log: Console.Error.WriteLine);
+                checkoutProvider, paths, options.CheckoutToken, log: Console.Error.WriteLine,
+                submoduleHosts: options.SubmoduleHosts);
         // Criterion 2: the service worker evaluates UNTRUSTED checkouts, so wrap its MSBuild evaluation in
         // the enforced sandbox (time/memory/secret/filesystem isolation) — applied to private and public
         // repos alike. The local CLI/daemon path does not construct this worker, so it stays byte-identical.

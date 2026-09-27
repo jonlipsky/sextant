@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using Sextant.Core;
 using Sextant.Indexer;
 using Sextant.Store;
+using Sextant.TestSupport;
 
 namespace Sextant.Benchmarks;
 
@@ -63,6 +64,11 @@ public sealed class BenchmarkOptions
 /// </summary>
 public sealed class BenchmarkRunner
 {
+    // Generous: the self/external corpus can be an arbitrary (large) repository restored from a cold cache.
+    // Generated corpora are tiny, so they keep the helper's default bound.
+    private static readonly TimeSpan SourceRestoreTimeout = TimeSpan.FromMinutes(30);
+    private static readonly TimeSpan GitTimeout = TimeSpan.FromSeconds(30);
+
     public static async Task<BenchmarkReport> RunAsync(BenchmarkOptions options, CancellationToken cancellationToken = default)
     {
         var redact = options.Redact || options.Corpus == "external";
@@ -74,7 +80,7 @@ public sealed class BenchmarkRunner
         var (solutionPath, isGenerated) = ResolveSolution(options, log);
 
         if (options.Restore)
-            Restore(solutionPath, log);
+            Restore(solutionPath, isGenerated ? BoundedProcess.DefaultTimeout : SourceRestoreTimeout, log);
 
         var dbPath = PrepareDatabasePath(options);
 
@@ -288,29 +294,19 @@ public sealed class BenchmarkRunner
         return Path.Combine(dbDir, "index.db");
     }
 
-    private static void Restore(string solutionPath, Action<string> log)
+    private static void Restore(string solutionPath, TimeSpan timeout, Action<string> log)
     {
         log($"Restoring {Path.GetFileName(solutionPath)}...");
         try
         {
-            var psi = new ProcessStartInfo("dotnet", $"restore \"{solutionPath}\"")
-            {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WorkingDirectory = Path.GetDirectoryName(solutionPath) ?? "."
-            };
-            using var process = Process.Start(psi);
-            if (process == null) { log("Restore could not start; continuing."); return; }
-            // Drain both redirected streams concurrently: reading one to EOF before the other can
-            // deadlock if the child fills the other pipe's buffer (dotnet restore writes to stdout).
-            var stdoutTask = process.StandardOutput.ReadToEndAsync();
-            var stderr = process.StandardError.ReadToEnd();
-            stdoutTask.GetAwaiter().GetResult();
-            process.WaitForExit();
-            if (process.ExitCode != 0)
-                log($"Restore reported exit code {process.ExitCode} (continuing): {stderr.Trim()}");
+            // Bounded, concurrently-drained, build-servers-off restore (issue #144): a hung restore is
+            // stopped (its own process tree only) instead of hanging the benchmark forever.
+            var result = BoundedProcess.DotnetRestore(
+                solutionPath, timeout, Path.GetDirectoryName(solutionPath) ?? ".");
+            if (result.TimedOut)
+                log($"Restore did not finish within {timeout.TotalMinutes:0} min and was stopped (continuing).");
+            else if (result.ExitCode != 0)
+                log($"Restore reported exit code {result.ExitCode} (continuing): {result.StandardError.Trim()}");
         }
         catch (Exception ex)
         {
@@ -361,19 +357,9 @@ public sealed class BenchmarkRunner
         if (dir == null) return null;
         try
         {
-            var psi = new ProcessStartInfo("git", "rev-parse --short HEAD")
-            {
-                WorkingDirectory = dir,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-            using var process = Process.Start(psi);
-            if (process == null) return null;
-            var output = process.StandardOutput.ReadToEnd().Trim();
-            process.WaitForExit();
-            return process.ExitCode == 0 && output.Length > 0 ? output : null;
+            var result = BoundedProcess.Run("git", ["rev-parse", "--short", "HEAD"], GitTimeout, dir);
+            var output = result.StandardOutput.Trim();
+            return result.Succeeded && output.Length > 0 ? output : null;
         }
         catch
         {

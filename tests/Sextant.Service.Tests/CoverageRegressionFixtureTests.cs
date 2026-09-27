@@ -9,7 +9,8 @@ namespace Sextant.Service.Tests;
 /// <summary>
 /// Issue #119 regression fixture: the elevenworks/monorepo shape that was indexed 5 of 415 projects yet
 /// reported COMPLETE. A real git "remote" (file:// — no network) with TWO solutions, a project file no
-/// solution declares, and a declared-but-uninitialized submodule is cloned through the real
+/// solution declares, and a declared submodule whose url the host policy refuses (so it stays uninitialized) is
+/// cloned through the real
 /// <see cref="CloningCheckoutProvider"/>; the real selection (the no-config default union, #124) + real
 /// checkout inventory then feed the coverage verdict. The MSBuild load is synthetic (each selected
 /// solution's one project loaded) so the test runs on every <c>dotnet test</c>; the real-MSBuild union load
@@ -84,9 +85,13 @@ public class CoverageRegressionFixtureTests
         Assert.AreEqual(3, c.ProjectFilesOnDisk);
         Assert.AreEqual(1, c.ProjectFilesUnreferenced, "only the orphan project is on disk but in no solution");
         Assert.AreEqual(1, c.SubmodulesDeclared);
-        Assert.AreEqual(1, c.SubmodulesUnpopulated, "a plain clone never initializes submodules");
+        Assert.AreEqual(1, c.SubmodulesUnpopulated,
+            "the fixture's submodule url (https://example.invalid) is refused by the submodule host policy");
         Assert.AreEqual(0, c.ScanErrors);
         Assert.AreEqual(2, c.Reasons.Count, "one reason per remaining gap: unpopulated submodule, orphan project");
+        Assert.IsTrue(c.Reasons.Any(r => r.Contains("libs/shared (url refused", StringComparison.Ordinal)),
+            "the unpopulated submodule's reason names WHY it was not provisioned (issue #125)");
+        Assert.AreEqual(SubmoduleProvisioningStatus.UrlRefused, resolution.SubmoduleProvisioning.Single().Status);
 
         Assert.IsFalse(result.Projects.Any(p => p.Code == "solution_not_selected"));
         Assert.IsTrue(result.Projects.Any(p => p.Code == "submodule_unpopulated" && p.ProjectPath == "libs/shared"));
@@ -95,8 +100,8 @@ public class CoverageRegressionFixtureTests
     }
 
     // A monorepo-shaped remote: App.slnx → src/App/App.csproj, Tools.slnx → tools/Tool/Tool.csproj, a project
-    // file no solution declares (orphans/Orphan), and a gitlink at libs/shared declared in .gitmodules (never
-    // initialized, exactly like a fresh clone).
+    // file no solution declares (orphans/Orphan), and a gitlink at libs/shared declared in .gitmodules whose
+    // url the service may not fetch (another host), so it stays unpopulated.
     private (string url, string commit) NewMonorepoRemote()
     {
         var repo = Temp("sextant_covfix_remote");

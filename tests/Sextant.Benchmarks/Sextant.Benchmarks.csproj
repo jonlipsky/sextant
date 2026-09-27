@@ -23,4 +23,9 @@
     <ProjectReference Include="..\..\src\Sextant.Indexer\Sextant.Indexer.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Bounded, deadlock-free subprocess runner shared with the test projects (issue #144). -->
+    <Compile Include="..\Shared\BoundedProcess.cs" Link="Shared\BoundedProcess.cs" />
+  </ItemGroup>
+
 </Project>

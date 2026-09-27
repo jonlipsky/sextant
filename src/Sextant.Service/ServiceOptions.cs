@@ -72,11 +72,22 @@ public sealed record ServiceOptions
 
     /// <summary>
     /// An OPTIONAL access token used only in <see cref="ServiceCheckoutMode.Clone"/> mode to authenticate an
-    /// outbound clone of a PRIVATE <c>https</c> repository (injected as
-    /// <c>https://x-access-token:&lt;token&gt;@host/...</c>). Public repositories need none. It is never logged
-    /// and is only written into the transient remote URL handed to git. Null → unauthenticated clone.
+    /// outbound clone of a PRIVATE <c>https</c> repository (and of its submodules on the SAME host). Public
+    /// repositories need none. It is never logged, never written into any git config, remote URL or process
+    /// argument: it is handed to git only TRANSIENTLY, through environment-scoped config
+    /// (<c>GIT_CONFIG_COUNT</c> → an <c>http.https://&lt;repository-host&gt;/.extraheader</c> Basic credential)
+    /// scoped to the top-level repository's https host (issue #125). Null → unauthenticated clone.
     /// </summary>
     public string? CheckoutToken { get; init; }
+
+    /// <summary>
+    /// Extra https hosts (<c>host</c> or <c>host:port</c>, lower-cased, default port 443 dropped) whose
+    /// submodules <see cref="ServiceCheckoutMode.Clone"/> mode may fetch — ANONYMOUSLY: the checkout token is
+    /// only ever sent to the top-level repository's own host. A submodule on any other host is left
+    /// unpopulated with a <c>url_refused</c> reason (coverage partial). Bound from
+    /// <c>SEXTANT_SERVICE_SUBMODULE_HOSTS</c> (comma-separated); a malformed entry fails startup (fail closed).
+    /// </summary>
+    public IReadOnlyList<string> SubmoduleHosts { get; init; } = [];
 
     /// <summary>
     /// Upper bound on how many times an identity's job may run before a persistently-RETRYABLE provisioning
@@ -188,6 +199,7 @@ public sealed record ServiceOptions
             QueryPort = EnvInt("QUERY_PORT"),
             CheckoutMode = ParseCheckoutMode(Env("CHECKOUT_MODE")),
             CheckoutToken = Env("CHECKOUT_TOKEN"),
+            SubmoduleHosts = ParseSubmoduleHosts(Env("SUBMODULE_HOSTS")),
             // Bound retryable-provisioning re-attempts. Out-of-range/invalid values fall back to the default
             // (5) rather than failing start, and are clamped to a sane ceiling so a huge configured value
             // cannot defeat the safety bound.
@@ -263,6 +275,34 @@ public sealed record ServiceOptions
 
     private static long? EnvLong(string name) =>
         long.TryParse(Env(name), out var v) ? v : null;
+
+    /// <summary>
+    /// Parses <c>SEXTANT_SERVICE_SUBMODULE_HOSTS</c>: a comma-separated list of extra https hosts
+    /// (<c>host</c> or <c>host:port</c>) whose submodules clone mode may fetch anonymously. Unset → none.
+    /// Any malformed entry (a scheme, a path, userinfo, whitespace inside, an invalid DNS name or port)
+    /// THROWS rather than being skipped — the list widens outbound fetches, so a typo must fail startup
+    /// loudly (fail closed, matching the checkout-mode convention). Entries are normalized (lower-cased,
+    /// default port 443 dropped) and de-duplicated.
+    /// </summary>
+    internal static IReadOnlyList<string> ParseSubmoduleHosts(string? value)
+    {
+        if (value is null)
+            return [];
+        var hosts = new List<string>();
+        foreach (var raw in value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var normalized = SubmoduleUrlPolicy.NormalizeAuthority(raw);
+            if (normalized is null)
+                throw new InvalidOperationException(
+                    $"Environment variable {EnvPrefix}SUBMODULE_HOSTS has an invalid entry '{raw}'. Provide " +
+                    "comma-separated https host names with an optional port (e.g. 'gitlab.example.com' or " +
+                    "'git.example.com:8443') — no scheme, path or credentials. Refusing to start with an " +
+                    "ambiguous submodule host allowlist (fail closed).");
+            if (!hosts.Contains(normalized, StringComparer.Ordinal))
+                hosts.Add(normalized);
+        }
+        return hosts;
+    }
 
     /// <summary>
     /// Parses and validates a network host token (a bind address). Returns null when unset (the caller's
