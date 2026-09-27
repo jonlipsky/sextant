@@ -120,7 +120,11 @@ public sealed class SdkPinGuard
 
     public SdkPinGuard(SdkPinOptions? options = null, ISdkResolutionProbe? probe = null, Action<string>? log = null)
     {
-        _options = options ?? new SdkPinOptions();
+        var configured = options ?? new SdkPinOptions();
+        // Journal paths are compared against absolute paths during recovery, so a relative root is anchored once.
+        _options = configured.JournalRoot is { } root
+            ? configured with { JournalRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root)) }
+            : configured;
         _probe = probe ?? HostFxrSdkResolutionProbe.Instance;
         _log = log;
     }
@@ -220,6 +224,15 @@ public sealed class SdkPinGuard
         // Journal FIRST (atomic + fsynced, outside the working tree) so a crash after any file is modified
         // can always be repaired by the next run.
         var journalPath = JournalPathFor(checkout);
+        if (IsContained(checkout, journalPath))
+        {
+            // E.g. a checkout at a filesystem root (no parent to hold the journal) or a journal root configured
+            // inside it: recovery refuses such a journal, so a crash could never be repaired — do not modify.
+            const string reason = "the SDK-pin restore journal would be inside the checkout's working tree " +
+                "(a checkout at a filesystem root, or a journal root configured inside it), so the checkout was not modified";
+            findings.AddRange(candidates.Select(c => c.Finding with { NotOverriddenReason = reason }));
+            return new SdkPinOverlay(this, checkout, journalPath: null, [], findings);
+        }
         try
         {
             WriteJournal(journalPath, new SdkPinJournal
@@ -256,7 +269,7 @@ public sealed class SdkPinGuard
             var reprobe = SafeProbe(Path.GetDirectoryName(entry.Path)!);
             if (reprobe is { Resolved: false })
             {
-                var restoreError = RestoreEntry(entry, recovering: false);
+                var restoreError = RestoreEntry(entry, checkout, volume: null, recovering: false);
                 findings.Add(finding with
                 {
                     NotOverriddenReason =
@@ -362,12 +375,12 @@ public sealed class SdkPinGuard
         return Path.Combine(root, $"{(leaf.Length > 0 ? leaf : "checkout")}-{hash}.json");
     }
 
-    internal string? RestoreAll(IReadOnlyList<SdkPinJournalEntry> entries, string? journalPath)
+    internal string? RestoreAll(string checkout, IReadOnlyList<SdkPinJournalEntry> entries, string? journalPath)
     {
         var errors = new List<string>();
         foreach (var entry in entries)
         {
-            var error = RestoreEntry(entry, recovering: false);
+            var error = RestoreEntry(entry, checkout, volume: null, recovering: false);
             if (error is not null)
                 errors.Add(error);
         }
@@ -528,9 +541,15 @@ public sealed class SdkPinGuard
     // content (neither neutralized nor original — someone else changed it; never clobber). Recovery after a
     // crash never recreates a missing file and FAILS CLOSED on a missing or foreign file, keeping the journal
     // so the checkout is not indexed. (A checkout that has since moved to another commit never reaches this:
-    // RecoverJournal retires its journal without writing anything.) Returns null on success, else the error.
-    private string? RestoreEntry(SdkPinJournalEntry entry, bool recovering)
+    // RecoverJournal retires its journal without writing anything.) The link check is repeated right before
+    // any write because the MSBuild load ran in between. That narrows, but cannot close, the window in which a
+    // directory could be swapped for a link. Evaluated code already holds the worker's filesystem authority (see
+    // EvaluationSandbox; OS-hard isolation is #76), so a swap gains it nothing it could not do directly.
+    // Returns null on success, else the error.
+    private string? RestoreEntry(SdkPinJournalEntry entry, string checkout, string? volume, bool recovering)
     {
+        if (LinkRefusal(checkout, entry.Path, volume) is { } refusal)
+            return $"'{entry.Path}' was not restored: {refusal}";
         try
         {
             if (IsOwnTempPath(entry.Path, entry.TempPath))
@@ -628,10 +647,8 @@ public sealed class SdkPinGuard
             if (!string.Equals(journal.Head, head, StringComparison.OrdinalIgnoreCase))
             {
                 // The checkout was re-provisioned at another commit (the cloning provider replaces the whole
-                // tree), so every journaled path now holds THAT commit's content — even one whose bytes happen to
-                // equal the neutralized form. Never write to it: remove only this guard's own temp files.
-                foreach (var entry in journal.Entries)
-                    TryDelete(entry.TempPath);
+                // tree), so every journaled path — even a temp-file path, or a global.json whose bytes happen to
+                // equal the neutralized form — now belongs to THAT commit. Never write or delete anything in it.
                 _log?.Invoke($"sdk-pin: checkout '{checkout}' moved from {journal.Head} to {head}; retiring its restore journal without touching the checkout.");
                 RetireJournal(journalPath);
                 return true;
@@ -639,9 +656,10 @@ public sealed class SdkPinGuard
         }
 
         var errors = new List<string>();
+        var volume = Path.GetDirectoryName(Path.GetDirectoryName(Path.GetFullPath(journalPath)));
         foreach (var entry in journal.Entries)
         {
-            if (RestoreEntry(entry, recovering: true) is { } error)
+            if (RestoreEntry(entry, checkout, volume, recovering: true) is { } error)
                 errors.Add(error);
         }
 
@@ -926,7 +944,7 @@ public sealed class SdkPinOverlay
     {
         if (_restored)
             return;
-        RestoreError = _guard.RestoreAll(_applied, _journalPath);
+        RestoreError = _guard.RestoreAll(CheckoutDir, _applied, _journalPath);
         _restored = RestoreError is null;
     }
 }
