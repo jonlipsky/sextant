@@ -305,6 +305,43 @@ public class SdkPinOverrideIntegrationTests
         Assert.AreEqual(string.Empty, Git(_checkout, "status", "--porcelain").Trim());
     }
 
+    [TestMethod]
+    public async Task DefaultUnion_APinInANestedProjectDirectory_IsIsolatedOff_AndOverriddenOn()
+    {
+        // #124: with no sextant.json the service selects the UNION of every discovered solution and loads it
+        // through MultiSolutionLoader's per-project path. The pin here sits in a declared PROJECT's directory,
+        // below its solution's directory, so it governs only that project's evaluation — the guard must find it.
+        var commit = CreateRepo(
+            ("tools/Tools.slnx", "<Solution>\n  <Project Path=\"Legacy/Legacy.csproj\" />\n</Solution>\n"),
+            ("tools/Legacy/Legacy.csproj", ProjectXml),
+            ("tools/Legacy/Anvil.cs", "namespace Fixture.Legacy;\n\npublic sealed class Anvil\n{\n}\n"),
+            ("tools/Legacy/global.json", UnsatisfiablePin));
+        var selection = SolutionSelector.Select(_checkout, configuredSolutions: null);
+        Assert.AreEqual(SolutionSelectionSource.DefaultUnion, selection.Source);
+        Assert.AreEqual(2, selection.SolutionPaths.Count, string.Join(", ", selection.SolutionPaths));
+
+        var (off, _) = await ProduceAsync(
+            commit, selection.SolutionPaths, overrideEnabled: false, source: selection.Source);
+
+        Assert.AreEqual(SnapshotJobStatus.Partial, off.Status, $"{off.Error}\n{string.Join('\n', _log)}");
+        StringAssert.Contains(off.Error, "'tools/Legacy/global.json' requests SDK 10.0.999");
+        Assert.IsTrue(off.Projects.Any(p => p.Code == LocalIndexerSnapshotWorker.SdkResolutionFailedCode
+                                            && p.Severity == JobDiagnosticSeverity.Warning));
+        Assert.IsTrue(Scalar("SELECT COUNT(*) FROM symbols WHERE fully_qualified_name LIKE '%Greeter%';") > 0,
+            "the unpinned solution still indexes");
+        Assert.AreEqual(0, Scalar("SELECT COUNT(*) FROM symbols WHERE fully_qualified_name LIKE '%Anvil%';"));
+
+        ResetCatalog();
+        var (on, _) = await ProduceAsync(
+            commit, selection.SolutionPaths, overrideEnabled: true, source: selection.Source);
+
+        Assert.AreEqual(SnapshotJobStatus.Complete, on.Status, $"{on.Error}\n{string.Join('\n', _log)}");
+        Assert.AreEqual("tools/Legacy/global.json",
+            on.Projects.Single(p => p.Code == LocalIndexerSnapshotWorker.SdkPinOverriddenCode).ProjectPath);
+        Assert.IsTrue(Scalar("SELECT COUNT(*) FROM symbols WHERE fully_qualified_name LIKE '%Anvil%';") > 0);
+        Assert.AreEqual(string.Empty, Git(_checkout, "status", "--porcelain").Trim());
+    }
+
     // ---- fixture ------------------------------------------------------------------------------------
 
     /// <summary>
