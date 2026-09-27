@@ -217,18 +217,40 @@ public static class ServiceApp
     {
         var control = app.MapGroup("/control");
 
-        control.MapPost("/ensure", async (EnsureSnapshotRequest request, HttpRequest req, SnapshotService service, CancellationToken ct) =>
+        // Issue #148: production runs on the SERVICE lifetime, so the request token `ct` only bounds how long
+        // this HTTP caller waits — a client disconnect/timeout never cancels or requeues the index; the job
+        // stays running and publishes normally, and a re-ensure attaches to it. `?wait=false` returns 202 as
+        // soon as the job is registered (status queued/running + job_id) so the caller polls /control/status.
+        control.MapPost("/ensure", async (EnsureSnapshotRequest request, bool? wait, HttpRequest req, SnapshotService service, CancellationToken ct) =>
         {
-            var result = await service.EnsureSnapshotAsync(request, ct, ExtractBearer(req));
-            // A non-terminal (queued) result means the ensure ran but the identity was requeued for a later
-            // re-attempt — a TRANSIENT provisioning failure bounded by the attempt cap. Surface 202 Accepted
-            // so the orchestrator polls /status rather than treating it as a settled 200 outcome.
+            EnsureSnapshotResult result;
+            try
+            {
+                result = wait == false
+                    ? await service.BeginEnsureSnapshotAsync(request, ExtractBearer(req), ct)
+                    : await service.EnsureSnapshotAsync(request, ct, ExtractBearer(req));
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                // The ensure was stopped by the SERVICE, not this caller: it is shutting down (or its worker
+                // cancelled itself). Claim nothing about the job — it may have been requeued, never
+                // registered, or already settled — the retried ensure reports (and re-attaches to) its real state.
+                return Results.Json(
+                    new { status = "unavailable", reason = "the index service stopped this ensure before it completed (e.g. it is shutting down); retry the ensure" },
+                    ServiceJson.Options, statusCode: StatusCodes.Status503ServiceUnavailable);
+            }
+            // A non-terminal result is 202 Accepted so the orchestrator polls /status rather than treating it
+            // as a settled 200 outcome: either the ensure ran but the identity was requeued for a later
+            // re-attempt (a TRANSIENT provisioning failure bounded by the attempt cap), or `wait=false` returned
+            // while production is still queued/running.
             var statusCode = SnapshotJobStatus.IsTerminal(result.Status)
                 ? StatusCodes.Status200OK
                 : StatusCodes.Status202Accepted;
             return Results.Json(result, ServiceJson.Options, statusCode: statusCode);
         });
 
+        // Status/resolve read an independent WAL read connection (issue #148), so they answer promptly while a
+        // worker holds the single writer for a long index.
         control.MapGet("/status/{jobId:long}", (long jobId, SnapshotService service) =>
         {
             var status = service.GetStatus(jobId);
@@ -249,9 +271,9 @@ public static class ServiceApp
             return Results.Json(body, ServiceJson.Options);
         });
 
-        control.MapPost("/retention", (bool? execute, HttpRequest req, SnapshotService service) =>
+        control.MapPost("/retention", async (bool? execute, HttpRequest req, SnapshotService service, CancellationToken ct) =>
         {
-            var report = service.RunRetention(execute ?? false, ExtractBearer(req));
+            var report = await service.RunRetentionAsync(execute ?? false, ExtractBearer(req), ct);
             return Results.Json(report, ServiceJson.Options);
         });
 
@@ -291,11 +313,11 @@ public static class ServiceApp
 
         // Backup (criterion 6). Writes a consistent catalog + artifact backup to the requested directory.
         // Restore runs OFFLINE via `sextant service restore` (it must precede service startup).
-        control.MapPost("/backup", (string dir, HttpRequest req, SnapshotService service) =>
+        control.MapPost("/backup", async (string dir, HttpRequest req, SnapshotService service, CancellationToken ct) =>
         {
             if (string.IsNullOrWhiteSpace(dir))
                 return Results.BadRequest("query parameter 'dir' is required.");
-            var manifest = service.CreateBackup(dir, ExtractBearer(req));
+            var manifest = await service.CreateBackupAsync(dir, ExtractBearer(req), ct);
             return Results.Json(manifest, ServiceJson.Options);
         });
 
