@@ -118,7 +118,7 @@ public static class ServiceHostRunner
             if (service.ProductionDrained)
                 database.Dispose();
             else
-                Console.Error.WriteLine(
+                await Console.Error.WriteLineAsync(
                     $"An in-flight snapshot production did not stop within {options.ShutdownDrainTimeout}; the " +
                     "writer lease was abandoned (it expires by its TTL) instead of released.");
         }

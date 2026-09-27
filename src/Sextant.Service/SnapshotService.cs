@@ -1641,7 +1641,9 @@ public sealed class SnapshotService : IDisposable
 
     private T WithWrite<T>(Func<T> work)
     {
-        _writeGate.Wait();
+        // Synchronous callers only (startup reconcile, the sync retention/backup/PR-root APIs): request threads
+        // use WithWriteAsync with their own token (issue #148), so this explicitly opts out of cancellation.
+        _writeGate.Wait(CancellationToken.None);
         try
         {
             EnsureLeaseHeld();
@@ -1726,7 +1728,7 @@ public sealed class SnapshotService : IDisposable
             return true;
         try
         {
-            return Task.WhenAll(pending).Wait(timeout);
+            return Task.WhenAll(pending).Wait(timeout, CancellationToken.None);
         }
         catch (AggregateException)
         {
