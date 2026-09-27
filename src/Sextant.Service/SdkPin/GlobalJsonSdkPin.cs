@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 
 namespace Sextant.Service.SdkPin;
 
@@ -12,7 +13,7 @@ namespace Sextant.Service.SdkPin;
 /// is preserved so project-SDK versions still resolve as the repository intends. Parsing tolerates the
 /// comments and trailing commas hostfxr accepts, and a UTF-8 BOM.
 /// </summary>
-internal static class GlobalJsonSdkPin
+internal static partial class GlobalJsonSdkPin
 {
     private const string SdkProperty = "sdk";
 
@@ -38,6 +39,14 @@ internal static class GlobalJsonSdkPin
             pin = new Pin(StringValue(sdk, "version"), StringValue(sdk, "rollForward"));
         return true;
     }
+
+    /// <summary>
+    /// True when <paramref name="version"/> is a well-formed .NET SDK version — <c>major.minor.patch</c> with
+    /// a feature band of at least 100 (e.g. <c>10.0.300</c>), optionally with a prerelease/build suffix. hostfxr
+    /// reports a malformed pin such as <c>1.2.0</c> with the same "A compatible .NET SDK was not found"
+    /// wording as an absent band, so only a pin that names a real SDK band is a candidate for the override.
+    /// </summary>
+    public static bool IsSdkVersion(string? version) => version is not null && SdkVersionRegex().IsMatch(version);
 
     /// <summary>
     /// Produces the content with the <c>sdk</c> object removed. False (with a reason) when the content is
@@ -103,4 +112,7 @@ internal static class GlobalJsonSdkPin
             null => null,
             var other => other.ToJsonString()
         };
+
+    [GeneratedRegex(@"^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.[1-9]\d{2,}(?:-[0-9A-Za-z\-]+(?:\.[0-9A-Za-z\-]+)*)?(?:\+[0-9A-Za-z\-]+(?:\.[0-9A-Za-z\-]+)*)?$", RegexOptions.CultureInvariant)]
+    private static partial Regex SdkVersionRegex();
 }

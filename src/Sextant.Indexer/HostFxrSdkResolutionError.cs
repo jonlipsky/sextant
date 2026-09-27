@@ -45,10 +45,11 @@ public sealed partial record HostFxrSdkResolutionError
     public bool IsGlobalJsonPin => GlobalJsonPath is not null || RequestedVersion is not null;
 
     /// <summary>
-    /// True when hostfxr reported the specific "no compatible SDK is installed" outcome (status
-    /// <see cref="SdkResolveFailureCode"/> or its "was not found" wording) rather than some other
-    /// <c>hostfxr_resolve_sdk2</c> failure (e.g. a malformed <c>global.json</c> or an invalid argument). Only
-    /// this outcome is a candidate for the service's SDK-pin override (issue #113).
+    /// True when hostfxr's wording reports the specific "no compatible SDK is installed" outcome rather than
+    /// some other <c>hostfxr_resolve_sdk2</c> failure. The numeric status <see cref="SdkResolveFailureCode"/>
+    /// alone is NOT proof: hostfxr returns it for every resolution failure (including a <c>global.json</c> it
+    /// rejects as invalid). Only this outcome is a candidate for the service's SDK-pin override (issue #113),
+    /// and even then only for a well-formed SDK version (hostfxr words a malformed <c>1.2.0</c> pin the same way).
     /// </summary>
     public bool IsMissingSdk { get; init; }
 
@@ -120,12 +121,13 @@ public sealed partial record HostFxrSdkResolutionError
     }
 
     private static bool IsSdkResolutionFailure(string message) =>
-        message.Contains(ResolveFunction, StringComparison.Ordinal) || IsMissingSdkFailure(message);
+        message.Contains(ResolveFunction, StringComparison.Ordinal)
+        || message.Contains(SdkResolveFailureCodeText, StringComparison.Ordinal)
+        || message.Contains(SdkResolveFailureHex, StringComparison.OrdinalIgnoreCase)
+        || IsMissingSdkFailure(message);
 
     private static bool IsMissingSdkFailure(string message) =>
-        message.Contains(SdkResolveFailureCodeText, StringComparison.Ordinal)
-        || message.Contains(SdkResolveFailureHex, StringComparison.OrdinalIgnoreCase)
-        || message.Contains("A compatible .NET SDK was not found", StringComparison.OrdinalIgnoreCase)
+        message.Contains("A compatible .NET SDK was not found", StringComparison.OrdinalIgnoreCase)
         || message.Contains("A compatible installed .NET SDK for global.json version", StringComparison.OrdinalIgnoreCase)
         || message.Contains("No .NET SDKs were found", StringComparison.OrdinalIgnoreCase)
         || (InstallTheRegex().IsMatch(message) && message.Contains("to match an installed SDK", StringComparison.OrdinalIgnoreCase));

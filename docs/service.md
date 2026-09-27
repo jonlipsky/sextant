@@ -211,35 +211,51 @@ cost a full copy per job and break checkout-relative paths. So the service handl
    the checkout. The persistent, reused checkout therefore never diverges from its commit (`git status`
    stays clean).
 3. **Crash-safe.** Before any file is modified, the original bytes and the checkout's `HEAD` commit are
-   journaled atomically (fsynced, and the directory flushed on Unix) to
+   journaled atomically (fsynced, with the rename and a newly created journal directory flushed on Unix) to
    `<checkout-root>/.sextant-sdk-pin/<checkout>-<hash>.json`, outside every working tree. Each rewrite goes
    through a uniquely named sibling temp file created exclusively, so no repository file (whatever its
-   name) is ever overwritten or deleted. Every job replays leftover journals **before** a cached checkout is
-   resolved or reused:
+   name) is ever overwritten or deleted. A restored file (including its mode and mtime) is flushed before
+   its journal is deleted, and the deletion is flushed too. Every job replays leftover journals **before** a
+   cached checkout is resolved or reused:
    - a file that still holds exactly the neutralized content is restored; one that already holds the
      committed content is left alone;
    - a file that is **missing or holds foreign content** fails closed while the checkout is still at the
      journaled commit: the journal is kept and the checkout is not indexed. Repair it by restoring the
      committed `global.json` (e.g. `git checkout -- global.json`) or by deleting the checkout so it is
-     re-cloned; the journal then retires itself. Once the checkout has moved to another commit (or is
-     gone), the journal is simply retired;
+     re-cloned; the journal then retires itself;
+   - once the checkout has **moved to another commit** (the cloning provider re-provisions a mismatched
+     checkout as a whole fresh tree) or is gone, the journal is retired **without writing anything** to the
+     checkout — even a file whose bytes happen to equal the neutralized form belongs to the new commit. If the
+     journaled commit can no longer be confirmed (the checkout's `HEAD` is unreadable), it fails closed;
    - a journal is replayed only when it is well formed and confined: it must be the journal of the checkout
-     it names, that checkout must be on the checkout volume, and every entry must be a non-symlinked
-     `global.json` inside it whose journaled bytes match their checksum. Anything else is logged and left
-     for inspection.
+     it names, that checkout must be on the checkout volume, and it must list at least one entry, each a
+     distinct, non-symlinked `global.json` inside it whose journaled bytes match their checksum and whose
+     recorded commit, timestamp and mode are valid. Neither the checkout directory nor any directory
+     between it and the checkout volume may be a symlink/junction. Anything else is logged and left for
+     inspection, and one bad journal never stops the others from being replayed;
+   - if the journal directory cannot be read (e.g. after a restart under another UID), the service cannot
+     rule out a leftover journal, so the checkout is not indexed — an access failure is never read as "no
+     journal".
 
    If a restore fails during a job (even a cancelled one), or a leftover journal cannot be replayed, the
    checkout is not indexed, the journal is kept, and the job is **requeued** with an `sdk_pin_restore_failed`
    diagnostic rather than recorded as a terminal failure. The checkout's state is the problem, not the commit,
-   so it must not poison the identity: once the checkout is repaired, the next ensure retries. Like a transient
-   clone failure, this is bounded by `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS`. Once the attempts are used
-   up the job settles to `failed`, still carrying `sdk_pin_restore_failed` next to
+   so it must not poison the identity: once the checkout is repaired, the next ensure retries. There is no
+   background retry: the next attempt runs when the orchestrator **re-calls `POST /control/ensure`** for the
+   same commit (`/control/status/{jobId}` shows the `queued` job and its diagnostic in the meantime). Like a
+   transient clone failure, this is bounded by `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS`. Once the attempts
+   are used up the job settles to `failed`, still carrying `sdk_pin_restore_failed` next to
    `provisioning_attempts_exhausted`.
 4. **Refusals.** A pin is left alone and reported as not overridden, with the reason, when:
    - the override is disabled;
-   - hostfxr failed for a reason **other than a missing SDK version** (only its "compatible .NET SDK was
-     not found" outcome, status `0x8000809B`, is overridden — never a malformed file or another error);
-   - the `global.json` lies outside the checkout or is reached through a symlink;
+   - hostfxr failed for a reason **other than a missing SDK version**. Only its "A compatible .NET SDK was
+     not found" wording is overridden; the bare `0x8000809B` status is not enough, because hostfxr returns it
+     for every resolution failure;
+   - the pinned version is not a well-formed SDK version (`major.minor.patch` with a feature band of at
+     least 100, e.g. `10.0.300`). hostfxr words a malformed `1.2.0` pin exactly like an absent band, so this
+     keeps the override to pins that name a real SDK band;
+   - the `global.json` lies outside the checkout, or is reached through a symlink/junction (including a
+     symlinked checkout directory);
    - it cannot be read or parsed, it has no `sdk` section, or its `sdk` section pins no version;
    - the journal cannot be written;
    - neutralizing it still leaves no resolvable SDK (for example, a parent pin outside the checkout also
@@ -253,7 +269,7 @@ Outcomes and diagnostics. All paths are checkout-relative, and every diagnostic 
 | pin overridden, checkout loaded | `complete` (unless another coverage gap applies) | `sdk_pin_overridden` (warning; also the substituted SDK) |
 | pin not overridden and the **whole** load failed SDK resolution | `failed` with a typed reason (requested vs installed, pin path, why not overridden) — never a bare exception message. This also applies when the load fails with an error that names no hostfxr function (e.g. every project came back empty) while a pin it depends on is known not to resolve; the reason then carries the load error too | `sdk_resolution_failed` (error) |
 | pin not overridden, but only **some** solutions/projects are governed by it (#90-style isolation, e.g. a `tools/global.json` in one of several solutions) | `partial`; the reason names the pin | `sdk_resolution_failed` (warning) for the pin and for each project it kept from loading |
-| a neutralized pin could not be restored (or a leftover journal could not be replayed) | `queued` (requeued; HTTP 202), nothing indexed; `failed` once `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS` is exhausted | `sdk_pin_restore_failed` (error) |
+| a neutralized pin could not be restored (or a leftover journal could not be replayed, or its presence ruled out) | `queued` (requeued; HTTP 202 — re-call ensure to retry), nothing indexed; `failed` once `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS` is exhausted | `sdk_pin_restore_failed` (error) |
 
 An overridden snapshot is **complete**, because the override restored full coverage, but it is never
 silent:
@@ -296,7 +312,8 @@ poisons a recoverable commit while still caching genuinely-hopeless ones:
   requeued, so the orchestrator's natural retry (re-calling `ensure` for the same commit) re-runs the
   worker. This is bounded by `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS` (default `5`); once exhausted the
   job settles to terminal `failed`. Such an ensure returns **HTTP 202 Accepted** with a non-terminal
-  (`queued`) status — poll `/control/status/{jobId}`.
+  (`queued`) status. `/control/status/{jobId}` shows the queued job and its diagnostics, but nothing
+  re-runs it in the background: the next attempt happens when `ensure` is called again.
 - **Deterministic** — the job records a terminal `unsupported`/`failed` as before, and every later ensure
   for that identity attaches the cached result **without** re-running the worker (so a hopeless request is
   not re-attempted on every delivery). This is byte-identical to the pre-existing behavior.

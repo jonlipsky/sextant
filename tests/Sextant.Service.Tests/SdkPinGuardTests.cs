@@ -453,6 +453,198 @@ public sealed class SdkPinGuardTests
     }
 
     [TestMethod]
+    [DataRow("empty-entries")]
+    [DataRow("null-entries")]
+    [DataRow("null-entry")]
+    [DataRow("corrupt-head")]
+    [DataRow("null-content")]
+    [DataRow("bad-checksum-shape")]
+    [DataRow("ticks-too-large")]
+    [DataRow("negative-ticks")]
+    [DataRow("mode-out-of-range")]
+    [DataRow("duplicate-entry")]
+    [DataRow("nul-in-path")]
+    public void MalformedJournal_IsKept_BlocksTheCheckout_AndNeverThrows(string mutation)
+    {
+        WritePin(GlobalJson);
+        var guard = new SdkPinGuard(probe: new FakeHostFxr());
+        _ = guard.Apply(_checkout, [_solution]); // "crash": a well-formed journal, then tamper with its shape
+        var neutralized = File.ReadAllBytes(GlobalJson);
+        var journalPath = guard.JournalPathFor(_checkout);
+        var journal = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(journalPath))!.AsObject();
+        var entries = journal["entries"]!.AsArray();
+        var entry = entries[0]!.AsObject();
+        switch (mutation)
+        {
+            case "empty-entries": entries.Clear(); break;
+            case "null-entries": journal["entries"] = null; break;
+            case "null-entry": entries[0] = null; break;
+            case "corrupt-head": journal["head"] = "corrupt"; break;
+            case "null-content": entry["original_base64"] = null; break;
+            case "bad-checksum-shape": entry["neutralized_sha256"] = "XYZ"; break;
+            case "ticks-too-large": entry["last_write_time_utc_ticks"] = long.MaxValue; break;
+            case "negative-ticks": entry["last_write_time_utc_ticks"] = -1; break;
+            case "mode-out-of-range": entry["unix_mode"] = 99999; break;
+            case "duplicate-entry": entries.Add(entry.DeepClone()); break;
+            case "nul-in-path": entry["path"] = Path.Combine(_checkout, "a\0b", "global.json"); break;
+            default: Assert.Fail(mutation); break;
+        }
+        File.WriteAllText(journalPath, journal.ToJsonString());
+
+        Assert.IsFalse(guard.Recover(_checkout), $"{mutation}: an invalid journal must keep blocking the checkout");
+        Assert.IsTrue(File.Exists(journalPath), $"{mutation}: kept for an operator to inspect");
+        CollectionAssert.AreEqual(neutralized, File.ReadAllBytes(GlobalJson), $"{mutation}: nothing was written");
+    }
+
+    [TestMethod]
+    public void RecoverAll_OneBadJournal_NeverStopsTheOthers()
+    {
+        var options = new SdkPinOptions { JournalRoot = JournalDir };
+        var original = WritePin(GlobalJson);
+        _ = new SdkPinGuard(options, new FakeHostFxr()).Apply(_checkout, [_solution]); // "crash"
+        File.WriteAllText(Path.Combine(JournalDir, "garbage-0123456789ab.json"), "{ \"version\": 1, \"checkout_dir\": null, \"entries\": null }");
+
+        Assert.AreEqual(1, new SdkPinGuard(options, new FakeHostFxr()).RecoverAll());
+        CollectionAssert.AreEqual(original, File.ReadAllBytes(GlobalJson), "the valid journal was still replayed");
+        Assert.IsTrue(File.Exists(Path.Combine(JournalDir, "garbage-0123456789ab.json")), "the bad one is kept");
+    }
+
+    [TestMethod]
+    public void Recovery_AfterTheCheckoutMoved_NeverWrites_EvenWhenTheNewCommitHoldsTheNeutralizedBytes()
+    {
+        WriteHead("1111111111111111111111111111111111111111");
+        WritePin(GlobalJson);
+        _ = new SdkPinGuard(probe: new FakeHostFxr()).Apply(_checkout, [_solution]); // "crash"
+        var neutralized = File.ReadAllBytes(GlobalJson);
+
+        // Re-provisioned at a commit whose committed global.json is byte-identical to the neutralized form.
+        WriteHead("2222222222222222222222222222222222222222");
+
+        Assert.IsTrue(new SdkPinGuard(probe: new FakeHostFxr()).Recover(_checkout));
+        CollectionAssert.AreEqual(neutralized, File.ReadAllBytes(GlobalJson), "the other commit's content is never overwritten");
+        Assert.AreEqual(0, Directory.GetFiles(JournalDir).Length);
+    }
+
+    [TestMethod]
+    public void Recovery_WhenTheJournaledHeadCanNoLongerBeRead_FailsClosed()
+    {
+        WriteHead("1111111111111111111111111111111111111111");
+        WritePin(GlobalJson);
+        _ = new SdkPinGuard(probe: new FakeHostFxr()).Apply(_checkout, [_solution]); // "crash"
+        var neutralized = File.ReadAllBytes(GlobalJson);
+        Directory.Delete(Path.Combine(_checkout, ".git"), recursive: true);
+
+        Assert.IsFalse(new SdkPinGuard(probe: new FakeHostFxr()).Recover(_checkout), "it cannot tell whether the commit moved");
+        CollectionAssert.AreEqual(neutralized, File.ReadAllBytes(GlobalJson));
+        Assert.AreEqual(1, Directory.GetFiles(JournalDir).Length);
+    }
+
+    [TestMethod]
+    public void InaccessibleJournalDirectory_IsNeverMistakenForNoJournal()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.Inconclusive("POSIX permission bits do not apply on Windows");
+            return;
+        }
+
+        WritePin(GlobalJson);
+        _ = new SdkPinGuard(probe: new FakeHostFxr()).Apply(_checkout, [_solution]); // "crash"
+        var mode = File.GetUnixFileMode(JournalDir);
+        File.SetUnixFileMode(JournalDir, UnixFileMode.None);
+        try
+        {
+            if (TryListFiles(JournalDir))
+            {
+                Assert.Inconclusive("running with privileges that bypass directory permissions");
+                return;
+            }
+            Assert.IsFalse(new SdkPinGuard(probe: new FakeHostFxr()).Recover(_checkout),
+                "an unreadable journal directory must block the checkout, not read as 'no journal'");
+        }
+        finally
+        {
+            File.SetUnixFileMode(JournalDir, mode);
+        }
+        Assert.AreEqual(1, Directory.GetFiles(JournalDir).Length);
+    }
+
+    private static bool TryListFiles(string directory)
+    {
+        try
+        {
+            _ = Directory.GetFiles(directory);
+            return true;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    [TestMethod]
+    public void SymlinkedCheckoutDirectory_IsNeverModified()
+    {
+        var real = Path.Combine(_root, "real-checkout");
+        Directory.CreateDirectory(real);
+        var target = Path.Combine(real, "global.json");
+        var original = WritePin(target);
+        File.Copy(_solution, Path.Combine(real, "Repo.slnx"));
+        var linked = Path.Combine(_root, "checkouts", "linked");
+        try
+        {
+            Directory.CreateSymbolicLink(linked, real);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            Assert.Inconclusive($"symbolic links cannot be created here: {ex.Message}");
+            return;
+        }
+
+        var overlay = new SdkPinGuard(probe: new FakeHostFxr()).Apply(linked, [Path.Combine(linked, "Repo.slnx")]);
+
+        var finding = overlay.Findings.Single();
+        Assert.IsFalse(finding.OverrideApplied);
+        StringAssert.Contains(finding.NotOverriddenReason, "checkout directory is a symbolic link");
+        CollectionAssert.AreEqual(original, File.ReadAllBytes(target), "the link target is untouched");
+    }
+
+    [TestMethod]
+    [DataRow("1.2.0")]
+    [DataRow("10.0.3")]
+    [DataRow("10.0.099")]
+    [DataRow("latest")]
+    public void MalformedSdkVersion_IsReported_NotOverridden(string version)
+    {
+        var original = WritePin(GlobalJson, $$"""{ "sdk": { "version": "{{version}}", "rollForward": "disable" } }""");
+
+        var overlay = new SdkPinGuard(probe: new FakeHostFxr()).Apply(_checkout, [_solution]);
+
+        var finding = overlay.Findings.Single();
+        Assert.IsFalse(finding.OverrideApplied);
+        StringAssert.Contains(finding.NotOverriddenReason, "not a well-formed .NET SDK version");
+        CollectionAssert.AreEqual(original, File.ReadAllBytes(GlobalJson));
+        Assert.IsFalse(Directory.Exists(JournalDir));
+    }
+
+    [TestMethod]
+    [DataRow("10.0.300", true)]
+    [DataRow("9.0.999", true)]
+    [DataRow("10.0.100-preview.7.25380.108", true)]
+    [DataRow("10.0.300+build.1", true)]
+    [DataRow("1.2.0", false)]
+    [DataRow("10.0.3", false)]
+    [DataRow("10.0.099", false)]
+    [DataRow("010.0.300", false)]
+    [DataRow("10.0", false)]
+    [DataRow("10.0.300.1", false)]
+    [DataRow("latest", false)]
+    [DataRow("", false)]
+    [DataRow(null, false)]
+    public void IsSdkVersion_AcceptsOnlyAFeatureBandVersion(string? version, bool expected) =>
+        Assert.AreEqual(expected, GlobalJsonSdkPin.IsSdkVersion(version), version);
+
+    [TestMethod]
     public void CheckoutHead_ReadsDetachedLooseAndPackedRefs()
     {
         const string a = "1111111111111111111111111111111111111111";

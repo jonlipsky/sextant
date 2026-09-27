@@ -91,6 +91,6 @@ internal static class CheckoutHead
         && !refName.Contains('\\')
         && !Path.IsPathRooted(refName);
 
-    private static bool IsObjectId(string value) =>
+    internal static bool IsObjectId(string value) =>
         value.Length is 40 or 64 && value.All(char.IsAsciiHexDigit);
 }

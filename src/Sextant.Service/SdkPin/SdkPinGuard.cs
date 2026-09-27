@@ -188,6 +188,9 @@ public sealed class SdkPinGuard
                 refusal = neutralizeError;
             if (refusal is null && pin.Version is null)
                 refusal = "the global.json's \"sdk\" section does not pin a version, so the service does not override it";
+            if (refusal is null && !GlobalJsonSdkPin.IsSdkVersion(pin.Version))
+                refusal = $"the global.json pins \"{pin.Version}\", which is not a well-formed .NET SDK version " +
+                    "(major.minor.patch with a feature band of at least 100), so the service does not override it";
 
             SdkPinJournalEntry? entry = null;
             if (refusal is null)
@@ -275,7 +278,7 @@ public sealed class SdkPinGuard
         }
 
         if (applied.Count == 0)
-            TryDelete(journalPath);
+            RetireJournal(journalPath);
 
         return new SdkPinOverlay(this, checkout, applied.Count > 0 ? journalPath : null, applied, findings);
     }
@@ -283,11 +286,18 @@ public sealed class SdkPinGuard
     /// <summary>
     /// Replays every leftover journal under the configured <see cref="SdkPinOptions.JournalRoot"/> (a crash
     /// between neutralizing and restoring). Run at the start of every job, BEFORE any checkout is reused or
-    /// inspected. Never throws. Returns the number of journals fully resolved.
+    /// inspected. Never throws, and one bad journal never stops the others from being replayed. Returns the
+    /// number of journals fully resolved. A journal directory that cannot be read is only logged here: the
+    /// per-checkout <see cref="Recover"/> gate then refuses to index a checkout whose journal it cannot rule out.
     /// </summary>
     public int RecoverAll()
     {
-        if (_options.JournalRoot is not { } root || !Directory.Exists(root))
+        if (_options.JournalRoot is not { } root)
+            return 0;
+        var rootPresence = PresenceOf(root, out var rootError);
+        if (rootPresence == Presence.Unknown)
+            _log?.Invoke($"sdk-pin: could not access the restore-journal directory '{root}' ({rootError}).");
+        if (rootPresence != Presence.Present)
             return 0;
 
         var resolved = 0;
@@ -310,11 +320,35 @@ public sealed class SdkPinGuard
         return resolved;
     }
 
-    /// <summary>Replays the leftover journal for one checkout, if any. Never throws.</summary>
+    /// <summary>
+    /// Replays the leftover journal for one checkout, if any. Never throws. False — the checkout must not be
+    /// indexed — when a journal exists and could not be replayed, or when its presence cannot be ruled out
+    /// (the journal directory is unreadable): an access failure is never mistaken for "no journal".
+    /// </summary>
     public bool Recover(string checkoutDir)
     {
-        var journal = JournalPathFor(Path.GetFullPath(checkoutDir));
-        return !File.Exists(journal) || RecoverJournal(journal);
+        string journal;
+        try
+        {
+            journal = JournalPathFor(Path.GetFullPath(checkoutDir));
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or IOException)
+        {
+            _log?.Invoke($"sdk-pin: could not locate the restore journal for '{checkoutDir}' ({ex.Message}).");
+            return false;
+        }
+
+        var presence = PresenceOf(journal, out var error);
+        if (presence == Presence.Absent)
+            return true;
+        if (presence == Presence.Unknown)
+        {
+            _log?.Invoke(
+                $"sdk-pin: could not determine whether '{journal}' exists ({error}); checkout '{checkoutDir}' is " +
+                "not indexed until the restore-journal directory is accessible.");
+            return false;
+        }
+        return RecoverJournal(journal);
     }
 
     /// <summary>The journal file for <paramref name="checkoutDir"/> (internal for tests).</summary>
@@ -347,7 +381,7 @@ public sealed class SdkPinGuard
         }
 
         if (journalPath is not null)
-            TryDelete(journalPath);
+            RetireJournal(journalPath);
         return null;
     }
 
@@ -414,18 +448,26 @@ public sealed class SdkPinGuard
         return LinkRefusal(checkout, path);
     }
 
-    // The service never writes through a symbolic link: not the global.json itself, nor any directory between
-    // it and the checkout root (either could redirect the write outside the checkout).
-    private static string? LinkRefusal(string checkout, string path)
+    // The service never writes through a symbolic link (or junction): not the global.json itself, nor any
+    // directory from it up to and including the checkout root — nor, when recovering, any directory between
+    // the checkout and the checkout volume (<paramref name="volume"/>, exclusive). Any of them could redirect
+    // the write outside the checkout. A path that does not exist is not a link.
+    private static string? LinkRefusal(string checkout, string path, string? volume = null)
     {
         try
         {
-            if (new FileInfo(path).LinkTarget is not null)
+            if (IsLink(new FileInfo(path)))
                 return "the global.json is a symbolic link, so the service does not modify it";
-            for (var dir = Path.GetDirectoryName(path); dir is not null && !PathEquals(dir, checkout); dir = Path.GetDirectoryName(dir))
+            for (var dir = Path.GetDirectoryName(path); dir is not null; dir = Path.GetDirectoryName(dir))
             {
-                if (new DirectoryInfo(dir).LinkTarget is not null)
-                    return "a directory containing the global.json is a symbolic link, so the service does not modify it";
+                if (volume is not null && PathEquals(dir, volume))
+                    break;
+                if (IsLink(new DirectoryInfo(dir)))
+                    return IsContained(checkout, dir)
+                        ? "a directory containing the global.json is a symbolic link, so the service does not modify it"
+                        : "the checkout directory is a symbolic link or junction, so the service does not modify it";
+                if (volume is null && PathEquals(dir, checkout))
+                    break;
             }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -434,6 +476,19 @@ public sealed class SdkPinGuard
         }
 
         return null;
+    }
+
+    // LinkTarget throws for a missing path on Unix; a missing path is simply not a link.
+    private static bool IsLink(FileSystemInfo info)
+    {
+        try
+        {
+            return info.LinkTarget is not null;
+        }
+        catch (IOException) when (!info.Exists)
+        {
+            return false;
+        }
     }
 
     private static SdkPinJournalEntry NewEntry(string path, byte[] original, byte[] neutralized)
@@ -471,11 +526,10 @@ public sealed class SdkPinGuard
 
     // Restores one entry. Normal restore puts the committed bytes back unless the file now holds FOREIGN
     // content (neither neutralized nor original — someone else changed it; never clobber). Recovery after a
-    // crash never recreates a missing file, and it FAILS CLOSED on a missing or foreign file — keeping the
-    // journal so the checkout is not indexed — unless the checkout has since moved to another commit
-    // (<paramref name="checkoutMoved"/>: re-checked-out or replaced, so the file legitimately differs).
-    // Returns null on success, else the error.
-    private string? RestoreEntry(SdkPinJournalEntry entry, bool recovering, bool checkoutMoved = false)
+    // crash never recreates a missing file and FAILS CLOSED on a missing or foreign file, keeping the journal
+    // so the checkout is not indexed. (A checkout that has since moved to another commit never reaches this:
+    // RecoverJournal retires its journal without writing anything.) Returns null on success, else the error.
+    private string? RestoreEntry(SdkPinJournalEntry entry, bool recovering)
     {
         try
         {
@@ -485,51 +539,49 @@ public sealed class SdkPinGuard
 
             if (!File.Exists(entry.Path))
             {
-                if (!recovering)
-                {
-                    WriteAtomically(entry.Path, entry.TempPath, original, entry.UnixMode);
-                    SetMetadata(entry);
-                    return null;
-                }
-                if (checkoutMoved)
-                {
-                    _log?.Invoke($"sdk-pin: '{entry.Path}' no longer exists and the checkout has moved to another commit; nothing to restore.");
-                    return null;
-                }
-                return $"'{entry.Path}' is missing although the checkout is still at the commit whose SDK pin was neutralized; it was not recreated";
+                if (recovering)
+                    return $"'{entry.Path}' is missing although the checkout is still at the commit whose SDK pin was neutralized; it was not recreated";
+                WriteRestored(entry, original);
+                return null;
             }
 
             var current = Sha256(File.ReadAllBytes(entry.Path));
             if (string.Equals(current, entry.OriginalSha256, StringComparison.Ordinal))
             {
-                if (!checkoutMoved)
-                    SetMetadata(entry);
+                SetMetadata(entry);
                 return null;
             }
 
             if (!string.Equals(current, entry.NeutralizedSha256, StringComparison.Ordinal))
-            {
-                if (recovering && checkoutMoved)
-                {
-                    _log?.Invoke($"sdk-pin: '{entry.Path}' changed since its SDK pin was neutralized, but the checkout has moved to another commit; left as-is.");
-                    return null;
-                }
                 return $"'{entry.Path}' was changed by something else while its SDK pin was neutralized; it was left as-is";
-            }
 
-            WriteAtomically(entry.Path, entry.TempPath, original, entry.UnixMode);
-            SetMetadata(entry);
+            WriteRestored(entry, original);
             if (recovering)
                 _log?.Invoke($"sdk-pin: recovered the committed '{entry.Path}' left neutralized by an interrupted job.");
             return null;
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or FormatException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or FormatException or ArgumentException)
         {
             return $"could not restore the committed '{entry.Path}': {ex.Message}";
         }
     }
 
+    // A per-journal exception boundary: an unexpected failure keeps the journal (so its checkout stays blocked,
+    // surfacing as a requeued sdk_pin_restore_failed) and never stops RecoverAll replaying the other journals.
     private bool RecoverJournal(string journalPath)
+    {
+        try
+        {
+            return RecoverJournalCore(journalPath);
+        }
+        catch (Exception ex)
+        {
+            _log?.Invoke($"sdk-pin: recovering restore journal '{journalPath}' failed ({ex.GetType().Name}: {ex.Message}); leaving it for inspection.");
+            return false;
+        }
+    }
+
+    private bool RecoverJournalCore(string journalPath)
     {
         SdkPinJournal? journal;
         try
@@ -549,22 +601,47 @@ public sealed class SdkPinGuard
         }
 
         var checkout = Path.GetFullPath(journal!.CheckoutDir);
-        if (!Directory.Exists(checkout))
+        var checkoutPresence = PresenceOf(checkout, out var checkoutError);
+        if (checkoutPresence == Presence.Unknown)
+        {
+            _log?.Invoke($"sdk-pin: could not access checkout '{checkout}' ({checkoutError}); keeping its restore journal.");
+            return false;
+        }
+        if (checkoutPresence == Presence.Absent)
         {
             // The checkout is gone (deleted by an operator): a later clone is fresh, so there is nothing to repair.
             _log?.Invoke($"sdk-pin: checkout '{checkout}' no longer exists; retiring its restore journal.");
-            TryDelete(journalPath);
+            RetireJournal(journalPath);
             return true;
         }
 
-        var head = CheckoutHead.TryRead(checkout);
-        var moved = journal.Head is not null && head is not null
-            && !string.Equals(journal.Head, head, StringComparison.OrdinalIgnoreCase);
+        if (journal.Head is not null)
+        {
+            var head = CheckoutHead.TryRead(checkout);
+            if (head is null)
+            {
+                _log?.Invoke(
+                    $"sdk-pin: cannot confirm checkout '{checkout}' is still at commit {journal.Head} (its HEAD is unreadable); " +
+                    $"keeping the restore journal '{journalPath}'.");
+                return false;
+            }
+            if (!string.Equals(journal.Head, head, StringComparison.OrdinalIgnoreCase))
+            {
+                // The checkout was re-provisioned at another commit (the cloning provider replaces the whole
+                // tree), so every journaled path now holds THAT commit's content — even one whose bytes happen to
+                // equal the neutralized form. Never write to it: remove only this guard's own temp files.
+                foreach (var entry in journal.Entries)
+                    TryDelete(entry.TempPath);
+                _log?.Invoke($"sdk-pin: checkout '{checkout}' moved from {journal.Head} to {head}; retiring its restore journal without touching the checkout.");
+                RetireJournal(journalPath);
+                return true;
+            }
+        }
 
         var errors = new List<string>();
         foreach (var entry in journal.Entries)
         {
-            if (RestoreEntry(entry, recovering: true, moved) is { } error)
+            if (RestoreEntry(entry, recovering: true) is { } error)
                 errors.Add(error);
         }
 
@@ -578,19 +655,34 @@ public sealed class SdkPinGuard
             return false;
         }
 
-        TryDelete(journalPath);
+        RetireJournal(journalPath);
         return true;
     }
 
     // A journal is only replayed when it is well-formed and confined: it must be the journal for the checkout
     // it names, that checkout must lie on the checkout volume the journal directory belongs to, and every
-    // entry must be a non-symlinked global.json inside that checkout whose journaled bytes match their hash.
+    // entry must be a distinct, non-symlinked global.json inside that checkout whose journaled bytes match
+    // their hash and whose metadata is in range. Validation is total: any malformed shape is a problem string.
     private string? JournalProblem(string journalPath, SdkPinJournal? journal)
+    {
+        try
+        {
+            return JournalProblemCore(journalPath, journal);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or IOException or UnauthorizedAccessException)
+        {
+            return $"it names an invalid path ({ex.Message})";
+        }
+    }
+
+    private string? JournalProblemCore(string journalPath, SdkPinJournal? journal)
     {
         if (journal is null)
             return "it is empty";
         if (journal.Version != SdkPinJournal.CurrentVersion)
             return $"unsupported journal version {journal.Version}";
+        if (journal.Head is not null && !CheckoutHead.IsObjectId(journal.Head))
+            return "its recorded HEAD is not a commit id";
         if (string.IsNullOrWhiteSpace(journal.CheckoutDir) || !Path.IsPathFullyQualified(journal.CheckoutDir))
             return "it names no absolute checkout path";
 
@@ -600,42 +692,114 @@ public sealed class SdkPinGuard
         var volume = Path.GetDirectoryName(Path.GetDirectoryName(Path.GetFullPath(journalPath)));
         if (volume is null || !IsContained(volume, checkout))
             return "the checkout it names is outside the checkout volume";
+        if (journal.Entries is not { Count: > 0 } entries)
+            return "it lists no entries";
 
-        foreach (var entry in journal.Entries)
+        var paths = new HashSet<string>(GlobalJsonLocator.PathComparer);
+        var temps = new HashSet<string>(GlobalJsonLocator.PathComparer);
+        foreach (var entry in entries)
         {
-            if (string.IsNullOrEmpty(entry.Path) || !Path.IsPathFullyQualified(entry.Path)
-                || !string.Equals(Path.GetFileName(entry.Path), GlobalJsonLocator.FileName, StringComparison.Ordinal)
-                || !IsContained(checkout, Path.GetFullPath(entry.Path)))
-                return "an entry is not a global.json inside the checkout";
-            if (!IsOwnTempPath(entry.Path, entry.TempPath))
-                return "an entry names an unexpected temporary file";
-            try
-            {
-                if (!string.Equals(Sha256(Convert.FromBase64String(entry.OriginalBase64)), entry.OriginalSha256, StringComparison.Ordinal))
-                    return "an entry's journaled content does not match its checksum";
-            }
-            catch (FormatException)
-            {
-                return "an entry's journaled content is not valid base64";
-            }
-            // Recovery only ever rewrites a file that still exists, so only an existing one needs the link check
-            // (LinkTarget throws for a missing path on Unix — a deleted checkout must still retire its journal).
-            var full = Path.GetFullPath(entry.Path);
-            if (File.Exists(full) && LinkRefusal(checkout, full) is { } link)
-                return link;
+            if (EntryProblem(checkout, volume, entry) is { } problem)
+                return problem;
+            if (!paths.Add(Path.GetFullPath(entry.Path)) || !temps.Add(Path.GetFullPath(entry.TempPath)))
+                return "it lists the same file twice";
         }
         return null;
+    }
+
+    private static string? EntryProblem(string checkout, string volume, SdkPinJournalEntry? entry)
+    {
+        if (entry is null)
+            return "an entry is empty";
+        if (string.IsNullOrEmpty(entry.Path) || !Path.IsPathFullyQualified(entry.Path)
+            || !string.Equals(Path.GetFileName(entry.Path), GlobalJsonLocator.FileName, StringComparison.Ordinal)
+            || !IsContained(checkout, Path.GetFullPath(entry.Path)))
+            return "an entry is not a global.json inside the checkout";
+        if (!IsOwnTempPath(entry.Path, entry.TempPath))
+            return "an entry names an unexpected temporary file";
+        if (!IsSha256(entry.OriginalSha256) || !IsSha256(entry.NeutralizedSha256))
+            return "an entry's checksums are malformed";
+        if (entry.OriginalBase64 is null)
+            return "an entry has no journaled content";
+        try
+        {
+            if (!string.Equals(Sha256(Convert.FromBase64String(entry.OriginalBase64)), entry.OriginalSha256, StringComparison.Ordinal))
+                return "an entry's journaled content does not match its checksum";
+        }
+        catch (FormatException)
+        {
+            return "an entry's journaled content is not valid base64";
+        }
+        if (entry.LastWriteTimeUtcTicks is < 0 or > MaxTicks)
+            return "an entry's timestamp is out of range";
+        if (entry.UnixMode is < 0 or > MaxUnixMode)
+            return "an entry's file mode is out of range";
+        return LinkRefusal(checkout, Path.GetFullPath(entry.Path), volume);
+    }
+
+    private static bool IsSha256(string? value) =>
+        value is { Length: 64 } && value.All(c => c is (>= '0' and <= '9') or (>= 'a' and <= 'f'));
+
+    private const long MaxTicks = 3155378975999999999; // DateTime.MaxValue.Ticks
+    private const int MaxUnixMode = 0xFFF; // every UnixFileMode flag (07777)
+
+    private enum Presence { Absent, Present, Unknown }
+
+    // Distinguishes a path that is confirmed absent from one whose existence cannot be determined (an access
+    // or I/O failure): File.Exists/Directory.Exists report both as "false", which must never count as "no journal".
+    private static Presence PresenceOf(string path, out string? error)
+    {
+        error = null;
+        try
+        {
+            _ = File.GetAttributes(path);
+            return Presence.Present;
+        }
+        catch (FileNotFoundException)
+        {
+            return Presence.Absent;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return Presence.Absent;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            error = ex.Message;
+            return Presence.Unknown;
+        }
     }
 
     private static void WriteJournal(string journalPath, SdkPinJournal journal)
     {
         var directory = Path.GetDirectoryName(journalPath)!;
-        Directory.CreateDirectory(directory);
+        if (!Directory.Exists(directory))
+        {
+            Directory.CreateDirectory(directory);
+            // A new journal directory is only durable once its own parent entry is flushed.
+            if (Path.GetDirectoryName(directory) is { } parent)
+                _ = DurableFlush.TryFlush(parent);
+        }
         var temp = journalPath + ".tmp";
         WriteDurably(temp, JsonSerializer.SerializeToUtf8Bytes(journal, JournalJson));
         File.Move(temp, journalPath, overwrite: true);
         // The journal must be durable BEFORE global.json is touched, so flush the rename too.
-        _ = DurableDirectory.TryFlush(directory);
+        _ = DurableFlush.TryFlush(directory);
+    }
+
+    // Deletes a journal whose checkout needs no more repair, and flushes the deletion — only after the
+    // restored file (and its metadata) was flushed, so a power loss never keeps the deletion but loses the restore.
+    private void RetireJournal(string journalPath)
+    {
+        TryDelete(journalPath);
+        if (Path.GetDirectoryName(journalPath) is { } directory)
+            _ = DurableFlush.TryFlush(directory);
+    }
+
+    private static void WriteRestored(SdkPinJournalEntry entry, byte[] original)
+    {
+        WriteAtomically(entry.Path, entry.TempPath, original, entry.UnixMode);
+        SetMetadata(entry);
     }
 
     private static void WriteAtomically(string path, string temp, byte[] content, int? unixMode)
@@ -660,7 +824,7 @@ public sealed class SdkPinGuard
             if (created)
                 DeleteQuietly(temp);
         }
-        _ = DurableDirectory.TryFlush(Path.GetDirectoryName(path)!);
+        _ = DurableFlush.TryFlush(Path.GetDirectoryName(path)!);
     }
 
     private static void WriteDurably(string path, byte[] content)
@@ -675,6 +839,8 @@ public sealed class SdkPinGuard
         if (entry.UnixMode is { } mode && !OperatingSystem.IsWindows())
             File.SetUnixFileMode(entry.Path, (UnixFileMode)mode);
         File.SetLastWriteTimeUtc(entry.Path, new DateTime(entry.LastWriteTimeUtcTicks, DateTimeKind.Utc));
+        // Mode and mtime are inode metadata: flush them too before the journal that repairs them is retired.
+        _ = DurableFlush.TryFlush(entry.Path);
     }
 
     private void TryDelete(string path)

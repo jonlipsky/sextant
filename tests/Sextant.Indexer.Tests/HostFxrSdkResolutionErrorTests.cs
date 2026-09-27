@@ -100,8 +100,7 @@ public sealed class HostFxrSdkResolutionErrorTests
         foreach (var message in new[]
         {
             BuildHostMessage, LocatorMessage,
-            "A compatible installed .NET SDK for global.json version [6.0.100] from [/src/app/global.json] was not found.",
-            "hostfxr returned 0x8000809B (SdkResolveFailure)"
+            "A compatible installed .NET SDK for global.json version [6.0.100] from [/src/app/global.json] was not found."
         })
         {
             Assert.IsTrue(HostFxrSdkResolutionError.TryParse(message, out var error), message);
@@ -112,10 +111,13 @@ public sealed class HostFxrSdkResolutionErrorTests
     [TestMethod]
     [DataRow("Error while calling hostfxr function hostfxr_resolve_sdk2. Error code: -2147450730")]
     [DataRow("Error while calling hostfxr function hostfxr_resolve_sdk2. Error code: -2147450749 Detailed error: invalid global.json")]
+    [DataRow("Error while calling hostfxr function hostfxr_resolve_sdk2. Error code: -2147450725 Detailed error: ")]
+    [DataRow("hostfxr returned 0x8000809B (SdkResolveFailure)")]
     public void IsMissingSdk_IsFalseForOtherResolveSdk2Failures(string message)
     {
-        // Still a hostfxr SDK-resolution failure (so it is reported typed), but not the missing-SDK outcome the
-        // service's override may act on — e.g. a malformed global.json or an invalid argument.
+        // Still a hostfxr SDK-resolution failure (so it is reported typed), but not PROVEN to be the missing-SDK
+        // outcome the service's override may act on — e.g. a malformed global.json, an invalid argument, or the
+        // bare SdkResolveFailure status, which hostfxr returns for EVERY resolution failure (invalid global.json too).
         Assert.IsTrue(HostFxrSdkResolutionError.TryParse(message, out var error));
         Assert.IsFalse(error.IsMissingSdk);
     }

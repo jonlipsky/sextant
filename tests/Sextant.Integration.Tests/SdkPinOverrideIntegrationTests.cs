@@ -157,6 +157,26 @@ public class SdkPinOverrideIntegrationTests
     }
 
     [TestMethod]
+    public async Task MalformedSdkVersionPin_IsNeverOverridden_AndFailsTyped()
+    {
+        // Real hostfxr words a malformed version ("1.2.0" has no feature band) exactly like an absent band, so
+        // only the guard's version validation keeps it from "fixing" a pin that does not name a real SDK band.
+        const string malformed = "{\n  \"sdk\": {\n    \"version\": \"1.2.0\",\n    \"rollForward\": \"disable\"\n  }\n}\n";
+        var commit = CreateRepo(("global.json", malformed));
+        var globalJson = Path.Combine(_checkout, "global.json");
+        var bytesBefore = File.ReadAllBytes(globalJson);
+
+        var (result, _) = await ProduceAsync(commit, [Path.Combine(_checkout, "App.slnx")], overrideEnabled: true);
+
+        Assert.AreEqual(SnapshotJobStatus.Failed, result.Status, string.Join('\n', _log));
+        StringAssert.Contains(result.Error, "not a well-formed .NET SDK version");
+        Assert.AreEqual(1, result.Projects.Count(p => p.Code == LocalIndexerSnapshotWorker.SdkResolutionFailedCode));
+        Assert.IsFalse(result.Projects.Any(p => p.Code == LocalIndexerSnapshotWorker.SdkPinOverriddenCode));
+        CollectionAssert.AreEqual(bytesBefore, File.ReadAllBytes(globalJson));
+        Assert.IsFalse(Directory.Exists(_journalRoot), "a refused pin never writes a journal");
+    }
+
+    [TestMethod]
     public async Task LeftoverNeutralizedPin_FromAnInterruptedJob_IsRepairedBeforeTheCheckoutIsReused()
     {
         var commit = CreateRepo(("global.json", UnsatisfiablePin));
