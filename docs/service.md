@@ -214,6 +214,38 @@ bumps the schema version (folded into the snapshot identity), every repository i
 coverage row — on its next ensure. The Phase-10 `snapshots.fallback_reason` column is **not** used for
 coverage; the reason lives on the job and in the coverage record.
 
+**Provider snapshots carry their own coverage (issue #162).** A Phase-12 provider snapshot (a populated,
+clean submodule published at its pinned commit) is published in the same transaction as its consumer, and it
+now gets its own `snapshot_coverage` row in that transaction. A later direct ensure that reuses the provider
+identity therefore reports the provider's real verdict on ensure/status/resolve and in MCP
+`meta.snapshot.coverage`, instead of reporting "complete" by omission. The record is computed over the
+provider's **subtree** (`SnapshotCoverageBuilder.BuildProviders`), not over the whole checkout:
+
+- counts are limited to the subtree: the projects the parent's selection declared, loaded, and skipped
+  under the submodule path, the project files on disk there, the solution files there, and the submodules
+  nested inside it;
+- **partial** when any provider project was skipped; when a provider project on disk was neither declared
+  nor loaded (always a gap, even under a configured parent `solutions` scope, because the parent's scope does
+  not scope another repository); when the provider has its own solution files and **none** of them was
+  selected (the provider was built only from the projects the parent's selection reaches, so its
+  solution-scoped view is missing) or only some of them were; when a provider solution declared no readable
+  project; when a nested submodule is unpopulated; or when any part of the checkout could not be scanned;
+- a provider with no solution files, whose on-disk projects all loaded, is `complete`;
+- `selection_source` is the parent's source when one of the provider's own solutions was selected, and
+  `parent_selection` otherwise. SDK-pin overrides are kept only when the `global.json` governs the provider
+  (inside it, rewritten provider-relative, or an ancestor, shown as `<indexing checkout>/global.json`);
+- reasons name provider-relative paths only, so the parent's layout never leaks to a reader of the provider.
+
+The row is **record-if-absent**. A #53 growth republish of an already-published provider keeps its
+first-publish verdict. That verdict can only be conservative: `complete` means every on-disk project loaded.
+A provider that is rebuilt after a failure, or is re-staged from a non-complete state, has its stale row
+deleted first, so re-recording never trips the "recorded twice" guard. A provider reused as already complete
+keeps whatever row it has and is never backfilled. So a provider published before #162 still has coverage
+*not recorded*, until its identity changes, for example through a schema or `AnalyzerVersion` bump. If the
+worker computed no coverage for a provider's submodule path, the provider is recorded `partial` with reason
+"coverage was not computed". Provider coverage is not part of `SnapshotIdentity`, so Phase-12 dedup is
+unchanged.
+
 Routing platform heads to a native Windows/macOS worker is a separate concern (issue #89); here they are
 recorded skipped-with-reason.
 
@@ -654,7 +686,8 @@ ordering and supplies this sequence so Sextant advances the data-plane branch po
 pointer (and stored `branches.head_sequence`) advance only when the supplied sequence is strictly greater
 than the stored one; a lower/equal sequence still ensures/attaches the immutable snapshot but leaves the
 branch pointer untouched (no transient regression to a stale snapshot). A NULL sequence — the local
-CLI/daemon path — advances unconditionally and never writes the column, preserving pre-#84 behavior.
+CLI/daemon path — advances unconditionally and never writes the column, preserving pre-#84 behavior (a
+null-sequence service ensure that *reuses* a published snapshot follows the stricter #162 rule below).
 
 **Re-selecting a superseded snapshot on reset/force-push (issue #85).** A branch advance supersedes the
 previous head, so after A@10 → B@20 the snapshot for A is `superseded`. A sequence-bearing ensure of A
@@ -677,8 +710,35 @@ republishes into the same id. Retention also reclaims ledger rows independently 
 
 Otherwise it is demoted to `failed` and the ensure falls through to the worker, which rebuilds the identity
 into the same snapshot id instead of resurrecting a data-less snapshot. A snapshot whose row retention has
-already GC'd is simply regenerated (issue #46). The null-sequence path is unchanged: it still hands a
+already GC'd is simply regenerated (issue #46). The null-sequence path does not re-select: it still hands a
 superseded identity to the worker.
+
+**Null-sequence reuse re-points only when history cannot regress (issue #162).** An ensure with no
+`branch_head_sequence` that reuses an already-published snapshot (a Phase-12 provider built by a monorepo
+ensure, or any identity built earlier) used to be attach-if-unset. The worker path for the same request
+advances unconditionally, so identical requests had different outcomes depending on whether the identity
+had already been built. The reuse path now re-points the branch **only** when that cannot move the head to
+older history:
+
+- the branch has no target yet (attach, as before);
+- the branch's current target is **not usable**: it is no longer `complete` (for example `superseded`), or
+  retention reclaimed it (the pointer is null);
+- the current target is a **pure identity change at the same commit**: same repository, same non-null
+  commit, neither snapshot an overlay, and no working-tree delta. This covers an `AnalyzerVersion`, schema,
+  config, or toolchain upgrade, and a flip of the node's SDK-pin override policy (issue #113, now part of the
+  identity). The latest such ensure wins, as it does on the worker path, so nodes with different policies
+  ensuring the same commit simply alternate the head between two equally current snapshots.
+
+In every other case, and in particular when the current target is at a different commit, the pointer is left
+alone: a null sequence carries no ordering, so an older commit must not replace a newer head. When the branch
+is re-pointed, the previous target is marked `superseded` only if it was `complete` and **no other branch
+still points at it**, so this path never strands another branch on a superseded head (the #128 hazard;
+the other advance paths are unchanged). `head_sequence` is never written. Everything runs in the existing
+single `BEGIN IMMEDIATE` transaction under the write gate, together with the #104 default-branch
+bookkeeping. Reuse also clears the provider-only flag on the repository, on both the null-sequence and the
+sequence-bearing path, just as the worker's `EnsureRepository` does. So a repository first seen only as a
+provider becomes selectable once it is ensured directly. Sequence-bearing requests stay on the #84/#85
+forward-only gate, unchanged.
 
 On the terminal-attach fast path (an already-terminal job), checking that the job's snapshot is still usable
 and advancing the branch to it happen in the same write-gate hold. Otherwise a concurrent ensure could
@@ -918,7 +978,10 @@ Plus store-level regressions: `RetentionSnapshotGcTests` (#46/#37/#54), `WriterL
 `ProviderGrowthImmutabilityTests` (#53), and `RemoteFederationTests` (#51 paging/caching/offline/timeout/
 auth). Coverage integrity (#119): `SnapshotCoverageBuilderTests`, `CheckoutInventoryTests`,
 `SnapshotCoverageStoreTests`, `OrchestratorCoverageTests`, `SnapshotServiceCoverageTests`, and the
-`CoverageRegressionFixtureTests` clone of a two-solution repo with a refused-host submodule. Submodule
+`CoverageRegressionFixtureTests` clone of a two-solution repo with a refused-host submodule. Null-sequence
+reuse and provider coverage (#162): `NullSequenceReusePointerTests`, `EnsureNullSequenceReuseTests`,
+`ProviderCoverageBuilderTests`, `OrchestratorProviderCoverageTests`, and the
+`ServiceHttpTests` direct-ensure-reusing-a-provider test. Submodule
 provisioning (#125): `CloningCheckoutProviderSubmoduleTests` (local `file://` fixtures, no network:
 absolute/relative/nested pins, unfetchable → partial with reasons, sentinel-token non-persistence across every
 git dir, pre-change cache upgrade, transient failure retried then degraded on the final attempt),

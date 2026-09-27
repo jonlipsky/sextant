@@ -6,9 +6,11 @@ namespace Sextant.Store;
 
 /// <summary>
 /// Durable per-snapshot coverage (migration 022, issue #119). One immutable row per published snapshot,
-/// written inside the publish transaction by the orchestrator when the producing worker computed coverage.
-/// A snapshot with no row has "coverage not recorded" (a local/overlay/provider/contribution/pre-022
-/// snapshot) — distinct from a recorded complete verdict. Enrols in the caller's ambient transaction.
+/// written inside the publish transaction by the orchestrator when the producing worker computed coverage —
+/// including each Phase-12 provider snapshot published in that transaction (issue #162, computed over the
+/// provider's submodule subtree). A snapshot with no row has "coverage not recorded" (a local/overlay/
+/// contribution/pre-022/pre-#162-provider snapshot) — distinct from a recorded complete verdict. Enrols in
+/// the caller's ambient transaction.
 /// </summary>
 public sealed class SnapshotCoverageStore(SqliteConnection connection)
 {

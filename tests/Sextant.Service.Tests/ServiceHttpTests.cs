@@ -152,6 +152,51 @@ public class ServiceHttpTests
     }
 
     [TestMethod]
+    public async Task DirectEnsureReusingProviderSnapshot_ReportsItsRecordedCoverage_OnEnsureAndResolve()
+    {
+        // Issue #162: the monorepo ensure published this commit as a Phase-12 PROVIDER snapshot and recorded
+        // its provider-subtree coverage; a later direct ensure of the provider repository reuses it and must
+        // report that verdict, never an absent (implicitly complete) one.
+        var coverage = new SnapshotCoverage
+        {
+            Verdict = SnapshotCoverageVerdict.Partial,
+            Reasons = ["1 of 3 project file(s) on disk were not reached by the indexing checkout's solution selection and were not indexed (Tools/Tools.csproj)."],
+            SelectionSource = "parent_selection",
+            ProjectFilesOnDisk = 3,
+            ProjectFilesUnreferenced = 1
+        };
+        await using var host = await ServiceHttpHarness.StartAsync(
+            withWorker: true, seedComplete: true, coverage, seedAsProvider: true);
+
+        using var ensure = new HttpRequestMessage(HttpMethod.Post, "/control/ensure")
+        {
+            Content = JsonContent.Create(ServiceTestFixtures.Request(branch: "main"), options: ServiceJson.Options)
+        };
+        ensure.Headers.Authorization = new AuthenticationHeaderValue("Bearer", ControlToken);
+        var ensureResponse = await host.Client.SendAsync(ensure);
+        var ensureJson = await ensureResponse.Content.ReadAsStringAsync();
+        Assert.AreEqual(HttpStatusCode.OK, ensureResponse.StatusCode, ensureJson);
+        using (var doc = System.Text.Json.JsonDocument.Parse(ensureJson))
+        {
+            Assert.AreEqual("partial", doc.RootElement.GetProperty("status").GetString());
+            Assert.AreEqual("parent_selection",
+                doc.RootElement.GetProperty("coverage").GetProperty("selection_source").GetString());
+        }
+
+        using var resolve = new HttpRequestMessage(HttpMethod.Get,
+            $"/control/resolve?repository={Uri.EscapeDataString(ServiceTestFixtures.Request().RepositoryRemoteUrl)}&branch=main");
+        resolve.Headers.Authorization = new AuthenticationHeaderValue("Bearer", ControlToken);
+        var resolveResponse = await host.Client.SendAsync(resolve);
+        var resolveJson = await resolveResponse.Content.ReadAsStringAsync();
+        Assert.AreEqual(HttpStatusCode.OK, resolveResponse.StatusCode, resolveJson);
+        using (var doc = System.Text.Json.JsonDocument.Parse(resolveJson))
+        {
+            Assert.AreEqual("partial", doc.RootElement.GetProperty("coverage").GetProperty("verdict").GetString());
+            Assert.AreEqual(1, doc.RootElement.GetProperty("coverage").GetProperty("project_files_unreferenced").GetInt32());
+        }
+    }
+
+    [TestMethod]
     public async Task Mcp_Endpoint_IsMapped_AndAuthGated()
     {
         await using var host = await ServiceHttpHarness.StartAsync(withWorker: true, seedComplete: true);
@@ -295,7 +340,7 @@ public class ServiceHttpTests
         private string DbPath { get; init; } = "";
 
         public static async Task<ServiceHttpHarness> StartAsync(
-            bool withWorker, bool seedComplete, SnapshotCoverage? seedCoverage = null)
+            bool withWorker, bool seedComplete, SnapshotCoverage? seedCoverage = null, bool seedAsProvider = false)
         {
             var dbPath = ServiceTestFixtures.NewDbPath();
             var db = new IndexDatabase(dbPath);
@@ -304,7 +349,7 @@ public class ServiceHttpTests
             var request = ServiceTestFixtures.Request();
             if (seedComplete)
             {
-                var snapId = ServiceTestFixtures.PublishComplete(db, request);
+                var snapId = ServiceTestFixtures.PublishComplete(db, request, isProvider: seedAsProvider);
                 if (seedCoverage is not null)
                     new SnapshotCoverageStore(db.GetConnection()).Record(snapId, seedCoverage, 1);
             }
