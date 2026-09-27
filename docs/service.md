@@ -1004,7 +1004,13 @@ repos pins a solution's directory; the other uses the #124 default union, with t
 directory. Through a real `SnapshotService` over one shared catalog, a commit ensured with the override off
 (`failed`, or `partial` for the multi-solution repo) is rebuilt with complete coverage under a new identity
 once the override is on, instead of being reused. A re-ensure under the unchanged policy then attaches without
-a rebuild.
+a rebuild. Per-pin and submodule verification (#171): `SdkPinGuardTests` (one unverifiable pin never
+suppresses another's override; submodule pins verified through every gitlink, journal `version 2`, and
+submodule-entry recovery: restored, moved, unpopulated, unconfirmed, malformed), `GitCheckoutContentVerifierTests`
+(`GitlinkProblem` and the guard over a real absorbed submodule: both pins overridden, `.git`/`.git/modules`
+byte-identical, both trees clean), and two `SdkPinOverrideIntegrationTests` over a real absorbed submodule under
+the default union: a root pin plus a submodule pin both overridden (`complete`), and a submodule checked out away
+from its gitlink refused with its own reason while the root pin is still overridden (`partial`).
 
 ### Phase 15 — platform routing tests
 
