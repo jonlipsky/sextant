@@ -279,11 +279,16 @@ public sealed class LocalIndexerSnapshotWorker(
 
             // Coverage (issue #119) depends only on the selection, the load, and the checkout's file tree —
             // all known BEFORE indexing — so it rides on the snapshot context and is recorded in the SAME
-            // transaction that publishes the snapshot.
-            var coverage = SnapshotCoverageBuilder.Build(
-                checkoutDir, resolution, load, SnapshotCoverageBuilder.Inventory.Scan(checkoutDir),
-                pins.Where(p => p.OverrideApplied).Select(p => p.ToCoverageOverride()).ToList());
-            var indexContext = context with { Coverage = coverage.Coverage };
+            // transaction that publishes the snapshot. The same inventory yields each Phase-12 provider
+            // subtree's own verdict (issue #162), recorded when the orchestrator publishes that provider.
+            var inventory = SnapshotCoverageBuilder.Inventory.Scan(checkoutDir);
+            var pinOverrides = pins.Where(p => p.OverrideApplied).Select(p => p.ToCoverageOverride()).ToList();
+            var coverage = SnapshotCoverageBuilder.Build(checkoutDir, resolution, load, inventory, pinOverrides);
+            var indexContext = context with
+            {
+                Coverage = coverage.Coverage,
+                ProviderCoverage = SnapshotCoverageBuilder.BuildProviders(checkoutDir, resolution, load, inventory, pinOverrides)
+            };
 
             var orchestrator = new IndexOrchestrator(
                 database, log, configuration.DocumentExtractor,

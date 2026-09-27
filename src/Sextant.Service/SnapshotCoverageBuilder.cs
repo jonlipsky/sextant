@@ -18,6 +18,12 @@ namespace Sextant.Service;
 /// disk is in no selected solution. Each gap is also recorded as a warning diagnostic, so a partial
 /// snapshot is never silent.
 /// </para>
+/// <para>
+/// <see cref="BuildProviders"/> applies the same idea to each Phase-12 provider snapshot (issue #162), scoped
+/// to that provider's submodule subtree: it is partial when a provider project was skipped or left
+/// unreached, when the provider's own solutions were not (all) the selection basis, when a nested submodule
+/// is unpopulated, or when the scan was incomplete.
+/// </para>
 /// </summary>
 public static class SnapshotCoverageBuilder
 {
@@ -33,12 +39,44 @@ public static class SnapshotCoverageBuilder
         IReadOnlyList<DeclaredSubmodule> Submodules,
         IReadOnlyList<string>? ScanErrors = null)
     {
+        /// <summary>
+        /// The solution files (full paths) found under the checkout's POPULATED submodules — the Phase-12
+        /// providers' OWN solutions (issue #162), whether or not the parent's selection chose them. Null when
+        /// not scanned (then a provider is judged as if it declared no solution).
+        /// </summary>
+        public IReadOnlyList<string>? SubmoduleSolutionFiles { get; init; }
+
         public static Inventory Scan(string checkoutDir)
         {
             var errors = new List<string>();
             var projects = CheckoutInventory.FindProjectFiles(checkoutDir, errors);
             var submodules = CheckoutInventory.FindDeclaredSubmodules(checkoutDir, errors);
-            return new Inventory(projects, submodules, errors);
+            return new Inventory(projects, submodules, errors)
+            {
+                SubmoduleSolutionFiles = ScanSubmoduleSolutions(checkoutDir, submodules, errors)
+            };
+        }
+
+        // Walks only the OUTERMOST populated submodules (a nested one lies inside its parent's walk), so a
+        // checkout without submodules pays nothing. The project walk already covered these directories, so an
+        // I/O error it reported is not counted twice.
+        private static IReadOnlyList<string> ScanSubmoduleSolutions(
+            string checkoutDir, IReadOnlyList<DeclaredSubmodule> submodules, List<string> errors)
+        {
+            var root = Path.GetFullPath(checkoutDir);
+            var populated = submodules.Where(s => s.Populated).Select(s => s.Path).ToList();
+            var solutions = new List<string>();
+            var walkErrors = new List<string>();
+            foreach (var path in populated)
+            {
+                if (populated.Any(outer => path.StartsWith(outer + "/", StringComparison.Ordinal)))
+                    continue;
+                solutions.AddRange(CheckoutInventory.FindSolutionFiles(Path.Combine(root, path), walkErrors));
+            }
+            foreach (var error in walkErrors)
+                if (!errors.Contains(error))
+                    errors.Add(error);
+            return solutions.Distinct(CheckoutInventory.PathComparer).OrderBy(s => s, StringComparer.Ordinal).ToList();
         }
     }
 
@@ -233,6 +271,164 @@ public static class SnapshotCoverageBuilder
 
         return new Result(coverage, diagnostics);
     }
+
+    /// <summary>
+    /// Computes the coverage of every Phase-12 PROVIDER snapshot this checkout can produce (issue #162), keyed
+    /// by the populated submodule's checkout-relative <c>/</c>-separated path (the same key the orchestrator
+    /// routes a provider from). A provider snapshot is built from exactly the projects of its submodule
+    /// subtree that the PARENT's solution selection declared or loaded, so its verdict is computed over that
+    /// subtree alone, and is PARTIAL when:
+    /// <list type="bullet">
+    /// <item>a declared project in the subtree failed to load;</item>
+    /// <item>a project file in the subtree is on disk but was neither declared nor loaded (always a gap for
+    /// the provider, even under a <c>configured</c> parent scope: nobody scoped the PROVIDER repository);</item>
+    /// <item>one of the provider's OWN solutions was not selected — in particular when none was, i.e. the
+    /// provider was built only from projects the parent's selection reaches, so it lacks the provider's
+    /// solution-scoped view even if every project happened to load;</item>
+    /// <item>a selected provider solution declared nothing readable;</item>
+    /// <item>a submodule nested in the provider is not populated;</item>
+    /// <item>the checkout scan reported any error (it cannot prove nothing in the subtree was missed).</item>
+    /// </list>
+    /// Reasons name paths relative to the PROVIDER root only, never the parent's layout or URL, because the
+    /// record is served to whoever later ensures the provider repository directly.
+    /// </summary>
+    public static IReadOnlyDictionary<string, SnapshotCoverage> BuildProviders(
+        string checkoutDir, CheckoutResolution resolution, MultiSolutionLoadResult load, Inventory inventory,
+        IReadOnlyList<SdkPinOverride>? sdkPinOverrides = null)
+    {
+        var comparer = CheckoutInventory.PathComparer;
+        var root = Path.GetFullPath(checkoutDir);
+        var result = new Dictionary<string, SnapshotCoverage>(comparer);
+
+        var loadedFiles = new HashSet<string>(comparer);
+        foreach (var project in load.Solution.Projects)
+            if (!string.IsNullOrEmpty(project.FilePath))
+                loadedFiles.Add(Path.GetFullPath(project.FilePath));
+        var declaredFiles = new HashSet<string>(load.DeclaredProjects.Select(Path.GetFullPath), comparer);
+        var selectedSolutions = resolution.SelectedSolutions.Select(Path.GetFullPath).ToList();
+        var providerSolutionsOnDisk = (inventory.SubmoduleSolutionFiles ?? []).Select(Path.GetFullPath).ToList();
+        var scanErrors = inventory.ScanErrors ?? [];
+
+        foreach (var submodule in inventory.Submodules.Where(s => s.Populated))
+        {
+            var subtree = Path.GetFullPath(Path.Combine(root, submodule.Path));
+            bool InSubtree(string fullPath) => IsUnder(subtree, fullPath);
+            string Rel(string fullPath) => Path.GetRelativePath(subtree, fullPath).Replace('\\', '/');
+
+            var declared = declaredFiles.Where(InSubtree).ToList();
+            var loaded = loadedFiles.Where(InSubtree).ToList();
+            var skipped = load.SkippedProjects.Where(s => InSubtree(Path.GetFullPath(s.ProjectPath))).ToList();
+            var onDisk = inventory.ProjectFilesOnDisk.Where(p => InSubtree(Path.GetFullPath(p))).ToList();
+            var accounted = new HashSet<string>(declared, comparer);
+            accounted.UnionWith(loaded);
+            var unreferenced = onDisk.Where(p => !accounted.Contains(Path.GetFullPath(p))).ToList();
+            var nested = inventory.Submodules
+                .Where(s => s.Path.StartsWith(submodule.Path + "/", StringComparison.Ordinal))
+                .ToList();
+            var nestedUnpopulated = nested.Where(s => !s.Populated).ToList();
+            var ownSolutions = providerSolutionsOnDisk.Where(InSubtree).ToHashSet(comparer);
+            var selectedOwn = selectedSolutions.Where(InSubtree).ToList();
+            ownSolutions.UnionWith(selectedOwn);
+            var notSelectedOwn = ownSolutions.Where(s => !selectedOwn.Contains(s, comparer))
+                .OrderBy(s => Rel(s), StringComparer.Ordinal)
+                .ToList();
+            var emptyOwn = load.Solutions
+                .Count(c => c.DeclaredProjectCount == 0 && InSubtree(Path.GetFullPath(c.SolutionPath)));
+
+            var reasons = new List<string>();
+            if (skipped.Count > 0)
+                reasons.Add(
+                    $"{skipped.Count} project(s) of this repository could not be loaded while indexing the checkout " +
+                    $"that pins it ({NameSample(skipped.Select(s => Rel(Path.GetFullPath(s.ProjectPath))).ToList())}).");
+            if (selectedOwn.Count == 0 && ownSolutions.Count > 0)
+                reasons.Add(
+                    $"none of this repository's {ownSolutions.Count} solution(s) was selected; it was built only from " +
+                    "the projects the indexing checkout's solution selection reaches, so its solution-scoped view " +
+                    "is missing.");
+            else if (notSelectedOwn.Count > 0)
+                reasons.Add(
+                    $"{notSelectedOwn.Count} of this repository's {ownSolutions.Count} solution(s) were not selected " +
+                    $"({NameSample(notSelectedOwn.Select(Rel).ToList())}).");
+            if (unreferenced.Count > 0)
+                reasons.Add(
+                    $"{unreferenced.Count} of {onDisk.Count} project file(s) on disk were not reached by the indexing " +
+                    $"checkout's solution selection and were not indexed ({NameSample(unreferenced.Select(p => Rel(Path.GetFullPath(p))).ToList())}).");
+            if (emptyOwn > 0)
+                reasons.Add($"{emptyOwn} selected solution(s) of this repository declared no readable projects.");
+            if (nestedUnpopulated.Count > 0)
+                reasons.Add(
+                    $"{nestedUnpopulated.Count} of {nested.Count} nested submodule(s) are not populated " +
+                    $"({NameSample(nestedUnpopulated.Select(s => s.Path[(submodule.Path.Length + 1)..]).ToList())}); " +
+                    "their projects are not indexed.");
+            if (scanErrors.Count > 0)
+                reasons.Add(
+                    $"the coverage scan could not inspect {scanErrors.Count} part(s) of the indexing checkout, so it " +
+                    "cannot prove every project of this repository was accounted for.");
+
+            var pins = (sdkPinOverrides ?? [])
+                .Where(p => PinAppliesTo(p.GlobalJsonPath, submodule.Path))
+                .Select(p => p with { GlobalJsonPath = ProviderPinPath(p.GlobalJsonPath, submodule.Path) })
+                .ToList();
+            result[submodule.Path] = new SnapshotCoverage
+            {
+                Verdict = reasons.Count > 0 ? SnapshotCoverageVerdict.Partial : SnapshotCoverageVerdict.Complete,
+                Reasons = reasons,
+                SelectionSource = selectedOwn.Count > 0 ? SourceWireName(resolution.Source) : ParentSelectionSource,
+                SolutionsDiscovered = ownSolutions.Count,
+                SolutionsSelected = selectedOwn.Count,
+                SolutionsNotSelected = notSelectedOwn.Count,
+                SolutionsSkipped = 0,
+                ProjectsDeclared = declared.Count,
+                ProjectsLoaded = loaded.Count,
+                ProjectsSkipped = skipped.Count,
+                ProjectFilesOnDisk = onDisk.Count,
+                ProjectFilesUnreferenced = unreferenced.Count,
+                SubmodulesDeclared = nested.Count,
+                SubmodulesUnpopulated = nestedUnpopulated.Count,
+                ScanErrors = scanErrors.Count,
+                SdkPinOverrides = pins.Count > 0 ? pins : null
+            };
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// The <see cref="SnapshotCoverage.SelectionSource"/> of a provider snapshot none of whose own solutions
+    /// was selected: it was built only from the projects the indexing parent's selection reached (issue #162).
+    /// </summary>
+    public const string ParentSelectionSource = "parent_selection";
+
+    private static bool IsUnder(string directory, string fullPath)
+    {
+        var relative = Path.GetRelativePath(directory, fullPath);
+        return relative != "." && !Path.IsPathRooted(relative)
+            && relative != ".." && !relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+            && !relative.StartsWith("../", StringComparison.Ordinal);
+    }
+
+    // A global.json governs every project below its directory, so a pin override applies to a provider when
+    // the pin sits at or above the provider's root, or inside it.
+    private static bool PinAppliesTo(string globalJsonPath, string submodulePath)
+    {
+        var slash = globalJsonPath.LastIndexOf('/');
+        var dir = slash < 0 ? string.Empty : globalJsonPath[..slash];
+        return dir.Length == 0
+            || string.Equals(dir, submodulePath, StringComparison.Ordinal)
+            || submodulePath.StartsWith(dir + "/", StringComparison.Ordinal)
+            || dir.StartsWith(submodulePath + "/", StringComparison.Ordinal);
+    }
+
+    // A pin inside the provider is named relative to the provider root; one at or above it belongs to the
+    // indexing checkout, whose layout the provider's readers must not learn, so only its file name is kept.
+    private static string ProviderPinPath(string globalJsonPath, string submodulePath) =>
+        globalJsonPath.StartsWith(submodulePath + "/", StringComparison.Ordinal)
+            ? globalJsonPath[(submodulePath.Length + 1)..]
+            : $"<indexing checkout>/{Path.GetFileName(globalJsonPath)}";
+
+    private static string NameSample(IReadOnlyList<string> names) =>
+        string.Join(", ", names.Take(MaxNamedInReason))
+        + (names.Count > MaxNamedInReason ? $", +{names.Count - MaxNamedInReason} more" : string.Empty);
 
     /// <summary>
     /// "'&lt;repo-relative global.json&gt;' requests SDK &lt;version&gt;" for a classified hostfxr failure —

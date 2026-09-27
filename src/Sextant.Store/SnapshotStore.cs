@@ -99,13 +99,7 @@ public sealed class SnapshotStore(SqliteConnection connection)
         // spelling. The single writer + BEGIN IMMEDIATE serializes this get-or-create.
         if (GetRepositoryId(remoteUrl) is long existing)
         {
-            // A repository indexed in its own right is a PRIMARY/consumer repo: clear any is_provider flag
-            // left over from an earlier submodule-provider-only discovery so the scope-less single-repo
-            // local default counts it. For an ordinary consumer this stays 0 (no-op).
-            using var upd = connection.CreateCommand();
-            upd.CommandText = "UPDATE repositories SET is_provider = 0 WHERE id = @id;";
-            upd.Parameters.AddWithValue("@id", existing);
-            upd.ExecuteNonQuery();
+            MarkConsumerRepository(existing);
             return existing;
         }
         using var cmd = connection.CreateCommand();
@@ -116,6 +110,23 @@ public sealed class SnapshotStore(SqliteConnection connection)
         cmd.Parameters.AddWithValue("@url", remoteUrl);
         cmd.Parameters.AddWithValue("@now", now);
         return (long)cmd.ExecuteScalar()!;
+    }
+
+    /// <summary>
+    /// Marks a repository as a PRIMARY/consumer repository indexed (or ensured) in its own right: clears any
+    /// <c>is_provider</c> flag left over from an earlier submodule-provider-only discovery, so the scope-less
+    /// single-repo local default and the multi-tenant read selector
+    /// (<see cref="GetSelectedSnapshotIdForRepository"/>, which requires <c>is_provider = 0</c>) count it.
+    /// A no-op for an ordinary consumer. <see cref="EnsureRepository"/> runs it on the worker path; the
+    /// service reuse path runs it when a direct ensure attaches a branch without the worker (issue #162), so
+    /// a provider-only repository that is ensured directly becomes selectable either way.
+    /// </summary>
+    public void MarkConsumerRepository(long repositoryId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "UPDATE repositories SET is_provider = 0 WHERE id = @id AND is_provider <> 0;";
+        cmd.Parameters.AddWithValue("@id", repositoryId);
+        cmd.ExecuteNonQuery();
     }
 
     /// <summary>
@@ -497,6 +508,65 @@ public sealed class SnapshotStore(SqliteConnection connection)
         if (GetBranchSnapshotId(branchId) is null)
             SetBranchPointer(branchId, snapshotId, now);
         return branchId;
+    }
+
+    /// <summary>
+    /// The branch-pointer decision for a NULL-sequence service ensure that REUSES an already-published
+    /// snapshot without running the worker (issue #162). Without a head sequence the service cannot order
+    /// two ensures of different commits, so this keeps <see cref="AttachBranchPointer"/>'s attach-if-unset
+    /// behavior, with ONE exception: it re-points an existing pointer to <paramref name="snapshotId"/> (a
+    /// COMPLETE snapshot of the same repository) only when that cannot regress commit history:
+    /// <list type="bullet">
+    /// <item>the current target is at the SAME commit (same repository and commit, neither an overlay nor a
+    /// dirty working-tree identity): a pure identity change (analyzer, schema, config, or toolchain). This
+    /// ignores which identity is newer, as the worker path does: the latest ensure wins; or</item>
+    /// <item>the current target is not usable: not <see cref="SnapshotStatus.Complete"/> (superseded, failed,
+    /// …) or no longer present. A pointer to a snapshot retention reclaimed is already NULL
+    /// (<c>ON DELETE SET NULL</c>), which the attach-if-unset step fills.</item>
+    /// </list>
+    /// On a re-point the previous target is superseded like the worker path's advance, but ONLY when it is
+    /// still <see cref="SnapshotStatus.Complete"/> AND no other branch points at it. Since #62 several branches
+    /// can share one snapshot, and superseding it would strand the others (issue #128). An older-commit
+    /// reuse still declines, and <c>head_sequence</c> is never written. Returns the branch id. Runs on the
+    /// caller's connection inside the caller's write transaction.
+    /// </summary>
+    public long AttachOrUpgradeBranchPointer(long repositoryId, string branchName, long snapshotId, long now)
+    {
+        var branchId = AttachBranchPointer(repositoryId, branchName, snapshotId, now);
+        if (GetBranchSnapshotId(branchId) is not long current || current == snapshotId)
+            return branchId;
+        if (GetById(snapshotId) is not { Status: SnapshotStatus.Complete } target || target.RepositoryId != repositoryId)
+            return branchId;
+
+        var previous = GetById(current);
+        var previousUsable = previous is { Status: SnapshotStatus.Complete };
+        if (previousUsable && !IsSameCommitIdentityChange(previous!, target))
+            return branchId;
+
+        SetBranchPointer(branchId, snapshotId, now);
+        if (previousUsable && !IsPointedByAnotherBranch(current, branchId))
+            MarkStatus(current, SnapshotStatus.Superseded);
+        return branchId;
+    }
+
+    // Same repository + same commit row (commits are UNIQUE per repository + sha), and neither side is an
+    // overlay or a dirty working-tree identity, so swapping one for the other changes only the analyzer/
+    // schema/config/toolchain identity, never the commit a branch resolves to.
+    private static bool IsSameCommitIdentityChange(SnapshotRow previous, SnapshotRow target) =>
+        previous.RepositoryId == target.RepositoryId
+        && previous.CommitId is long previousCommit && target.CommitId is long targetCommit
+        && previousCommit == targetCommit
+        && !previous.IsOverlay && !target.IsOverlay
+        && previous.WorkingTreeDelta is null && target.WorkingTreeDelta is null;
+
+    /// <summary>True when a branch other than <paramref name="exceptBranchId"/> points at the snapshot.</summary>
+    public bool IsPointedByAnotherBranch(long snapshotId, long exceptBranchId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT EXISTS (SELECT 1 FROM branches WHERE snapshot_id = @s AND id <> @b);";
+        cmd.Parameters.AddWithValue("@s", snapshotId);
+        cmd.Parameters.AddWithValue("@b", exceptBranchId);
+        return cmd.ExecuteScalar() is long v && v == 1;
     }
 
     /// <summary>
