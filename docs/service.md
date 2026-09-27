@@ -295,6 +295,35 @@ than the stored one; a lower/equal sequence still ensures/attaches the immutable
 branch pointer untouched (no transient regression to a stale snapshot). A NULL sequence — the local
 CLI/daemon path — advances unconditionally and never writes the column, preserving pre-#84 behavior.
 
+**Re-selecting a superseded snapshot on reset/force-push (issue #85).** A branch advance supersedes the
+previous head, so after A@10 → B@20 the snapshot for A is `superseded`. A sequence-bearing ensure of A
+(e.g. A@30 after a reset/force-push) re-selects A on the no-worker reuse path, the same way the
+orchestrator's `SelectExistingSnapshot` does. In ONE write transaction under the single-writer gate, A is
+restored to `complete` and the same forward-only gate runs. A higher sequence re-points the branch back to A
+and supersedes B. A lower/equal sequence is declined: the pointer and `head_sequence` stay untouched, but A
+stays `complete`, so it can still be resolved by commit, as #84 already specifies for the orchestrator path.
+The job verdict comes from A's durable coverage row (`partial` when that row is partial). The row is read and
+reported, never rewritten or backfilled.
+
+A superseded snapshot is only reused when it is still **intact**. All of these must hold:
+- it was published (`published_at` set);
+- it is not an overlay;
+- it still owns mapped project-version data;
+- every Phase-12 provider it consumes is still published.
+
+The `index_runs` ledger is not consulted. `run_id` is bound when the row is first staged, and a retry
+republishes into the same id. Retention also reclaims ledger rows independently of the snapshot's data.
+
+Otherwise it is demoted to `failed` and the ensure falls through to the worker, which rebuilds the identity
+into the same snapshot id instead of resurrecting a data-less snapshot. A snapshot whose row retention has
+already GC'd is simply regenerated (issue #46). The null-sequence path is unchanged: it still hands a
+superseded identity to the worker.
+
+On the terminal-attach fast path (an already-terminal job), checking that the job's snapshot is still usable
+and advancing the branch to it happen in the same write-gate hold. Otherwise a concurrent ensure could
+supersede the snapshot between the check and the advance, and the head would end up on a `superseded`
+snapshot.
+
 ### Restart recovery (criterion 2)
 
 The catalog, published data, branch pointers, and dependency edges are all durable SQLite. A restart

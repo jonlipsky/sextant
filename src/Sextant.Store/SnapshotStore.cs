@@ -347,6 +347,52 @@ public sealed class SnapshotStore(SqliteConnection connection)
         cmd.ExecuteNonQuery();
     }
 
+    /// <summary>
+    /// Whether a SUPERSEDED snapshot is still intact enough to be re-selected (un-superseded back to
+    /// Complete) without a rebuild — the service ensure reuse path for a branch reset / force-push
+    /// A→B→A (issue #85), mirroring the orchestrator's <c>SelectExistingSnapshot</c>. True only when ALL of:
+    /// <list type="bullet">
+    /// <item>its status is <see cref="SnapshotStatus.Superseded"/> and it was genuinely published
+    /// (<c>published_at</c> is set only by the guarded pending→complete flip, which the orchestrator commits
+    /// in the same transaction as the publishing run's own completion) — a once-served branch head. The
+    /// <c>index_runs</c> ledger is deliberately NOT consulted: <c>run_id</c> is bound only when the row is
+    /// first staged (a retry after a cancelled/crashed first attempt republishes into the same id while it
+    /// still points at the abandoned first run), and retention reclaims ledger rows independently of the
+    /// snapshot's data (ON DELETE SET NULL; contribution snapshots never have one) — so servability is
+    /// judged on the snapshot itself;</item>
+    /// <item>it is not an overlay (a service ensure identity never is — defense in depth);</item>
+    /// <item>its semantic DATA is still present — at least one project-version row it OWNS is still mapped
+    /// (retention GC deletes a snapshot's <c>projects</c> and its catalog row together, so a data-less row
+    /// is an anomaly that must be rebuilt, never resurrected as Complete);</item>
+    /// <item>every submodule provider it consumes (Phase 12) is still published (complete/superseded).</item>
+    /// </list>
+    /// Read-only; callers act on the verdict inside their own write transaction.
+    /// </summary>
+    public bool IsReselectable(long snapshotId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT EXISTS (
+                SELECT 1 FROM snapshots s
+                WHERE s.id = @id
+                  AND s.status = @superseded
+                  AND s.published_at IS NOT NULL
+                  AND s.is_overlay = 0
+                  AND EXISTS (
+                      SELECT 1 FROM snapshot_projects sp
+                      JOIN projects p ON p.id = sp.project_id
+                      WHERE sp.snapshot_id = s.id AND p.snapshot_id = s.id)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM snapshot_dependencies d
+                      JOIN snapshots prov ON prov.id = d.provider_snapshot_id
+                      WHERE d.consumer_snapshot_id = s.id AND prov.status NOT IN (@complete, @superseded)));
+            """;
+        cmd.Parameters.AddWithValue("@id", snapshotId);
+        cmd.Parameters.AddWithValue("@superseded", SnapshotStatus.Superseded);
+        cmd.Parameters.AddWithValue("@complete", SnapshotStatus.Complete);
+        return cmd.ExecuteScalar() is long v && v == 1;
+    }
+
     public SnapshotRow? GetByIdentityHash(string identityHash)
     {
         using var cmd = connection.CreateCommand();
