@@ -225,19 +225,35 @@ public class CloningCheckoutProviderTests
     }
 
     [TestMethod]
-    public void AuthenticatedUrl_InjectsTokenOnlyForHttpsWithoutUserInfo()
+    public void TopLevelEnvironment_ScopesTransientTokenHeaderToRepositoryHostOnly()
     {
-        Assert.AreEqual("https://x-access-token:tok@github.com/o/r.git",
-            CloningCheckoutProvider.AuthenticatedUrl("https://github.com/o/r.git", "tok"));
-        // No token → unchanged.
-        Assert.AreEqual("https://github.com/o/r.git",
-            CloningCheckoutProvider.AuthenticatedUrl("https://github.com/o/r.git", null));
-        // Non-https → unchanged (public/local remotes need no credential).
-        Assert.AreEqual("git@github.com:o/r.git",
-            CloningCheckoutProvider.AuthenticatedUrl("git@github.com:o/r.git", "tok"));
-        // Already carries userinfo → don't double-inject.
-        Assert.AreEqual("https://user@github.com/o/r.git",
-            CloningCheckoutProvider.AuthenticatedUrl("https://user@github.com/o/r.git", "tok"));
+        var paths = NewPaths();
+        var provider = new CloningCheckoutProvider(
+            new PersistentVolumeCheckoutProvider(paths), paths, token: "tok");
+        var basic = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("x-access-token:tok"));
+
+        // Token + https repository host → an extraheader scoped to EXACTLY that host: an empty reset entry
+        // (clears any inherited header) followed by the Basic credential. The token never appears raw.
+        var env = provider.TopLevelEnvironment("github.com", "https://github.com/o/r.git");
+        var headers = env.Config.Where(kv => kv.Key.EndsWith(".extraheader", StringComparison.Ordinal)).ToList();
+        CollectionAssert.AreEqual(
+            new[] { "http.https://github.com/.extraheader", "http.https://github.com/.extraheader" },
+            headers.Select(kv => kv.Key).ToArray());
+        Assert.AreEqual(string.Empty, headers[0].Value);
+        Assert.AreEqual($"AUTHORIZATION: basic {basic}", headers[1].Value);
+        Assert.IsFalse(env.Config.Any(kv => kv.Value.Contains("tok", StringComparison.Ordinal) && !kv.Value.Contains(basic, StringComparison.Ordinal)),
+            "the raw token must never be handed to git");
+        // Credential helpers / askpass are always reset, so no stored credential is consulted or written.
+        Assert.IsTrue(env.Config.Any(kv => kv.Key == "credential.helper" && kv.Value.Length == 0));
+        Assert.IsTrue(env.Config.Any(kv => kv.Key == "core.askPass" && kv.Value.Length == 0));
+
+        // No authority (non-https repository) → no header at all.
+        Assert.IsFalse(provider.TopLevelEnvironment(null, "https://github.com/o/r.git").Config.Any(kv => kv.Key.EndsWith(".extraheader", StringComparison.Ordinal)));
+        // No token configured → no header even for an https host.
+        Assert.IsFalse(NewCloneProvider(paths).TopLevelEnvironment("github.com", "https://github.com/o/r.git").Config
+            .Any(kv => kv.Key.EndsWith(".extraheader", StringComparison.Ordinal)));
+        // Submodule fetches are https-only (no ssh/git/http/ext transports from an untrusted .gitmodules).
+        Assert.AreEqual("https", provider.SubmoduleFetchEnvironment(null, "https://github.com/o/r.git").AllowedProtocols);
     }
 
     [TestMethod]

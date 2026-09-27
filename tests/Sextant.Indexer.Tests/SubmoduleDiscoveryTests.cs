@@ -105,4 +105,33 @@ public class SubmoduleDiscoveryTests
         Assert.IsFalse(SubmoduleDiscovery.ParseStatusLine("").Matched);
         Assert.IsFalse(SubmoduleDiscovery.ParseStatusLine("not a submodule status line").Matched);
     }
+
+    /// <summary>
+    /// Issue #125: an UNPOPULATED submodule (declared + gitlinked, but its directory empty — what a service
+    /// checkout leaves for an unfetchable submodule) has no remote of its own. `git remote get-url` inside it
+    /// walks up to the PARENT's origin, so discovery used to report a bogus provider at the parent's URL. It
+    /// contributes no projects and must be skipped.
+    /// </summary>
+    [TestMethod]
+    public async Task DiscoverAsync_UnpopulatedSubmodule_IsSkipped()
+    {
+        using var repo = TestGitRepo.TryCreate(new Dictionary<string, string>
+        {
+            ["README.md"] = "parent",
+            [".gitmodules"] = "[submodule \"lib\"]\n\tpath = libs/lib\n\turl = https://example.invalid/lib.git\n",
+        });
+        if (repo == null)
+        {
+            Assert.Inconclusive("git is not available on PATH.");
+            return;
+        }
+        Assert.IsNotNull(repo.Run("remote add origin https://example.invalid/parent.git"));
+        Assert.IsNotNull(repo.Run($"update-index --add --cacheinfo 160000,{new string('3', 40)},libs/lib"));
+        Assert.IsNotNull(repo.Run("commit -m gitlink"));
+        Directory.CreateDirectory(Path.Combine(repo.Root, "libs", "lib"));
+
+        var submodules = await SubmoduleDiscovery.DiscoverAsync(repo.Root);
+
+        Assert.AreEqual(0, submodules.Count, "an unpopulated submodule must never become a provider at the parent's url");
+    }
 }
