@@ -107,6 +107,29 @@ public class WriterLeaseTests
     }
 
     [TestMethod]
+    public void Abandon_FlagsLost_KeepsTheRow_UntilItExpires()
+    {
+        // Issue #148: a holder that can no longer prove it stopped writing (a worker outlived the shutdown
+        // drain) abandons the lease: it fails every write probe closed, and the row is NOT deleted — even by
+        // a later Dispose — so no other writer can start until it expires by its TTL, as for a crash.
+        var lease = WriterLease.TryAcquire(_dbPath, "straggler", TimeSpan.FromMilliseconds(300), autoHeartbeat: false);
+        Assert.IsNotNull(lease);
+
+        lease!.Abandon();
+        lease.Dispose();
+
+        Assert.IsTrue(lease.IsLost, "an abandoned lease is lost, so its holder's write probes fail closed");
+        Assert.AreEqual(lease.OwnerToken, WriterLease.GetCurrent(_db.GetConnection())?.OwnerToken,
+            "an abandoned lease keeps its row");
+        Assert.IsNull(WriterLease.TryAcquire(_dbPath, "successor", autoHeartbeat: false),
+            "no other writer may start while the abandoned lease is still live");
+
+        Thread.Sleep(400);
+        using var successor = WriterLease.TryAcquire(_dbPath, "successor", autoHeartbeat: false);
+        Assert.IsNotNull(successor, "the abandoned lease becomes stealable once it expires");
+    }
+
+    [TestMethod]
     public void Renew_AfterLeaseStolen_ReturnsFalse_AndFlagsLost()
     {
         // A holder with a tiny TTL that stops renewing (a stalled heartbeat / slept host): once its lease

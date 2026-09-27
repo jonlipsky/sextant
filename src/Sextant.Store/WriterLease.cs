@@ -59,7 +59,8 @@ public sealed class WriterLease : IDisposable
     /// heartbeat, a paused/slept host, thread-pool starvation) and another writer legitimately reacquired
     /// it. The holder has lost single-writer exclusivity and MUST stop writing; <see cref="SnapshotService"/>
     /// checks this before every catalog write so it fails closed instead of silently racing the new owner
-    /// (issue #38). It never becomes true for a lease released on the normal shutdown path.
+    /// (issue #38). It never becomes true for a lease released on the normal shutdown path; it does become
+    /// true once the holder <see cref="Abandon"/>s the lease.
     /// </summary>
     public bool IsLost => _lost;
 
@@ -198,6 +199,25 @@ public sealed class WriterLease : IDisposable
             {
                 // Best-effort release; an expired lease will be reclaimable by the next writer anyway.
             }
+        }
+    }
+
+    /// <summary>
+    /// Gives the lease up WITHOUT releasing its row, for a holder that can no longer guarantee it has stopped
+    /// writing (issue #148: a worker outlived the shutdown drain). <see cref="IsLost"/> becomes true, so every
+    /// write probe fails closed and the straggler's write session aborts at its next batch boundary, and the
+    /// heartbeat stops so the row EXPIRES by its TTL, exactly as for a crashed holder, instead of being
+    /// immediately reacquirable by another writer while the straggler may still commit. Idempotent;
+    /// <see cref="Release"/>/<see cref="Dispose"/> afterwards never delete the row.
+    /// </summary>
+    public void Abandon()
+    {
+        lock (_gate)
+        {
+            _lost = true;
+            _released = true;
+            _heartbeat?.Dispose();
+            _heartbeat = null;
         }
     }
 
