@@ -168,6 +168,16 @@ public sealed record ServiceOptions
     /// </summary>
     public bool SdkPinOverride { get; init; } = true;
 
+    /// <summary>
+    /// The <see cref="SnapshotIdentity.SdkPinPolicy"/> component folded into every ensure request's identity
+    /// (issue #113). It is null for the default override-on policy, so identities stay byte-identical to before
+    /// #113, and <c>strict</c> when <see cref="SdkPinOverride"/> is off. Flipping the toggle therefore changes the
+    /// identity, and the next ensure of a commit REBUILDS it rather than reusing a snapshot (or a failed job)
+    /// produced under the other policy. The worker publishes under the same value
+    /// (<see cref="SdkPin.SdkPinGuard.IdentityComponent"/>), because the host builds its guard from this toggle.
+    /// </summary>
+    public string? SdkPinIdentityComponent => SdkPin.SdkPinOptions.IdentityComponentFor(SdkPinOverride);
+
     private const string EnvPrefix = "SEXTANT_SERVICE_";
 
     /// <summary>
