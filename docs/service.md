@@ -565,7 +565,7 @@ The host deliberately **separates control endpoints from query endpoints**, and 
 | --- | --- | --- | --- |
 | `GET /health` | — | open | Service **AVAILABILITY**: the process is up and the catalog is reachable. |
 | `GET /ready` | — | open | Worker **CAPACITY**: `503` when this node has no worker (query-only), so an operator can tell "up" from "can index". |
-| `POST /control/ensure` | control | control token | Idempotent ensure-snapshot (criterion 1). Accepts an optional monotonic `branch_head_sequence` for forward-only branch-head advance (Phase 14, issue #84). |
+| `POST /control/ensure` | control | control token | Idempotent ensure-snapshot (criterion 1). Accepts an optional monotonic `branch_head_sequence` for forward-only branch-head advance (Phase 14, issue #84). Blocks until terminal (`200`; `202` when transient-requeued) unless `?wait=false`, which returns `202` at once with the job to poll (issue #148). A caller disconnect/timeout **never** cancels production. |
 | `POST /control/contribute` | control | control **or** contribute token | Ingest a client/CI semantic contribution (Phase 16); the least-privilege contribute token authorizes this endpoint only. |
 | `GET /control/status/{jobId}` | control | control token | Job status + per-project diagnostics (criterion 5) + checkout `coverage` (#119). |
 | `GET /control/resolve` | control | control token | Resolve a repository branch to its current published snapshot (+ its `coverage`, #119). |
@@ -579,7 +579,9 @@ The host deliberately **separates control endpoints from query endpoints**, and 
 
 A null token disables that plane's auth (single-node development). Token checks are constant-time. Query
 reads use a connection **independent** of the service writer (Phase-9 WAL supports concurrent readers), so
-a low-latency query never blocks behind a running index.
+a low-latency query never blocks behind a running index. Control-plane **reads** — `/control/status`,
+`/control/resolve` (and its coverage), metrics, audit — do the same (issue #148), so they answer promptly
+for the whole duration of a long index.
 
 ## The `SnapshotService` data plane
 
@@ -604,6 +606,54 @@ snapshot under a per-job **scratch** directory; its output is validated — a wo
 match the requested hash, is **downgraded to `failed`** — and published through the catalog, then a terminal
 status + per-project diagnostics are recorded. A job **cancelled** mid-run is requeued (transient), never
 recorded as a permanent failure.
+
+### Ensure lifecycle: production outlives the caller (issue #148)
+
+Indexing a large repository takes far longer than a typical HTTP client timeout (ProcessStack's
+`HttpClient` defaults to 100 s; proxies and operator `curl`s give up too). So an ensure's production is
+owned by the **service**, never by the request:
+
+- **A caller disconnect/timeout never cancels production.** The worker runs on a service-owned lifetime;
+  the request only *waits* for it. When the caller goes away, only that wait ends — the job stays
+  `running`, the worker finishes, and the snapshot publishes normally (status, diagnostics, coverage,
+  branch pointer, audit row).
+- **Re-ensures attach to the in-flight run.** In-flight productions are tracked per identity, so an
+  ensure for an identity that is already producing attaches at once (without waiting for the writer) and
+  the worker runs **once** (criterion 1). A retrying client never restarts an index.
+- **Non-blocking ensure.** `POST /control/ensure?wait=false` returns **`202 Accepted`** as soon as the job
+  is registered. The body is the same ensure-result shape as a blocking ensure — `job_id`,
+  `identity_hash`, `status` (`queued` while waiting for the writer, `running` once the worker holds it),
+  `attached` — or the full terminal result when the identity is already settled (`200`). Poll
+  `GET /control/status/{job_id}` until `job.status` is terminal. Without the parameter the ensure keeps the
+  blocking contract (`200` terminal, `202` transient-requeued).
+- **Only shutdown cancels a worker.** On host `ApplicationStopping` (and `SnapshotService.Dispose`) the
+  service lifetime is cancelled: each in-flight worker is cancelled and its job **requeued** (never
+  failed; even a worker that ignores the cancellation and then reports a failure is requeued, because such a
+  failure is usually just the shutdown surfacing). Dispose waits up to `ShutdownDrainTimeout` (30 s) for those requeues to land **before** it
+  releases the writer lease. From the moment shutdown begins, every ensure is refused with **`503`**
+  (`status: unavailable`), including a waiting one and a `wait=false` attach to a production that is
+  winding down. The body claims nothing about the job (it may have been requeued, never registered, or
+  already settled), so the client retries against the next instance and that ensure reports the real state.
+- **A worker that ignores cancellation never races a successor.** If a production is still running when
+  the drain bound expires, Dispose **abandons** the writer lease instead of releasing it. Every write
+  probe then fails closed: the straggler's write session aborts at its next batch, and its result is never
+  recorded. The lease row is left to **expire by its TTL**, exactly as if the process had crashed, and the
+  host leaves the shared catalog open for process exit. A restart within the TTL is refused by the
+  fail-closed lease guard until it expires; the next owner's startup reconcile then requeues the
+  `running` job.
+- **Single writer is unchanged.** Productions of *different* identities are still serialized by the one
+  writer. Registering a **new** identity's job needs that writer too, so even a `wait=false` ensure for a
+  new identity waits while another identity is producing. The ensure still survives its caller
+  disconnecting: it registers and produces once the writer frees up. Making this registration
+  gate-free is tracked in #158.
+- **Lease loss mid-run fails closed.** If the writer lease is stolen during a worker run, the service
+  records **nothing**. The job stays `running` for the new owner's startup reconcile to requeue (#38).
+
+**Recommended clients:** use `?wait=false` and poll `/control/status/{job_id}` with backoff, with a
+polling budget sized for your largest repository (hours for a monorepo, not minutes). A blocking ensure is
+fine for small repositories or operator use. Either way, a client timeout is now harmless: re-issue the
+ensure to re-attach, or poll the job. Status and resolve reads never wait for a running index, so a short
+per-poll timeout (a few seconds) is appropriate.
 
 **Forward-only branch-head advance (Phase 14, issue #84).** An ensure request may carry an optional
 monotonic `branch_head_sequence`. Because the service ensures *every* delivered commit (including
@@ -893,7 +943,7 @@ catalog, and a `FakeSnapshotWorker`. The suite maps to the acceptance criteria:
 
 | Criterion | Test coverage |
 | --- | --- |
-| 1 — idempotent ensure | `SnapshotServiceTests` (concurrent ensures attach to one job; worker runs once) |
+| 1 — idempotent ensure | `SnapshotServiceTests` (concurrent ensures attach to one job; worker runs once); `EnsureCallerDisconnectTests` / `EnsureCallerDisconnectHttpTests` (#148: caller disconnect never cancels production, re-ensure attaches to the in-flight run, `wait=false`, prompt status/resolve during a run, shutdown requeues) |
 | 2 — restart recovery | `SnapshotServiceTests` (catalog survives restart; orphaned `running` jobs reconciled) |
 | 3 — scratch cannot delete published | `ServicePathsTests` (scratch/persistent separation + `ReleaseScratch` refusal) |
 | 4 — query via HTTP MCP without ProcessStack | `ServiceHttpTests` (`/mcp` mapped + auth-gated; `/query` paging) |
