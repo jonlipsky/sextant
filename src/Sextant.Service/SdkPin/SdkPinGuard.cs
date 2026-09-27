@@ -254,7 +254,9 @@ public sealed class SdkPinGuard
 
         // The journal must hold the COMMIT's bytes: a same-commit recovery then only ever restores committed
         // content, never a local edit or an untracked file onto a tree re-provisioned at the same commit.
-        var uncommitted = VerifyCommitted(checkout, head!, candidates.Select(c => c.Entry.Path).ToList());
+        var uncommitted = VerifyCommitted(checkout, head!, candidates
+            .Select(c => new CheckoutFileContent(c.Entry.Path, Convert.FromBase64String(c.Entry.OriginalBase64)))
+            .ToList());
         if (uncommitted is not null)
         {
             var reason = $"the global.json is not verifiably the checkout's committed content ({uncommitted}), so the service does not override it";
@@ -453,7 +455,7 @@ public sealed class SdkPinGuard
         return failing;
     }
 
-    private string? VerifyCommitted(string checkout, string head, IReadOnlyList<string> files)
+    private string? VerifyCommitted(string checkout, string head, IReadOnlyList<CheckoutFileContent> files)
     {
         try
         {

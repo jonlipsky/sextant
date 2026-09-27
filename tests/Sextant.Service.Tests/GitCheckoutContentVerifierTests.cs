@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text;
 using Sextant.Service.SdkPin;
 
 namespace Sextant.Service.Tests;
@@ -47,11 +48,16 @@ public sealed class GitCheckoutContentVerifierTests
 
     private static GitCheckoutContentVerifier Verifier => GitCheckoutContentVerifier.Instance;
 
+    private static CheckoutFileContent[] OnDisk(params string[] paths) =>
+        paths.Select(p => new CheckoutFileContent(p, File.ReadAllBytes(p))).ToArray();
+
+    private static string SameSizeEdit => Pin.Replace("10.0.999", "10.0.998", StringComparison.Ordinal);
+
     [TestMethod]
     public void ACommittedUnmodifiedFile_IsVouchedFor()
     {
-        Assert.IsNull(Verifier.Problem(_checkout, _head, [GlobalJson]));
-        Assert.IsNull(Verifier.Problem(_checkout, _head.ToUpperInvariant(), [GlobalJson]), "object ids compare case-insensitively");
+        Assert.IsNull(Verifier.Problem(_checkout, _head, OnDisk(GlobalJson)));
+        Assert.IsNull(Verifier.Problem(_checkout, _head.ToUpperInvariant(), OnDisk(GlobalJson)), "object ids compare case-insensitively");
     }
 
     [TestMethod]
@@ -64,7 +70,47 @@ public sealed class GitCheckoutContentVerifierTests
         Git(_checkout, "commit", "--quiet", "-m", "nested");
         var head = Git(_checkout, "rev-parse", "HEAD").Trim();
 
-        Assert.IsNull(Verifier.Problem(_checkout, head, [GlobalJson, nested]));
+        Assert.IsNull(Verifier.Problem(_checkout, head, OnDisk(GlobalJson, nested)));
+    }
+
+    [TestMethod]
+    public void BytesOtherThanTheCommittedContent_AreRefused_EvenWhenTheWorkingTreeIsClean()
+    {
+        var problem = Verifier.Problem(_checkout, _head, [new CheckoutFileContent(GlobalJson, Encoding.UTF8.GetBytes(SameSizeEdit))]);
+
+        StringAssert.Contains(problem, "the bytes read from 'global.json' are not its committed content");
+    }
+
+    [TestMethod]
+    public void AnEditGitStatusCannotSeeFromStatData_IsStillRefused()
+    {
+        // With minimal stat checking, a same-size edit that keeps the recorded mtime looks clean to `git status`.
+        Git(_checkout, "config", "core.checkStat", "minimal");
+        Git(_checkout, "config", "core.trustctime", "false");
+        var mtime = new DateTime(2020, 1, 2, 3, 4, 5, DateTimeKind.Utc);
+        File.SetLastWriteTimeUtc(GlobalJson, mtime);
+        Git(_checkout, "update-index", "--refresh");
+        File.WriteAllText(GlobalJson, SameSizeEdit);
+        File.SetLastWriteTimeUtc(GlobalJson, mtime);
+        Assert.AreEqual(string.Empty, Git(_checkout, "status", "--porcelain", "--untracked-files=no"),
+            "precondition: git status cannot see the edit");
+
+        var problem = Verifier.Problem(_checkout, _head, OnDisk(GlobalJson));
+
+        StringAssert.Contains(problem, "the bytes read from 'global.json' are not its committed content");
+    }
+
+    [TestMethod]
+    public void AWorkingCopyInTheCheckoutsLineEndings_IsItsCommittedContent()
+    {
+        // Committed with LF, checked out by git with CRLF: hashing applies the path's eol conversion, as `git add` would.
+        File.WriteAllText(Path.Combine(_checkout, ".gitattributes"), "*.json text eol=crlf\n");
+        File.Delete(GlobalJson);
+        Git(_checkout, "checkout", "--", "global.json");
+        CollectionAssert.AreEqual(Encoding.UTF8.GetBytes(Pin.Replace("\n", "\r\n", StringComparison.Ordinal)), File.ReadAllBytes(GlobalJson),
+            "precondition: git checked the file out with CRLF");
+
+        Assert.IsNull(Verifier.Problem(_checkout, _head, OnDisk(GlobalJson)));
     }
 
     [TestMethod]
@@ -72,7 +118,7 @@ public sealed class GitCheckoutContentVerifierTests
     {
         File.WriteAllText(GlobalJson, Pin.Replace("10.0.999", "10.0.998", StringComparison.Ordinal));
 
-        StringAssert.Contains(Verifier.Problem(_checkout, _head, [GlobalJson]), "'global.json' differs from its committed content");
+        StringAssert.Contains(Verifier.Problem(_checkout, _head, OnDisk(GlobalJson)), "'global.json' differs from its committed content");
     }
 
     [TestMethod]
@@ -81,7 +127,7 @@ public sealed class GitCheckoutContentVerifierTests
         File.WriteAllText(GlobalJson, Pin.Replace("10.0.999", "10.0.998", StringComparison.Ordinal));
         Git(_checkout, "add", "global.json");
 
-        StringAssert.Contains(Verifier.Problem(_checkout, _head, [GlobalJson]), "differs from its committed content");
+        StringAssert.Contains(Verifier.Problem(_checkout, _head, OnDisk(GlobalJson)), "differs from its committed content");
     }
 
     [TestMethod]
@@ -92,7 +138,7 @@ public sealed class GitCheckoutContentVerifierTests
         File.WriteAllText(added, Pin);
         Git(_checkout, "add", "tools/global.json");
 
-        StringAssert.Contains(Verifier.Problem(_checkout, _head, [added]), "'tools/global.json' differs from its committed content");
+        StringAssert.Contains(Verifier.Problem(_checkout, _head, OnDisk(added)), "'tools/global.json' differs from its committed content");
     }
 
     [TestMethod]
@@ -104,7 +150,7 @@ public sealed class GitCheckoutContentVerifierTests
         Directory.CreateDirectory(Path.GetDirectoryName(untracked)!);
         File.WriteAllText(untracked, Pin);
 
-        StringAssert.Contains(Verifier.Problem(_checkout, _head, [GlobalJson, untracked]), $"'{directory}/global.json' is not tracked by git");
+        StringAssert.Contains(Verifier.Problem(_checkout, _head, OnDisk(GlobalJson, untracked)), $"'{directory}/global.json' is not tracked by git");
     }
 
     [TestMethod]
@@ -115,7 +161,7 @@ public sealed class GitCheckoutContentVerifierTests
         Git(_checkout, "update-index", flag, "global.json");
         File.WriteAllText(GlobalJson, Pin.Replace("10.0.999", "10.0.998", StringComparison.Ordinal));
 
-        var problem = Verifier.Problem(_checkout, _head, [GlobalJson]);
+        var problem = Verifier.Problem(_checkout, _head, OnDisk(GlobalJson));
 
         StringAssert.Contains(problem, $"'global.json' is flagged in the git index (ls-files tag '{tag}')");
     }
@@ -125,7 +171,7 @@ public sealed class GitCheckoutContentVerifierTests
     {
         var other = new string('a', 40);
 
-        StringAssert.Contains(Verifier.Problem(_checkout, other, [GlobalJson]), $"not the commit {other}");
+        StringAssert.Contains(Verifier.Problem(_checkout, other, OnDisk(GlobalJson)), $"not the commit {other}");
     }
 
     [TestMethod]
@@ -136,7 +182,7 @@ public sealed class GitCheckoutContentVerifierTests
         File.WriteAllText(Path.Combine(fresh, "global.json"), Pin);
         Git(fresh, "init", "--quiet", "--initial-branch", "main");
 
-        Assert.IsNotNull(Verifier.Problem(fresh, _head, [Path.Combine(fresh, "global.json")]));
+        Assert.IsNotNull(Verifier.Problem(fresh, _head, OnDisk(Path.Combine(fresh, "global.json"))));
     }
 
     [TestMethod]
@@ -151,7 +197,7 @@ public sealed class GitCheckoutContentVerifierTests
         Git(_checkout, "commit", "--quiet", "-m", "sub");
         var head = Git(_checkout, "rev-parse", "HEAD").Trim();
 
-        Assert.IsNotNull(Verifier.Problem(inner, head, [Path.Combine(inner, "global.json")]));
+        Assert.IsNotNull(Verifier.Problem(inner, head, OnDisk(Path.Combine(inner, "global.json"))));
     }
 
     [TestMethod]
@@ -160,7 +206,7 @@ public sealed class GitCheckoutContentVerifierTests
         var outside = Path.Combine(_root, "global.json");
         File.WriteAllText(outside, Pin);
 
-        StringAssert.Contains(Verifier.Problem(_checkout, _head, [outside]), "is not inside the checkout");
+        StringAssert.Contains(Verifier.Problem(_checkout, _head, OnDisk(outside)), "is not inside the checkout");
     }
 
     [TestMethod]
@@ -168,7 +214,7 @@ public sealed class GitCheckoutContentVerifierTests
     {
         var verifier = new GitCheckoutContentVerifier(Path.Combine(_root, "no-such-git"));
 
-        StringAssert.Contains(verifier.Problem(_checkout, _head, [GlobalJson]), "git could not verify it");
+        StringAssert.Contains(verifier.Problem(_checkout, _head, OnDisk(GlobalJson)), "git could not verify it");
     }
 
     [TestMethod]
@@ -180,7 +226,7 @@ public sealed class GitCheckoutContentVerifierTests
         var indexTime = File.GetLastWriteTimeUtc(index);
         File.SetLastWriteTimeUtc(GlobalJson, DateTime.UtcNow.AddMinutes(-5));
 
-        Assert.IsNull(Verifier.Problem(_checkout, _head, [GlobalJson]));
+        Assert.IsNull(Verifier.Problem(_checkout, _head, OnDisk(GlobalJson)));
 
         CollectionAssert.AreEqual(before, File.ReadAllBytes(index));
         Assert.AreEqual(indexTime, File.GetLastWriteTimeUtc(index));
