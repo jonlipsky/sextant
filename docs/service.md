@@ -302,14 +302,16 @@ cost a full copy per job and break checkout-relative paths. So the service handl
      the neutralized tree apart from a re-provisioned one that happens to hold the same bytes;
    - git cannot confirm the `global.json` is exactly its **committed** content. `HEAD` must resolve to that
      commit, and the file must be tracked, carry no assume-unchanged/skip-worktree flag, and have no staged
-     or unstaged change. The exact bytes to be journaled must also hash (with the path's eol/filter
-     conversion, as `git add` would) to the commit's blob. This matters because `git status` can call an
-     edit clean from cached stat data alone. The rule covers an untracked or locally edited `global.json`
-     in a `locate`-mode checkout. The journal therefore only ever holds the commit's content, and a
+     or unstaged change. The exact bytes to be journaled must also equal, byte for byte, the commit's blob
+     as stored or git's checkout rendering of it (eol/smudge conversion). This matters because `git status`
+     can call an edit clean from cached stat data alone, and clean conversions such as `ident` are
+     many-to-one, so hashing the bytes would not be proof. The rule covers an untracked or locally edited
+     `global.json` in a `locate`-mode checkout. The journal therefore only ever holds the commit's content, and a
      same-commit recovery can only put the committed file back. git runs with inherited `GIT_*` variables
-     dropped, repository discovery stopped at the checkout, literal pathspecs, `core.fsmonitor` off and
-     optional locks off (it never rewrites `.git/index` or writes objects). If git is missing, times out,
-     or refuses the checkout (e.g. its `safe.directory` ownership check), the pin is refused;
+     dropped, replace refs ignored, repository discovery stopped at the checkout, literal pathspecs,
+     `core.fsmonitor` off and optional locks off (it never rewrites `.git/index` or writes objects). If git
+     is missing, times out, or refuses the checkout (e.g. its `safe.directory` ownership check), the pin is
+     refused;
    - the journal cannot be written, or is laid out so recovery could never replay it: inside the checkout,
      or in a directory whose parent does not contain the checkout (the service always uses
      `<checkout-root>/.sextant-sdk-pin`);
@@ -727,9 +729,10 @@ auth). Coverage integrity (#119): `SnapshotCoverageBuilderTests`, `CheckoutInven
 `CoverageRegressionFixtureTests` clone of a two-solution repo with an uninitialized submodule. SDK pins
 (#113): `HostFxrSdkResolutionErrorTests` (classifying the hostfxr SDK-not-found error), `SdkPinGuardTests`
 (detect/neutralize/restore/journal recovery/refusals over a fake hostfxr probe),
-`GitCheckoutContentVerifierTests` (the committed-content check over real git: edits, including one
-`git status` cannot see from stat data; staged changes; untracked/ignored files; index flags; CRLF
-checkouts; a moved or unborn `HEAD`; no discovery above the checkout; and no index writes), `SdkPinSurfaceTests`
+`GitCheckoutContentVerifierTests` (the committed-content check over real git: edits, including ones
+`git status` cannot see from stat data or through an `ident` clean filter; staged changes; untracked/ignored
+files; index flags; CRLF and stored-form checkouts; a replace ref; a moved or unborn `HEAD`; no discovery
+above the checkout; and no index writes), `SdkPinSurfaceTests`
 (diagnostics, coverage provenance, audit suffix, status), and the real-MSBuild
 `SdkPinOverrideIntegrationTests`. The integration tests cover a `10.0.999` + `disable` pin that is
 overridden (with and without the sandboxed worker; the checkout bytes, mtime, `git status` and
