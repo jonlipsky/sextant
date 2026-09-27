@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using Sextant.Indexer;
 
 namespace Sextant.Benchmarks.Tests;
@@ -44,7 +43,7 @@ public sealed class ResilientSolutionLoadTests
 
             // Restore only the loadable project so it evaluates; restoring the whole (broken) solution
             // would itself fail.
-            Restore(Path.Combine(goodDir, "Good.csproj"));
+            CorpusRestore.Restore(Path.Combine(goodDir, "Good.csproj"));
 
             var diagnostics = new List<string>();
             var result = await SolutionLoader.LoadSolutionResilientlyAsync(slnx, diagnostics.Add);
@@ -68,19 +67,6 @@ public sealed class ResilientSolutionLoadTests
         {
             TryDelete(root);
         }
-    }
-
-    private static void Restore(string projectPath)
-    {
-        var psi = new ProcessStartInfo("dotnet", $"restore \"{projectPath}\"")
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
-        using var process = Process.Start(psi)!;
-        process.WaitForExit();
     }
 
     private static string NewTempDir(string tag)
