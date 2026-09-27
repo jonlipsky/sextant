@@ -140,8 +140,10 @@ externals). The worker chooses the set to index **explicitly and deterministical
   solution, loaded as before. With several, each project is opened individually (that is what isolates a
   per-project load fault), so no solution sets `$(SolutionDir)`: a project that imports
   `$(SolutionDir)…` with no fallback may be skipped-with-reason on this path. Each selected solution still
-  gets its own `solution → project` mapping (the `solution:` query scope), taken from the projects that
-  solution declares. Nothing is "discovered but
+    gets its own `solution → project` mapping (the `solution:` query scope): the projects that solution
+    declares plus everything they reference, as the single-solution path maps. A `solution:` scope over a
+    selected solution none of whose projects loaded returns nothing rather than the whole repository.
+    Nothing is "discovered but
   not selected" any more. Before #124 the default
   picked **one** solution and reported the rest as `solution_not_selected`; that kept a monorepo with no
   root solution (issue #119) mostly unindexed.
