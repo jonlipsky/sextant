@@ -318,14 +318,17 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
             // private repository will fail authentication — say why rather than look like a bad token.
             _log?.Invoke($"SEXTANT_SERVICE_CHECKOUT_TOKEN is not sent to '{SanitizeUrlForLog(cleanUrl)}': its host is not a plain DNS host name (e.g. it contains '_', ends with '.', or is an IPv6 literal), so the token cannot be scoped to it; fetching anonymously.");
         }
-        var topEnv = TopLevelEnvironment(_token is not null ? repositoryAuthority : null);
+        var topEnv = TopLevelEnvironment(_token is not null ? repositoryAuthority : null, cleanUrl);
         try
         {
             Directory.CreateDirectory(temp);
 
-            if (_token is not null && repositoryAuthority is not null && !EnvironmentConfigSupported(temp))
+            // Every service git invocation relies on environment-scoped config (git >= 2.31) for its hardening
+            // (credential helpers/askpass reset, no implicit submodule recursion, the token header, no redirects
+            // with the token); an older git silently IGNORES it, so clone mode refuses to run on one at all.
+            if (!EnvironmentConfigSupported(temp))
             {
-                _log?.Invoke($"Clone skipped for '{cleanUrl}': this git does not support environment-scoped config (GIT_CONFIG_COUNT, git >= 2.31), which is required to pass SEXTANT_SERVICE_CHECKOUT_TOKEN without persisting it. Upgrade git.");
+                _log?.Invoke($"Clone skipped for '{SanitizeUrlForLog(cleanUrl)}': this git does not support environment-scoped config (GIT_CONFIG_COUNT, git >= 2.31), which clone mode requires to disable credential helpers and to pass SEXTANT_SERVICE_CHECKOUT_TOKEN without persisting it. Upgrade git.");
                 return false;
             }
 
@@ -775,18 +778,18 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
     /// <paramref name="authAuthority"/> is set (a token is configured and the repository is https) — the
     /// token as a Basic credential header scoped to <c>https://&lt;authAuthority&gt;/</c> only.
     /// </summary>
-    internal GitEnvironment TopLevelEnvironment(string? authAuthority) =>
-        new(AllowedGitProtocols, WithAuth(authAuthority));
+    internal GitEnvironment TopLevelEnvironment(string? authAuthority, string fetchUrl) =>
+        new(AllowedGitProtocols, WithAuth(authAuthority, fetchUrl));
 
     /// <summary>
     /// A submodule fetch's environment: https ONLY (plus <c>file</c> under the test-only flag) — never ssh,
     /// git://, http:// or helper transports from an untrusted <c>.gitmodules</c> — hardening, and the auth
     /// header only when the submodule is on the repository's own host (<paramref name="authAuthority"/>).
     /// </summary>
-    internal GitEnvironment SubmoduleFetchEnvironment(string? authAuthority) =>
-        new(AllowFileTransportForTesting ? "https:file" : "https", WithAuth(authAuthority));
+    internal GitEnvironment SubmoduleFetchEnvironment(string? authAuthority, string fetchUrl) =>
+        new(AllowFileTransportForTesting ? "https:file" : "https", WithAuth(authAuthority, fetchUrl));
 
-    private IReadOnlyList<KeyValuePair<string, string>> WithAuth(string? authAuthority)
+    private IReadOnlyList<KeyValuePair<string, string>> WithAuth(string? authAuthority, string fetchUrl)
     {
         if (_token is null || authAuthority is null)
             return HardeningConfig;
@@ -797,10 +800,14 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
         // target, and `http.extraheader` — unlike a URL/credential-helper credential — is copied onto every
         // request, so a redirect on the repository host (steerable through an untrusted `.gitmodules` path)
         // would hand the token to another host. A repository reachable only via a redirect then fails closed.
+        // git resolves http.<url>.* by the MOST SPECIFIC matching url (the last entry winning a tie), so the
+        // plain key alone could be overridden by an inherited url-scoped `followRedirects=true`; the entry for
+        // the EXACT fetch url is the most specific possible, and env config is read after every config file.
         return
         [
             .. HardeningConfig,
             new("http.followRedirects", "false"),
+            new($"http.{fetchUrl}.followRedirects", "false"),
             new(key, ""),
             new(key, $"AUTHORIZATION: basic {_tokenBasicCredential}"),
         ];
@@ -808,8 +815,8 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
 
     /// <summary>
     /// Probes (once) that this git honours environment-scoped config (<c>GIT_CONFIG_COUNT</c>, git ≥ 2.31).
-    /// An older git would silently IGNORE the auth header and the hardening, so an authenticated clone must
-    /// not proceed on it. A timeout is transient (not cached); any other failure is cached as unsupported.
+    /// An older git would silently IGNORE the hardening and the auth header, so clone mode must not proceed on
+    /// it. A timeout or a spawn failure is transient (not cached); a completed probe's answer is cached.
     /// </summary>
     private bool EnvironmentConfigSupported(string workingDir)
     {
@@ -817,7 +824,7 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
             return known;
         var probe = new GitEnvironment("https", [.. HardeningConfig, new("sextant.envconfigprobe", "ok")]);
         var result = RunGit(workingDir, probe, "config", "--get", "sextant.envconfigprobe");
-        if (result.Kind == GitFailureKind.Timeout)
+        if (result.Kind is GitFailureKind.Timeout or GitFailureKind.SpawnFailure)
             throw Transient("config probe", "(local)", result);
         var supported = result.Ok && string.Equals(result.Stdout.Trim(), "ok", StringComparison.Ordinal);
         _envConfigSupported = supported;
