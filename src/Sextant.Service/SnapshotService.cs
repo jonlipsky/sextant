@@ -275,11 +275,17 @@ public sealed class SnapshotService : IDisposable
 
             jobs.MarkRunning(job.Id, _lease.OwnerToken);
 
+            // Issue #125: on the LAST attempt the bound allows, tell the worker so a clone-mode checkout degrades
+            // a persistently-transient SUBMODULE failure to partial coverage instead of failing the whole job.
+            var workRequest = jobs.GetJob(job.Id)!.Attempts >= _options.MaxProvisioningAttempts
+                ? request with { IsFinalProvisioningAttempt = true }
+                : request;
+
             var scratch = _paths.AllocateScratch($"job-{job.Id}");
             SnapshotWorkResult result;
             try
             {
-                result = await _worker.ProduceAsync(request, hash, scratch, cancellationToken).ConfigureAwait(false);
+                result = await _worker.ProduceAsync(workRequest, hash, scratch, cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
