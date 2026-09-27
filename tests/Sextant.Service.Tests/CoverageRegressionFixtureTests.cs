@@ -74,9 +74,13 @@ public class CoverageRegressionFixtureTests
         Assert.AreEqual(2, c.ProjectFilesOnDisk);
         Assert.AreEqual(1, c.ProjectFilesUnreferenced, "the other solution's project is on disk but not indexed");
         Assert.AreEqual(1, c.SubmodulesDeclared);
-        Assert.AreEqual(1, c.SubmodulesUnpopulated, "a plain clone never initializes submodules");
+        Assert.AreEqual(1, c.SubmodulesUnpopulated,
+            "the fixture's submodule url (https://example.invalid) is refused by the submodule host policy");
         Assert.AreEqual(0, c.ScanErrors);
         Assert.AreEqual(3, c.Reasons.Count, "one reason per gap: unselected solution, unpopulated submodule, orphan project");
+        Assert.IsTrue(c.Reasons.Any(r => r.Contains("libs/shared (url refused", StringComparison.Ordinal)),
+            "the unpopulated submodule's reason names WHY it was not provisioned (issue #125)");
+        Assert.AreEqual(SubmoduleProvisioningStatus.UrlRefused, resolution.SubmoduleProvisioning.Single().Status);
 
         Assert.IsTrue(result.Projects.Any(p => p.Code == "solution_not_selected"));
         Assert.IsTrue(result.Projects.Any(p => p.Code == "submodule_unpopulated" && p.ProjectPath == "libs/shared"));
@@ -85,7 +89,7 @@ public class CoverageRegressionFixtureTests
     }
 
     // A monorepo-shaped remote: App.slnx → src/App/App.csproj, Tools.slnx → tools/Tool/Tool.csproj, and a
-    // gitlink at libs/shared declared in .gitmodules (never initialized, exactly like a fresh clone).
+    // gitlink at libs/shared declared in .gitmodules whose url the service may not fetch (another host).
     private (string url, string commit) NewMonorepoRemote()
     {
         var repo = Temp("sextant_covfix_remote");

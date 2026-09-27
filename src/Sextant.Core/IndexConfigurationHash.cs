@@ -39,8 +39,16 @@ public static class IndexConfigurationHash
     /// multi-solution monorepo that changes which projects (and therefore which rows) an otherwise
     /// identically-configured index produces, so a pre-#109 snapshot must not be reused for the same
     /// identity — the bump invalidates it and forces the new loader to run.
+    /// <para>
+    /// <c>"3"</c> is reserved by the parallel union-of-solutions-default change (W1b). <c>"3"</c>/<c>"2"</c>
+    /// → <c>"4"</c> (issue #125): the service's cloning checkout provider now recursively initializes
+    /// submodules at their pinned gitlink commits. The checkout policy is not otherwise part of the snapshot
+    /// identity, so without this bump a pre-#125 snapshot of the SAME commit — indexed with every submodule
+    /// unpopulated (missing the submodule-provided projects and their Phase-12 provider snapshots /
+    /// cross-repository usage edges) — would be reused instead of re-indexing with the submodules present.
+    /// </para>
     /// </remarks>
-    public const string AnalyzerVersion = "2";
+    public const string AnalyzerVersion = "4";
 
     /// <summary>
     /// Computes the configuration hash for a resolved profile. The canonical pre-image is a fixed,

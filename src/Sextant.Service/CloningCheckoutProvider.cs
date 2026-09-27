@@ -31,14 +31,39 @@ namespace Sextant.Service;
 /// <see cref="ServicePaths.RepoDirectoryName"/> mapping and asserted to stay inside the checkout root, so a
 /// crafted repository URL can never write outside the volume (defense in depth with URL sanitization).
 /// </para>
+/// <para>
+/// Credentials (issue #125): the token is never placed in a URL, argv, or any git config. It is handed to
+/// git TRANSIENTLY through environment-scoped config (<c>GIT_CONFIG_COUNT</c>/<c>GIT_CONFIG_KEY_n</c>/
+/// <c>GIT_CONFIG_VALUE_n</c>) as an <c>http.https://&lt;repository-host&gt;/.extraheader</c> Basic
+/// credential — scoped to the top-level repository's https host only — and host credential helpers /
+/// askpass are disabled so no other credential is ever consulted or stored. Every git dir of the staged
+/// checkout (incl. <c>.git/modules/**</c>) is scrubbed of <c>FETCH_HEAD</c> and scanned for the token
+/// before publish; any hit refuses publish (fail closed).
+/// </para>
+/// <para>
+/// Submodules (issue #125): every <c>.gitmodules</c>-declared submodule is populated recursively at its
+/// pinned gitlink commit (see <c>CloningCheckoutProvider.Submodules.cs</c>); a permanently unfetchable one
+/// is left unpopulated with a recorded reason so coverage reports the checkout partial.
+/// </para>
 /// </summary>
-public sealed class CloningCheckoutProvider : ICheckoutProvider
+public sealed partial class CloningCheckoutProvider : ICheckoutProvider
 {
     private readonly ICheckoutProvider _inner;
     private readonly ServicePaths _paths;
     private readonly string? _token;
+    private readonly string? _tokenBasicCredential;
+    private readonly string? _tokenBase64;
+    private readonly IReadOnlySet<string> _submoduleHosts;
     private readonly string _gitExecutable;
     private readonly Action<string>? _log;
+    private bool? _envConfigSupported;
+
+    /// <summary>
+    /// TEST-ONLY: permit <c>file://</c> submodule URLs so fixtures can provision submodules from local bare
+    /// repositories without a network. Never set in production — an untrusted <c>.gitmodules</c> must not be
+    /// able to read arbitrary local repositories on the service host.
+    /// </summary>
+    internal bool AllowFileTransportForTesting { get; init; }
 
     /// <summary>Upper bound on any single git invocation (a shallow fetch of one commit).</summary>
     private static readonly TimeSpan GitTimeout = TimeSpan.FromMinutes(10);
@@ -77,16 +102,29 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
     /// <param name="token">Optional access token for a private <c>https</c> clone; never logged.</param>
     /// <param name="gitExecutable">The git executable (overridable for tests); defaults to <c>git</c> on PATH.</param>
     /// <param name="log">Optional structured log sink (secrets are never passed to it).</param>
+    /// <param name="submoduleHosts">Extra https <c>host[:port]</c> authorities whose submodules may be fetched
+    /// ANONYMOUSLY (<see cref="ServiceOptions.SubmoduleHosts"/>); the token only ever goes to the repository's host.</param>
     public CloningCheckoutProvider(
         ICheckoutProvider inner,
         ServicePaths paths,
         string? token = null,
         string gitExecutable = "git",
-        Action<string>? log = null)
+        Action<string>? log = null,
+        IReadOnlyCollection<string>? submoduleHosts = null)
     {
         _inner = inner;
         _paths = paths;
         _token = string.IsNullOrWhiteSpace(token) ? null : token;
+        if (_token is not null)
+        {
+            _tokenBasicCredential = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("x-access-token:" + _token));
+            _tokenBase64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(_token));
+        }
+        var hosts = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var host in submoduleHosts ?? [])
+            hosts.Add(SubmoduleUrlPolicy.NormalizeAuthority(host)
+                ?? throw new ArgumentException($"'{host}' is not a valid https host[:port] authority.", nameof(submoduleHosts)));
+        _submoduleHosts = hosts;
         _gitExecutable = gitExecutable;
         _log = log;
 
@@ -104,10 +142,15 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
         // indexed as the requested commit (that would publish a snapshot whose code is the wrong revision),
         // so a VERIFIED mismatch of our own cache falls through to re-provisioning below. An UNVERIFIABLE
         // checkout (e.g. an externally-provisioned non-git tree) keeps the locate provider's
-        // trust-what-is-on-disk semantics — we neither re-clone nor clobber it.
-        if (_inner.TryResolve(request, out resolution)
-            && CheckoutCommitState(resolution.CheckoutDir, request.CommitSha) != CommitState.Mismatch)
+        // trust-what-is-on-disk semantics — we neither re-clone nor clobber it. A matching checkout that
+        // PREDATES recursive submodule provisioning (issue #125: no provisioning marker, and a declared
+        // submodule is unpopulated) is also not a hit — it is upgraded below instead of silently indexed
+        // without its submodules.
+        if (_inner.TryResolve(request, out resolution) && IsReusable(resolution.CheckoutDir, request.CommitSha))
+        {
+            resolution = WithProvisioning(resolution);
             return true;
+        }
 
         resolution = null!;
 
@@ -122,32 +165,77 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
         {
             // Re-check under the lock: a concurrent ensure for the same repo may have just published it AT
             // the requested commit.
-            if (_inner.TryResolve(request, out resolution)
-                && CheckoutCommitState(resolution.CheckoutDir, request.CommitSha) != CommitState.Mismatch)
+            if (_inner.TryResolve(request, out resolution) && IsReusable(resolution.CheckoutDir, request.CommitSha))
+            {
+                resolution = WithProvisioning(resolution);
                 return true;
+            }
 
             resolution = null!;
 
-            // Decide whether a pre-existing canonical directory may be REPLACED. Only a VERIFIED commit
-            // mismatch of a checkout we manage is safe to swap (the service serializes ALL production behind
-            // one write gate, so nothing is mid-index of this checkout). A match with no solution, or an
-            // unverifiable tree, must NOT be clobbered — cloning the same repo cannot conjure a solution the
-            // repository lacks, and we must not destroy an externally-provisioned checkout. Degrade cleanly.
+            // Decide whether a pre-existing canonical directory may be REPLACED. Only a checkout we manage
+            // whose state is VERIFIED is safe to swap (the service serializes ALL production behind one write
+            // gate, so nothing is mid-index of this checkout; the swap itself is the same atomic retired-rename
+            // as a commit change): (a) a commit mismatch, or (b) a match that predates recursive submodule
+            // provisioning and has an unpopulated submodule (an UPGRADE — a fresh clone is staged and swapped
+            // in whole, never populated in place, so a reader never observes a half-initialized tree). A match
+            // with no solution and nothing to upgrade, or an unverifiable tree, must NOT be clobbered —
+            // cloning the same repo cannot conjure a solution the repository lacks, and we must not destroy
+            // an externally-provisioned checkout. Degrade cleanly.
             var allowReplace = false;
+            var upgrade = false;
             if (Directory.Exists(target))
             {
-                if (CheckoutCommitState(target, request.CommitSha) != CommitState.Mismatch)
-                    return false;
-                allowReplace = true;
+                switch (CheckoutCommitState(target, request.CommitSha))
+                {
+                    case CommitState.Mismatch:
+                        allowReplace = true;
+                        break;
+                    case CommitState.Match when NeedsSubmoduleUpgrade(target):
+                        allowReplace = true;
+                        upgrade = true;
+                        break;
+                    default:
+                        return false;
+                }
             }
 
             if (!TryProvision(request, root, target, allowReplace))
+            {
+                // A DETERMINISTIC upgrade failure (e.g. the token no longer reads the repository) must not
+                // make a previously-indexable checkout unusable: keep serving the cached checkout at the SAME
+                // commit — its unpopulated submodules still report the coverage partial. (A transient failure
+                // already threw above and is retried by the service.)
+                if (upgrade && _inner.TryResolve(request, out resolution)
+                    && CheckoutCommitState(resolution.CheckoutDir, request.CommitSha) == CommitState.Match)
+                {
+                    _log?.Invoke($"Submodule upgrade of the cached checkout for '{SanitizeUrlForLog(request.RepositoryRemoteUrl)}' failed; reusing it as-is (coverage stays partial).");
+                    resolution = WithProvisioning(resolution);
+                    return true;
+                }
+                resolution = null!;
                 return false;
+            }
 
             // Publish succeeded → the inner provider now locates the freshly-cloned checkout + solution.
-            return _inner.TryResolve(request, out resolution);
+            if (!_inner.TryResolve(request, out resolution))
+                return false;
+            resolution = WithProvisioning(resolution);
+            return true;
         }
     }
+
+    /// <summary>
+    /// Whether a located checkout may be served as-is: never at a VERIFIED different commit; always when its
+    /// commit is unverifiable (trust an externally-provisioned tree); at the requested commit unless it
+    /// predates recursive submodule provisioning and still has an unpopulated submodule (issue #125).
+    /// </summary>
+    private bool IsReusable(string checkoutDir, string? commitSha) => CheckoutCommitState(checkoutDir, commitSha) switch
+    {
+        CommitState.Mismatch => false,
+        CommitState.Match => !NeedsSubmoduleUpgrade(checkoutDir),
+        _ => true
+    };
 
     private enum CommitState { Match, Mismatch, Unverifiable }
 
@@ -207,32 +295,40 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
         if (!IsContainedIn(root, temp))
             return false;
 
-        // The token (if any) is injected ONLY into the transient fetch URL argument — never into the
-        // `origin` remote written to `.git/config` — so the published checkout never carries a credential.
-        var fetchUrl = AuthenticatedUrl(cleanUrl, _token);
+        // The token (if any) is sent ONLY to the repository's own https host, and only TRANSIENTLY through
+        // environment-scoped config (an http.<url>.extraheader) — never in the fetch URL/argv, never in
+        // `.git/config` — so neither the published checkout nor the process table ever carries it.
+        var repositoryAuthority = SubmoduleUrlPolicy.HttpsAuthority(cleanUrl);
+        var topEnv = TopLevelEnvironment(_token is not null ? repositoryAuthority : null);
         try
         {
             Directory.CreateDirectory(temp);
 
-            var init = RunGit(temp, "init", "--quiet");
+            if (_token is not null && repositoryAuthority is not null && !EnvironmentConfigSupported(temp))
+            {
+                _log?.Invoke($"Clone skipped for '{cleanUrl}': this git does not support environment-scoped config (GIT_CONFIG_COUNT, git >= 2.31), which is required to pass SEXTANT_SERVICE_CHECKOUT_TOKEN without persisting it. Upgrade git.");
+                return false;
+            }
+
+            var init = RunGit(temp, topEnv, "init", "--quiet");
             if (!init.Ok)
                 return FailProvision(GitStage.Init, "init", cleanUrl, init);
             // `--end-of-options` keeps a URL that starts with '-' from being parsed as an option
             // (argument-injection hardening); origin is the CLEAN url, so no token lands in .git/config.
-            var remote = RunGit(temp, "remote", "add", "origin", "--end-of-options", cleanUrl);
+            var remote = RunGit(temp, topEnv, "remote", "add", "origin", "--end-of-options", cleanUrl);
             if (!remote.Ok)
                 return FailProvision(GitStage.RemoteAdd, "remote add", cleanUrl, remote);
 
-            // Prefer a shallow fetch of the EXACT commit (minimal transfer) using the authenticated URL on
-            // the argv only. Some servers reject fetch-by-sha (uploadpack.allowReachableSHA1InWant off) —
-            // fall back to a full fetch. CLASSIFY EACH attempt: the overall fetch is DETERMINISTIC only when
-            // EVERY attempted path failed deterministically — a permanent shallow rejection followed by a
-            // TRANSIENT full-fetch failure (a network blip) is still transient (retryable), so a real
-            // connectivity failure can never be miscached as a permanent `unsupported`.
-            var shallow = RunGit(temp, "fetch", "--depth", "1", "--end-of-options", fetchUrl, commit);
+            // Prefer a shallow fetch of the EXACT commit (minimal transfer). Some servers reject fetch-by-sha
+            // (uploadpack.allowReachableSHA1InWant off) — fall back to a full fetch. CLASSIFY EACH attempt:
+            // the overall fetch is DETERMINISTIC only when EVERY attempted path failed deterministically — a
+            // permanent shallow rejection followed by a TRANSIENT full-fetch failure (a network blip) is still
+            // transient (retryable), so a real connectivity failure can never be miscached as a permanent
+            // `unsupported`.
+            var shallow = RunGit(temp, topEnv, "fetch", "--depth", "1", "--end-of-options", cleanUrl, commit);
             if (!shallow.Ok)
             {
-                var full = RunGit(temp, "fetch", "--end-of-options", fetchUrl);
+                var full = RunGit(temp, topEnv, "fetch", "--end-of-options", cleanUrl);
                 if (!full.Ok)
                 {
                     var shallowTransient = IsTransientGitFailure(GitStage.Fetch, shallow.Kind, shallow.Stderr);
@@ -250,11 +346,11 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
             // directly to the verified sha. (`--end-of-options` stays on `remote add`/`fetch`, which guard
             // real URL args.) A failure AFTER a successful fetch is DETERMINISTIC (see IsTransientGitFailure):
             // a fresh temp repo that fetched but cannot check out the object means the commit is not present.
-            var checkout = RunGit(temp, "checkout", "--detach", "--quiet", commit);
+            var checkout = RunGit(temp, topEnv, "checkout", "--detach", "--quiet", commit);
             if (!checkout.Ok)
                 return FailProvision(GitStage.Checkout, "checkout", cleanUrl, checkout);
 
-            var rev = RunGit(temp, "rev-parse", "HEAD");
+            var rev = RunGit(temp, topEnv, "rev-parse", "HEAD");
             if (!rev.Ok)
                 return FailProvision(GitStage.RevParse, "rev-parse", cleanUrl, rev);
             var head = rev.Stdout.Trim();
@@ -265,11 +361,17 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
                 return false;
             }
 
-            // FETCH_HEAD records the fetch URL — which carried the token — so scrub it before publishing to
-            // the durable volume. If it cannot be removed we FAIL CLOSED rather than cache a credential.
-            if (_token is not null && !ScrubFetchHead(temp))
+            // Recursively populate the declared submodules at their pinned gitlink commits (issue #125). A
+            // permanently unfetchable submodule is left unpopulated with a recorded reason (coverage partial);
+            // a transient failure throws and the whole staged clone is discarded + retried.
+            var submodules = ProvisionSubmodules(temp, cleanUrl, repositoryAuthority);
+            WriteMarker(temp, submodules);
+
+            // Scrub + verify EVERY git dir before publishing to the durable volume: delete every FETCH_HEAD
+            // and, when a token is configured, refuse to publish if it appears anywhere (FAIL CLOSED).
+            if (!ScrubAndVerifyGitDirs(temp, submodules, out var finding))
             {
-                _log?.Invoke($"Clone rejected for '{cleanUrl}': could not scrub the fetch record before publish.");
+                _log?.Invoke($"Clone rejected for '{cleanUrl}': a credential or unscrubbable fetch record remained in '{finding}' before publish.");
                 return false;
             }
 
@@ -278,7 +380,11 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
                 _log?.Invoke($"Clone abandoned for '{cleanUrl}': a checkout was already published at the target.");
                 return false;
             }
-            _log?.Invoke($"Provisioned checkout for '{cleanUrl}' at {commit[..Math.Min(8, commit.Length)]}.");
+            var populated = submodules.Count(s => s.IsPopulated);
+            var submoduleSummary = submodules.Count == 0
+                ? string.Empty
+                : $" with {populated} of {submodules.Count} submodule(s) populated";
+            _log?.Invoke($"Provisioned checkout for '{cleanUrl}' at {commit[..Math.Min(8, commit.Length)]}{submoduleSummary}.");
             return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -396,7 +502,7 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
             return false;
         return stage switch
         {
-            GitStage.Init or GitStage.RemoteAdd => true,
+            GitStage.Init or GitStage.RemoteAdd or GitStage.Configure => true,
             GitStage.Checkout or GitStage.RevParse => false,
             _ => !MatchesDeterministicGitError(stderr) // Fetch
         };
@@ -416,7 +522,10 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
         foreach (var pattern in DeterministicGitErrors)
             if (stderr.Contains(pattern, StringComparison.OrdinalIgnoreCase))
                 return true;
-        return false;
+        // `fatal: transport 'file' not allowed` — the URL's transport is disallowed by GIT_ALLOW_PROTOCOL;
+        // no retry can change that.
+        return stderr.Contains("transport '", StringComparison.OrdinalIgnoreCase)
+               && stderr.Contains("' not allowed", StringComparison.OrdinalIgnoreCase);
     }
 
     // Permanent-error substrings (case-insensitive). Kept tight on purpose — see MatchesDeterministicGitError.
@@ -431,15 +540,29 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
         "terminal prompts disabled",
         "couldn't find remote ref",
         "reference is not a tree",
+        // The server refuses to serve the requested (pinned) object id: the commit is not in the repository
+        // (a gitlink pointing at an unpushed/force-pushed-away commit). Permanent for this request.
+        "not our ref",
     ];
 
-    /// <summary>Removes any occurrence of the token from a string before it is logged.</summary>
-    private string Redact(string value) =>
-        _token is null ? value : value.Replace(_token, "***", StringComparison.Ordinal);
+    /// <summary>
+    /// Removes any occurrence of the token — raw, base64, or as the base64 Basic credential git is handed —
+    /// from a string before it is logged or surfaced in a diagnostic.
+    /// </summary>
+    private string Redact(string value)
+    {
+        if (_token is null || string.IsNullOrEmpty(value))
+            return value;
+        return value
+            .Replace(_tokenBasicCredential!, "***", StringComparison.Ordinal)
+            .Replace(_tokenBase64!, "***", StringComparison.Ordinal)
+            .Replace(_token, "***", StringComparison.Ordinal);
+    }
 
     /// <summary>
-    /// Deletes <c>.git/FETCH_HEAD</c> (which echoes the authenticated fetch URL). Returns true when it is
-    /// gone afterward — regenerated on any later fetch — so a token can never be published on the volume.
+    /// Deletes <c>.git/FETCH_HEAD</c> (the record of the last fetch). Returns true when it is gone afterward
+    /// — regenerated on any later fetch. (The full pre-publish scrub, <see cref="ScrubAndVerifyGitDirs"/>,
+    /// covers every git dir incl. submodules; this is the top-level primitive.)
     /// </summary>
     internal static bool ScrubFetchHead(string checkoutDir)
     {
@@ -454,27 +577,6 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
         {
             return false;
         }
-    }
-
-    /// <summary>
-    /// Injects a token into an <c>https</c> URL as <c>https://x-access-token:&lt;token&gt;@host/...</c> for a
-    /// private-repo clone. Returns the URL unchanged when there is no token, the URL is not <c>https</c>, or
-    /// it already carries userinfo — public repos and non-https remotes need no credential.
-    /// </summary>
-    internal static string AuthenticatedUrl(string url, string? token)
-    {
-        if (token is null)
-            return url;
-        const string scheme = "https://";
-        if (!url.StartsWith(scheme, StringComparison.OrdinalIgnoreCase))
-            return url;
-        var rest = url[scheme.Length..];
-        // Already has userinfo (user[:pass]@host) before the first path separator → don't double-inject.
-        var firstSlash = rest.IndexOf('/');
-        var authority = firstSlash >= 0 ? rest[..firstSlash] : rest;
-        if (authority.Contains('@'))
-            return url;
-        return $"{scheme}x-access-token:{token}@{rest}";
     }
 
     /// <summary>
@@ -598,10 +700,95 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
     internal enum GitFailureKind { None, NonZeroExit, Timeout, SpawnFailure }
 
     /// <summary>The git subcommand a failure occurred at (drives transient-vs-deterministic classification).</summary>
-    internal enum GitStage { Init, RemoteAdd, Fetch, Checkout, RevParse }
+    internal enum GitStage { Init, RemoteAdd, Fetch, Checkout, RevParse, Configure }
 
     /// <summary>The outcome of a git invocation: success/kind plus the drained stdout/stderr.</summary>
     private readonly record struct GitResult(bool Ok, GitFailureKind Kind, string Stdout, string Stderr);
+
+    /// <summary>
+    /// The per-invocation git environment: the transport allowlist (<c>GIT_ALLOW_PROTOCOL</c>) and the
+    /// environment-scoped config entries (<c>GIT_CONFIG_COUNT</c>/<c>KEY_n</c>/<c>VALUE_n</c>, git ≥ 2.31)
+    /// that carry hardening and — for an authenticated fetch only — the transient auth header. Environment
+    /// config is never written to disk, so nothing it carries can persist in the checkout.
+    /// </summary>
+    internal sealed record GitEnvironment(string AllowedProtocols, IReadOnlyList<KeyValuePair<string, string>> Config)
+    {
+        /// <summary>Sets <c>GIT_LITERAL_PATHSPECS=1</c> so an untrusted path is never parsed as pathspec magic.</summary>
+        public bool LiteralPathspecs { get; init; }
+    }
+
+    // Hardening applied to EVERY service git invocation: reset any host credential helper (so no stored
+    // credential is ever consulted, and git never offers to STORE one — the token only ever travels in the
+    // env-scoped header), disable askpass, and never recurse into submodules implicitly (submodules are
+    // provisioned explicitly, pinned, by ProvisionSubmodules). Empty values RESET a multi-valued key.
+    private static readonly KeyValuePair<string, string>[] HardeningConfig =
+    [
+        new("credential.helper", ""),
+        new("core.askPass", ""),
+        new("submodule.recurse", "false"),
+        new("fetch.recurseSubmodules", "false"),
+    ];
+
+    // Inherited variables that could redirect git at a different repository/object store, leak a credential
+    // through tracing, or re-enable a prompt — never passed to a service git invocation.
+    private static readonly string[] ScrubbedEnvironmentVariables =
+    [
+        "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES", "GIT_CONFIG_PARAMETERS",
+        "GIT_ASKPASS", "SSH_ASKPASS", "GIT_TRACE", "GIT_TRACE_CURL", "GIT_TRACE_PACKET", "GIT_TRACE_PERFORMANCE",
+        "GIT_TRACE_SETUP", "GIT_TRACE2", "GIT_TRACE2_EVENT", "GIT_TRACE2_PERF", "GIT_CURL_VERBOSE",
+        "GIT_REDACT_COOKIES", "GIT_TRACE_REDACT",
+    ];
+
+    /// <summary>A local-only git invocation (config, ls-tree, rev-parse, absorbgitdirs): hardening, https only.</summary>
+    private static GitEnvironment LocalGitEnvironment { get; } = new("https", HardeningConfig);
+
+    /// <summary>
+    /// The top-level clone's environment: the historical transport allowlist, hardening, and — when
+    /// <paramref name="authAuthority"/> is set (a token is configured and the repository is https) — the
+    /// token as a Basic credential header scoped to <c>https://&lt;authAuthority&gt;/</c> only.
+    /// </summary>
+    internal GitEnvironment TopLevelEnvironment(string? authAuthority) =>
+        new(AllowedGitProtocols, WithAuth(authAuthority));
+
+    /// <summary>
+    /// A submodule fetch's environment: https ONLY (plus <c>file</c> under the test-only flag) — never ssh,
+    /// git://, http:// or helper transports from an untrusted <c>.gitmodules</c> — hardening, and the auth
+    /// header only when the submodule is on the repository's own host (<paramref name="authAuthority"/>).
+    /// </summary>
+    internal GitEnvironment SubmoduleFetchEnvironment(string? authAuthority) =>
+        new(AllowFileTransportForTesting ? "https:file" : "https", WithAuth(authAuthority));
+
+    private IReadOnlyList<KeyValuePair<string, string>> WithAuth(string? authAuthority)
+    {
+        if (_token is null || authAuthority is null)
+            return HardeningConfig;
+        var key = $"http.https://{authAuthority}/.extraheader";
+        // Base64 (Basic) — the header value can never smuggle CR/LF or a second header, whatever the token.
+        return [.. HardeningConfig, new(key, ""), new(key, $"AUTHORIZATION: basic {_tokenBasicCredential}")];
+    }
+
+    /// <summary>
+    /// Probes (once) that this git honours environment-scoped config (<c>GIT_CONFIG_COUNT</c>, git ≥ 2.31).
+    /// An older git would silently IGNORE the auth header and the hardening, so an authenticated clone must
+    /// not proceed on it. A timeout is transient (not cached); any other failure is cached as unsupported.
+    /// </summary>
+    private bool EnvironmentConfigSupported(string workingDir)
+    {
+        if (_envConfigSupported is { } known)
+            return known;
+        var probe = new GitEnvironment("https", [.. HardeningConfig, new("sextant.envconfigprobe", "ok")]);
+        var result = RunGit(workingDir, probe, "config", "--get", "sextant.envconfigprobe");
+        if (result.Kind == GitFailureKind.Timeout)
+            throw Transient("config probe", "(local)", result);
+        var supported = result.Ok && string.Equals(result.Stdout.Trim(), "ok", StringComparison.Ordinal);
+        _envConfigSupported = supported;
+        return supported;
+    }
+
+    /// <summary>A local-only git invocation under <see cref="LocalGitEnvironment"/>.</summary>
+    private GitResult RunGit(string workingDir, params string[] args) =>
+        RunGit(workingDir, LocalGitEnvironment with { AllowedProtocols = AllowedGitProtocols }, args);
 
     /// <summary>
     /// Runs a git subcommand with an argument list (no shell, so no injection), draining both pipes under a
@@ -609,7 +796,7 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
     /// timeout vs spawn failure) so provisioning can distinguish a TRANSIENT transport failure (retryable)
     /// from a DETERMINISTIC one (permanent).
     /// </summary>
-    private GitResult RunGit(string workingDir, params string[] args)
+    private GitResult RunGit(string workingDir, GitEnvironment environment, params string[] args)
     {
         Process? process = null;
         try
@@ -634,9 +821,14 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
             // classification deterministic across deployments.
             psi.Environment["LC_ALL"] = "C";
             psi.Environment["LANG"] = "C";
-            // Constrain transports to normal ones (+ file for local/test remotes); block helper transports
-            // like ext:: that could execute arbitrary commands for a crafted repository URL.
-            psi.Environment["GIT_ALLOW_PROTOCOL"] = AllowedGitProtocols;
+            // Constrain transports (the top-level allowlist, or https-only for untrusted submodule urls); block
+            // helper transports like ext:: that could execute arbitrary commands for a crafted URL.
+            psi.Environment["GIT_ALLOW_PROTOCOL"] = environment.AllowedProtocols;
+            foreach (var name in ScrubbedEnvironmentVariables)
+                psi.Environment.Remove(name);
+            if (environment.LiteralPathspecs)
+                psi.Environment["GIT_LITERAL_PATHSPECS"] = "1";
+            ApplyEnvironmentConfig(psi.Environment, environment.Config);
             foreach (var a in args)
                 psi.ArgumentList.Add(a);
 
@@ -675,13 +867,35 @@ public sealed class CloningCheckoutProvider : ICheckoutProvider
         }
     }
 
-    /// <summary>Thin bool wrapper over <see cref="RunGit"/> for the callers that only need success + output.</summary>
+    /// <summary>Thin bool wrapper over <see cref="RunGit(string, string[])"/> for the callers that only need success + output.</summary>
     private bool Run(string workingDir, out string stdout, out string stderr, params string[] args)
     {
         var result = RunGit(workingDir, args);
         stdout = result.Stdout;
         stderr = result.Stderr;
         return result.Ok;
+    }
+
+    /// <summary>
+    /// APPENDS <paramref name="config"/> to the environment-scoped config (<c>GIT_CONFIG_COUNT</c>): an
+    /// operator's own inherited entries (e.g. a proxy) are preserved and ours come last, so they win for
+    /// single-valued keys and the empty "reset" entries clear inherited multi-valued ones. An unparsable
+    /// inherited count is replaced (git would reject it anyway).
+    /// </summary>
+    internal static void ApplyEnvironmentConfig(
+        IDictionary<string, string?> environment, IReadOnlyList<KeyValuePair<string, string>> config)
+    {
+        var start = environment.TryGetValue("GIT_CONFIG_COUNT", out var inherited)
+                    && int.TryParse(inherited, System.Globalization.NumberStyles.None,
+                        System.Globalization.CultureInfo.InvariantCulture, out var n) && n is >= 0 and < 1000
+            ? n
+            : 0;
+        for (var i = 0; i < config.Count; i++)
+        {
+            environment[$"GIT_CONFIG_KEY_{start + i}"] = config[i].Key;
+            environment[$"GIT_CONFIG_VALUE_{start + i}"] = config[i].Value;
+        }
+        environment["GIT_CONFIG_COUNT"] = (start + config.Count).ToString(System.Globalization.CultureInfo.InvariantCulture);
     }
 
     private static string SafeResult(Task<string> task)
