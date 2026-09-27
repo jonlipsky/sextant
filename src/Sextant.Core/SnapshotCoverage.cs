@@ -31,7 +31,9 @@ public sealed record SnapshotCoverage
     /// <summary>
     /// How the solution set was chosen: <c>configured</c>, <c>default_union</c> (no config: every discovered
     /// solution, issue #124), or <c>none</c>. Rows recorded before #124 may carry the retired single-solution
-    /// value <c>default_root</c>.
+    /// value <c>default_root</c>. A Phase-12 PROVIDER snapshot (issue #162) carries the indexing parent's
+    /// source when at least one of the provider's OWN solutions was selected, or <c>parent_selection</c> when
+    /// none was, i.e. the provider was built only from projects the parent's selection reached.
     /// </summary>
     public string? SelectionSource { get; init; }
 
