@@ -222,7 +222,8 @@ public static class ServiceApp
             var result = await service.EnsureSnapshotAsync(request, ct, ExtractBearer(req));
             // A non-terminal (queued) result means the ensure ran but the identity was requeued for a later
             // re-attempt — a TRANSIENT provisioning failure bounded by the attempt cap. Surface 202 Accepted
-            // so the orchestrator polls /status rather than treating it as a settled 200 outcome.
+            // so the orchestrator does not treat it as a settled 200 outcome; nothing re-runs it in the
+            // background, so the next attempt is the orchestrator's next ensure for the same commit.
             var statusCode = SnapshotJobStatus.IsTerminal(result.Status)
                 ? StatusCodes.Status200OK
                 : StatusCodes.Status202Accepted;

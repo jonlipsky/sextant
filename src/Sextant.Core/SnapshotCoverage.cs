@@ -82,7 +82,40 @@ public sealed record SnapshotCoverage
     /// </summary>
     public int ScanErrors { get; init; }
 
+    /// <summary>
+    /// The unsatisfiable <c>global.json</c> SDK pins the worker temporarily neutralized so the checkout could
+    /// be evaluated with an installed SDK (issue #113). Null when no pin was overridden (omitted from the
+    /// JSON, so records written before #113 read back unchanged). An override does NOT make the verdict
+    /// partial — every project still loaded — but it is provenance an operator must be able to see: the
+    /// snapshot was built with a substituted SDK.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IReadOnlyList<SdkPinOverride>? SdkPinOverrides { get; init; }
+
     /// <summary>True when <see cref="Verdict"/> is <see cref="SnapshotCoverageVerdict.Partial"/>.</summary>
     [JsonIgnore]
     public bool IsPartial => string.Equals(Verdict, SnapshotCoverageVerdict.Partial, StringComparison.Ordinal);
+}
+
+/// <summary>
+/// One <c>global.json</c> SDK pin the service worker overrode because hostfxr could not satisfy it on this
+/// worker (issue #113) — e.g. <c>"version": "10.0.300", "rollForward": "disable"</c> on a node that only
+/// has 10.0.401. Serialized snake_case inside <see cref="SnapshotCoverage.SdkPinOverrides"/>.
+/// </summary>
+public sealed record SdkPinOverride
+{
+    /// <summary>The overridden <c>global.json</c>, relative to the checkout root (forward slashes).</summary>
+    public required string GlobalJsonPath { get; init; }
+
+    /// <summary>The SDK version the pin requested (<c>sdk.version</c>), when present.</summary>
+    public string? RequestedVersion { get; init; }
+
+    /// <summary>The pin's <c>sdk.rollForward</c> policy, when present.</summary>
+    public string? RollForward { get; init; }
+
+    /// <summary>The installed SDK hostfxr resolved once the pin was neutralized (the SDK actually used).</summary>
+    public string? ResolvedSdkVersion { get; init; }
+
+    /// <summary>The SDK versions installed on the worker, newest first.</summary>
+    public IReadOnlyList<string> InstalledSdks { get; init; } = [];
 }
