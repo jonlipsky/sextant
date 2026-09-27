@@ -25,8 +25,8 @@ public readonly record struct CheckoutFileContent(string Path, ReadOnlyMemory<by
 
 /// <summary>
 /// The git-backed <see cref="ICheckoutContentVerifier"/>: <c>rev-parse HEAD^{commit}</c>, <c>ls-files -v</c> and
-/// <c>status --porcelain</c> over just the candidate paths, then <c>ls-tree</c> of the verified commit and
-/// <c>cat-file</c> of each blob. <c>status</c> alone is not proof: git may call a file clean from its cached
+/// <c>status --porcelain</c> over just the candidate paths, then <c>ls-tree</c> of the verified commit,
+/// <c>check-attr filter</c> and <c>cat-file</c> of each blob. <c>status</c> alone is not proof: git may call a file clean from its cached
 /// stat data (e.g. <c>core.checkStat=minimal</c> and a same-size edit that kept its mtime), so the bytes to be
 /// journaled must equal, byte for byte, the commit's blob as stored or git's checkout rendering (smudge/eol
 /// conversion) of it. git is run hardened against the checkout's own
@@ -117,7 +117,9 @@ public sealed class GitCheckoutContentVerifier : ICheckoutContentVerifier
     /// rendering of it (smudge/eol conversion under the current configuration — the stored form also covers a
     /// file checked out before, say, <c>core.autocrlf</c> was turned on). Hashing the bytes through the clean
     /// filter would not do: clean conversions are many-to-one (<c>ident</c>, custom filters), so an edit they
-    /// normalize away would pass.
+    /// normalize away would pass. The rendering is only trusted from git's own deterministic conversions
+    /// (eol, <c>ident</c>, <c>working-tree-encoding</c>): a <c>filter</c> driver's smudge output is whatever the
+    /// configured program emits, not a function of the blob, so a path with one must match the stored blob.
     /// </summary>
     private string? ContentProblem(string checkout, string commit, IReadOnlyList<CheckoutFileContent> files, List<string> relative)
     {
@@ -155,6 +157,15 @@ public sealed class GitCheckoutContentVerifier : ICheckoutContentVerifier
             return stored.Problem.Length > 0 ? stored.Problem : "git cat-file failed";
         if (content.SequenceEqual(stored.Stdout))
             return null;
+        var attribute = Run(checkout, ["check-attr", "-z", "filter", "--", path]);
+        if (attribute.Problem is not null)
+            return attribute.Problem.Length > 0 ? attribute.Problem : "git check-attr failed";
+        // "<path> NUL filter NUL <value> NUL"
+        var fields = attribute.Text.Split('\0');
+        var driver = fields.Length >= 3 ? fields[2] : "unspecified";
+        if (driver is not ("unspecified" or "unset"))
+            return $"the bytes read from '{path}' are not its committed blob {blobId}, and git would check it out " +
+                $"through the '{FirstLine(driver)}' filter driver, whose output cannot vouch for the commit";
         var rendered = Run(checkout, ["cat-file", "--filters", $"--path={path}", blobId]);
         if (rendered.Problem is not null)
             return rendered.Problem.Length > 0 ? rendered.Problem : "git cat-file failed";
@@ -209,6 +220,11 @@ public sealed class GitCheckoutContentVerifier : ICheckoutContentVerifier
         if (!process.WaitForExit(_timeout))
         {
             try { process.Kill(entireProcessTree: true); } catch (InvalidOperationException) { /* already exited */ }
+            // Let the killed pipes drain before the buffer and process are disposed; never leave a fault unobserved.
+            if (process.WaitForExit(DrainTimeout))
+                Task.WaitAny([Task.WhenAll(copy, stderr)], DrainTimeout);
+            Observe(copy);
+            Observe(stderr);
             return new GitRun([], $"git {args[0]} timed out");
         }
         process.WaitForExit();
@@ -218,6 +234,13 @@ public sealed class GitCheckoutContentVerifier : ICheckoutContentVerifier
             ? new GitRun(stdout.ToArray(), null)
             : new GitRun(stdout.ToArray(), string.IsNullOrWhiteSpace(error) ? string.Empty : $"git {args[0]} failed ({FirstLine(error)})");
     }
+
+    private static readonly TimeSpan DrainTimeout = TimeSpan.FromSeconds(5);
+
+    private static void Observe(Task task) =>
+        task.ContinueWith(t => _ = t.Exception, CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+
     private static string FirstLine(string value)
     {
         var line = value.Trim().Split('\n', 2)[0].Trim();

@@ -152,6 +152,34 @@ public sealed class GitCheckoutContentVerifierTests
     }
 
     [TestMethod]
+    public void ACheckoutRenderedByAFilterDriver_IsNeverVouchedFor()
+    {
+        // The driver's clean hides the edit from `git status`, and its smudge renders exactly the bytes on disk,
+        // but that output is the program's, not the blob's.
+        Git(_checkout, "config", "filter.swap.clean", "sed -e s/10.0.998/10.0.999/");
+        Git(_checkout, "config", "filter.swap.smudge", "sed -e s/10.0.999/10.0.998/");
+        File.WriteAllText(Path.Combine(_checkout, ".gitattributes"), "global.json filter=swap\n");
+        Git(_checkout, "add", ".gitattributes");
+        Git(_checkout, "commit", "--quiet", "-m", "filter");
+        var head = Git(_checkout, "rev-parse", "HEAD").Trim();
+        File.Delete(GlobalJson);
+        Git(_checkout, "checkout", "--", "global.json");
+        Assert.AreEqual(SameSizeEdit, File.ReadAllText(GlobalJson), "precondition: the smudge filter rendered the file");
+        Assert.AreEqual(string.Empty, Git(_checkout, "status", "--porcelain", "--untracked-files=no"),
+            "precondition: git status sees no change");
+
+        StringAssert.Contains(Verifier.Problem(_checkout, head, OnDisk(GlobalJson)), "through the 'swap' filter driver");
+    }
+
+    [TestMethod]
+    public void AGitThatDoesNotAnswerInTime_IsAProblem()
+    {
+        var verifier = new GitCheckoutContentVerifier(timeout: TimeSpan.FromMilliseconds(1));
+
+        StringAssert.Contains(verifier.Problem(_checkout, _head, OnDisk(GlobalJson)), "timed out");
+    }
+
+    [TestMethod]
     public void AReplaceRefForTheHeadCommit_IsIgnored()
     {
         // HEAD stays at _head, but a local refs/replace entry swaps in a commit whose tree matches the edited
