@@ -510,8 +510,23 @@ public sealed class SdkPinGuard
     // of gitlinks: each submodule must keep its git metadata inside the checkout's own git directories and be
     // checked out at exactly the commit its parent's verified commit pins, so the file is still the superproject
     // commit's content. `submodule` is set only in the submodule case; the journal records it so recovery can
-    // tell a submodule that moved since from one modified in place.
+    // tell a submodule that moved since from one modified in place. A per-candidate exception boundary: an
+    // unexpected failure refuses only THIS pin (with its reason) and never aborts Apply for the others.
     private string? VerifyCandidate(string checkout, string head, SdkPinJournalEntry entry, out PinOwner? submodule)
+    {
+        submodule = null;
+        try
+        {
+            return VerifyCandidateCore(checkout, head, entry, out submodule);
+        }
+        catch (Exception ex)
+        {
+            submodule = null;
+            return $"verification failed ({ex.GetType().Name}: {ex.Message})";
+        }
+    }
+
+    private string? VerifyCandidateCore(string checkout, string head, SdkPinJournalEntry entry, out PinOwner? submodule)
     {
         submodule = null;
         var chain = EnclosingSubmodules(checkout, entry.Path, out var problem);
