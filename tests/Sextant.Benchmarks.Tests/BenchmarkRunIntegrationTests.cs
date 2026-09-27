@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using Sextant.Core;
 using Sextant.Indexer;
 using Sextant.Store;
@@ -20,7 +19,7 @@ public sealed class BenchmarkRunIntegrationTests
     {
         _sharedRoot = NewTempDir("shared");
         _sharedSlnx = CorpusGenerator.GenerateCorrectnessCorpus(_sharedRoot);
-        Restore(_sharedSlnx);
+        CorpusRestore.Restore(_sharedSlnx);
     }
 
     [ClassCleanup]
@@ -200,24 +199,6 @@ public sealed class BenchmarkRunIntegrationTests
     private sealed class CancelOnFirstReport(CancellationTokenSource cts) : IProgress<IndexingProgress>
     {
         public void Report(IndexingProgress value) => cts.Cancel();
-    }
-
-    private static void Restore(string solutionPath)
-    {
-        var psi = new ProcessStartInfo("dotnet", $"restore \"{solutionPath}\"")
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
-        using var process = Process.Start(psi)!;
-        var stdoutTask = process.StandardOutput.ReadToEndAsync();
-        var stderr = process.StandardError.ReadToEnd();
-        stdoutTask.GetAwaiter().GetResult();
-        process.WaitForExit();
-        if (process.ExitCode != 0)
-            Assert.Inconclusive($"restore of the generated corpus failed (exit {process.ExitCode}): {stderr}");
     }
 
     private static string NewTempDir(string tag)

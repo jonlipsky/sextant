@@ -10,6 +10,16 @@ dotnet test Sextant.slnx --no-build
 dotnet test --no-build --filter "FullyQualifiedName~SomeTest"
 ```
 
+**Subprocesses in the benchmark harness and its tests go through `tests/Shared/BoundedProcess.cs` (issue #144).**
+Link that file for new test subprocess code. It drains stdout+stderr concurrently, closes stdin, bounds the wait (on
+timeout it kills only the process tree it started — never processes by name), and never waits on pipe EOF after the
+child exits (a descendant that inherited the pipes — a reused MSBuild node, a compiler server, a leaked grandchild —
+can hold them open indefinitely). `BoundedProcess.DotnetRestore` runs `dotnet restore --disable-build-servers
+-nodeReuse:false` with `MSBUILDDISABLENODEREUSE=1`/`DOTNET_CLI_USE_MSBUILD_SERVER=0`. Never read a redirected child's
+streams sequentially to EOF or call the parameterless `WaitForExit()` on it (the older call sites in other test
+projects and `src/` are tracked in #146). CI's `Build & Test` job has a 30-minute timeout and runs `dotnet test` with
+`--blame-hang-timeout 10m` (hang dumps + blame sequence files are uploaded as the `test-hang-diagnostics` artifact).
+
 ## Project Structure
 
 ```

@@ -29,6 +29,9 @@ jobs:
     # A windows/macos matrix could be added later for cross-platform coverage,
     # but is intentionally omitted here to keep the required check lean.
     runs-on: ubuntu-latest
+    # Fail fast instead of burning the 6-hour Actions default when something hangs (issue #144).
+    # A normal run takes ~8-10 minutes end to end.
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -52,5 +55,32 @@ jobs:
       # The env-gated real-MSBuild integration tests stay skipped because
       # SEXTANT_RUN_MULTISLN is left unset — they're too slow/nondeterministic
       # for the required gate. Any test failure fails the job (default behavior).
+      #
+      # Hang guards (issue #144): a single test that makes no progress for 10
+      # minutes gets its test host (and child processes) mini-dumped and killed,
+      # which fails the run and names the hanging test instead of stalling the
+      # job. The step timeout leaves room for the diagnostics upload below.
+      # Node reuse and the MSBuild server are off so no build process spawned by
+      # a test outlives it while holding its redirected output pipes.
       - name: Test
-        run: dotnet test Sextant.slnx --no-build --configuration Debug
+        timeout-minutes: 25
+        env:
+          MSBUILDDISABLENODEREUSE: '1'
+          DOTNET_CLI_USE_MSBUILD_SERVER: '0'
+        run: >-
+          dotnet test Sextant.slnx --no-build --configuration Debug
+          --blame-hang-timeout 10m --blame-hang-dump-type mini
+          --results-directory TestResults
+
+      # Hang dumps and blame sequence files only exist after a hang or crash, so
+      # this uploads nothing on a normal failure or a passing run.
+      - name: Upload test hang diagnostics
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-hang-diagnostics
+          path: |
+            TestResults/**/*.dmp
+            TestResults/**/Sequence_*.xml
+          if-no-files-found: ignore
+          retention-days: 7
