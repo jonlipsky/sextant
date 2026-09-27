@@ -157,13 +157,10 @@ public sealed class GitCheckoutContentVerifier : ICheckoutContentVerifier
             return stored.Problem.Length > 0 ? stored.Problem : "git cat-file failed";
         if (content.SequenceEqual(stored.Stdout))
             return null;
-        var attribute = Run(checkout, ["check-attr", "-z", "filter", "--", path]);
-        if (attribute.Problem is not null)
-            return attribute.Problem.Length > 0 ? attribute.Problem : "git check-attr failed";
-        // "<path> NUL filter NUL <value> NUL"
-        var fields = attribute.Text.Split('\0');
-        var driver = fields.Length >= 3 ? fields[2] : "unspecified";
-        if (driver is not ("unspecified" or "unset"))
+        var driver = FilterDriver(checkout, path, out var attributeProblem);
+        if (attributeProblem is not null)
+            return attributeProblem;
+        if (driver is not null)
             return $"the bytes read from '{path}' are not its committed blob {blobId}, and git would check it out " +
                 $"through the '{FirstLine(driver)}' filter driver, whose output cannot vouch for the commit";
         var rendered = Run(checkout, ["cat-file", "--filters", $"--path={path}", blobId]);
@@ -172,6 +169,35 @@ public sealed class GitCheckoutContentVerifier : ICheckoutContentVerifier
         return content.SequenceEqual(rendered.Stdout)
             ? null
             : $"the bytes read from '{path}' are not a checkout of its committed content (blob {blobId})";
+    }
+
+    /// <summary>
+    /// The <c>filter</c> attribute's value when one is recorded for the path, else null. <c>--all</c> lists only
+    /// attributes that are set, unset or valued, so a driver literally named <c>unspecified</c> or <c>unset</c>
+    /// cannot pass for "no filter"; an explicit <c>-filter</c> reads as a driver too, which only fails closed.
+    /// </summary>
+    private string? FilterDriver(string checkout, string path, out string? problem)
+    {
+        var attributes = Run(checkout, ["check-attr", "-z", "--all", "--", path]);
+        if (attributes.Problem is not null)
+        {
+            problem = attributes.Problem.Length > 0 ? attributes.Problem : "git check-attr failed";
+            return null;
+        }
+        // "<path> NUL <attribute> NUL <info> NUL", once per attribute.
+        var fields = attributes.Text.Split('\0');
+        if (fields.Length % 3 != 1 || fields[^1].Length != 0)
+        {
+            problem = $"git check-attr answered unexpectedly for '{path}'";
+            return null;
+        }
+        problem = null;
+        for (var i = 0; i + 2 < fields.Length; i += 3)
+        {
+            if (fields[i + 1] == "filter")
+                return fields[i + 2];
+        }
+        return null;
     }
 
     /// <summary>The drained stdout, or a problem: empty for a silent non-zero exit, else a description.</summary>
@@ -217,18 +243,21 @@ public sealed class GitCheckoutContentVerifier : ICheckoutContentVerifier
         using var stdout = new MemoryStream();
         var copy = process.StandardOutput.BaseStream.CopyToAsync(stdout);
         var stderr = process.StandardError.ReadToEndAsync();
+        var drains = Task.WhenAll(copy, stderr);
+        // A timed-out run abandons the drains; never leave one of their faults unobserved.
+        Observe(copy);
+        Observe(stderr);
+        Observe(drains);
         if (!process.WaitForExit(_timeout))
         {
             try { process.Kill(entireProcessTree: true); } catch (InvalidOperationException) { /* already exited */ }
-            // Let the killed pipes drain before the buffer and process are disposed; never leave a fault unobserved.
+            // Let the killed pipes drain before the buffer and process are disposed.
             if (process.WaitForExit(DrainTimeout))
-                Task.WaitAny([Task.WhenAll(copy, stderr)], DrainTimeout);
-            Observe(copy);
-            Observe(stderr);
+                Task.WaitAny([drains], DrainTimeout);
             return new GitRun([], $"git {args[0]} timed out");
         }
         process.WaitForExit();
-        copy.GetAwaiter().GetResult();
+        drains.GetAwaiter().GetResult();
         var error = stderr.GetAwaiter().GetResult();
         return process.ExitCode == 0
             ? new GitRun(stdout.ToArray(), null)
