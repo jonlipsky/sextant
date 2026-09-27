@@ -229,8 +229,13 @@ cost a full copy per job and break checkout-relative paths. So the service handl
 
 1. **Detect.** Before loading, the worker asks hostfxr (the same resolver the BuildHost uses) whether the
    nearest `global.json` for each selected solution's directory and each declared project's directory
-   resolves. A pin that resolves is **never touched**, so repositories that work today behave exactly as
-   before. For example, `10.0.100` with `latestFeature` rolls forward to 10.0.401 and is left alone.
+   resolves. Under the no-config default every discovered solution is selected (#124), so this covers
+   every project the union load opens. A project reached only through a `ProjectReference` from outside
+   every selected solution is not probed, so its pin is never overridden: it loads, or fails, exactly as
+   before #113. Under the no-config default such a project file is in no selected solution, which already
+   makes coverage `partial`. A pin that resolves is **never
+   touched**, so repositories that work today behave exactly as before. For example, `10.0.100` with
+   `latestFeature` rolls forward to 10.0.401 and is left alone.
 2. **Neutralize, only for the load.** With `SEXTANT_SERVICE_SDK_PIN_OVERRIDE` on (the default), each
    failing pin inside the checkout has its `sdk` section removed **in place**. Other sections such as
    `msbuild-sdks` are kept. hostfxr then resolves the newest installed SDK, which is re-probed and
@@ -295,6 +300,14 @@ cost a full copy per job and break checkout-relative paths. So the service handl
    - the checkout's git `HEAD` commit cannot be read (e.g. a non-git directory placed by an external
      provisioner in `locate` mode). The journaled commit, not the file content, is what lets recovery tell
      the neutralized tree apart from a re-provisioned one that happens to hold the same bytes;
+   - git cannot confirm the `global.json` is exactly its **committed** content. `HEAD` must resolve to that
+     commit, and the file must be tracked, carry no assume-unchanged/skip-worktree flag, and have no staged
+     or unstaged change. This covers an untracked or locally edited `global.json` in a `locate`-mode
+     checkout. The journal therefore only ever holds the commit's bytes, and a same-commit recovery can
+     only put the committed file back. git runs with inherited `GIT_*` variables dropped, repository
+     discovery stopped at the checkout, literal pathspecs, `core.fsmonitor` off and optional locks off (it
+     never rewrites `.git/index`). If git is missing, times out, or refuses the checkout (e.g. its
+     `safe.directory` ownership check), the pin is refused;
    - the journal cannot be written, or is laid out so recovery could never replay it: inside the checkout,
      or in a directory whose parent does not contain the checkout (the service always uses
      `<checkout-root>/.sextant-sdk-pin`);
@@ -711,13 +724,18 @@ auth). Coverage integrity (#119): `SnapshotCoverageBuilderTests`, `CheckoutInven
 `SnapshotCoverageStoreTests`, `OrchestratorCoverageTests`, `SnapshotServiceCoverageTests`, and the
 `CoverageRegressionFixtureTests` clone of a two-solution repo with an uninitialized submodule. SDK pins
 (#113): `HostFxrSdkResolutionErrorTests` (classifying the hostfxr SDK-not-found error), `SdkPinGuardTests`
-(detect/neutralize/restore/journal recovery/refusals over a fake hostfxr probe), `SdkPinSurfaceTests`
+(detect/neutralize/restore/journal recovery/refusals over a fake hostfxr probe),
+`GitCheckoutContentVerifierTests` (the committed-content check over real git: edits, staged changes,
+untracked/ignored files, index flags, a moved or unborn `HEAD`, no discovery above the checkout, and no index
+writes), `SdkPinSurfaceTests`
 (diagnostics, coverage provenance, audit suffix, status), and the real-MSBuild
 `SdkPinOverrideIntegrationTests`. The integration tests cover a `10.0.999` + `disable` pin that is
 overridden (with and without the sandboxed worker; the checkout bytes, mtime, `git status` and
 `EvaluationFingerprint` are unchanged afterwards), the override disabled (typed failure), a resolvable pin
-(untouched), crash recovery, and a multi-solution repo where one solution's pin yields `partial` (override
-off) or `complete` (override on).
+(untouched), an uncommitted local pin (refused, typed failure, left as found), crash recovery, and
+multi-solution repos where one pin yields `partial` (override off) or `complete` (override on). One of those
+repos pins a solution's directory; the other uses the #124 default union, with the pin in a nested project's
+directory.
 
 ### Phase 15 — platform routing tests
 
