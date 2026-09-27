@@ -300,6 +300,10 @@ public sealed class LocalOverlayReconciler
     /// base fetched by a Windows client) yields a distinct hash and safely falls through to the full-local
     /// build — a capability incompatibility, not a mere addressing miss. This MUST stay byte-identical to the
     /// read-side <c>BaseSnapshotIdentity.ForRemoteOverlay</c> reconstruction, which folds the same value.
+    /// It also addresses the peer's DEFAULT SDK-pin policy (override on, issue #113), which leaves
+    /// <see cref="SnapshotIdentity.SdkPinPolicy"/> null. A peer running with the override disabled publishes
+    /// under a distinct identity, so its bases are not addressable and the reconciler falls through to the
+    /// full-local build.
     /// </summary>
     private SnapshotIdentity BuildRemoteBaseIdentity(SnapshotContext ctx) => new()
     {
