@@ -861,9 +861,10 @@ Migration `016_service_job_catalog.sql` adds `snapshot_jobs`, `snapshot_job_diag
 slice-1/2 additions; `020_audit_log.sql` adds the durable operational + security **audit log** (Phase 17
 slice 3, criterion 5); `021_branch_head_sequence.sql` adds `branches.head_sequence` for the forward-only
 branch-head advance on the ensure path (Phase 14, issue #84); `022_snapshot_coverage.sql` adds the durable
-per-snapshot `snapshot_coverage` record (issue #119). All are additive/forward-only. See
+per-snapshot `snapshot_coverage` record (issue #119); `023_partial_occurrence_source_index.sql` rebuilds
+`ix_occ_source` as a partial index over call edges only (issue #160). All are additive/forward-only. See
 [`schema.md`](schema.md) for the table definitions. `LatestSchemaVersion` auto-derives from the highest
-migration and is **22**.
+migration and is **23**.
 
 ## Testing
 
