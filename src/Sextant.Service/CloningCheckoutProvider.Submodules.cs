@@ -67,6 +67,9 @@ public sealed partial class CloningCheckoutProvider
         public List<SubmoduleProvisioningOutcome> Outcomes { get; } = [];
         public int Visited { get; set; }
 
+        /// <summary>Raw (not display) directory + pinned commit of every populated submodule, for post-absorb verification.</summary>
+        public List<(string Directory, string Commit, string Display)> PopulatedDirectories { get; } = [];
+
         /// <summary>The service's LAST provisioning attempt: degrade a transient submodule failure (see ProvisionLevel).</summary>
         public bool DegradeTransientFailures { get; init; }
     }
@@ -84,10 +87,36 @@ public sealed partial class CloningCheckoutProvider
     {
         var walk = new SubmoduleWalk { DegradeTransientFailures = degradeTransientFailures };
         ProvisionLevel(checkoutRoot, checkoutRoot, topCleanUrl, repositoryAuthority, depth: 1, walk);
-        if (walk.Outcomes.Any(o => o.IsPopulated))
+        if (walk.PopulatedDirectories.Count > 0)
+        {
             AbsorbGitDirs(checkoutRoot);
+            VerifyPopulatedSubmodules(walk);
+        }
         walk.Outcomes.Sort((a, b) => string.CompareOrdinal(a.Path, b.Path));
         return walk.Outcomes;
+    }
+
+    /// <summary>
+    /// Re-checks every submodule recorded as populated AFTER the git dirs were absorbed: it must still have a
+    /// git link (<c>.git</c> file or dir) that resolves to a repository whose HEAD is the pinned commit. A
+    /// half-completed absorb (moved git dir, missing/broken gitfile) would otherwise publish a tree whose marker
+    /// claims <c>populated</c> for a submodule git cannot open — so it fails the staged clone as TRANSIENT
+    /// (discarded and retried) rather than publishing it.
+    /// </summary>
+    private void VerifyPopulatedSubmodules(SubmoduleWalk walk)
+    {
+        foreach (var (dir, commit, display) in walk.PopulatedDirectories)
+        {
+            var dotGit = Path.Combine(dir, ".git");
+            var head = File.Exists(dotGit) || Directory.Exists(dotGit)
+                ? RunGit(dir, LocalGitEnvironment, "rev-parse", "--verify", "--quiet", "HEAD")
+                : default;
+            if (head.Ok && string.Equals(head.Stdout.Trim(), commit, StringComparison.OrdinalIgnoreCase))
+                continue;
+            var message = $"submodule '{display}' no longer resolves to its pinned commit after its git dir was absorbed";
+            _log?.Invoke($"Clone will retry — {message}");
+            throw new TransientProvisioningException(message);
+        }
     }
 
     private void ProvisionLevel(
@@ -125,6 +154,7 @@ public sealed partial class CloningCheckoutProvider
             if (outcome.IsPopulated)
             {
                 var subDir = Path.GetFullPath(Path.Combine(repoDir, entry.Path!));
+                walk.PopulatedDirectories.Add((subDir, outcome.Commit!, relative));
                 ProvisionLevel(root, subDir, outcome.Url!, repositoryAuthority, depth + 1, walk);
             }
         }
@@ -321,12 +351,19 @@ public sealed partial class CloningCheckoutProvider
 
         var env = SubmoduleFetchEnvironment(decision.SendToken ? decision.Authority : null);
 
+        // The env-scoped hardening (credential-helper/askpass reset, no implicit recursion, and — with the
+        // token — the scoped header + no redirects) needs git >= 2.31; an older git would silently ignore it,
+        // so an untrusted .gitmodules is never fetched without it. Probed once per provider.
+        if (!EnvironmentConfigSupported(subDir))
+            return Outcome(display, entry, SubmoduleProvisioningStatus.FetchFailed, url: cleanUrl, commit: gitlink,
+                reason: "this git does not honour environment-scoped config (git >= 2.31 is required to fetch submodules safely)");
+
         var init = RunGit(subDir, env, "init", "--quiet");
         if (!init.Ok)
-            return FailSubmodule(GitStage.Init, "init", subDir, display, entry, cleanUrl, gitlink, init);
+            return FailSubmodule(GitStage.Init, "init", root, repoDir, path, display, entry, cleanUrl, gitlink, init);
         var remote = RunGit(subDir, env, "remote", "add", "origin", "--end-of-options", cleanUrl);
         if (!remote.Ok)
-            return FailSubmodule(GitStage.RemoteAdd, "remote add", subDir, display, entry, cleanUrl, gitlink, remote);
+            return FailSubmodule(GitStage.RemoteAdd, "remote add", root, repoDir, path, display, entry, cleanUrl, gitlink, remote);
 
         // Same shape as the top-level: shallow fetch of the EXACT pinned commit, falling back to a full
         // branch fetch when the server rejects fetch-by-sha; deterministic only if BOTH attempts are.
@@ -338,12 +375,11 @@ public sealed partial class CloningCheckoutProvider
             {
                 var shallowTransient = IsTransientGitFailure(GitStage.Fetch, shallow.Kind, shallow.Stderr);
                 var fullTransient = IsTransientGitFailure(GitStage.Fetch, full.Kind, full.Stderr);
+                // A transient throw discards the whole staged clone (or, on the final attempt, is degraded by
+                // ProvisionOneOrDegrade after it resets this directory) — no cleanup is needed here.
                 if (shallowTransient || fullTransient)
-                {
-                    RemoveSubmoduleGitDir(subDir, display);
                     throw SubmoduleTransient("fetch", display, logUrl, fullTransient ? full : shallow);
-                }
-                RemoveSubmoduleGitDirOrThrow(subDir, display);
+                ResetSubmoduleDirectoryOrThrow(root, repoDir, path, display);
                 var reason = ShortReason(full) is { Length: > 0 } r ? r : ShortReason(shallow);
                 _log?.Invoke($"Submodule '{display}' ({logUrl}) not populated: fetch failed: {reason}");
                 return Outcome(display, entry, SubmoduleProvisioningStatus.FetchFailed, url: cleanUrl, commit: gitlink,
@@ -354,16 +390,16 @@ public sealed partial class CloningCheckoutProvider
         // The gitlink sha is a validated hex object id (ReadGitlink), so it cannot be parsed as an option.
         var checkout = RunGit(subDir, env, "checkout", "--detach", "--quiet", gitlink);
         if (!checkout.Ok)
-            return FailSubmodule(GitStage.Checkout, "checkout", subDir, display, entry, cleanUrl, gitlink, checkout,
-                SubmoduleProvisioningStatus.CheckoutFailed);
+            return FailSubmodule(GitStage.Checkout, "checkout", root, repoDir, path, display, entry, cleanUrl, gitlink,
+                checkout, SubmoduleProvisioningStatus.CheckoutFailed);
 
         var rev = RunGit(subDir, env, "rev-parse", "HEAD");
         if (!rev.Ok)
-            return FailSubmodule(GitStage.RevParse, "rev-parse", subDir, display, entry, cleanUrl, gitlink, rev,
-                SubmoduleProvisioningStatus.CheckoutFailed);
+            return FailSubmodule(GitStage.RevParse, "rev-parse", root, repoDir, path, display, entry, cleanUrl, gitlink,
+                rev, SubmoduleProvisioningStatus.CheckoutFailed);
         if (!string.Equals(rev.Stdout.Trim(), gitlink, StringComparison.OrdinalIgnoreCase))
         {
-            RemoveSubmoduleGitDirOrThrow(subDir, display);
+            ResetSubmoduleDirectoryOrThrow(root, repoDir, path, display);
             return Outcome(display, entry, SubmoduleProvisioningStatus.CheckoutFailed, url: cleanUrl, commit: gitlink,
                 reason: "the checked-out HEAD does not match the pinned commit");
         }
@@ -375,28 +411,24 @@ public sealed partial class CloningCheckoutProvider
             ? RunGit(repoDir, LocalGitEnvironment, "config", $"submodule.{entry.Name}.active", "true")
             : registerUrl;
         if (!registerActive.Ok)
-        {
-            RemoveSubmoduleGitDir(subDir, display);
             throw SubmoduleTransient("config", display, logUrl, registerActive);
-        }
 
         return Outcome(display, entry, SubmoduleProvisioningStatus.Populated, url: cleanUrl, commit: gitlink);
     }
 
     /// <summary>
-    /// Maps a failed single-invocation submodule step: TRANSIENT → throw (after removing the partial git dir);
-    /// DETERMINISTIC → remove the partial git dir and return a non-populated outcome.
+    /// Maps a failed single-invocation submodule step: TRANSIENT → throw (the staged clone is discarded, or the
+    /// final attempt degrades it); DETERMINISTIC → reset the submodule directory to EMPTY (a failed checkout can
+    /// leave partial work-tree files — incl. project files the solution would otherwise load into the PARENT
+    /// snapshot) and return a non-populated outcome.
     /// </summary>
     private SubmoduleProvisioningOutcome FailSubmodule(
-        GitStage stage, string step, string subDir, string display, GitmodulesEntry entry, string cleanUrl,
-        string gitlink, GitResult result, string status = SubmoduleProvisioningStatus.FetchFailed)
+        GitStage stage, string step, string root, string repoDir, string path, string display, GitmodulesEntry entry,
+        string cleanUrl, string gitlink, GitResult result, string status = SubmoduleProvisioningStatus.FetchFailed)
     {
         if (IsTransientGitFailure(stage, result.Kind, result.Stderr))
-        {
-            RemoveSubmoduleGitDir(subDir, display);
             throw SubmoduleTransient(step, display, SanitizeUrlForLog(cleanUrl), result);
-        }
-        RemoveSubmoduleGitDirOrThrow(subDir, display);
+        ResetSubmoduleDirectoryOrThrow(root, repoDir, path, display);
         var reason = $"git {step} failed: {ShortReason(result)}";
         _log?.Invoke($"Submodule '{display}' ({SanitizeUrlForLog(cleanUrl)}) not populated: {reason}");
         return Outcome(display, entry, status, url: cleanUrl, commit: gitlink, reason: reason);
@@ -442,25 +474,16 @@ public sealed partial class CloningCheckoutProvider
             _log?.Invoke($"Submodule git dirs were left embedded (absorbgitdirs failed): {ShortReason(result)}");
     }
 
-    /// <summary>Removes a failed submodule's partial git dir so the directory stays an UNPOPULATED submodule.</summary>
-    private static bool RemoveSubmoduleGitDir(string subDir, string display)
-    {
-        _ = display;
-        var dotGit = Path.Combine(subDir, ".git");
-        TryDeleteDirectory(dotGit);
-        return !Directory.Exists(dotGit) && !File.Exists(dotGit);
-    }
-
     /// <summary>
-    /// Like <see cref="RemoveSubmoduleGitDir"/>, but FAIL CLOSED: a partial git dir that cannot be removed
-    /// would make the coverage scan count an empty submodule as populated, so it aborts the whole clone as
-    /// transient (retried) instead.
+    /// FAIL CLOSED: a failed submodule whose directory cannot be reset to empty (a leftover git dir would make
+    /// the coverage scan count it populated; leftover work-tree files could be indexed into the parent) aborts
+    /// the whole clone as transient (retried) instead.
     /// </summary>
-    private void RemoveSubmoduleGitDirOrThrow(string subDir, string display)
+    private static void ResetSubmoduleDirectoryOrThrow(string root, string repoDir, string path, string display)
     {
-        if (!RemoveSubmoduleGitDir(subDir, display))
+        if (!TryResetSubmoduleDirectory(root, repoDir, path))
             throw new TransientProvisioningException(
-                $"could not remove the partial git directory of failed submodule '{display}'");
+                $"could not reset the directory of failed submodule '{display}' to empty");
     }
 
     private TransientProvisioningException SubmoduleTransient(string step, string display, string? logUrl, GitResult result)

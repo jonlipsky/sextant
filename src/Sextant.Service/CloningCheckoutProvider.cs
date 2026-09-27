@@ -563,6 +563,10 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
         // The server refuses to serve the requested (pinned) object id: the commit is not in the repository
         // (a gitlink pointing at an unpushed/force-pushed-away commit). Permanent for this request.
         "not our ref",
+        // An unfollowed redirect (`http.followRedirects=false` whenever the token header is attached, so the
+        // token can never be carried to a redirect target): a redirect is a stable server property — retrying
+        // cannot help. Deliberately `30x` only (a 5xx stays transient).
+        "the requested url returned error: 30",
     ];
 
     /// <summary>
@@ -760,6 +764,9 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
         "GIT_REDACT_COOKIES", "GIT_TRACE_REDACT",
     ];
 
+    // Below this length a token could coincidentally match unrelated environment values (e.g. PATH).
+    private const int MinTokenLengthForValueScrub = 8;
+
     /// <summary>A local-only git invocation (config, ls-tree, rev-parse, absorbgitdirs): hardening, https only.</summary>
     private static GitEnvironment LocalGitEnvironment { get; } = new("https", HardeningConfig);
 
@@ -785,7 +792,18 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
             return HardeningConfig;
         var key = $"http.https://{authAuthority}/.extraheader";
         // Base64 (Basic) — the header value can never smuggle CR/LF or a second header, whatever the token.
-        return [.. HardeningConfig, new(key, ""), new(key, $"AUTHORIZATION: basic {_tokenBasicCredential}")];
+        // Redirects are DISABLED whenever the header is attached: git's default (`initial`) follows a redirect
+        // of the first request and then REBASES every later request (the upload-pack POST) onto the redirect
+        // target, and `http.extraheader` — unlike a URL/credential-helper credential — is copied onto every
+        // request, so a redirect on the repository host (steerable through an untrusted `.gitmodules` path)
+        // would hand the token to another host. A repository reachable only via a redirect then fails closed.
+        return
+        [
+            .. HardeningConfig,
+            new("http.followRedirects", "false"),
+            new(key, ""),
+            new(key, $"AUTHORIZATION: basic {_tokenBasicCredential}"),
+        ];
     }
 
     /// <summary>
@@ -846,6 +864,19 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
             psi.Environment["GIT_ALLOW_PROTOCOL"] = environment.AllowedProtocols;
             foreach (var name in ScrubbedEnvironmentVariables)
                 psi.Environment.Remove(name);
+            // The service's own configuration (incl. SEXTANT_SERVICE_CHECKOUT_TOKEN and the control/query
+            // tokens) and any other variable carrying the raw checkout token (e.g. the same token exported as
+            // GH_TOKEN) are never inherited by git or anything it launches (transports, filters, hooks): the
+            // token reaches git ONLY as the host-scoped header. (Value matching needs a token long enough not to
+            // match unrelated values such as PATH.)
+            var matchTokenValues = _token is { Length: >= MinTokenLengthForValueScrub };
+            foreach (var key in psi.Environment
+                         .Where(kv => kv.Key.StartsWith("SEXTANT_", StringComparison.OrdinalIgnoreCase)
+                                      || (matchTokenValues && kv.Value is not null
+                                          && kv.Value.Contains(_token!, StringComparison.Ordinal)))
+                         .Select(kv => kv.Key)
+                         .ToList())
+                psi.Environment.Remove(key);
             if (environment.LiteralPathspecs)
                 psi.Environment["GIT_LITERAL_PATHSPECS"] = "1";
             ApplyEnvironmentConfig(psi.Environment, environment.Config);

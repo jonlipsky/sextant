@@ -365,14 +365,94 @@ public class CloningCheckoutProviderSubmoduleTests
     {
         var paths = NewPaths();
         var provider = NewProvider(paths, token: Sentinel);
-        // '_' is legal in many internal host names but not a plain DNS name: the token cannot be host-scoped.
-        var request = ServiceTestFixtures.Request("https://git_internal.invalid/org/app.git", new string('a', 40));
+        // An IPv6 literal is a valid https host but not a plain DNS name, so the token cannot be host-scoped to
+        // it. (A literal, not a name: no DNS lookup — the connection is refused/unreachable, i.e. transient.)
+        var request = ServiceTestFixtures.Request("https://[::1]:1/org/app.git", new string('a', 40));
 
         Assert.ThrowsExactly<TransientProvisioningException>(() => provider.TryResolve(request, out _));
         Assert.IsTrue(_log.Any(l => l.Contains("is not sent to", StringComparison.Ordinal)),
             "an unscoped token is never dropped silently: " + string.Join(Environment.NewLine, _log));
         foreach (var line in _log)
             Assert.IsFalse(line.Contains(Sentinel, StringComparison.Ordinal), line);
+    }
+
+    [TestMethod]
+    public void TryResolve_GitNeverInheritsTheServiceTokenOrAnySextantVariable()
+    {
+        // A fake git that dumps the environment it was started with: git — and anything IT launches
+        // (transports, smudge filters, hooks) — must never see SEXTANT_SERVICE_CHECKOUT_TOKEN (the token
+        // reaches git ONLY as the host-scoped header), the service's other SEXTANT_* secrets, or any other
+        // variable that happens to carry the raw token.
+        var fakeDir = Temp("sextant_fakegit");
+        var dump = Path.Combine(fakeDir, "env.txt");
+        string fakeGit;
+        if (OperatingSystem.IsWindows())
+        {
+            fakeGit = Path.Combine(fakeDir, "git.cmd");
+            File.WriteAllText(fakeGit, "@set > \"%~dp0env.txt\"\r\n@exit /b 1\r\n");
+        }
+        else
+        {
+            fakeGit = Path.Combine(fakeDir, "git");
+            File.WriteAllText(fakeGit, "#!/bin/sh\nenv > \"$(dirname \"$0\")/env.txt\"\nexit 1\n");
+            File.SetUnixFileMode(fakeGit, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+
+        using var env = new EnvironmentScope(
+            ("SEXTANT_SERVICE_CHECKOUT_TOKEN", Sentinel),
+            ("SEXTANT_SERVICE_CONTROL_TOKEN", "control-secret-4d1f"),
+            ("UNRELATED_VARIABLE_WITH_TOKEN", "prefix-" + Sentinel));
+
+        var paths = NewPaths();
+        var provider = new CloningCheckoutProvider(new PersistentVolumeCheckoutProvider(paths), paths,
+            token: Sentinel, gitExecutable: fakeGit, log: _log.Add);
+        Assert.IsFalse(provider.TryResolve(
+            ServiceTestFixtures.Request("https://git.test/org/app.git", new string('a', 40)), out _));
+
+        Assert.IsTrue(File.Exists(dump), "the fake git ran: " + string.Join(Environment.NewLine, _log));
+        var lines = File.ReadAllLines(dump);
+        Assert.IsTrue(lines.Contains("GIT_TERMINAL_PROMPT=0"), "the dump is of the provider's git environment");
+        foreach (var line in lines)
+        {
+            Assert.IsFalse(line.StartsWith("SEXTANT_", StringComparison.OrdinalIgnoreCase), $"inherited: {line}");
+            Assert.IsFalse(line.Contains(Sentinel, StringComparison.Ordinal), $"the raw token reached git: {line}");
+            Assert.IsFalse(line.Contains("control-secret-4d1f", StringComparison.Ordinal), line);
+        }
+    }
+
+    [TestMethod]
+    public void TryResolve_SubmoduleCheckoutFailsHalfway_LeavesItsDirectoryEmpty()
+    {
+        // A submodule commit whose checkout fails AFTER writing some files (a required smudge filter that
+        // fails on the LAST path): the partially written work tree — including a project file the solution
+        // loader would otherwise pick up into the PARENT snapshot — must not survive; the directory is reset to
+        // empty and the submodule reported unpopulated.
+        var lib = InitRepo("boomlib");
+        Write(lib, ".gitattributes", "*.boom filter=boom\n");
+        Write(lib, "A.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />\n");
+        Write(lib, "Z.boom", "payload");
+        var libPinned = CommitAll(lib, "boom");
+        var (_, appUrl, appCommit) = NewRepoWithSubmodules("app",
+            ("boom", "libs/boom", new Uri(lib).AbsoluteUri, libPinned));
+
+        using var env = new EnvironmentScope(
+            ("GIT_CONFIG_COUNT", "2"),
+            ("GIT_CONFIG_KEY_0", "filter.boom.smudge"),
+            ("GIT_CONFIG_VALUE_0", "false"),
+            ("GIT_CONFIG_KEY_1", "filter.boom.required"),
+            ("GIT_CONFIG_VALUE_1", "true"));
+
+        var paths = NewPaths();
+        Assert.IsTrue(NewProvider(paths).TryResolve(ServiceTestFixtures.Request(appUrl, appCommit), out var resolution),
+            string.Join(Environment.NewLine, _log));
+
+        var outcome = resolution.SubmoduleProvisioning.Single();
+        Assert.AreEqual(SubmoduleProvisioningStatus.CheckoutFailed, outcome.Status, outcome.Reason);
+        var dir = Path.Combine(resolution.CheckoutDir, "libs", "boom");
+        Assert.IsTrue(Directory.Exists(dir));
+        Assert.IsFalse(Directory.EnumerateFileSystemEntries(dir).Any(),
+            "no partial work-tree file (or git dir) of the failed submodule survives: "
+            + string.Join(", ", Directory.EnumerateFileSystemEntries(dir).Select(Path.GetFileName)));
     }
 
     // ---- fixtures --------------------------------------------------------------------------------

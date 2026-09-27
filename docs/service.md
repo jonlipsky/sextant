@@ -201,9 +201,12 @@ It does **not** run `git submodule update`. It reads `.gitmodules` from the comm
 the same hardened sequence as the top level: `init` → `remote add origin --end-of-options <clean-url>` →
 `fetch --depth 1 --no-tags --end-of-options origin <gitlink>` (a full fetch as fallback when the pin is not
 advertised shallowly) → `checkout --detach` → verify `HEAD` equals the gitlink. The child's git dir is then
-absorbed into the parent (`.git/modules/<name>`), and nesting recurses (bounded to depth 8 and 256
+absorbed into the parent (`.git/modules/<name>`) — after which every populated submodule is re-verified (its
+gitdir link must still resolve to its pinned `HEAD`; otherwise the staged provisioning is discarded and
+retried) — and nesting recurses (bounded to depth 8 and 256
 submodules). Submodule names/paths are validated (no `..`, no absolute or `.git` segments, no escape from the
-parent).
+parent). Fetching any submodule needs git ≥ 2.31 (the hardening below travels as environment-scoped config,
+which an older git silently ignores), so on an older git every submodule is left unpopulated with that reason.
 
 **URL policy (per `.gitmodules` entry).**
 
@@ -219,11 +222,15 @@ parent).
 host** (the same env-scoped header as the top level). `SEXTANT_SERVICE_SUBMODULE_HOSTS` (comma-separated
 `host[:port]` list) additionally allows submodules on other hosts, fetched **anonymously** (the token is never
 sent to them). Any other host is refused. When the top-level remote is not `https` (ssh/scp) no host is
-authenticated, so only allowlisted-host https submodules are fetched.
+authenticated, so only allowlisted-host https submodules are fetched. A token-carrying fetch never follows
+a redirect (see the security note below).
 
 **An unfetchable submodule never fails the checkout.** A refused URL, an auth/404/unreachable fetch, a pinned
 commit that is not on the remote, an invalid entry, a `.gitmodules` entry with no gitlink, or exceeding the
-depth/count bounds leaves that submodule **unpopulated** and records a token-redacted outcome. Coverage then
+depth/count bounds leaves that submodule **unpopulated** — its directory is reset to **empty** (a checkout
+that failed halfway leaves no partial work-tree files, which could otherwise be loaded into the parent
+snapshot; if the directory cannot be emptied the provisioning is discarded and retried) — and records a
+token-redacted outcome. Coverage then
 reports the snapshot `partial` with a `submodule_unpopulated` diagnostic per submodule whose message and the
 job `reason` say why, e.g. `libs/X (url refused: host 'example.com' is not the repository host …)`,
 `libs/Y (fetch failed: …)`, `libs/Z (pinned commit not found: …)`, `libs/W (no gitlink: …)`. A
@@ -285,7 +292,9 @@ base64 forms — from every log line and exception. Every service git invocation
 helpers and askpass (`credential.helper=` / `core.askPass=` through the same channel) and disables implicit
 submodule recursion, so a host-level credential helper can neither supply nor **store** a credential for a
 service fetch. **Behavior change (#125):** before this, a host credential helper could silently authenticate
-a clone; now only `SEXTANT_SERVICE_CHECKOUT_TOKEN` does. An authenticated clone requires git ≥ 2.31 (it is
+a clone; now only `SEXTANT_SERVICE_CHECKOUT_TOKEN` does. Git (and anything it launches — transports,
+filters, hooks) never inherits the service's own `SEXTANT_*` variables (including the raw token and the
+control/query tokens) or any other variable whose value contains the token. An authenticated clone requires git ≥ 2.31 (it is
 probed once; an older git fails the provisioning closed rather than fetching without its hardening). Public
 repositories (and non-`https` remotes) need no token. The header can only be scoped to a plain DNS host name,
 so for an `https` remote whose host is not one (an `_`, a trailing `.`, an IPv6 literal) the token is **not
@@ -305,8 +314,18 @@ packed-refs, hooks, markers, …) is scanned for the raw, base64 and basic-crede
 > before indexing; git helper transports are blocked (`GIT_ALLOW_PROTOCOL`; submodules are further limited
 > to `https`) and prompting is disabled. The token lives only in the git child's **environment** (not
 > persisted, not logged, not on argv), so it is visible only to a process that can already read the service
-> process's environment — treat the service host as trusted. Git's default redirect policy is kept; libcurl
-> drops the `Authorization` header on a cross-host redirect. Prefer `locate` for nodes that must not reach
+> process's environment — treat the service host as trusted. **Redirects are disabled for every fetch that
+> carries the token** (`http.followRedirects=false`): git copies `http.extraheader` onto every request,
+> including the requests it rebases onto a redirect target after following one, so a redirect on the
+> repository host (a path an untrusted `.gitmodules` can choose) would otherwise hand the token to another
+> host. An authenticated repository or same-host submodule reachable only through a redirect (e.g. a renamed
+> repository) therefore fails **deterministically** (`The requested URL returned error: 301`) — update the
+> URL. Anonymous fetches keep git's default redirect policy. Host-level git configuration (system/global
+> config, an inherited `GIT_CONFIG_COUNT` block) is **operator-trusted** and still honoured — CA bundles,
+> proxies, `url.<base>.insteadOf` mirrors — so it is part of the trusted host: an `insteadOf` there can change
+> where a URL is fetched from; the token header is matched against the URL *after* that rewrite, so it is
+> still only ever sent to the repository's own host (a mirror on another host is fetched without it).
+> Prefer `locate` for nodes that must not reach
 > the network; scope network egress and the control token appropriately when enabling `clone`. Any value
 > other than `locate`/`clone` **fails startup** (fail-closed).
 
