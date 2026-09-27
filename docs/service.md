@@ -54,7 +54,7 @@ of the box.
 | `SEXTANT_SERVICE_CHECKOUT_MODE` | How a checkout is obtained: `locate` (index only an already-provisioned checkout) or `clone` (provision it by cloning the requested commit) | `locate` |
 | `SEXTANT_SERVICE_CHECKOUT_TOKEN` | Access token for cloning a **private** `https` repo in `clone` mode (sent transiently as an env-scoped `Authorization` header to the repository's own host and same-host submodules only; public repos need none) | none |
 | `SEXTANT_SERVICE_SUBMODULE_HOSTS` | In `clone` mode, comma-separated `host[:port]` list of **additional** hosts submodules may be fetched from — **anonymously** (the token is never sent to them). Invalid entries fail startup | none (same host only) |
-| `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS` | In `clone` mode, how many times a **transient** clone/provisioning failure is retried across re-ensures before the job settles to terminal `failed` (clamped to 1–100; deterministic failures are never retried) | `5` |
+| `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS` | In `clone` mode, how many times a **transient** clone/provisioning failure is retried across re-ensures before the job settles to terminal `failed` (clamped to 1–100; deterministic failures are never retried). Also bounds the requeue of a checkout whose neutralized `global.json` SDK pin could not be restored (`sdk_pin_restore_failed`, #113), in any checkout mode | `5` |
 | `SEXTANT_SERVICE_CONTROL_TOKEN` | Bearer token for `/control/*` | none (open, dev only) |
 | `SEXTANT_SERVICE_QUERY_TOKEN` | Bearer token for `/mcp` + `/query/*` | none (anonymous read) |
 | `SEXTANT_SERVICE_CONTRIBUTE_TOKEN` | Least-privilege token for `/control/contribute` only (issue #71); the control token remains a superset that also authorizes it | none (falls back to control token) |
@@ -73,6 +73,7 @@ of the box.
 | `SEXTANT_SERVICE_SANDBOX_MEMORY_BUDGET_BYTES` | Watchdog memory ceiling | policy default |
 | `SEXTANT_SERVICE_SANDBOX_ALLOW_NETWORK` | Allow network during evaluation | `false` |
 | `SEXTANT_SERVICE_SANDBOX_SCRUB_SECRETS` | Scrub secrets from the evaluation environment | `true` |
+| `SEXTANT_SERVICE_SDK_PIN_OVERRIDE` | Temporarily neutralize a checkout `global.json` SDK pin that no installed SDK satisfies, so the checkout still indexes with an installed SDK (issue #113; see [SDK pins](#repository-globaljson-sdk-pins-issue-113)). `false` leaves such pins alone and the job fails / goes partial with a typed `sdk_resolution_failed` diagnostic. An unparseable value **fails startup** | `true` |
 
 Boolean toggles accept `1/0`, `true/false`, `yes/no`, `on/off` (case-insensitive); any other non-empty
 value **fails startup** rather than silently disabling a security-relevant control (fail-closed). The
@@ -168,7 +169,7 @@ file-system inventory (project files on disk, excluding `obj`/`bin`/`.git`; subm
 | --- | --- |
 | a discovered solution was not selected (defensive; the no-config default selects all of them since #124) | `solution_not_selected` |
 | a configured solution is missing/invalid/outside the checkout | `solution_skipped` |
-| a declared project could not load on this worker (e.g. an iOS/Android/Mac/WPF head on Linux, #90) | `project_skipped` |
+| a declared project could not load on this worker (e.g. an iOS/Android/Mac/WPF head on Linux, #90) | `project_skipped` (`sdk_resolution_failed` when its `global.json` pins an SDK this worker lacks and the pin was not overridden, #113) |
 | a selected solution declared no readable project, or nothing loaded at all | `solution_no_projects` / `no_projects_loaded` |
 | a declared submodule is not populated (no `.git` at its path) | `submodule_unpopulated` |
 | a project file on disk is in no selected solution and was not pulled in by a `ProjectReference` | `project_file_unreferenced` |
@@ -280,6 +281,149 @@ on the final allowed attempt the cached tree is served too. A
 pre-change checkout with no submodules is reused untouched. Separately, `AnalyzerVersion` is bumped to `4`,
 so a pre-change snapshot indexed without submodules at the same commit is never reused.
 
+#### Repository `global.json` SDK pins (issue #113)
+
+Roslyn's MSBuild BuildHost picks its .NET SDK through hostfxr, which honors the checkout's `global.json`.
+If a repository pins an SDK band the worker does not have **and** forbids roll-forward (e.g.
+`{"sdk": {"version": "10.0.300", "rollForward": "disable"}}` on an image that only ships 10.0.401), the
+load dies before any project evaluates (`hostfxr_resolve_sdk2 … A compatible .NET SDK was not found`),
+even though the code builds fine with the installed SDK. No environment variable or MSBuildLocator/
+MSBuildWorkspace option makes hostfxr ignore a `global.json`, and copying the checkout to scratch would
+cost a full copy per job and break checkout-relative paths. So the service handles it like this:
+
+1. **Detect.** Before loading, the worker asks hostfxr (the same resolver the BuildHost uses) whether the
+   nearest `global.json` for each selected solution's directory and each declared project's directory
+   resolves. Under the no-config default every discovered solution is selected (#124), so this covers
+   every project the union load opens. A project reached only through a `ProjectReference` from outside
+   every selected solution is not probed, so its pin is never overridden: it loads, or fails, exactly as
+   before #113. Under the no-config default such a project file is in no selected solution, which already
+   makes coverage `partial`. A pin that resolves is **never
+   touched**, so repositories that work today behave exactly as before. For example, `10.0.100` with
+   `latestFeature` rolls forward to 10.0.401 and is left alone.
+2. **Neutralize, only for the load.** With `SEXTANT_SERVICE_SDK_PIN_OVERRIDE` on (the default), each
+   failing pin inside the checkout has its `sdk` section removed **in place**. Other sections such as
+   `msbuild-sdks` are kept. hostfxr then resolves the newest installed SDK, which is re-probed and
+   recorded. The committed bytes, last-write time and unix mode are **restored in a `finally` immediately
+   after the MSBuild load**, before the coverage scan, the `EvaluationFingerprint`, or any indexing reads
+   the checkout. The persistent, reused checkout therefore never diverges from its commit (`git status`
+   stays clean). The symlink/junction check is repeated right before the restore writes, so a directory
+   swapped for a link during the load is refused (the restore fails closed, as below). This is defense in
+   depth, not a security boundary: evaluated repository code already holds the worker's filesystem
+   authority (see the evaluation sandbox; OS-hard isolation is #76).
+3. **Crash-safe.** Before any file is modified, the original bytes and the checkout's `HEAD` commit are
+   journaled atomically (fsynced, with the rename and a newly created journal directory flushed on Unix) to
+   `<checkout-root>/.sextant-sdk-pin/<checkout>-<hash>.json`, outside every working tree. Each rewrite goes
+   through a uniquely named sibling temp file created exclusively, so no repository file (whatever its
+   name) is ever overwritten or deleted. A restored file (including its mode and mtime) is flushed before
+   its journal is deleted, and the deletion is flushed too. Every job replays leftover journals **before** a
+   cached checkout is resolved or reused:
+   - a file that still holds exactly the neutralized content is restored; one that already holds the
+     committed content is left alone;
+   - a file that is **missing or holds foreign content** fails closed while the checkout is still at the
+     journaled commit: the journal is kept and the checkout is not indexed. Repair it by restoring the
+     committed `global.json` (e.g. `git checkout -- global.json`) or by deleting the checkout so it is
+     re-cloned; the journal then retires itself;
+   - once the checkout has **moved to another commit** (the cloning provider re-provisions a mismatched
+     checkout as a whole fresh tree) or is gone, the journal is retired **without writing or deleting
+     anything** in the checkout — even a file whose bytes happen to equal the neutralized form, or one at
+     the journaled temp-file path, belongs to the new commit. If the
+     journaled commit can no longer be confirmed (the checkout's `HEAD` is unreadable), it fails closed;
+   - a journal is replayed only when it is well formed and confined: it must be the journal of the checkout
+     it names, that checkout must be on the checkout volume (the journal directory's parent), and it must
+     list at least one entry, each a distinct `global.json` inside it whose journaled bytes match their
+     checksum and whose recorded commit, timestamp and mode are valid. Before a checkout that is still at
+     the journaled commit is restored, neither the `global.json`, nor the checkout directory, nor any
+     directory between them and the checkout volume may be a symlink/junction (checked for every entry
+     before any is written). A moved checkout's links belong to the new commit and never block retiring its
+     journal. Anything else is logged and left for inspection, and one bad journal never stops the others
+     from being replayed;
+   - if the journal directory cannot be read (e.g. after a restart under another UID), the service cannot
+     rule out a leftover journal, so the checkout is not indexed — an access failure is never read as "no
+     journal".
+
+   If a restore fails during a job (even a cancelled one), or a leftover journal cannot be replayed, the
+   checkout is not indexed, the journal is kept, and the job is **requeued** with an `sdk_pin_restore_failed`
+   diagnostic rather than recorded as a terminal failure. The checkout's state is the problem, not the commit,
+   so it must not poison the identity: once the checkout is repaired, the next ensure retries. There is no
+   background retry: the next attempt runs when the orchestrator **re-calls `POST /control/ensure`** for the
+   same commit (`/control/status/{jobId}` shows the `queued` job and its diagnostic in the meantime). Like a
+   transient clone failure, this is bounded by `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS`. Once the attempts
+   are used up the job settles to `failed`, still carrying `sdk_pin_restore_failed` next to
+   `provisioning_attempts_exhausted`.
+4. **Refusals.** A pin is left alone and reported as not overridden, with the reason, when:
+   - the override is disabled;
+   - hostfxr failed for a reason **other than a missing SDK version**. Only its "A compatible .NET SDK was
+     not found" wording is overridden; the bare `0x8000809B` status is not enough, because hostfxr returns it
+     for every resolution failure;
+   - the pinned version is not a well-formed SDK version (`major.minor.patch` with a feature band of at
+     least 100, e.g. `10.0.300`). hostfxr words a malformed `1.2.0` pin exactly like an absent band, so this
+     keeps the override to pins that name a real SDK band;
+   - the `global.json` lies outside the checkout, or is reached through a symlink/junction (including a
+     symlinked checkout directory);
+   - it cannot be read or parsed, it has no `sdk` section, or its `sdk` section pins no version;
+   - the checkout's git `HEAD` commit cannot be read (e.g. a non-git directory placed by an external
+     provisioner in `locate` mode). The journaled commit, not the file content, is what lets recovery tell
+     the neutralized tree apart from a re-provisioned one that happens to hold the same bytes;
+   - git cannot confirm the `global.json` is exactly its **committed** content. `HEAD` must resolve to that
+     commit, and the file must be tracked, carry no assume-unchanged/skip-worktree flag, and have no staged
+     or unstaged change. The exact bytes to be journaled must also equal, byte for byte, the commit's blob
+     as stored or git's checkout rendering of it (eol/`ident`/`working-tree-encoding` conversion). A path
+     that goes through a `filter` driver (e.g. LFS) must match the stored blob, because a driver's smudge
+     output is the program's, not the blob's. The rendered alternative needs git 2.11 or later
+     (`cat-file --filters`); an older git fails closed. This matters because `git status`
+     can call an edit clean from cached stat data alone, and clean conversions such as `ident` are
+     many-to-one, so hashing the bytes would not be proof. The rule covers an untracked or locally edited
+     `global.json` in a `locate`-mode checkout. The journal therefore only ever holds the commit's content, and a
+     same-commit recovery can only put the committed file back. git runs with inherited `GIT_*` variables
+     dropped, replace refs ignored, repository discovery stopped at the checkout, literal pathspecs,
+     `core.fsmonitor` off and optional locks off (it never rewrites `.git/index` or writes objects). If git
+     is missing, times out, or refuses the checkout (e.g. its `safe.directory` ownership check), the pin is
+     refused;
+   - the journal cannot be written, or is laid out so recovery could never replay it: inside the checkout,
+     or in a directory whose parent does not contain the checkout (the service always uses
+     `<checkout-root>/.sextant-sdk-pin`);
+   - neutralizing it still leaves no resolvable SDK (for example, a parent pin outside the checkout also
+     fails). In that case it is restored at once.
+
+Outcomes and diagnostics. All paths are checkout-relative, and every diagnostic names the repo-relative
+`global.json`, the requested version and `rollForward`, and the installed SDK(s):
+
+| Situation | Job status | Diagnostic `code` |
+| --- | --- | --- |
+| pin overridden, checkout loaded | `complete` (unless another coverage gap applies) | `sdk_pin_overridden` (warning; also the substituted SDK) |
+| pin not overridden and the **whole** load failed SDK resolution | `failed` with a typed reason (requested vs installed, pin path, why not overridden) — never a bare exception message. This also applies when the load fails with an error that names no hostfxr function (e.g. every project came back empty) while a pin it depends on is known not to resolve; the reason then carries the load error too | `sdk_resolution_failed` (error) |
+| pin not overridden, but only **some** solutions/projects are governed by it (#90-style isolation, e.g. a `tools/global.json` in one of several solutions) | `partial`; the reason names the pin | `sdk_resolution_failed` (warning) for the pin and for each project it kept from loading |
+| a neutralized pin could not be restored (or a leftover journal could not be replayed, or its presence ruled out) | `queued` (requeued; HTTP 202 — re-call ensure to retry), nothing indexed; `failed` once `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS` is exhausted | `sdk_pin_restore_failed` (error) |
+
+An overridden snapshot is **complete**, because the override restored full coverage, but it is never
+silent:
+
+- `GET /control/status/{jobId}` lists the `sdk_pin_overridden` diagnostic.
+- The snapshot's durable `coverage` block (in ensure/status/resolve, query pages, and MCP
+  `meta.snapshot.coverage`) carries
+  `sdk_pin_overrides: [{ global_json_path, requested_version, roll_forward, resolved_sdk_version, installed_sdks }]`.
+- The ensure audit row's `detail` gains a suffix, e.g. `job_42;sdk_pin_overridden`. The suffixes are
+  `;sdk_resolution_failed` and `;sdk_pin_restore_failed` for the other two outcomes.
+
+**Identity and fingerprints stay deterministic.** The snapshot identity is computed from the request and
+the service toolchain before the worker runs, and does not read `global.json`.
+`EvaluationFingerprint.Compute` does hash `global.json`, but it runs at index time, after the restore. It
+therefore records the **committed** checkout's value, the same value a worker that has the pinned SDK would
+record. The override needs no `AnalyzerVersion` bump.
+
+**The override policy is not part of the snapshot identity.** Like the clone credential, the
+`SEXTANT_SERVICE_SDK_PIN_OVERRIDE` toggle and the worker's installed SDK bands are operator/worker
+configuration, not snapshot inputs. A terminal `failed` job is reused for its identity, so a commit that
+already failed SDK resolution (e.g. on a worker from before this feature, or with the override off) is not
+retried just because the override is now on or a new SDK band was installed. Pushing a new commit (or an
+`AnalyzerVersion` bump) produces a new identity that is evaluated afresh.
+
+**Operator options.** Install the pinned SDK band in the worker image, which makes the pin resolve so the
+override never engages. Alternatively, have the repository relax `rollForward` (e.g. `latestFeature`). Set
+`SEXTANT_SERVICE_SDK_PIN_OVERRIDE=false` to prefer an honest `failed`/`partial` over a substituted SDK. The
+local CLI/daemon path is unaffected: it evaluates with the developer's own SDK and never rewrites
+`global.json`.
+
 #### Transient vs deterministic provisioning failures
 
 Cloning is a **network** operation, so some failures are expected to recover on their own (a DNS blip, a
@@ -292,7 +436,8 @@ poisons a recoverable commit while still caching genuinely-hopeless ones:
   requeued, so the orchestrator's natural retry (re-calling `ensure` for the same commit) re-runs the
   worker. This is bounded by `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS` (default `5`); once exhausted the
   job settles to terminal `failed`. Such an ensure returns **HTTP 202 Accepted** with a non-terminal
-  (`queued`) status — poll `/control/status/{jobId}`.
+  (`queued`) status. `/control/status/{jobId}` shows the queued job and its diagnostics, but nothing
+  re-runs it in the background: the next attempt happens when `ensure` is called again.
 - **Deterministic** — the job records a terminal `unsupported`/`failed` as before, and every later ensure
   for that identity attaches the cached result **without** re-running the worker (so a hopeless request is
   not re-attempted on every delivery). This is byte-identical to the pre-existing behavior.
@@ -533,6 +678,11 @@ separate from the persistent checkout/artifact/cache volumes**:
 So a botched worker-scratch cleanup can **never** reach — let alone delete — a published snapshot's durable
 data. This extends the Phase-8 retention servable guard + Phase-9 `BranchPointerProtection`.
 
+The checkout volume also holds `.sextant-sdk-pin/`, the SDK-pin restore journals (issue #113). It is a
+sibling of the checkouts, never inside a working tree, and is empty except while a job has a `global.json`
+pin neutralized or after a crash in that window. Keep it on the same persistent volume as the checkouts:
+it is what lets the next job put a neutralized `global.json` back.
+
 ## Untrusted evaluation sandbox (Phase 17, criterion 2)
 
 MSBuild project evaluation is an **untrusted execution boundary — even for a private repo** (imported
@@ -681,7 +831,21 @@ provisioning (#125): `CloningCheckoutProviderSubmoduleTests` (local `file://` fi
 absolute/relative/nested pins, unfetchable → partial with reasons, sentinel-token non-persistence across every
 git dir, pre-change cache upgrade, transient failure retried then degraded on the final attempt),
 `SubmoduleUrlPolicyTests`, `SubmoduleProvisioningHelperTests`, and the
-`SubmoduleCheckoutIntegrationTests` end-to-end Phase-12 provider-snapshot test.
+`SubmoduleCheckoutIntegrationTests` end-to-end Phase-12 provider-snapshot test. SDK pins
+(#113): `HostFxrSdkResolutionErrorTests` (classifying the hostfxr SDK-not-found error), `SdkPinGuardTests`
+(detect/neutralize/restore/journal recovery/refusals over a fake hostfxr probe),
+`GitCheckoutContentVerifierTests` (the committed-content check over real git: edits, including ones
+`git status` cannot see from stat data, through an `ident` clean filter, or through a `filter` driver;
+staged changes; untracked/ignored files; index flags; CRLF and stored-form checkouts; a replace ref; a moved
+or unborn `HEAD`; a timeout; no discovery above the checkout; and no index writes), `SdkPinSurfaceTests`
+(diagnostics, coverage provenance, audit suffix, status), and the real-MSBuild
+`SdkPinOverrideIntegrationTests`. The integration tests cover a `10.0.999` + `disable` pin that is
+overridden (with and without the sandboxed worker; the checkout bytes, mtime, `git status` and
+`EvaluationFingerprint` are unchanged afterwards), the override disabled (typed failure), a resolvable pin
+(untouched), an uncommitted local pin (refused, typed failure, left as found), crash recovery, and
+multi-solution repos where one pin yields `partial` (override off) or `complete` (override on). One of those
+repos pins a solution's directory; the other uses the #124 default union, with the pin in a nested project's
+directory.
 
 ### Phase 15 — platform routing tests
 
