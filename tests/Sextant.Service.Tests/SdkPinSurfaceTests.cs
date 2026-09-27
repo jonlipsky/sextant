@@ -423,4 +423,110 @@ public sealed class SdkPinSurfaceTests
             Environment.SetEnvironmentVariable(name, null);
         }
     }
+
+    [TestMethod]
+    public void SdkPinIdentityComponent_IsNullByDefault_AndStrictWhenTheOverrideIsOff()
+    {
+        var options = ServiceTestFixtures.NewOptions(ServiceTestFixtures.NewDbPath());
+
+        Assert.IsNull(options.SdkPinIdentityComponent, "the default policy keeps identities byte-identical");
+        Assert.AreEqual(SdkPinOptions.StrictIdentityComponent, (options with { SdkPinOverride = false }).SdkPinIdentityComponent);
+
+        // The worker publishes under the value its guard derives from the SAME toggle, so the two always agree.
+        Assert.IsNull(new SdkPinGuard(new SdkPinOptions { OverrideEnabled = true }).IdentityComponent);
+        Assert.AreEqual(SdkPinOptions.StrictIdentityComponent,
+            new SdkPinGuard(new SdkPinOptions { OverrideEnabled = false }).IdentityComponent);
+
+        var request = ServiceTestFixtures.Request();
+        var context = LocalIndexerSnapshotWorker.CreateSnapshotContext(request, capability: null, SdkPinOptions.StrictIdentityComponent);
+        Assert.AreEqual(SdkPinOptions.StrictIdentityComponent, context.SdkPinPolicy, "the orchestrator publishes under it");
+        Assert.IsNull(LocalIndexerSnapshotWorker.CreateSnapshotContext(request, capability: null).SdkPinPolicy);
+
+        Assert.AreEqual(request.ToIdentity("cfg", "cap").Hash, request.ToIdentity("cfg", "cap", sdkPinPolicy: null).Hash);
+        Assert.AreNotEqual(request.ToIdentity("cfg", "cap").Hash,
+            request.ToIdentity("cfg", "cap", SdkPinOptions.StrictIdentityComponent).Hash);
+    }
+
+    [TestMethod]
+    public async Task FlippingTheOverride_EnsuresTheSameCommitUnderANewIdentity_AndRebuildsIt()
+    {
+        // A snapshot that is already published is never rebuilt, and a failed job is reused as recorded. So the
+        // override policy must be part of the identity: otherwise a commit ensured with the override off (partial
+        // or failed) would be silently reused after the operator turned it on, and the other way round.
+        var dbPath = ServiceTestFixtures.NewDbPath();
+        var db = new IndexDatabase(dbPath);
+        db.RunMigrations();
+        var hashes = new List<string>();
+        SnapshotService? service = null;
+        try
+        {
+            async Task<EnsureSnapshotResult> EnsureAsync(bool overrideEnabled, FakeSnapshotWorker worker)
+            {
+                service?.Dispose();
+                service = SnapshotService.Start(
+                    ServiceTestFixtures.NewOptions(dbPath) with { SdkPinOverride = overrideEnabled }, worker, db);
+                var result = await service.EnsureSnapshotAsync(ServiceTestFixtures.Request());
+                hashes.Add(result.IdentityHash);
+                return result;
+            }
+
+            // Off: this node's worker fails the pinned commit (a whole-load SDK failure is a terminal failed job).
+            var strictWorker = new FakeSnapshotWorker(db, FakeSnapshotWorker.FailedWithDiagnostics("SDK 10.0.300 is not installed"));
+            var off = await EnsureAsync(overrideEnabled: false, strictWorker);
+            Assert.AreEqual(SnapshotJobStatus.Failed, off.Status);
+
+            // On: a NEW identity, so the failed job is not reused; the worker runs and the commit publishes.
+            var overridingWorker = new FakeSnapshotWorker(db);
+            var on = await EnsureAsync(overrideEnabled: true, overridingWorker);
+            Assert.AreNotEqual(off.IdentityHash, on.IdentityHash);
+            Assert.IsFalse(on.Attached, "a job produced under the other policy is never attached to");
+            Assert.AreEqual(SnapshotJobStatus.Complete, on.Status, on.Reason);
+            Assert.AreEqual(1, overridingWorker.Calls);
+            Assert.AreEqual(ServiceTestFixtures.Request().ToIdentity().Hash, on.IdentityHash,
+                "the default policy's identity is byte-identical to the pre-#113 identity");
+
+            // Each policy is deterministic: re-ensuring under either attaches to that policy's own job.
+            var onAgain = await EnsureAsync(overrideEnabled: true, overridingWorker);
+            Assert.IsTrue(onAgain.Attached);
+            Assert.AreEqual(on.SnapshotId, onAgain.SnapshotId);
+            Assert.AreEqual(1, overridingWorker.Calls, "no rebuild under an unchanged policy");
+            var offAgain = await EnsureAsync(overrideEnabled: false, strictWorker);
+            Assert.AreEqual(off.IdentityHash, offAgain.IdentityHash);
+            Assert.AreEqual(off.JobId, offAgain.JobId);
+            Assert.AreEqual(1, strictWorker.Calls);
+        }
+        finally
+        {
+            service?.Dispose();
+            SqliteTestDatabase.Delete(dbPath, db);
+        }
+    }
+
+    [TestMethod]
+    public async Task OverrideOffNode_PublishesUnderTheStrictIdentity_AndItValidates()
+    {
+        // The worker on an override-disabled node publishes under the strict component; the service's request
+        // identity carries the same component, so its published-identity validation accepts the result.
+        var dbPath = ServiceTestFixtures.NewDbPath();
+        var db = new IndexDatabase(dbPath);
+        db.RunMigrations();
+        var worker = new FakeSnapshotWorker(db, (self, request) => SnapshotWorkResult.Complete(
+            ServiceTestFixtures.PublishComplete(self.Database, request, sdkPinPolicy: SdkPinOptions.StrictIdentityComponent)));
+        var service = SnapshotService.Start(
+            ServiceTestFixtures.NewOptions(dbPath) with { SdkPinOverride = false }, worker, db);
+        try
+        {
+            var result = await service.EnsureSnapshotAsync(ServiceTestFixtures.Request());
+
+            Assert.AreEqual(SnapshotJobStatus.Complete, result.Status, result.Reason);
+            Assert.AreEqual(
+                ServiceTestFixtures.Request().ToIdentity(sdkPinPolicy: SdkPinOptions.StrictIdentityComponent).Hash,
+                result.IdentityHash);
+        }
+        finally
+        {
+            service.Dispose();
+            SqliteTestDatabase.Delete(dbPath, db);
+        }
+    }
 }

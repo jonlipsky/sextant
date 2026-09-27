@@ -281,6 +281,8 @@ public sealed class IndexOrchestrator
                     // unchanged), set by the routing service so a snapshot built under one capability set
                     // is never silently reused under an incompatible one.
                     CapabilityFingerprint = effectiveCtx.CapabilityFingerprint,
+                    // Issue #113: the service's non-default SDK-pin policy (null locally / by default).
+                    SdkPinPolicy = effectiveCtx.SdkPinPolicy,
                     // A full index is never an overlay; for a dirty fallback this keeps its identity
                     // distinct from an overlay of the same dirty tree (issue #47). Ignored when the tree
                     // is clean (delta null → discriminator not folded).
@@ -341,7 +343,9 @@ public sealed class IndexOrchestrator
                         // An overlay is distinct from a full-local fallback for the same dirty tree (#47).
                         IsOverlay = true,
                         // Phase-15 worker-capability fingerprint (null in local/single-node runs).
-                        CapabilityFingerprint = effectiveCtx.CapabilityFingerprint
+                        CapabilityFingerprint = effectiveCtx.CapabilityFingerprint,
+                        // Issue #113 SDK-pin policy (null on every local run).
+                        SdkPinPolicy = effectiveCtx.SdkPinPolicy
                     };
                     var (overlayId, overlayExisted, overlayStatus) = snapshotStore.BeginPending(
                         overlayIdentity, repositoryId.Value, commitId, runScope.RunId, now,
@@ -447,7 +451,10 @@ public sealed class IndexOrchestrator
                 WorkingTreeDelta = sub.IsDirty ? "submodule-dirty" : null,
                 IsOverlay = false,
                 // Phase-15 worker-capability fingerprint (null in local/single-node runs).
-                CapabilityFingerprint = effectiveCtx.CapabilityFingerprint
+                CapabilityFingerprint = effectiveCtx.CapabilityFingerprint,
+                // Issue #113: a submodule's projects load in the SAME MSBuild load, under the same SDK-pin
+                // policy, so a provider built with the override disabled is never reused once it is enabled.
+                SdkPinPolicy = effectiveCtx.SdkPinPolicy
             };
             var (provId, provExisted, provStatus) = snapshotStore.BeginPending(
                 providerIdentity, providerRepoId, providerCommitId, runScope.RunId, now, isProvider: true);
