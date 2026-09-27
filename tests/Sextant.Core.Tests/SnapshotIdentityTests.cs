@@ -84,4 +84,25 @@ public class SnapshotIdentityTests
         Assert.AreNotEqual(linuxBuilt.Hash, windowsBuilt.Hash,
             "snapshots built under different worker capabilities must not share an identity");
     }
+
+    [TestMethod]
+    public void SdkPinPolicy_FoldedOnlyWhenSet_DefaultIdentityUnchanged()
+    {
+        // Issue #113: the default (override-on) policy and every local run leave the component null, so their
+        // identity is byte-identical to before it existed. The pre-image below is the pre-#113 one, verbatim.
+        var identity = Identity(delta: null, isOverlay: false) with { CapabilityFingerprint = "cap-linux" };
+        const string preSdkPinPreImage =
+            "v=1;repo=https://github.com/org/repo;commit=commit_abc;tree=tree_abc;schema=14;analyzer=1;config=cfg;" +
+            "toolchain=tc;delta=;capability=cap-linux";
+        var expected = Convert.ToHexStringLower(
+            System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(preSdkPinPreImage)));
+
+        Assert.AreEqual(expected, identity.Hash, "a null SDK-pin policy must not perturb the identity");
+        Assert.AreEqual(expected, (identity with { SdkPinPolicy = null }).Hash);
+
+        var strict = identity with { SdkPinPolicy = "strict" };
+        Assert.AreNotEqual(identity.Hash, strict.Hash,
+            "a snapshot built with the override disabled must never share an identity with an override-on one");
+        Assert.AreEqual(strict.Hash, (identity with { SdkPinPolicy = "strict" }).Hash, "deterministic");
+    }
 }

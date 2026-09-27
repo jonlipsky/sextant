@@ -19,6 +19,22 @@ public sealed record SdkPinOptions
     public bool OverrideEnabled { get; init; } = true;
 
     /// <summary>
+    /// The <see cref="Sextant.Core.SnapshotIdentity.SdkPinPolicy"/> component for a node whose override is
+    /// disabled. Such a node publishes something different for a pinned commit (partial or failed rather than
+    /// complete), so its snapshots must never share an identity with a default override-on node's.
+    /// </summary>
+    public const string StrictIdentityComponent = "strict";
+
+    /// <summary>
+    /// The snapshot-identity component for this policy: null for the default (override on, so the identity
+    /// stays byte-identical to before issue #113), else <see cref="StrictIdentityComponent"/>. The service's
+    /// request identity (<see cref="ServiceOptions.SdkPinIdentityComponent"/>) and the worker's published
+    /// identity (<see cref="SdkPinGuard.IdentityComponent"/>) both derive from this one function, so the two
+    /// cannot disagree for the same setting.
+    /// </summary>
+    public static string? IdentityComponentFor(bool overrideEnabled) => overrideEnabled ? null : StrictIdentityComponent;
+
+    /// <summary>
     /// Where restore journals are written. Must be outside every checkout working tree, and its PARENT must
     /// contain the checkouts (recovery only replays a journal laid out that way; <see cref="SdkPinGuard.Apply"/>
     /// refuses to override otherwise). Null derives <c>&lt;parent of the checkout&gt;/.sextant-sdk-pin</c> — for
@@ -145,6 +161,14 @@ public sealed class SdkPinGuard
     }
 
     public SdkPinOptions Options => _options;
+
+    /// <summary>
+    /// The <see cref="Sextant.Core.SnapshotIdentity.SdkPinPolicy"/> component that snapshots loaded through this
+    /// guard are published under (issue #113): null by default, <see cref="SdkPinOptions.StrictIdentityComponent"/>
+    /// when the override is disabled. It is taken from the SAME toggle that governs <see cref="Apply"/>, so the
+    /// identity always states how the snapshot was actually built.
+    /// </summary>
+    public string? IdentityComponent => SdkPinOptions.IdentityComponentFor(_options.OverrideEnabled);
 
     /// <summary>The SDK versions installed on this worker, newest first (empty when unknown). Never throws.</summary>
     public IReadOnlyList<string> ListInstalledSdks() => SafeListInstalled();

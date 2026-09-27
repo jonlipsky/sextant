@@ -19,7 +19,10 @@ namespace Sextant.Store;
 /// never match a real service base; a same-platform peer's base is addressable, a different-capability base
 /// falls through to full-local). The schema/analyzer/config/toolchain are taken from the overlay ROW (their
 /// build-time values), which equal the running binary's values at build time, so the reconstructed hash is
-/// byte-identical to the one the reconciler probed and the peer published.
+/// byte-identical to the one the reconciler probed and a DEFAULT-policy peer published. Like the reconciler,
+/// it leaves <see cref="SnapshotIdentity.SdkPinPolicy"/> null (issue #113): a peer running with the SDK-pin
+/// override OFF publishes under <c>sdkpin=strict</c>, so its bases are intentionally not addressable here
+/// and the overlay falls back to a full-local build.
 /// </para>
 /// </summary>
 public static class BaseSnapshotIdentity
