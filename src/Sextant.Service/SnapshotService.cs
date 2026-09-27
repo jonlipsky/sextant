@@ -587,14 +587,17 @@ public sealed class SnapshotService : IDisposable
             if (attempts < _options.MaxProvisioningAttempts)
             {
                 jobs.ReplaceDiagnostics(
-                    jobId, [ProvisioningDiagnostic(jobId, "provisioning_transient", ex.Message)]);
+                    jobId, [ProvisioningDiagnostic(jobId, ex.DiagnosticCode ?? "provisioning_transient", ex.Message)]);
                 jobs.Requeue(jobId);
                 return Produced(jobs.GetJob(jobId)!);
             }
             var exhausted = $"provisioning failed after {attempts} attempt(s): {ex.Message}";
             jobs.MarkResult(jobId, SnapshotJobStatus.Failed, null, exhausted);
-            jobs.ReplaceDiagnostics(
-                jobId, [ProvisioningDiagnostic(jobId, "provisioning_attempts_exhausted", exhausted)]);
+            SnapshotJobDiagnostic[] exhaustedDiagnostics = ex.DiagnosticCode is { } code
+                ? [ProvisioningDiagnostic(jobId, code, ex.Message),
+                   ProvisioningDiagnostic(jobId, "provisioning_attempts_exhausted", exhausted)]
+                : [ProvisioningDiagnostic(jobId, "provisioning_attempts_exhausted", exhausted)];
+            jobs.ReplaceDiagnostics(jobId, exhaustedDiagnostics);
             return Produced(jobs.GetJob(jobId)!);
         }
         catch (Exception ex) when (!LeaseLost)
@@ -1569,7 +1572,8 @@ public sealed class SnapshotService : IDisposable
     // durable before any caller observes the result, even one that already disconnected (issue #148).
     private void RecordEnsureAuditLocked(EnsureSnapshotRequest request, EnsureSnapshotResult result, string? principal)
     {
-        var job = new SnapshotJobStore(_conn).GetJob(result.JobId);
+        var jobs = new SnapshotJobStore(_conn);
+        var job = jobs.GetJob(result.JobId);
         long? costMs = !result.Attached && job is { StartedAt: long s, CompletedAt: long c } && c >= s
             ? c - s
             : null;
@@ -1578,8 +1582,23 @@ public sealed class SnapshotService : IDisposable
             MapOutcome(result.Status),
             actor: AuditLogStore.HashActor(principal),
             repositoryScope: request.RepositoryRemoteUrl,
-            detail: $"job_{result.JobId}",
+            detail: $"job_{result.JobId}{SdkPinAuditSuffix(jobs.GetDiagnostics(result.JobId))}",
             costIndexMs: costMs);
+    }
+
+    // Issue #113: the audit row flags a job whose snapshot was built with a substituted SDK (or that failed
+    // SDK resolution / could not restore a neutralized global.json), e.g. "job_42;sdk_pin_overridden", so the
+    // audit trail — not just the job's diagnostics — shows it. Empty for every other job (detail unchanged).
+    internal static string SdkPinAuditSuffix(IReadOnlyList<SnapshotJobDiagnostic> diagnostics)
+    {
+        string[] flagged =
+        [
+            LocalIndexerSnapshotWorker.SdkPinOverriddenCode,
+            LocalIndexerSnapshotWorker.SdkResolutionFailedCode,
+            LocalIndexerSnapshotWorker.SdkPinRestoreFailedCode
+        ];
+        var present = flagged.Where(code => diagnostics.Any(d => string.Equals(d.Code, code, StringComparison.Ordinal)));
+        return string.Concat(present.Select(code => ";" + code));
     }
 
     // Maps a job status to an audit outcome. Non-terminal (queued/running) is recorded as accepted;

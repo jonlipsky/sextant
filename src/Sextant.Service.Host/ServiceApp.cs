@@ -241,8 +241,9 @@ public static class ServiceApp
             }
             // A non-terminal result is 202 Accepted so the orchestrator polls /status rather than treating it
             // as a settled 200 outcome: either the ensure ran but the identity was requeued for a later
-            // re-attempt (a TRANSIENT provisioning failure bounded by the attempt cap), or `wait=false` returned
-            // while production is still queued/running.
+            // re-attempt (a TRANSIENT provisioning failure bounded by the attempt cap; nothing re-runs it in the
+            // background, so the next attempt is the orchestrator's next ensure for the same commit), or
+            // `wait=false` returned while production is still queued/running.
             var statusCode = SnapshotJobStatus.IsTerminal(result.Status)
                 ? StatusCodes.Status200OK
                 : StatusCodes.Status202Accepted;

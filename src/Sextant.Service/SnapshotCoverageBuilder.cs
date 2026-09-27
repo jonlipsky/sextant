@@ -46,7 +46,8 @@ public static class SnapshotCoverageBuilder
     public sealed record Result(SnapshotCoverage Coverage, IReadOnlyList<ProjectOutcome> Diagnostics);
 
     public static Result Build(
-        string checkoutDir, CheckoutResolution resolution, MultiSolutionLoadResult load, Inventory inventory)
+        string checkoutDir, CheckoutResolution resolution, MultiSolutionLoadResult load, Inventory inventory,
+        IReadOnlyList<SdkPinOverride>? sdkPinOverrides = null)
     {
         var comparer = CheckoutInventory.PathComparer;
         var reasons = new List<string>();
@@ -95,17 +96,44 @@ public static class SnapshotCoverageBuilder
 
         if (load.SkippedProjects.Count > 0)
         {
-            // Name a bounded sample so the record (surfaced in MCP meta) stays compact; the full list with
-            // each project's load failure is in the `project_skipped` job diagnostics.
-            var sample = load.SkippedProjects
-                .Take(MaxNamedInReason)
-                .Select(s => ReasonPath(checkoutDir, s.ProjectPath));
-            var more = load.SkippedProjects.Count > MaxNamedInReason
-                ? $", +{load.SkippedProjects.Count - MaxNamedInReason} more"
-                : string.Empty;
-            reasons.Add(
-                $"{load.SkippedProjects.Count} declared project(s) could not be loaded on this worker " +
-                $"({string.Join(", ", sample)}{more}); see the `project_skipped` diagnostics for each reason.");
+            // A project skipped because hostfxr could not resolve the SDK its global.json pins (issue #113) is
+            // named as such, with the pin, so the operator sees the actionable cause rather than a generic skip
+            // (its per-project detail is an `sdk_resolution_failed` diagnostic).
+            var sdkSkips = load.SkippedProjects
+                .Select(s => (Skip: s, Ok: HostFxrSdkResolutionError.TryParse(s.Reason, out var e), Error: e))
+                .Where(x => x.Ok)
+                .ToList();
+            var otherSkips = load.SkippedProjects
+                .Where(s => !HostFxrSdkResolutionError.TryParse(s.Reason, out _))
+                .ToList();
+            if (otherSkips.Count > 0)
+            {
+                // Name a bounded sample so the record (surfaced in MCP meta) stays compact; the full list with
+                // each project's load failure is in the `project_skipped` job diagnostics.
+                var sample = otherSkips
+                    .Take(MaxNamedInReason)
+                    .Select(s => ReasonPath(checkoutDir, s.ProjectPath));
+                var more = otherSkips.Count > MaxNamedInReason
+                    ? $", +{otherSkips.Count - MaxNamedInReason} more"
+                    : string.Empty;
+                reasons.Add(
+                    $"{otherSkips.Count} declared project(s) could not be loaded on this worker " +
+                    $"({string.Join(", ", sample)}{more}); see the `project_skipped` diagnostics for each reason.");
+            }
+            if (sdkSkips.Count > 0)
+            {
+                var pins = sdkSkips
+                    .Where(x => x.Error!.IsGlobalJsonPin)
+                    .Select(x => DescribePin(checkoutDir, x.Error!))
+                    .Distinct(StringComparer.Ordinal)
+                    .ToList();
+                reasons.Add(pins.Count > 0
+                    ? $"{sdkSkips.Count} declared project(s) could not be loaded because the .NET SDK their " +
+                      $"global.json pins is not installed on this worker ({string.Join("; ", pins.Take(10))}" +
+                      $"{(pins.Count > 10 ? "; …" : string.Empty)})."
+                    : $"{sdkSkips.Count} declared project(s) could not be loaded because no compatible .NET SDK " +
+                      "could be resolved on this worker.");
+            }
         }
 
         if (emptySolutions > 0)
@@ -199,10 +227,21 @@ public static class SnapshotCoverageBuilder
             ProjectFilesUnreferenced = unreferenced.Count,
             SubmodulesDeclared = inventory.Submodules.Count,
             SubmodulesUnpopulated = unpopulated.Count,
-            ScanErrors = scanErrors.Count
+            ScanErrors = scanErrors.Count,
+            SdkPinOverrides = sdkPinOverrides is { Count: > 0 } ? sdkPinOverrides : null
         };
 
         return new Result(coverage, diagnostics);
+    }
+
+    /// <summary>
+    /// "'&lt;repo-relative global.json&gt;' requests SDK &lt;version&gt;" for a classified hostfxr failure —
+    /// checkout-relative so the job ledger never records the worker's volume layout.
+    /// </summary>
+    internal static string DescribePin(string checkoutDir, HostFxrSdkResolutionError error)
+    {
+        var path = error.GlobalJsonPath is { } p ? RepoRelative(checkoutDir, p) : "global.json";
+        return error.RequestedVersion is { } v ? $"'{path}' requests SDK {v}" : $"'{path}'";
     }
 
     /// <summary>

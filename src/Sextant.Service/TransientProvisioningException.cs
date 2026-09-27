@@ -16,6 +16,16 @@ namespace Sextant.Service;
 /// The message MUST already be token-redacted and URL-sanitized by the thrower: raw git stderr can echo the
 /// authenticated fetch URL, and this message is persisted as a job diagnostic.
 /// </para>
+/// <para>
+/// <paramref name="diagnosticCode"/> optionally types the persisted diagnostic (default
+/// <c>provisioning_transient</c>) — e.g. <c>sdk_pin_restore_failed</c> when the checkout could not be returned
+/// to its committed state (issue #113), a checkout-state problem an operator repair resolves, never a property
+/// of the commit that should poison its identity.
+/// </para>
 /// </summary>
-public sealed class TransientProvisioningException(string message, Exception? innerException = null)
-    : Exception(message, innerException);
+public sealed class TransientProvisioningException(string message, Exception? innerException = null, string? diagnosticCode = null)
+    : Exception(message, innerException)
+{
+    /// <summary>The persisted diagnostic's code, or null for the generic <c>provisioning_transient</c>.</summary>
+    public string? DiagnosticCode { get; } = diagnosticCode;
+}
