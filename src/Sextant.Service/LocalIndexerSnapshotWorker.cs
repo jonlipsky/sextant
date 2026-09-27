@@ -223,8 +223,7 @@ public sealed class LocalIndexerSnapshotWorker(
         }
 
         var context = CreateSnapshotContext(request, capability);
-        SdkPinOverlay? pinOverlay = null;
-        var loadCompleted = false;
+        var pinState = new SdkPinLoadState();
 
         // The untrusted region: loading the solution EVALUATES its MSBuild projects (arbitrary imported
         // targets / SDK resolvers / inline tasks), so — private repo or not — it runs under the evaluation
@@ -236,7 +235,8 @@ public sealed class LocalIndexerSnapshotWorker(
             // this worker lacks) would fail the BuildHost before any project evaluates. Neutralize ONLY such
             // pins for the load, and put the committed bytes back before anything else reads the checkout —
             // coverage scan, EvaluationFingerprint, indexing — so the published checkout never diverges.
-            pinOverlay = _sdkPinGuard.Apply(checkoutDir, resolution.SelectedSolutions);
+            var pinOverlay = _sdkPinGuard.Apply(checkoutDir, resolution.SelectedSolutions);
+            pinState.Overlay = pinOverlay;
             MultiSolutionLoadResult load;
             try
             {
@@ -251,7 +251,7 @@ public sealed class LocalIndexerSnapshotWorker(
             {
                 pinOverlay.Restore();
             }
-            loadCompleted = true;
+            pinState.LoadCompleted = true;
 
             if (pinOverlay.RestoreError is { } restoreError)
                 throw SdkPinRestoreFailure(pinOverlay, restoreError);
@@ -314,8 +314,8 @@ public sealed class LocalIndexerSnapshotWorker(
         // A failed restore outranks every other outcome: the checkout no longer matches its commit, so the job
         // must report THAT (the journal is kept so the next job can repair the checkout before reusing it).
         SnapshotWorkResult Fail(string message) =>
-            pinOverlay?.RestoreError is { } restoreError
-                ? throw SdkPinRestoreFailure(pinOverlay, restoreError)
+            pinState.Overlay is { RestoreError: { } restoreError } failedOverlay
+                ? throw SdkPinRestoreFailure(failedOverlay, restoreError)
                 : SnapshotWorkResult.Failed(message);
 
         try
@@ -340,25 +340,25 @@ public sealed class LocalIndexerSnapshotWorker(
             // thrown from inside the evaluation (issue #113).
             throw;
         }
-        catch (OperationCanceledException) when (pinOverlay?.RestoreError is { } restoreError)
+        catch (OperationCanceledException) when (pinState.Overlay is { RestoreError: { } restoreError } failedOverlay)
         {
             // Even a cancelled job must report a checkout it could not put back, typed (it is still requeued).
-            throw SdkPinRestoreFailure(pinOverlay, restoreError);
+            throw SdkPinRestoreFailure(failedOverlay, restoreError);
         }
         catch (OperationCanceledException)
         {
             throw;
         }
-        catch (Exception ex) when (pinOverlay?.RestoreError is null
+        catch (Exception ex) when (pinState.Overlay?.RestoreError is null
                                    && HostFxrSdkResolutionError.TryClassify(ex, out var sdkError))
         {
             // Issue #113 fallback: the whole load died on hostfxr SDK resolution (a pin the service could not
             // or was not allowed to override). Fail with a TYPED, actionable diagnostic — never a bare message.
-            var pins = pinOverlay?.Findings ?? [];
+            var pins = pinState.Overlay?.Findings ?? [];
             return SdkResolutionFailed(checkoutDir, sdkError, pins, InstalledSdks(pins, sdkError));
         }
-        catch (Exception ex) when (!loadCompleted
-                                   && pinOverlay is { RestoreError: null } overlay
+        catch (Exception ex) when (!pinState.LoadCompleted
+                                   && pinState.Overlay is { RestoreError: null } overlay
                                    && overlay.Findings.FirstOrDefault(f => !f.OverrideApplied) is { } unresolved)
         {
             // The load died with an error that does not itself name hostfxr (e.g. every project came back as an
@@ -377,6 +377,15 @@ public sealed class LocalIndexerSnapshotWorker(
         {
             return Fail(ex.Message);
         }
+    }
+
+    // What the evaluation (possibly running inside the sandbox) shares with the catch handlers around it: the
+    // SDK-pin overlay once applied, and whether the load finished. A holder rather than captured locals, so the
+    // handlers read the evaluation's writes.
+    private sealed class SdkPinLoadState
+    {
+        public SdkPinOverlay? Overlay { get; set; }
+        public bool LoadCompleted { get; set; }
     }
 
     /// <summary>The installed SDKs to report: from the pin findings when known, else a fresh probe.</summary>
