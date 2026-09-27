@@ -345,8 +345,9 @@ cost a full copy per job and break checkout-relative paths. So the service handl
 3. **Crash-safe.** Before any file is modified, the original bytes and the checkout's `HEAD` commit are
    journaled atomically (fsynced, with the rename and a newly created journal directory flushed on Unix) to
    `<checkout-root>/.sextant-sdk-pin/<checkout>-<hash>.json`, outside every working tree. For a pin inside a
-   populated submodule (issue #171) the entry also records the submodule's work tree and the commit it was
-   checked out at, and the journal is written as version `2`: a binary from before #171 cannot read it, so
+   populated submodule (issue #171) the entry also records the submodule's work tree, the commit it was
+   checked out at and the git directory its `.git` resolved to, and the journal is written as version `2`: a
+   binary from before #171 cannot read it, so
    it fails closed instead of replaying it without the submodule check (a journal with no submodule entry
    stays version `1`). Nothing is ever written under `.git` or `.git/modules`. Each rewrite goes
    through a uniquely named sibling temp file created exclusively, so no repository file (whatever its
@@ -364,18 +365,22 @@ cost a full copy per job and break checkout-relative paths. So the service handl
      anything** in the checkout — even a file whose bytes happen to equal the neutralized form, or one at
      the journaled temp-file path, belongs to the new commit. If the
      journaled commit can no longer be confirmed (the checkout's `HEAD` is unreadable), it fails closed;
-   - a submodule entry is restored only while that submodule is **still at its journaled commit**. A
+   - a submodule entry is restored only while that submodule is **still at its journaled commit**, is still
+     the innermost submodule containing the file, and still resolves to the same git directory. A
      submodule that has moved to another commit, or is no longer populated and its `global.json` is gone,
      holds nothing of the neutralized tree: its entry is retired without writing anything, and the
      checkout's other entries are still restored. A submodule whose commit cannot be confirmed (its `HEAD` is
-     unreadable, or its `.git` is gone while the `global.json` remains) fails closed like the checkout's own
-     unreadable `HEAD`: nothing is written, the journal is kept and the checkout is not indexed;
+     unreadable, its `.git` now points at another git directory or outside the checkout's own git
+     metadata, or its `.git` is gone while the `global.json` remains) fails closed like the checkout's own
+     unreadable `HEAD`: nothing is written, the journal is kept and the checkout is not indexed. So does a
+     checkout-owned entry whose `global.json` now lies inside a populated submodule;
    - a journal is replayed only when it is well formed and confined: it must be the journal of the checkout
      it names, that checkout must be on the checkout volume (the journal directory's parent), and it must
      list at least one entry, each a distinct `global.json` inside it (never under `.git`) whose journaled
      bytes match their checksum and whose recorded commit, timestamp and mode are valid. A submodule entry
-     must name both an absolute work tree inside the checkout that contains its `global.json` and a commit
-     id, and only a version-`2` journal may carry one. Before a checkout that is still at
+     must name an absolute work tree inside the checkout that contains its `global.json`, a commit id, and
+     an absolute git directory inside the checkout's git metadata; a version-`2` journal must carry at least
+     one submodule entry, and only a version-`2` journal may. Before a checkout that is still at
      the journaled commit is restored, neither the `global.json`, nor the checkout directory, nor any
      directory between them and the checkout volume may be a symlink/junction (checked for every entry
      before any is written). A moved checkout's links belong to the new commit and never block retiring its
@@ -432,8 +437,12 @@ cost a full copy per job and break checkout-relative paths. So the service handl
      belongs to the **submodule's** repository (from the superproject it is simply untracked), so it is
      verified there, as above, at the submodule's own `HEAD` — but only after every enclosing submodule,
      outermost first, is shown by `git ls-tree` of its parent's verified commit to be a gitlink (mode
-     `160000`) pinned to exactly that `HEAD`. A submodule checked out away from its gitlink, one whose `HEAD`
-     cannot be read, or a nested repository the commit does not record as a submodule is refused (e.g.
+     `160000`) pinned to exactly that `HEAD`. Each submodule's git metadata must be the checkout's own —
+     an embedded `.git` directory or an absorbed git dir under a `.git` directory inside the checkout
+     (`.git/modules/…`), reached through no symlink/junction — so its `HEAD` describes that work tree and no
+     other repository. A submodule checked out away from its gitlink, one whose `HEAD` cannot be read, one
+     whose `.git` points elsewhere (another checkout, outside the checkout) or is a symlink, or a nested
+     repository the commit does not record as a submodule is refused (e.g.
      `the submodule 'libs/sub' is checked out at <sha>, not the commit <gitlink> that <commit> pins for it`);
    - the journal cannot be written, or is laid out so recovery could never replay it: inside the checkout,
      or in a directory whose parent does not contain the checkout (the service always uses
@@ -1005,8 +1014,9 @@ directory. Through a real `SnapshotService` over one shared catalog, a commit en
 (`failed`, or `partial` for the multi-solution repo) is rebuilt with complete coverage under a new identity
 once the override is on, instead of being reused. A re-ensure under the unchanged policy then attaches without
 a rebuild. Per-pin and submodule verification (#171): `SdkPinGuardTests` (one unverifiable pin never
-suppresses another's override; submodule pins verified through every gitlink, journal `version 2`, and
-submodule-entry recovery: restored, moved, unpopulated, unconfirmed, malformed), `GitCheckoutContentVerifierTests`
+suppresses another's override; submodule pins verified through every gitlink, with git metadata confined to
+the checkout's own, journal `version 2`, and submodule-entry recovery: restored, moved, unpopulated,
+unconfirmed, repointed, malformed), `GitCheckoutContentVerifierTests`
 (`GitlinkProblem` and the guard over a real absorbed submodule: both pins overridden, `.git`/`.git/modules`
 byte-identical, both trees clean), and two `SdkPinOverrideIntegrationTests` over a real absorbed submodule under
 the default union: a root pin plus a submodule pin both overridden (`complete`), and a submodule checked out away
