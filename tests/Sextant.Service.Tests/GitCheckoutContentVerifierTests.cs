@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text;
+using System.Text.RegularExpressions;
 using Sextant.Service.SdkPin;
 
 namespace Sextant.Service.Tests;
@@ -78,7 +79,7 @@ public sealed class GitCheckoutContentVerifierTests
     {
         var problem = Verifier.Problem(_checkout, _head, [new CheckoutFileContent(GlobalJson, Encoding.UTF8.GetBytes(SameSizeEdit))]);
 
-        StringAssert.Contains(problem, "the bytes read from 'global.json' are not its committed content");
+        StringAssert.Contains(problem, "the bytes read from 'global.json' are not a checkout of its committed content");
     }
 
     [TestMethod]
@@ -97,20 +98,74 @@ public sealed class GitCheckoutContentVerifierTests
 
         var problem = Verifier.Problem(_checkout, _head, OnDisk(GlobalJson));
 
-        StringAssert.Contains(problem, "the bytes read from 'global.json' are not its committed content");
+        StringAssert.Contains(problem, "the bytes read from 'global.json' are not a checkout of its committed content");
     }
 
     [TestMethod]
     public void AWorkingCopyInTheCheckoutsLineEndings_IsItsCommittedContent()
     {
-        // Committed with LF, checked out by git with CRLF: hashing applies the path's eol conversion, as `git add` would.
+        // Stored with LF, checked out by git with CRLF: the comparison is with git's checkout rendering.
         File.WriteAllText(Path.Combine(_checkout, ".gitattributes"), "*.json text eol=crlf\n");
+        Git(_checkout, "add", ".gitattributes");
+        Git(_checkout, "commit", "--quiet", "-m", "eol");
+        var head = Git(_checkout, "rev-parse", "HEAD").Trim();
         File.Delete(GlobalJson);
         Git(_checkout, "checkout", "--", "global.json");
         CollectionAssert.AreEqual(Encoding.UTF8.GetBytes(Pin.Replace("\n", "\r\n", StringComparison.Ordinal)), File.ReadAllBytes(GlobalJson),
             "precondition: git checked the file out with CRLF");
 
+        Assert.IsNull(Verifier.Problem(_checkout, head, OnDisk(GlobalJson)));
+    }
+
+    [TestMethod]
+    public void ACheckoutMadeBeforeAnEolSettingChanged_IsItsStoredContent()
+    {
+        // The LF file on disk is the blob as stored, although a fresh checkout would now render it with CRLF.
+        Git(_checkout, "config", "core.autocrlf", "true");
+
         Assert.IsNull(Verifier.Problem(_checkout, _head, OnDisk(GlobalJson)));
+    }
+
+    [TestMethod]
+    public void AnEditTheCleanFilterNormalizesAway_IsRefused()
+    {
+        // `ident` collapses "$Id: <anything> $" back to "$Id$" on the way in, so the edit below is invisible to
+        // `git status` and to hashing through the clean filter; only the checkout rendering exposes it.
+        File.WriteAllText(Path.Combine(_checkout, ".gitattributes"), "global.json ident\n");
+        File.WriteAllText(GlobalJson, "{ \"id\": \"$Id$\", \"sdk\": { \"version\": \"10.0.999\", \"rollForward\": \"disable\" } }\n");
+        Git(_checkout, "add", "-A");
+        Git(_checkout, "commit", "--quiet", "-m", "ident");
+        var head = Git(_checkout, "rev-parse", "HEAD").Trim();
+        File.Delete(GlobalJson);
+        Git(_checkout, "checkout", "--", "global.json");
+        var expanded = File.ReadAllText(GlobalJson);
+        var id = Regex.Match(expanded, @"\$Id: ([0-9a-f]+) \$").Groups[1].Value;
+        Assert.AreNotEqual(string.Empty, id, "precondition: git expanded the ident keyword");
+        Assert.IsNull(Verifier.Problem(_checkout, head, OnDisk(GlobalJson)), "the expanded checkout is the committed content");
+
+        File.WriteAllText(GlobalJson, expanded.Replace(id, new string('0', id.Length), StringComparison.Ordinal));
+        Assert.AreEqual(string.Empty, Git(_checkout, "status", "--porcelain", "--untracked-files=no"),
+            "precondition: git status cannot see the edit");
+
+        StringAssert.Contains(Verifier.Problem(_checkout, head, OnDisk(GlobalJson)),
+            "the bytes read from 'global.json' are not a checkout of its committed content");
+    }
+
+    [TestMethod]
+    public void AReplaceRefForTheHeadCommit_IsIgnored()
+    {
+        // HEAD stays at _head, but a local refs/replace entry swaps in a commit whose tree matches the edited
+        // index and worktree. git must still judge the file against _head's own tree.
+        File.WriteAllText(GlobalJson, SameSizeEdit);
+        Git(_checkout, "add", "global.json");
+        Git(_checkout, "commit", "--quiet", "-m", "edited");
+        var edited = Git(_checkout, "rev-parse", "HEAD").Trim();
+        Git(_checkout, "reset", "--soft", _head);
+        Git(_checkout, "replace", _head, edited);
+        Assert.AreEqual(string.Empty, Git(_checkout, "status", "--porcelain", "--untracked-files=no"),
+            "precondition: with the replace ref honored, git status sees no change");
+
+        Assert.IsNotNull(Verifier.Problem(_checkout, _head, OnDisk(GlobalJson)));
     }
 
     [TestMethod]
@@ -243,6 +298,8 @@ public sealed class GitCheckoutContentVerifierTests
         {
             Assert.Inconclusive($"git is not available: {ex.Message}");
         }
+        // The verifier sees the repository's configuration, so pin it rather than inherit the machine's.
+        Git(dir, "config", "core.autocrlf", "false");
         Git(dir, "add", "-A");
         Git(dir, "commit", "--quiet", "-m", "fixture");
         return Git(dir, "rev-parse", "HEAD").Trim();
