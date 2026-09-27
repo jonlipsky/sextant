@@ -34,6 +34,15 @@ public sealed record SnapshotContext
     public string? CapabilityFingerprint { get; init; }
 
     /// <summary>
+    /// The service worker's non-default <c>global.json</c> SDK-pin policy (issue #113), or <c>null</c>. When
+    /// set it is folded into <see cref="SnapshotIdentity.SdkPinPolicy"/> of every snapshot this run publishes
+    /// (the repository snapshot and its submodule provider snapshots). That way a snapshot built with the
+    /// override disabled is never reused once it is enabled, nor the other way round. <c>null</c> for the
+    /// default override-on policy and for every local CLI/daemon run, which keeps the identity byte-identical.
+    /// </summary>
+    public string? SdkPinPolicy { get; init; }
+
+    /// <summary>
     /// An OPTIONAL monotonic per-branch head sequence for the SERVICE ensure path (issue #84). When set,
     /// <c>AdvanceBranchToSnapshot</c> advances the branch pointer only when this value is strictly greater
     /// than the sequence already recorded for the branch (forward-only), so an out-of-order/older service

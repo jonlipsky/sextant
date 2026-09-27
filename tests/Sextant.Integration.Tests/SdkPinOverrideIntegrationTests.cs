@@ -363,6 +363,99 @@ public class SdkPinOverrideIntegrationTests
         Assert.AreEqual(string.Empty, Git(_checkout, "status", "--porcelain").Trim());
     }
 
+    [TestMethod]
+    [DataRow(false, DisplayName = "the root pin fails the whole load (failed job)")]
+    [DataRow(true, DisplayName = "one solution's pin is isolated (partial snapshot)")]
+    public async Task FlippingTheOverride_OffThenOn_RebuildsTheCommitUnderANewIdentity_InsteadOfReusingIt(bool multiSolution)
+    {
+        // An already-published snapshot is never rebuilt and a failed job is reused as recorded. So the policy is
+        // part of the identity: after the operator turns the override on, the SAME commit (in the SAME catalog)
+        // is re-indexed with complete coverage instead of reusing what the override-off node produced.
+        string commit;
+        string[] solutions;
+        if (multiSolution)
+        {
+            commit = CreateRepo(
+                ("tools/Tools.slnx", "<Solution>\n  <Project Path=\"Tool/Tool.csproj\" />\n</Solution>\n"),
+                ("tools/Tool/Tool.csproj", ProjectXml),
+                ("tools/Tool/Hammer.cs", "namespace Fixture.Tools;\n\npublic sealed class Hammer\n{\n}\n"),
+                ("tools/global.json", UnsatisfiablePin));
+            solutions = [Path.Combine(_checkout, "App.slnx"), Path.Combine(_checkout, "tools", "Tools.slnx")];
+        }
+        else
+        {
+            commit = CreateRepo(("global.json", UnsatisfiablePin));
+            solutions = [Path.Combine(_checkout, "App.slnx")];
+        }
+        var coverageStore = new SnapshotCoverageStore(_db.GetConnection());
+
+        var off = await EnsureThroughServiceAsync(commit, solutions, overrideEnabled: false);
+
+        if (multiSolution)
+        {
+            Assert.AreEqual(SnapshotJobStatus.Partial, off.Status, $"{off.Reason}\n{string.Join('\n', _log)}");
+            Assert.AreEqual(SnapshotCoverageVerdict.Partial, coverageStore.Get(off.SnapshotId!.Value)!.Verdict);
+        }
+        else
+        {
+            Assert.AreEqual(SnapshotJobStatus.Failed, off.Status, $"{off.Reason}\n{string.Join('\n', _log)}");
+            Assert.IsNull(off.SnapshotId);
+        }
+
+        var on = await EnsureThroughServiceAsync(commit, solutions, overrideEnabled: true);
+
+        Assert.AreNotEqual(off.IdentityHash, on.IdentityHash, "the override policy is part of the snapshot identity");
+        Assert.IsFalse(on.Attached, "the override-off result is not reused");
+        Assert.AreEqual(SnapshotJobStatus.Complete, on.Status, $"{on.Reason}\n{string.Join('\n', _log)}");
+        Assert.AreNotEqual(off.SnapshotId, on.SnapshotId, "a fresh snapshot was built");
+        var coverage = coverageStore.Get(on.SnapshotId!.Value)!;
+        Assert.AreEqual(SnapshotCoverageVerdict.Complete, coverage.Verdict);
+        Assert.AreEqual(multiSolution ? "tools/global.json" : "global.json", coverage.SdkPinOverrides!.Single().GlobalJsonPath);
+        Assert.IsTrue(Scalar(
+            $"SELECT COUNT(*) FROM symbols WHERE fully_qualified_name LIKE '%{(multiSolution ? "Hammer" : "Greeter")}%';") > 0);
+        if (multiSolution)
+            Assert.AreEqual(SnapshotCoverageVerdict.Partial, coverageStore.Get(off.SnapshotId!.Value)!.Verdict,
+                "the override-off snapshot is immutable and keeps its own partial verdict");
+
+        // Under an unchanged policy the published snapshot is reused as usual, with no rebuild.
+        var again = await EnsureThroughServiceAsync(commit, solutions, overrideEnabled: true);
+        Assert.IsTrue(again.Attached);
+        Assert.AreEqual(on.SnapshotId, again.SnapshotId);
+        Assert.AreEqual(string.Empty, Git(_checkout, "status", "--porcelain").Trim());
+    }
+
+    /// <summary>
+    /// One ensure through a real <see cref="SnapshotService"/> over the shared catalog, as a node configured with
+    /// <c>SEXTANT_SERVICE_SDK_PIN_OVERRIDE=<paramref name="overrideEnabled"/></c> would run it. The host wires the
+    /// guard and the service options from that one toggle; each call is a fresh service start, as after an
+    /// operator changes the setting and restarts.
+    /// </summary>
+    private async Task<EnsureSnapshotResult> EnsureThroughServiceAsync(
+        string commit, IReadOnlyList<string> solutions, bool overrideEnabled)
+    {
+        var config = new SextantConfiguration();
+        var resolution = new CheckoutResolution
+        {
+            CheckoutDir = _checkout,
+            SelectedSolutions = solutions,
+            Source = solutions.Count > 1 ? SolutionSelectionSource.Configured : SolutionSelectionSource.DefaultUnion
+        };
+        var guard = new SdkPinGuard(
+            new SdkPinOptions { OverrideEnabled = overrideEnabled, JournalRoot = _journalRoot }, log: _log.Add);
+        var worker = new LocalIndexerSnapshotWorker(
+            _db, config, new FixedCheckoutProvider(resolution), _log.Add, sdkPinGuard: guard);
+        var options = new ServiceOptions
+        {
+            CatalogDbPath = _dbPath,
+            Volumes = ServiceVolumes.Rooted(_root),
+            DefaultConfigHash = IndexProfileDescriptor.FromConfiguration(config).ConfigurationHash,
+            SdkPinOverride = overrideEnabled
+        };
+        using var service = SnapshotService.Start(options, worker, _db);
+        return await service.EnsureSnapshotAsync(
+            new EnsureSnapshotRequest { RepositoryRemoteUrl = RemoteUrl, CommitSha = commit, BranchName = "main" });
+    }
+
     // ---- fixture ------------------------------------------------------------------------------------
 
     /// <summary>
@@ -445,7 +538,9 @@ public class SdkPinOverrideIntegrationTests
         var worker = new LocalIndexerSnapshotWorker(
             _db, config, new FixedCheckoutProvider(resolution), _log.Add, sandbox: sandbox, sdkPinGuard: guard);
         var request = new EnsureSnapshotRequest { RepositoryRemoteUrl = RemoteUrl, CommitSha = commit, BranchName = "main" };
-        var identity = request.ToIdentity(IndexProfileDescriptor.FromConfiguration(config).ConfigurationHash).Hash;
+        // As the service does: the requested identity carries the node's SDK-pin policy (issue #113).
+        var identity = request.ToIdentity(
+            IndexProfileDescriptor.FromConfiguration(config).ConfigurationHash, sdkPinPolicy: guard.IdentityComponent).Hash;
         var result = await worker.ProduceAsync(request, identity, scratch, cancellationToken);
         return (result, identity);
     }
