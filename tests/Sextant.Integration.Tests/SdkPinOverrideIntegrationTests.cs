@@ -424,6 +424,85 @@ public class SdkPinOverrideIntegrationTests
         Assert.AreEqual(string.Empty, Git(_checkout, "status", "--porcelain").Trim());
     }
 
+    [TestMethod]
+    public async Task DefaultUnion_ARootPinAndAPinInsideAPopulatedSubmodule_AreBothOverridden()
+    {
+        // Issue #171: the submodule's global.json belongs to the submodule's repository (from the superproject it
+        // is untracked). It is verified there, at the gitlink, and overridden like the root pin — before #171 its
+        // refusal also refused the root pin, and the whole default-union load failed.
+        var commit = CreateRepoWithSubmodule();
+        var sub = Path.Combine(_checkout, "libs", "sub");
+        var rootPin = Path.Combine(_checkout, "global.json");
+        var subPin = Path.Combine(sub, "global.json");
+        var rootBytes = File.ReadAllBytes(rootPin);
+        var subBytes = File.ReadAllBytes(subPin);
+        var subMtime = File.GetLastWriteTimeUtc(subPin);
+        var selection = SolutionSelector.Select(_checkout, configuredSolutions: null);
+        Assert.AreEqual(2, selection.SolutionPaths.Count, string.Join(", ", selection.SolutionPaths));
+
+        var (result, _) = await ProduceAsync(
+            commit, selection.SolutionPaths, overrideEnabled: true, source: selection.Source);
+
+        Assert.AreEqual(SnapshotJobStatus.Complete, result.Status, $"{result.Error}\n{string.Join('\n', _log)}");
+        CollectionAssert.AreEquivalent(
+            new[] { "global.json", "libs/sub/global.json" },
+            result.Projects.Where(p => p.Code == LocalIndexerSnapshotWorker.SdkPinOverriddenCode).Select(p => p.ProjectPath).ToArray());
+        Assert.IsFalse(result.Projects.Any(p => p.Code == LocalIndexerSnapshotWorker.SdkResolutionFailedCode));
+        var coverage = new SnapshotCoverageStore(_db.GetConnection()).Get(result.SnapshotId!.Value)!;
+        Assert.AreEqual(SnapshotCoverageVerdict.Complete, coverage.Verdict, string.Join("; ", coverage.Reasons));
+        CollectionAssert.AreEquivalent(
+            new[] { "global.json", "libs/sub/global.json" }, coverage.SdkPinOverrides!.Select(p => p.GlobalJsonPath).ToArray());
+        Assert.IsTrue(Scalar("SELECT COUNT(*) FROM symbols WHERE fully_qualified_name LIKE '%Greeter%';") > 0);
+        Assert.IsTrue(Scalar("SELECT COUNT(*) FROM symbols WHERE fully_qualified_name LIKE '%Anvil%';") > 0,
+            "the submodule's projects were indexed with the installed SDK");
+
+        CollectionAssert.AreEqual(rootBytes, File.ReadAllBytes(rootPin));
+        CollectionAssert.AreEqual(subBytes, File.ReadAllBytes(subPin));
+        Assert.AreEqual(subMtime, File.GetLastWriteTimeUtc(subPin));
+        Assert.AreEqual(string.Empty, Git(_checkout, "status", "--porcelain", "--ignore-submodules=none").Trim(),
+            "the superproject matches its commit, and the submodule its gitlink");
+        Assert.AreEqual(string.Empty, Git(sub, "status", "--porcelain").Trim());
+        Assert.AreEqual(0, Directory.Exists(_journalRoot) ? Directory.GetFiles(_journalRoot).Length : 0, "no restore journal is left");
+    }
+
+    [TestMethod]
+    public async Task DefaultUnion_ASubmoduleAwayFromItsGitlink_IsIsolatedAsPartial_WhileTheRootPinIsStillOverridden()
+    {
+        // A submodule not at the commit the superproject pins holds content the snapshot's commit never vouched
+        // for, so its pin is refused — with its OWN reason — and only its projects are lost (#90 isolation).
+        var commit = CreateRepoWithSubmodule();
+        var sub = Path.Combine(_checkout, "libs", "sub");
+        Git(sub, "commit", "--quiet", "--allow-empty", "-m", "drift");
+        var subPin = Path.Combine(sub, "global.json");
+        var subBytes = File.ReadAllBytes(subPin);
+        var subMtime = File.GetLastWriteTimeUtc(subPin);
+        var selection = SolutionSelector.Select(_checkout, configuredSolutions: null);
+
+        var (result, _) = await ProduceAsync(
+            commit, selection.SolutionPaths, overrideEnabled: true, source: selection.Source);
+
+        Assert.AreEqual(SnapshotJobStatus.Partial, result.Status, $"{result.Error}\n{string.Join('\n', _log)}");
+        StringAssert.Contains(result.Error, "'libs/sub/global.json' requests SDK 9.0.999");
+        Assert.AreEqual("global.json",
+            result.Projects.Single(p => p.Code == LocalIndexerSnapshotWorker.SdkPinOverriddenCode).ProjectPath,
+            "the root pin is overridden although the submodule's is refused");
+        var refused = result.Projects.Single(p => p.Code == LocalIndexerSnapshotWorker.SdkResolutionFailedCode
+                                                  && p.ProjectPath == "libs/sub/global.json");
+        Assert.AreEqual(JobDiagnosticSeverity.Warning, refused.Severity);
+        StringAssert.Contains(refused.Message, "the submodule 'libs/sub' is checked out at");
+        Assert.IsFalse(result.Projects.Any(p => p.Code == LocalIndexerSnapshotWorker.SdkResolutionFailedCode
+                                                && p.ProjectPath == "global.json"));
+        Assert.IsTrue(Scalar("SELECT COUNT(*) FROM symbols WHERE fully_qualified_name LIKE '%Greeter%';") > 0,
+            "the root solution indexes with the installed SDK");
+        Assert.AreEqual(0, Scalar("SELECT COUNT(*) FROM symbols WHERE fully_qualified_name LIKE '%Anvil%';"));
+
+        CollectionAssert.AreEqual(subBytes, File.ReadAllBytes(subPin), "the refused pin is never touched");
+        Assert.AreEqual(subMtime, File.GetLastWriteTimeUtc(subPin));
+        Assert.AreEqual(string.Empty, Git(sub, "status", "--porcelain").Trim());
+        Assert.AreEqual(string.Empty, Git(_checkout, "status", "--porcelain", "--ignore-submodules=all").Trim());
+        Assert.AreEqual(0, Directory.Exists(_journalRoot) ? Directory.GetFiles(_journalRoot).Length : 0, "no restore journal is left");
+    }
+
     /// <summary>
     /// One ensure through a real <see cref="SnapshotService"/> over the shared catalog, as a node configured with
     /// <c>SEXTANT_SERVICE_SDK_PIN_OVERRIDE=<paramref name="overrideEnabled"/></c> would run it. The host wires the
@@ -584,6 +663,48 @@ public class SdkPinOverrideIntegrationTests
         var full = Path.Combine(_checkout, relative);
         Directory.CreateDirectory(Path.GetDirectoryName(full)!);
         File.WriteAllText(full, content);
+    }
+
+    // The CreateRepo superproject with a root pin, plus an absorbed submodule at libs/sub (its git dir under
+    // .git/modules, as #125's provisioning leaves it) whose own commit holds Sub.slnx → Anvil and its own
+    // unsatisfiable pin. Returns the superproject's commit, which records the submodule's gitlink.
+    private string CreateRepoWithSubmodule()
+    {
+        var source = Path.Combine(_root, "sub-source");
+        void WriteSource(string relative, string content)
+        {
+            var full = Path.Combine(source, relative);
+            Directory.CreateDirectory(Path.GetDirectoryName(full)!);
+            File.WriteAllText(full, content);
+        }
+        WriteSource("Sub.slnx", "<Solution>\n  <Project Path=\"Anvil/Anvil.csproj\" />\n</Solution>\n");
+        WriteSource("Anvil/Anvil.csproj", ProjectXml);
+        WriteSource("Anvil/Anvil.cs", "namespace Fixture.Sub;\n\npublic sealed class Anvil\n{\n}\n");
+        WriteSource("global.json", UnsatisfiablePin.Replace("10.0.999", "9.0.999", StringComparison.Ordinal));
+        WriteSource(".gitignore", "bin/\nobj/\n");
+
+        _ = CreateRepo(("global.json", UnsatisfiablePin));
+        ConfigureRepo(source, init: true);
+        Git(source, "add", "-A");
+        Git(source, "commit", "--quiet", "-m", "submodule fixture");
+
+        Git(_checkout, "-c", "protocol.file.allow=always", "-c", "core.autocrlf=false",
+            "submodule", "add", "--quiet", source, "libs/sub");
+        var sub = Path.Combine(_checkout, "libs", "sub");
+        ConfigureRepo(sub, init: false);
+        Git(_checkout, "commit", "--quiet", "-m", "add submodule");
+        Assert.IsTrue(File.Exists(Path.Combine(sub, ".git")), "the submodule is absorbed (.git is a gitdir file)");
+        return Git(_checkout, "rev-parse", "HEAD").Trim();
+    }
+
+    private static void ConfigureRepo(string dir, bool init)
+    {
+        if (init)
+            Git(dir, "init", "--quiet", "--initial-branch", "main");
+        Git(dir, "config", "user.email", "test@example.com");
+        Git(dir, "config", "user.name", "Sextant Test");
+        Git(dir, "config", "commit.gpgsign", "false");
+        Git(dir, "config", "core.autocrlf", "false");
     }
 
     private static string Git(string dir, params string[] args)
