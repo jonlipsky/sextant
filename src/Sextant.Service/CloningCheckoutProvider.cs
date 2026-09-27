@@ -200,12 +200,24 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
                 }
             }
 
-            if (!TryProvision(request, root, target, allowReplace))
+            bool provisioned;
+            try
             {
-                // A DETERMINISTIC upgrade failure (e.g. the token no longer reads the repository) must not
-                // make a previously-indexable checkout unusable: keep serving the cached checkout at the SAME
-                // commit — its unpopulated submodules still report the coverage partial. (A transient failure
-                // already threw above and is retried by the service.)
+                provisioned = TryProvision(request, root, target, allowReplace);
+            }
+            catch (TransientProvisioningException) when (upgrade && request.IsFinalProvisioningAttempt)
+            {
+                // The service's LAST attempt to upgrade a cached pre-#125 checkout still failed transiently:
+                // keep serving the cached tree (honestly partial) rather than failing the job terminally.
+                provisioned = false;
+            }
+
+            if (!provisioned)
+            {
+                // A DETERMINISTIC upgrade failure (e.g. the token no longer reads the repository) — or a
+                // transient one on the final attempt — must not make a previously-indexable checkout unusable:
+                // keep serving the cached checkout at the SAME commit — its unpopulated submodules still report
+                // the coverage partial. (An earlier transient failure already threw and is retried.)
                 if (upgrade && _inner.TryResolve(request, out resolution)
                     && CheckoutCommitState(resolution.CheckoutDir, request.CommitSha) == CommitState.Match)
                 {
@@ -299,6 +311,13 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
         // environment-scoped config (an http.<url>.extraheader) — never in the fetch URL/argv, never in
         // `.git/config` — so neither the published checkout nor the process table ever carries it.
         var repositoryAuthority = SubmoduleUrlPolicy.HttpsAuthority(cleanUrl);
+        if (_token is not null && repositoryAuthority is null
+            && cleanUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        {
+            // Never silent: the token can only be scoped to a plain DNS host, so it is NOT sent here and a
+            // private repository will fail authentication — say why rather than look like a bad token.
+            _log?.Invoke($"SEXTANT_SERVICE_CHECKOUT_TOKEN is not sent to '{SanitizeUrlForLog(cleanUrl)}': its host is not a plain DNS host name (e.g. it contains '_', ends with '.', or is an IPv6 literal), so the token cannot be scoped to it; fetching anonymously.");
+        }
         var topEnv = TopLevelEnvironment(_token is not null ? repositoryAuthority : null);
         try
         {
@@ -363,13 +382,14 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
 
             // Recursively populate the declared submodules at their pinned gitlink commits (issue #125). A
             // permanently unfetchable submodule is left unpopulated with a recorded reason (coverage partial);
-            // a transient failure throws and the whole staged clone is discarded + retried.
-            var submodules = ProvisionSubmodules(temp, cleanUrl, repositoryAuthority);
+            // a transient failure throws and the whole staged clone is discarded + retried — except on the
+            // service's final attempt, where it too is left unpopulated with its reason.
+            var submodules = ProvisionSubmodules(temp, cleanUrl, repositoryAuthority, request.IsFinalProvisioningAttempt);
             WriteMarker(temp, submodules);
 
             // Scrub + verify EVERY git dir before publishing to the durable volume: delete every FETCH_HEAD
             // and, when a token is configured, refuse to publish if it appears anywhere (FAIL CLOSED).
-            if (!ScrubAndVerifyGitDirs(temp, submodules, out var finding))
+            if (!ScrubAndVerifyGitDirs(temp, out var finding))
             {
                 _log?.Invoke($"Clone rejected for '{cleanUrl}': a credential or unscrubbable fetch record remained in '{finding}' before publish.");
                 return false;

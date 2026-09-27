@@ -424,7 +424,7 @@ public class SubmoduleProvisioningHelperTests
         File.WriteAllText(Path.Combine(moduleDir, "config"),
             $"[http \"https://github.com/\"]\n\textraheader = AUTHORIZATION: basic {basic}\n");
 
-        Assert.IsFalse(provider.ScrubAndVerifyGitDirs(checkout, [], out var finding),
+        Assert.IsFalse(provider.ScrubAndVerifyGitDirs(checkout, out var finding),
             "a credential anywhere under .git/modules must refuse publish");
         Assert.AreEqual(".git/modules/lib/config", finding);
         Assert.IsFalse(finding!.Contains(token, StringComparison.Ordinal));
@@ -438,18 +438,30 @@ public class SubmoduleProvisioningHelperTests
         const string token = "SENTINEL-TOKEN-4f1c2b";
         var provider = NewProvider(token);
         var checkout = NewStagedCheckout();
-        var embedded = Path.Combine(checkout, "libs", "a", ".git");
+        // The embedded git dir is DISCOVERED by walking the work tree (never rebuilt from recorded outcome
+        // paths, which are display-sanitized/truncated), so even an unrecorded, deeply nested one is scanned.
+        var embedded = Path.Combine(checkout, "libs", "a", "vendor", "deep", ".git");
         Directory.CreateDirectory(embedded);
         File.WriteAllText(Path.Combine(embedded, "HEAD"), "ref: refs/heads/main\n");
         File.WriteAllText(Path.Combine(embedded, "packed-refs"),
             rawToken ? $"# {token}\n" : $"# {Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(token))}\n");
-        var populated = new SubmoduleProvisioningOutcome
-        {
-            Path = "libs/a", Name = "a", Status = SubmoduleProvisioningStatus.Populated
-        };
 
-        Assert.IsFalse(provider.ScrubAndVerifyGitDirs(checkout, [populated], out var finding));
-        Assert.AreEqual("libs/a/.git/packed-refs", finding);
+        Assert.IsFalse(provider.ScrubAndVerifyGitDirs(checkout, out var finding));
+        Assert.AreEqual("libs/a/vendor/deep/.git/packed-refs", finding);
+    }
+
+    [TestMethod]
+    public void ScrubAndVerify_TokenInAGitfile_FailsClosed()
+    {
+        const string token = "SENTINEL-TOKEN-4f1c2b";
+        var provider = NewProvider(token);
+        var checkout = NewStagedCheckout();
+        var sub = Path.Combine(checkout, "libs", "b");
+        Directory.CreateDirectory(sub);
+        File.WriteAllText(Path.Combine(sub, ".git"), $"gitdir: ../../.git/modules/b # {token}\n");
+
+        Assert.IsFalse(provider.ScrubAndVerifyGitDirs(checkout, out var finding));
+        Assert.AreEqual("libs/b/.git", finding);
     }
 
     [TestMethod]
@@ -469,7 +481,7 @@ public class SubmoduleProvisioningHelperTests
         Directory.CreateDirectory(objects);
         File.WriteAllText(Path.Combine(objects, "cdef"), "SENTINEL-TOKEN-4f1c2b");
 
-        Assert.IsTrue(provider.ScrubAndVerifyGitDirs(checkout, [], out var finding), finding);
+        Assert.IsTrue(provider.ScrubAndVerifyGitDirs(checkout, out var finding), finding);
         Assert.IsFalse(File.Exists(top));
         Assert.IsFalse(File.Exists(nested), "a nested submodule git dir's FETCH_HEAD is scrubbed too");
     }

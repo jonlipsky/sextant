@@ -66,18 +66,23 @@ public sealed partial class CloningCheckoutProvider
     {
         public List<SubmoduleProvisioningOutcome> Outcomes { get; } = [];
         public int Visited { get; set; }
+
+        /// <summary>The service's LAST provisioning attempt: degrade a transient submodule failure (see ProvisionLevel).</summary>
+        public bool DegradeTransientFailures { get; init; }
     }
 
     private readonly record struct GitmodulesEntry(string Name, string? Path, string? Url);
 
     /// <summary>
     /// Populates every submodule declared (recursively) by the checkout at <paramref name="checkoutRoot"/>,
-    /// returning one outcome per declared entry in ordinal path order.
+    /// returning one outcome per declared entry in ordinal path order. When
+    /// <paramref name="degradeTransientFailures"/> (the service's final provisioning attempt), a submodule that
+    /// still fails TRANSIENTLY is left unpopulated with its reason rather than failing the whole checkout.
     /// </summary>
     private IReadOnlyList<SubmoduleProvisioningOutcome> ProvisionSubmodules(
-        string checkoutRoot, string topCleanUrl, string? repositoryAuthority)
+        string checkoutRoot, string topCleanUrl, string? repositoryAuthority, bool degradeTransientFailures)
     {
-        var walk = new SubmoduleWalk();
+        var walk = new SubmoduleWalk { DegradeTransientFailures = degradeTransientFailures };
         ProvisionLevel(checkoutRoot, checkoutRoot, topCleanUrl, repositoryAuthority, depth: 1, walk);
         if (walk.Outcomes.Any(o => o.IsPopulated))
             AbsorbGitDirs(checkoutRoot);
@@ -115,7 +120,7 @@ public sealed partial class CloningCheckoutProvider
                 continue;
             }
 
-            var outcome = ProvisionOne(root, repoDir, entry, parentCleanUrl, repositoryAuthority);
+            var outcome = ProvisionOneOrDegrade(root, repoDir, entry, relative, parentCleanUrl, repositoryAuthority, walk);
             walk.Outcomes.Add(outcome);
             if (outcome.IsPopulated)
             {
@@ -206,6 +211,65 @@ public sealed partial class CloningCheckoutProvider
             entries.Add(new GitmodulesEntry(name, path, url));
         }
         return entries;
+    }
+
+    /// <summary>
+    /// <see cref="ProvisionOne"/>, except that on the service's FINAL provisioning attempt a still-transient
+    /// failure (an unreachable host, a persistent 5xx, a timeout) is degraded to an unpopulated
+    /// <see cref="SubmoduleProvisioningStatus.FetchFailed"/> outcome — one unreachable submodule must never make
+    /// the whole repository un-indexable — provided the submodule directory can be reset to empty (else the
+    /// failure stays fatal: a leftover partial tree would be miscounted by the coverage scan).
+    /// </summary>
+    private SubmoduleProvisioningOutcome ProvisionOneOrDegrade(
+        string root, string repoDir, GitmodulesEntry entry, string display, string parentCleanUrl,
+        string? repositoryAuthority, SubmoduleWalk walk)
+    {
+        try
+        {
+            return ProvisionOne(root, repoDir, entry, parentCleanUrl, repositoryAuthority);
+        }
+        catch (TransientProvisioningException ex)
+            when (walk.DegradeTransientFailures && TryResetSubmoduleDirectory(root, repoDir, entry.Path!))
+        {
+            _log?.Invoke($"Submodule '{display}' not populated: the transient failure persisted through the final provisioning attempt.");
+            return Outcome(display, entry, SubmoduleProvisioningStatus.FetchFailed,
+                reason: $"transient failure persisted through the final provisioning attempt: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Empties a failed submodule's directory (it was verified empty before provisioning began, so everything
+    /// in it is ours). True when the directory is now absent or empty; false when it could not be reset or the
+    /// path is not a safe, contained submodule path.
+    /// </summary>
+    private static bool TryResetSubmoduleDirectory(string root, string repoDir, string path)
+    {
+        if (!IsSafeSubmodulePath(path))
+            return false;
+        var subDir = SafeFullPath(repoDir, path);
+        if (subDir is null || !IsContainedIn(repoDir, subDir) || !IsContainedIn(root, subDir)
+            || string.Equals(subDir, repoDir, StringComparison.Ordinal) || TraversesReparsePoint(repoDir, path))
+            return false;
+        if (!Directory.Exists(subDir))
+            return true;
+        try
+        {
+            foreach (var child in Directory.EnumerateFileSystemEntries(subDir).ToList())
+            {
+                if (Directory.Exists(child) && (File.GetAttributes(child) & FileAttributes.ReparsePoint) == 0)
+                    TryDeleteDirectory(child);
+                else
+                {
+                    File.SetAttributes(child, FileAttributes.Normal);
+                    File.Delete(child);
+                }
+            }
+            return !Directory.EnumerateFileSystemEntries(subDir).Any();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
     }
 
     /// <summary>
@@ -568,21 +632,17 @@ public sealed partial class CloningCheckoutProvider
 
     /// <summary>
     /// Before publish: deletes every <c>FETCH_HEAD</c> in every git dir of the staged checkout (the top-level
-    /// <c>.git</c> incl. <c>.git/modules/**</c>, plus any still-embedded submodule git dir) and — when a token
-    /// is configured — scans every remaining non-object file of those git dirs for the token in any form
-    /// (raw, or the base64 Basic credential). Returns false (FAIL CLOSED: never publish) when a record cannot
-    /// be scrubbed or a credential is found; <paramref name="finding"/> names the file, never the secret.
+    /// <c>.git</c> incl. <c>.git/modules/**</c>, plus any still-embedded submodule git dir — DISCOVERED by
+    /// walking the work tree, never reconstructed from recorded display paths) and — when a token is
+    /// configured — scans every remaining non-object file of those git dirs for the token in any form (raw, or
+    /// the base64 Basic credential). Returns false (FAIL CLOSED: never publish) when a record cannot be
+    /// scrubbed or a credential is found; <paramref name="finding"/> names the file, never the secret.
     /// </summary>
-    internal bool ScrubAndVerifyGitDirs(
-        string checkoutDir, IReadOnlyList<SubmoduleProvisioningOutcome> outcomes, out string? finding)
+    internal bool ScrubAndVerifyGitDirs(string checkoutDir, out string? finding)
     {
         finding = null;
-        var gitDirs = new List<string> { Path.Combine(checkoutDir, ".git") };
-        foreach (var outcome in outcomes.Where(o => o.IsPopulated))
-            gitDirs.Add(Path.Combine(checkoutDir, outcome.Path.Replace('/', Path.DirectorySeparatorChar), ".git"));
-
         var needles = CredentialNeedles();
-        foreach (var gitDir in gitDirs)
+        foreach (var gitDir in EnumerateWorkTreeGitDirs(checkoutDir))
         {
             if (File.Exists(gitDir))
             {
@@ -617,6 +677,34 @@ public sealed partial class CloningCheckoutProvider
             }
         }
         return true;
+    }
+
+    /// <summary>
+    /// Every <c>.git</c> entry (a git dir, or a gitfile pointing into <c>.git/modules</c>) in the checkout's
+    /// work tree, starting with the top-level one. Git never tracks a path named <c>.git</c>, so every such
+    /// entry is one we (or git) created. A <c>.git</c> directory is not descended into here (its contents are
+    /// scanned by <see cref="EnumerateGitMetadataFiles"/>, which covers <c>.git/modules/**</c>); reparse points
+    /// are never followed.
+    /// </summary>
+    private static IEnumerable<string> EnumerateWorkTreeGitDirs(string checkoutDir)
+    {
+        var stack = new Stack<string>();
+        stack.Push(checkoutDir);
+        while (stack.Count > 0)
+        {
+            var dir = stack.Pop();
+            var git = Path.Combine(dir, ".git");
+            if (File.Exists(git) || Directory.Exists(git))
+                yield return git;
+            foreach (var sub in Directory.GetDirectories(dir))
+            {
+                if (string.Equals(Path.GetFileName(sub), ".git", StringComparison.Ordinal))
+                    continue;
+                if ((File.GetAttributes(sub) & FileAttributes.ReparsePoint) != 0)
+                    continue;
+                stack.Push(sub);
+            }
+        }
     }
 
     /// <summary>

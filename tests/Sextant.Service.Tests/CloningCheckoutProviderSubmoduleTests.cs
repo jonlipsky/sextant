@@ -297,12 +297,90 @@ public class CloningCheckoutProviderSubmoduleTests
         Assert.IsFalse(File.Exists(Path.Combine(resolution.CheckoutDir, "libs", "abs", ".git")));
     }
 
+    [TestMethod]
+    public void TryResolve_TransientSubmoduleFailure_RetriesUntilTheFinalAttempt_ThenDegradesToPartial()
+    {
+        // A connection-refused endpoint is a TRANSIENT failure (not a recognized permanent git error). Before
+        // the service's last attempt it discards the staged clone and throws (retry); ON the last attempt it
+        // must not make the whole repository un-indexable — the submodule is left unpopulated with a reason.
+        var (_, libUrl, libPinned, _) = NewLibRepo("lib");
+        const string unreachable = "https://127.0.0.1:1/org/down.git";
+        var (_, appUrl, appCommit) = NewRepoWithSubmodules("app",
+            ("good", "libs/good", libUrl, libPinned),
+            ("down", "libs/down", unreachable, libPinned));
+        var paths = NewPaths();
+        var provider = NewProvider(paths, token: Sentinel, submoduleHosts: ["127.0.0.1:1"]);
+        var request = ServiceTestFixtures.Request(appUrl, appCommit);
+
+        var ex = Assert.ThrowsExactly<TransientProvisioningException>(() => provider.TryResolve(request, out _));
+        Assert.IsFalse(ex.Message.Contains(Sentinel, StringComparison.Ordinal));
+        Assert.IsFalse(Directory.Exists(Path.Combine(paths.CheckoutRoot, ServicePaths.RepoDirectoryName(appUrl))),
+            "a non-final transient failure publishes nothing");
+
+        Assert.IsTrue(provider.TryResolve(request with { IsFinalProvisioningAttempt = true }, out var resolution),
+            "the final attempt degrades the transient submodule failure instead of failing the checkout");
+        var down = resolution.SubmoduleProvisioning.Single(o => o.Path == "libs/down");
+        Assert.AreEqual(SubmoduleProvisioningStatus.FetchFailed, down.Status);
+        StringAssert.Contains(down.Reason, "final provisioning attempt");
+        Assert.IsTrue(resolution.SubmoduleProvisioning.Single(o => o.Path == "libs/good").IsPopulated);
+        var downDir = Path.Combine(resolution.CheckoutDir, "libs", "down");
+        Assert.IsFalse(Directory.Exists(downDir) && Directory.EnumerateFileSystemEntries(downDir).Any(),
+            "the degraded submodule is left EMPTY (no partial git dir)");
+        Assert.AreEqual(1, SnapshotCoverageBuilder.Inventory.Scan(resolution.CheckoutDir).Submodules.Count(s => !s.Populated),
+            "coverage reports the degraded submodule unpopulated");
+        foreach (var line in _log)
+            Assert.IsFalse(line.Contains(Sentinel, StringComparison.Ordinal), line);
+    }
+
+    [TestMethod]
+    public void TryResolve_PreChangeCachedCheckout_TransientUpgradeFailure_RetriesThenServesTheCachedTreeOnTheFinalAttempt()
+    {
+        var (_, libUrl, libPinned, _) = NewLibRepo("lib");
+        var (app, _, appCommit) = NewRepoWithSubmodules("app", ("abs", "libs/abs", libUrl, libPinned));
+        // The cached checkout was published for an https remote that is now unreachable (transient).
+        const string appUrl = "https://127.0.0.1:1/org/app.git";
+        var paths = NewPaths();
+        Directory.CreateDirectory(paths.CheckoutRoot);
+        var canonical = Path.Combine(paths.CheckoutRoot, ServicePaths.RepoDirectoryName(appUrl));
+        Git(paths.CheckoutRoot, "clone", "--quiet", "--no-recurse-submodules", new Uri(app).AbsoluteUri, canonical);
+        Git(canonical, "checkout", "--quiet", "--detach", appCommit);
+        var stale = Path.Combine(canonical, "stale.txt");
+        File.WriteAllText(stale, "pre-change");
+        var provider = NewProvider(paths);
+        var request = ServiceTestFixtures.Request(appUrl, appCommit);
+
+        Assert.ThrowsExactly<TransientProvisioningException>(() => provider.TryResolve(request, out _),
+            "before the final attempt a transient upgrade failure is retried");
+        Assert.IsTrue(File.Exists(stale), "the failed upgrade never touched the served tree");
+
+        Assert.IsTrue(provider.TryResolve(request with { IsFinalProvisioningAttempt = true }, out var resolution),
+            "on the final attempt the cached checkout keeps being served");
+        Assert.AreEqual(Path.GetFullPath(canonical), Path.GetFullPath(resolution.CheckoutDir));
+        Assert.IsTrue(File.Exists(stale));
+        Assert.IsTrue(_log.Any(l => l.Contains("reusing it as-is", StringComparison.Ordinal)), string.Join(Environment.NewLine, _log));
+    }
+
+    [TestMethod]
+    public void TryResolve_TokenWithAHostItCannotBeScopedTo_IsNotSent_AndSaysWhy()
+    {
+        var paths = NewPaths();
+        var provider = NewProvider(paths, token: Sentinel);
+        // '_' is legal in many internal host names but not a plain DNS name: the token cannot be host-scoped.
+        var request = ServiceTestFixtures.Request("https://git_internal.invalid/org/app.git", new string('a', 40));
+
+        Assert.ThrowsExactly<TransientProvisioningException>(() => provider.TryResolve(request, out _));
+        Assert.IsTrue(_log.Any(l => l.Contains("is not sent to", StringComparison.Ordinal)),
+            "an unscoped token is never dropped silently: " + string.Join(Environment.NewLine, _log));
+        foreach (var line in _log)
+            Assert.IsFalse(line.Contains(Sentinel, StringComparison.Ordinal), line);
+    }
+
     // ---- fixtures --------------------------------------------------------------------------------
 
     private ServicePaths NewPaths() => new(ServiceVolumes.Rooted(Temp("sextant_subfix_data")));
 
-    private CloningCheckoutProvider NewProvider(ServicePaths paths, string? token = null) =>
-        new(new PersistentVolumeCheckoutProvider(paths), paths, token: token, log: _log.Add)
+    private CloningCheckoutProvider NewProvider(ServicePaths paths, string? token = null, string[]? submoduleHosts = null) =>
+        new(new PersistentVolumeCheckoutProvider(paths), paths, token: token, log: _log.Add, submoduleHosts: submoduleHosts)
         {
             AllowFileTransportForTesting = true
         };
