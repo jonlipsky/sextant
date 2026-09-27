@@ -35,7 +35,10 @@ public sealed class SdkPinGuardTests
         _solution = Path.Combine(_checkout, "Repo.slnx");
         File.WriteAllText(_solution, "<Solution><Project Path=\"src/App/App.csproj\" /></Solution>");
         File.WriteAllText(Path.Combine(_checkout, "src", "App", "App.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\" />");
+        WriteHead(DefaultHead); // the service only overrides a git checkout whose commit it can read
     }
+
+    private const string DefaultHead = "1111111111111111111111111111111111111111";
 
     [TestCleanup]
     public void Cleanup()
@@ -324,6 +327,7 @@ public sealed class SdkPinGuardTests
     {
         var second = Path.Combine(_root, "checkouts", "other");
         Directory.CreateDirectory(second);
+        WriteHead(DefaultHead, second);
         File.Copy(_solution, Path.Combine(second, "Repo.slnx"));
         Directory.CreateDirectory(Path.Combine(second, "src", "App"));
         var originalA = WritePin(GlobalJson);
@@ -457,6 +461,7 @@ public sealed class SdkPinGuardTests
     [DataRow("null-entries")]
     [DataRow("null-entry")]
     [DataRow("corrupt-head")]
+    [DataRow("null-head")]
     [DataRow("null-content")]
     [DataRow("bad-checksum-shape")]
     [DataRow("ticks-too-large")]
@@ -480,6 +485,7 @@ public sealed class SdkPinGuardTests
             case "null-entries": journal["entries"] = null; break;
             case "null-entry": entries[0] = null; break;
             case "corrupt-head": journal["head"] = "corrupt"; break;
+            case "null-head": journal["head"] = null; break;
             case "null-content": entry["original_base64"] = null; break;
             case "bad-checksum-shape": entry["neutralized_sha256"] = "XYZ"; break;
             case "ticks-too-large": entry["last_write_time_utc_ticks"] = long.MaxValue; break;
@@ -644,6 +650,83 @@ public sealed class SdkPinGuardTests
     }
 
     [TestMethod]
+    public void NonGitCheckout_IsNeverOverridden()
+    {
+        // Without a readable commit, recovery could not tell this tree from a re-provisioned one holding the
+        // neutralized bytes, so the pin is reported (typed) instead of being neutralized.
+        Directory.Delete(Path.Combine(_checkout, ".git"), recursive: true);
+        var original = WritePin(GlobalJson);
+
+        var overlay = new SdkPinGuard(probe: new FakeHostFxr()).Apply(_checkout, [_solution]);
+
+        var finding = overlay.Findings.Single();
+        Assert.IsFalse(finding.OverrideApplied);
+        StringAssert.Contains(finding.NotOverriddenReason, "git HEAD commit cannot be read");
+        CollectionAssert.AreEqual(original, File.ReadAllBytes(GlobalJson));
+        Assert.IsFalse(Directory.Exists(JournalDir));
+    }
+
+    [TestMethod]
+    public void Recovery_AtTheSameCommit_OneLinkedEntry_BlocksEveryRestore()
+    {
+        WritePin(GlobalJson);
+        var projectDir = Path.Combine(_checkout, "src", "App");
+        WritePin(Path.Combine(projectDir, "global.json"));
+        var guard = new SdkPinGuard(probe: new FakeHostFxr());
+        _ = guard.Apply(_checkout, [_solution]); // "crash"
+        var neutralizedRoot = File.ReadAllBytes(GlobalJson);
+        using (var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllBytes(guard.JournalPathFor(_checkout))))
+        {
+            var entries = doc.RootElement.GetProperty("entries");
+            Assert.AreEqual(GlobalJson, entries[0].GetProperty("path").GetString(), "precondition: the safe entry is first");
+            Assert.AreEqual(Path.Combine(projectDir, "global.json"), entries[1].GetProperty("path").GetString());
+        }
+
+        var outside = Path.Combine(_root, "outside");
+        Directory.CreateDirectory(outside);
+        Directory.Move(projectDir, projectDir + ".moved");
+        try
+        {
+            Directory.CreateSymbolicLink(projectDir, outside);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            Assert.Inconclusive($"symbolic links cannot be created here: {ex.Message}");
+            return;
+        }
+
+        Assert.IsFalse(new SdkPinGuard(probe: new FakeHostFxr()).Recover(_checkout));
+        CollectionAssert.AreEqual(neutralizedRoot, File.ReadAllBytes(GlobalJson), "no entry is restored before every entry is checked");
+        Assert.AreEqual(0, Directory.GetFileSystemEntries(outside).Length);
+        Assert.AreEqual(1, Directory.GetFiles(JournalDir).Length, "the journal keeps blocking the checkout");
+    }
+
+    [TestMethod]
+    public void Recovery_AtTheSameCommit_ThroughASymlinkedCheckoutDirectory_FailsClosed()
+    {
+        WritePin(GlobalJson);
+        _ = new SdkPinGuard(probe: new FakeHostFxr()).Apply(_checkout, [_solution]); // "crash"
+        var neutralized = File.ReadAllBytes(GlobalJson);
+
+        // The checkout path now reaches the same tree (same HEAD) through a link.
+        var real = _checkout + ".real";
+        Directory.Move(_checkout, real);
+        try
+        {
+            Directory.CreateSymbolicLink(_checkout, real);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            Assert.Inconclusive($"symbolic links cannot be created here: {ex.Message}");
+            return;
+        }
+
+        Assert.IsFalse(new SdkPinGuard(probe: new FakeHostFxr()).Recover(_checkout));
+        CollectionAssert.AreEqual(neutralized, File.ReadAllBytes(Path.Combine(real, "global.json")), "nothing is written through the link");
+        Assert.AreEqual(1, Directory.GetFiles(JournalDir).Length);
+    }
+
+    [TestMethod]
     public void Recovery_WhenTheJournaledHeadCanNoLongerBeRead_FailsClosed()
     {
         WriteHead("1111111111111111111111111111111111111111");
@@ -772,6 +855,7 @@ public sealed class SdkPinGuardTests
     {
         const string a = "1111111111111111111111111111111111111111";
         const string b = "2222222222222222222222222222222222222222";
+        Directory.Delete(Path.Combine(_checkout, ".git"), recursive: true);
         Assert.IsNull(CheckoutHead.TryRead(_checkout), "not a git checkout");
 
         WriteHead(a.ToUpperInvariant());
@@ -797,9 +881,9 @@ public sealed class SdkPinGuardTests
         Assert.AreEqual(b, CheckoutHead.TryRead(worktree));
     }
 
-    private void WriteHead(string sha)
+    private void WriteHead(string sha, string? checkout = null)
     {
-        var gitDir = Path.Combine(_checkout, ".git");
+        var gitDir = Path.Combine(checkout ?? _checkout, ".git");
         Directory.CreateDirectory(gitDir);
         File.WriteAllText(Path.Combine(gitDir, "HEAD"), sha + "\n");
     }

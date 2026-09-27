@@ -94,7 +94,9 @@ public sealed record SdkPinFinding
 /// the neutralized content is restored; the original content needs nothing. A missing or foreign file FAILS
 /// CLOSED (the journal is kept and the checkout is not indexed) unless the checkout's HEAD has moved to
 /// another commit since, or the checkout is gone — then the difference is legitimate and the journal retires.
-/// A journal is only replayed when it is confined to its own checkout on the checkout volume.
+/// A journal is only replayed when it is confined to its own checkout on the checkout volume. The override
+/// is only applied to a checkout whose git HEAD can be read: the journaled commit (not the content) is what
+/// tells the neutralized tree apart from a re-provisioned one.
 /// </para>
 /// <para>
 /// In-place modification is safe because the service runs one worker at a time behind its write gate and
@@ -225,10 +227,15 @@ public sealed class SdkPinGuard
         // Journal FIRST (atomic + fsynced, outside the working tree) so a crash after any file is modified
         // can always be repaired by the next run.
         var journalPath = JournalPathFor(checkout);
-        if (JournalLayoutProblem(checkout, journalPath) is { } layoutProblem)
+        var head = CheckoutHead.TryRead(checkout);
+        var unrecoverable = JournalLayoutProblem(checkout, journalPath)
+            ?? (head is null
+                ? "the checkout's git HEAD commit cannot be read, so recovery could not tell it from a re-provisioned checkout"
+                : null);
+        if (unrecoverable is not null)
         {
             // Recovery would refuse this journal, so a crash could never be repaired: do not modify anything.
-            var reason = $"the SDK-pin restore journal could not be replayed after a crash ({layoutProblem}), so the checkout was not modified";
+            var reason = $"the SDK-pin restore journal could not be replayed safely after a crash ({unrecoverable}), so the checkout was not modified";
             findings.AddRange(candidates.Select(c => c.Finding with { NotOverriddenReason = reason }));
             return new SdkPinOverlay(this, checkout, journalPath: null, [], findings);
         }
@@ -237,7 +244,7 @@ public sealed class SdkPinGuard
             WriteJournal(journalPath, new SdkPinJournal
             {
                 CheckoutDir = checkout,
-                Head = CheckoutHead.TryRead(checkout),
+                Head = head,
                 CreatedUtc = DateTimeOffset.UtcNow,
                 Entries = candidates.Select(c => c.Entry).ToList()
             });
@@ -633,25 +640,24 @@ public sealed class SdkPinGuard
             return true;
         }
 
-        if (journal.Head is not null)
+        // The journaled commit is what proves the tree is still the one whose pin was neutralized (content alone
+        // cannot: a re-provisioned tree may hold the neutralized bytes), so Apply never journals without it.
+        var head = CheckoutHead.TryRead(checkout);
+        if (head is null)
         {
-            var head = CheckoutHead.TryRead(checkout);
-            if (head is null)
-            {
-                _log?.Invoke(
-                    $"sdk-pin: cannot confirm checkout '{checkout}' is still at commit {journal.Head} (its HEAD is unreadable); " +
-                    $"keeping the restore journal '{journalPath}'.");
-                return false;
-            }
-            if (!string.Equals(journal.Head, head, StringComparison.OrdinalIgnoreCase))
-            {
-                // The checkout was re-provisioned at another commit (the cloning provider replaces the whole
-                // tree), so every journaled path — even a temp-file path, or a global.json whose bytes happen to
-                // equal the neutralized form — now belongs to THAT commit. Never write or delete anything in it.
-                _log?.Invoke($"sdk-pin: checkout '{checkout}' moved from {journal.Head} to {head}; retiring its restore journal without touching the checkout.");
-                RetireJournal(journalPath);
-                return true;
-            }
+            _log?.Invoke(
+                $"sdk-pin: cannot confirm checkout '{checkout}' is still at commit {journal.Head} (its HEAD is unreadable); " +
+                $"keeping the restore journal '{journalPath}'.");
+            return false;
+        }
+        if (!string.Equals(journal.Head, head, StringComparison.OrdinalIgnoreCase))
+        {
+            // The checkout was re-provisioned at another commit (the cloning provider replaces the whole
+            // tree), so every journaled path — even a temp-file path, or a global.json whose bytes happen to
+            // equal the neutralized form — now belongs to THAT commit. Never write or delete anything in it.
+            _log?.Invoke($"sdk-pin: checkout '{checkout}' moved from {journal.Head} to {head}; retiring its restore journal without touching the checkout.");
+            RetireJournal(journalPath);
+            return true;
         }
 
         var errors = new List<string>();
@@ -710,7 +716,9 @@ public sealed class SdkPinGuard
             return "it is empty";
         if (journal.Version != SdkPinJournal.CurrentVersion)
             return $"unsupported journal version {journal.Version}";
-        if (journal.Head is not null && !CheckoutHead.IsObjectId(journal.Head))
+        if (journal.Head is null)
+            return "it records no checkout commit";
+        if (!CheckoutHead.IsObjectId(journal.Head))
             return "its recorded HEAD is not a commit id";
         if (string.IsNullOrWhiteSpace(journal.CheckoutDir) || !Path.IsPathFullyQualified(journal.CheckoutDir))
             return "it names no absolute checkout path";
@@ -981,7 +989,10 @@ internal sealed record SdkPinJournal
     public int Version { get; init; } = CurrentVersion;
     public required string CheckoutDir { get; init; }
 
-    /// <summary>The commit the checkout's HEAD pointed at when the pin was neutralized (null when unknown).</summary>
+    /// <summary>
+    /// The commit the checkout's HEAD pointed at when the pin was neutralized. Always written by
+    /// <see cref="SdkPinGuard.Apply"/>; a journal without it is rejected by recovery.
+    /// </summary>
     public string? Head { get; init; }
 
     public DateTimeOffset CreatedUtc { get; init; }
