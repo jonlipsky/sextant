@@ -104,6 +104,15 @@ public sealed record ServiceOptions
     /// <summary>Writer-lease TTL. The service holds a single-writer lease for its lifetime (issue #38).</summary>
     public TimeSpan LeaseTtl { get; init; } = TimeSpan.FromSeconds(30);
 
+    /// <summary>
+    /// How long <see cref="SnapshotService.Dispose"/> waits for in-flight ensures to finish after shutdown
+    /// cancelled their workers (issue #148), so each cancelled job is requeued while the writer lease is
+    /// still held. A worker that ignores cancellation past this bound is abandoned: the writer lease is
+    /// abandoned too (left to expire by its TTL, never released under the straggler), its job stays running,
+    /// and the next service instance's startup reconcile requeues it.
+    /// </summary>
+    public TimeSpan ShutdownDrainTimeout { get; init; } = TimeSpan.FromSeconds(30);
+
     /// <summary>Remote peer base URLs for snapshot federation (issue #51). Empty for a standalone node.</summary>
     public IReadOnlyList<string> Peers { get; init; } = [];
 
