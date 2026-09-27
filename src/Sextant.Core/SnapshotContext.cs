@@ -62,4 +62,16 @@ public sealed record SnapshotContext
     /// identity: coverage is derived from the same commit + configuration the identity already pins.
     /// </summary>
     public SnapshotCoverage? Coverage { get; init; }
+
+    /// <summary>
+    /// The coverage of each Phase-12 PROVIDER subtree the producing worker computed (issue #162), keyed by
+    /// the submodule path relative to the checkout root with <c>/</c> separators (the same form
+    /// <c>git submodule status --recursive</c> reports), or <c>null</c> when the caller computes no coverage
+    /// (the local CLI/daemon path). The orchestrator records the entry for each provider snapshot it
+    /// publishes inside the SAME publish transaction, so a directly-ensured provider reports an honest
+    /// verdict instead of "not recorded". A provider this run publishes whose path has no entry is recorded
+    /// as partial ("not computed"). An already-complete provider that is reused keeps whatever row it has
+    /// (never backfilled). Not part of snapshot identity.
+    /// </summary>
+    public IReadOnlyDictionary<string, SnapshotCoverage>? ProviderCoverage { get; init; }
 }

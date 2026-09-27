@@ -39,6 +39,13 @@ public sealed class IndexOrchestrator
         _gitStateProbe = gitStateProbe ?? GitStateProbe.Default;
     }
 
+    /// <summary>
+    /// Discovers the submodules under a repository root (defaults to <see cref="SubmoduleDiscovery.DiscoverAsync"/>,
+    /// which runs git). Tests substitute a fixed list so the Phase-12 provider path runs over an in-memory
+    /// workspace without a real submodule checkout.
+    /// </summary>
+    internal Func<string, Task<List<SubmoduleInfo>>> SubmoduleDiscoverer { get; init; } = SubmoduleDiscovery.DiscoverAsync;
+
     /// <summary>One non-generated document paired with its project's compilation, the unit of parallel
     /// per-document extraction. The semantic model is built inside the worker so each model is used on
     /// a single thread; the compilation is immutable and safely shared.</summary>
@@ -183,7 +190,7 @@ public sealed class IndexOrchestrator
             repoRoot = GitRemoteResolver.ResolveGitRoot(firstProjectPath);
             if (repoRoot != null)
             {
-                submodules = await SubmoduleDiscovery.DiscoverAsync(repoRoot);
+                submodules = await SubmoduleDiscoverer(repoRoot);
                 if (submodules.Count > 0)
                     _log?.Invoke($"Discovered {submodules.Count} submodule(s)");
             }
@@ -403,6 +410,9 @@ public sealed class IndexOrchestrator
         var providerSnapshotsToPublish = new HashSet<long>();
         var providerProjectInfo = new Dictionary<long, (long snapshotId, long repoId, string commit, bool dirty)>();
         var providerProjectsToLoadIntoCatalog = new List<long>();
+        // Issue #162: the checkout-relative submodule path(s) each provider snapshot was routed from this
+        // run, so its publish can record the worker-computed coverage of THAT provider subtree.
+        var providerSubmodulePaths = new Dictionary<long, SortedSet<string>>();
 
         // Get-or-create the deduplicated provider snapshot for a submodule pin (Phase 12). Reuses an
         // already-complete provider generation (dedup — criterion 1); otherwise stages a fresh pending
@@ -412,9 +422,19 @@ public sealed class IndexOrchestrator
         (long snapshotId, long repoId, bool complete) EnsureProviderSnapshot(SubmoduleInfo sub)
         {
             var pinKey = $"{sub.RemoteUrl}@{sub.CommitSha}{(sub.IsDirty ? "+dirty" : "")}";
-            if (providerSnapshotByPin.TryGetValue(pinKey, out var cached))
-                return cached;
+            if (!providerSnapshotByPin.TryGetValue(pinKey, out var result))
+            {
+                result = StageProviderSnapshot(sub);
+                providerSnapshotByPin[pinKey] = result;
+            }
+            if (!providerSubmodulePaths.TryGetValue(result.snapshotId, out var paths))
+                providerSubmodulePaths[result.snapshotId] = paths = new SortedSet<string>(StringComparer.Ordinal);
+            paths.Add(NormalizeSubmodulePath(sub.Path));
+            return result;
+        }
 
+        (long snapshotId, long repoId, bool complete) StageProviderSnapshot(SubmoduleInfo sub)
+        {
             var providerRepoId = snapshotStore!.EnsureProviderRepository(sub.RemoteUrl, now);
             var providerCommitId = snapshotStore.EnsureCommit(providerRepoId, sub.CommitSha, null, now);
             var providerIdentity = new SnapshotIdentity
@@ -445,11 +465,14 @@ public sealed class IndexOrchestrator
                 // to pending so the guarded pending->complete publish succeeds, and publish it this run.
                 if (provExisted && provStatus != SnapshotStatus.Pending)
                     snapshotStore.MarkStatus(provId, SnapshotStatus.Pending);
+                // Coverage recorded for an earlier generation of this identity describes a build that is
+                // being redone; drop it so this run's publish records its own (issue #162), exactly like
+                // a rebuilt parent snapshot.
+                if (provExisted)
+                    new SnapshotCoverageStore(conn).Delete(provId);
                 providerSnapshotsToPublish.Add(provId);
             }
-            var result = (provId, providerRepoId, complete);
-            providerSnapshotByPin[pinKey] = result;
-            return result;
+            return (provId, providerRepoId, complete);
         }
 
         foreach (var project in solution.Projects)
@@ -1438,12 +1461,18 @@ public sealed class IndexOrchestrator
         // in this set. Unlike the parent gate we do not throw when the guarded flip writes no row: a
         // provider generation is neutral shared infrastructure, and a concurrent/idempotent completion is
         // tolerable (it stays complete either way) rather than a reason to abort the parent publish.
+        // Issue #162: each provider publish also records the worker-computed coverage of its subtree in
+        // this transaction, so a direct ensure that later reuses the provider reports an honest verdict.
         if (snapshotStore != null)
         {
             foreach (var providerSnapshotId in providerSnapshotsToPublish)
             {
-                if (snapshotStore.MarkComplete(providerSnapshotId, completedAt) == 1)
-                    _log?.Invoke($"  Published provider snapshot {providerSnapshotId} (deduplicated submodule).");
+                if (snapshotStore.MarkComplete(providerSnapshotId, completedAt) != 1)
+                    continue;
+                _log?.Invoke($"  Published provider snapshot {providerSnapshotId} (deduplicated submodule).");
+                if (effectiveCtx != null)
+                    RecordProviderCoverage(conn, providerSnapshotId,
+                        providerSubmodulePaths.GetValueOrDefault(providerSnapshotId), effectiveCtx, completedAt);
             }
         }
 
@@ -1722,6 +1751,54 @@ public sealed class IndexOrchestrator
             throw new InvalidOperationException(
                 $"Snapshot {snapshotId} already has a recorded coverage row at first publish (issue #119 invariant).");
     }
+
+    /// <summary>
+    /// Records the coverage of a PROVIDER snapshot this run just published (issue #162), inside the publish
+    /// transaction, from the worker-computed per-subtree verdicts. A no-op when the caller computed none
+    /// (local CLI/daemon). Several submodule paths pinning the same commit share one provider: their verdicts
+    /// merge worst-of, and a path the worker computed nothing for is recorded as partial rather than silently
+    /// complete. Record-if-absent, never throws: a provider re-opened by #53 growth republishes the SAME
+    /// snapshot id, and its first-publish verdict stays authoritative (coverage is immutable). A rebuilt
+    /// provider had its stale row dropped when it was re-staged, so it records afresh.
+    /// </summary>
+    internal static void RecordProviderCoverage(
+        SqliteConnection conn, long providerSnapshotId, IEnumerable<string>? submodulePaths, SnapshotContext ctx,
+        long recordedAt)
+    {
+        if (ctx.ProviderCoverage is not { } computed)
+            return;
+        var verdicts = new List<SnapshotCoverage>();
+        foreach (var path in submodulePaths ?? [])
+            verdicts.Add(computed.TryGetValue(path, out var coverage)
+                ? coverage
+                : new SnapshotCoverage
+                {
+                    Verdict = SnapshotCoverageVerdict.Partial,
+                    Reasons = ["coverage was not computed for this provider's submodule, so it cannot be proven complete."]
+                });
+        if (verdicts.Count == 0)
+            verdicts.Add(new SnapshotCoverage
+            {
+                Verdict = SnapshotCoverageVerdict.Partial,
+                Reasons = ["the provider's submodule path is unknown, so its coverage cannot be proven complete."]
+            });
+        new SnapshotCoverageStore(conn).Record(providerSnapshotId, WorstOf(verdicts), recordedAt);
+    }
+
+    // The worst of several coverage verdicts for one provider: complete only when every contributing path is
+    // complete (then the first, since equal-commit checkouts describe the same tree); otherwise the first
+    // partial one, carrying every distinct partial reason so no gap is hidden.
+    private static SnapshotCoverage WorstOf(IReadOnlyList<SnapshotCoverage> verdicts)
+    {
+        var partials = verdicts.Where(v => v.IsPartial).ToList();
+        if (partials.Count == 0)
+            return verdicts[0];
+        return partials[0] with { Reasons = partials.SelectMany(p => p.Reasons).Distinct(StringComparer.Ordinal).ToList() };
+    }
+
+    // `git submodule status` reports paths relative to the repository root with '/' separators; the worker keys
+    // provider coverage the same way, so normalize defensively (a stray '\' or trailing '/') before the lookup.
+    private static string NormalizeSubmodulePath(string path) => path.Replace('\\', '/').Trim('/');
 
     private void WarnOnCoverageMismatch(SqliteConnection conn, long snapshotId, SnapshotContext ctx)
     {
