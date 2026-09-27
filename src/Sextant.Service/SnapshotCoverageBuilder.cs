@@ -100,13 +100,16 @@ public static class SnapshotCoverageBuilder
             if (sdkSkips.Count > 0)
             {
                 var pins = sdkSkips
+                    .Where(x => x.Error!.IsGlobalJsonPin)
                     .Select(x => DescribePin(checkoutDir, x.Error!))
                     .Distinct(StringComparer.Ordinal)
                     .ToList();
-                reasons.Add(
-                    $"{sdkSkips.Count} declared project(s) could not be loaded because the .NET SDK their " +
-                    $"global.json pins is not installed on this worker ({string.Join("; ", pins.Take(10))}" +
-                    $"{(pins.Count > 10 ? "; …" : string.Empty)}).");
+                reasons.Add(pins.Count > 0
+                    ? $"{sdkSkips.Count} declared project(s) could not be loaded because the .NET SDK their " +
+                      $"global.json pins is not installed on this worker ({string.Join("; ", pins.Take(10))}" +
+                      $"{(pins.Count > 10 ? "; …" : string.Empty)})."
+                    : $"{sdkSkips.Count} declared project(s) could not be loaded because no compatible .NET SDK " +
+                      "could be resolved on this worker.");
             }
         }
 

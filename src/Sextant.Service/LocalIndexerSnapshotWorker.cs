@@ -260,7 +260,7 @@ public sealed class LocalIndexerSnapshotWorker(
                 var reason =
                     $"no project across the {resolution.SelectedSolutions.Count} selected solution(s) could be " +
                     $"loaded on this worker ({load.SkippedProjects.Count} project(s) skipped-with-reason" +
-                    (sdkSkips > 0 ? $", {sdkSkips} of them because the .NET SDK their global.json pins is not installed" : string.Empty) +
+                    (sdkSkips > 0 ? $", {sdkSkips} of them because no .NET SDK could be resolved for them (see the sdk_resolution_failed diagnostics)" : string.Empty) +
                     "); nothing was indexed and no snapshot was published.";
                 return SnapshotWorkResult.Failed(
                     reason,
@@ -302,7 +302,7 @@ public sealed class LocalIndexerSnapshotWorker(
         }
 
         // A failed restore outranks every other outcome: the checkout no longer matches its commit, so the job
-        // must report THAT (the journal is kept and the next job repairs the checkout before reusing it).
+        // must report THAT (the journal is kept so the next job can repair the checkout before reusing it).
         SnapshotWorkResult Fail(string message) =>
             pinOverlay?.RestoreError is { } restoreError
                 ? SdkPinRestoreFailed(restoreError, pinOverlay)
@@ -501,8 +501,10 @@ public sealed class LocalIndexerSnapshotWorker(
                     Code = SdkResolutionFailedCode,
                     ProjectPath = RepoRelative(checkoutDir, skippedProject.ProjectPath),
                     Message =
-                        $"Project '{skippedProject.ProjectName}' could not be loaded on this worker because the .NET " +
-                        $"SDK its global.json pins is not installed: {SnapshotCoverageBuilder.DescribePin(checkoutDir, sdkError)} " +
+                        $"Project '{skippedProject.ProjectName}' could not be loaded on this worker because " +
+                        (sdkError.IsGlobalJsonPin
+                            ? $"the .NET SDK its global.json pins is not installed: {SnapshotCoverageBuilder.DescribePin(checkoutDir, sdkError)} "
+                            : "no compatible .NET SDK could be resolved (hostfxr reported no global.json pin) ") +
                         $"(installed SDK(s): {InstalledList(installedSdks.Count > 0 ? installedSdks : sdkError.InstalledSdks)})."
                 });
                 continue;
@@ -594,6 +596,24 @@ public sealed class LocalIndexerSnapshotWorker(
     {
         var diagnostics = SdkPinDiagnostics(pins, published: false);
         var installed = installedSdks.Count > 0 ? installedSdks : error.InstalledSdks;
+
+        // hostfxr also fails SDK resolution with no pin at all (no SDK installed); never blame a global.json then.
+        if (!error.IsGlobalJsonPin && pins.Count == 0)
+        {
+            diagnostics.Add(new ProjectOutcome
+            {
+                Severity = JobDiagnosticSeverity.Error,
+                Code = SdkResolutionFailedCode,
+                Message =
+                    "No compatible .NET SDK could be resolved on this worker and hostfxr reported no global.json pin " +
+                    $"(installed SDK(s): {InstalledList(installed)}). Install a .NET SDK on the worker."
+            });
+            return SnapshotWorkResult.Failed(
+                "no compatible .NET SDK could be resolved on this worker (hostfxr reported no global.json pin); " +
+                $"installed SDK(s): {InstalledList(installed)}. Nothing was indexed and no snapshot was published.",
+                diagnostics);
+        }
+
         var matching = error.GlobalJsonPath is { } failedPath
             ? pins.FirstOrDefault(p => string.Equals(
                 Path.GetFullPath(p.FullPath), Path.GetFullPath(failedPath),
@@ -637,7 +657,8 @@ public sealed class LocalIndexerSnapshotWorker(
         return SnapshotWorkResult.Failed(
             "the service neutralized an unsatisfiable global.json SDK pin for the MSBuild load but could not restore " +
             "the committed file afterwards, so the checkout was NOT indexed (it no longer matches its commit). The " +
-            "restore journal was kept and the next job repairs the checkout before reusing it.",
+            "restore journal was kept so the next job can put the committed file back before reusing the checkout " +
+            "(a file that something else changed meanwhile is left as-is).",
             diagnostics);
     }
 
