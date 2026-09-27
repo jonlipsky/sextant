@@ -176,6 +176,41 @@ public sealed class SolutionSelectorTests
     }
 
     [TestMethod]
+    public void OrderForUnion_CaseOnlyDistinctPaths_FollowTheHostFileSystemCaseSemantics()
+    {
+        // On a case-sensitive file system (the Linux worker) App.slnx and app.slnx are two DISTINCT solutions:
+        // case-folding would silently drop one from the union AND from coverage. On Windows/macOS they are the
+        // same file and must collapse. Pure path logic, so this runs (with the host's expectation) on every OS.
+        var upper = Path.Combine(_root, "App.slnx");
+        var lower = Path.Combine(_root, "app.slnx");
+
+        var ordered = SolutionSelector.OrderForUnion(_root, [upper, lower]);
+
+        var caseSensitiveHost = !CheckoutInventory.PathComparer.Equals(upper, lower);
+        Assert.AreEqual(caseSensitiveHost ? 2 : 1, ordered.Count,
+            "case-only-distinct solution paths are distinct exactly when the host file system is case-sensitive");
+        if (caseSensitiveHost)
+            CollectionAssert.AreEqual(new[] { "App.slnx", "app.slnx" }, Relative(ordered),
+                "both are kept, in the deterministic ordinal tiebreak order");
+    }
+
+    [TestMethod]
+    public void NoConfig_CaseOnlyDistinctSolutions_BothSelected_OnACaseSensitiveFileSystem()
+    {
+        Plant("App.slnx");
+        var second = Path.Combine(_root, "app.slnx");
+        if (File.Exists(second))
+            Assert.Inconclusive("the host file system is case-insensitive; covered by the path-logic test above");
+        File.WriteAllText(second, "<Solution />");
+
+        var selection = SolutionSelector.Select(_root, configuredSolutions: null);
+
+        CollectionAssert.AreEqual(new[] { "App.slnx", "app.slnx" }, Relative(selection.SolutionPaths),
+            "two case-distinct solution files on a case-sensitive file system are both in the union");
+        CollectionAssert.AreEqual(new[] { "App.slnx", "app.slnx" }, Relative(selection.DiscoveredSolutions));
+    }
+
+    [TestMethod]
     public void NoConfig_OrderingUsesSlashNormalizedPaths_IdenticalOnEveryOs()
     {
         // With the raw Windows separator, "x/a0/…" would sort BEFORE "x/a\…" ('0' 0x30 < '\' 0x5C) while on

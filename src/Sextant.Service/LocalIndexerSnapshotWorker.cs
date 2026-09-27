@@ -242,7 +242,7 @@ public sealed class LocalIndexerSnapshotWorker(
 
             await orchestrator.IndexSolutionAsync(
                 load.Solution, progress: null, metrics: null, cancellationToken: token,
-                snapshotContext: indexContext).ConfigureAwait(false);
+                snapshotContext: indexContext, solutionMembership: load.Membership).ConfigureAwait(false);
 
             var published = new SnapshotStore(database.GetConnection()).GetByIdentityHash(identityHash);
             if (published is not { Status: SnapshotStatus.Complete })

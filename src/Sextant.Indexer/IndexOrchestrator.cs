@@ -55,7 +55,8 @@ public sealed class IndexOrchestrator
         OverlayContext? overlay = null,
         string? workingTreeDelta = null,
         string? fallbackReason = null,
-        GitStatePin? gitStatePin = null)
+        GitStatePin? gitStatePin = null,
+        IReadOnlyList<SolutionMembership>? solutionMembership = null)
     {
         var totalStopwatch = Stopwatch.StartNew();
         var phaseStopwatch = new Stopwatch();
@@ -576,6 +577,8 @@ public sealed class IndexOrchestrator
             foreach (var pid in projectRoslynToId.Values)
                 solutionStore.AddProjectMapping(solutionId, pid);
         }
+        else if (solutionMembership is { Count: > 0 })
+            RecordSolutionMembership(solution, solutionMembership, projectRoslynToId, solutionStore, now);
         session.CommitBatch();
 
         // Phase 2: Extract symbols from all projects
@@ -1515,6 +1518,43 @@ public sealed class IndexOrchestrator
             // fingerprint hash is a raw SHA-256 taken from disk — the same bytes the daemon compares.
             fileStore.ResolveFileVersionId(projectId, filePath, contentHash: null, lastIndexedAt: now);
             session.RowsWritten();
+        }
+    }
+
+    /// <summary>
+    /// Records each selected solution's <c>solution → project</c> mapping for a multi-solution workspace
+    /// (issue #124). The combined workspace has no solution file of its own (projects are opened
+    /// individually), so membership comes from the loader's static per-solution declared lists: every
+    /// loaded (per-TFM) project whose file a solution declares is mapped to that solution — a project shared
+    /// by several solutions maps to each. Path matching uses the loader's own de-dup comparer so a mapping
+    /// never disagrees with which project the union loaded.
+    /// </summary>
+    private static void RecordSolutionMembership(
+        Solution solution,
+        IReadOnlyList<SolutionMembership> membership,
+        Dictionary<ProjectId, long> projectRoslynToId,
+        SolutionStore solutionStore,
+        long now)
+    {
+        var idsByPath = new Dictionary<string, List<long>>(MultiSolutionLoader.ProjectPathComparer);
+        foreach (var project in solution.Projects)
+        {
+            if (project.FilePath == null || !projectRoslynToId.TryGetValue(project.Id, out var pid))
+                continue;
+            var full = Path.GetFullPath(project.FilePath);
+            if (!idsByPath.TryGetValue(full, out var ids))
+                idsByPath[full] = ids = [];
+            ids.Add(pid);
+        }
+
+        foreach (var member in membership)
+        {
+            var solutionId = solutionStore.Upsert(
+                member.SolutionPath, Path.GetFileNameWithoutExtension(member.SolutionPath), now);
+            foreach (var declared in member.DeclaredProjects)
+                if (idsByPath.TryGetValue(Path.GetFullPath(declared), out var ids))
+                    foreach (var pid in ids)
+                        solutionStore.AddProjectMapping(solutionId, pid);
         }
     }
 
