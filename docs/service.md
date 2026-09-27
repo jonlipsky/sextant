@@ -305,7 +305,8 @@ cost a full copy per job and break checkout-relative paths. So the service handl
      or unstaged change. The exact bytes to be journaled must also equal, byte for byte, the commit's blob
      as stored or git's checkout rendering of it (eol/`ident`/`working-tree-encoding` conversion). A path
      that goes through a `filter` driver (e.g. LFS) must match the stored blob, because a driver's smudge
-     output is the program's, not the blob's. This matters because `git status`
+     output is the program's, not the blob's. The rendered alternative needs git 2.11 or later
+     (`cat-file --filters`); an older git fails closed. This matters because `git status`
      can call an edit clean from cached stat data alone, and clean conversions such as `ident` are
      many-to-one, so hashing the bytes would not be proof. The rule covers an untracked or locally edited
      `global.json` in a `locate`-mode checkout. The journal therefore only ever holds the commit's content, and a
