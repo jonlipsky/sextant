@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using Microsoft.Data.Sqlite;
 using Sextant.Core;
 using Sextant.Indexer;
@@ -26,7 +25,7 @@ public sealed class ProfileGatingTests
         try
         {
             var slnx = CorpusGenerator.GenerateCorrectnessCorpus(root);
-            Restore(slnx);
+            CorpusRestore.Restore(slnx);
 
             // Index the SAME on-disk state twice: once at the core profile, once at deep.
             using var coreDb = new IndexDatabase(Path.Combine(coreDbDir, "index.db"));
@@ -108,23 +107,5 @@ public sealed class ProfileGatingTests
         var dir = Path.Combine(Path.GetTempPath(), $"sextant-profile-{tag}-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
         return dir;
-    }
-
-    private static void Restore(string solutionPath)
-    {
-        var psi = new ProcessStartInfo("dotnet", $"restore \"{solutionPath}\"")
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
-        using var process = Process.Start(psi)!;
-        var stdoutTask = process.StandardOutput.ReadToEndAsync();
-        var stderr = process.StandardError.ReadToEnd();
-        stdoutTask.GetAwaiter().GetResult();
-        process.WaitForExit();
-        if (process.ExitCode != 0)
-            Assert.Inconclusive($"restore of the generated corpus failed (exit {process.ExitCode}): {stderr}");
     }
 }

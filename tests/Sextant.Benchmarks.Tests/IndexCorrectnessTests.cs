@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using Microsoft.Data.Sqlite;
 using Sextant.Core;
 using Sextant.Indexer;
@@ -26,7 +25,7 @@ public sealed class IndexCorrectnessTests
         try
         {
             var slnx = CorpusGenerator.GenerateCorrectnessCorpus(root);
-            Restore(slnx);
+            CorpusRestore.Restore(slnx);
 
             // Path B (incremental): full-index the original state, then apply one edit and reindex it.
             var incrDir = NewTempDir("diff-incr");
@@ -98,7 +97,7 @@ public sealed class IndexCorrectnessTests
         try
         {
             var slnx = CorpusGenerator.GenerateCorrectnessCorpus(root);
-            Restore(slnx);
+            CorpusRestore.Restore(slnx);
 
             using var db = new IndexDatabase(Path.Combine(dbDir, "index.db"));
             db.RunMigrations();
@@ -143,7 +142,7 @@ public sealed class IndexCorrectnessTests
         try
         {
             var slnx = CorpusGenerator.GenerateCorrectnessCorpus(root);
-            Restore(slnx);
+            CorpusRestore.Restore(slnx);
 
             using var db = new IndexDatabase(Path.Combine(dbDir, "index.db"));
             db.RunMigrations();
@@ -187,7 +186,7 @@ public sealed class IndexCorrectnessTests
         try
         {
             var slnx = CorpusGenerator.GenerateCorrectnessCorpus(root);
-            Restore(slnx);
+            CorpusRestore.Restore(slnx);
 
             using var db = new IndexDatabase(Path.Combine(dbDir, "index.db"));
             db.RunMigrations();
@@ -226,7 +225,7 @@ public sealed class IndexCorrectnessTests
         try
         {
             var slnx = CorpusGenerator.GenerateCorrectnessCorpus(root);
-            Restore(slnx);
+            CorpusRestore.Restore(slnx);
 
             using var db = new IndexDatabase(Path.Combine(dbDir, "index.db"));
             db.RunMigrations();
@@ -269,7 +268,7 @@ public sealed class IndexCorrectnessTests
         try
         {
             var slnx = CorpusGenerator.GenerateCorrectnessCorpus(root);
-            Restore(slnx);
+            CorpusRestore.Restore(slnx);
 
             var incrDir = NewTempDir("refdrop-incr");
             var fullDir = NewTempDir("refdrop-full");
@@ -310,7 +309,7 @@ public sealed class IndexCorrectnessTests
                     }
                     """.ReplaceLineEndings("\n"));
 
-                Restore(slnx);
+                CorpusRestore.Restore(slnx);
                 var solution1 = await SolutionLoader.LoadSolutionAsync(slnx);
                 await new IncrementalIndexer(incrDb, useDocumentExtractor: useDocumentExtractor).IndexChangedFilesAsync(solution1, [appCsproj, appRunner]);
 
@@ -354,7 +353,7 @@ public sealed class IndexCorrectnessTests
         try
         {
             var slnx = CorpusGenerator.GenerateCorrectnessCorpus(root);
-            Restore(slnx);
+            CorpusRestore.Restore(slnx);
 
             using var db = new IndexDatabase(Path.Combine(dbDir, "index.db"));
             db.RunMigrations();
@@ -412,7 +411,7 @@ public sealed class IndexCorrectnessTests
         try
         {
             var slnx = CorpusGenerator.GenerateCorrectnessCorpus(root);
-            Restore(slnx);
+            CorpusRestore.Restore(slnx);
 
             using var db = new IndexDatabase(Path.Combine(dbDir, "index.db"));
             db.RunMigrations();
@@ -540,23 +539,5 @@ public sealed class IndexCorrectnessTests
         var dir = Path.Combine(Path.GetTempPath(), $"sextant-correctness-{tag}-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
         return dir;
-    }
-
-    private static void Restore(string solutionPath)
-    {
-        var psi = new ProcessStartInfo("dotnet", $"restore \"{solutionPath}\"")
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
-        using var process = Process.Start(psi)!;
-        var stdoutTask = process.StandardOutput.ReadToEndAsync();
-        var stderr = process.StandardError.ReadToEnd();
-        stdoutTask.GetAwaiter().GetResult();
-        process.WaitForExit();
-        if (process.ExitCode != 0)
-            Assert.Inconclusive($"restore of the generated corpus failed (exit {process.ExitCode}): {stderr}");
     }
 }
