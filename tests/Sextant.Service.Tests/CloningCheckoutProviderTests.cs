@@ -234,7 +234,7 @@ public class CloningCheckoutProviderTests
 
         // Token + https repository host → an extraheader scoped to EXACTLY that host: an empty reset entry
         // (clears any inherited header) followed by the Basic credential. The token never appears raw.
-        var env = provider.TopLevelEnvironment("github.com");
+        var env = provider.TopLevelEnvironment("github.com", "https://github.com/o/r.git");
         var headers = env.Config.Where(kv => kv.Key.EndsWith(".extraheader", StringComparison.Ordinal)).ToList();
         CollectionAssert.AreEqual(
             new[] { "http.https://github.com/.extraheader", "http.https://github.com/.extraheader" },
@@ -248,12 +248,12 @@ public class CloningCheckoutProviderTests
         Assert.IsTrue(env.Config.Any(kv => kv.Key == "core.askPass" && kv.Value.Length == 0));
 
         // No authority (non-https repository) → no header at all.
-        Assert.IsFalse(provider.TopLevelEnvironment(null).Config.Any(kv => kv.Key.EndsWith(".extraheader", StringComparison.Ordinal)));
+        Assert.IsFalse(provider.TopLevelEnvironment(null, "https://github.com/o/r.git").Config.Any(kv => kv.Key.EndsWith(".extraheader", StringComparison.Ordinal)));
         // No token configured → no header even for an https host.
-        Assert.IsFalse(NewCloneProvider(paths).TopLevelEnvironment("github.com").Config
+        Assert.IsFalse(NewCloneProvider(paths).TopLevelEnvironment("github.com", "https://github.com/o/r.git").Config
             .Any(kv => kv.Key.EndsWith(".extraheader", StringComparison.Ordinal)));
         // Submodule fetches are https-only (no ssh/git/http/ext transports from an untrusted .gitmodules).
-        Assert.AreEqual("https", provider.SubmoduleFetchEnvironment(null).AllowedProtocols);
+        Assert.AreEqual("https", provider.SubmoduleFetchEnvironment(null, "https://github.com/o/r.git").AllowedProtocols);
     }
 
     [TestMethod]

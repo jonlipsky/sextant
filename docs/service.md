@@ -205,8 +205,7 @@ absorbed into the parent (`.git/modules/<name>`) — after which every populated
 gitdir link must still resolve to its pinned `HEAD`; otherwise the staged provisioning is discarded and
 retried) — and nesting recurses (bounded to depth 8 and 256
 submodules). Submodule names/paths are validated (no `..`, no absolute or `.git` segments, no escape from the
-parent). Fetching any submodule needs git ≥ 2.31 (the hardening below travels as environment-scoped config,
-which an older git silently ignores), so on an older git every submodule is left unpopulated with that reason.
+parent). (Clone mode as a whole requires git ≥ 2.31 — see the credentials paragraph below.)
 
 **URL policy (per `.gitmodules` entry).**
 
@@ -294,7 +293,7 @@ submodule recursion, so a host-level credential helper can neither supply nor **
 service fetch. **Behavior change (#125):** before this, a host credential helper could silently authenticate
 a clone; now only `SEXTANT_SERVICE_CHECKOUT_TOKEN` does. Git (and anything it launches — transports,
 filters, hooks) never inherits the service's own `SEXTANT_*` variables (including the raw token and the
-control/query tokens) or any other variable whose value contains the token. An authenticated clone requires git ≥ 2.31 (it is
+control/query tokens) or any other variable whose value contains the token. Clone mode requires git ≥ 2.31 — even without a token, since the helper/askpass reset travels the same way (it is
 probed once; an older git fails the provisioning closed rather than fetching without its hardening). Public
 repositories (and non-`https` remotes) need no token. The header can only be scoped to a plain DNS host name,
 so for an `https` remote whose host is not one (an `_`, a trailing `.`, an IPv6 literal) the token is **not
@@ -315,7 +314,8 @@ packed-refs, hooks, markers, …) is scanned for the raw, base64 and basic-crede
 > to `https`) and prompting is disabled. The token lives only in the git child's **environment** (not
 > persisted, not logged, not on argv), so it is visible only to a process that can already read the service
 > process's environment — treat the service host as trusted. **Redirects are disabled for every fetch that
-> carries the token** (`http.followRedirects=false`): git copies `http.extraheader` onto every request,
+> carries the token** (`http.followRedirects=false`, set both globally and for the exact fetch URL, so an inherited
+> URL-scoped `followRedirects=true` cannot win git's most-specific-URL match): git copies `http.extraheader` onto every request,
 > including the requests it rebases onto a redirect target after following one, so a redirect on the
 > repository host (a path an untrusted `.gitmodules` can choose) would otherwise hand the token to another
 > host. An authenticated repository or same-host submodule reachable only through a redirect (e.g. a renamed

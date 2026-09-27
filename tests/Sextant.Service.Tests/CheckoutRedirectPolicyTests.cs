@@ -28,21 +28,46 @@ public class CheckoutRedirectPolicyTests
     public void AuthenticatedEnvironments_DisableRedirects_AnonymousOnesKeepGitsDefault()
     {
         var provider = NewProvider(token: "tok");
+        const string url = "https://github.com/org/repo.git";
 
-        foreach (var env in new[] { provider.TopLevelEnvironment("github.com"), provider.SubmoduleFetchEnvironment("github.com") })
+        foreach (var env in new[] { provider.TopLevelEnvironment("github.com", url), provider.SubmoduleFetchEnvironment("github.com", url) })
+        {
             Assert.AreEqual("false", env.Config.Last(kv => kv.Key == "http.followRedirects").Value,
                 "an environment carrying the token header must never follow a redirect");
+            Assert.AreEqual("false", env.Config.Last(kv => kv.Key == $"http.{url}.followRedirects").Value,
+                "… not even when a more specific url-scoped setting is inherited (the exact url is the most specific)");
+        }
 
         // No header ⇒ nothing to leak ⇒ git's default redirect policy is kept (e.g. an anonymous allowlisted host).
-        Assert.IsFalse(provider.TopLevelEnvironment(null).Config.Any(kv => kv.Key == "http.followRedirects"));
-        Assert.IsFalse(provider.SubmoduleFetchEnvironment(null).Config.Any(kv => kv.Key == "http.followRedirects"));
-        Assert.IsFalse(NewProvider(token: null).TopLevelEnvironment("github.com").Config.Any(kv => kv.Key == "http.followRedirects"));
+        Assert.IsFalse(provider.TopLevelEnvironment(null, url).Config.Any(kv => kv.Key.EndsWith("followRedirects", StringComparison.Ordinal)));
+        Assert.IsFalse(provider.SubmoduleFetchEnvironment(null, url).Config.Any(kv => kv.Key.EndsWith("followRedirects", StringComparison.Ordinal)));
+        Assert.IsFalse(NewProvider(token: null).TopLevelEnvironment("github.com", url).Config
+            .Any(kv => kv.Key.EndsWith("followRedirects", StringComparison.Ordinal)));
+    }
+
+    /// <summary>How the git config for one redirect scenario is assembled.</summary>
+    public enum RedirectScenario
+    {
+        /// <summary>The provider's authenticated environment, nothing inherited.</summary>
+        Provider,
+        /// <summary>An operator's inherited path-scoped <c>followRedirects=true</c>, then the provider's environment.</summary>
+        ProviderUnderInheritedPrefixOverride,
+        /// <summary>An operator's inherited exact-url <c>followRedirects=true</c>, then the provider's environment.</summary>
+        ProviderUnderInheritedExactOverride,
+        /// <summary>Control: the header with git's default redirect policy.</summary>
+        ControlNoRedirectPolicy,
+        /// <summary>Control: only the GLOBAL <c>followRedirects=false</c>, under a path-scoped override.</summary>
+        ControlGlobalKeyOnlyUnderPrefixOverride,
     }
 
     [TestMethod]
-    [DataRow(true, DisplayName = "authenticated environment (redirects disabled)")]
-    [DataRow(false, DisplayName = "control: same header, git's default redirect policy")]
-    public async Task Git_WithTheAuthenticatedEnvironment_NeverContactsARedirectTarget(bool useProviderEnvironment)
+    [DataRow(RedirectScenario.Provider, false)]
+    [DataRow(RedirectScenario.ProviderUnderInheritedPrefixOverride, false)]
+    [DataRow(RedirectScenario.ProviderUnderInheritedExactOverride, false)]
+    [DataRow(RedirectScenario.ControlNoRedirectPolicy, true)]
+    [DataRow(RedirectScenario.ControlGlobalKeyOnlyUnderPrefixOverride, true)]
+    public async Task Git_WithTheAuthenticatedEnvironment_NeverContactsARedirectTarget(
+        RedirectScenario scenario, bool expectTargetContacted)
     {
         using var target = new RecordingServer(_ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         using var origin = new RecordingServer(request =>
@@ -53,14 +78,29 @@ public class CheckoutRedirectPolicyTests
         });
 
         var authority = $"127.0.0.1:{origin.Port}";
-        // The provider's REAL authenticated config, with the header key re-scoped from https:// to the plain-http
-        // loopback origin (a test server cannot present a trusted TLS certificate). The control drops only the
-        // redirect entry, proving the test would detect a redirect being followed.
-        var config = NewProvider(token: "SENTINEL-TOKEN-redirect").TopLevelEnvironment(authority).Config
-            .Where(kv => useProviderEnvironment || kv.Key != "http.followRedirects")
+        // The provider's REAL authenticated config, with its url-scoped keys re-scoped from https:// to the
+        // plain-http loopback origin (a test server cannot present a trusted TLS certificate). The controls
+        // drop redirect entries, proving the test would detect a redirect being followed.
+        var providerConfig = NewProvider(token: "SENTINEL-TOKEN-redirect")
+            .TopLevelEnvironment(authority, $"https://{authority}/org/repo.git").Config
+            .Where(kv => scenario switch
+            {
+                RedirectScenario.ControlNoRedirectPolicy => !kv.Key.EndsWith(".followRedirects", StringComparison.Ordinal),
+                RedirectScenario.ControlGlobalKeyOnlyUnderPrefixOverride =>
+                    !kv.Key.EndsWith(".followRedirects", StringComparison.Ordinal) || kv.Key == "http.followRedirects",
+                _ => true
+            })
             .Select(kv => new KeyValuePair<string, string>(
-                kv.Key.Replace($"http.https://{authority}/", $"http.http://{authority}/", StringComparison.Ordinal), kv.Value))
-            .ToList();
+                kv.Key.Replace($"http.https://{authority}/", $"http.http://{authority}/", StringComparison.Ordinal), kv.Value));
+        IEnumerable<KeyValuePair<string, string>> inherited = scenario switch
+        {
+            RedirectScenario.ProviderUnderInheritedPrefixOverride or RedirectScenario.ControlGlobalKeyOnlyUnderPrefixOverride =>
+                [new($"http.http://{authority}/org/.followRedirects", "true")],
+            RedirectScenario.ProviderUnderInheritedExactOverride =>
+                [new($"http.http://{authority}/org/repo.git.followRedirects", "true")],
+            _ => []
+        };
+        var config = inherited.Concat(providerConfig).ToList();
 
         var (exitCode, stderr) = await RunGitAsync(config, "ls-remote", "--end-of-options", $"http://{authority}/org/repo.git");
         Console.WriteLine($"git stderr: {stderr}");
@@ -68,7 +108,7 @@ public class CheckoutRedirectPolicyTests
         Assert.AreNotEqual(0, exitCode, "neither server serves a repository");
         Assert.IsTrue(origin.Requests.Any(r => r.Contains("authorization: basic", StringComparison.OrdinalIgnoreCase)),
             "the header is scoped to (and sent to) the repository host itself: " + string.Join(" | ", origin.Requests));
-        if (useProviderEnvironment)
+        if (!expectTargetContacted)
         {
             Assert.AreEqual(0, target.Requests.Count,
                 $"the redirect target must never be contacted by an authenticated fetch. git: {stderr}");
@@ -77,7 +117,7 @@ public class CheckoutRedirectPolicyTests
         }
         else
             Assert.IsTrue(target.Requests.Count > 0,
-                $"control: with git's default policy the redirect IS followed (so the assertion above is meaningful). git: {stderr}");
+                $"control: without the provider's redirect policy the redirect IS followed (so the assertion above is meaningful). git: {stderr}");
     }
 
     private CloningCheckoutProvider NewProvider(string? token)

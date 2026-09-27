@@ -349,15 +349,9 @@ public sealed partial class CloningCheckoutProvider
             return Outcome(display, entry, SubmoduleProvisioningStatus.InvalidEntry, url: cleanUrl, commit: gitlink,
                 reason: "the submodule directory is not empty");
 
-        var env = SubmoduleFetchEnvironment(decision.SendToken ? decision.Authority : null);
+        var env = SubmoduleFetchEnvironment(decision.SendToken ? decision.Authority : null, cleanUrl);
 
-        // The env-scoped hardening (credential-helper/askpass reset, no implicit recursion, and — with the
-        // token — the scoped header + no redirects) needs git >= 2.31; an older git would silently ignore it,
-        // so an untrusted .gitmodules is never fetched without it. Probed once per provider.
-        if (!EnvironmentConfigSupported(subDir))
-            return Outcome(display, entry, SubmoduleProvisioningStatus.FetchFailed, url: cleanUrl, commit: gitlink,
-                reason: "this git does not honour environment-scoped config (git >= 2.31 is required to fetch submodules safely)");
-
+        // (The env-scoped hardening this relies on was probed — git >= 2.31 — before the top-level clone.)
         var init = RunGit(subDir, env, "init", "--quiet");
         if (!init.Ok)
             return FailSubmodule(GitStage.Init, "init", root, repoDir, path, display, entry, cleanUrl, gitlink, init);
