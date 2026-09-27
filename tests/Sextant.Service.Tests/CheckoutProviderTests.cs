@@ -1,3 +1,5 @@
+using Sextant.Indexer;
+
 namespace Sextant.Service.Tests;
 
 /// <summary>
@@ -61,7 +63,7 @@ public class CheckoutProviderTests
     }
 
     [TestMethod]
-    public void TryResolve_MalformedSextantJson_ResolvesConfigErrorWithoutSilentDefaultRoot()
+    public void TryResolve_MalformedSextantJson_ResolvesConfigErrorWithoutSilentDefaultSelection()
     {
         _dataRoot = ServiceTestFixtures.NewDataRoot();
         var paths = new ServicePaths(ServiceVolumes.Rooted(_dataRoot));
@@ -69,16 +71,16 @@ public class CheckoutProviderTests
         var request = ServiceTestFixtures.Request() with { RepositoryRemoteUrl = "https://github.com/org/app.git" };
         var checkout = Path.Combine(paths.CheckoutRoot, ServicePaths.RepoDirectoryName(request.RepositoryRemoteUrl));
         Directory.CreateDirectory(checkout);
-        // A perfectly loadable default-root solution IS present — a lenient config read would silently pick
+        // A perfectly loadable solution IS present for the no-config default — a lenient config read would silently pick
         // it and report complete. The malformed config must instead surface a config error (issue #109).
         File.WriteAllText(Path.Combine(checkout, "App.slnx"), string.Empty);
         File.WriteAllText(Path.Combine(checkout, "sextant.json"), "{ this is not valid json ]");
 
         var provider = new PersistentVolumeCheckoutProvider(paths);
         Assert.IsTrue(provider.TryResolve(request, out var resolution),
-            "a checkout with a malformed sextant.json still resolves — but as a config error, not a default-root pick");
+            "a checkout with a malformed sextant.json still resolves — but as a config error, not the default selection");
         Assert.IsFalse(resolution.HasSelectedSolutions,
-            "a malformed config must NOT silently fall back to a default-root solution");
+            "a malformed config must NOT silently fall back to the default selection");
         Assert.IsNotNull(resolution.ConfigurationError, "the config error is surfaced with a reason");
         StringAssert.Contains(resolution.ConfigurationError!, "json",
             "the reason names the malformed JSON");
@@ -93,9 +95,9 @@ public class CheckoutProviderTests
         var request = ServiceTestFixtures.Request() with { RepositoryRemoteUrl = "https://github.com/org/app.git" };
         var checkout = Path.Combine(paths.CheckoutRoot, ServicePaths.RepoDirectoryName(request.RepositoryRemoteUrl));
         Directory.CreateDirectory(checkout);
-        // A discoverable default-root solution exists, but the operator explicitly scoped `solutions` to an
+        // A discoverable solution exists for the no-config default, but the operator explicitly scoped `solutions` to an
         // entry that does not exist. We must report the config error WITH the reason, never silently index
-        // the default root as if it were the configured coverage.
+        // the default selection as if it were the configured coverage.
         File.WriteAllText(Path.Combine(checkout, "App.slnx"), string.Empty);
         File.WriteAllText(Path.Combine(checkout, "sextant.json"),
             "{ \"solutions\": [ \"does/not/Exist.slnx\" ] }");
@@ -108,6 +110,57 @@ public class CheckoutProviderTests
         Assert.AreEqual(1, resolution.SkippedSolutions.Count,
             "the invalid configured entry is recorded skipped-with-reason, not silently dropped");
         Assert.AreEqual("does/not/Exist.slnx", resolution.SkippedSolutions[0].RequestedPath);
+    }
+
+    [TestMethod]
+    public void TryResolve_NoConfig_MultipleSolutions_SelectsTheUnion_NothingLeftUnselected()
+    {
+        // #124: with no sextant.json every discovered solution is selected (the default union), in the
+        // deterministic order, so DiscoveredButNotSelected is empty and PrimarySolution is the top-ranked one.
+        _dataRoot = ServiceTestFixtures.NewDataRoot();
+        var paths = new ServicePaths(ServiceVolumes.Rooted(_dataRoot));
+
+        var request = ServiceTestFixtures.Request() with { RepositoryRemoteUrl = "https://github.com/org/app.git" };
+        var checkout = Path.Combine(paths.CheckoutRoot, ServicePaths.RepoDirectoryName(request.RepositoryRemoteUrl));
+        Directory.CreateDirectory(Path.Combine(checkout, "Build.Mac"));
+        Directory.CreateDirectory(Path.Combine(checkout, "Build.Linux"));
+        File.WriteAllText(Path.Combine(checkout, "Build.Mac", "App-ios.slnx"), string.Empty);
+        File.WriteAllText(Path.Combine(checkout, "Build.Linux", "App-server.slnx"), string.Empty);
+        File.WriteAllText(Path.Combine(checkout, "Build.Linux", "Tools.sln"), string.Empty);
+
+        var provider = new PersistentVolumeCheckoutProvider(paths);
+        Assert.IsTrue(provider.TryResolve(request, out var resolution));
+
+        Assert.AreEqual(SolutionSelectionSource.DefaultUnion, resolution.Source);
+        CollectionAssert.AreEqual(
+            new[] { "Build.Linux/App-server.slnx", "Build.Linux/Tools.sln", "Build.Mac/App-ios.slnx" },
+            resolution.SelectedSolutions.Select(s => Path.GetRelativePath(checkout, s).Replace('\\', '/')).ToArray(),
+            "every solution is selected: Linux-marker first, neutral next, the platform head last");
+        Assert.AreEqual(0, resolution.DiscoveredButNotSelected.Count);
+        Assert.IsTrue(resolution.PrimarySolution.EndsWith("App-server.slnx", StringComparison.Ordinal));
+    }
+
+    [TestMethod]
+    public void TryResolve_ExplicitConfig_StaysAuthoritative_UnderTheUnionDefault()
+    {
+        // The default union applies ONLY without config: a `solutions` list still selects exactly that set.
+        _dataRoot = ServiceTestFixtures.NewDataRoot();
+        var paths = new ServicePaths(ServiceVolumes.Rooted(_dataRoot));
+
+        var request = ServiceTestFixtures.Request() with { RepositoryRemoteUrl = "https://github.com/org/app.git" };
+        var checkout = Path.Combine(paths.CheckoutRoot, ServicePaths.RepoDirectoryName(request.RepositoryRemoteUrl));
+        Directory.CreateDirectory(checkout);
+        File.WriteAllText(Path.Combine(checkout, "App.slnx"), string.Empty);
+        File.WriteAllText(Path.Combine(checkout, "Other.slnx"), string.Empty);
+        File.WriteAllText(Path.Combine(checkout, "sextant.json"), "{ \"solutions\": [ \"Other.slnx\" ] }");
+
+        var provider = new PersistentVolumeCheckoutProvider(paths);
+        Assert.IsTrue(provider.TryResolve(request, out var resolution));
+
+        Assert.AreEqual(SolutionSelectionSource.Configured, resolution.Source);
+        Assert.AreEqual(1, resolution.SelectedSolutions.Count);
+        Assert.IsTrue(resolution.PrimarySolution.EndsWith("Other.slnx", StringComparison.Ordinal));
+        Assert.AreEqual(0, resolution.DiscoveredButNotSelected.Count, "an explicit config records no discovery");
     }
 
     [TestMethod]
