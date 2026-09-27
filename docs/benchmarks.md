@@ -266,14 +266,17 @@ path, verified with `EXPLAIN QUERY PLAN`:
 
 | Query | Plan (verified) |
 |---|---|
-| Cross-project closure pairs (`source_symbol_id IS NULL`) | `SEARCH o USING INDEX ix_occ_source` |
+| Cross-project closure pairs (`source_symbol_id IS NULL`) | `SCAN o` (`NOT INDEXED`: one sequential pass over every pure reference; issue #160) |
+| Calls by caller (`GetByCaller`) | `SEARCH o USING INDEX ix_occ_source (source_symbol_id=?)` (partial index, migration `023`) |
+| Cross-repository usages / candidate consumers | `SEARCH psym USING COVERING INDEX ix_symbols_key` → `SEARCH o USING INDEX ix_occ_target` (forced join order; issue #160) |
 | References to a declaration (`GetBySymbolId`) | `SEARCH … USING INDEX ix_occ_target` |
 | FQN lookup | `SEARCH s USING INDEX ix_symbols_fqn_lookup` |
 | Project + accessibility (API surface) | `SEARCH s USING INDEX ix_symbols_project_access` |
 | FTS symbol search | `SCAN fts VIRTUAL TABLE` + `SEARCH s USING INTEGER PRIMARY KEY` |
 
 `PerformanceTests` now asserts these plans directly (deterministic) instead of wall-clock thresholds
-(closes the intermittent-timing flake, issue #33).
+(closes the intermittent-timing flake, issue #33); `OccurrenceIndexPlanTests` and
+`CrossRepositoryUsageQueryPlanTests` pin the issue-#160 plans.
 
 For the opt-in `external` corpus (and any run with `--redact`), the report is structurally scrubbed
 before it is written:

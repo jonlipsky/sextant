@@ -111,9 +111,13 @@ public sealed class ReferenceStore(SqliteConnection connection)
     {
         var pairs = new List<(long, long)>();
         using var cmd = connection.CreateCommand();
+        // Every pure reference must be visited, so one sequential pass over occurrences is optimal.
+        // NOT INDEXED pins that plan. The partial ix_occ_source (migration 023) no longer serves
+        // `IS NULL`, and without it the planner would otherwise walk ix_occ_project with a random table
+        // lookup per row, about 5x slower (issue #160).
         cmd.CommandText = """
             SELECT DISTINCT o.in_project_id AS consumer, s.project_id AS dependency
-            FROM occurrences o
+            FROM occurrences o NOT INDEXED
             JOIN symbols s ON s.id = o.target_symbol_id
             WHERE o.source_symbol_id IS NULL AND o.in_project_id != s.project_id;
             """;
