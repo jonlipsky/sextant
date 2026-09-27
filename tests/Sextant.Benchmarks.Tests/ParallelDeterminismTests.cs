@@ -25,7 +25,7 @@ public sealed class ParallelDeterminismTests
         try
         {
             var slnx = CorpusGenerator.GenerateCorrectnessCorpus(root);
-            Restore(slnx);
+            CorpusRestore.Restore(slnx);
 
             // Sequential: one document at a time (MaxParallelism = 1).
             var sequential = await IndexAndDumpAsync(
@@ -70,7 +70,7 @@ public sealed class ParallelDeterminismTests
         try
         {
             var slnx = CorpusGenerator.GenerateCorrectnessCorpus(root);
-            Restore(slnx);
+            CorpusRestore.Restore(slnx);
 
             using var db = new IndexDatabase(Path.Combine(dbDir, "index.db"));
             db.RunMigrations();
@@ -217,23 +217,5 @@ public sealed class ParallelDeterminismTests
     {
         try { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); }
         catch { /* best-effort cleanup */ }
-    }
-
-    private static void Restore(string solutionPath)
-    {
-        var psi = new System.Diagnostics.ProcessStartInfo("dotnet", $"restore \"{solutionPath}\"")
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
-        using var process = System.Diagnostics.Process.Start(psi)!;
-        var stdoutTask = process.StandardOutput.ReadToEndAsync();
-        var stderr = process.StandardError.ReadToEnd();
-        stdoutTask.GetAwaiter().GetResult();
-        process.WaitForExit();
-        if (process.ExitCode != 0)
-            Assert.Inconclusive($"restore of the generated corpus failed (exit {process.ExitCode}): {stderr}");
     }
 }
