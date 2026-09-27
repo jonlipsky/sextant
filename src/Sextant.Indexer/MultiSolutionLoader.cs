@@ -18,6 +18,16 @@ public sealed record SolutionCoverage(
     IReadOnlyList<SkippedProject> SkippedProjects);
 
 /// <summary>
+/// The projects one selected solution DECLARES (absolute paths, declaration order). A multi-solution load
+/// opens projects individually, so the combined <see cref="Solution"/> has no solution file of its own;
+/// the orchestrator uses this to record each selected solution's <c>solution → project</c> mapping (the
+/// <c>solution:</c> query scope) exactly as the single-solution path does from <see cref="Solution.FilePath"/>.
+/// </summary>
+/// <param name="SolutionPath">The absolute solution path.</param>
+/// <param name="DeclaredProjects">The absolute paths of the projects the solution declares.</param>
+public sealed record SolutionMembership(string SolutionPath, IReadOnlyList<string> DeclaredProjects);
+
+/// <summary>
 /// The outcome of loading one or more solutions into a single workspace: the combined (possibly partial)
 /// <see cref="Solution"/> spanning the UNION of all solutions' projects (de-duplicated by project
 /// identity), the union of skipped projects, and per-solution coverage.
@@ -35,6 +45,13 @@ public sealed record MultiSolutionLoadResult(
     /// order — the denominator for checkout coverage (issue #119).
     /// </summary>
     public IReadOnlyList<string> DeclaredProjects { get; init; } = [];
+
+    /// <summary>
+    /// Each selected solution's declared projects, in selection order. Passed to
+    /// <see cref="IndexOrchestrator.IndexSolutionAsync"/> so a multi-solution snapshot keeps its
+    /// <c>solution → project</c> mappings (issue #124).
+    /// </summary>
+    public IReadOnlyList<SolutionMembership> Membership { get; init; } = [];
 }
 
 /// <summary>
@@ -43,12 +60,18 @@ public sealed record MultiSolutionLoadResult(
 /// DE-DUPLICATED by project file path (a project shared by several solution heads is loaded once), which —
 /// because one checkout's absolute project path is 1:1 with its project identity
 /// <c>(git-remote, repo-relative path)</c> — yields the union-of-projects-by-identity the acceptance
-/// criteria require. A single selected solution preserves the existing fast whole-solution load path
-/// byte-for-byte, so the common (and default) single-solution case is unchanged.
+/// criteria require. A single selected solution (a one-solution checkout, or a one-entry config) preserves
+/// the existing fast whole-solution load path byte-for-byte. Several solutions — an explicit list, or the
+/// no-config default union of every discovered solution (issue #124) — take the per-project union path,
+/// which opens each project individually (no solution context, so <c>$(SolutionDir)</c> is not set by a
+/// solution) to isolate per-project load faults.
 /// </summary>
 public static class MultiSolutionLoader
 {
     private static readonly StringComparer PathComparer = StringComparer.OrdinalIgnoreCase;
+
+    /// <summary>The comparer the union uses to de-duplicate project files (shared with membership mapping).</summary>
+    internal static StringComparer ProjectPathComparer => PathComparer;
 
     /// <summary>
     /// Loads <paramref name="solutionPaths"/> (already selected + deterministically ordered by
@@ -81,8 +104,10 @@ public static class MultiSolutionLoader
         var union = ComputeUnion(perSolutionDeclared);
         if (solutionPaths.Count == 1)
         {
-            // Preserve the byte-identical single-solution fast path (OpenSolutionAsync) so the common and
-            // default case — and its determinism/parity test coverage — is unchanged.
+            // Preserve the byte-identical single-solution fast path (OpenSolutionAsync) when exactly ONE
+            // solution is selected (a one-solution checkout or a one-entry config), so that case — and its
+            // determinism/parity test coverage — is unchanged. A multi-solution no-config checkout selects the
+            // union (#124) and takes the per-project branch below.
             loaded = await SolutionLoader.LoadSolutionResilientlyAsync(
                 solutionPaths[0], onDiagnostic, cancellationToken).ConfigureAwait(false);
         }
@@ -95,7 +120,10 @@ public static class MultiSolutionLoader
         var coverage = BuildCoverage(perSolutionDeclared, loaded.SkippedProjects);
         return new MultiSolutionLoadResult(loaded.Solution, loaded.SkippedProjects, coverage)
         {
-            DeclaredProjects = union
+            DeclaredProjects = union,
+            Membership = perSolutionDeclared
+                .Select(p => new SolutionMembership(Path.GetFullPath(p.Solution), p.Declared))
+                .ToList()
         };
     }
 

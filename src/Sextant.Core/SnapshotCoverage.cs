@@ -28,7 +28,11 @@ public sealed record SnapshotCoverage
     /// <summary>One human-readable reason per coverage gap; empty when <see cref="Verdict"/> is complete.</summary>
     public IReadOnlyList<string> Reasons { get; init; } = [];
 
-    /// <summary>How the solution set was chosen: <c>configured</c>, <c>default_root</c>, or <c>none</c>.</summary>
+    /// <summary>
+    /// How the solution set was chosen: <c>configured</c>, <c>default_union</c> (no config: every discovered
+    /// solution, issue #124), or <c>none</c>. Rows recorded before #124 may carry the retired single-solution
+    /// value <c>default_root</c>.
+    /// </summary>
     public string? SelectionSource { get; init; }
 
     /// <summary>Solutions found on disk (default selection) or listed in <c>sextant.json</c> (configured selection).</summary>
@@ -37,7 +41,11 @@ public sealed record SnapshotCoverage
     /// <summary>Solutions actually indexed.</summary>
     public int SolutionsSelected { get; init; }
 
-    /// <summary>Solutions discovered on disk that the selection left out.</summary>
+    /// <summary>
+    /// Solutions discovered on disk that the selection left out. Always 0 under <c>default_union</c> (every
+    /// discovered solution is selected) and <c>configured</c> (no discovery); non-zero only on pre-#124
+    /// <c>default_root</c> rows.
+    /// </summary>
     public int SolutionsNotSelected { get; init; }
 
     /// <summary>Configured solutions that could not be used (missing, invalid, outside the checkout).</summary>

@@ -24,9 +24,14 @@ internal static class ScopeResolver
         if (scope.StartsWith("solution:"))
         {
             var solutionStore = new SolutionStore(conn);
-            var projectIds = solutionStore.GetProjectIdsForSolution(scope[9..]);
-            if (projectIds.Count == 0) return ScopeFilter.None;
-            return new ScopeFilter { ProjectIds = projectIds };
+            var solutionPath = scope[9..];
+            var projectIds = solutionStore.GetProjectIdsForSolution(solutionPath);
+            if (projectIds.Count > 0)
+                return new ScopeFilter { ProjectIds = projectIds };
+            // A KNOWN solution with no mapped project (e.g. a selected multi-solution head none of whose
+            // projects loaded, issue #124) fails CLOSED: an empty, non-null project set matches nothing,
+            // rather than degrading to an unfiltered whole-repository query.
+            return solutionStore.Exists(solutionPath) ? new ScopeFilter { ProjectIds = [] } : ScopeFilter.None;
         }
 
         return ScopeFilter.None;

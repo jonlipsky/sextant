@@ -82,4 +82,17 @@ public sealed class SolutionStore(SqliteConnection connection)
             results.Add(reader.GetInt64(0));
         return results;
     }
+
+    /// <summary>
+    /// True when <paramref name="solutionPath"/> is a recorded solution, even one with no mapped projects
+    /// (e.g. a selected solution none of whose projects loaded) — distinguishes "known but empty" from
+    /// "unknown" so a <c>solution:</c> scope over the former can fail closed.
+    /// </summary>
+    public bool Exists(string solutionPath)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT 1 FROM solutions WHERE file_path = @path LIMIT 1;";
+        cmd.Parameters.AddWithValue("@path", solutionPath);
+        return cmd.ExecuteScalar() is not null;
+    }
 }

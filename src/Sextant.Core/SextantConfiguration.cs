@@ -197,7 +197,7 @@ public sealed class SextantConfiguration
     /// WITHOUT the lenient fall-through that <see cref="Load"/> applies (it swallows a malformed file and
     /// returns defaults). Distinguishing an ABSENT config (no scoping intent) from a MALFORMED one (a
     /// scoping intent the operator got wrong) is what lets the service checkout provider refuse to silently
-    /// fall back to a default-root pick — and thus never report PARTIAL coverage as COMPLETE — when a
+    /// fall back to the no-config default selection — and thus never report PARTIAL coverage as COMPLETE — when a
     /// checkout's config is broken (issue #109).
     /// </summary>
     /// <param name="checkoutDir">The checkout root that may contain a <c>sextant.json</c>.</param>
