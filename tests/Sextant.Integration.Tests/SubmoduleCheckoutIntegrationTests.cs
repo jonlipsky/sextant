@@ -85,6 +85,18 @@ public class SubmoduleCheckoutIntegrationTests : IDisposable
             "SELECT remote_url FROM repositories WHERE is_provider = 1 LIMIT 1;", conn).ExecuteScalar()!;
         Assert.AreEqual(GitRemoteNormalizer.Normalize(new Uri(providerDir).AbsoluteUri), providerUrl,
             "the provider is keyed by the submodule's OWN remote (not the parent's)");
+
+        // #162: the provider snapshot carries its OWN coverage, computed by the worker over the submodule
+        // subtree and recorded in the publish transaction. The provider has no solution of its own and its only
+        // project loaded, so it is complete — judged on the parent's selection.
+        var providerSnapshotId = Convert.ToInt64(new SqliteCommand(
+            "SELECT id FROM snapshots WHERE is_provider = 1 LIMIT 1;", conn).ExecuteScalar());
+        var providerCoverage = new SnapshotCoverageStore(conn).Get(providerSnapshotId);
+        Assert.IsNotNull(providerCoverage, "the provider snapshot recorded coverage at publish (#162)");
+        Assert.AreEqual(SnapshotCoverageVerdict.Complete, providerCoverage!.Verdict, string.Join(" ", providerCoverage.Reasons));
+        Assert.AreEqual(SnapshotCoverageBuilder.ParentSelectionSource, providerCoverage.SelectionSource);
+        Assert.AreEqual(1, providerCoverage.ProjectFilesOnDisk, "only the provider subtree is counted");
+        Assert.AreEqual(1, providerCoverage.ProjectsLoaded);
         var combineKey = (string?)new SqliteCommand("""
             SELECT s.symbol_key FROM symbols s
             JOIN projects p ON p.id = s.project_id
