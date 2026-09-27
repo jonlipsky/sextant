@@ -113,6 +113,8 @@ internal static partial class GlobalJsonSdkPin
             var other => other.ToJsonString()
         };
 
-    [GeneratedRegex(@"^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.[1-9]\d{2,}(?:-[0-9A-Za-z\-]+(?:\.[0-9A-Za-z\-]+)*)?(?:\+[0-9A-Za-z\-]+(?:\.[0-9A-Za-z\-]+)*)?$", RegexOptions.CultureInvariant)]
+    // ASCII digits only (\d also matches other Unicode digits); a numeric prerelease identifier has no leading
+    // zero (SemVer 2.0, as hostfxr parses it); build metadata is unconstrained.
+    [GeneratedRegex(@"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.[1-9][0-9]{2,}(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$", RegexOptions.CultureInvariant)]
     private static partial Regex SdkVersionRegex();
 }

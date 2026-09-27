@@ -514,15 +514,87 @@ public sealed class SdkPinGuardTests
     {
         WriteHead("1111111111111111111111111111111111111111");
         WritePin(GlobalJson);
-        _ = new SdkPinGuard(probe: new FakeHostFxr()).Apply(_checkout, [_solution]); // "crash"
+        var guard = new SdkPinGuard(probe: new FakeHostFxr());
+        _ = guard.Apply(_checkout, [_solution]); // "crash"
         var neutralized = File.ReadAllBytes(GlobalJson);
+        string tempPath;
+        using (var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllBytes(guard.JournalPathFor(_checkout))))
+            tempPath = doc.RootElement.GetProperty("entries")[0].GetProperty("temp_path").GetString()!;
 
-        // Re-provisioned at a commit whose committed global.json is byte-identical to the neutralized form.
+        // Re-provisioned at a commit whose committed global.json is byte-identical to the neutralized form, and
+        // which even holds a file at the journaled temp-file path: both belong to the new commit now.
         WriteHead("2222222222222222222222222222222222222222");
+        File.WriteAllText(tempPath, "the new commit's file");
 
         Assert.IsTrue(new SdkPinGuard(probe: new FakeHostFxr()).Recover(_checkout));
         CollectionAssert.AreEqual(neutralized, File.ReadAllBytes(GlobalJson), "the other commit's content is never overwritten");
+        Assert.AreEqual("the new commit's file", File.ReadAllText(tempPath), "nothing in the moved checkout is deleted either");
         Assert.AreEqual(0, Directory.GetFiles(JournalDir).Length);
+    }
+
+    [TestMethod]
+    public void Restore_ThroughADirectorySwappedForALinkDuringTheLoad_IsRefused()
+    {
+        var projectDir = Path.Combine(_checkout, "src", "App");
+        var projectPin = Path.Combine(projectDir, "global.json");
+        WritePin(projectPin);
+        var outside = Path.Combine(_root, "outside");
+        Directory.CreateDirectory(outside);
+
+        var overlay = new SdkPinGuard(probe: new FakeHostFxr()).Apply(_checkout, [_solution]);
+        Assert.IsTrue(overlay.Findings.Single().OverrideApplied);
+
+        // Something run by the load replaces the pin's directory with a link that points outside the checkout.
+        Directory.Move(projectDir, projectDir + ".moved");
+        try
+        {
+            Directory.CreateSymbolicLink(projectDir, outside);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            Assert.Inconclusive($"symbolic links cannot be created here: {ex.Message}");
+            return;
+        }
+
+        overlay.Restore();
+
+        StringAssert.Contains(overlay.RestoreError, "symbolic link");
+        Assert.AreEqual(0, Directory.GetFileSystemEntries(outside).Length, "nothing is written through the link");
+        Assert.AreEqual(1, Directory.GetFiles(JournalDir).Length, "the journal is kept, so the checkout stays blocked");
+        Assert.IsFalse(new SdkPinGuard(probe: new FakeHostFxr()).Recover(_checkout), "recovery refuses the link too");
+        Assert.AreEqual(0, Directory.GetFileSystemEntries(outside).Length);
+    }
+
+    [TestMethod]
+    public void RelativeJournalRoot_IsAnchored_SoACrashIsStillRecoverable()
+    {
+        var original = WritePin(GlobalJson);
+        var relative = Path.GetRelativePath(Environment.CurrentDirectory, Path.Combine(_root, "journal"));
+        if (Path.IsPathRooted(relative))
+        {
+            Assert.Inconclusive("the temp directory is on another volume than the working directory");
+            return;
+        }
+        var options = new SdkPinOptions { JournalRoot = relative };
+        _ = new SdkPinGuard(options, new FakeHostFxr()).Apply(_checkout, [_solution]); // "crash"
+
+        Assert.AreEqual(1, new SdkPinGuard(options, new FakeHostFxr()).RecoverAll());
+        CollectionAssert.AreEqual(original, File.ReadAllBytes(GlobalJson));
+    }
+
+    [TestMethod]
+    public void JournalRootInsideTheCheckout_IsRefused_WithoutModifyingTheFile()
+    {
+        var original = WritePin(GlobalJson);
+        var options = new SdkPinOptions { JournalRoot = Path.Combine(_checkout, "journal") };
+
+        var overlay = new SdkPinGuard(options, new FakeHostFxr()).Apply(_checkout, [_solution]);
+
+        var finding = overlay.Findings.Single();
+        Assert.IsFalse(finding.OverrideApplied);
+        StringAssert.Contains(finding.NotOverriddenReason, "journal would be inside the checkout");
+        CollectionAssert.AreEqual(original, File.ReadAllBytes(GlobalJson));
+        Assert.IsFalse(Directory.Exists(options.JournalRoot));
     }
 
     [TestMethod]
@@ -632,6 +704,11 @@ public sealed class SdkPinGuardTests
     [DataRow("9.0.999", true)]
     [DataRow("10.0.100-preview.7.25380.108", true)]
     [DataRow("10.0.300+build.1", true)]
+    [DataRow("10.0.300-rc.0", true)]
+    [DataRow("10.0.300-0a", true)]
+    [DataRow("10.0.300-preview.01", false)]
+    [DataRow("\uFF11\uFF10.0.300", false)]
+    [DataRow("10.0.\u0663\u0660\u0660", false)]
     [DataRow("1.2.0", false)]
     [DataRow("10.0.3", false)]
     [DataRow("10.0.099", false)]

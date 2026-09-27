@@ -209,7 +209,10 @@ cost a full copy per job and break checkout-relative paths. So the service handl
    recorded. The committed bytes, last-write time and unix mode are **restored in a `finally` immediately
    after the MSBuild load**, before the coverage scan, the `EvaluationFingerprint`, or any indexing reads
    the checkout. The persistent, reused checkout therefore never diverges from its commit (`git status`
-   stays clean).
+   stays clean). The symlink/junction check is repeated right before the restore writes, so a directory
+   swapped for a link during the load is refused (the restore fails closed, as below). This is defense in
+   depth, not a security boundary: evaluated repository code already holds the worker's filesystem
+   authority (see the evaluation sandbox; OS-hard isolation is #76).
 3. **Crash-safe.** Before any file is modified, the original bytes and the checkout's `HEAD` commit are
    journaled atomically (fsynced, with the rename and a newly created journal directory flushed on Unix) to
    `<checkout-root>/.sextant-sdk-pin/<checkout>-<hash>.json`, outside every working tree. Each rewrite goes
@@ -224,8 +227,9 @@ cost a full copy per job and break checkout-relative paths. So the service handl
      committed `global.json` (e.g. `git checkout -- global.json`) or by deleting the checkout so it is
      re-cloned; the journal then retires itself;
    - once the checkout has **moved to another commit** (the cloning provider re-provisions a mismatched
-     checkout as a whole fresh tree) or is gone, the journal is retired **without writing anything** to the
-     checkout — even a file whose bytes happen to equal the neutralized form belongs to the new commit. If the
+     checkout as a whole fresh tree) or is gone, the journal is retired **without writing or deleting
+     anything** in the checkout — even a file whose bytes happen to equal the neutralized form, or one at
+     the journaled temp-file path, belongs to the new commit. If the
      journaled commit can no longer be confirmed (the checkout's `HEAD` is unreadable), it fails closed;
    - a journal is replayed only when it is well formed and confined: it must be the journal of the checkout
      it names, that checkout must be on the checkout volume, and it must list at least one entry, each a
@@ -257,7 +261,8 @@ cost a full copy per job and break checkout-relative paths. So the service handl
    - the `global.json` lies outside the checkout, or is reached through a symlink/junction (including a
      symlinked checkout directory);
    - it cannot be read or parsed, it has no `sdk` section, or its `sdk` section pins no version;
-   - the journal cannot be written;
+   - the journal cannot be written, or would land inside the checkout (a checkout at a filesystem root, or
+     a journal root configured inside it), where recovery could never replay it;
    - neutralizing it still leaves no resolvable SDK (for example, a parent pin outside the checkout also
      fails). In that case it is restored at once.
 
