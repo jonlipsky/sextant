@@ -37,7 +37,7 @@ public sealed class ExtractorParityTests
         try
         {
             var slnx = CorpusGenerator.GenerateCorrectnessCorpus(root);
-            Restore(slnx);
+            CorpusRestore.Restore(slnx);
 
             // Two from-scratch full indexes of the identical on-disk corpus, one per extractor.
             using var legacyDb = new IndexDatabase(Path.Combine(legacyDir, "index.db"));
@@ -220,23 +220,5 @@ public sealed class ExtractorParityTests
     {
         try { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); }
         catch { /* best-effort cleanup */ }
-    }
-
-    private static void Restore(string solutionPath)
-    {
-        var psi = new System.Diagnostics.ProcessStartInfo("dotnet", $"restore \"{solutionPath}\"")
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
-        using var process = System.Diagnostics.Process.Start(psi)!;
-        var stdoutTask = process.StandardOutput.ReadToEndAsync();
-        var stderr = process.StandardError.ReadToEnd();
-        stdoutTask.GetAwaiter().GetResult();
-        process.WaitForExit();
-        if (process.ExitCode != 0)
-            Assert.Inconclusive($"restore of the generated corpus failed (exit {process.ExitCode}): {stderr}");
     }
 }

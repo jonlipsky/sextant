@@ -299,14 +299,21 @@ correctness corpus):
 dotnet test Sextant.slnx --no-build --filter "FullyQualifiedName~Sextant.Benchmarks.Tests"
 ```
 
-There is no CI workflow in this repository yet. When one is added, the benchmark can be wired in as
-two steps — run the fixtures, then produce and upload an artifact:
+The fixtures run in CI as part of the required `Build & Test` job (`.github/workflows/ci.yml`),
+which runs the whole solution's tests. That job has a 30-minute timeout, and it runs `dotnet test`
+with `--blame-hang-timeout 10m --blame-hang-dump-type mini`. So a hung test host is dumped and
+killed instead of stalling the job, and any dumps or blame sequence files are uploaded as the
+`test-hang-diagnostics` artifact (issue #144).
+
+Every `dotnet restore` and `git` subprocess started by the fixtures and the harness goes through
+`tests/Shared/BoundedProcess.cs`. It drains stdout and stderr concurrently and bounds the wait.
+On timeout it kills only the process tree it started. Restores run with build servers and MSBuild
+node reuse disabled, so a lingering node cannot hold the redirected pipes open.
+
+The baseline report is not produced in CI yet. It can be wired in as extra steps:
 
 ```yaml
-# Example GitHub Actions steps (no workflow is committed yet):
-- name: Benchmark correctness fixtures
-  run: dotnet test Sextant.slnx --filter "FullyQualifiedName~Sextant.Benchmarks.Tests"
-
+# Example GitHub Actions steps (not in the committed workflow):
 - name: Produce baseline benchmark report
   run: dotnet run --project tests/Sextant.Benchmarks -- --corpus self --out $RUNNER_TEMP/benchmark-results
 

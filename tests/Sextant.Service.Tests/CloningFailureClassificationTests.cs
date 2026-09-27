@@ -67,6 +67,9 @@ public class CloningFailureClassificationTests
             GitStage.Fetch, GitFailureKind.NonZeroExit, "fatal: the remote end hung up unexpectedly"));
         Assert.IsTrue(CloningCheckoutProvider.IsTransientGitFailure(
             GitStage.Fetch, GitFailureKind.NonZeroExit, "fatal: early EOF: did not send all necessary objects"));
+        Assert.IsTrue(CloningCheckoutProvider.IsTransientGitFailure(
+            GitStage.Fetch, GitFailureKind.NonZeroExit, "fatal: unable to access 'https://h/r/': The requested URL returned error: 503"),
+            "a 5xx is a server blip, not the (permanent) unfollowed-redirect 30x");
     }
 
     [DataTestMethod]
@@ -77,6 +80,7 @@ public class CloningFailureClassificationTests
     [DataRow("fatal: could not read Username for 'https://host': terminal prompts disabled")]
     [DataRow("fatal: couldn't find remote ref deadbeef")]
     [DataRow("fatal: reference is not a tree: deadbeef")]
+    [DataRow("fatal: unable to access 'https://host/repo/': The requested URL returned error: 301")]
     public void Fetch_UnambiguousPermanentErrors_AreDeterministic(string stderr)
     {
         Assert.IsFalse(CloningCheckoutProvider.IsTransientGitFailure(GitStage.Fetch, GitFailureKind.NonZeroExit, stderr),
