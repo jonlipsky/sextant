@@ -39,6 +39,13 @@ public static partial class SubmoduleDiscovery
             var fullPath = Path.Combine(repoRoot, submodulePath);
             var isDirty = parsed.IsDirty;
 
+            // An UNPOPULATED submodule (`-` prefix: an empty directory, no `.git` file/dir) has no remote of
+            // its own — `git remote get-url` inside it would walk up and report the PARENT's origin, turning a
+            // missing submodule into a bogus "provider" at the parent's URL. It contributes no projects, so
+            // skip it (issue #125: a service checkout leaves an unfetchable submodule unpopulated).
+            if (!IsPopulatedSubmodule(fullPath))
+                continue;
+
             // Get the submodule's own remote URL
             var remoteUrl = await GetSubmoduleRemoteUrl(fullPath);
             if (string.IsNullOrWhiteSpace(remoteUrl))
@@ -88,6 +95,16 @@ public static partial class SubmoduleDiscovery
 
     /// <summary>The parsed shape of one <c>git submodule status</c> line (see <see cref="ParseStatusLine"/>).</summary>
     public readonly record struct SubmoduleStatusLine(bool Matched, string CommitSha, string Path, bool IsDirty);
+
+    /// <summary>
+    /// True when <paramref name="submoduleFullPath"/> is a checked-out submodule: it has its own <c>.git</c>
+    /// (a gitdir link file or an embedded directory). An empty directory is an unpopulated submodule.
+    /// </summary>
+    internal static bool IsPopulatedSubmodule(string submoduleFullPath)
+    {
+        var dotGit = Path.Combine(submoduleFullPath, ".git");
+        return File.Exists(dotGit) || Directory.Exists(dotGit);
+    }
 
     /// <summary>
     /// Discovers .csproj files within a submodule directory.

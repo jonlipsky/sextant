@@ -59,6 +59,17 @@ public sealed record EnsureSnapshotRequest
     public bool ResolveIsDefaultBranch() => IsDefaultBranch ?? (BranchName is null);
 
     /// <summary>
+    /// Set by <see cref="SnapshotService"/> — never bound from the wire (internal + ignored) — when this run is
+    /// the LAST provisioning attempt the job-wide bound allows (issue #125). A clone-mode checkout then degrades
+    /// a still-TRANSIENT submodule failure (an unreachable host, a persistent 5xx) to an unpopulated submodule
+    /// (coverage partial with the reason) instead of failing the whole checkout, and a failed upgrade of a
+    /// cached pre-#125 checkout keeps serving the cached tree. Earlier attempts keep the transient retry.
+    /// Deliberately NOT folded into <see cref="ToIdentity"/>.
+    /// </summary>
+    [JsonIgnore]
+    internal bool IsFinalProvisioningAttempt { get; init; }
+
+    /// <summary>
     /// Builds the durable identity for this request using the service-side schema/analyzer/toolchain.
     /// A committed-branch ensure is always a clean, non-overlay identity (no working-tree delta). When the
     /// request omits <see cref="ConfigHash"/> the caller's <paramref name="fallbackConfigHash"/> (the
