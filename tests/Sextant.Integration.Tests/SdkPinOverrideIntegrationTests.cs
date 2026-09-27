@@ -178,6 +178,49 @@ public class SdkPinOverrideIntegrationTests
     }
 
     [TestMethod]
+    public async Task RestoreFailureAfterASuccessfulLoad_FailsTheJob_WithoutIndexingTheDivergedCheckout()
+    {
+        const string foreign = "{\n  \"comment\": \"rewritten by something else\"\n}\n";
+        var commit = CreateRepo(("global.json", UnsatisfiablePin));
+        var globalJson = Path.Combine(_checkout, "global.json");
+
+        var (result, _) = await ProduceAsync(commit, [Path.Combine(_checkout, "App.slnx")], overrideEnabled: true,
+            probe: new RewritingProbe(foreign));
+
+        // The load succeeded (the rewritten file has no pin), but the committed bytes could not be put back:
+        // the job must fail with the restore error — never index/publish a checkout that diverges from its commit.
+        Assert.AreEqual(SnapshotJobStatus.Failed, result.Status, string.Join('\n', _log));
+        StringAssert.Contains(result.Error, "could not restore the committed file");
+        var restore = result.Projects.Single(p => p.Code == LocalIndexerSnapshotWorker.SdkPinRestoreFailedCode);
+        Assert.AreEqual(JobDiagnosticSeverity.Error, restore.Severity);
+        StringAssert.Contains(restore.Message, "./global.json");
+        Assert.IsFalse(restore.Message.Contains(_checkout, StringComparison.OrdinalIgnoreCase), "no worker volume paths");
+        Assert.AreEqual(0, Scalar("SELECT COUNT(*) FROM snapshots WHERE status = 'complete';"), "nothing was published");
+        Assert.AreEqual(0, Scalar("SELECT COUNT(*) FROM symbols;"), "nothing was indexed");
+        Assert.AreEqual(foreign, File.ReadAllText(globalJson), "content something else wrote is never clobbered");
+        Assert.AreEqual(1, Directory.GetFiles(_journalRoot).Length, "the journal is kept for the next job");
+    }
+
+    [TestMethod]
+    public async Task RestoreFailure_OutranksALoadFailure()
+    {
+        // The rewrite re-pins an unsatisfiable band, so the load ALSO dies in hostfxr — but the checkout no
+        // longer matches its commit, and that is what the job must report (not a generic sdk_resolution_failed).
+        const string foreign = "{\n  \"sdk\": { \"version\": \"10.0.998\", \"rollForward\": \"disable\" }\n}\n";
+        var commit = CreateRepo(("global.json", UnsatisfiablePin));
+
+        var (result, _) = await ProduceAsync(commit, [Path.Combine(_checkout, "App.slnx")], overrideEnabled: true,
+            probe: new RewritingProbe(foreign));
+
+        Assert.AreEqual(SnapshotJobStatus.Failed, result.Status);
+        StringAssert.Contains(result.Error, "could not restore the committed file");
+        Assert.IsTrue(result.Projects.Any(p => p.Code == LocalIndexerSnapshotWorker.SdkPinRestoreFailedCode));
+        Assert.IsFalse(result.Error!.Contains("could not be resolved on this worker", StringComparison.Ordinal),
+            "the restore failure is reported, not the SDK-resolution failure it caused");
+        Assert.AreEqual(0, Scalar("SELECT COUNT(*) FROM snapshots WHERE status = 'complete';"));
+    }
+
+    [TestMethod]
     public async Task MultiSolution_OnlyOneSolutionPinsAMissingBand_IsPartialOff_AndCompleteOn()
     {
         var commit = CreateRepo(
@@ -209,12 +252,38 @@ public class SdkPinOverrideIntegrationTests
 
     // ---- fixture ------------------------------------------------------------------------------------
 
+    /// <summary>
+    /// The real hostfxr probe, except that the FIRST time it is asked to re-probe a directory whose
+    /// <c>global.json</c> is currently neutralized (no <c>"sdk"</c> section) it simulates something else rewriting
+    /// that file mid-job — writing <paramref name="foreign"/> — and reports success, so the guard proceeds with
+    /// the override and the post-load restore then finds content it must not clobber.
+    /// </summary>
+    private sealed class RewritingProbe(string foreign) : ISdkResolutionProbe
+    {
+        private bool _rewritten;
+
+        public SdkResolutionProbeResult Probe(string workingDirectory)
+        {
+            var globalJson = Path.Combine(workingDirectory, "global.json");
+            if (!_rewritten && File.Exists(globalJson)
+                && !File.ReadAllText(globalJson).Contains("\"sdk\"", StringComparison.Ordinal))
+            {
+                _rewritten = true;
+                File.WriteAllText(globalJson, foreign);
+                return new SdkResolutionProbeResult { ResolvedSdkVersion = "10.0.0-rewritten" };
+            }
+            return HostFxrSdkResolutionProbe.Instance.Probe(workingDirectory);
+        }
+
+        public IReadOnlyList<string> ListInstalledSdks() => HostFxrSdkResolutionProbe.Instance.ListInstalledSdks();
+    }
     private const string ProjectXml =
         "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <TargetFramework>net10.0</TargetFramework>\n" +
         "  </PropertyGroup>\n</Project>\n";
 
     private async Task<(SnapshotWorkResult Result, string IdentityHash)> ProduceAsync(
-        string commit, IReadOnlyList<string> solutions, bool overrideEnabled, bool sandboxed = false)
+        string commit, IReadOnlyList<string> solutions, bool overrideEnabled, bool sandboxed = false,
+        ISdkResolutionProbe? probe = null)
     {
         var config = new SextantConfiguration();
         var resolution = new CheckoutResolution
@@ -224,7 +293,7 @@ public class SdkPinOverrideIntegrationTests
             Source = solutions.Count > 1 ? SolutionSelectionSource.Configured : SolutionSelectionSource.DefaultRoot
         };
         var guard = new SdkPinGuard(
-            new SdkPinOptions { OverrideEnabled = overrideEnabled, JournalRoot = _journalRoot }, log: _log.Add);
+            new SdkPinOptions { OverrideEnabled = overrideEnabled, JournalRoot = _journalRoot }, probe, _log.Add);
 
         // The production host enforces the evaluation sandbox by default: the guard's probe + rewrite then run
         // inside its scrubbed environment scope, with per-job scratch under the service scratch root.

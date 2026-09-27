@@ -38,6 +38,13 @@ public sealed partial record HostFxrSdkResolutionError
     public IReadOnlyList<string> InstalledSdks { get; init; } = [];
 
     /// <summary>
+    /// True when hostfxr attributed the failure to a <c>global.json</c> pin (it reported the file or a
+    /// requested version). False for a plain "no compatible SDK installed" failure with no pin involved (e.g.
+    /// "No .NET SDKs were found." on a runtime-only image), which callers must not describe as a pin.
+    /// </summary>
+    public bool IsGlobalJsonPin => GlobalJsonPath is not null || RequestedVersion is not null;
+
+    /// <summary>
     /// True when <paramref name="message"/> is a hostfxr SDK-resolution failure; <paramref name="error"/>
     /// then carries whatever details the message contained.
     /// </summary>
@@ -105,8 +112,15 @@ public sealed partial record HostFxrSdkResolutionError
 
     private static bool IsSdkResolutionFailure(string message) =>
         message.Contains(ResolveFunction, StringComparison.Ordinal)
+        || message.Contains(SdkResolveFailureCodeText, StringComparison.Ordinal)
+        || message.Contains(SdkResolveFailureHex, StringComparison.OrdinalIgnoreCase)
         || message.Contains("A compatible .NET SDK was not found", StringComparison.OrdinalIgnoreCase)
         || message.Contains("A compatible installed .NET SDK for global.json version", StringComparison.OrdinalIgnoreCase);
+
+    private static readonly string SdkResolveFailureCodeText =
+        "Error code: " + SdkResolveFailureCode.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    private const string SdkResolveFailureHex = "0x8000809B";
 
     private static string? FirstGroup(Regex regex, string input, string group = "value")
     {

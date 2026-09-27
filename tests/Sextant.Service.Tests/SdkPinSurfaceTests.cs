@@ -111,6 +111,103 @@ public sealed class SdkPinSurfaceTests
     }
 
     [TestMethod]
+    public void WholeLoadSdkFailure_WithNoPin_NeverBlamesAGlobalJson()
+    {
+        // hostfxr also fails resolution on a worker with no usable SDK at all; there is no pin to relax then.
+        Assert.IsTrue(HostFxrSdkResolutionError.TryParse(
+            "Error while calling hostfxr function hostfxr_resolve_sdk2. Error code: -2147450725 Detailed error: " +
+            "No .NET SDKs were found.", out var error));
+        Assert.IsFalse(error.IsGlobalJsonPin);
+
+        var result = LocalIndexerSnapshotWorker.SdkResolutionFailed(CheckoutDir, error, [], []);
+
+        Assert.AreEqual(SnapshotJobStatus.Failed, result.Status);
+        StringAssert.Contains(result.Error, "no compatible .NET SDK could be resolved on this worker");
+        StringAssert.Contains(result.Error, "installed SDK(s): unknown");
+        Assert.IsFalse(result.Error!.Contains("rollForward", StringComparison.Ordinal));
+        Assert.IsFalse(result.Error.Contains("pins", StringComparison.Ordinal));
+        var diagnostic = result.Projects.Single();
+        Assert.AreEqual(LocalIndexerSnapshotWorker.SdkResolutionFailedCode, diagnostic.Code);
+        Assert.AreEqual(JobDiagnosticSeverity.Error, diagnostic.Severity);
+        Assert.IsNull(diagnostic.ProjectPath);
+        StringAssert.Contains(diagnostic.Message, "Install a .NET SDK on the worker");
+    }
+
+    [TestMethod]
+    public void ProjectSkippedWithNoPin_IsTypedWithoutBlamingAGlobalJson()
+    {
+        var reason = "Error while calling hostfxr function hostfxr_resolve_sdk2. Error code: -2147450725 Detailed " +
+                     "error: No .NET SDKs were found.";
+        var skipped = new[] { new SkippedProject($"{CheckoutDir}/tools/Tool/Tool.csproj", reason) };
+        var load = new MultiSolutionLoadResult(new AdhocWorkspace().CurrentSolution, skipped,
+        [
+            new SolutionCoverage($"{CheckoutDir}/App.slnx", 1, 1, []),
+            new SolutionCoverage($"{CheckoutDir}/tools/Tools.slnx", 1, 0, skipped)
+        ]);
+        var resolution = Resolution();
+        var coverage = SnapshotCoverageBuilder.Build(CheckoutDir, resolution, load, new SnapshotCoverageBuilder.Inventory([], []));
+
+        var result = LocalIndexerSnapshotWorker.BuildResult(9, CheckoutDir, resolution, load, coverage, [], ["10.0.401"]);
+
+        Assert.AreEqual(SnapshotJobStatus.Partial, result.Status);
+        StringAssert.Contains(result.Error,
+            "1 declared project(s) could not be loaded because no compatible .NET SDK could be resolved on this worker.");
+        Assert.IsFalse(result.Error!.Contains("global.json pins", StringComparison.Ordinal));
+        var diagnostic = result.Projects.Single(p => p.Code == LocalIndexerSnapshotWorker.SdkResolutionFailedCode);
+        StringAssert.Contains(diagnostic.Message, "no compatible .NET SDK could be resolved (hostfxr reported no global.json pin)");
+    }
+
+    [TestMethod]
+    public async Task UnreplayableLeftoverJournal_FailsTheJobBeforeAnyLoad_AndKeepsTheJournal()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"sextant_sdkpin_gate_{Guid.NewGuid():N}");
+        var checkout = Path.Combine(root, "checkouts", "repo");
+        var journalRoot = Path.Combine(root, "checkouts", SdkPinOptions.JournalDirectoryName);
+        Directory.CreateDirectory(checkout);
+        var dbPath = ServiceTestFixtures.NewDbPath();
+        var db = new IndexDatabase(dbPath);
+        db.RunMigrations();
+        try
+        {
+            var guard = new SdkPinGuard(new SdkPinOptions { JournalRoot = journalRoot });
+            var journal = guard.JournalPathFor(checkout);
+            Directory.CreateDirectory(journalRoot);
+            File.WriteAllText(journal, "{ not a journal");
+            var resolution = new CheckoutResolution
+            {
+                CheckoutDir = checkout,
+                SelectedSolutions = [Path.Combine(checkout, "App.slnx")],
+                Source = SolutionSelectionSource.DefaultRoot
+            };
+            var worker = new LocalIndexerSnapshotWorker(
+                db, new SextantConfiguration(), new FixedCheckoutProvider(resolution), sdkPinGuard: guard);
+
+            var result = await worker.ProduceAsync(ServiceTestFixtures.Request(), "identity", root, CancellationToken.None);
+
+            Assert.AreEqual(SnapshotJobStatus.Failed, result.Status);
+            StringAssert.Contains(result.Error, "could not be restored");
+            Assert.AreEqual(LocalIndexerSnapshotWorker.SdkPinRestoreFailedCode, result.Projects.Single().Code);
+            Assert.AreEqual(JobDiagnosticSeverity.Error, result.Projects.Single().Severity);
+            Assert.IsTrue(File.Exists(journal), "the journal is kept for inspection");
+            Assert.IsNull(result.SnapshotId);
+        }
+        finally
+        {
+            SqliteTestDatabase.Delete(dbPath, db);
+            try { Directory.Delete(root, recursive: true); } catch { /* best-effort temp cleanup */ }
+        }
+    }
+
+    private sealed class FixedCheckoutProvider(CheckoutResolution resolution) : ICheckoutProvider
+    {
+        public bool TryResolve(EnsureSnapshotRequest request, out CheckoutResolution resolved)
+        {
+            resolved = resolution;
+            return true;
+        }
+    }
+
+    [TestMethod]
     public void ProjectSkippedForAnSdkPin_IsTypedAndNamedInTheCoverageReason()
     {
         // Multi-solution isolation (#90 parity): only tools/ pins a missing band, so its project is skipped

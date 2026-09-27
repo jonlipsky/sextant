@@ -90,6 +90,31 @@ public sealed class HostFxrSdkResolutionErrorTests
         Assert.IsTrue(HostFxrSdkResolutionError.TryParse(hintOnly, out var error));
         Assert.AreEqual("9.0.999", error.RequestedVersion);
         Assert.AreEqual("/r/global.json", error.GlobalJsonPath);
+        Assert.IsTrue(error.IsGlobalJsonPin);
+    }
+
+    [TestMethod]
+    [DataRow("Error while calling hostfxr function hostfxr_resolve_sdk2. Error code: -2147450725 Detailed error: No .NET SDKs were found.")]
+    [DataRow("SDK resolution failed. Error code: -2147450725")]
+    [DataRow("hostfxr returned 0x8000809B (SdkResolveFailure)")]
+    public void TryParse_NoSdkInstalled_IsAResolutionFailureButNotAPin(string message)
+    {
+        // A runtime-only image with no SDK (and no global.json) fails the same hostfxr call; callers must not
+        // describe it as a global.json pin, so no requested version or path is invented.
+        Assert.IsTrue(HostFxrSdkResolutionError.TryParse(message, out var error));
+        Assert.IsNull(error.RequestedVersion);
+        Assert.IsNull(error.GlobalJsonPath);
+        Assert.IsFalse(error.IsGlobalJsonPin);
+    }
+
+    [TestMethod]
+    public void IsGlobalJsonPin_IsTrueWhenHostFxrNamedTheFileOrVersion()
+    {
+        Assert.IsTrue(HostFxrSdkResolutionError.TryParse(BuildHostMessage, out var error));
+        Assert.IsTrue(error.IsGlobalJsonPin);
+        Assert.IsTrue(new HostFxrSdkResolutionError { RequestedVersion = "10.0.300" }.IsGlobalJsonPin);
+        Assert.IsTrue(new HostFxrSdkResolutionError { GlobalJsonPath = "/r/global.json" }.IsGlobalJsonPin);
+        Assert.IsFalse(new HostFxrSdkResolutionError().IsGlobalJsonPin);
     }
 
     [TestMethod]
