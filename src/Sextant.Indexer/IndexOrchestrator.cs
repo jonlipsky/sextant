@@ -55,7 +55,8 @@ public sealed class IndexOrchestrator
         OverlayContext? overlay = null,
         string? workingTreeDelta = null,
         string? fallbackReason = null,
-        GitStatePin? gitStatePin = null)
+        GitStatePin? gitStatePin = null,
+        IReadOnlyList<SolutionMembership>? solutionMembership = null)
     {
         var totalStopwatch = Stopwatch.StartNew();
         var phaseStopwatch = new Stopwatch();
@@ -576,6 +577,8 @@ public sealed class IndexOrchestrator
             foreach (var pid in projectRoslynToId.Values)
                 solutionStore.AddProjectMapping(solutionId, pid);
         }
+        else if (solutionMembership is { Count: > 0 })
+            RecordSolutionMembership(solution, solutionMembership, projectRoslynToId, solutionStore, now);
         session.CommitBatch();
 
         // Phase 2: Extract symbols from all projects
@@ -1516,6 +1519,80 @@ public sealed class IndexOrchestrator
             fileStore.ResolveFileVersionId(projectId, filePath, contentHash: null, lastIndexedAt: now);
             session.RowsWritten();
         }
+    }
+
+    /// <summary>
+    /// Records each selected solution's <c>solution → project</c> mapping for a multi-solution workspace
+    /// (issue #124). The combined workspace has no solution file of its own (projects are opened
+    /// individually), so membership is computed by <see cref="ComputeSolutionMembership"/> from the loader's
+    /// static per-solution declared lists plus the loaded project-reference graph. A selected solution with
+    /// no loaded project is still upserted (with no mappings) so a <c>solution:</c> scope over it fails
+    /// CLOSED instead of being mistaken for an unknown solution.
+    /// </summary>
+    private static void RecordSolutionMembership(
+        Solution solution,
+        IReadOnlyList<SolutionMembership> membership,
+        IReadOnlyDictionary<ProjectId, long> projectRoslynToId,
+        SolutionStore solutionStore,
+        long now)
+    {
+        foreach (var (solutionPath, projectIds) in ComputeSolutionMembership(solution, membership, projectRoslynToId))
+        {
+            var solutionId = solutionStore.Upsert(solutionPath, Path.GetFileNameWithoutExtension(solutionPath), now);
+            foreach (var pid in projectIds)
+                solutionStore.AddProjectMapping(solutionId, pid);
+        }
+    }
+
+    /// <summary>
+    /// For each selected solution, the registered (per-TFM) project ids it covers: every loaded project whose
+    /// file the solution DECLARES (all of its TFM variants) plus everything reachable from those through the
+    /// loaded <see cref="Project.ProjectReferences"/> graph. The transitive closure keeps parity with the
+    /// single-solution path, which maps every workspace project (MSBuild loads referenced projects too), so
+    /// adding an unrelated second solution never shrinks the first solution's scope; following the Roslyn
+    /// references (not file paths) keeps membership per TFM. Declared-path matching uses the loader's own
+    /// de-dup comparer so a mapping never disagrees with which project the union loaded. Ids are returned in
+    /// ascending order per solution (deterministic).
+    /// </summary>
+    internal static IReadOnlyList<(string SolutionPath, IReadOnlyList<long> ProjectIds)> ComputeSolutionMembership(
+        Solution solution,
+        IReadOnlyList<SolutionMembership> membership,
+        IReadOnlyDictionary<ProjectId, long> projectRoslynToId)
+    {
+        var projectsByPath = new Dictionary<string, List<Project>>(MultiSolutionLoader.ProjectPathComparer);
+        foreach (var project in solution.Projects)
+        {
+            if (project.FilePath == null)
+                continue;
+            var full = Path.GetFullPath(project.FilePath);
+            if (!projectsByPath.TryGetValue(full, out var variants))
+                projectsByPath[full] = variants = [];
+            variants.Add(project);
+        }
+
+        var result = new List<(string, IReadOnlyList<long>)>(membership.Count);
+        foreach (var member in membership)
+        {
+            var visited = new HashSet<ProjectId>();
+            var pending = new Queue<Project>();
+            foreach (var declared in member.DeclaredProjects)
+                if (projectsByPath.TryGetValue(Path.GetFullPath(declared), out var variants))
+                    foreach (var variant in variants)
+                        if (visited.Add(variant.Id))
+                            pending.Enqueue(variant);
+
+            var ids = new SortedSet<long>();
+            while (pending.TryDequeue(out var project))
+            {
+                if (projectRoslynToId.TryGetValue(project.Id, out var pid))
+                    ids.Add(pid);
+                foreach (var reference in project.ProjectReferences)
+                    if (solution.GetProject(reference.ProjectId) is { } referenced && visited.Add(referenced.Id))
+                        pending.Enqueue(referenced);
+            }
+            result.Add((member.SolutionPath, ids.ToList()));
+        }
+        return result;
     }
 
     private static string? GetHeadCommit(string? repoRoot)

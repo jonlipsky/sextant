@@ -122,14 +122,42 @@ externals). The worker chooses the set to index **explicitly and deterministical
   by several solution heads is indexed **once**, never per solution). A listed entry that is missing, is not
   a `.sln`/`.slnx`, or escapes the checkout is recorded **skipped-with-reason** (it is never silently
   dropped) and makes the snapshot **partial**.
-- **Default (no config).** All solutions under the checkout are discovered (build-output/VCS dirs excluded)
-  and **one** deterministic default is chosen, preferring a root-level, **Linux-loadable** solution (e.g. a
-  `*-no-macos.slnx`-style root) over a nested one or a platform head. The other discovered solutions are
-  **recorded** as `solution_not_selected` warnings and make the snapshot **partial** (issue #119) — list them
-  in `solutions` to index them.
+- **Default (no config) — the union of every solution (issue #124).** All solutions under the checkout are
+  discovered (build-output/VCS dirs excluded) and **every** one is selected. They are loaded through the
+  same multi-solution union path as a configured list, into **one** snapshot, with the same per-identity
+  de-duplication: a project declared by N solutions is evaluated and indexed **once per target framework**
+  (identity = remote + repo-relative path + TFM). The loader opens one project at a time and the Phase-6
+  extraction pipeline keeps one compilation live at a time, so memory stays bounded. The order is
+  deterministic and independent of file-system enumeration order: shallowest first, then solutions with a
+  Linux-loadable marker in the name (e.g. a `*-no-macos.slnx`-style root), then neutral names, then
+  **platform heads last** (iOS/Android/Mac/Windows/WPF/Unity/…), then `.slnx` before `.sln`, then ordinal
+  `/`-separated repo-relative path. **Platform-head solutions are included**, not ranked out: their
+  loadable projects (shared libraries, and anything that evaluates on this worker) are indexed, and each
+  project that cannot load here is recorded **skipped-with-reason** (`project_skipped`, per-project fault
+  isolation from #90) and makes the snapshot **partial**. A partly-unloadable union never fails the
+  snapshot; only a union in which **no** project loads at all fails the job, so an empty snapshot is never
+  published. A checkout whose
+  discovered solutions all load is **complete**. With a single discovered solution this is just that
+  solution, loaded as before. With several, each project is opened individually (that is what isolates a
+  per-project load fault), so no solution sets `$(SolutionDir)`: a project that imports
+  `$(SolutionDir)…` with no fallback may be skipped-with-reason on this path. Each selected solution still
+    gets its own `solution → project` mapping (the `solution:` query scope): the projects that solution
+    declares plus everything they reference, as the single-solution path maps. A `solution:` scope over a
+    selected solution none of whose projects loaded returns nothing rather than the whole repository.
+    Nothing is "discovered but
+  not selected" any more. Before #124 the default
+  picked **one** solution and reported the rest as `solution_not_selected`; that kept a monorepo with no
+  root solution (issue #119) mostly unindexed.
 
 Because selection is a pure function of the committed checkout tree + committed `sextant.json` (both pinned
-by the commit), it is **stable across runs** for a given commit.
+by the commit), it is **stable across runs** for a given commit. The selection policy itself is not part of
+the snapshot identity, so changing it bumps `IndexConfigurationHash.AnalyzerVersion` (`"3"` for #124): a
+narrow pre-#124 snapshot of the same commit is never reused as the union snapshot. The recorded
+`coverage.selection_source` is `configured`, `default_union`, or `none` (rows written before #124 may still
+say `default_root`).
+
+To narrow the scope (for example, to skip platform heads that cannot load on this worker and avoid the
+`partial` verdict they cause), list the wanted solutions in `solutions`.
 
 **Coverage reporting (partial never reported as complete, issue #119).** Before indexing, the worker computes
 a durable **coverage** record for the checkout from the selection, the multi-solution load, and a pure
@@ -138,7 +166,7 @@ file-system inventory (project files on disk, excluding `obj`/`bin`/`.git`; subm
 
 | Gap | Diagnostic `code` |
 | --- | --- |
-| a discovered solution was not selected (no-config default) | `solution_not_selected` |
+| a discovered solution was not selected (defensive; the no-config default selects all of them since #124) | `solution_not_selected` |
 | a configured solution is missing/invalid/outside the checkout | `solution_skipped` |
 | a declared project could not load on this worker (e.g. an iOS/Android/Mac/WPF head on Linux, #90) | `project_skipped` |
 | a selected solution declared no readable project, or nothing loaded at all | `solution_no_projects` / `no_projects_loaded` |
@@ -390,6 +418,35 @@ pointer (and stored `branches.head_sequence`) advance only when the supplied seq
 than the stored one; a lower/equal sequence still ensures/attaches the immutable snapshot but leaves the
 branch pointer untouched (no transient regression to a stale snapshot). A NULL sequence — the local
 CLI/daemon path — advances unconditionally and never writes the column, preserving pre-#84 behavior.
+
+**Re-selecting a superseded snapshot on reset/force-push (issue #85).** A branch advance supersedes the
+previous head, so after A@10 → B@20 the snapshot for A is `superseded`. A sequence-bearing ensure of A
+(e.g. A@30 after a reset/force-push) re-selects A on the no-worker reuse path, the same way the
+orchestrator's `SelectExistingSnapshot` does. In ONE write transaction under the single-writer gate, A is
+restored to `complete` and the same forward-only gate runs. A higher sequence re-points the branch back to A
+and supersedes B. A lower/equal sequence is declined: the pointer and `head_sequence` stay untouched, but A
+stays `complete`, so it can still be resolved by commit, as #84 already specifies for the orchestrator path.
+The job verdict comes from A's durable coverage row (`partial` when that row is partial). The row is read and
+reported, never rewritten or backfilled.
+
+A superseded snapshot is only reused when it is still **intact**. All of these must hold:
+- it was published (`published_at` set);
+- it is not an overlay;
+- it still owns mapped project-version data;
+- every Phase-12 provider it consumes is still published.
+
+The `index_runs` ledger is not consulted. `run_id` is bound when the row is first staged, and a retry
+republishes into the same id. Retention also reclaims ledger rows independently of the snapshot's data.
+
+Otherwise it is demoted to `failed` and the ensure falls through to the worker, which rebuilds the identity
+into the same snapshot id instead of resurrecting a data-less snapshot. A snapshot whose row retention has
+already GC'd is simply regenerated (issue #46). The null-sequence path is unchanged: it still hands a
+superseded identity to the worker.
+
+On the terminal-attach fast path (an already-terminal job), checking that the job's snapshot is still usable
+and advancing the branch to it happen in the same write-gate hold. Otherwise a concurrent ensure could
+supersede the snapshot between the check and the advance, and the head would end up on a `superseded`
+snapshot.
 
 ### Restart recovery (criterion 2)
 

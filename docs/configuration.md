@@ -29,7 +29,7 @@ All fields are optional — Sextant uses sensible defaults.
 |---|---|---|---|
 | `db_path` | string | `.sextant/profiles/default/sextant.db` | SQLite database path for the active index slot. |
 | `profile` | string | `default` | On-disk **index slot** name — selects `.sextant/profiles/<name>/sextant.db`. Distinct from the semantic `indexing_profile`; see [Index Profiles](#index-profiles). Also settable via `--profile`/`-p` or `SEXTANT_PROFILE`. |
-| `solutions` | string[] | `[]` | Solutions/projects to index. |
+| `solutions` | string[] | `[]` | Solutions (`.sln`/`.slnx`, repo-relative) to index. When set, it is authoritative everywhere. When empty, the **index service** indexes the deterministic union of **every** solution discovered under the checkout into one snapshot (issue #124; see [service.md — Solution selection](service.md#solution-selection--which-solutions-get-indexed)), while the local **daemon** falls back to the `*.sln` files at the repo root (the CLI `index` command always takes an explicit solution path). |
 | `max_call_hierarchy_depth` | int | `5` | Max call-hierarchy traversal depth. |
 | `fts_max_results` | int | `20` | Max FTS search results. |
 | `auto_spawn_daemon` | bool | `true` | Auto-spawn the daemon from the MCP server. |

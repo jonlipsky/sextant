@@ -209,25 +209,22 @@ public sealed class SnapshotService : IDisposable
 
         // Idempotent attach: create-or-return the ONE durable job for this identity (criterion 1), and in
         // the SAME write check whether a terminal result is still backed by durable data (a complete job
-        // whose snapshot retention has since reclaimed must NOT be reported complete forever).
-        var (job, existed, terminalUsable) = await WithWriteAsync(() =>
+        // whose snapshot retention has since reclaimed must NOT be reported complete forever). A usable
+        // terminal result is attached — branch pointer advanced — in that SAME gate hold: releasing the gate
+        // between the check and the advance would let a concurrent ensure supersede the snapshot in between,
+        // leaving the branch head on a Superseded snapshot (issue #85).
+        var (job, existed, terminalAttached, attachedCoverage) = await WithWriteAsync(() =>
         {
             var jobs = new SnapshotJobStore(_conn);
             var (row, wasExisting) = jobs.EnsureJob(hash, request.RepositoryRemoteUrl, request.CommitSha, request.BranchName);
-            var usable = SnapshotJobStatus.IsTerminal(row.Status)
-                && TerminalResultUsable(row, hash, new SnapshotStore(_conn));
-            return Task.FromResult((row, wasExisting, usable));
+            if (!SnapshotJobStatus.IsTerminal(row.Status) || !TerminalResultUsable(row, hash, new SnapshotStore(_conn)))
+                return Task.FromResult((row, wasExisting, false, (SnapshotCoverage?)null));
+            AdvanceOrAttachBranchPointer(request, row.SnapshotId);
+            return Task.FromResult((row, wasExisting, true, CoverageFor(row.SnapshotId)));
         }).ConfigureAwait(false);
 
-        if (SnapshotJobStatus.IsTerminal(job.Status) && terminalUsable)
-        {
-            var attachedCoverage = WithWrite(() =>
-            {
-                AdvanceOrAttachBranchPointer(request, job.SnapshotId);
-                return CoverageFor(job.SnapshotId);
-            });
+        if (terminalAttached)
             return Attach(job, existed, attachedCoverage);
-        }
 
         // Serialize production so only ONE worker runs per identity; concurrent callers attach.
         await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -252,17 +249,22 @@ public sealed class SnapshotService : IDisposable
             if (published is { Status: SnapshotStatus.Complete })
             {
                 var publishedCoverage = CoverageFor(published.Id);
-                if (publishedCoverage is { IsPartial: true })
-                {
-                    jobs.MarkResult(
-                        job.Id, SnapshotJobStatus.Partial, published.Id, PartialCoverageReason(publishedCoverage));
-                }
-                else
-                {
-                    jobs.MarkResult(job.Id, SnapshotJobStatus.Complete, published.Id);
-                }
+                RecordPublishedVerdict(jobs, job.Id, published.Id, publishedCoverage);
                 AdvanceOrAttachBranchPointer(request, published.Id);
                 return Attach(jobs.GetJob(job.Id)!, existed, publishedCoverage);
+            }
+
+            // Branch reset / force-push A→B→A (issue #85): the identity's snapshot was published but a later
+            // advance superseded it. When the request carries a head sequence, re-select it WITHOUT running
+            // the worker — mirroring the orchestrator's SelectExistingSnapshot — provided it is still intact;
+            // a data-less/unservable one is demoted so the worker below genuinely rebuilds it. A NULL
+            // sequence (the local/legacy path) keeps today's worker path byte-for-byte (#84 criterion 2).
+            if (request.BranchHeadSequence is long && published is { Status: SnapshotStatus.Superseded })
+            {
+                var (reselected, reselectedCoverage) =
+                    ReselectOrDemoteSupersededSnapshot(request, job.Id, published.Id, jobs, snapshots);
+                if (reselected)
+                    return Attach(jobs.GetJob(job.Id)!, existed, reselectedCoverage);
             }
 
             // A STALE terminal result (a complete/partial job whose published snapshot was reclaimed by
@@ -802,6 +804,47 @@ public sealed class SnapshotService : IDisposable
         snapshots.AdvanceBranchPointerForwardOnly(branchId, sid, seq, now);
     }
 
+    // Issue #85: re-selects an already-published but SUPERSEDED snapshot for a sequence-bearing ensure — the
+    // branch reset / force-push A@10 → B@20 → A@30 case — mirroring the orchestrator's SelectExistingSnapshot
+    // so the no-worker reuse path converges on the same state the worker path would. Runs in ONE raw
+    // BEGIN IMMEDIATE / COMMIT transaction (callers hold the write gate; WithWrite is not reentrant):
+    //  * INTACT (SnapshotStore.IsReselectable): restore it to Complete, then run the SAME #84 forward-only
+    //    advance — a higher sequence re-points the branch and supersedes the previous head; a lower/equal one
+    //    declines and leaves the pointer + stored sequence untouched while (exactly like SelectExistingSnapshot)
+    //    the snapshot stays Complete, attached and resolvable by commit. The job verdict comes from the
+    //    snapshot's durable coverage row, which is read but never written. Returns (true, coverage).
+    //  * NOT intact (data reclaimed, an unpublished provider, never published): demote it to Failed
+    //    so the worker's orchestrator genuinely rebuilds the identity (its Failed → Pending retry reset, which
+    //    also drops stale coverage) instead of resurrecting a data-less snapshot via SelectExistingSnapshot.
+    //    Returns (false, null); the caller falls through to the requeue/worker path.
+    private (bool Reselected, SnapshotCoverage? Coverage) ReselectOrDemoteSupersededSnapshot(
+        EnsureSnapshotRequest request, long jobId, long snapshotId, SnapshotJobStore jobs, SnapshotStore snapshots)
+    {
+        ExecRaw("BEGIN IMMEDIATE;");
+        try
+        {
+            if (!snapshots.IsReselectable(snapshotId))
+            {
+                if (snapshots.GetById(snapshotId) is { Status: SnapshotStatus.Superseded })
+                    snapshots.MarkStatus(snapshotId, SnapshotStatus.Failed);
+                ExecRaw("COMMIT;");
+                return (false, null);
+            }
+
+            snapshots.MarkStatus(snapshotId, SnapshotStatus.Complete);
+            AdvanceOrAttachBranchPointerCore(request, snapshotId);
+            var coverage = CoverageFor(snapshotId);
+            RecordPublishedVerdict(jobs, jobId, snapshotId, coverage);
+            ExecRaw("COMMIT;");
+            return (true, coverage);
+        }
+        catch
+        {
+            ExecRaw("ROLLBACK;");
+            throw;
+        }
+    }
+
     // Advances a branch pointer to a published snapshot and supersedes the previous target — the same
     // atomic branch advance the orchestrator performs, run inside the ingest write transaction.
     private static void AdvanceBranch(
@@ -1107,6 +1150,18 @@ public sealed class SnapshotService : IDisposable
 
     private static string PartialCoverageReason(SnapshotCoverage coverage) =>
         "snapshot coverage is partial: " + string.Join(" ", coverage.Reasons);
+
+    // Records the verdict of a job attached to an already-PUBLISHED snapshot (no worker run), taken from the
+    // snapshot's DURABLE coverage record (issue #119): a snapshot recorded as partial is never reported
+    // complete. Coverage is only read here — reuse never backfills or rewrites it.
+    private static void RecordPublishedVerdict(
+        SnapshotJobStore jobs, long jobId, long snapshotId, SnapshotCoverage? coverage)
+    {
+        if (coverage is { IsPartial: true })
+            jobs.MarkResult(jobId, SnapshotJobStatus.Partial, snapshotId, PartialCoverageReason(coverage));
+        else
+            jobs.MarkResult(jobId, SnapshotJobStatus.Complete, snapshotId);
+    }
 
     // A terminal job is only safe to attach to when its recorded outcome is still backed by durable state:
     // a complete/partial job MUST still point at a published COMPLETE snapshot that carries this exact

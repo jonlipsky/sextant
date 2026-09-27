@@ -11,16 +11,21 @@ namespace Sextant.Service;
 /// without MSBuild.
 /// <para>
 /// The verdict is PARTIAL whenever the published snapshot does not cover the whole checkout: a discovered
-/// solution was left unselected, a configured solution was unusable, a declared project failed to load, a
-/// selected solution declared nothing readable, nothing loaded at all, a declared submodule is not
-/// populated, or (under the no-config default) a project file on disk is in no selected solution. Each gap
-/// is also recorded as a warning diagnostic, so a partial snapshot is never silent.
+/// solution was left unselected (defensive — the no-config default selects the union of every discovered
+/// solution, issue #124, so this is empty unless a future selector narrows again), a configured solution
+/// was unusable, a declared project failed to load, a selected solution declared nothing readable, nothing
+/// loaded at all, a declared submodule is not populated, or (under the no-config default) a project file on
+/// disk is in no selected solution. Each gap is also recorded as a warning diagnostic, so a partial
+/// snapshot is never silent.
 /// </para>
 /// </summary>
 public static class SnapshotCoverageBuilder
 {
     /// <summary>Caps per-item diagnostics of one kind so a huge monorepo cannot flood the job ledger.</summary>
     internal const int MaxItemDiagnosticsPerKind = 200;
+
+    /// <summary>Caps how many items a single coverage REASON names, keeping the persisted record compact.</summary>
+    internal const int MaxNamedInReason = 10;
 
     /// <summary>The checkout facts coverage is computed over, gathered without running git or MSBuild.</summary>
     public sealed record Inventory(
@@ -65,6 +70,9 @@ public static class SnapshotCoverageBuilder
         var unpopulated = inventory.Submodules.Where(s => !s.Populated).ToList();
         var scanErrors = inventory.ScanErrors ?? [];
 
+        // Defensive invariant: the no-config default selects the UNION of every discovered solution (#124)
+        // and an explicit config records no discovery, so this is empty today. It is still honored so that a
+        // future narrowing selector can never silently hide an unselected solution.
         var notSelected = resolution.DiscoveredButNotSelected;
         if (notSelected.Count > 0)
         {
@@ -86,7 +94,19 @@ public static class SnapshotCoverageBuilder
             reasons.Add($"{resolution.SkippedSolutions.Count} configured solution(s) could not be used.");
 
         if (load.SkippedProjects.Count > 0)
-            reasons.Add($"{load.SkippedProjects.Count} declared project(s) could not be loaded on this worker.");
+        {
+            // Name a bounded sample so the record (surfaced in MCP meta) stays compact; the full list with
+            // each project's load failure is in the `project_skipped` job diagnostics.
+            var sample = load.SkippedProjects
+                .Take(MaxNamedInReason)
+                .Select(s => ReasonPath(checkoutDir, s.ProjectPath));
+            var more = load.SkippedProjects.Count > MaxNamedInReason
+                ? $", +{load.SkippedProjects.Count - MaxNamedInReason} more"
+                : string.Empty;
+            reasons.Add(
+                $"{load.SkippedProjects.Count} declared project(s) could not be loaded on this worker " +
+                $"({string.Join(", ", sample)}{more}); see the `project_skipped` diagnostics for each reason.");
+        }
 
         if (emptySolutions > 0)
             reasons.Add($"{emptySolutions} selected solution(s) declared no readable projects.");
@@ -185,11 +205,14 @@ public static class SnapshotCoverageBuilder
         return new Result(coverage, diagnostics);
     }
 
-    /// <summary>The snake_case wire name of a selection source.</summary>
+    /// <summary>
+    /// The snake_case wire name of a selection source. Coverage rows are immutable, so rows recorded before
+    /// issue #124 may still carry the retired single-solution name <c>default_root</c>.
+    /// </summary>
     public static string SourceWireName(SolutionSelectionSource source) => source switch
     {
         SolutionSelectionSource.Configured => "configured",
-        SolutionSelectionSource.DefaultRoot => "default_root",
+        SolutionSelectionSource.DefaultUnion => "default_union",
         _ => "none"
     };
 
@@ -214,6 +237,15 @@ public static class SnapshotCoverageBuilder
     {
         var root = Path.GetFullPath(checkoutDir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
         return message.Replace(root, ".", StringComparison.OrdinalIgnoreCase).Replace('\\', '/');
+    }
+
+    // A coverage reason is persisted in the immutable record and surfaced to query clients (MCP meta,
+    // /control/resolve), so it must never carry a worker volume path. A declared project OUTSIDE the
+    // checkout (a solution entry like `../../other/X.csproj`) is named by its file name only.
+    private static string ReasonPath(string checkoutDir, string fullPath)
+    {
+        var relative = RepoRelative(checkoutDir, fullPath);
+        return Path.IsPathRooted(relative) ? $"<outside checkout>/{Path.GetFileName(fullPath)}" : relative;
     }
 
     private static string RepoRelative(string checkoutDir, string fullPath)
