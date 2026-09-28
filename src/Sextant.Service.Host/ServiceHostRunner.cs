@@ -33,7 +33,7 @@ public static class ServiceHostRunner
         var config = SextantConfiguration.Load();
         var options = ServiceOptions.FromEnvironment(config);
         if (options.RepositoryUrlPolicy.AllowsAnyHost)
-            Console.Error.WriteLine(
+            await Console.Error.WriteLineAsync(
                 "WARNING: SEXTANT_SERVICE_REPOSITORY_HOSTS contains '*': /control/ensure accepts a repository on ANY " +
                 "public DNS host that passes the URL shape rules, including a name that resolves to an internal " +
                 "address. Prefer an explicit host allow-list.");
