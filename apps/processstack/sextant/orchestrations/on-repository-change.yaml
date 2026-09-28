@@ -246,8 +246,8 @@ nodes:
     next: route-grant
 
   # Only an application caller gets 200 or 409 grant_limit from PUT /control/grants/tenant, so anything else
-  # (a user's direct run gets 403) sends nothing further. A missed ensure is healed by the next push or the
-  # nightly reconcile.
+  # (a user's direct run gets 403) sends nothing further. A missed ensure is repaired only by the reconcile:
+  # a later push carries its own `before` as the CAS, which fails while the pointer is still behind.
   - id: route-grant
     type: decision
     next:

@@ -1,8 +1,8 @@
 name: watch-first-ensure-head-unreadable
 description: >
   The grant is recorded and the branch has no snapshot, but GitHub's branch listing fails (500): the watch
-  stands, no ensure is sent, and the reply says indexing starts with the next push (not that the branch has
-  no commits).
+  stands, no ensure is sent, and the reply says the nightly reconcile starts indexing (not that the branch
+  has no commits).
 entrypoint: grant-watch
 principal:
   userId: u-alice
@@ -52,7 +52,7 @@ expected:
     granted: true
     needsIndex: true
     ensureOutcome: unavailable
-    message: "Now watching octocat/hello-world on main (the default branch). Indexing could not start yet; it will start with the next push."
+    message: "Now watching octocat/hello-world on main (the default branch). Indexing could not start yet; the nightly reconcile will start it."
   httpCalls:
     - connection: github
       method: GET
