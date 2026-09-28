@@ -350,8 +350,14 @@ public static class ServiceApp
             return status is null ? Results.NotFound() : Results.Json(status, ServiceJson.Options);
         });
 
-        control.MapGet("/resolve", (string repository, string? branch, SnapshotService service) =>
+        // SVC-4: a user caller resolves only a repository it can read. The grant is checked BEFORE the branch is
+        // resolved, so an ungranted repository is the same bare 404 as an absent one (no existence oracle).
+        control.MapGet("/resolve", (string repository, string? branch, HttpRequest req, SnapshotService service) =>
         {
+            if (CallerRequest.Get(req.HttpContext)?.Principal is { Actor: CallerActor.User } user
+                && !service.IsRepositoryVisible(user, repository))
+                return Results.NotFound();
+
             var head = service.ResolveBranchHead(repository, branch);
             if (head is null)
                 return Results.NotFound();

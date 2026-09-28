@@ -668,7 +668,346 @@ public class GrantHttpTests
         CollectionAssert.Contains(ToolSelectionFilters.SelectionExemptTools.ToList(), "list_repositories");
     }
 
+    // ==== review additions: fail-closed, cross-tenant, uniform not-found, header, concurrency, resolve ==============
+
+    [TestMethod]
+    public async Task StoreUnavailable_GrantWritesAndEnsureNotGranted_Are503_AndWriteNothing()
+    {
+        await using var host = await Harness.StartAsync(configure: o => o with { LeaseTtl = TimeSpan.FromSeconds(3) });
+        await PutSelfAsync(host, host.UserAssertion(sub: "user-1"), Widgets);
+        var auditBefore = host.Service.RecentAudit(action: AuditAction.Grant).Count;
+        await host.StealLeaseAsync();
+
+        using var put = await host.ControlAsync(HttpMethod.Put, SelfPath, ControlToken, host.UserAssertion(sub: "user-1"), Body(Gadgets));
+        using var tenantPut = await host.ControlAsync(HttpMethod.Put, TenantPath, ControlToken, AppAssertion(host), Body(Gadgets));
+        using var delete = await host.ControlAsync(HttpMethod.Delete, SelfPath + "?repository=https://github.com/acme/widgets",
+            ControlToken, host.UserAssertion(sub: "user-1"));
+        using var ensure = await host.ControlAsync(HttpMethod.Post, "/control/ensure", ControlToken, host.UserAssertion(sub: "user-2"), EnsureBody());
+
+        foreach (var response in new[] { put, tenantPut, delete, ensure })
+        {
+            var raw = await response.Content.ReadAsStringAsync();
+            Assert.AreEqual(HttpStatusCode.ServiceUnavailable, response.StatusCode, raw);
+            Assert.AreEqual("unavailable", JsonDocument.Parse(raw).RootElement.GetProperty("status").GetString(), raw);
+        }
+        Assert.AreEqual(1, GrantCount(host), "no grant was written and none was revoked");
+        Assert.AreEqual(auditBefore, host.Service.RecentAudit(action: AuditAction.Grant).Count, "no grant audit row was written");
+        Assert.AreEqual(0, host.Service.RecentAudit(action: AuditAction.Ensure).Count, "no not_granted row was written");
+        Assert.AreEqual(0, host.Worker.Calls, "nothing was indexed for the ungranted user");
+    }
+
+    [TestMethod]
+    public async Task VisibilityReadFailure_FailsClosed_OnEveryReadSurface()
+    {
+        await using var host = await Harness.StartAsync();
+        await PutSelfAsync(host, host.UserAssertion(), Widgets);
+        const string args = """{"name":"global::App.Type0","repository":"acme/widgets"}""";
+        var granted = await host.CallAsync("find_symbol", args, DelegateToken, host.UserAssertion());
+        Assert.IsTrue(granted.Body.GetProperty("results").GetArrayLength() > 0, granted.Body.ToString());
+
+        // The grant catalog becomes unreadable: every visibility read now throws.
+        host.ExecuteOnCatalog("ALTER TABLE repository_grants RENAME TO repository_grants_unreadable;");
+
+        foreach (var (tool, arguments) in new[] { ("find_symbol", args), ("find_symbol", FindSymbolArguments), ("list_repositories", "{}") })
+        {
+            var (status, raw, _, payload) = await host.SendRpcAsync("tools/call",
+                $$"""{"name":"{{tool}}","arguments":{{arguments}}}""", DelegateToken, host.UserAssertion());
+            Assert.IsTrue(status != HttpStatusCode.OK || IsFailure(payload), $"{tool} must fail: {raw}");
+            Assert.IsFalse(payload.Contains("Type0", StringComparison.Ordinal) || payload.Contains("acme", StringComparison.OrdinalIgnoreCase),
+                $"{tool} returned data: {raw}");
+        }
+        Assert.AreNotEqual(HttpStatusCode.OK, await StatusOrNullAsync(() => host.SnapshotPageAsync(DelegateToken, host.WidgetsHash, host.UserAssertion())));
+        Assert.AreNotEqual(HttpStatusCode.OK, await StatusOrNullAsync(() => host.ControlAsync(HttpMethod.Get,
+            "/control/resolve?repository=https://github.com/acme/widgets", ControlToken, host.UserAssertion())));
+        var ensure = await StatusOrNullAsync(() => host.ControlAsync(HttpMethod.Post, "/control/ensure", ControlToken, host.UserAssertion(), EnsureBody()));
+        Assert.IsFalse(ensure is HttpStatusCode.OK or HttpStatusCode.Accepted, $"an ensure must not proceed: {ensure}");
+        Assert.AreEqual(0, host.Worker.Calls);
+
+        static bool IsFailure(string payload)
+        {
+            using var rpc = JsonDocument.Parse(payload);
+            return rpc.RootElement.TryGetProperty("error", out _)
+                || (rpc.RootElement.TryGetProperty("result", out var result)
+                    && result.TryGetProperty("isError", out var isError) && isError.GetBoolean());
+        }
+    }
+
+    [TestMethod]
+    public async Task FindCrossRepositoryUsages_UngrantedConsumersAreDropped()
+    {
+        await using var host = await Harness.StartAsync(seed: SeedUsages);
+        var args = $$"""{"provider_repository_url":"{{Widgets}}","symbol_fqn":"global::App.Type0"}""";
+        await PutSelfAsync(host, host.UserAssertion(sub: "user-1"), Widgets);
+        await PutSelfAsync(host, host.UserAssertion(sub: "user-1"), Gadgets);
+        foreach (var repository in new[] { Widgets, Gadgets, Gizmos })
+        {
+            using var tenant = await host.ControlAsync(HttpMethod.Put, TenantPath, ControlToken, AppAssertion(host), Body(repository));
+            Assert.AreEqual(HttpStatusCode.OK, tenant.StatusCode);
+        }
+
+        var everything = await host.CallAsync("find_cross_repository_usages", args, DelegateToken, AppAssertion(host));
+        var otherTenant = await host.CallAsync("find_cross_repository_usages", args, DelegateToken, host.UserAssertion(tenant: "tenant-b", sub: "user-1"));
+        using (var revoke = await host.ControlAsync(HttpMethod.Delete, TenantPath + "?repository=https://github.com/acme/gizmos", ControlToken, AppAssertion(host)))
+            Assert.AreEqual(HttpStatusCode.OK, revoke.StatusCode);
+        var ownGrants = await host.CallAsync("find_cross_repository_usages", args, DelegateToken, host.UserAssertion(sub: "user-1"));
+
+        CollectionAssert.AreEquivalent(new[] { Gadgets, Gizmos }, Consumers(everything.Body), $"both consumers use the symbol: {everything.Body}");
+        Assert.AreEqual(NotFound, WithoutTimestamp(otherTenant.Body), "another tenant's grants open nothing");
+        CollectionAssert.AreEquivalent(new[] { Gadgets }, Consumers(ownGrants.Body),
+            $"an ungranted consumer contributes no row: {ownGrants.Body}");
+        Assert.IsFalse(ownGrants.Body.ToString().Contains("gizmos", StringComparison.OrdinalIgnoreCase));
+
+        static List<string?> Consumers(JsonElement body) =>
+            body.GetProperty("results").EnumerateArray().Select(r => r.GetProperty("consumer_repository").GetString()).ToList();
+    }
+
+    [TestMethod]
+    public async Task FindCrossRepositoryUsages_UngrantedProvider_IsTheUniformNotFound_LikeAnAbsentOne()
+    {
+        await using var host = await Harness.StartAsync(seed: SeedUsages);
+        await PutSelfAsync(host, host.UserAssertion(), Gadgets);
+        await PutSelfAsync(host, host.UserAssertion(), Gizmos);
+
+        var ungranted = await host.CallAsync("find_cross_repository_usages",
+            $$"""{"provider_repository_url":"{{Widgets}}","symbol_fqn":"global::App.Type0"}""", DelegateToken, host.UserAssertion());
+        var absent = await host.CallAsync("find_cross_repository_usages",
+            """{"provider_repository_url":"https://github.com/acme/absent","symbol_fqn":"global::App.Type0"}""", DelegateToken, host.UserAssertion());
+
+        Assert.AreEqual(NotFound, WithoutTimestamp(ungranted.Body), "a caller who cannot read the provider learns nothing about it");
+        Assert.AreEqual(WithoutTimestamp(absent.Body), WithoutTimestamp(ungranted.Body));
+    }
+
+    [TestMethod]
+    public async Task TenantGrant_Revoked_TakesEffectOnTheNextCall()
+    {
+        await using var host = await Harness.StartAsync();
+        const string args = """{"name":"global::App.Type0","repository":"acme/widgets"}""";
+        using (var tenant = await host.ControlAsync(HttpMethod.Put, TenantPath, ControlToken, AppAssertion(host), Body(Widgets)))
+            Assert.AreEqual(HttpStatusCode.OK, tenant.StatusCode);
+
+        var userGranted = await host.CallAsync("find_symbol", args, DelegateToken, host.UserAssertion(sub: "user-2"));
+        var appGranted = await host.CallAsync("find_symbol", args, DelegateToken, AppAssertion(host));
+        Assert.AreEqual(1, await DeleteAsync(host, TenantPath + "?repository=https://github.com/acme/widgets", AppAssertion(host)));
+        var userRevoked = await host.CallAsync("find_symbol", args, DelegateToken, host.UserAssertion(sub: "user-2"));
+        var appRevoked = await host.CallAsync("find_symbol", args, DelegateToken, AppAssertion(host));
+        var listed = await host.CallAsync("list_repositories", "{}", DelegateToken, host.UserAssertion(sub: "user-2"));
+        using var page = await host.SnapshotPageAsync(DelegateToken, host.WidgetsHash, host.UserAssertion(sub: "user-2"));
+
+        Assert.IsTrue(userGranted.Body.GetProperty("results").GetArrayLength() > 0, userGranted.Body.ToString());
+        Assert.IsTrue(appGranted.Body.GetProperty("results").GetArrayLength() > 0, appGranted.Body.ToString());
+        Assert.AreEqual(NotFound, WithoutTimestamp(userRevoked.Body), "a tenant-wide revocation closes the repository to users");
+        Assert.AreEqual(NotFound, WithoutTimestamp(appRevoked.Body), "and to the application");
+        Assert.AreEqual(0, listed.Body.GetProperty("repositories").GetArrayLength());
+        Assert.AreEqual(HttpStatusCode.NotFound, page.StatusCode);
+    }
+
+    [TestMethod]
+    public async Task TenantGrant_IsInvisibleToAnotherTenant_UserAndApplication()
+    {
+        await using var host = await Harness.StartAsync();
+        const string args = """{"name":"global::App.Type0","repository":"acme/widgets"}""";
+        using (var tenant = await host.ControlAsync(HttpMethod.Put, TenantPath, ControlToken, AppAssertion(host, "tenant-a"), Body(Widgets)))
+            Assert.AreEqual(HttpStatusCode.OK, tenant.StatusCode);
+        var otherUser = host.UserAssertion(tenant: "tenant-b", sub: "user-1");
+        var otherApp = AppAssertion(host, "tenant-b");
+
+        var ownUser = await host.CallAsync("find_symbol", args, DelegateToken, host.UserAssertion(tenant: "tenant-a", sub: "user-1"));
+        foreach (var assertion in new[] { otherUser, otherApp })
+        {
+            var read = await host.CallAsync("find_symbol", args, DelegateToken, assertion);
+            var listed = await host.CallAsync("list_repositories", "{}", DelegateToken, assertion);
+            using var page = await host.SnapshotPageAsync(DelegateToken, host.WidgetsHash, assertion);
+            Assert.AreEqual(NotFound, WithoutTimestamp(read.Body));
+            Assert.AreEqual(0, listed.Body.GetProperty("repositories").GetArrayLength(), listed.Body.ToString());
+            Assert.AreEqual(HttpStatusCode.NotFound, page.StatusCode);
+        }
+        using var targets = await host.ControlAsync(HttpMethod.Get, TargetsPath, ControlToken, otherApp);
+        using var ownList = await host.ControlAsync(HttpMethod.Get, SelfPath, ControlToken, otherUser);
+
+        Assert.IsTrue(ownUser.Body.GetProperty("results").GetArrayLength() > 0, "the granting tenant's users see it");
+        Assert.AreEqual(0, (await JsonAsync(targets, HttpStatusCode.OK)).GetProperty("targets").GetArrayLength());
+        Assert.AreEqual(0, (await JsonAsync(ownList, HttpStatusCode.OK)).GetProperty("grants").GetArrayLength());
+    }
+
+    [TestMethod]
+    public async Task GetIndexStatus_Ungranted_IsByteIdenticalToAbsent()
+    {
+        await using var host = await Harness.StartAsync(seed: db => GrantServiceTests.PublishOnBranch(db, Gadgets, "commit-g1", "main", isDefault: true));
+        await PutSelfAsync(host, host.UserAssertion(), Widgets);
+
+        var granted = await host.CallAsync("get_index_status", """{"repository":"acme/widgets"}""", DelegateToken, host.UserAssertion());
+        var ungranted = await host.CallAsync("get_index_status", """{"repository":"acme/gadgets"}""", DelegateToken, host.UserAssertion());
+        var absent = await host.CallAsync("get_index_status", """{"repository":"acme/absent"}""", DelegateToken, host.UserAssertion());
+
+        Assert.AreNotEqual(NotFound, WithoutTimestamp(granted.Body), granted.Body.ToString());
+        Assert.AreEqual(NotFound, WithoutTimestamp(ungranted.Body));
+        Assert.AreEqual(WithoutTimestamp(absent.Body), WithoutTimestamp(ungranted.Body),
+            "an ungranted, published repository's status reads exactly like an absent one");
+        Assert.AreEqual(absent.IsError, ungranted.IsError);
+    }
+
+    [TestMethod]
+    public async Task SnapshotPage_Ungranted_IsByteIdenticalToAbsent()
+    {
+        await using var host = await Harness.StartAsync();
+        var absentHash = new string('0', host.WidgetsHash.Length);
+
+        using var ungranted = await host.SnapshotPageAsync(DelegateToken, host.WidgetsHash, host.UserAssertion());
+        using var absent = await host.SnapshotPageAsync(DelegateToken, absentHash, host.UserAssertion());
+
+        Assert.AreEqual(HttpStatusCode.NotFound, ungranted.StatusCode);
+        Assert.AreEqual(absent.StatusCode, ungranted.StatusCode);
+        Assert.AreEqual(await absent.Content.ReadAsStringAsync(), await ungranted.Content.ReadAsStringAsync());
+        Assert.AreEqual(absent.Content.Headers.ContentType?.ToString(), ungranted.Content.Headers.ContentType?.ToString());
+        Assert.AreEqual(absent.Content.Headers.ContentLength, ungranted.Content.Headers.ContentLength);
+    }
+
+    [TestMethod]
+    public async Task RepositoryHeader_NamingAnUngrantedRepository_IsTheUniformNotFound()
+    {
+        await using var host = await Harness.StartAsync(seed: db => GrantServiceTests.PublishOnBranch(db, Gadgets, "commit-g1", "main", isDefault: true));
+        await PutSelfAsync(host, host.UserAssertion(), Widgets);
+
+        host.RepositoryHeader = Gadgets;
+        var ungranted = await host.CallAsync("find_symbol", FindSymbolArguments, DelegateToken, host.UserAssertion());
+        host.RepositoryHeader = "https://github.com/acme/absent";
+        var absent = await host.CallAsync("find_symbol", FindSymbolArguments, DelegateToken, host.UserAssertion());
+        host.RepositoryHeader = Widgets;
+        var granted = await host.CallAsync("find_symbol", FindSymbolArguments, DelegateToken, host.UserAssertion());
+
+        Assert.AreEqual(NotFound, WithoutTimestamp(ungranted.Body), "the header never bypasses the grant");
+        Assert.AreEqual(WithoutTimestamp(absent.Body), WithoutTimestamp(ungranted.Body));
+        Assert.IsTrue(granted.Body.GetProperty("results").GetArrayLength() > 0, granted.Body.ToString());
+    }
+
+    [TestMethod]
+    public async Task RepositoryHeader_AndArgument_ArgumentTakesPrecedence_AndADisagreementIsAConflict()
+    {
+        await using var host = await Harness.StartAsync(seed: db => GrantServiceTests.PublishOnBranch(db, Gadgets, "commit-g1", "main", isDefault: true));
+        await PutSelfAsync(host, host.UserAssertion(), Widgets);
+
+        host.RepositoryHeader = Widgets;
+        var sameRepository = await host.CallAsync("find_symbol", """{"name":"global::App.Type0","repository":"Acme/Widgets.git"}""",
+            DelegateToken, host.UserAssertion());
+        var argumentUngranted = await host.CallAsync("find_symbol", """{"name":"global::App.Type0","repository":"acme/gadgets"}""",
+            DelegateToken, host.UserAssertion());
+        host.RepositoryHeader = Gadgets;
+        var headerUngranted = await host.CallAsync("find_symbol", """{"name":"global::App.Type0","repository":"acme/widgets"}""",
+            DelegateToken, host.UserAssertion());
+        var conflictAbsent = await host.CallAsync("find_symbol", """{"name":"global::App.Type0","repository":"acme/absent"}""",
+            DelegateToken, host.UserAssertion());
+
+        Assert.IsTrue(sameRepository.Body.GetProperty("results").GetArrayLength() > 0, sameRepository.Body.ToString());
+        Assert.AreEqual(ToolSelectionFilters.SelectorConflictCode, ErrorCode(argumentUngranted.Body), argumentUngranted.Body.ToString());
+        Assert.AreEqual(ToolSelectionFilters.SelectorConflictCode, ErrorCode(headerUngranted.Body),
+            "a granted argument cannot launder an ungranted header, and vice versa");
+        Assert.AreEqual(WithoutTimestamp(conflictAbsent.Body), WithoutTimestamp(headerUngranted.Body),
+            "the conflict is decided before any grant or catalog lookup, so it reveals nothing");
+    }
+
+    [TestMethod]
+    public async Task ConcurrentPuts_AtTheLimit_ExactlyTheLimitSucceed()
+    {
+        const int limit = 3;
+        await using var host = await Harness.StartAsync(configure: o => o with { MaxGrantsPerPrincipal = limit });
+
+        var responses = await Task.WhenAll(Enumerable.Range(0, 8).Select(async i =>
+        {
+            using var response = await host.ControlAsync(HttpMethod.Put, SelfPath, ControlToken, host.UserAssertion(),
+                Body($"https://github.com/acme/repo{i}"));
+            return (response.StatusCode, Body: await response.Content.ReadAsStringAsync());
+        }));
+
+        Assert.AreEqual(limit, responses.Count(r => r.StatusCode == HttpStatusCode.OK), string.Join("\n", responses));
+        Assert.AreEqual(8 - limit, responses.Count(r => r.StatusCode == HttpStatusCode.Conflict
+            && r.Body == $$"""{"status":"rejected","reason":"{{GrantReason.GrantLimit}}"}"""), string.Join("\n", responses));
+        Assert.AreEqual(limit, GrantCount(host));
+    }
+
+    [TestMethod]
+    public async Task Resolve_UserWithoutAGrant_IsTheBare404_LikeAnAbsentRepository()
+    {
+        await using var host = await Harness.StartAsync();
+        const string path = "/control/resolve?repository=https://github.com/acme/widgets&branch=main";
+
+        using var ungranted = await host.ControlAsync(HttpMethod.Get, path, ControlToken, host.UserAssertion());
+        using var absent = await host.ControlAsync(HttpMethod.Get, "/control/resolve?repository=https://github.com/acme/absent", ControlToken, host.UserAssertion());
+        using var application = await host.ControlAsync(HttpMethod.Get, path, ControlToken, AppAssertion(host));
+        using var operatorCall = await host.ControlAsync(HttpMethod.Get, path, ControlToken);
+        await PutSelfAsync(host, host.UserAssertion(), Widgets);
+        using var granted = await host.ControlAsync(HttpMethod.Get, path, ControlToken, host.UserAssertion());
+        using var grantedAbsentBranch = await host.ControlAsync(HttpMethod.Get,
+            "/control/resolve?repository=https://github.com/acme/widgets&branch=gone", ControlToken, host.UserAssertion());
+
+        Assert.AreEqual(HttpStatusCode.NotFound, ungranted.StatusCode);
+        Assert.AreEqual(HttpStatusCode.NotFound, absent.StatusCode);
+        var ungrantedBody = await ungranted.Content.ReadAsStringAsync();
+        Assert.AreEqual(string.Empty, ungrantedBody, "a bare 404");
+        Assert.AreEqual(await absent.Content.ReadAsStringAsync(), ungrantedBody);
+        Assert.AreEqual(await grantedAbsentBranch.Content.ReadAsStringAsync(), ungrantedBody);
+        Assert.AreEqual(HttpStatusCode.NotFound, grantedAbsentBranch.StatusCode);
+        foreach (var allowed in new[] { application, operatorCall, granted })
+        {
+            var body = await JsonAsync(allowed, HttpStatusCode.OK);
+            Assert.AreEqual(host.WidgetsHash, body.GetProperty("identity_hash").GetString(), body.ToString());
+        }
+    }
+
     // ==== helpers ===================================================================================
+
+    // Gadgets and Gizmos pin Widgets (the provider) and each use its symbol global::App.Type0 once.
+    private static void SeedUsages(IndexDatabase db)
+    {
+        var provider = new SnapshotStore(db.GetConnection()).GetSelectedSnapshotIdForRepository(Widgets)!.Value;
+        foreach (var (consumer, commit) in new[] { (Gadgets, "commit-g1"), (Gizmos, "commit-z1") })
+        {
+            GrantServiceTests.SeedConsumer(db, consumer, commit, provider);
+            var conn = db.GetConnection();
+            var consumerRepository = new SnapshotStore(conn).GetRepositoryId(consumer)!.Value;
+            var consumerProject = Scalar(conn, """
+                SELECT d.consumer_project_id FROM snapshot_dependencies d
+                JOIN snapshots s ON s.id = d.consumer_snapshot_id WHERE s.repository_id = @a;
+                """, consumerRepository);
+            var target = Scalar(conn, """
+                SELECT s.id FROM symbols s JOIN snapshot_projects sp ON sp.project_id = s.project_id
+                WHERE sp.snapshot_id = @a AND s.fully_qualified_name = 'global::App.Type0';
+                """, provider);
+            var file = Scalar(conn, "INSERT INTO files (project_id, repo_relative_path) VALUES (@a, 'src/App/Use.cs') RETURNING id;", consumerProject);
+            var fileVersion = Scalar(conn,
+                "INSERT INTO file_versions (file_id, content_hash, last_indexed_at) VALUES (@a, randomblob(32), 1) RETURNING id;", file);
+            using var occurrence = conn.CreateCommand();
+            occurrence.CommandText = """
+                INSERT INTO occurrences (in_project_id, target_symbol_id, source_symbol_id, file_version_id, line, col, kind, flags)
+                VALUES (@project, @target, NULL, @fv, 7, 3, 0, 0);
+                """;
+            occurrence.Parameters.AddWithValue("@project", consumerProject);
+            occurrence.Parameters.AddWithValue("@target", target);
+            occurrence.Parameters.AddWithValue("@fv", fileVersion);
+            occurrence.ExecuteNonQuery();
+        }
+
+        static long Scalar(Microsoft.Data.Sqlite.SqliteConnection conn, string sql, long a)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = sql;
+            cmd.Parameters.AddWithValue("@a", a);
+            return (long)cmd.ExecuteScalar()!;
+        }
+    }
+
+    // The status of a request whose handler may throw (the test server then surfaces the failure to the client).
+    private static async Task<HttpStatusCode?> StatusOrNullAsync(Func<Task<HttpResponseMessage>> send)
+    {
+        try
+        {
+            using var response = await send();
+            return response.StatusCode;
+        }
+        catch (Exception ex) when (ex is not AssertFailedException)
+        {
+            return null;
+        }
+    }
 
     private static string AppAssertion(Harness host, string tenant = "tenant-a") =>
         host.Sign(CallerAssertionSigner.ApplicationClaims(DateTimeOffset.UtcNow, tenantId: tenant), tenant == "tenant-b" ? "kid-b" : "kid-a");
