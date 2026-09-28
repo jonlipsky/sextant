@@ -767,6 +767,10 @@ public sealed class LocalIndexerSnapshotWorker(
         CapabilityFingerprint = capability?.Fingerprint,
         // The control-plane forward-only head sequence (issue #84); null preserves unconditional advance.
         BranchHeadSequence = request.BranchHeadSequence,
+        // SVC-6/7 branch guards: the head CAS and `branch_update: none`. Null when absent, so an unguarded
+        // ensure advances exactly as before.
+        ExpectedHeadCommit = request.ExpectedHeadCommit,
+        SuppressBranchUpdate = request.SuppressesBranchUpdate ? true : null,
         // Issue #113: must equal the service's ServiceOptions.SdkPinIdentityComponent, or the service's
         // ValidateWorkerResult fails the job closed (published identity != requested identity).
         SdkPinPolicy = sdkPinPolicy
