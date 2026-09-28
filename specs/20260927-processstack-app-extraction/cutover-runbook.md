@@ -30,7 +30,7 @@ Ships PS-2…PS-8. The old path is untouched.
 Ships SX-1…SX-8.
 
 1. **Env settings:**
-   - `SEXTANT_SERVICE_CALLER_KEYS=<kid>=<key>@<tenantId>`; the key is generated on the host with `openssl rand -base64 48` and never echoed.
+   - `SEXTANT_SERVICE_CALLER_KEYS=<kid>=<key>@<tenantId>`; the key is base64url, generated on the host with `openssl rand -base64 48 | tr '+/' '-_' | tr -d '=\n'`, and never echoed.
    - `SEXTANT_SERVICE_CALLER_AUDIENCE=sextant`, `SEXTANT_SERVICE_CALLER_APPS=sextant`, `SEXTANT_SERVICE_CALLER_IDPS=processstack`.
    - `SEXTANT_SERVICE_DELEGATE_TOKENS`.
    - Host policy defaults to `github.com`.
