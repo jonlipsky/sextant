@@ -510,7 +510,8 @@ public class SearchSymbolsHttpTests
                 return;
             entered.TrySetResult();
             // Holds the statement on its first row until the abort has reached the call's token. The hook only waits:
-            // what stops the statement once it moves on is the interrupt the cancellation raised.
+            // what stops the statement once it moves on is the interrupt the cancellation raised, or, when the step
+            // wins the race with that callback, the token check as the next row arrives.
             sawCancellation = callToken.WaitHandle.WaitOne(TimeSpan.FromSeconds(30));
             left.TrySetResult();
         };

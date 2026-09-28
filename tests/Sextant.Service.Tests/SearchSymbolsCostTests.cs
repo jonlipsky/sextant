@@ -399,7 +399,8 @@ public class SearchSymbolsCostTests
 
         var ex = Assert.ThrowsExactly<OperationCanceledException>(() => Search(service, "Type", cancellationToken: cancel.Token));
 
-        // The row loop does not check the token: only SQLite's interrupt can have stopped the statement.
+        // Cancel() ran the interrupt callback before it returned, and the row loop checks the token only once a row
+        // arrives, so SQLite's interrupt is what stopped the statement at its next step.
         Assert.AreEqual(1, rows, "the statement stopped at its next row");
         Assert.IsInstanceOfType<SqliteException>(ex.InnerException);
         Assert.AreEqual(9 /* SQLITE_INTERRUPT */, ((SqliteException)ex.InnerException!).SqliteErrorCode);

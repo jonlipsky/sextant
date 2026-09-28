@@ -919,8 +919,8 @@ cannot see is treated exactly like one naming a snapshot that does not exist.
 - The call returns at most `SEARCH_MAX_HITS` symbols.
 - With a `kind` filter, it examines at most 8192 rows in all.
 - The caller's repositories are found by one indexed query over the caller's own grants.
-- If the client disconnects or cancels the request, the search stops: before its next snapshot, or by interrupting
-  the SQLite statement that is running. The read connection is released cleanly.
+- If the client disconnects or cancels the request, the search stops: before its next snapshot, at the next row it
+  reads, or by interrupting the SQLite statement that is running. The read connection is released cleanly.
 
 **Errors** (all tool errors): `caller_required`, `invalid_arguments` (a missing or blank `name_prefix`, a wrong
 type, an unknown argument or `kind`), `invalid_selector` (a `repository` the URL policy refuses),
