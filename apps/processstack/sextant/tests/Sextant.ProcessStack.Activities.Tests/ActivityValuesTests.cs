@@ -36,10 +36,39 @@ public sealed class ActivityValuesTests
         Assert.IsTrue(ActivityValues.IsAuthoredExpression(ActivityHarness.Map(("a", 1), ("b", "= x"))));
         Assert.IsTrue(ActivityValues.IsAuthoredExpression(new List<object?> { "plain", new List<object?> { "${y}" } }));
         Assert.IsTrue(ActivityValues.IsAuthoredExpression(ActivityHarness.Json("""{"a":["= z"]}""")));
-        Assert.IsFalse(ActivityValues.IsAuthoredExpression(ActivityHarness.Map(("a", "=x"), ("b", "$y {z}"))));
+        Assert.IsTrue(ActivityValues.IsAuthoredExpression(ActivityHarness.Map(("a", 1), ("b", "=x"))));
+        Assert.IsFalse(ActivityValues.IsAuthoredExpression(ActivityHarness.Map(("a", "x="), ("b", "$y {z}"))));
         Assert.IsFalse(ActivityValues.IsAuthoredExpression("watch octocat/hello-world"));
         Assert.IsFalse(ActivityValues.IsAuthoredExpression(42));
         Assert.IsFalse(ActivityValues.IsAuthoredExpression(null));
+    }
+
+    [TestMethod]
+    [DataRow("= prompt", true)]
+    [DataRow("=prompt", true)]
+    [DataRow("=${prompt}", true)]
+    [DataRow("  = prompt", true)]
+    [DataRow("\t\n=prompt", true)]
+    [DataRow("=", true)]
+    [DataRow("a = b", false)]
+    [DataRow("x=", false)]
+    [DataRow("", false)]
+    [DataRow("   ", false)]
+    public void Any_text_whose_trimmed_start_is_an_equals_sign_is_authored(string text, bool authored)
+    {
+        Assert.AreEqual(authored, ActivityValues.IsAuthoredExpression(text));
+    }
+
+    [TestMethod]
+    [DataRow("=prompt")]
+    [DataRow("  = prompt")]
+    [DataRow("=${prompt}")]
+    public void A_parameter_with_any_equals_prefix_never_wins_over_the_bound_property(string authored)
+    {
+        var activity = new SextantParseWatchCommandActivity();
+        activity.Definition.Parameters["prompt"] = authored;
+
+        Assert.AreEqual("watch octocat/hello-world", ActivityValues.Input(activity, "prompt", "watch octocat/hello-world"));
     }
 
     [TestMethod]
