@@ -33,7 +33,7 @@ namespace Sextant.Service;
 /// attaches to the running production (the worker runs once). Only service shutdown
 /// (<see cref="StopProduction"/> / <see cref="Dispose"/>) cancels a worker, and that requeues the job.
 /// </summary>
-public sealed class SnapshotService : IDisposable
+public sealed partial class SnapshotService : IDisposable
 {
     private readonly ServiceOptions _options;
     private readonly ISnapshotWorker _worker;
@@ -220,7 +220,7 @@ public sealed class SnapshotService : IDisposable
     /// non-blocking variant.
     /// </summary>
     public async Task<EnsureSnapshotResult> EnsureSnapshotAsync(
-        EnsureSnapshotRequest request, CancellationToken cancellationToken = default, string? principal = null)
+        EnsureSnapshotRequest request, CancellationToken cancellationToken = default, AuditCaller principal = default)
     {
         var (_, completion) = StartEnsureOperation(request, principal);
         return await WaitForCallerAsync(completion, cancellationToken).ConfigureAwait(false);
@@ -235,7 +235,7 @@ public sealed class SnapshotService : IDisposable
     /// is attached without waiting). <paramref name="cancellationToken"/> only bounds this caller's wait.
     /// </summary>
     public async Task<EnsureSnapshotResult> BeginEnsureSnapshotAsync(
-        EnsureSnapshotRequest request, string? principal = null, CancellationToken cancellationToken = default)
+        EnsureSnapshotRequest request, AuditCaller principal = default, CancellationToken cancellationToken = default)
     {
         var (accepted, _) = StartEnsureOperation(request, principal);
         return await WaitForCallerAsync(accepted, cancellationToken).ConfigureAwait(false);
@@ -255,7 +255,7 @@ public sealed class SnapshotService : IDisposable
     /// after shutdown began throws <see cref="OperationCanceledException"/> on the service lifetime (503).
     /// </summary>
     public Task RecordEnsureDeniedAsync(
-        string reason, string? principal = null, CancellationToken cancellationToken = default) =>
+        string reason, AuditCaller principal = default, CancellationToken cancellationToken = default) =>
         RecordDeniedAsync(AuditAction.Ensure, reason, principal, cancellationToken);
 
     /// <summary>
@@ -264,11 +264,11 @@ public sealed class SnapshotService : IDisposable
     /// Same contract as <see cref="RecordEnsureDeniedAsync"/>: the reason code only, never the submitted URL.
     /// </summary>
     public Task RecordRetireDeniedAsync(
-        string reason, string? principal = null, CancellationToken cancellationToken = default) =>
+        string reason, AuditCaller principal = default, CancellationToken cancellationToken = default) =>
         RecordDeniedAsync(AuditAction.Retire, reason, principal, cancellationToken);
 
     private async Task RecordDeniedAsync(
-        string action, string reason, string? principal, CancellationToken cancellationToken)
+        string action, string reason, AuditCaller principal, CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrEmpty(reason);
         Task<bool> write;
@@ -282,8 +282,8 @@ public sealed class SnapshotService : IDisposable
                     {
                         new AuditLogStore(_conn).Append(
                             action, AuditOutcome.Denied,
-                            actor: AuditLogStore.HashActor(principal),
-                            detail: reason);
+                            actor: principal.Actor,
+                            detail: principal.Detail(reason));
                         return Task.FromResult(true);
                     },
                     CancellationToken.None),
@@ -335,7 +335,7 @@ public sealed class SnapshotService : IDisposable
     // drain snapshot (both under _inFlightLock): an operation either starts before shutdown closes admission
     // and is drained, or is refused, so none can run on against a released lease or a closed catalog.
     private (Task<EnsureSnapshotResult> Accepted, Task<EnsureSnapshotResult> Completion) StartEnsureOperation(
-        EnsureSnapshotRequest request, string? principal)
+        EnsureSnapshotRequest request, AuditCaller principal)
     {
         // SVC-6/7: a malformed branch guard is refused before any job exists. The host validates first and
         // answers 400; this protects direct callers.
@@ -404,7 +404,7 @@ public sealed class SnapshotService : IDisposable
     }
 
     private async Task<EnsureSnapshotResult> RunEnsureAsync(
-        EnsureSnapshotRequest request, string? principal, TaskCompletionSource<EnsureSnapshotResult> accepted)
+        EnsureSnapshotRequest request, AuditCaller principal, TaskCompletionSource<EnsureSnapshotResult> accepted)
     {
         using var activity = ServiceTelemetry.Source.StartActivity("ensure_snapshot");
         activity?.SetTag("sextant.repository", request.RepositoryRemoteUrl);
@@ -421,7 +421,7 @@ public sealed class SnapshotService : IDisposable
     // The idempotent-ensure core. Every durable step (and the request's audit row) runs under the single
     // write gate; the only long step — the worker — is a shared, service-owned production per identity.
     private async Task<EnsureSnapshotResult> EnsureSnapshotCoreAsync(
-        EnsureSnapshotRequest request, string? principal, TaskCompletionSource<EnsureSnapshotResult> accepted)
+        EnsureSnapshotRequest request, AuditCaller principal, TaskCompletionSource<EnsureSnapshotResult> accepted)
     {
         // Issue #113: the non-default SDK-pin policy is part of the identity, so flipping
         // SEXTANT_SERVICE_SDK_PIN_OVERRIDE never reuses a snapshot (or failed job) built under the other policy.
@@ -494,7 +494,7 @@ public sealed class SnapshotService : IDisposable
     // when its terminal result is still usable, advances/attaches this request's branch pointer and records the
     // request's audit row in the SAME gate hold. Returns the attach result, or null when production is needed.
     private (SnapshotJobRow Job, bool Existed, EnsureSnapshotResult? Attached) TryAttachTerminal(
-        EnsureSnapshotRequest request, string hash, string? principal)
+        EnsureSnapshotRequest request, string hash, AuditCaller principal)
     {
         var jobs = new SnapshotJobStore(_conn);
         var (row, wasExisting) = jobs.EnsureJob(hash, request.RepositoryRemoteUrl, request.CommitSha, request.BranchName);
@@ -515,7 +515,7 @@ public sealed class SnapshotService : IDisposable
     // Returns the identity's in-flight production, starting (and registering) one when none is running. The
     // starter is the OWNER: the production runs with its request (branch, sequence) and principal.
     private (Task<EnsureSnapshotResult> Production, bool Owner) GetOrStartProduction(
-        EnsureSnapshotRequest request, string hash, long jobId, bool existed, string? principal)
+        EnsureSnapshotRequest request, string hash, long jobId, bool existed, AuditCaller principal)
     {
         lock (_inFlightLock)
         {
@@ -555,7 +555,7 @@ public sealed class SnapshotService : IDisposable
     // releasing the gate — so any request that can observe the new durable state (which needs the gate) never
     // attaches to this already-finished production.
     private async Task<EnsureSnapshotResult> RunProductionAsync(
-        EnsureSnapshotRequest request, string hash, long jobId, bool existed, string? principal, InFlightProduction entry)
+        EnsureSnapshotRequest request, string hash, long jobId, bool existed, AuditCaller principal, InFlightProduction entry)
     {
         var gateHeld = false;
         try
@@ -1445,7 +1445,7 @@ public sealed class SnapshotService : IDisposable
     /// The host applies the repository URL policy before calling this.
     /// </summary>
     public async Task<RetireBranchResult> RetireBranchAsync(
-        RetireBranchRequest request, string? principal = null, CancellationToken cancellationToken = default)
+        RetireBranchRequest request, AuditCaller principal = default, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentException.ThrowIfNullOrEmpty(request.Repository);
@@ -1455,7 +1455,7 @@ public sealed class SnapshotService : IDisposable
             () => Task.FromResult(RetireBranchLocked(request, principal)), cancellationToken).ConfigureAwait(false);
     }
 
-    private RetireBranchResult RetireBranchLocked(RetireBranchRequest request, string? principal)
+    private RetireBranchResult RetireBranchLocked(RetireBranchRequest request, AuditCaller principal)
     {
         var snapshots = new SnapshotStore(_conn);
         ExecRaw("BEGIN IMMEDIATE;");
@@ -1477,9 +1477,9 @@ public sealed class SnapshotService : IDisposable
             new AuditLogStore(_conn).Append(
                 AuditAction.Retire,
                 result.Reason is null ? AuditOutcome.Complete : AuditOutcome.Denied,
-                actor: AuditLogStore.HashActor(principal),
+                actor: principal.Actor,
                 repositoryScope: request.Repository,
-                detail: result.Reason ?? (result.Retired ? "retired" : "absent"));
+                detail: principal.Detail(result.Reason ?? (result.Retired ? "retired" : "absent")));
             ExecRaw("COMMIT;");
             return result;
         }
@@ -1496,7 +1496,7 @@ public sealed class SnapshotService : IDisposable
     /// retained consumer's providers. The service is the natural lease owner, so this can never race a live
     /// writer.
     /// </summary>
-    public RetentionReport RunRetention(bool execute, string? principal = null)
+    public RetentionReport RunRetention(bool execute, AuditCaller principal = default)
     {
         using var activity = ServiceTelemetry.Source.StartActivity("retention");
         activity?.SetTag("sextant.execute", execute);
@@ -1509,7 +1509,7 @@ public sealed class SnapshotService : IDisposable
     /// <paramref name="cancellationToken"/> fires before the writer is acquired.
     /// </summary>
     public async Task<RetentionReport> RunRetentionAsync(
-        bool execute, string? principal = null, CancellationToken cancellationToken = default)
+        bool execute, AuditCaller principal = default, CancellationToken cancellationToken = default)
     {
         using var activity = ServiceTelemetry.Source.StartActivity("retention");
         activity?.SetTag("sextant.execute", execute);
@@ -1517,7 +1517,7 @@ public sealed class SnapshotService : IDisposable
             () => Task.FromResult(RunRetentionLocked(execute, principal)), cancellationToken).ConfigureAwait(false);
     }
 
-    private RetentionReport RunRetentionLocked(bool execute, string? principal)
+    private RetentionReport RunRetentionLocked(bool execute, AuditCaller principal)
     {
         var retention = new RetentionService(_conn, _options.Retention);
         var report = execute ? retention.Execute() : retention.Plan();
@@ -1525,8 +1525,8 @@ public sealed class SnapshotService : IDisposable
         // dry-run plan or an executed GC pass (criterion 5, audit).
         new AuditLogStore(_conn).Append(
             AuditAction.Retention, AuditOutcome.Complete,
-            actor: AuditLogStore.HashActor(principal),
-            detail: execute ? "execute" : "plan");
+            actor: principal.Actor,
+            detail: principal.Detail(execute ? "execute" : "plan"));
         return report;
     }
 
@@ -1569,7 +1569,7 @@ public sealed class SnapshotService : IDisposable
     /// copy races no concurrent write, and records a durable audit row. The backup NEVER contains secrets;
     /// the manifest documents the credentials boundary an operator re-provides on restore.
     /// </summary>
-    public BackupManifest CreateBackup(string destinationDir, string? principal = null)
+    public BackupManifest CreateBackup(string destinationDir, AuditCaller principal = default)
     {
         using var activity = ServiceTelemetry.Source.StartActivity("backup");
         return WithWrite(() => CreateBackupLocked(destinationDir, principal));
@@ -1580,22 +1580,22 @@ public sealed class SnapshotService : IDisposable
     /// gives up when <paramref name="cancellationToken"/> fires before the writer is acquired.
     /// </summary>
     public async Task<BackupManifest> CreateBackupAsync(
-        string destinationDir, string? principal = null, CancellationToken cancellationToken = default)
+        string destinationDir, AuditCaller principal = default, CancellationToken cancellationToken = default)
     {
         using var activity = ServiceTelemetry.Source.StartActivity("backup");
         return await WithWriteAsync(
             () => Task.FromResult(CreateBackupLocked(destinationDir, principal)), cancellationToken).ConfigureAwait(false);
     }
 
-    private BackupManifest CreateBackupLocked(string destinationDir, string? principal)
+    private BackupManifest CreateBackupLocked(string destinationDir, AuditCaller principal)
     {
         var manifest = ServiceBackup.Create(
             _conn, IndexDatabase.LatestSchemaVersion, _paths, destinationDir,
             configFingerprint: _options.DefaultConfigHash ?? "none");
         new AuditLogStore(_conn).Append(
             AuditAction.Backup, AuditOutcome.Complete,
-            actor: AuditLogStore.HashActor(principal),
-            detail: $"schema_{manifest.SchemaVersion}");
+            actor: principal.Actor,
+            detail: principal.Detail($"schema_{manifest.SchemaVersion}"));
         return manifest;
     }
 
@@ -1819,7 +1819,7 @@ public sealed class SnapshotService : IDisposable
     // is recorded only for a job that actually RAN (an attach reuses prior work and has no new cost). The
     // caller holds the write gate — the row is written in the same hold that settled the result, so it is
     // durable before any caller observes the result, even one that already disconnected (issue #148).
-    private void RecordEnsureAuditLocked(EnsureSnapshotRequest request, EnsureSnapshotResult result, string? principal)
+    private void RecordEnsureAuditLocked(EnsureSnapshotRequest request, EnsureSnapshotResult result, AuditCaller principal)
     {
         var jobs = new SnapshotJobStore(_conn);
         var job = jobs.GetJob(result.JobId);
@@ -1829,9 +1829,9 @@ public sealed class SnapshotService : IDisposable
         new AuditLogStore(_conn).Append(
             AuditAction.Ensure,
             MapOutcome(result.Status),
-            actor: AuditLogStore.HashActor(principal),
+            actor: principal.Actor,
             repositoryScope: request.RepositoryRemoteUrl,
-            detail: $"job_{result.JobId}{SdkPinAuditSuffix(jobs.GetDiagnostics(result.JobId))}{ForcedAuditSuffix(request)}",
+            detail: principal.Detail($"job_{result.JobId}{SdkPinAuditSuffix(jobs.GetDiagnostics(result.JobId))}{ForcedAuditSuffix(request)}"),
             costIndexMs: costMs);
     }
 
