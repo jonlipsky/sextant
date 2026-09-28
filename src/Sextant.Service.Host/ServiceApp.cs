@@ -82,19 +82,18 @@ public static class ServiceApp
         // arbitrary-file-read / cross-tenant leak. A default-deny allowlist also means a newly added tool is
         // NOT silently exposed remotely until it is vetted and added here. The local stdio server
         // (McpServerSetup) keeps the full assembly-wide set — it is the zero-policy single-node path.
-        // STATELESS HTTP transport (gateway-proxy contract): the remote /mcp surface is fronted by
-        // ProcessStack's Sextant query gateway, a "faithful JSON-RPC proxy" that handles `initialize` /
-        // `notifications/initialized` LOCALLY and forwards only `tools/list` + `tools/call` verbatim to
-        // this upstream — it never performs an MCP session handshake against us and never carries an
-        // Mcp-Session-Id header. The default (stateful) Streamable-HTTP transport rejects any non-initialize
-        // POST that lacks that header with HTTP 400 ("A new session can only be created by an initialize
-        // request. Include a valid Mcp-Session-Id header for non-initialize requests."), which makes the
-        // whole cross-repo query gateway non-functional in production. Stateless mode makes each POST an
-        // independent request-response needing no prior initialize and no session header, which is also the
-        // architecturally correct model for a proxied, multi-tenant, read-only query surface (no session
-        // affinity, horizontally scalable). The auth/scope middleware runs per-POST on the /mcp path BEFORE
-        // MapMcp, so it is unaffected; the local stdio server (McpServerSetup) is a separate path and stays
-        // stateful/unchanged.
+        // STATELESS HTTP transport, so any proxy or pooled MCP client works. Each POST is an independent
+        // request-response that needs no prior `initialize` and no Mcp-Session-Id header. A full SDK client
+        // (initialize, then tools/list + tools/call over one pooled connection) and a proxy that answers
+        // `initialize` itself and forwards only `tools/list` + `tools/call` verbatim are served alike, and
+        // any request can land on any replica (no session affinity). The default (stateful) Streamable-HTTP
+        // transport would reject a non-initialize POST that lacks the session header with HTTP 400 ("A new
+        // session can only be created by an initialize request. Include a valid Mcp-Session-Id header for
+        // non-initialize requests."). Stateless is also the architecturally correct model for a multi-tenant,
+        // read-only query surface (horizontally scalable). McpClientCompatibilityTests and the stateless
+        // proxy-client tests in ServiceHttpTests pin both client shapes. The auth/scope middleware runs
+        // per-POST on the /mcp path BEFORE MapMcp, so it is unaffected; the local stdio server
+        // (McpServerSetup) is a separate path and stays stateful/unchanged.
         builder.Services.AddMcpServer()
             .WithHttpTransport(transport => transport.Stateless = true)
             // Cast to IEnumerable<Type> is REQUIRED: RemoteQueryTools is typed IReadOnlyList<Type>, and a

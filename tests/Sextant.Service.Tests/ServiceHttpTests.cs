@@ -217,17 +217,16 @@ public class ServiceHttpTests
     }
 
     /// <summary>
-    /// Regression for the production gateway scenario: ProcessStack's Sextant query gateway is a "faithful
-    /// JSON-RPC proxy" that handles <c>initialize</c>/<c>notifications/initialized</c> LOCALLY and forwards
-    /// only <c>tools/list</c> + <c>tools/call</c> verbatim — it never performs an MCP session handshake and
-    /// never sends an <c>Mcp-Session-Id</c> header. With the default STATEFUL Streamable-HTTP transport a
-    /// bare <c>tools/list</c> was rejected with HTTP 400 ("A new session can only be created by an
-    /// initialize request. Include a valid Mcp-Session-Id header for non-initialize requests."), breaking
-    /// the whole cross-repo gateway. The stateless transport must answer a SINGLE bare <c>tools/list</c>
+    /// Stateless proxy client: a proxy (or any lightweight MCP client) may answer <c>initialize</c> /
+    /// <c>notifications/initialized</c> itself and forward only <c>tools/list</c> + <c>tools/call</c>
+    /// verbatim, so the service never sees a session handshake or an <c>Mcp-Session-Id</c> header. A
+    /// stateful Streamable-HTTP transport would reject such a bare <c>tools/list</c> with HTTP 400 ("A new
+    /// session can only be created by an initialize request. Include a valid Mcp-Session-Id header for
+    /// non-initialize requests."). The stateless transport must answer a SINGLE bare <c>tools/list</c>
     /// POST — no prior initialize, no session header — with 200 and the RemoteQueryTools allowlist.
     /// </summary>
     [TestMethod]
-    public async Task Mcp_BareToolsList_NoInitialize_NoSession_ReturnsToolsOverStatelessTransport()
+    public async Task Mcp_StatelessProxyClient_BareToolsList_NoInitialize_NoSession_ReturnsTools()
     {
         await using var host = await ServiceHttpHarness.StartAsync(withWorker: true, seedComplete: true);
 
@@ -252,11 +251,12 @@ public class ServiceHttpTests
     }
 
     /// <summary>
-    /// The gateway's other forwarded verb: a bare <c>tools/call</c> (no initialize, no session header) must
-    /// dispatch and execute a RemoteQueryTool statelessly, routing through the fail-closed authorizer.
+    /// The stateless proxy client's other forwarded verb: a bare <c>tools/call</c> (no initialize, no
+    /// session header) must dispatch and execute a RemoteQueryTool statelessly, routing through the
+    /// fail-closed authorizer.
     /// </summary>
     [TestMethod]
-    public async Task Mcp_BareToolsCall_NoInitialize_NoSession_DispatchesToolStatelessly()
+    public async Task Mcp_StatelessProxyClient_BareToolsCall_NoInitialize_NoSession_DispatchesTool()
     {
         await using var host = await ServiceHttpHarness.StartAsync(withWorker: true, seedComplete: true);
 
@@ -276,9 +276,9 @@ public class ServiceHttpTests
             "the tool executed and returned MCP content statelessly");
     }
 
-    /// <summary>The bare gateway verbs are still auth-gated: no query token ⇒ 401, never a tool result.</summary>
+    /// <summary>The stateless proxy client's bare verbs are still auth-gated: no query token ⇒ 401, never a tool result.</summary>
     [TestMethod]
-    public async Task Mcp_BareToolsList_WithoutToken_IsRejected()
+    public async Task Mcp_StatelessProxyClient_BareToolsList_WithoutToken_IsRejected()
     {
         await using var host = await ServiceHttpHarness.StartAsync(withWorker: true, seedComplete: true);
 
