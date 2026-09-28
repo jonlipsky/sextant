@@ -44,11 +44,11 @@ Ships SX-1…SX-8.
 
 ## G2c: the app
 1. **Register connections in tenant `<tenant>`.** Secrets are entered via the UI by the human, or piped from a host file by the operator's remote agent without printing.
-   - **`sextant-query`** (`type: mcp`, http): URL `http://<sextant-service-addr>/mcp`, a delegate token header, and `callerIdentity {mode: signed-header, audience: sextant, keyId: <kid>, signingKey: <same key>}`.
-   - **`sextant-control`** (`type: http-api`): baseUrl `http://<sextant-service-addr>`, bearer CONTROL token, plus the same `callerIdentity`, **with the same explicit `keyId`**. F4 defaults `keyId` to the connection instance id, so if you leave it unset the two connections end up with two different kids.
+   - **`sextant-query`** (`type: mcp`, http): URL `https://<sextant-service-addr>/mcp`, a delegate token header, and `callerIdentity {mode: signed-header, audience: sextant, keyId: <kid>, signingKey: <same key>}`.
+   - **`sextant-control`** (`type: http-api`): baseUrl `https://<sextant-service-addr>` (plain `http://` only on a private network: both connections carry a bearer token and a signed caller assertion), bearer CONTROL token, plus the same `callerIdentity`, **with the same explicit `keyId`**. F4 defaults `keyId` to the connection instance id, so if you leave it unset the two connections end up with two different kids.
    - **`github`:** the existing connection, unchanged. Its webhook must include **`push`, `delete` and `pull_request`**; `create` is not used by the app. Check this in the GitHub App settings; if any is missing, the human adds it.
 2. **Publish and activate v2.0.0 from the sextant repo:**
-   - Commands: `processstack app validate|test|publish apps/processstack/sextant`, then `app activate` with bindings (github, sextant-query, sextant-control).
+   - Commands: `processstack app validate|test|publish apps/processstack/sextant`, then bind the connections (github, sextant-query, sextant-control) in the WebClient deploy dialog (the CLI sets no bindings) and run `processstack app activate sextant`.
    - The same app name makes this a new version of the existing asset. **Note:** activation replaces v1.0.1 as the active version, so the chat and triggers move to v2. The old *gateway* stays live because it is platform code that reads the legacy stores, and v2 keeps writing those stores (dual-write).
 3. **Migrate:**
    - **Watches.** The owner runs `import-legacy-watches`, which executes as the owner, reads the owner's own legacy user memory, and writes grants through the app. Expect 8 imported.
@@ -77,7 +77,7 @@ Ships SX-1…SX-8.
 **Soak:** at least 48h with both paths live, including at least one real push and at least one agent session.
 
 ## Rollback (any time before G3)
-1. **App:** `processstack app activate sextant --version 1.0.1`, i.e. version id `<v1-version-id>`. Because v2 dual-writes, the legacy memory and App State are current, so v1 resumes with the same data.
+1. **App:** `processstack app rollback sextant 1.0.1`, then `processstack app activate sextant`. `app activate` has no `--version`; the rollback publishes 1.0.1's content (version id `<v1-version-id>`) as a new, auto-bumped version. Because v2 dual-writes, the legacy memory and App State are current, so v1 resumes with the same data. After a later re-activation of v2, run `import-legacy-watches` again: its flag survives the rollback.
 2. **Connections:** disable `sextant-query` and `sextant-control`, or leave them; v1 doesn't use them.
 3. **Service:** the previous image tag. **Platform:** the `<rollback_tag>` tags.
 4. **Keys:** the old snapshot key stays valid until G3, so agents can fall back to `_sextant`.

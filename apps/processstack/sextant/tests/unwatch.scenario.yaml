@@ -15,6 +15,9 @@ inputs:
   channelType: "web"
 seed:
   userMemory:
+    # The v1 watches were already imported (the lazy import is pinned by lazy-legacy-import).
+    - key: "sextant.app:legacy-import-v1"
+      value: "2026-01-02T00:00:00.000Z"
     - key: "sextant.watched-repos:github.com/octocat/hello-world@main"
       value: '{"owner":"octocat","repo":"hello-world","branch":"main","cloneUrl":"https://github.com/octocat/hello-world.git","addedAt":"2026-01-01T00:00:00+00:00"}'
 # Shape: GrantEndpoints DELETE /control/grants/self → {deleted: N} (src/Sextant.Service.Host/GrantEndpoints.cs).

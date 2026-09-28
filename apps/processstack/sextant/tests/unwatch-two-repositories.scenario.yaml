@@ -15,6 +15,9 @@ inputs:
   channelType: "web"
 seed:
   userMemory:
+    # The v1 watches were already imported (the lazy import is pinned by lazy-legacy-import).
+    - key: "sextant.app:legacy-import-v1"
+      value: "2026-01-02T00:00:00.000Z"
     - key: "sextant.watched-repos:github.com/octocat/spoon-knife@main"
       value: '{"owner":"octocat","repo":"spoon-knife","branch":"main","cloneUrl":"https://github.com/octocat/spoon-knife.git","addedAt":"2026-01-01T00:00:00+00:00"}'
 # Neither DELETE removes a grant. spoon-knife's watch exists only in the v1 memory (never imported): branch=*

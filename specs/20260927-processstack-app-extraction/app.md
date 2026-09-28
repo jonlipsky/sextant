@@ -168,7 +168,7 @@ As built (SX-9), `ensure` sends neither `default_branch` nor `forced`: SX-10's p
 | `stop watching {repo} [on {branch}]` · unwatch · untrack | `HttpRequest DELETE /control/grants/self?repository=&branch=`; `legacy-dual-write` writes the tombstone |
 | `what am i watching*` · `list watched*` · `show my watched*` | `HttpRequest GET /control/grants/self` → formatted list (branch, snapshot status, short sha) |
 | anything else | Help text |
-| first turn (`isFirstTurn` or no `sextant.app:legacy-import-v1` flag), internal channel only | Run `import-legacy-watches` once, then `SetMyMemory {scope: sextant.app, key: legacy-import-v1, value: "<iso>"}` |
+| every turn on an internal channel while the `sextant.app:legacy-import-v1` flag is unset | Run `import-legacy-watches` before the command. The process sets the flag itself (ISO time) once nothing is left to retry; its note, when there is one, is prepended to the reply. A failed import is a note, never a failed turn (SX-11 as built) |
 
 ### Processes exposed over MCP (`act=user`)
 
@@ -176,7 +176,7 @@ As built (SX-9), `ensure` sends neither `default_branch` nor `forced`: SX-10's p
 |---|---|---|
 | `start-indexing` | `repositoryRemoteUrl, commitSha, branchName?, treeSha?, configHash?` → `jobId, identityHash, indexingState, snapshotId, attached, branchAdvanced` | The body is built from GitHub and the service, never from the arguments' spelling (#203): `GetRepository` → `repository_remote_url` from GitHub's `full_name` (github.com only). If `branchName` is set and there is no tree or config hash: `ListBranches` → head. `commitSha == head` → `ensure` with `commit_sha` = GitHub's head, `branch_name` and `expected_head_commit = resolve.commit_sha` (CAS advance). Else, or with no `branchName`, `branch_update: none` (historical commit, no regress). Never `default_branch: true` or a `branch_head_sequence`: a user ensure beyond these bounds is 400 (SX-6d, `service-changes.md`). 403 `not_granted` → "watch the repository first" |
 | `get-indexing-status` | `jobId` → `found, indexingState, terminal, snapshotId, lastError, errorCode` | `HttpRequest GET /control/status/{jobId}`. 404 → `found=false`. Map `job.status`/`job.snapshot_id`; `job.last_error` → `lastError` (its first line, control characters replaced, at most 200 chars) and `errorCode` (the `^[a-z0-9_]{1,64}:` code it starts with, else `""`) |
-| `import-legacy-watches` | — → `imported, skipped, failed` | `ListMyMemory {scope: sextant.watched-repos}` → skip null values (tombstones) → `for-each` `PUT /control/grants/self {repository: value.cloneUrl, branch: value.branch}`, with `source` recorded server-side as `self`. Idempotent |
+| `import-legacy-watches` | `retryUnresolved?` → `imported, newlyImported, skipped, failed, remaining, complete, outcome, message` | `ListMyMemory {scope: sextant.watched-repos}` → skip JSON-null tombstones → `GET /control/grants/self` (an entry already held counts as imported) → `SextantPlanLegacyImport` → per entry (at most 200 per run): `GetRepository` (github) → `SextantNormalizeRepository` over GitHub's `full_name` → `PUT /control/grants/self {repository}` (a v1 watch on the default branch) or `{repository, branch}`, with `source` recorded server-side as `self`. The URL never comes from memory text. Idempotent. See "SX-11, as built" |
 
 ## Legacy dual-write (v2.0.x; dropped in v2.1 post-G3)
 
@@ -188,7 +188,7 @@ As built (SX-9), `ensure` sends neither `default_branch` nor `forced`: SX-10's p
 v2.1 cleanup, run through the app (depends on PS-13):
 - `ListAppValues(enrolled/)` → `DeleteAppValue`;
 - `DeleteAppValue` for `sextant-service-url` and `sextant-control-token`;
-- `DeleteMyMemory` (PS-13) for each user's `sextant.watched-repos` keys, tombstones included, run lazily on that user's next chat or `import-legacy-watches` call, because `*MyMemory` is caller-scoped;
+- `DeleteMyMemory` (PS-13) for each user's `sextant.watched-repos` keys, tombstones included, and the import's `sextant.app` keys (`legacy-import-v1`, `legacy-import-attempts`), run lazily on that user's next chat or `import-legacy-watches` call, because `*MyMemory` is caller-scoped;
 - drop reconcile's legacy import step.
 
 ## Scenario tests (`tests/`)
@@ -206,8 +206,8 @@ These assume the PS-6 scenario stubs: `principal`, `seed.userMemory`, `seed.appS
 | 7 | unwatch-absent | `DELETE` → `deleted: 0` → "not watching" |
 | 8 | list-empty / 9 list-two | `GET grants/self` rendering |
 | 10 | help-fallback | No HTTP calls |
-| 11 | lazy-legacy-import | Seeded memory (2 entries + 1 tombstone) → 2 `PUT`s + flag set; the second turn does not re-import |
-| 12 | import-legacy-watches-process | Output counts |
+| 11 | lazy-legacy-import | Seeded memory (2 entries + 1 tombstone) → 2 `PUT`s, the reply starts with the import note; `lazy-import-flag-set-skips`: with the flag set, no import and no call |
+| 12 | import-legacy-watches-process | Output counts, the flag and the attempt marks (`import-legacy-watches-*` cover the other paths) |
 | 13 | push-default-branch | `PUT grants/tenant`, ensure (CAS `before`, `default_branch: true`), enrolled PascalCase upsert |
 | 14 | push-feature-branch | Ensure with `default_branch: false`; no enrolled write |
 | 15 | push-branch-create | `before` = zeros → `expected_head_commit: ""` |
@@ -255,12 +255,12 @@ These assume the PS-6 scenario stubs: `principal`, `seed.userMemory`, `seed.appS
    - `sextant-control` (http-api, control bearer, the same callerIdentity **and the same explicit `keyId`**);
    - `github` with webhook events `push`, `delete` and `pull_request`.
 3. **Publish:** `processstack app validate -p apps/processstack/sextant && processstack app test -p apps/processstack/sextant --all && processstack app publish apps/processstack/sextant`.
-4. **Activate:** `processstack app activate sextant --version 2.0.0` with bindings `github`, `sextant-query` and `sextant-control`.
+4. **Deploy and activate:** bind `github`, `sextant-query` and `sextant-control` in the WebClient deploy dialog (the CLI sets no bindings), then `processstack app activate sextant` (it has no `--version`: it activates the published version).
 5. **Import:**
    - each user runs `import-legacy-watches` (or it happens lazily on first internal-channel chat);
    - enrollments: fire `nightly-reconcile` once with trigger run-now, `POST /v1/{tenant}/triggers/run/{triggerId}` (needs `triggers:write`). It runs as `act=application`, and its legacy import step imports the `enrolled/*` rows.
 6. **Agents:** `processstack api-key create --name sextant-agents --app sextant`, then point clients at `POST /v1/{tenant}/mcp/sextant`.
-7. **Rollback:** `processstack app activate sextant --version 1.0.1`. The dual-write keeps v1's stores current.
+7. **Rollback:** `processstack app rollback sextant 1.0.1` (publishes 1.0.1's content as a new, auto-bumped version), then `processstack app activate sextant`. The dual-write keeps v1's stores current.
 
 ## Implementation notes (SX-9, as built)
 
@@ -268,7 +268,7 @@ SX-9 builds the manifest, the chat, the MCP processes, `ensure` and the v1 memor
 
 **Manifest**
 - **The `prompt` trigger maps only `prompt`, `isFirstTurn`, `channelType` and `conversationState`.** `conversationId` and `senderId` are server-hydrated reserved names. The app never maps, defaults or sets them, and nothing reads `senderId`: the service sees only the run's caller (PS-7).
-- **`mcp.include` is `[start-indexing, get-indexing-status]`.** SX-11 adds `import-legacy-watches` and `connectionTools`.
+- **`mcp.include` is `[start-indexing, get-indexing-status, import-legacy-watches]`**, and `mcp.connectionTools` re-exposes the service's query tools (SX-11, below).
 
 **Flows**
 - **`grant-watch` and `revoke-watch` are orchestrations**, not processes. A GitHub activity throws on a 404, and `HttpRequest` throws on a network failure. Only an orchestration can route that with `on-error` to a reply instead of failing the chat turn. Each returns one reply line in `message`; `configure-watched-repos` runs one per repository with a sequential `for-each` (`continueOnError`, so a failed child becomes a "Something went wrong" line).
@@ -323,7 +323,7 @@ SX-9 builds the manifest, the chat, the MCP processes, `ensure` and the v1 memor
   - `get-indexing-status`: its 3 variables and 8 outputs.
   - `grant-watch`: all 20 variables, which cover its outputs (`granted`, `needsIndex`, `ensureOutcome`, `memoryKeys`, `memoryValue`, `message`).
   - `revoke-watch`: all 12 variables, which cover its outputs.
-  - `configure-watched-repos`: all 10 variables (`stateUpdate` is still `{}` from a `SetVariable` node).
+  - `configure-watched-repos`: all 18 variables, SX-11's 8 `import*` ones included (`stateUpdate` is still `{}` from a `SetVariable` node).
   - `legacy-dual-write`: its 4 variables and 3 outputs.
 
   Pins, each checked by mutation:
@@ -433,3 +433,33 @@ SX-10 adds the GitHub repository-event triggers, the nightly schedule, `on-repos
 - **Seeded-state pins,** each checked by mutation (removing one name from the flow's `init` fails it): `repo-change-seeded-state-ignored`, `reconcile-seeded-state-ignored`, `reconcile-target-seeded-state-ignored` and `tenant-grant-seeded-outputs-ignored`.
 - **The harness exposes no claims for an application run.** `caller: { act: "!absent" }` therefore asserts that no user caller signed the request, which is how 31 and 33 are checked for repository events and the schedule.
 - **`app test` supplies the connection-event envelope.** The scenario's `event:` block is merged over its defaults.
+
+## Implementation notes (SX-11, as built)
+
+SX-11 adds `mcp.connectionTools`, the `import-legacy-watches` process, the lazy import in the chat, and the app's `README.md`. Where the code differs from the sections above, the code wins.
+
+**Connection tools**
+- **One entry: `sextant-query`, `prefix: ""`, `timeoutSeconds: 120`, 24 tools.** The `include` list is exactly `ServiceApp.RemoteQueryTools` minus `research_codebase` (it calls an LLM on the service's side). `ProcessStackAppManifestTests` (`tests/Sextant.Service.Tests`, which can reference `Sextant.Service.Host`; the app's test project cannot) reads `psapp.yaml` as text and pins that equality in both directions, the absence of the local-only tools (`get_source_context`, `get_daemon_status`, `get_base_snapshot_symbols`) and of `research_codebase`, `sextant-query` as `type: mcp` with no `config:` (a deployment-bound dependency; an inline one fails `CONNECTION_INLINE`), no name shared with an app entrypoint, no `internal: true` entrypoint in `include`, and no flow reachable from a user-facing entrypoint (the chat and the MCP processes, following `orchestrationName`/`processName`/`type: process:` references) that is application-only (`tenant-grant`). A tool added to or dropped from the service surface therefore fails the public build until the app is triaged.
+- **Not scenario-tested (deviation).** `app test` has no stub for connection tools: the `mcp:` stubs answer `CallMcpTool` only, so no scenario can list or forward them. The kickoff's connection-tools scenario is replaced by the manifest test and the pooled-client test below.
+- **One pooled upstream client is authorized request by request (elevenworks/ProcessStack#3258 item 4).** PS pools one MCP client per (tenant, connection) and shares it across users, with each request carrying its own assertion. The service's `/mcp` is stateless and verifies each POST's assertion (`CallerAssertionGate`); nothing is bound to an MCP session id. `McpClientCompatibilityTests.SdkClient_OnePooledClient_AuthorizesEachRequestByItsOwnCaller` pins it with one SDK client over the delegate token whose handler stamps each request's assertion: `user-1` (granted) reads the repository, `user-2` (no grant) reads nothing, `user-1` still reads afterwards, a request with no assertion is `caller_required`, and six concurrent calls alternating the two users each get their own caller's answer.
+
+**`import-legacy-watches`**
+- **It cannot reuse `grant-watch` (deviation).** An MCP tool must be a process, and a process can neither start an orchestration nor route an error, so it repeats `grant-watch`'s gate inline: `GitHubGetRepository` (the workspace's GitHub connection must see the repository), then `SextantNormalizeRepository` over GitHub's `full_name`. The URL sent is GitHub's spelling, never memory text (the row above used to say `value.cloneUrl`). It sends no first ensure, unlike `grant-watch`: one chat turn would otherwise start an index job per v1 watch. An imported watch with no snapshot lists as "not indexed yet" until a push, reconcile or `start-indexing` indexes it. It writes no v1 memory (the entry is already there).
+- **Memory is untrusted.** `SextantPlanLegacyImport` (pure) reads each value's `owner`, `repo` and `branch`. The owner and repository must each be one path segment in the SVC-5 shape, a `cloneUrl`, when present, must name the same github.com repository, and the branch must pass `git check-ref-format --branch` without a `refs/heads/` prefix. Anything else is unreadable (counted as skipped). Tombstones (`null`, `""`, `"null"`) and duplicate slugs are not counted.
+- **Already imported.** An entry is held when a grant for the same repository key names its branch, or a default-branch grant resolved (`status.resolved_branch`) to it. A v1 watch on GitHub's `default_branch` is granted as a default-branch watch (`{repository}`, no `branch`), as "watch owner/repo" records it; any other branch is named.
+- **Failures converge (deviation).** A GitHub 404 or 5xx fails the whole run, because a process has no error route. So before each GitHub check the entry's count in `sextant.app:legacy-import-attempts` (`{slug: count}`) is written; a grant clears it, and a refusal (a normalize refusal, 400, or the 409 watch limit) sets it to 2. The plan checks the fewest-attempted entries first and leaves out an entry at 2 unless `retryUnresolved` is set, so each run gets past the entry the last one stopped at, and N entries GitHub never shows settle within 2N + 1 runs. A 401, 403 or 5xx from the `PUT` takes the run's mark back (GitHub answered, so it uses no attempt) and leaves the import incomplete, so the next run tries it again, like a failed grants read; only GitHub failures and refusals count towards the 2 attempts. After the first 409 `grant_limit` a new grant would be refused too, so the run passes over every later entry on a repository the caller holds no grant on: it is marked unresolved and counted as failed, as its own 409 would have left it, with no GitHub call or `PUT`. An entry the plan flags `mayBeHeld` (the caller holds a grant on its repository: another branch, or a default-branch grant the service has not resolved) is still checked, because re-granting an existing grant never counts towards the limit and answers 200 `created: false`. The limit is per principal or per tenant and not visible to the caller, so a run cannot skip planning before it. The attempts map is untrusted too: a non-object or a non-positive count reads as empty, and a count is clamped; a tampered map can only skip or re-check the user's own entries.
+- **At most 200 entries per run** (`remaining` counts the rest), inside the process's 300 s MCP bound.
+- **Outputs (deviation: more than `imported, skipped, failed`).** `imported` (held after the run, including those held before), `newlyImported` (a `PUT` that answered `created: true`; one for a grant the plan could not see as held, such as a default-branch grant the service has not resolved yet, answers `created: false` and counts only as imported), `skipped` (unreadable, unresolved, or refused for good), `failed` (not granted this run, or at the watch limit), `remaining`, `complete`, `outcome` (`ok`, or `unavailable` when `GET /control/grants/self` fails, which imports nothing) and `message`. The message carries counts only, never a repository name or service text.
+- **The process sets the flag itself (deviation).** It writes `sextant.app:legacy-import-v1` (ISO time) only when `complete`: nothing remaining, no service failure on a `PUT` in this run, and every attempt mark at 2. An import run over MCP therefore counts too, and one cut short by a failure is picked up again.
+- **Every variable and output is reset first** (#3286), pinned by `import-legacy-watches-seeded-state-ignored`: seeded `pending`, counts and marks change nothing.
+- **Scenarios:** `import-legacy-watches-process` (#12), `-not-visible` (a failed run leaves its mark), `-unresolved-skipped`, `-retry-unresolved`, `-service-unavailable`, `-refusals` (400/409/503), `-retry-keeps-attempts` (a second 503 keeps the mark at 1), `-already-held` (`created: false`), `-grant-limit-stops` (after the limit only a possibly held entry is checked) and `-seeded-state-ignored`. The `PUT`s assert the `act=user` caller claims (#31).
+
+**The lazy import in the chat**
+- **The flag alone guards it (deviation: no `isFirstTurn` check).** On an internal channel, each turn reads the flag (`GetMyMemory`; a failed read is logged and skips the import for that turn) and, while it is unset, runs `import-legacy-watches` before the command. It stops once the process sets the flag. Slack is refused before this, so a Slack turn never imports (`slack-watch-refused`).
+- **The note is prepended to the reply to the command** (`compose-reply`, then a blank line). It is the process's `message` when `outcome` is not `ok` or anything was newly imported, skipped, failed or left; nothing is said when there was nothing to import or every entry was already held. A failed import is the note "I couldn't finish importing your earlier Sextant watches yet; I'll try again next time." with `_lastErrorType` logged; the command is still answered.
+- **Scenarios:** `lazy-legacy-import` (#11: two `PUT`s, the tombstone skipped, the reply starts with the note), `lazy-import-flag-set-skips` (no call with the flag set) and `lazy-import-failed-note`. `unwatch` and `unwatch-two-repositories` seed the flag, because they seed v1 entries.
+
+**Deploy (the README section above is corrected)**
+- **`processstack app activate` takes no `--version`** (CLI 1.1.1): it activates the published version. Bindings are set in the WebClient deploy dialog; the CLI sets none. Rollback is `processstack app rollback sextant 1.0.1`, which publishes 1.0.1's content as a new auto-bumped version, then `processstack app activate sextant`. `cutover-runbook.md` is corrected the same way.
+- **After a rollback and a re-activation, run `import-legacy-watches` again.** The flag survives the rollback, so watches added under v1 meanwhile are not imported lazily.
+- **v2.1 cleanup also deletes the import's `sextant.app` keys** (listed above).

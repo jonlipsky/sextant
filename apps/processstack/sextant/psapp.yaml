@@ -16,16 +16,52 @@ version: 2.0.0
 author: Sextant
 license: MIT
 
-# Only the two control processes are MCP tools. Orchestrations are never eligible, and the internal
-# processes (ensure, legacy-dual-write, tenant-grant) stay out of `include`.
+# The three control processes are MCP tools, and connectionTools re-exposes the Sextant service's own query
+# tools from the sextant-query connection under their own names (no process runs). Orchestrations are never
+# eligible, and the internal processes (ensure, legacy-dual-write, tenant-grant) stay out of `include`.
 mcp:
   expose: true
   displayName: "Sextant"
-  description: "Start and check Sextant indexing jobs for the repositories you watch."
+  description: "Query the Sextant semantic code index, and start and check indexing jobs for the repositories you watch."
   defaultTimeoutSeconds: 60
   include:
     - start-indexing
     - get-indexing-status
+    - import-legacy-watches
+  # Forwarded verbatim to the service's /mcp with the caller's signed identity; the service decides what each
+  # caller can read from that identity and its grants, never from the arguments. research_codebase is left
+  # out (it calls an LLM on the service's side), as are the service's local-only tools, which it never serves
+  # remotely. Pinned by ProcessStackAppManifestTests in tests/Sextant.Service.Tests.
+  connectionTools:
+    - connection: sextant-query
+      prefix: ""
+      timeoutSeconds: 120
+      description: "Sextant semantic code queries over the repositories you can see."
+      include:
+        - find_symbol
+        - find_references
+        - find_by_attribute
+        - find_by_signature
+        - find_comments
+        - find_tests
+        - find_unreferenced
+        - find_cross_repository_usages
+        - find_submodule_consumers
+        - get_api_surface
+        - get_call_hierarchy
+        - get_file_symbols
+        - get_impact
+        - get_implementors
+        - get_index_status
+        - get_namespace_tree
+        - get_project_dependencies
+        - get_type_dependents
+        - get_type_hierarchy
+        - get_type_members
+        - semantic_search
+        - trace_value
+        - list_repositories
+        - search_symbols
 
 entrypoints:
   - name: configure-watched-repos
@@ -60,6 +96,11 @@ entrypoints:
     description: Read the current state of one Sextant indexing job by id
     type: process
     path: processes/get-indexing-status.yaml
+
+  - name: import-legacy-watches
+    description: Import your v1 Sextant watches as repository grants (idempotent; returns counts only)
+    type: process
+    path: processes/import-legacy-watches.yaml
 
   - name: ensure
     description: Sends one guarded POST /control/ensure and interprets the answer
@@ -107,8 +148,8 @@ connections:
   # granting it, and reads branch heads from it.
   - id: github
     type: github
-  # The Sextant service's MCP endpoint (bearer + signed caller identity). Its tools are exposed through
-  # mcp.connectionTools in a later version; nothing calls it yet.
+  # The Sextant service's MCP endpoint (bearer + signed caller identity). mcp.connectionTools re-exposes its
+  # query tools; no flow calls it.
   - id: sextant-query
     type: mcp
   # The Sextant service's control plane (bearer + signed caller identity). Every HttpRequest step names it.
