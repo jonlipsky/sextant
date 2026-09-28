@@ -18,6 +18,7 @@ public class ServiceOptionsEnvTests
     private const string CheckoutMode = "SEXTANT_SERVICE_CHECKOUT_MODE";
     private const string CheckoutToken = "SEXTANT_SERVICE_CHECKOUT_TOKEN";
     private const string MaxProvisioningAttempts = "SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS";
+    private const string RequireRepositorySelection = "SEXTANT_SERVICE_REQUIRE_REPOSITORY_SELECTION";
 
     private static SextantConfiguration Config() => new() { DbPath = ServiceTestFixtures.NewDbPath() };
 
@@ -277,6 +278,49 @@ public class ServiceOptionsEnvTests
         finally
         {
             Environment.SetEnvironmentVariable(MaxProvisioningAttempts, null);
+        }
+    }
+
+    [TestMethod]
+    public void RequireRepositorySelection_DefaultsOff_WhenUnset()
+    {
+        Environment.SetEnvironmentVariable(RequireRepositorySelection, null);
+        var options = ServiceOptions.FromEnvironment(Config());
+        Assert.IsFalse(options.RequireRepositorySelection,
+            "a query with no repository selector keeps reading the unselected default until the operator opts in");
+    }
+
+    [TestMethod]
+    [DataRow("true", true)]
+    [DataRow(" ON ", true)]
+    [DataRow("0", false)]
+    public void RequireRepositorySelection_RecognizedValue_Binds(string value, bool expected)
+    {
+        Environment.SetEnvironmentVariable(RequireRepositorySelection, value);
+        try
+        {
+            var options = ServiceOptions.FromEnvironment(Config());
+            Assert.AreEqual(expected, options.RequireRepositorySelection);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(RequireRepositorySelection, null);
+        }
+    }
+
+    [TestMethod]
+    public void RequireRepositorySelection_Malformed_FailsClosed_Throws()
+    {
+        Environment.SetEnvironmentVariable(RequireRepositorySelection, "tru");
+        try
+        {
+            Assert.ThrowsExactly<InvalidOperationException>(
+                () => ServiceOptions.FromEnvironment(Config()),
+                "a typo must abort startup rather than silently leave selection optional");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(RequireRepositorySelection, null);
         }
     }
 }
