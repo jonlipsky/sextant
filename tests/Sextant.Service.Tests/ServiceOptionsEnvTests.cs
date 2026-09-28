@@ -19,6 +19,8 @@ public class ServiceOptionsEnvTests
     private const string CheckoutToken = "SEXTANT_SERVICE_CHECKOUT_TOKEN";
     private const string MaxProvisioningAttempts = "SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS";
     private const string RequireRepositorySelection = "SEXTANT_SERVICE_REQUIRE_REPOSITORY_SELECTION";
+    private const string RepositoryHosts = "SEXTANT_SERVICE_REPOSITORY_HOSTS";
+    private const string RepositoryOwners = "SEXTANT_SERVICE_REPOSITORY_OWNERS";
 
     private static SextantConfiguration Config() => new() { DbPath = ServiceTestFixtures.NewDbPath() };
 
@@ -321,6 +323,58 @@ public class ServiceOptionsEnvTests
         finally
         {
             Environment.SetEnvironmentVariable(RequireRepositorySelection, null);
+        }
+    }
+
+    [TestMethod]
+    public void RepositoryUrlPolicy_UnsetIsGitHubOnly()
+    {
+        Environment.SetEnvironmentVariable(RepositoryHosts, null);
+        Environment.SetEnvironmentVariable(RepositoryOwners, null);
+        var policy = ServiceOptions.FromEnvironment(Config()).RepositoryUrlPolicy;
+        CollectionAssert.AreEqual(new[] { "github.com" }, policy.Hosts.ToArray());
+        Assert.IsNull(policy.Owners);
+        Assert.IsTrue(policy.Evaluate("https://github.com/org/app").Ok);
+        Assert.AreEqual(RepositoryUrlRejection.HostNotAllowed, policy.Evaluate("https://gitlab.com/org/app").Reason);
+    }
+
+    [TestMethod]
+    public void RepositoryUrlPolicy_BindsHostsAndOwners()
+    {
+        Environment.SetEnvironmentVariable(RepositoryHosts, "github.com, git.example.com");
+        Environment.SetEnvironmentVariable(RepositoryOwners, "git.example.com/*,github.com/org");
+        try
+        {
+            var policy = ServiceOptions.FromEnvironment(Config()).RepositoryUrlPolicy;
+            Assert.IsTrue(policy.Evaluate("https://git.example.com/team/app").Ok);
+            Assert.IsTrue(policy.Evaluate("https://github.com/org/app").Ok);
+            Assert.AreEqual(RepositoryUrlRejection.OwnerNotAllowed, policy.Evaluate("https://github.com/other/app").Reason);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(RepositoryHosts, null);
+            Environment.SetEnvironmentVariable(RepositoryOwners, null);
+        }
+    }
+
+    [TestMethod]
+    [DataRow(RepositoryHosts, "github.com,https://evil.example")]
+    [DataRow(RepositoryHosts, "10.0.0.1")]
+    [DataRow(RepositoryHosts, " , ")]
+    [DataRow(RepositoryOwners, "github.com")]
+    [DataRow(RepositoryOwners, "gitlab.com/org")]
+    public void RepositoryUrlPolicy_MalformedEntry_FailsStartup(string name, string value)
+    {
+        Environment.SetEnvironmentVariable(name, value);
+        try
+        {
+            Assert.ThrowsExactly<InvalidOperationException>(
+                () => ServiceOptions.FromEnvironment(Config()),
+                "a malformed repository host/owner allow-list must abort startup (fail closed)");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(name, null);
         }
     }
 }

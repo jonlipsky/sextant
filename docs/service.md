@@ -54,6 +54,8 @@ of the box.
 | `SEXTANT_SERVICE_CHECKOUT_MODE` | How a checkout is obtained: `locate` (index only an already-provisioned checkout) or `clone` (provision it by cloning the requested commit) | `locate` |
 | `SEXTANT_SERVICE_CHECKOUT_TOKEN` | Access token for cloning a **private** `https` repo in `clone` mode (sent transiently as an env-scoped `Authorization` header to the repository's own host and same-host submodules only; public repos need none) | none |
 | `SEXTANT_SERVICE_SUBMODULE_HOSTS` | In `clone` mode, comma-separated `host[:port]` list of **additional** hosts submodules may be fetched from — **anonymously** (the token is never sent to them). Invalid entries fail startup | none (same host only) |
+| `SEXTANT_SERVICE_REPOSITORY_HOSTS` | Comma-separated DNS host names a `POST /control/ensure` repository URL may name (see [Repository URL policy](#repository-url-policy-svc-5)). `*` admits any host that passes the URL shape rules and logs a startup warning. A malformed entry **fails startup** | `github.com` |
+| `SEXTANT_SERVICE_REPOSITORY_OWNERS` | Optional comma-separated `host/owner` (or `host/*`) allow-list for ensure repository URLs; each host must also be allowed by `REPOSITORY_HOSTS`. A malformed entry **fails startup** | none (any owner) |
 | `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS` | In `clone` mode, how many times a **transient** clone/provisioning failure is retried across re-ensures before the job settles to terminal `failed` (clamped to 1–100; deterministic failures are never retried). Also bounds the requeue of a checkout whose neutralized `global.json` SDK pin could not be restored (`sdk_pin_restore_failed`, #113), in any checkout mode | `5` |
 | `SEXTANT_SERVICE_CONTROL_TOKEN` | Bearer token for `/control/*` | none (open, dev only) |
 | `SEXTANT_SERVICE_QUERY_TOKEN` | Bearer token for `/mcp` + `/query/*` | none (anonymous read) |
@@ -90,6 +92,36 @@ syntactically malformed value is rejected at startup (fail-closed) rather than h
 would silently widen it to a bind on all interfaces. Note that Kestrel only pins a **specific** interface
 for `localhost` or an IP literal; a non-IP **hostname** binds all interfaces, so use an IP literal (e.g.
 `127.0.0.1`) when you need to restrict the service to one interface.
+
+### Repository URL policy (SVC-5)
+
+`POST /control/ensure` evaluates the request's `repository_remote_url` against a pure SSRF policy
+(`RepositoryUrlPolicy`) **before any job row exists**, in both checkout modes. A refused URL returns
+`400 {"status":"rejected","reason":"<code>"}` (the URL is never echoed), runs no worker, creates no job, and
+writes one `ensure`/`denied` audit row whose `detail` is the reason code (the URL itself is never stored).
+The 400 waits at most about two seconds for that row. While a running index holds the single writer, the row
+is queued and lands once the writer frees up, so a refusal is never delayed behind a long index run.
+
+| Rule | Refusal `reason` |
+| --- | --- |
+| The scheme is `https` (not `http`, `ssh`, `git`, scp-like `git@host:o/r`, or `file`) | `scheme_not_allowed` |
+| No userinfo, query, fragment, or port other than `443`; no whitespace, control characters or `\`; at most 2048 characters | `url_component_not_allowed` |
+| The host is a DNS name with at least two labels and no trailing dot. It is not an IP literal (IPv4, IPv6, or a numeric form such as `127.1`/`0x7f.1`) and not `localhost` or `*.localhost` | `host_not_allowed` |
+| The host is on `SEXTANT_SERVICE_REPOSITORY_HOSTS` (default `github.com`; `*` = any host passing the shape rule) | `host_not_allowed` |
+| The path is exactly `/{owner}/{repo}` with an optional `.git`. Each segment is 1–100 of `[A-Za-z0-9._-]`, does not start with `-`, and is not `.` or `..` | `path_not_allowed` |
+| When `SEXTANT_SERVICE_REPOSITORY_OWNERS` is set, `host/owner` (or `host/*`) is on it. A host the list does not name admits no owner | `owner_not_allowed` |
+
+The policy's canonical form, `https://{host}/{owner}/{repo}`, is folded with the same host-aware rule as the
+catalog (so `github.com` owners match case-insensitively). It is a **policy key only**: the ensure keeps the
+**submitted** URL spelling, because snapshot identity hashes it and rewriting it would re-index every
+repository. The shape rules still apply under `*`, but a public DNS name can resolve to an internal address,
+so prefer an explicit host list. Direct `SnapshotService` callers (the local CLI/daemon never construct one)
+are not subject to the route policy.
+
+> **Migration note.** The default admits only `github.com`. A deployment that ensures repositories on any
+> other host must list them in `SEXTANT_SERVICE_REPOSITORY_HOSTS`, **including a `locate`-mode deployment**
+> whose checkouts come from non-GitHub remotes. The policy applies in both modes, so without the setting
+> those ensures are refused with `host_not_allowed`.
 
 ### Checkout provisioning — `locate` vs `clone`
 
@@ -599,7 +631,7 @@ The host deliberately **separates control endpoints from query endpoints**, and 
 | --- | --- | --- | --- |
 | `GET /health` | — | open | Service **AVAILABILITY**: the process is up and the catalog is reachable. |
 | `GET /ready` | — | open | Worker **CAPACITY**: `503` when this node has no worker (query-only), so an operator can tell "up" from "can index". |
-| `POST /control/ensure` | control | control token | Idempotent ensure-snapshot (criterion 1). Accepts an optional monotonic `branch_head_sequence` for forward-only branch-head advance (Phase 14, issue #84). Blocks until terminal (`200`; `202` when transient-requeued) unless `?wait=false`, which returns `202` at once with the job to poll (issue #148). A caller disconnect/timeout **never** cancels production. |
+| `POST /control/ensure` | control | control token | Idempotent ensure-snapshot (criterion 1). Accepts an optional monotonic `branch_head_sequence` for forward-only branch-head advance (Phase 14, issue #84). Blocks until terminal (`200`; `202` when transient-requeued) unless `?wait=false`, which returns `202` at once with the job to poll (issue #148). A caller disconnect/timeout **never** cancels production. A repository URL the [repository URL policy](#repository-url-policy-svc-5) refuses is `400 {"status":"rejected","reason":"<code>"}` before any job exists (audited `ensure`/`denied`). |
 | `POST /control/contribute` | control | control **or** contribute token | Ingest a client/CI semantic contribution (Phase 16); the least-privilege contribute token authorizes this endpoint only. |
 | `GET /control/status/{jobId}` | control | control token | Job status + per-project diagnostics (criterion 5) + checkout `coverage` (#119). |
 | `GET /control/resolve` | control | control token | Resolve a repository branch to its current published snapshot (+ its `coverage`, #119). |

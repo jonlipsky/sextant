@@ -225,11 +225,21 @@ public static class ServiceApp
         // this HTTP caller waits — a client disconnect/timeout never cancels or requeues the index; the job
         // stays running and publishes normally, and a re-ensure attaches to it. `?wait=false` returns 202 as
         // soon as the job is registered (status queued/running + job_id) so the caller polls /control/status.
-        control.MapPost("/ensure", async (EnsureSnapshotRequest request, bool? wait, HttpRequest req, SnapshotService service, CancellationToken ct) =>
+        control.MapPost("/ensure", async (EnsureSnapshotRequest request, bool? wait, HttpRequest req, SnapshotService service, ServiceOptions options, CancellationToken ct) =>
         {
             EnsureSnapshotResult result;
             try
             {
+                // SVC-5: refuse an unsafe/unlisted repository URL BEFORE any job row exists. The decision's
+                // canonical form is a policy key only — the request keeps its submitted spelling, because
+                // snapshot identity hashes it. The 400 body carries only the reason code (never the URL).
+                var decision = options.RepositoryUrlPolicy.Evaluate(request.RepositoryRemoteUrl);
+                if (!decision.Ok)
+                {
+                    await service.RecordEnsureDeniedAsync(decision.Reason!, ExtractBearer(req), ct);
+                    return Results.Json(new { status = "rejected", reason = decision.Reason }, ServiceJson.Options,
+                        statusCode: StatusCodes.Status400BadRequest);
+                }
                 result = wait == false
                     ? await service.BeginEnsureSnapshotAsync(request, ExtractBearer(req), ct)
                     : await service.EnsureSnapshotAsync(request, ct, ExtractBearer(req));
