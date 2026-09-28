@@ -31,6 +31,9 @@ internal static class ServiceTestFixtures
             CatalogDbPath = dbPath,
             Volumes = ServiceVolumes.Rooted(dataRoot),
             ControlToken = controlToken,
+            // SX-6d: a test that builds no control token runs the control plane open on purpose (the host
+            // would otherwise refuse to start), exactly as a dev service opts in.
+            InsecureOpenControlPlane = controlToken is null,
             QueryToken = queryToken,
             Retention = retention ?? new RetentionPolicy(),
             LeaseTtl = TimeSpan.FromSeconds(30)

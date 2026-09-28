@@ -4,6 +4,7 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
@@ -583,6 +584,13 @@ public class CallerAssertionHttpTests
     internal static string EnsureBody() =>
         JsonSerializer.Serialize(ServiceTestFixtures.Request(repo: "https://github.com/acme/gadgets", commit: "commit-g1"), ServiceJson.Options);
 
+    /// <summary><see cref="EnsureBody"/> within the SX-6d user-caller bounds (<c>branch_update: none</c>).</summary>
+    internal static string UserEnsureBody() =>
+        JsonSerializer.Serialize(ServiceTestFixtures.Request(repo: "https://github.com/acme/gadgets", commit: "commit-g1") with
+        {
+            BranchUpdate = "none"
+        }, ServiceJson.Options);
+
     internal static void AssertUnauthorized(RpcResponse response, string code, string bearerError)
     {
         Assert.AreEqual(HttpStatusCode.Unauthorized, response.Status, response.Raw);
@@ -675,6 +683,8 @@ public class CallerAssertionHttpTests
         public SnapshotService Service { get; private set; } = null!;
         public FakeSnapshotWorker Worker { get; private set; } = null!;
         private readonly CapturingLoggerProvider _logs = new();
+        /// <summary>The real socket address when started with <c>kestrel: true</c>; null under the TestServer.</summary>
+        public Uri? ListenAddress { get; private set; }
         private HttpClient Client { get; set; } = null!;
         private WebApplication App { get; set; } = null!;
         private IndexDatabase Db { get; set; } = null!;
@@ -683,7 +693,8 @@ public class CallerAssertionHttpTests
 
         public static async Task<Harness> StartAsync(
             bool callerIdentity = true, bool readPolicy = false, string[]? apps = null,
-            Func<ServiceOptions, ServiceOptions>? configure = null, Action<IndexDatabase>? seed = null)
+            Func<ServiceOptions, ServiceOptions>? configure = null, Action<IndexDatabase>? seed = null,
+            bool kestrel = false, IRemoteDefaultBranchResolver? remoteDefaults = null)
         {
             var harness = new Harness();
             var dbPath = ServiceTestFixtures.NewDbPath();
@@ -725,10 +736,14 @@ public class CallerAssertionHttpTests
             var worker = new FakeSnapshotWorker(db);
             if (configure is not null)
                 options = configure(options);
-            var service = SnapshotService.Start(options, worker, db);
+            var service = SnapshotService.Start(options, worker, db, remoteDefaults: remoteDefaults);
 
             var builder = WebApplication.CreateBuilder();
-            builder.WebHost.UseTestServer();
+            // A real Kestrel socket on an ephemeral loopback port, so its request-target normalization is exercised.
+            if (kestrel)
+                builder.WebHost.UseUrls("http://127.0.0.1:0");
+            else
+                builder.WebHost.UseTestServer();
             builder.Logging.ClearProviders();
             builder.Logging.AddProvider(harness._logs);
             builder.Logging.SetMinimumLevel(LogLevel.Trace);
@@ -745,7 +760,13 @@ public class CallerAssertionHttpTests
             await app.StartAsync();
 
             harness.App = app;
-            harness.Client = app.GetTestClient();
+            if (kestrel)
+            {
+                harness.ListenAddress = new Uri(app.Urls.Single());
+                harness.Client = new HttpClient { BaseAddress = harness.ListenAddress };
+            }
+            else
+                harness.Client = app.GetTestClient();
             harness.Service = service;
             harness.Worker = worker;
             harness.Db = db;
@@ -764,7 +785,15 @@ public class CallerAssertionHttpTests
                 .ToList();
 
         /// <summary>How many grant rows the catalog holds (read on its own connection).</summary>
-        public long GrantRows()
+        public long GrantRows() => CatalogScalar("SELECT COUNT(*) FROM repository_grants;");
+
+        /// <summary>How many snapshot job rows the catalog holds (read on its own connection).</summary>
+        public long JobRows() => CatalogScalar("SELECT COUNT(*) FROM snapshot_jobs;");
+
+        /// <summary>How many branch rows the catalog holds (read on its own connection).</summary>
+        public long BranchRows() => CatalogScalar("SELECT COUNT(*) FROM branches;");
+
+        private long CatalogScalar(string sql)
         {
             using var conn = new Microsoft.Data.Sqlite.SqliteConnection(new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder
             {
@@ -774,7 +803,7 @@ public class CallerAssertionHttpTests
             }.ToString());
             conn.Open();
             using var cmd = conn.CreateCommand();
-            cmd.CommandText = "SELECT COUNT(*) FROM repository_grants;";
+            cmd.CommandText = sql;
             return (long)cmd.ExecuteScalar()!;
         }
 

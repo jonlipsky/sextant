@@ -344,6 +344,38 @@ public class CloningCheckoutProviderTests
         Assert.IsTrue(Directory.Exists(recent), "a recently-touched temp clone must be spared (may be in-flight)");
     }
 
+    // ---- remote default branch (issue #199) ------------------------------------------------------
+
+    [TestMethod]
+    public void ResolveDefaultBranch_ReadsTheBranchTheRemotesHeadNames()
+    {
+        var (remoteUrl, _) = NewRemoteRepo(out var repoDir);
+        var paths = NewPaths();
+        var provider = NewCloneProvider(paths);
+
+        Assert.AreEqual("main", provider.ResolveDefaultBranch(remoteUrl));
+
+        Git(repoDir, "branch", "trunk");
+        Git(repoDir, "symbolic-ref", "HEAD", "refs/heads/trunk");
+        Assert.AreEqual("trunk", provider.ResolveDefaultBranch(remoteUrl), "the remote's HEAD decides, not a name convention");
+        Assert.IsFalse(Directory.EnumerateDirectories(paths.CheckoutRoot, ".tmp-clone-*").Any(),
+            "the lookup leaves no temp directory behind");
+    }
+
+    [TestMethod]
+    public void ResolveDefaultBranch_WhenItCannotBeDetermined_IsNull()
+    {
+        var paths = NewPaths();
+        var provider = NewCloneProvider(paths);
+        var missing = new Uri(Path.Combine(Path.GetTempPath(), $"sextant_missing_{Guid.NewGuid():N}")).AbsoluteUri;
+
+        Assert.IsNull(provider.ResolveDefaultBranch(missing), "an unreachable remote");
+        Assert.IsNull(new CloningCheckoutProvider(new PersistentVolumeCheckoutProvider(paths), paths, gitExecutable: "definitely-not-git")
+            .ResolveDefaultBranch("https://github.com/acme/widgets"), "git cannot run");
+        Assert.IsNull(provider.ResolveDefaultBranch("https://user:secret@github.com/acme/widgets"),
+            "a URL that embeds credentials is refused before git runs");
+    }
+
     // ---- helpers ---------------------------------------------------------------------------------
 
     private ServicePaths NewPaths()

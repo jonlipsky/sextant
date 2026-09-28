@@ -105,13 +105,24 @@ public sealed partial class SnapshotService
     /// Unlike the URL-policy refusal the repository was accepted, so the row is scoped to its key.
     /// </summary>
     public Task RecordEnsureNotGrantedAsync(
-        string repositoryKey, AuditCaller auditor = default, CancellationToken cancellationToken = default)
+        string repositoryKey, AuditCaller auditor = default, CancellationToken cancellationToken = default) =>
+        RecordUserEnsureDeniedAsync(repositoryKey, GrantReason.NotGranted, auditor, cancellationToken);
+
+    /// <summary>
+    /// Records an <c>ensure</c>/<c>denied</c> row for an ensure the host refused for a user caller that can see the
+    /// repository (SX-6d, <see cref="EnsureSnapshotRequest.UserCallerBranchProblem"/>), with the same contract as
+    /// <see cref="RecordEnsureNotGrantedAsync"/>: scoped to the repository key, written on the grant connection (so it
+    /// never waits behind a production), and <see cref="GrantStoreUnavailableException"/> when it cannot be recorded.
+    /// </summary>
+    public Task RecordUserEnsureDeniedAsync(
+        string repositoryKey, string reason, AuditCaller auditor = default, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(repositoryKey);
+        ArgumentException.ThrowIfNullOrEmpty(reason);
         return RunGrantWriteAsync(conn =>
         {
             new AuditLogStore(conn).Append(AuditAction.Ensure, AuditOutcome.Denied, actor: auditor.Actor,
-                repositoryScope: repositoryKey, detail: auditor.Detail(GrantReason.NotGranted));
+                repositoryScope: repositoryKey, detail: auditor.Detail(reason));
             return true;
         }, cancellationToken);
     }

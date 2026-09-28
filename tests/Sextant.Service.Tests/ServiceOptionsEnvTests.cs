@@ -612,4 +612,94 @@ public class ServiceOptionsEnvTests
         };
         Assert.ThrowsExactly<InvalidOperationException>(options.ValidateCallerIdentity);
     }
+
+    // ==== SX-6d: the control plane needs a token unless explicitly opted out ============================
+
+    private const string InsecureOpenControlPlaneVar = "SEXTANT_SERVICE_INSECURE_OPEN_CONTROL_PLANE";
+
+    private static T WithControlEnv<T>(string? controlToken, string? openControlPlane, Func<T> body)
+    {
+        Environment.SetEnvironmentVariable(ControlTokenVar, controlToken);
+        Environment.SetEnvironmentVariable(InsecureOpenControlPlaneVar, openControlPlane);
+        try
+        {
+            return body();
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(ControlTokenVar, null);
+            Environment.SetEnvironmentVariable(InsecureOpenControlPlaneVar, null);
+        }
+    }
+
+    [TestMethod]
+    public void InsecureOpenControlPlane_UnsetIsOff_AndTheOptionsStillBuild()
+    {
+        // FromEnvironment does not enforce the guard (the offline backup/restore commands use it and serve nothing);
+        // ValidateControlPlane, which the host runs before it serves, does.
+        var options = WithControlEnv(null, null, () => ServiceOptions.FromEnvironment(Config()));
+
+        Assert.IsFalse(options.InsecureOpenControlPlane);
+        Assert.IsFalse(options.ControlPlaneIsOpen);
+        var refused = Assert.ThrowsExactly<InvalidOperationException>(options.ValidateControlPlane);
+        StringAssert.Contains(refused.Message, "SEXTANT_SERVICE_CONTROL_TOKEN is not set");
+        StringAssert.Contains(refused.Message, InsecureOpenControlPlaneVar);
+    }
+
+    [TestMethod]
+    [DataRow("true")]
+    [DataRow(" ON ")]
+    [DataRow("1")]
+    public void InsecureOpenControlPlane_Set_OpensTheControlPlaneOnPurpose(string value)
+    {
+        var options = WithControlEnv(null, value, () => ServiceOptions.FromEnvironment(Config()));
+
+        Assert.IsTrue(options.InsecureOpenControlPlane);
+        Assert.IsTrue(options.ControlPlaneIsOpen);
+        options.ValidateControlPlane();
+    }
+
+    [TestMethod]
+    [DataRow("false")]
+    [DataRow("0")]
+    public void InsecureOpenControlPlane_False_StillRefuses(string value)
+    {
+        var options = WithControlEnv(null, value, () => ServiceOptions.FromEnvironment(Config()));
+
+        Assert.IsFalse(options.ControlPlaneIsOpen);
+        Assert.ThrowsExactly<InvalidOperationException>(options.ValidateControlPlane);
+    }
+
+    [TestMethod]
+    public void InsecureOpenControlPlane_Malformed_FailsClosed()
+    {
+        WithControlEnv(null, "yes-please", () => Assert.ThrowsExactly<InvalidOperationException>(
+            () => ServiceOptions.FromEnvironment(Config()), "a malformed opt-out must abort startup, not open the plane"));
+    }
+
+    [TestMethod]
+    [DataRow(null)]
+    [DataRow("true")]
+    public void ControlToken_Set_PassesTheGuard_AndTheOptOutIsIgnored(string? openControlPlane)
+    {
+        var options = WithControlEnv("control-secret", openControlPlane, () => ServiceOptions.FromEnvironment(Config()));
+
+        Assert.AreEqual("control-secret", options.ControlToken);
+        Assert.IsFalse(options.ControlPlaneIsOpen, "a configured control token always wins over the opt-out");
+        options.ValidateControlPlane();
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public void ControlToken_WhitespaceOnly_FailsTheGuard_EvenWithTheOptOut(bool openControlPlane)
+    {
+        var options = ServiceTestFixtures.NewOptions(ServiceTestFixtures.NewDbPath(), controlToken: "   ") with
+        {
+            InsecureOpenControlPlane = openControlPlane
+        };
+
+        var refused = Assert.ThrowsExactly<InvalidOperationException>(options.ValidateControlPlane);
+        StringAssert.Contains(refused.Message, "blank");
+    }
 }

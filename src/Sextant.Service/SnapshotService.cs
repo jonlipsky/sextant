@@ -46,6 +46,7 @@ public sealed partial class SnapshotService : IDisposable
     private readonly IContributionAuthorizer _authorizer;
     private readonly IGitContentProvider _gitContent;
     private readonly ContributionPolicy _contributionPolicy;
+    private readonly RemoteDefaultBranchLookup? _remoteDefaults;
     private readonly ServiceMetrics _metrics = new();
 
     // Issue #148: the service-owned lifetime every ensure operation + worker run is bound to (cancelled only
@@ -63,7 +64,8 @@ public sealed partial class SnapshotService : IDisposable
     private SnapshotService(
         ServiceOptions options, ISnapshotWorker worker, ServicePaths paths,
         IndexDatabase db, WriterLease lease, bool ownsDatabase,
-        IContributionAuthorizer authorizer, IGitContentProvider gitContent, ContributionPolicy contributionPolicy)
+        IContributionAuthorizer authorizer, IGitContentProvider gitContent, ContributionPolicy contributionPolicy,
+        IRemoteDefaultBranchResolver? remoteDefaults)
     {
         _options = options;
         _worker = worker;
@@ -75,6 +77,7 @@ public sealed partial class SnapshotService : IDisposable
         _authorizer = authorizer;
         _gitContent = gitContent;
         _contributionPolicy = contributionPolicy;
+        _remoteDefaults = remoteDefaults is null ? null : new RemoteDefaultBranchLookup(remoteDefaults);
     }
 
     public ServicePaths Paths => _paths;
@@ -117,7 +120,7 @@ public sealed partial class SnapshotService : IDisposable
     public static SnapshotService Start(
         ServiceOptions options, ISnapshotWorker? worker = null, IndexDatabase? database = null,
         IContributionAuthorizer? authorizer = null, IGitContentProvider? gitContent = null,
-        ContributionPolicy? contributionPolicy = null)
+        ContributionPolicy? contributionPolicy = null, IRemoteDefaultBranchResolver? remoteDefaults = null)
     {
         var effectivePolicy = contributionPolicy ?? options.Contribution;
         var effectiveAuthorizer = authorizer ?? OpenContributionAuthorizer.Instance;
@@ -157,7 +160,7 @@ public sealed partial class SnapshotService : IDisposable
                 db.Recover();
                 var service = new SnapshotService(
                     options, worker ?? new UnavailableSnapshotWorker(), paths, db, lease, ownsDatabase,
-                    effectiveAuthorizer, effectiveGitContent, effectivePolicy);
+                    effectiveAuthorizer, effectiveGitContent, effectivePolicy, remoteDefaults);
                 service.ReconcileOnStartup();
                 return service;
             }
@@ -431,11 +434,43 @@ public sealed partial class SnapshotService : IDisposable
         return result;
     }
 
+    // Issue #199: a caller that may not pick its repository's default (RestrictsImplicitDefault) gets the #104
+    // first-branch default only for the branch the REMOTE names as its default. The service looks that up itself,
+    // outside the write gate, and only when the answer can matter: the repository has no default branch yet (the only
+    // time the safety net can apply) and the ensure may move a pointer (not `branch_update: none`). The lookup is shared,
+    // remembered briefly and capped (RemoteDefaultBranchLookup). Any value a direct caller supplied is discarded. No
+    // resolver (locate mode), a failed lookup or a full cap leaves it unset, so the branch is created without the
+    // default (fail closed).
+    private async Task<EnsureSnapshotRequest> WithVerifiedRemoteDefaultAsync(EnsureSnapshotRequest request)
+    {
+        if (!request.RestrictsImplicitDefault)
+            return request;
+        var unverified = request with { VerifiedRemoteDefaultBranch = null };
+        if (request.SuppressesBranchUpdate || _remoteDefaults is not { } lookup || RepositoryHasDefaultBranch(request.RepositoryRemoteUrl))
+            return unverified;
+        try
+        {
+            var branch = await lookup.ResolveAsync(request.RepositoryRemoteUrl).WaitAsync(_lifetime.Token).ConfigureAwait(false);
+            return request with { VerifiedRemoteDefaultBranch = branch };
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return unverified;
+        }
+    }
+
+    private bool RepositoryHasDefaultBranch(string repositoryRemoteUrl) => ReadCatalog(conn =>
+    {
+        var snapshots = new SnapshotStore(conn);
+        return snapshots.GetRepositoryId(repositoryRemoteUrl) is long repoId && snapshots.GetDefaultBranchId(repoId) is not null;
+    });
+
     // The idempotent-ensure core. Every durable step (and the request's audit row) runs under the single
     // write gate; the only long step — the worker — is a shared, service-owned production per identity.
     private async Task<EnsureSnapshotResult> EnsureSnapshotCoreAsync(
         EnsureSnapshotRequest request, AuditCaller principal, TaskCompletionSource<EnsureSnapshotResult> accepted)
     {
+        request = await WithVerifiedRemoteDefaultAsync(request).ConfigureAwait(false);
         // Issue #113: the non-default SDK-pin policy is part of the identity, so flipping
         // SEXTANT_SERVICE_SDK_PIN_OVERRIDE never reuses a snapshot (or failed job) built under the other policy.
         var identity = request.ToIdentity(
@@ -1146,8 +1181,9 @@ public sealed partial class SnapshotService : IDisposable
         // first/sole consumer) — promote it so the multi-tenant read selector (GetSelectedSnapshotIdFor-
         // Repository, which requires is_default = 1) can resolve a snapshot instead of failing closed. Uses
         // SetSoleDefaultBranch (not PromoteSoleDefaultBranch) because the attached row is is_default = 0 and
-        // must be SET, not merely have siblings demoted; it preserves the single-default invariant.
-        if (snapshots.ShouldOwnDefault(repoId, branch, request.ResolveIsDefaultBranch()))
+        // must be SET, not merely have siblings demoted; it preserves the single-default invariant. A caller that
+        // may not pick the default (issue #199) gets the no-default clause only for the remote's own default.
+        if (snapshots.ShouldOwnDefault(repoId, branch, request.ResolveIsDefaultBranch(), request.AllowsImplicitDefault(branch)))
             snapshots.SetSoleDefaultBranch(repoId, branchId);
     }
 
@@ -1230,7 +1266,8 @@ public sealed partial class SnapshotService : IDisposable
         var branchName = request.BranchName ?? "main";
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         snapshots.MarkConsumerRepository(repoId);
-        var ownsDefault = snapshots.ShouldOwnDefault(repoId, branchName, request.ResolveIsDefaultBranch());
+        var ownsDefault = snapshots.ShouldOwnDefault(
+            repoId, branchName, request.ResolveIsDefaultBranch(), request.AllowsImplicitDefault(branchName));
         var branchId = snapshots.EnsureBranch(repoId, branchName, ownsDefault, now);
         if (ownsDefault)
             snapshots.PromoteSoleDefaultBranch(repoId, branchId);
@@ -1251,7 +1288,8 @@ public sealed partial class SnapshotService : IDisposable
         if (!snapshots.BranchHeadMatches(snapshots.GetBranchId(repoId, branchName), expectedHead))
             return;
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        var ownsDefault = snapshots.ShouldOwnDefault(repoId, branchName, request.ResolveIsDefaultBranch());
+        var ownsDefault = snapshots.ShouldOwnDefault(
+            repoId, branchName, request.ResolveIsDefaultBranch(), request.AllowsImplicitDefault(branchName));
         var branchId = snapshots.EnsureBranch(repoId, branchName, ownsDefault, now);
         if (ownsDefault)
             snapshots.PromoteSoleDefaultBranch(repoId, branchId);
