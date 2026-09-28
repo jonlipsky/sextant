@@ -40,10 +40,17 @@ public class ToolArgumentSelectionHttpTests
 
         var tools = (await host.RpcAsync("tools/list", "{}")).GetProperty("tools").EnumerateArray().ToList();
 
-        Assert.AreEqual(ServiceApp.RepositoryScopedTools.Count, tools.Count, "every remote tool is repository-scoped today");
+        Assert.AreEqual(ServiceApp.RepositoryScopedTools.Count + ToolSelectionFilters.SelectionExemptTools.Count, tools.Count,
+            "every remote tool is repository-scoped except the selection-exempt ones (list_repositories)");
         foreach (var tool in tools)
         {
             var name = tool.GetProperty("name").GetString()!;
+            if (ToolSelectionFilters.SelectionExemptTools.Contains(name))
+            {
+                var exemptProperties = tool.GetProperty("inputSchema").TryGetProperty("properties", out var p) ? p : default;
+                Assert.IsFalse(exemptProperties.ValueKind == JsonValueKind.Object && exemptProperties.TryGetProperty("repository", out _), name);
+                continue;
+            }
             Assert.IsTrue(ServiceApp.RepositoryScopedTools.Contains(name), name);
             var schema = tool.GetProperty("inputSchema");
             var properties = schema.GetProperty("properties");

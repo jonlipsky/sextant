@@ -41,12 +41,24 @@ public class RemoteToolAllowlistTests
         {
             typeof(GetSourceContextTool), typeof(GetDaemonStatusTool), typeof(GetBaseSnapshotSymbolsTool)
         };
-        var expected = allToolTypes.Where(t => !excluded.Contains(t)).ToList();
+        // SVC-4: the one service-only tool (it reads the caller's grants, not an index).
+        var serviceOnly = new[] { typeof(Sextant.Service.Grants.ListRepositoriesTool) };
+        var expected = allToolTypes.Where(t => !excluded.Contains(t)).Concat(serviceOnly).ToList();
 
-        // The allowlist must equal ALL MCP tools minus the two local-only tools. This fails closed on drift
-        // in BOTH directions: a newly added tool is not silently exposed remotely (it must be triaged and
-        // added here), and a query tool is not silently dropped from the remote surface.
+        // The allowlist must equal ALL MCP tools minus the local-only tools, plus the service-only tools. This fails
+        // closed on drift in BOTH directions: a newly added tool is not silently exposed remotely (it must be triaged
+        // and added here), and a query tool is not silently dropped from the remote surface.
         CollectionAssert.AreEquivalent(expected, ServiceApp.RemoteQueryTools.ToList(),
-            "the remote allowlist must equal all MCP tools minus the unauthenticated local-only tools");
+            "the remote allowlist must equal all MCP tools minus the unauthenticated local-only tools, plus list_repositories");
+    }
+
+    [TestMethod]
+    public void ServiceOnlyTools_AreTheOnlyMcpToolsInTheServiceAssembly()
+    {
+        // A tool added to Sextant.Service is service-only by construction; it must be triaged into the allowlist.
+        var serviceTools = typeof(Sextant.Service.Grants.ListRepositoriesTool).Assembly.GetTypes()
+            .Where(t => t.GetCustomAttributes(false).Any(a => a.GetType().Name == "McpServerToolTypeAttribute"))
+            .ToList();
+        CollectionAssert.AreEquivalent(new[] { typeof(Sextant.Service.Grants.ListRepositoriesTool) }, serviceTools);
     }
 }

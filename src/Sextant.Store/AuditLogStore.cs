@@ -23,6 +23,9 @@ public static class AuditAction
 
     /// <summary>A branch retirement (SVC-6, <c>POST /control/branches/retire</c>).</summary>
     public const string Retire = "retire";
+
+    /// <summary>A repository grant written or revoked (SVC-4, <c>PUT</c>/<c>DELETE /control/grants/*</c>).</summary>
+    public const string Grant = "grant";
 }
 
 /// <summary>The outcome an <see cref="AuditEntry"/> records (migration 020 <c>audit_log.outcome</c>).</summary>
@@ -36,7 +39,10 @@ public static class AuditOutcome
     /// whose repository URL the service's repository URL policy rejects (SVC-5, <c>ensure</c>/<c>denied</c>,
     /// detail = the reason code; the refused URL is never stored) or whose branch guards are malformed
     /// (SVC-6/7), and a branch retirement refused by that policy, for a missing branch name, as the
-    /// repository's default branch, or on a head mismatch (SVC-6, <c>retire</c>/<c>denied</c>). It is
+    /// repository's default branch, or on a head mismatch (SVC-6, <c>retire</c>/<c>denied</c>), a repository
+    /// grant write refused for its caller, body, repository URL, branch or limit (SVC-4, <c>grant</c>/<c>denied</c>,
+    /// detail = <c>{operation};{reason}</c>), and an ensure a user caller is not granted (SVC-4,
+    /// <c>ensure</c>/<c>denied</c>, detail <c>not_granted</c>). It is
     /// deliberately NOT emitted from the
     /// auth-middleware hot path: a durable write per unauthenticated request would drive the single writer
     /// into contention (a DoS amplifier), and the uniform-not-found denial already prevents an unauthorized
