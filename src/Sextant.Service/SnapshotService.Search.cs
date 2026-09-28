@@ -104,7 +104,7 @@ public sealed partial class SnapshotService
             Math.Clamp(_options.SearchMaxWidth, 1, ServiceOptions.SearchMaxWidthCeiling),
             Math.Clamp(_options.SearchMaxHits, ServiceOptions.SearchMaxHitsFloor, ServiceOptions.SearchMaxHitsCeiling));
         var bounded = query with { Limit = Math.Clamp(query.Limit, 1, SymbolSearchQuery.MaxLimit) };
-        return ReadCatalog(conn => SearchOn(conn, caller, bounded, resume, bounds, cancellationToken), cancellationToken);
+        return ReadCatalogCancellable(conn => SearchOn(conn, caller, bounded, resume, bounds, cancellationToken), cancellationToken);
     }
 
     private SymbolSearchOutcome SearchOn(
