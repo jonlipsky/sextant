@@ -1,0 +1,74 @@
+name: unwatch-default-unresolved-github-default
+description: >
+  "stop watching X on main" while the caller's only grant is a default-branch watch whose branch the
+  service has not resolved yet (no resolved_branch). GitHub's default branch decides it: it is main, so the
+  default-branch grant is removed (DELETE without a branch) and the v1 entry is tombstoned.
+entrypoint: revoke-watch
+principal:
+  userId: u-alice
+inputs:
+  host: github.com
+  owner: octocat
+  repo: hello-world
+  remoteUrl: "https://github.com/octocat/hello-world.git"
+  branch: main
+seed:
+  userMemory:
+    - key: "sextant.watched-repos:github.com/octocat/hello-world@main"
+      value: '{"owner":"octocat","repo":"hello-world","branch":"main","cloneUrl":"https://github.com/octocat/hello-world.git","addedAt":"2026-01-01T00:00:00+00:00"}'
+# Shapes: DELETE → {deleted: N}; GET → {grants: [GrantView], result_count} (src/Sextant.Service.Host/GrantEndpoints.cs,
+# src/Sextant.Service/Grants/GrantContracts.cs; a null resolved_branch is omitted). The first DELETE (branch=main)
+# answers once; the second (no branch) removes the default-branch grant.
+http:
+  # Shape: GitHub REST GET /repos/{owner}/{repo} (read by GitHubGetRepository through Octokit).
+  - connection: github
+    method: GET
+    path: /repos/octocat/hello-world
+    body:
+      id: 1296269
+      name: hello-world
+      full_name: octocat/hello-world
+      owner: { login: octocat, id: 1 }
+      private: false
+      default_branch: main
+      html_url: "https://github.com/octocat/hello-world"
+      clone_url: "https://github.com/octocat/hello-world.git"
+  - connection: sextant-control
+    method: DELETE
+    path: /control/grants/self
+    times: 1
+    body: { deleted: 0 }
+  - connection: sextant-control
+    method: GET
+    path: /control/grants/self
+    body:
+      grants:
+        - repository: "https://github.com/octocat/hello-world.git"
+          branch: ""
+          source: self
+          created_at: 1767225600
+          status: { snapshot_status: missing }
+      result_count: 1
+  - connection: sextant-control
+    method: DELETE
+    path: /control/grants/self
+    body: { deleted: 1 }
+expected:
+  status: Completed
+  variables:
+    defaultState: unknown
+    githubDefault: main
+    deleted: 1
+    tombstoned: 1
+    memoryKeys: "github.com/octocat/hello-world@main"
+    message: "Stopped watching octocat/hello-world on main. Existing snapshots are left in place."
+  httpCalls:
+    - connection: github
+      method: GET
+      path: /repos/octocat/hello-world
+      count: 1
+    - connection: sextant-control
+      method: DELETE
+      path: /control/grants/self
+      caller: { act: user, idp: processstack, sub: u-alice }
+      count: 2

@@ -1,15 +1,16 @@
-name: start-indexing-historical
+name: start-indexing-config-never-advances
 description: >
-  (#28) Without a branch, start-indexing only indexes the commit: the ensure carries branch_update "none"
-  and no compare-and-swap, and never default_branch or branch_head_sequence.
+  A request with a configuration hash asks for a non-default snapshot, so it never moves a branch, even
+  for the branch's current head: branch_update "none", no compare-and-swap, and neither the service's nor
+  GitHub's head is read. The hash is sent lower-cased.
 entrypoint: start-indexing
 principal:
   userId: u-alice
 inputs:
   repositoryRemoteUrl: "https://github.com/octocat/hello-world.git"
   commitSha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
-# Shape: POST /control/ensure[?wait=false] → EnsureSnapshotResult, 202 while not terminal
-# (src/Sextant.Service.Host/ServiceApp.cs, src/Sextant.Service/ServiceContracts.cs).
+  branchName: main
+  configHash: "0A1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4E5F60718293A4B5C6D7E8F9"
 http:
   # Shape: GitHub REST GET /repos/{owner}/{repo} (read by GitHubGetRepository through Octokit).
   - connection: github
@@ -24,38 +25,36 @@ http:
       default_branch: main
       html_url: "https://github.com/octocat/hello-world"
       clone_url: "https://github.com/octocat/hello-world.git"
+  # Shape: POST /control/ensure[?wait=false] → EnsureSnapshotResult, 202 while not terminal
+  # (src/Sextant.Service.Host/ServiceApp.cs, src/Sextant.Service/ServiceContracts.cs).
   - connection: sextant-control
     method: POST
     path: /control/ensure
     status: 202
-    body: { job_id: 42, identity_hash: "9b1d", status: queued, attached: false }
+    body: { job_id: 44, identity_hash: "c0de", status: queued, attached: false }
 expected:
   status: Completed
   variables:
     outcome: ok
-    jobId: "42"
-    identityHash: "9b1d"
-    indexingState: queued
-    attached: false
+    jobId: "44"
+    advanceRequested: false
   httpCalls:
     - connection: sextant-control
-      method: POST
-      path: /control/ensure
-      caller: { act: user, idp: processstack, sub: u-alice }
-      bodyMatch:
-        repository_remote_url: "https://github.com/octocat/hello-world.git"
-        commit_sha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
-        branch_update: none
-        branch_name: null
-        expected_head_commit: null
-        default_branch: null
-        branch_head_sequence: null
-        forced: null
-      count: 1
-    - connection: github
       method: GET
-      path: /repos/octocat/hello-world
-      count: 1
+      path: /control/resolve
+      count: 0
     - connection: github
       path: /repos/octocat/hello-world/branches
       count: 0
+    - connection: sextant-control
+      method: POST
+      path: /control/ensure
+      bodyMatch:
+        repository_remote_url: "https://github.com/octocat/hello-world.git"
+        commit_sha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+        config_hash: "0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9"
+        branch_update: none
+        expected_head_commit: null
+        default_branch: null
+        branch_head_sequence: null
+      count: 1

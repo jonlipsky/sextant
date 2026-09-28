@@ -10,6 +10,19 @@ inputs:
   commitSha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
   branchName: main
 http:
+  # Shape: GitHub REST GET /repos/{owner}/{repo} (read by GitHubGetRepository through Octokit).
+  - connection: github
+    method: GET
+    path: /repos/octocat/hello-world
+    body:
+      id: 1296269
+      name: hello-world
+      full_name: octocat/hello-world
+      owner: { login: octocat, id: 1 }
+      private: false
+      default_branch: main
+      html_url: "https://github.com/octocat/hello-world"
+      clone_url: "https://github.com/octocat/hello-world.git"
   # Shape: GitHub REST GET /repos/{owner}/{repo}/branches (read by GitHubListBranches through Octokit).
   - connection: github
     method: GET
