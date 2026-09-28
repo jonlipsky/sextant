@@ -4,8 +4,9 @@ namespace Sextant.ProcessStack.Activities;
 
 /// <summary>
 /// Diffs the Sextant service's watched branches against GitHub and plans the CAS-guarded calls that bring
-/// the service in line: an ensure for every branch whose GitHub head the service does not point at, and a
-/// retire for every non-default branch GitHub no longer has. Deterministic (sorted, de-duplicated, capped)
+/// the service in line: an ensure for every branch whose GitHub head the service does not point at (or that
+/// is GitHub's default branch but not the service's default yet, #199), and a retire for every non-default
+/// branch GitHub no longer has. Deterministic (sorted, de-duplicated, capped)
 /// and pure: the flow gathers the inputs and sends the planned bodies.
 /// <para>
 /// Every CAS is the commit the service pointed at when resolved, so the flow must resolve every target
@@ -60,7 +61,7 @@ public sealed class SextantPlanReconcileActivity : AbstractActivity
     [ActivityInput("maxRetires", Description = "At most this many retires are planned (default 20, at most 1000).", DefaultValue = DefaultMaxRetires)]
     public object? MaxRetires { get; set; }
 
-    [ActivityOutput("ensures", Description = "The POST /control/ensure bodies to send (CAS-guarded advance).")]
+    [ActivityOutput("ensures", Description = "The POST /control/ensure bodies to send (CAS-guarded advance; default_branch is whether the branch is GitHub's default, which is how the service's default is set).")]
     public List<object?> Ensures { get; set; } = [];
 
     [ActivityOutput("retires", Description = "The POST /control/branches/retire bodies to send (CAS-guarded).")]
@@ -72,7 +73,7 @@ public sealed class SextantPlanReconcileActivity : AbstractActivity
     [ActivityOutput("truncatedTargets", Description = "How many targets maxTargets left out.")]
     public int TruncatedTargets { get; set; }
 
-    [ActivityOutput("upToDate", Description = "How many targets already point at GitHub's head.")]
+    [ActivityOutput("upToDate", Description = "How many targets already point at GitHub's head (GitHub's default must also be the service's default: one resolved with is_default:false is promoted by an ensure whose CAS is its current commit).")]
     public int UpToDate { get; set; }
 
     [ActivityOutput("skipped", Description = "How many planned targets produced no call (see skippedTargets).")]
@@ -170,6 +171,8 @@ public sealed class SextantPlanReconcileActivity : AbstractActivity
             return;
         }
 
+        var isGitHubDefault = listing.DefaultBranch.Length > 0
+            && string.Equals(branch, listing.DefaultBranch, StringComparison.Ordinal);
         string expected;
         switch (target.ResolveStatusCode)
         {
@@ -182,8 +185,14 @@ public sealed class SextantPlanReconcileActivity : AbstractActivity
                 }
                 if (string.Equals(commit, head, StringComparison.OrdinalIgnoreCase))
                 {
-                    UpToDate++;
-                    return;
+                    // At GitHub's head but not the service's default although it is GitHub's (a user watched it
+                    // first, and a user never claims the default: #199). The CAS on the current commit moves
+                    // no pointer; default_branch: true only promotes it.
+                    if (!isGitHubDefault || ActivityValues.AsBool(ActivityValues.Get(target.Resolve, "is_default")) != false)
+                    {
+                        UpToDate++;
+                        return;
+                    }
                 }
                 expected = commit;
                 break;
@@ -201,9 +210,7 @@ public sealed class SextantPlanReconcileActivity : AbstractActivity
             Skip(target, branch, ReasonEnsureLimit);
             return;
         }
-        bool? isDefault = listing.DefaultBranch.Length > 0
-            ? string.Equals(branch, listing.DefaultBranch, StringComparison.Ordinal)
-            : null;
+        bool? isDefault = listing.DefaultBranch.Length > 0 ? isGitHubDefault : null;
         Ensures.Add(ServiceRequests.Ensure(
             target.Repository, head, branch, isDefault, expected, null, ServiceRequests.Advance));
     }

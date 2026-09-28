@@ -1,0 +1,158 @@
+name: tenant-grant
+description: >
+  Records one tenant-wide repository grant with PUT /control/grants/tenant, so every principal of the tenant
+  can query the repository and the nightly reconcile keeps it in step. The grant covers the default branch;
+  there is no per-branch tenant grant. It is idempotent: re-granting a held repository answers
+  created:false.
+
+  The service accepts this call from an application caller only (a GitHub repository event or the
+  schedule). A user caller gets 403 wrong_actor and an assertion-less one 401 caller_required, so a
+  "granted" or "limit" outcome also proves the run is an application run. on-repository-change relies on
+  that before it sends a push ensure or writes an enrolled row.
+
+  A direct run is not refused (elevenworks/ProcessStack#3287) and an undeclared input seeds a variable
+  (elevenworks/ProcessStack#3286), so every variable and output is reset first, and the repository must pass
+  the service's URL shape rules before anything is sent. Only a code-shaped reason leaves the process; the
+  response body is never passed on. A network failure fails the run (a process has no error route); the
+  calling orchestration handles it.
+
+inputs:
+  - name: repository
+    type: string
+    required: true
+    description: The repository URL to grant (GitHub's clone_url; sent as the service stores it)
+
+variables:
+  - name: urlAccepted
+    type: bool
+    default: false
+  - name: checkedUrl
+    type: string
+    default: ""
+  - name: responseJson
+    type: json
+
+outputs:
+  - name: outcome
+    type: string
+    description: granted | rejected | limit | unauthorized | unavailable | error
+  - name: created
+    type: bool
+    description: True when this call created the grant; false when it was already held or not granted
+  - name: statusCode
+    type: int
+    description: The HTTP status of the PUT; 0 when nothing was sent
+  - name: reason
+    type: string
+    description: The service's reason code, else http_<status>; "" when granted
+
+nodes:
+  - id: start
+    type: start
+    next: init
+
+  - id: init
+    name: Reset every variable and output
+    type: activity:JavaScript
+    inputs:
+      script: |
+        context.setVariable('urlAccepted', false);
+        context.setVariable('checkedUrl', '');
+        context.setVariable('responseJson', null);
+        context.setVariable('outcome', '');
+        context.setVariable('created', false);
+        context.setVariable('statusCode', 0);
+        context.setVariable('reason', '');
+        null;
+    next: check
+
+  - id: check
+    name: Check the repository URL
+    type: activity:SextantNormalizeRepository
+    inputs:
+      cloneUrl: "= repository"
+    outputs:
+      accepted: urlAccepted
+      remoteUrl: checkedUrl
+    next: route-checked
+
+  - id: route-checked
+    type: decision
+    next:
+      - when: "urlAccepted && checkedUrl != ''"
+        next: put
+      - else: refuse
+
+  - id: refuse
+    name: Refuse a malformed repository
+    type: activity:JavaScript
+    inputs:
+      script: |
+        context.setVariable('outcome', 'rejected');
+        context.setVariable('reason', 'invalid_repository');
+        null;
+    next: log-refusal
+
+  - id: put
+    name: PUT /control/grants/tenant
+    type: activity:HttpRequest
+    inputs:
+      connectionId: sextant-control
+      method: PUT
+      url: /control/grants/tenant
+      body: "= ({ repository: checkedUrl })"
+      failOnErrorStatus: false
+    outputs:
+      statusCode: statusCode
+      json: responseJson
+    next: classify
+
+  # 200 is the grant (created or already held). 409 grant_limit is the tenant's cap; it is still an
+  # application answer. Every other refusal carries a code in `reason` (or `error` from the caller gate).
+  - id: classify
+    name: Classify the answer
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var code = Number(statusCode) || 0;
+        var body = responseJson != null && typeof responseJson === 'object' ? responseJson : {};
+        var raw = String(body.reason || body.error || '');
+        var reasonCode = /^[a-z0-9_]{1,64}$/.test(raw) ? raw : '';
+        var outcome;
+        if (code === 200) {
+          outcome = 'granted';
+          context.setVariable('created', body.created === true);
+          reasonCode = '';
+        } else if (code === 409 && reasonCode === 'grant_limit') {
+          outcome = 'limit';
+        } else if (code === 400 || code === 409) {
+          outcome = 'rejected';
+        } else if (code === 401 || code === 403) {
+          outcome = 'unauthorized';
+        } else if (code === 0 || code === 408 || code === 429 || (code >= 500 && code < 600)) {
+          outcome = 'unavailable';
+        } else {
+          outcome = 'error';
+        }
+        if (outcome !== 'granted' && reasonCode === '') reasonCode = 'http_' + code;
+        context.setVariable('outcome', outcome);
+        context.setVariable('reason', reasonCode);
+        outcome;
+    next: route-outcome
+
+  - id: route-outcome
+    type: decision
+    next:
+      - when: "outcome == 'granted'"
+        next: end
+      - else: log-refusal
+
+  - id: log-refusal
+    type: activity:Log
+    inputs:
+      level: Warning
+      message: "= 'Sextant tenant grant was not recorded: ' + outcome + ' (' + reason + ', HTTP ' + statusCode + ')'"
+    next: end
+
+  - id: end
+    type: end

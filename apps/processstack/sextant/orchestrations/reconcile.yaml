@@ -1,0 +1,350 @@
+name: reconcile
+description: >
+  The nightly reconcile (schedule nightly-reconcile, 03:00 UTC). It runs as the application:
+    1. GET /control/grants?scope=tenant lists the watched (repository, branch) targets: every tenant and
+       user grant of the tenant, grouped, with counts and no user ids. The service answers an application
+       caller only, so a run that is not the application's (a direct run is not refused,
+       elevenworks/ProcessStack#3287) stops here, refused, having sent nothing else.
+    2. The v2.0.x legacy enrollment import: every v1 enrolled/ row in App State becomes a tenant grant
+       (tenant-grant, PUT /control/grants/tenant). It is idempotent; after the G2c run-now only v2 writes
+       enrolled rows, and it grants them itself. When the import created a grant, the targets are listed
+       again so the repositories imported now are reconciled in the same run. Removed in v2.1.
+    3. reconcile-target brings each target in line with GitHub (four at a time), under the compare-and-swap
+       of the commit the service resolved.
+    4. The counts are logged: up to date, ensured, retired, skipped and failed.
+  Every variable and output is reset first (elevenworks/ProcessStack#3286).
+
+variables:
+  - name: grantsStatus
+    type: int
+    default: 0
+  - name: grantsJson
+    type: json
+  - name: appEntries
+    type: json
+  - name: legacyRepositories
+    type: json
+  - name: legacyResults
+    type: json
+  - name: legacyCreated
+    type: int
+    default: 0
+  - name: relistStatus
+    type: int
+    default: 0
+  - name: relistJson
+    type: json
+  - name: targets
+    type: json
+  - name: targetResults
+    type: json
+
+outputs:
+  - name: status
+    type: string
+    description: completed | refused (the grants listing answered 401/403) | unavailable (it failed)
+  - name: legacyRows
+    type: int
+    description: The distinct repositories of the enrolled rows imported (at most 500 per run)
+  - name: legacyGranted
+    type: int
+    description: How many of them the service granted (created or already held)
+  - name: targetCount
+    type: int
+    description: The targets reconciled (at most 500 per run)
+  - name: truncatedTargets
+    type: int
+    description: The targets beyond the cap, left for the next run
+  - name: upToDate
+    type: int
+  - name: ensured
+    type: int
+  - name: retired
+    type: int
+  - name: skipped
+    type: int
+  - name: failed
+    type: int
+
+nodes:
+  - id: start
+    type: start
+    next: init
+
+  - id: init
+    name: Reset every variable and output
+    type: activity:JavaScript
+    inputs:
+      script: |
+        ['grantsJson', 'appEntries', 'legacyRepositories', 'legacyResults', 'relistJson', 'targets',
+         'targetResults'].forEach(function (name) { context.setVariable(name, null); });
+        ['grantsStatus', 'legacyCreated', 'relistStatus', 'legacyRows', 'legacyGranted', 'targetCount',
+         'truncatedTargets', 'upToDate', 'ensured', 'retired', 'skipped', 'failed'
+        ].forEach(function (name) { context.setVariable(name, 0); });
+        context.setVariable('status', '');
+        null;
+    next: list-grants
+
+  # ---- 1. the watched targets (application only) ----
+
+  - id: list-grants
+    name: GET /control/grants?scope=tenant
+    type: activity:HttpRequest
+    inputs:
+      connectionId: sextant-control
+      method: GET
+      url: /control/grants
+      query:
+        scope: tenant
+      failOnErrorStatus: false
+    outputs:
+      statusCode: grantsStatus
+      json: grantsJson
+    next: route-grants
+    on-error: mark-unavailable
+
+  - id: route-grants
+    type: decision
+    next:
+      - when: "grantsStatus == 200 && grantsJson != null"
+        next: list-enrolled
+      - when: "grantsStatus == 401 || grantsStatus == 403"
+        next: mark-refused
+      - else: mark-unavailable
+
+  - id: mark-refused
+    type: activity:SetVariable
+    inputs:
+      value: refused
+    outputs:
+      result: status
+    next: log-not-listed
+
+  - id: mark-unavailable
+    type: activity:SetVariable
+    inputs:
+      value: unavailable
+    outputs:
+      result: status
+    next: log-not-listed
+
+  - id: log-not-listed
+    type: activity:Log
+    inputs:
+      level: Warning
+      message: "= 'Sextant reconcile: the tenant grants could not be listed (' + status + ', HTTP ' + grantsStatus + ')'"
+    next: end
+
+  # ---- 2. legacy enrollment import (v2.0.x) ----
+
+  - id: list-enrolled
+    name: Read the v1 enrolled rows
+    type: activity:ListAppValues
+    inputs:
+      prefix: enrolled/
+    outputs:
+      entries: appEntries
+    next: select-legacy
+    on-error: log-enrolled-failed
+
+  - id: log-enrolled-failed
+    type: activity:Log
+    inputs:
+      level: Warning
+      message: "= 'Sextant reconcile: the enrolled rows could not be read: ' + _lastErrorType"
+    next: select-targets
+
+  # v1's PascalCase EnrolledRepo value; the CloneUrl is what v1 indexed. A row that does not parse, or one
+  # whose CloneUrl is not a string, is skipped. One repository enrolled by several connections is granted
+  # once (the tenant grant has no branch).
+  - id: select-legacy
+    name: Select the enrolled repositories
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var seen = {};
+        var urls = [];
+        (appEntries || []).forEach(function (entry) {
+          if (!entry || typeof entry.value !== 'string') return;
+          var row = null;
+          try { row = JSON.parse(entry.value); } catch (e) { row = null; }
+          if (!row || typeof row !== 'object' || typeof row.CloneUrl !== 'string') return;
+          var url = row.CloneUrl.trim();
+          var key = url.toLowerCase().replace(/\/+$/, '').replace(/\.git$/, '');
+          if (url === '' || url.length > 2048 || seen[key]) return;
+          seen[key] = true;
+          urls.push(url);
+        });
+        urls.sort();
+        urls = urls.slice(0, 500);
+        context.setVariable('legacyRows', urls.length);
+        urls;
+    outputs:
+      result: legacyRepositories
+    next: route-legacy
+
+  - id: route-legacy
+    type: decision
+    next:
+      - when: "legacyRepositories != null && legacyRepositories.length > 0"
+        next: legacy-each
+      - else: select-targets
+
+  # One at a time, so the tenant's grant limit is counted in order.
+  - id: legacy-each
+    type: for-each
+    collection: "= legacyRepositories"
+    itemVariable: legacyUrl
+    parallel: false
+    continueOnError: true
+    processName: tenant-grant
+    inputs:
+      repository: "= legacyUrl"
+    resultsVariable: legacyResults
+    next: count-legacy
+
+  - id: count-legacy
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var granted = (legacyResults || []).filter(function (r) { return r && r.outcome === 'granted'; });
+        context.setVariable('legacyGranted', granted.length);
+        context.setVariable('legacyCreated', granted.filter(function (r) { return r.created === true; }).length);
+        null;
+    next: log-legacy
+
+  - id: log-legacy
+    type: activity:Log
+    inputs:
+      level: Info
+      message: "= 'Sextant reconcile: ' + legacyGranted + ' of ' + legacyRows + ' enrolled repositories are tenant grants (' + legacyCreated + ' new)'"
+    next: route-relist
+
+  # A grant created now is not in the first listing. When the second listing fails, the first one is used;
+  # the next run reconciles the new grants.
+  - id: route-relist
+    type: decision
+    next:
+      - when: "legacyCreated > 0"
+        next: relist-grants
+      - else: select-targets
+
+  - id: relist-grants
+    name: GET /control/grants?scope=tenant (after the import)
+    type: activity:HttpRequest
+    inputs:
+      connectionId: sextant-control
+      method: GET
+      url: /control/grants
+      query:
+        scope: tenant
+      failOnErrorStatus: false
+    outputs:
+      statusCode: relistStatus
+      json: relistJson
+    next: route-relisted
+    on-error: log-relist-failed
+
+  - id: route-relisted
+    type: decision
+    next:
+      - when: "relistStatus == 200 && relistJson != null"
+        next: adopt-relist
+      - else: log-relist-failed
+
+  - id: adopt-relist
+    type: activity:SetVariable
+    inputs:
+      value: "= relistJson"
+    outputs:
+      result: grantsJson
+    next: select-targets
+
+  - id: log-relist-failed
+    type: activity:Log
+    inputs:
+      level: Warning
+      message: "= 'Sextant reconcile: the grants were not listed again after the import (HTTP ' + relistStatus + '); the new grants wait for the next run'"
+    next: select-targets
+
+  # ---- 3. each target ----
+
+  # Deterministic and capped: sorted by (repository, branch), de-duplicated, at most 500 per run.
+  - id: select-targets
+    name: Select the targets
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var seen = {};
+        var list = [];
+        var items = grantsJson && grantsJson.targets && typeof grantsJson.targets.forEach === 'function' ? grantsJson.targets : [];
+        items.forEach(function (t) {
+          if (!t || typeof t.repository !== 'string' || t.repository.trim() === '') return;
+          var branch = t.branch == null ? '' : String(t.branch);
+          var repository = t.repository.trim();
+          var key = repository.toLowerCase().replace(/\/+$/, '').replace(/\.git$/, '') + '\n' + branch;
+          if (repository.length > 2048 || branch.length > 255 || seen[key]) return;
+          seen[key] = true;
+          list.push({ repository: repository, branch: branch, key: key });
+        });
+        list.sort(function (a, b) { return a.key < b.key ? -1 : a.key > b.key ? 1 : 0; });
+        context.setVariable('truncatedTargets', Math.max(0, list.length - 500));
+        list = list.slice(0, 500).map(function (t) { return { repository: t.repository, branch: t.branch }; });
+        context.setVariable('targetCount', list.length);
+        context.setVariable('status', 'completed');
+        list;
+    outputs:
+      result: targets
+    next: route-targets
+
+  - id: route-targets
+    type: decision
+    next:
+      - when: "targets != null && targets.length > 0"
+        next: reconcile-each
+      - else: log-summary
+
+  - id: reconcile-each
+    type: for-each
+    collection: "= targets"
+    itemVariable: target
+    parallel: true
+    maxConcurrency: 4
+    continueOnError: true
+    orchestrationName: reconcile-target
+    inputs:
+      repository: "= target.repository"
+      branch: "= target.branch"
+    resultsVariable: targetResults
+    next: tally
+
+  # A target whose run failed outright (no result) counts as failed.
+  - id: tally
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var counts = { up_to_date: 0, ensured: 0, retired: 0, skipped: 0, failed: 0 };
+        (targetResults || []).forEach(function (r) {
+          var result = r && typeof r.result === 'string' && counts.hasOwnProperty(r.result) ? r.result : 'failed';
+          counts[result]++;
+        });
+        var missing = Math.max(0, targetCount - (targetResults || []).length);
+        context.setVariable('upToDate', counts.up_to_date);
+        context.setVariable('ensured', counts.ensured);
+        context.setVariable('retired', counts.retired);
+        context.setVariable('skipped', counts.skipped);
+        context.setVariable('failed', counts.failed + missing);
+        null;
+    next: log-summary
+
+  # ---- 4. counts ----
+
+  - id: log-summary
+    type: activity:Log
+    inputs:
+      level: Info
+      message: "= 'Sextant reconcile: ' + targetCount + ' target(s): ' + upToDate + ' up to date, ' + ensured + ' ensured, ' + retired + ' retired, ' + skipped + ' skipped, ' + failed + ' failed' + (truncatedTargets > 0 ? ', ' + truncatedTargets + ' left for the next run' : '')"
+    next: end
+
+  - id: end
+    type: end

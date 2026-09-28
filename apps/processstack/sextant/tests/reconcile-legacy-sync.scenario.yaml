@@ -1,0 +1,68 @@
+name: reconcile-legacy-sync
+description: >
+  (#26) The v2.0.x legacy enrollment import: once the tenant's targets are listed (which proves the run is
+  the application's), each distinct repository of the v1 enrolled/ rows in App State becomes a tenant grant
+  (PUT /control/grants/tenant). One repository enrolled by two connections is granted once; a row whose
+  value does not parse is skipped. It is idempotent: a repository already granted answers created false and
+  still counts as granted. A grant created now is not in the first listing, so the targets are listed again.
+entrypoint: reconcile
+seed:
+  appState:
+    - tenantId: test-tenant
+      applicationName: sextant
+      kv:
+        - key: "enrolled/conn-1/github.com/octocat/hello-world@main"
+          value: '{"ConnectionId":"conn-1","Host":"github.com","Owner":"octocat","Repo":"hello-world","Branch":"main","CloneUrl":"https://github.com/octocat/hello-world.git","Slug":"github.com/octocat/hello-world@main","EnrolledAt":"2026-01-01T00:00:00+00:00"}'
+        - key: "enrolled/conn-2/github.com/octocat/hello-world@main"
+          value: '{"ConnectionId":"conn-2","Host":"github.com","Owner":"octocat","Repo":"hello-world","Branch":"main","CloneUrl":"https://github.com/octocat/hello-world.git","Slug":"github.com/octocat/hello-world@main","EnrolledAt":"2026-01-02T00:00:00+00:00"}'
+        - key: "enrolled/conn-1/github.com/octocat/spoon-knife@main"
+          value: '{"ConnectionId":"conn-1","Host":"github.com","Owner":"octocat","Repo":"spoon-knife","Branch":"main","CloneUrl":"https://github.com/octocat/spoon-knife.git","Slug":"github.com/octocat/spoon-knife@main","EnrolledAt":"2026-01-03T00:00:00+00:00"}'
+        - key: "enrolled/conn-1/github.com/octocat/broken@main"
+          value: "not json"
+http:
+  # Shape: PUT /control/grants/tenant → {grant, created} (src/Sextant.Service.Host/GrantEndpoints.cs).
+  - connection: sextant-control
+    method: PUT
+    path: /control/grants/tenant
+    bodyMatch: { repository: "https://github.com/octocat/hello-world.git" }
+    body:
+      grant: { repository: "https://github.com/octocat/hello-world.git", branch: "", source: tenant, created_at: 1760000000 }
+      created: true
+  - connection: sextant-control
+    method: PUT
+    path: /control/grants/tenant
+    bodyMatch: { repository: "https://github.com/octocat/spoon-knife.git" }
+    body:
+      grant: { repository: "https://github.com/octocat/spoon-knife.git", branch: "", source: tenant, created_at: 1750000000 }
+      created: false
+  - connection: sextant-control
+    method: GET
+    path: /control/grants
+    body: { targets: [], result_count: 0 }
+expected:
+  status: Completed
+  variables:
+    status: completed
+    legacyRows: 2
+    legacyGranted: 2
+    targetCount: 0
+  httpCalls:
+    - connection: sextant-control
+      method: PUT
+      path: /control/grants/tenant
+      count: 2
+    - connection: sextant-control
+      method: PUT
+      path: /control/grants/tenant
+      caller: { act: "!absent" }
+      bodyMatch: { repository: "https://github.com/octocat/hello-world.git" }
+      count: 1
+    - connection: sextant-control
+      method: PUT
+      path: /control/grants/tenant
+      bodyMatch: { repository: "https://github.com/octocat/spoon-knife.git" }
+      count: 1
+    - connection: sextant-control
+      method: GET
+      path: /control/grants
+      count: 2

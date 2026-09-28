@@ -1,0 +1,39 @@
+name: repo-delete-event-branch-recreated
+description: >
+  A delete event processed after a push that re-created the branch must not remove it. The retire has no
+  compare-and-swap, so GitHub is asked first; it has the branch again, so nothing is sent.
+entrypoint: on-repository-change
+event:
+  event: delete
+  owner: octocat
+  repo: hello-world
+  connectionId: conn-1
+  cloneUrl: "https://github.com/octocat/hello-world.git"
+  defaultBranch: main
+  ref: feature/x
+  refType: branch
+  branch: feature/x
+http:
+  - connection: github
+    method: GET
+    path: /repos/octocat/hello-world/branches
+    body:
+      - name: main
+        commit: { sha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d", url: "https://api.github.com/repos/octocat/hello-world/commits/7fd1a60b01f91b314f59955a4e4d4e80d8edf11d" }
+        protected: false
+      - name: feature/x
+        commit: { sha: "b3cbd5bbd7e81436d2eee04537ea2b4c0cad4cdf", url: "https://api.github.com/repos/octocat/hello-world/commits/b3cbd5bbd7e81436d2eee04537ea2b4c0cad4cdf" }
+        protected: false
+  - connection: sextant-control
+    path: "/**"
+    status: 500
+expected:
+  status: Completed
+  variables:
+    action: retire
+    retireSkipped: branch_exists
+    retireOutcome: ""
+    retired: false
+  httpCalls:
+    - connection: sextant-control
+      count: 0
