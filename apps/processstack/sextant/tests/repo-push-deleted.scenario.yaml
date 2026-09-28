@@ -1,8 +1,8 @@
 name: repo-push-deleted
 description: >
   (#16) A push that deletes a branch retires it under the CAS of `before` (the deleted head), so a stale
-  delete never removes a branch a newer push re-created. No grant or ensure is sent, and GitHub is not
-  asked: the CAS already orders the retire.
+  delete never removes a branch a newer push re-created. It waits for the tenant grant (the application-only
+  answer). No ensure is sent, and GitHub is not asked: the CAS already orders the retire.
 entrypoint: on-repository-change
 event:
   event: push
@@ -20,6 +20,13 @@ event:
   created: "false"
   deleted: "true"
 http:
+  # Shape: 200 {grant, created} (src/Sextant.Service.Host/GrantEndpoints.cs). Every call waits for it.
+  - connection: sextant-control
+    method: PUT
+    path: /control/grants/tenant
+    body:
+      grant: { repository: "https://github.com/octocat/hello-world.git", branch: "", source: tenant, created_at: 1760000000 }
+      created: false
   # Shape: POST /control/branches/retire → {retired} (src/Sextant.Service.Host/ServiceApp.cs).
   - connection: sextant-control
     method: POST
@@ -33,10 +40,16 @@ expected:
     retireOutcome: ok
     retired: true
     retireSkipped: ""
-    grantOutcome: ""
+    grantOutcome: granted
     ensureOutcome: ""
     enrollment: ""
   httpCalls:
+    - connection: sextant-control
+      method: PUT
+      path: /control/grants/tenant
+      caller: { act: "!absent" }
+      bodyMatch: { repository: "https://github.com/octocat/hello-world.git" }
+      count: 1
     - connection: sextant-control
       method: POST
       path: /control/branches/retire
@@ -46,9 +59,6 @@ expected:
         branch: feature/x
         expected_head_commit: "b3cbd5bbd7e81436d2eee04537ea2b4c0cad4cdf"
       count: 1
-    - connection: sextant-control
-      path: /control/grants/tenant
-      count: 0
     - connection: sextant-control
       path: /control/ensure
       count: 0

@@ -1,0 +1,57 @@
+name: repo-push-deleted-user-run-refused
+description: >
+  A user starts on-repository-change directly with a push that deletes the default branch. The service
+  refuses the tenant grant (403 wrong_actor), so the flow sends no retire and leaves the v1 enrolled row in
+  place.
+entrypoint: on-repository-change
+principal:
+  userId: u-mallory
+seed:
+  appState:
+    - tenantId: test-tenant
+      applicationName: sextant
+      kv:
+        - key: "enrolled/conn-1/github.com/octocat/hello-world@main"
+          value: '{"ConnectionId":"conn-1","Host":"github.com","Owner":"octocat","Repo":"hello-world","Branch":"main","CloneUrl":"https://github.com/octocat/hello-world.git","Slug":"github.com/octocat/hello-world@main","EnrolledAt":"2026-01-01T00:00:00+00:00"}'
+event:
+  event: push
+  owner: octocat
+  repo: hello-world
+  connectionId: conn-1
+  cloneUrl: "https://github.com/octocat/hello-world.git"
+  defaultBranch: main
+  ref: refs/heads/main
+  refType: branch
+  branch: main
+  before: "b3cbd5bbd7e81436d2eee04537ea2b4c0cad4cdf"
+  after: "0000000000000000000000000000000000000000"
+  forced: "false"
+  created: "false"
+  deleted: "true"
+http:
+  - connection: sextant-control
+    method: PUT
+    path: /control/grants/tenant
+    status: 403
+    body: { status: rejected, reason: wrong_actor }
+  - connection: sextant-control
+    method: POST
+    path: /control/branches/retire
+    body: { retired: true }
+expected:
+  status: Completed
+  variables:
+    action: retire
+    grantOutcome: unauthorized
+    retireOutcome: ""
+    retired: false
+    enrollment: ""
+    enrolledKey: ""
+  httpCalls:
+    - connection: sextant-control
+      method: PUT
+      path: /control/grants/tenant
+      caller: { act: user, sub: u-mallory }
+      count: 1
+    - connection: sextant-control
+      count: 1

@@ -3,24 +3,25 @@ description: >
   Keeps the Sextant service in step with one GitHub repository event: a branch push, a branch delete, or a
   pull request opened, synchronized or reopened. The connection-event triggers start it with the event's
   normalized fields in `event` (every value a string, "" when absent). SextantPlanRepositoryChange turns
-  the event into the service bodies, and this flow sends them verbatim:
-    - A branch push records the tenant grant (tenant-grant, PUT /control/grants/tenant), then sends the
-      ensure: branch_update advance under the compare-and-swap expected_head_commit = before ("" for a new
-      branch), default_branch when the event names the default, and forced for the audit. A default-branch
-      push also upserts the v1 enrolled row in App State (enrolled/{connectionId}/{slug}).
+  the event into the service bodies. Every event that calls for a change first records the tenant grant
+  (tenant-grant, PUT /control/grants/tenant) for its repository; this flow then sends the bodies verbatim:
+    - A branch push sends the ensure: branch_update advance under the compare-and-swap
+      expected_head_commit = before ("" for a new branch), default_branch when the event names the default,
+      and forced for the audit. A default-branch push also upserts the v1 enrolled row in App State
+      (enrolled/{connectionId}/{slug}).
     - A deleted push retires the branch under the CAS on before. A delete event has no head commit, so it
       retires without a CAS, and only after GitHub confirms the branch is still gone (a delete processed
       after a push that re-created the branch must not remove it). A default-branch retire removes the
       enrolled row.
-    - A pull request publishes its base and head commits with branch_update none: no pointer moves.
+    - A pull request publishes its base commit, and its head commit when the head is in the base
+      repository (never a fork's), with branch_update none: no pointer moves.
     - A tag, a create event, a closed pull request or a malformed event is logged and ignored.
 
   A repository event runs as the application (act=application), whoever the sender is; senderLogin is never
   identity. The platform does not refuse a direct run of this entrypoint (elevenworks/ProcessStack#3287),
-  and a direct run by a user runs as that user, with whatever `event` it passes. So the push ensure and the
-  enrolled row wait for the tenant grant, which the service records for an application caller only: a user's
-  run stops at the grant's 403. The service refuses a user's retire, and a pull request only publishes
-  commits (branch_update none), within the service's own checks.
+  and a direct run by a user runs as that user, with whatever `event` it passes. So every call waits for
+  the tenant grant, which the service records for an application caller only: a user's run stops at the
+  grant's 403 and sends nothing else (no ensure, retire or GitHub listing, no enrolled row).
 
   Deliveries are not de-duplicated, so every step is idempotent: the grant and the enrolled row are upserts,
   a repeated ensure attaches to its job, and a repeated retire answers retired:false. A failed call is
@@ -103,7 +104,7 @@ outputs:
     description: Why the plan ignored or degraded the event (tag, missing_before, ...); "" otherwise
   - name: grantOutcome
     type: string
-    description: The tenant grant's outcome (push only); "" when none was requested
+    description: The tenant grant's outcome; every call waits for granted or limit. "" when the event was ignored
   - name: ensureOutcome
     type: string
     description: The push ensure's, or the pull request base ensure's, outcome; "" when none was sent
@@ -204,17 +205,13 @@ nodes:
         null;
     next: route-plan
 
+  # Every call below waits for the tenant grant, which only an application caller gets (the platform does
+  # not refuse a user's direct run, elevenworks/ProcessStack#3287).
   - id: route-plan
     type: decision
     next:
-      - when: "planAction == 'retire' && retireBody != null && retireHasCas"
-        next: post-retire
-      - when: "planAction == 'retire' && retireBody != null"
-        next: race-check-url
-      - when: "planAction == 'ensure' && ensureBody != null && branchName != ''"
+      - when: "(planAction == 'retire' && retireBody != null) || (planAction == 'ensure' && ensureBody != null)"
         next: grant
-      - when: "planAction == 'ensure' && ensureBody != null"
-        next: post-base
       - else: log-ignored
 
   - id: log-ignored
@@ -224,7 +221,7 @@ nodes:
       message: "= 'Sextant repository event ignored (' + (reason != '' ? reason : 'no_action') + ')'"
     next: end
 
-  # ---- push: grant, ensure, enrolled row ----
+  # ---- every event: the tenant grant first ----
 
   - id: grant
     type: process:tenant-grant
@@ -246,20 +243,28 @@ nodes:
     next: route-grant
 
   # Only an application caller gets 200 or 409 grant_limit from PUT /control/grants/tenant, so anything else
-  # (a user's direct run gets 403) sends nothing further. A missed ensure is repaired only by the reconcile:
-  # a later push carries its own `before` as the CAS, which fails while the pointer is still behind.
+  # (a user's direct run gets 403) sends nothing further: no ensure, no GitHub listing, no retire. A pull
+  # request's commits and a retire's branch come from `event`, which a direct run chooses. A missed ensure
+  # is repaired only by the reconcile: a later push carries its own `before` as the CAS, which fails while
+  # the pointer is still behind.
   - id: route-grant
     type: decision
     next:
-      - when: "grantOutcome == 'granted' || grantOutcome == 'limit'"
+      - when: "grantOutcome != 'granted' && grantOutcome != 'limit'"
+        next: log-not-sent
+      - when: "planAction == 'retire' && retireHasCas"
+        next: post-retire
+      - when: "planAction == 'retire'"
+        next: race-check-url
+      - when: "branchName != ''"
         next: post-push
-      - else: log-push-not-sent
+      - else: post-base
 
-  - id: log-push-not-sent
+  - id: log-not-sent
     type: activity:Log
     inputs:
       level: Warning
-      message: "= 'Sextant push ensure was not sent: the tenant grant was ' + grantOutcome + ' (' + grantReason + ')'"
+      message: "= 'Sextant repository event: nothing was sent, the tenant grant was ' + grantOutcome + ' (' + grantReason + ')'"
     next: end
 
   - id: post-push
