@@ -116,6 +116,26 @@ public sealed record ServiceOptions
     public const int SearchMaxWidthCeiling = 100;
 
     /// <summary>
+    /// The most symbols one <c>search_symbols</c> call returns across all the snapshots it reads (issue #196). The
+    /// per-snapshot <c>limit</c> still applies; the page divides this budget among the snapshots it reads, in hash
+    /// order, so every one of them gets at least one row and the rest resume on later pages.
+    /// <c>SEXTANT_SERVICE_SEARCH_MAX_HITS</c> (default 500); a missing, non-positive or unparseable value keeps the
+    /// default, and any other value is clamped to <see cref="SearchMaxHitsFloor"/>..<see cref="SearchMaxHitsCeiling"/>.
+    /// </summary>
+    public int SearchMaxHits { get; init; } = DefaultSearchMaxHits;
+
+    internal const int DefaultSearchMaxHits = 500;
+
+    /// <summary>
+    /// The smallest <see cref="SearchMaxHits"/> honoured: <see cref="SearchMaxWidthCeiling"/>, so every snapshot a
+    /// page reads gets at least one row of the budget (the round-robin fairness bound depends on it).
+    /// </summary>
+    public const int SearchMaxHitsFloor = SearchMaxWidthCeiling;
+
+    /// <summary>The largest <see cref="SearchMaxHits"/> honoured.</summary>
+    public const int SearchMaxHitsCeiling = 5000;
+
+    /// <summary>
     /// Throws when the caller-identity settings are inconsistent (fail closed): invalid <see cref="CallerAssertion"/>
     /// options, delegate tokens without caller keys, or a delegate token that is blank or equal to the control,
     /// query or contribute token or to a read-policy principal's token. Messages never contain a token or key.
@@ -382,6 +402,8 @@ public sealed record ServiceOptions
                 ? perTenant : DefaultMaxGrantsPerTenant,
             SearchMaxWidth = EnvInt("SEARCH_MAX_WIDTH") is int width and > 0
                 ? Math.Min(width, SearchMaxWidthCeiling) : DefaultSearchMaxWidth,
+            SearchMaxHits = EnvInt("SEARCH_MAX_HITS") is int hits and > 0
+                ? Math.Clamp(hits, SearchMaxHitsFloor, SearchMaxHitsCeiling) : DefaultSearchMaxHits,
             BindAddress = EnvHost("BIND_ADDRESS") ?? "localhost",
             ControlPort = EnvInt("CONTROL_PORT") ?? 3011,
             QueryPort = EnvInt("QUERY_PORT"),

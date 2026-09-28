@@ -6,7 +6,10 @@ using Sextant.Service.CallerIdentity;
 
 namespace Sextant.Service.Search;
 
-/// <summary>Where one snapshot's <c>search_symbols</c> paging resumes: after the symbol row <paramref name="AfterId"/>.</summary>
+/// <summary>
+/// Where one snapshot's <c>search_symbols</c> paging resumes: after the symbol row <paramref name="AfterId"/> in the
+/// snapshot's (project, name, id) order, or from the start when it is 0.
+/// </summary>
 internal sealed record SymbolSearchPosition(string IdentityHash, long AfterId);
 
 /// <summary>
@@ -20,8 +23,9 @@ internal sealed record SymbolSearchCursorState(
 
 /// <summary>
 /// Encodes and validates the opaque <c>search_symbols</c> cursor (SVC-F): base64url of the JSON
-/// <c>{"v":1,"a":[[hash,afterId],...],"w":hash|null,"r":hash|null,"b":digest}</c>, at most <see cref="MaxLength"/>
-/// characters.
+/// <c>{"v":2,"a":[[hash,afterId],...],"w":hash|null,"r":hash|null,"b":digest}</c>, at most <see cref="MaxLength"/>
+/// characters. Version 2 (issue #196) pages each snapshot in (project, name, id) order instead of id order, so a
+/// version-1 cursor is <c>invalid_cursor</c> rather than resumed at a position that means something else.
 /// <para>
 /// <c>b</c> is an unkeyed SHA-256 digest over the cursor's contents and its binding (see <see cref="Binding"/>): the
 /// tenant, the caller and the query. It detects a tampered cursor and a cursor replayed by another caller, another
@@ -36,7 +40,7 @@ internal static class SymbolSearchCursor
     /// <summary>The longest cursor accepted, in characters.</summary>
     public const int MaxLength = 16 * 1024;
 
-    private const int Version = 1;
+    private const int Version = 2;
     private const int HashLength = 64;
 
     /// <summary>

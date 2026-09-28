@@ -1954,6 +1954,35 @@ public sealed partial class SnapshotService : IDisposable
         }
     }
 
+    // ReadCatalog that stops when `cancellationToken` is cancelled (issue #196). A cancellation interrupts the
+    // statement in flight (sqlite3_interrupt; SqliteCommand.Cancel does nothing in Microsoft.Data.Sqlite), `read`
+    // checks the token between its statements, and a statement failing while the token is cancelled surfaces as an
+    // OperationCanceledException. The registration is disposed (which waits out a callback already running) before the
+    // read transaction ends and the connection goes back to the pool, so a late cancellation can never interrupt the
+    // COMMIT or a statement of the connection's next user.
+    private T ReadCatalog<T>(Func<SqliteConnection, T> read, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        using var conn = OpenReadConnection();
+        ExecOn(conn, "BEGIN;");
+        try
+        {
+            using (cancellationToken.Register(static handle => SQLitePCL.raw.sqlite3_interrupt((SQLitePCL.sqlite3)handle!), conn.Handle))
+                return read(conn);
+        }
+        catch (SqliteException ex) when (cancellationToken.IsCancellationRequested)
+        {
+            throw new OperationCanceledException("The catalog read was cancelled.", ex, cancellationToken);
+        }
+        finally
+        {
+            // An interrupted statement can end the transaction itself; COMMIT only one still open, so the connection
+            // returns to the pool outside any transaction and a failing COMMIT never masks the cancellation.
+            if (SQLitePCL.raw.sqlite3_get_autocommit(conn.Handle) == 0)
+                ExecOn(conn, "COMMIT;");
+        }
+    }
+
     private static void ExecOn(SqliteConnection conn, string sql)
     {
         using var cmd = conn.CreateCommand();

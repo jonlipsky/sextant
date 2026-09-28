@@ -76,6 +76,7 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_MAX_GRANTS_PER_PRINCIPAL` | Most repository grants one user caller may hold in a tenant (see [Repository grants](#repository-grants-and-visibility-svc-4)); creating one more is `409 grant_limit`. The tenant-wide `'*'` grants are not counted. A missing or non-positive value uses the default | `200` |
 | `SEXTANT_SERVICE_MAX_GRANTS_PER_TENANT` | Most repository grant rows a tenant may hold, tenant-wide grants included; creating one more is `409 grant_limit` | `5000` |
 | `SEXTANT_SERVICE_SEARCH_MAX_WIDTH` | Most snapshots one [`search_symbols`](#search_symbols-svc-f) call reads (round-robin over the tracked ones); the rest are listed in `truncated` and searched on later pages. Values above `100` are clamped to `100` (the most snapshots a search tracks at once, which keeps a cursor within 16 KiB); a missing or non-positive value uses the default | `50` |
+| `SEXTANT_SERVICE_SEARCH_MAX_HITS` | Most symbols one [`search_symbols`](#search_symbols-svc-f) call returns in all; the snapshots it reads share it evenly (each still gets at least one row, so the round-robin is unchanged), and what a snapshot did not return is searched on its next turn. Clamped to `100`–`5000`; a missing or non-positive value uses the default | `500` |
 | `SEXTANT_SERVICE_BIND_ADDRESS` | Network interface the HTTP surface binds to | `localhost` |
 | `SEXTANT_SERVICE_CONTROL_PORT` | HTTP port | `3011` |
 | `SEXTANT_SERVICE_QUERY_PORT` | Optional dedicated query port (shares the control port when unset) | none (shared) |
@@ -865,7 +866,7 @@ A request with no verified caller (a plain query token) gets the tool error `cal
 | `branch` | string? | Search only this branch. Visibility is repository-level, so it can name any indexed branch of a visible repository. Absent = every **granted** branch (a default-branch grant searches the default branch) |
 | `kind` | string? | Only symbols of this kind: a lowercase `SymbolKind` name such as `class`, `method` or `typeparameter` |
 | `cursor` | string? | The previous page's `next_cursor`, passed back with the same other arguments |
-| `limit` | int? | The most symbols read from each snapshot per page; default 50, clamped to 1–200 |
+| `limit` | int? | The most symbols read from each snapshot per page; default 50, clamped to 1–200. The call's total is also capped by `SEARCH_MAX_HITS` (default 500), shared by the snapshots the page reads |
 
 The schema has `additionalProperties: false`, so an unknown argument is an error. The tool is exempt from the
 [reserved selector arguments](#reserved-tool-arguments-svc-2) and ignores the `X-Sextant-Repository` header: its
@@ -901,13 +902,25 @@ last snapshot the previous page read, and once it reaches the end the next page 
 hash. A snapshot that has not been searched yet joins, as tracked ones are exhausted, at the end of a round. So a
 snapshot with many matches never keeps the others waiting: with V visible snapshots, each tracked one is read at
 least once every ⌈min(V, 100) / `SEARCH_MAX_WIDTH`⌉ pages. Each page reads up to `limit` rows from each snapshot
-it reads and orders them by name, then identity hash, then row. While the grants and branch heads do not change,
+it reads, and at most `SEARCH_MAX_HITS` rows in all, shared evenly by those snapshots. It orders them by name, then
+identity hash, then row. A page can return fewer symbols than it could (with a `kind` filter, even none) and still
+have a `next_cursor`: keep paging until it is `null`. While the grants and branch heads do not change,
 walking every page returns every match exactly once. The cursor is opaque
 base64url JSON of at most 16 KiB. It carries each snapshot's position, and a digest binds it to the tenant, the
 caller and the query arguments other than `limit`. A tampered or oversized cursor, or one issued to another caller,
-tenant or query, gets `invalid_cursor`. The digest is not an authorization control. Every call reads the caller's
+tenant or query, gets `invalid_cursor`, and so does a cursor from a Sextant before issue #196 (restart the search).
+The digest is not an authorization control. Every call reads the caller's
 grants again, so a revoked grant stops being searched on the next page, and a cursor naming a snapshot the caller
 cannot see is treated exactly like one naming a snapshot that does not exist.
+
+**Cost.** One call is bounded, whatever the size of the snapshots (issue #196):
+- Each snapshot's page seeks the prefix's range in a name index (`ix_symbols_project_name_nocase`, migration
+  `025`), so a prefix that matches nothing costs a few index lookups per snapshot, never a scan.
+- The call returns at most `SEARCH_MAX_HITS` symbols.
+- With a `kind` filter, it examines at most 8192 rows in all.
+- The caller's repositories are found by one indexed query over the caller's own grants.
+- If the client disconnects or cancels the request, the search stops: before its next snapshot, or by interrupting
+  the SQLite statement that is running. The read connection is released cleanly.
 
 **Errors** (all tool errors): `caller_required`, `invalid_arguments` (a missing or blank `name_prefix`, a wrong
 type, an unknown argument or `kind`), `invalid_selector` (a `repository` the URL policy refuses),
@@ -1435,9 +1448,11 @@ slice 3, criterion 5); `021_branch_head_sequence.sql` adds `branches.head_sequen
 branch-head advance on the ensure path (Phase 14, issue #84); `022_snapshot_coverage.sql` adds the durable
 per-snapshot `snapshot_coverage` record (issue #119); `023_partial_occurrence_source_index.sql` rebuilds
 `ix_occ_source` as a partial index over call edges only (issue #160); `024_repository_grants.sql` adds the
-`repository_grants` table behind per-caller visibility (SVC-4). All are additive/forward-only. See
+`repository_grants` table behind per-caller visibility (SVC-4); `025_symbol_name_prefix_index.sql` adds the
+`NOCASE` name and repository-URL indexes that bound `search_symbols` (issue #196). All are additive/forward-only. See
 [`schema.md`](schema.md) for the table definitions. `LatestSchemaVersion` auto-derives from the highest
-migration and is **24**.
+migration and is **25**. Snapshot identities fold `SnapshotSchemaVersion` instead, which skips identity-neutral
+(index-only) migrations such as `025` and is **24**, so upgrading to 25 re-indexes nothing.
 
 ## Testing
 

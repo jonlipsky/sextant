@@ -160,36 +160,36 @@ public class SymbolSearchCursorTests
         // Each reshaped state carries a digest that is valid for it, so only the shape checks refuse it.
         foreach (var json in new[]
                  {
-                     Signed($$"""{"v":2,"a":[],"w":null,"r":null}""", new SymbolSearchCursorState([], null)),
-                     Signed($$"""{"v":1,"a":[["{{HashA}}",1]],"w":null,"r":null}""", new SymbolSearchCursorState([new(HashA, 1)], null)),
-                     Signed($$"""{"v":1,"a":[["{{HashB}}",1],["{{HashA}}",1]],"w":"{{HashC}}","r":null}""",
+                     Signed($$"""{"v":1,"a":[],"w":null,"r":null}""", new SymbolSearchCursorState([], null)),
+                     Signed($$"""{"v":2,"a":[["{{HashA}}",1]],"w":null,"r":null}""", new SymbolSearchCursorState([new(HashA, 1)], null)),
+                     Signed($$"""{"v":2,"a":[["{{HashB}}",1],["{{HashA}}",1]],"w":"{{HashC}}","r":null}""",
                          new SymbolSearchCursorState([new(HashB, 1), new(HashA, 1)], HashC)),
-                     Signed($$"""{"v":1,"a":[["{{HashA}}",1],["{{HashA}}",2]],"w":"{{HashC}}","r":null}""",
+                     Signed($$"""{"v":2,"a":[["{{HashA}}",1],["{{HashA}}",2]],"w":"{{HashC}}","r":null}""",
                          new SymbolSearchCursorState([new(HashA, 1), new(HashA, 2)], HashC)),
-                     Signed($$"""{"v":1,"a":[["{{HashC}}",1]],"w":"{{HashA}}","r":null}""",
+                     Signed($$"""{"v":2,"a":[["{{HashC}}",1]],"w":"{{HashA}}","r":null}""",
                          new SymbolSearchCursorState([new(HashC, 1)], HashA)),
-                     Signed($$"""{"v":1,"a":[["{{HashA}}",-1]],"w":"{{HashC}}","r":null}""",
+                     Signed($$"""{"v":2,"a":[["{{HashA}}",-1]],"w":"{{HashC}}","r":null}""",
                          new SymbolSearchCursorState([new(HashA, -1)], HashC)),
-                     Signed($$"""{"v":1,"a":[["{{HashA.ToUpperInvariant()}}",1]],"w":"{{HashC}}","r":null}""",
+                     Signed($$"""{"v":2,"a":[["{{HashA.ToUpperInvariant()}}",1]],"w":"{{HashC}}","r":null}""",
                          new SymbolSearchCursorState([new(HashA.ToUpperInvariant(), 1)], HashC)),
-                     Signed($$"""{"v":1,"a":[],"w":null,"r":null,"x":1}""", new SymbolSearchCursorState([], null)),
-                     Signed($$"""{"v":1,"a":[],"w":null,"w":null,"r":null}""", new SymbolSearchCursorState([], null)),
-                     Signed($$"""{"v":1,"a":[["{{HashA}}"]],"w":"{{HashC}}","r":null}""", new SymbolSearchCursorState([], HashC)),
-                     Signed($$"""{"v":1,"a":[["{{HashA}}","1"]],"w":"{{HashC}}","r":null}""", new SymbolSearchCursorState([new(HashA, 1)], HashC)),
-                     Signed($$"""{"v":1,"a":{},"w":null,"r":null}""", new SymbolSearchCursorState([], null)),
-                     Signed($$"""{"v":1,"a":[],"w":"short","r":null}""", new SymbolSearchCursorState([], "short")),
+                     Signed($$"""{"v":2,"a":[],"w":null,"r":null,"x":1}""", new SymbolSearchCursorState([], null)),
+                     Signed($$"""{"v":2,"a":[],"w":null,"w":null,"r":null}""", new SymbolSearchCursorState([], null)),
+                     Signed($$"""{"v":2,"a":[["{{HashA}}"]],"w":"{{HashC}}","r":null}""", new SymbolSearchCursorState([], HashC)),
+                     Signed($$"""{"v":2,"a":[["{{HashA}}","1"]],"w":"{{HashC}}","r":null}""", new SymbolSearchCursorState([new(HashA, 1)], HashC)),
+                     Signed($$"""{"v":2,"a":{},"w":null,"r":null}""", new SymbolSearchCursorState([], null)),
+                     Signed($$"""{"v":2,"a":[],"w":"short","r":null}""", new SymbolSearchCursorState([], "short")),
                      // The rotation: required, a hash, and never after the watermark.
-                     Signed($$"""{"v":1,"a":[],"w":"{{HashC}}"}""", new SymbolSearchCursorState([], HashC)),
-                     Signed($$"""{"v":1,"a":[],"w":"{{HashC}}","r":"short"}""", new SymbolSearchCursorState([], HashC, "short")),
-                     Signed($$"""{"v":1,"a":[],"w":"{{HashB}}","r":"{{HashC}}"}""", new SymbolSearchCursorState([], HashB, HashC)),
-                     Signed($$"""{"v":1,"a":[],"w":null,"r":"{{HashA}}"}""", new SymbolSearchCursorState([], null, HashA))
+                     Signed($$"""{"v":2,"a":[],"w":"{{HashC}}"}""", new SymbolSearchCursorState([], HashC)),
+                     Signed($$"""{"v":2,"a":[],"w":"{{HashC}}","r":"short"}""", new SymbolSearchCursorState([], HashC, "short")),
+                     Signed($$"""{"v":2,"a":[],"w":"{{HashB}}","r":"{{HashC}}"}""", new SymbolSearchCursorState([], HashB, HashC)),
+                     Signed($$"""{"v":2,"a":[],"w":null,"r":"{{HashA}}"}""", new SymbolSearchCursorState([], null, HashA))
                  })
         {
             Assert.IsFalse(SymbolSearchCursor.TryDecode(Encode(json), Binding(), 100, out _), json);
         }
 
         // The well-formed control case is accepted, so the refusals above are about shape, not the digest.
-        var valid = Signed($$"""{"v":1,"a":[["{{HashA}}",1]],"w":"{{HashC}}","r":"{{HashC}}"}""",
+        var valid = Signed($$"""{"v":2,"a":[["{{HashA}}",1]],"w":"{{HashC}}","r":"{{HashC}}"}""",
             new SymbolSearchCursorState([new(HashA, 1)], HashC, HashC));
         Assert.IsTrue(SymbolSearchCursor.TryDecode(Encode(valid), Binding(), 100, out _), valid);
     }

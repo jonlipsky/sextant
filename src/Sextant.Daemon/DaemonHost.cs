@@ -577,7 +577,7 @@ public sealed class DaemonHost : IDisposable
             var snapshotStore = new SnapshotStore(conn);
             if (snapshotStore.GetSelectedSnapshotId() is long id && snapshotStore.GetById(id) is { } snap)
             {
-                return snap.SchemaVersion != IndexDatabase.LatestSchemaVersion
+                return snap.SchemaVersion != IndexDatabase.SnapshotSchemaVersion
                     || !string.Equals(snap.AnalyzerVersion, IndexConfigurationHash.AnalyzerVersion, StringComparison.Ordinal)
                     || !string.Equals(snap.ConfigHash, _profile.ConfigurationHash, StringComparison.Ordinal)
                     || !string.Equals(snap.ToolchainFingerprint, ToolchainFingerprint.Current, StringComparison.Ordinal);

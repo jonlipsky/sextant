@@ -199,7 +199,7 @@ public sealed record EnsureSnapshotRequest
         RepositoryRemoteUrl = RepositoryRemoteUrl,
         CommitSha = CommitSha,
         TreeSha = TreeSha,
-        SchemaVersion = IndexDatabase.LatestSchemaVersion,
+        SchemaVersion = IndexDatabase.SnapshotSchemaVersion,
         AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
         ConfigHash = ConfigHash ?? fallbackConfigHash,
         ToolchainFingerprint = ToolchainFingerprint.Current,
