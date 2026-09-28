@@ -1,0 +1,96 @@
+name: ProcessStack app
+
+# Tests and publishes the Sextant ProcessStack app's activities (apps/processstack/). The app builds
+# against ProcessStack.Abstractions from a private package feed, so it has its own solution
+# (apps/processstack/sextant/Sextant.ProcessStack.slnx) and this separate workflow; the public
+# "Build & Test" gate never needs the feed.
+#
+# The feed credential comes from the PROCESSSTACK_PACKAGES_TOKEN repository secret (a token with
+# read:packages on the feed). When the secret is absent (not yet configured, or a fork PR, which never
+# receives secrets) the job emits a notice, skips its steps and succeeds.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/processstack/**'
+      - 'src/Sextant.Core/**'
+      # The activity tests pin parity with the service's URL policy, wire contract and job statuses.
+      - 'src/Sextant.Service/**'
+      - 'src/Sextant.Store/**'
+      - '.github/workflows/processstack-app.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'apps/processstack/**'
+      - 'src/Sextant.Core/**'
+      - 'src/Sextant.Service/**'
+      - 'src/Sextant.Store/**'
+      - '.github/workflows/processstack-app.yml'
+
+concurrency:
+  group: processstack-app-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  activities:
+    name: ProcessStack app activities
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Check for the packages token
+        id: feed
+        env:
+          PACKAGES_TOKEN: ${{ secrets.PROCESSSTACK_PACKAGES_TOKEN }}
+        run: |
+          if [ -z "${PACKAGES_TOKEN}" ]; then
+            echo "::notice title=ProcessStack app skipped::The PROCESSSTACK_PACKAGES_TOKEN secret is not available to this run (not configured, or a fork PR), so the app's activities were not restored, tested or published. Add the secret (a token with read:packages on the package feed) to enable this job."
+            echo "available=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "available=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      # Credentials go into the job workspace's copy of apps/processstack/nuget.config only; the
+      # committed file keeps the source without credentials. The token is passed through env, never
+      # interpolated into the script.
+      - name: Configure the package feed
+        if: steps.feed.outputs.available == 'true'
+        env:
+          PACKAGES_TOKEN: ${{ secrets.PROCESSSTACK_PACKAGES_TOKEN }}
+        run: >-
+          dotnet nuget update source elevenworks-github
+          --configfile apps/processstack/nuget.config
+          --username x --password "${PACKAGES_TOKEN}" --store-password-in-clear-text
+
+      - name: Test
+        if: steps.feed.outputs.available == 'true'
+        env:
+          MSBUILDDISABLENODEREUSE: '1'
+          DOTNET_CLI_USE_MSBUILD_SERVER: '0'
+        run: dotnet test apps/processstack/sextant/Sextant.ProcessStack.slnx
+
+      # Publishes activities/sextant/ and fails if the bundle ships any ProcessStack.*.dll.
+      - name: Publish the activities bundle
+        if: steps.feed.outputs.available == 'true'
+        env:
+          MSBUILDDISABLENODEREUSE: '1'
+          DOTNET_CLI_USE_MSBUILD_SERVER: '0'
+        run: bash apps/processstack/sextant/build.sh
+
+      - name: Remove the feed credential
+        if: always() && steps.feed.outputs.available == 'true'
+        run: git checkout -- apps/processstack/nuget.config

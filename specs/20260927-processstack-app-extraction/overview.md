@@ -9,6 +9,7 @@
 | `overview.md` (this file) | Goals, architecture, query path, who owns what |
 | [`service-changes.md`](service-changes.md) | Service PR units SVC-1…8, SVC-F; contracts, env, migration 024, tests |
 | [`app.md`](app.md) | `apps/processstack/sextant/` v2.0.0: manifest, flows, scenario tests, README, CI |
+| [`app-activities.md`](app-activities.md) | G1-A amendment: the app's own activities (`Sextant.ProcessStack.Activities`), build scripts, CI (SX-13) |
 | [`security.md`](security.md) | SSRF host policy, assertion verification, tenant binding, visibility, hardening |
 | [`pr-plan.md`](pr-plan.md) | SX-0…SX-12, stacking, dependencies on PS features |
 | [`cutover-runbook.md`](cutover-runbook.md) | G2a/G2b/G2c, validation, rollback to v1.0.1 |
