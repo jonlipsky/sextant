@@ -17,6 +17,10 @@ description: >
   and any request with a tree or configuration hash (a non-default snapshot). Without a branch name nothing
   moves. A GitHub failure fails the call, because a process has no error route.
 
+  A branch name must pass the chat parser's rule. The process assigns every variable and output before
+  reading it, so an extra tools/call argument naming one (elevenworks/ProcessStack#3286) never seeds the
+  compare-and-swap value or any other internal state.
+
 inputs:
   - name: repositoryRemoteUrl
     type: string
@@ -79,6 +83,9 @@ variables:
   - name: branch
     type: string
     default: ""
+  - name: branchValid
+    type: bool
+    default: false
   - name: branches
     type: json
   - name: githubHead
@@ -136,19 +143,48 @@ outputs:
 nodes:
   - id: start
     type: start
+    next: init
+
+  # An MCP tools/call turns every argument into a run input, declared or not, and a variables default only
+  # fills a name that is still unset (elevenworks/ProcessStack#3286). So every variable and output is
+  # assigned here, before anything reads it: a caller must not be able to seed the compare-and-swap value
+  # or any other internal state.
+  - id: init
+    name: Reset every variable and output
+    type: activity:JavaScript
+    inputs:
+      script: |
+        ['remoteUrl', 'urlReason', 'host', 'repositoryOwner', 'repositoryName', 'fullName', 'commit', 'tree',
+         'config', 'inputProblem', 'branch', 'githubHead', 'expectedHead', 'jobId', 'identityHash',
+         'indexingState', 'snapshotId', 'outcome', 'reason', 'message'].forEach(function (name) {
+          context.setVariable(name, '');
+        });
+        ['accepted', 'branchValid', 'isHead', 'advanceRequested', 'ensurePublished', 'attached'].forEach(function (name) {
+          context.setVariable(name, false);
+        });
+        context.setVariable('resolveStatus', 0);
+        context.setVariable('ensureStatus', 0);
+        context.setVariable('branches', null);
+        context.setVariable('resolveJson', null);
+        context.setVariable('branchAdvanced', null);
+        null;
     next: normalize
 
+  # The branch goes through the chat parser's rule (a leading refs/heads/ is dropped).
   - id: normalize
-    name: Check the repository URL
+    name: Check the repository URL and the branch name
     type: activity:SextantNormalizeRepository
     inputs:
       cloneUrl: "= repositoryRemoteUrl"
+      branch: "= branchName"
     outputs:
       accepted: accepted
       reason: urlReason
       host: host
       repositoryOwner: repositoryOwner
       repositoryName: repositoryName
+      branchValid: branchValid
+      branchName: branch
     next: check-inputs
 
   # Only lower-cased hex leaves this node, so no argument reaches the body in its own spelling.
@@ -168,6 +204,7 @@ nodes:
         var configValue = blank(configHash) ? '' : hex(configHash, /^[0-9a-f]{1,128}$/);
         var problem = !accepted ? urlReason
           : host !== 'github.com' ? 'unsupported_host'
+          : branchValid !== true ? 'invalid_branch'
           : commitValue === null ? 'invalid_commit'
           : treeValue === null ? 'invalid_tree_sha'
           : configValue === null ? 'invalid_config_hash'
@@ -216,16 +253,8 @@ nodes:
     type: decision
     next:
       - when: "accepted"
-        next: set-branch
+        next: route-branch
       - else: refuse-input
-
-  - id: set-branch
-    type: activity:SetVariable
-    inputs:
-      value: "= String(branchName || '').trim()"
-    outputs:
-      result: branch
-    next: route-branch
 
   # Only the default profile of a branch's GitHub head can move the branch.
   - id: route-branch
@@ -254,23 +283,23 @@ nodes:
       json: resolveJson
     next: route-resolve
 
-  # 404: the service holds no head for the branch yet, so the compare-and-swap expects none ("").
+  # 200 and 404 both go through expect-head, the one place expectedHead is computed.
   - id: route-resolve
     type: decision
     next:
-      - when: "resolveStatus == 200"
-        next: expect-resolved
-      - when: "resolveStatus == 404"
-        next: list-branches
+      - when: "resolveStatus == 200 || resolveStatus == 404"
+        next: expect-head
       - else: refuse-resolve
 
-  # A head that is not a commit SHA expects none (""), which only passes while the branch has no usable
+  # 404: the service holds no head for the branch yet, so the compare-and-swap expects none (""). A 200
+  # head that is not a commit SHA also expects none, which only passes while the branch has no usable
   # snapshot.
-  - id: expect-resolved
+  - id: expect-head
     type: activity:SetVariable
     inputs:
       value: >
-        = resolveJson != null && /^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$/.test(String(resolveJson.commit_sha || ''))
+        = resolveStatus == 200 && resolveJson != null
+            && /^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$/.test(String(resolveJson.commit_sha || ''))
             ? String(resolveJson.commit_sha).toLowerCase() : ''
     outputs:
       result: expectedHead
@@ -403,6 +432,9 @@ nodes:
         switch (code) {
           case 'unsupported_host':
             text = 'Only github.com repositories can be indexed through the Sextant app.';
+            break;
+          case 'invalid_branch':
+            text = 'branchName is not a valid branch name.';
             break;
           case 'invalid_commit':
             text = 'commitSha must be a full commit SHA.';

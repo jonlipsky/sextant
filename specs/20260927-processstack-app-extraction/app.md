@@ -125,6 +125,8 @@ testDirectory: tests
 | 2 | `HttpRequest` | `POST /control/ensure?wait=false`, body `{repository_remote_url, commit_sha, branch_name?, default_branch?, expected_head_commit?, forced?, branch_update?}` |
 | 3 | decision | 200/202 → outputs `{job_id, identity_hash, status, snapshot_id, attached, branch_advanced}`. 400 `rejected` → `Log` + outcome `rejected`. 503 → outcome `unavailable`, and the nightly reconcile heals it |
 
+As built (SX-9), `ensure` sends neither `default_branch` nor `forced`: SX-10's push flows send their own bodies. It validates every input, and it confirms an advance against GitHub's head itself before sending; anything unconfirmed is sent as `branch_update: none`. See "`ensure` does not trust its caller" under the implementation notes.
+
 ### `on-repository-change` (`act=application`)
 
 | `kind` / condition | Steps |
@@ -171,7 +173,7 @@ testDirectory: tests
 | Process | Inputs → outputs | Steps |
 |---|---|---|
 | `start-indexing` | `repositoryRemoteUrl, commitSha, branchName?, treeSha?, configHash?` → `jobId, identityHash, indexingState, snapshotId, attached, branchAdvanced` | The body is built from GitHub and the service, never from the arguments' spelling (#203): `GetRepository` → `repository_remote_url` from GitHub's `full_name` (github.com only). If `branchName` is set and there is no tree or config hash: `ListBranches` → head. `commitSha == head` → `ensure` with `commit_sha` = GitHub's head, `branch_name` and `expected_head_commit = resolve.commit_sha` (CAS advance). Else, or with no `branchName`, `branch_update: none` (historical commit, no regress). Never `default_branch: true` or a `branch_head_sequence`: a user ensure beyond these bounds is 400 (SX-6d, `service-changes.md`). 403 `not_granted` → "watch the repository first" |
-| `get-indexing-status` | `jobId` → `found, indexingState, terminal, snapshotId, lastError` | `HttpRequest GET /control/status/{jobId}`. 404 → `found=false`. Map `job.status`/`job.snapshot_id`/`job.last_error` |
+| `get-indexing-status` | `jobId` → `found, indexingState, terminal, snapshotId, lastError, errorCode` | `HttpRequest GET /control/status/{jobId}`. 404 → `found=false`. Map `job.status`/`job.snapshot_id`; `job.last_error` → `lastError` (its first line, control characters replaced, at most 200 chars) and `errorCode` (the `^[a-z0-9_]{1,64}:` code it starts with, else `""`) |
 | `import-legacy-watches` | — → `imported, skipped, failed` | `ListMyMemory {scope: sextant.watched-repos}` → skip null values (tombstones) → `for-each` `PUT /control/grants/self {repository: value.cloneUrl, branch: value.branch}`, with `source` recorded server-side as `self`. Idempotent |
 
 ## Legacy dual-write (v2.0.x; dropped in v2.1 post-G3)
@@ -278,10 +280,24 @@ SX-9 builds the manifest, the chat, the MCP processes, `ensure` and the v1 memor
 - **The v1 tombstones follow what the service is known to hold.** The matching v1 entries are tombstoned once the service holds no watch on what was named: `branch=*` answered 200, or, for a named branch, the listing shows no default-branch grant resolving to it (or that grant was deleted too). A v1-only entry, one v1 wrote that was never imported, is therefore tombstoned as well, so neither a rollback to 1.0.1 nor SX-11's import brings the watch back. The entries are kept when that is not known: the listing failed, or a default-branch grant has no `resolved_branch` yet (the repository has no default in the catalog, #199) and GitHub cannot say which branch it is. For such a grant `revoke-watch` reads `default_branch` with `GitHubGetRepository`, because the application ensure that sets the catalog default takes GitHub's: the named branch ends the default-branch watch too, and another branch leaves it alone and tombstones the named entries. When that read fails, the reply says the default-branch watch is still in place and that "stop watching {repo}" ends every branch. "Stopped watching" needs a removed grant or a tombstoned entry.
 - **Refusals are outputs, not failures.** `ensure`, `start-indexing` and `get-indexing-status` complete with an `outcome` (`SextantInterpretEnsureResult`'s set, or `not_found`/`rejected`) and a code-shaped `reason` (`^[a-z0-9_]{1,64}$`, else `http_<status>`). A free-text reason from the service is never passed on. The chat shows a service reason only in that shape.
 - **`ensure` builds the body itself and has no input for `default_branch`, `forced` or `branch_head_sequence`.** Every body carries `branch_update`:
-  - `advance` with `expected_head_commit`, when the caller asks to advance and names a branch (all zeros becomes `""`);
+  - `advance` with `expected_head_commit`, when the caller asks to advance, names a branch, and `ensure` confirms the advance rule below (all zeros becomes `""`);
   - otherwise `none`.
 
   A user or MCP caller can therefore never set the default flag. SX-10's push flows, which run as `act=application` and need `default_branch`/`forced`, send `SextantPlanRepositoryChange`'s bodies through their own `HttpRequest`, not through this process.
+- **`ensure` does not trust its caller.** `internal: true` is not enforced on a direct `/v1/applications/{id}/run` (elevenworks/ProcessStack#3287), so anyone who can run the app can call `ensure` with arguments of their own. Before anything is sent, it refuses (`rejected`, `statusCode` 0, no request) with the first problem it finds:
+  - `invalid_repository`: a URL `SextantNormalizeRepository` does not accept (the service's shape rules);
+  - `invalid_branch`: a branch the chat parser refuses (`git check-ref-format --branch`), or one that still starts with `refs/heads/`. Every caller drops that prefix first, so it is refused rather than stripped a second time: `refs/heads/x` must not be sent as `x`;
+  - `invalid_commit`/`invalid_tree_sha`: not 40 or 64 lower-case hex;
+  - `invalid_config_hash`: not `^[0-9a-f]{1,128}$`;
+  - `invalid_expected_head`: on an advance, neither `""` nor 40 or 64 lower-case hex (all zeros is still sent as `""`).
+
+  It also enforces the advance rule itself instead of trusting the caller's check. It sends `advance` only when all of these hold: the repository is on github.com; there is no tree or config hash; and `GitHubListBranches` shows the commit is the branch's current head. Anything else is sent as `branch_update: none`, which indexes the commit and moves nothing. A downgrade is not a refusal, the same as `start-indexing`'s rule, so a head that moves between the caller's read and `ensure`'s read gives `none`, not an error. A `ListBranches` failure fails the process: `grant-watch` routes that to its reply, and `start-indexing` already fails its MCP call on a GitHub error. On an advance, the caller and `ensure` therefore both read the heads.
+
+  The body carries the checked URL and branch, never the inputs' own spelling. Pins, each checked by mutation:
+  - `ensure-refuses-malformed-cas`, `ensure-refuses-non-hex-commit`, `ensure-refuses-invalid-branch` and `ensure-refuses-heads-prefixed-branch` pin the refusals;
+  - `ensure-advance-not-head-sends-none`, `ensure-advance-with-config-sends-none` and `ensure-advance-other-host-sends-none` pin the downgrades.
+
+  **Residual:** the check applies the URL's shape rules, not a host allowlist. A direct run can still ask for any shape-valid https host, though never to advance there. The service's SVC-5 intake policy (`REPOSITORY_HOSTS`, default `github.com`) and the caller's grants (403 `not_granted`) stay the authority, as they are for any user ensure. A direct run can still index any commit of a granted repository without moving a branch, which is what `start-indexing` allows too.
 - **Every user ensure stays inside SX-6d's bounds** (`EnsureSnapshotRequest.UserCallerBranchProblem`, #198):
   - an advance always carries `branch_name` plus `expected_head_commit`;
   - everything else is `branch_update: none`, which the service accepts with or without a `branch_name` (only `start-indexing` without a branch sends none);
@@ -291,14 +307,30 @@ SX-9 builds the manifest, the chat, the MCP processes, `ensure` and the v1 memor
 - **#199: a user's first ensure does not pick the default branch.** On a repository with no default yet, `grant-watch`'s first ensure makes the watched branch the default only when the service confirms that the remote's `HEAD` names it (clone mode). Otherwise the branch is created non-default. The default-branch grant then has no `resolved_branch`, and it reports `snapshot_status: missing` until an application ensure (SX-10's push or reconcile) sets the default. Another watch sends one more first ensure, which only attaches, because its CAS `""` no longer matches.
 - **`start-indexing` builds the body from GitHub and the service (#203).** No argument reaches the body in its own spelling:
   - The repository must be on github.com (else `rejected`/`unsupported_host`, before any call) and visible to the workspace's GitHub connection. `repository_remote_url` is `SextantNormalizeRepository` over GitHub's `full_name`, the spelling watches and push events use, so a mixed-case or `.git`-less argument hashes to the same identity.
-  - `commitSha`, `treeSha` and `configHash` must be hex (`invalid_commit`/`invalid_tree_sha`/`invalid_config_hash`) and are sent lower-cased.
+  - `commitSha`, `treeSha` and `configHash` must be hex (`invalid_commit`/`invalid_tree_sha`/`invalid_config_hash`) and are sent lower-cased. `branchName` goes through the chat parser's rule (`SextantNormalizeRepository`'s `branch` input: a leading `refs/heads/` is dropped, then `git check-ref-format --branch`); an invalid one is `invalid_branch`, before any call (`start-indexing-invalid-branch-refused`).
   - With a branch and no tree or config hash, it reads `GET /control/resolve` first (200 → CAS `commit_sha`, lower-cased, or `""` when it is not a SHA; 404 → CAS `""`; 400 refuses as `rejected`; anything else refuses), then the head with `GitHubListBranches`: the CAS only rejects pushes the service processes after the resolve (the `app-activities.md` rule for reconcile). When the commit is GitHub's head, it advances with GitHub's head as `commit_sha` and the service's head as `expected_head_commit`. The CAS value has to be the service's head: a GitHub head would never match once the service lags.
   - Everything else is `branch_update: none`: any other commit, no branch, or a tree or config hash (a non-default snapshot never moves a branch). In that mode the argument's commit, validated and lower-cased, is what gets indexed; it moves nothing.
   - A `GetRepository` or `ListBranches` failure fails the MCP call, because a process has no `on-error`.
 
   `start-indexing-body-from-github` and `watch-sha-is-a-branch-name` pin this. The first also fails when `ensure-advance` is changed to send the arguments.
 - **A CAS that no longer matches is not an error.** `/control/ensure` attaches with `branch_advanced: false`; it never answers 409 (`head_mismatch` is `/control/branches/retire`'s). Only a published result (complete or partial) carries that decision: a queued or running job has `branch_advanced` null and moves the branch when it publishes, if the guard still holds then. So `start-indexing` adds "the branch was not moved" only to a published result's message.
-- **`get-indexing-status`** accepts only a decimal `jobId` (`^[0-9]{1,19}$`) and never builds a URL from anything else.
+- **`get-indexing-status`** accepts only a decimal `jobId` (`^[0-9]{1,19}$`) and never builds a URL from anything else. The service's `last_error` is free text (an exception message, or a coverage reason that names projects), so only its first line leaves, with control characters replaced and at most 200 characters, plus the code a `code: message` error starts with as `errorCode` (`get-indexing-status-error-first-line`). The service already shows `last_error` to the same user on `/control/status`, so this is hygiene, not a boundary.
+- **Every flow assigns its variables and outputs before reading them.** A run takes every input as a variable, declared or not (an MCP `tools/call` passes every argument through), and a `variables:` default only fills a name that is still unset (elevenworks/ProcessStack#3286). Before this, an extra argument named `expectedHead` on start-indexing's resolve-404 path became the compare-and-swap value. Each flow now starts with an `init` node that assigns every variable and every output that is not an input:
+  - `start-indexing`: all 22 variables (including `expectedHead`, `advanceRequested`, `ensurePublished`, `resolveJson`, `githubHead`, `isHead`) and its 9 outputs. `expectedHead` is computed in one node (`expect-head`) for both a 200 and a 404 from resolve.
+  - `ensure`: its 14 variables and 12 outputs.
+  - `get-indexing-status`: its 3 variables and 8 outputs.
+  - `grant-watch`: all 20 variables, which cover its outputs (`granted`, `needsIndex`, `ensureOutcome`, `memoryKeys`, `memoryValue`, `message`).
+  - `revoke-watch`: all 12 variables, which cover its outputs.
+  - `configure-watched-repos`: all 10 variables (`stateUpdate` is still `{}` from a `SetVariable` node).
+  - `legacy-dual-write`: its 4 variables and 3 outputs.
+
+  Pins, each checked by mutation:
+  - `start-indexing-seeded-cas-ignored` fails against the old flow (the seeded value was sent as `expected_head_commit`). It needs both defences removed, the `init` reset and the shared `expect-head` node.
+  - `grant-watch-seeded-state-ignored` and `unwatch-seeded-state-ignored` fail when `init` is emptied, which also shows `context.setVariable` works in orchestration scripts.
+  - `get-indexing-status-seeded-outputs-ignored` fails the same way, on `errorCode`. The not-found path resets the other outputs itself.
+  - `get-indexing-status-seeded-response-ignored` pins a non-JSON 200 as `error`. It passes even without `init`, because the request's empty `json` output overwrites the seed.
+
+  A seeded name that shadows a script global makes the run fail, because inputs are data: a seeded `String` fails `check-inputs` with "Property 'String' of object is not a function" before any request (checked by hand).
 - **`legacy-dual-write`** writes the v1 slug and the camelCase value. A remove lists the scope and tombstones (`"null"`) each live entry that matches by value (owner, repo, host from `cloneUrl`, branch) or, when the value does not parse, by key. That covers entries v1 wrote under a non-canonical spelling.
 
 **Tests and CI**

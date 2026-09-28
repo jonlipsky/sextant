@@ -30,7 +30,7 @@ All of them are pure computation: deterministic, no network, no secrets. Authent
 
 | Name | Inputs → outputs | Replaces (app.md) |
 |---|---|---|
-| `SextantNormalizeRepository` | `cloneUrl` / `htmlUrl` / `owner` / `repo` → `remoteUrl`, `repositoryKey`, `host`, `accepted` (host shape only; the service's SVC-5 policy stays authoritative) | the URL `SetVariable`/JS in the flows; uses `Sextant.Core.GitRemoteNormalizer` / `RemoteUrlIdentity`, the same code the service uses |
+| `SextantNormalizeRepository` | `cloneUrl` / `htmlUrl` / `owner` / `repo` (+ optional `branch`) → `remoteUrl`, `repositoryKey`, `host`, `accepted` (host shape only; the service's SVC-5 policy stays authoritative), `branchName`, `branchValid` | the URL `SetVariable`/JS in the flows; uses `Sextant.Core.GitRemoteNormalizer` / `RemoteUrlIdentity`, the same code the service uses |
 | `SextantPlanRepositoryChange` | the event metadata (`kind`: push/delete/pr, plus PS-5 keys) → `action` (`ensure`\|`retire`\|`ignore`), `ensureBody` (`commit_sha`, `branch_name`, `default_branch`, `expected_head_commit` with all-zeros → `""`, `branch_update`, `forced`), `retireBody`, `reason` | the `ensure` steps 1–2 and the `on-repository-change` decision chain; enforces **CAS mode only** (SX-8 note) |
 | `SextantInterpretEnsureResult` | `statusCode`, `body` → `outcome` (`ok`\|`attached`\|`rejected`\|`unavailable`\|`head_mismatch`\|`not_granted`), `jobId`, `snapshotId`, `branchAdvanced`, `retryAdvised` | the `ensure` step 3 decision table, including the SX-8 out-of-order convergence (`branch_advanced:false` → `retryAdvised`) |
 | `SextantPlanReconcile` | `githubBranches[]`, `serviceTargets[]` (from `?scope=tenant` / resolve), limits → `ensures[]`, `retires[]`, `truncated` | the reconcile diff JS |
@@ -75,6 +75,7 @@ SX-13 follows the service code where it differs from the table above. Each activ
   - `htmlUrl` gets `.git` appended, and `owner`/`repo` build `https://{defaultHost}/{owner}/{repo}.git`.
   - `repositoryKey` is the service's policy key, `https://{host}/{owner}/{repo}` folded by `RemoteUrlIdentity.Normalize`.
 - **Extra inputs and outputs:** `defaultHost` (default `github.com`), `repositoryOwner`, `repositoryName` and `reason`. When the URL is not accepted, every URL output is `""`. The log names only the reason, never the input, which could carry a credential.
+- **An optional `branch` is checked with the chat parser's rule** (SX-9): a leading `refs/heads/` is dropped, then `git check-ref-format --branch` (`GitRefs.IsValidBranchName`, at most 255 characters). `branchValid` is true when no branch is named or the name is valid, and `branchName` is the checked name, `""` when none or invalid. The verdict is independent of the URL's. `start-indexing` and `ensure` use it, so an MCP or direct-run caller's branch passes the same check as a chat one. The log never names the branch.
 
 **`SextantPlanRepositoryChange`**
 - **The PS-5 metadata map is the `metadata` input.** Individual inputs override its keys.

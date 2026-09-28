@@ -56,6 +56,24 @@ outputs:
 nodes:
   - id: start
     type: start
+    next: init
+
+  # ensure's caveat applies here too: a direct run is not refused (elevenworks/ProcessStack#3287) and an
+  # undeclared input seeds a variable (elevenworks/ProcessStack#3286), so every variable and output is
+  # assigned before anything reads it.
+  - id: init
+    name: Reset every variable and output
+    type: activity:JavaScript
+    inputs:
+      script: |
+        context.setVariable('slugPrefix', '');
+        context.setVariable('facts', null);
+        context.setVariable('queue', null);
+        context.setVariable('currentKey', '');
+        context.setVariable('keys', '');
+        context.setVariable('value', '');
+        context.setVariable('count', 0);
+        null;
     next: prepare
 
   - id: prepare
