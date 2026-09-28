@@ -43,6 +43,20 @@ public sealed class ActivityValuesTests
     }
 
     [TestMethod]
+    [DataRow("${a}", true)]
+    [DataRow("x ${} then ${b}", true)]
+    [DataRow("${a${b}", true)]
+    [DataRow("${\n}", true)]
+    [DataRow("${}", false)]
+    [DataRow("${a", false)]
+    [DataRow("} ${", false)]
+    [DataRow("$ {a}", false)]
+    public void A_template_is_dollar_brace_then_at_least_one_character_then_a_closing_brace(string text, bool authored)
+    {
+        Assert.AreEqual(authored, ActivityValues.IsAuthoredExpression(text));
+    }
+
+    [TestMethod]
     public void Json_wrappers_unwrap_to_clr_values()
     {
         var element = ActivityHarness.Json("""{"a":1,"b":[true,"x",1.5],"c":null}""");
