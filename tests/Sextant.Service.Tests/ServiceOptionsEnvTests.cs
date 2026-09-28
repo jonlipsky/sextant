@@ -18,6 +18,8 @@ public class ServiceOptionsEnvTests
     private const string CheckoutMode = "SEXTANT_SERVICE_CHECKOUT_MODE";
     private const string CheckoutToken = "SEXTANT_SERVICE_CHECKOUT_TOKEN";
     private const string MaxProvisioningAttempts = "SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS";
+    private const string MaxGrantsPerPrincipal = "SEXTANT_SERVICE_MAX_GRANTS_PER_PRINCIPAL";
+    private const string MaxGrantsPerTenant = "SEXTANT_SERVICE_MAX_GRANTS_PER_TENANT";
     private const string RequireRepositorySelection = "SEXTANT_SERVICE_REQUIRE_REPOSITORY_SELECTION";
     private const string RepositoryHosts = "SEXTANT_SERVICE_REPOSITORY_HOSTS";
     private const string RepositoryOwners = "SEXTANT_SERVICE_REPOSITORY_OWNERS";
@@ -280,6 +282,29 @@ public class ServiceOptionsEnvTests
         finally
         {
             Environment.SetEnvironmentVariable(MaxProvisioningAttempts, null);
+        }
+    }
+
+    [TestMethod]
+    [DataRow(null, null, 200, 5000)]
+    [DataRow("3", " 40 ", 3, 40)]
+    [DataRow("0", "-1", 200, 5000)]
+    [DataRow("abc", "", 200, 5000)]
+    public void MaxGrants_BindOrFallBackToDefault(string? perPrincipal, string? perTenant, int expectedPrincipal, int expectedTenant)
+    {
+        // SVC-4: a missing, non-positive or unparseable limit keeps the default rather than disabling grants.
+        Environment.SetEnvironmentVariable(MaxGrantsPerPrincipal, perPrincipal);
+        Environment.SetEnvironmentVariable(MaxGrantsPerTenant, perTenant);
+        try
+        {
+            var options = ServiceOptions.FromEnvironment(Config());
+            Assert.AreEqual(expectedPrincipal, options.MaxGrantsPerPrincipal);
+            Assert.AreEqual(expectedTenant, options.MaxGrantsPerTenant);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(MaxGrantsPerPrincipal, null);
+            Environment.SetEnvironmentVariable(MaxGrantsPerTenant, null);
         }
     }
 

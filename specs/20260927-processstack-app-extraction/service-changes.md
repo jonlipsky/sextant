@@ -302,6 +302,7 @@ CREATE INDEX ix_grants_tenant_repo ON repository_grants(tenant_id, repository_ke
 | `/query/snapshots/{hash}/symbols` | For a delegate caller, authorized by grants in place of `AuthorizedForSnapshot`'s policy check (`ServiceApp.cs:422-433`), with the same uniform 404 |
 | `/control/ensure` with `act=user` | The repository must be visible → otherwise 403 `not_granted`. Trigger (`act=application`) and assertion-less control calls are unchanged |
 | `/control/status/{id}` with `act=user` | 404 unless the job's repository is visible (#77 opaque ids stays N) |
+| `/control/resolve` with `act=user` | The same bare 404 as an absent repository unless the repository is visible. Checked before the branch is resolved. Trigger (`act=application`) and assertion-less control calls are unchanged |
 
 **`list_repositories` MCP tool** (in `Sextant.Service`, added to `RemoteQueryTools`):
 - Input: `{}`.
@@ -317,8 +318,83 @@ CREATE INDEX ix_grants_tenant_repo ON repository_grants(tenant_id, repository_ke
 - Cross-repo tools are filtered.
 - An ungranted repository gets a uniform not-found.
 - Implicit selection.
-- The limits; the ensure/status `act=user` gates; audit rows.
+- The limits; the ensure/status/resolve `act=user` gates; audit rows.
 - Reconcile targets contain no user ids.
+
+### As implemented (SX-6)
+
+The contract above is implemented as written. These are the places where the code is more specific than the spec, or deliberately differs from it.
+
+**Placement.**
+- The storage is `Sextant.Store/RepositoryGrantStore.cs` over migration `024_repository_grants.sql`, exactly as the schema above.
+- The service logic is `Sextant.Service/SnapshotService.Grants.cs`. The pure pieces are in `Sextant.Service/Grants/`: `RepositoryGrantKey`, `GrantReadAuthorizer`, `ListRepositoriesTool`, `CallerContext` and the contracts.
+- The routes and the per-request visibility cache (`CallerVisibility`) are in `Sextant.Service.Host/GrantEndpoints.cs`. `ServiceApp.cs` gains only the authorizer install, the ensure, status and resolve gates, implicit selection and one `GrantEndpoints.Map` call.
+- `GrantReadAuthorizer` is built over a `Func<IReadOnlySet<string>?>` (the caller's visible keys) and the catalog's id → URL resolver. `GrantReadAuthorizer.IsVisible(url)` is public so a repository-set filter (SX-7) can reuse the same rule.
+
+**Repository key (differs from the schema comment).**
+- `repository_key` is `RepositoryGrantKey.Of(url)`, the SVC-5 canonical `https://{host}/{owner}/{repo}` form (folded by `RemoteUrlIdentity.Normalize`), not a bare `Normalize`.
+- The key is computed under the policy's shape rules only, ignoring the host and owner allow-lists, so a catalog repository keeps its key when an operator narrows them.
+- A URL outside the shape rules (a test `file://` fixture, for example) falls back to `Normalize`. Grants, catalog repositories and job rows are all compared through this one function.
+
+**Admission.** The spec is silent on a missing or non-matching caller, so the grant routes use these responses:
+- **No verified caller:** 401 `{"error":"caller_required"}` with `WWW-Authenticate: Bearer error="invalid_request"`, like `/query/*` in SX-5.
+- **Wrong `act`:** 403 `{"status":"rejected","reason":"wrong_actor"}`.
+- **`sub` is `*`:** a user whose `sub` is exactly `*` (the reserved tenant-wide principal) gets 403 `{"error":"caller_not_allowed"}`, so a user can never read or write the tenant's grants.
+- **Unchanged from SX-5:** the control token is still required first, and SVC-3's steps 10-11 policy failure is still 403 `caller_not_allowed` from the gate.
+
+**`principal_in_body` (security checklist item 10).**
+- A request is refused with 400 `principal_in_body` when a query key or a top-level body member is one of `tenant_id`, `tenantid`, `tid`, `principal`, `sub`, `user`, `user_id` or `userid`, matched case-insensitively.
+- The check runs before the URL is read, so a request that names a principal always gets this reason.
+
+**Request validation (beyond the table).**
+- **PUT body:** a JSON object of at most 16 KiB. `repository` must be a string. `branch` is optional and may be a string or null. A duplicate member, a non-string value, or a body that is not an object → 400 `invalid_body`.
+- **DELETE query:** a repeated `repository` or `branch` parameter → 400 `invalid_body`.
+- **Branch:** a branch longer than 255 characters, or one containing whitespace, a control character or `*` → 400 `branch_not_allowed`. The exception is `branch=*` on DELETE, which means all branches.
+- **Scope:** `GET /control/grants` without exactly `scope=tenant` (case-sensitive) → 400 `invalid_scope`.
+- **URL:** a refused URL is `400 {"status":"rejected","reason":<SVC-5 code>}`. It is audited with no repository scope and without echoing the URL.
+- **Revocation:** a DELETE is still accepted when the URL is refused only because its host or owner is no longer allow-listed (`RepositoryGrantKey.EvaluateForRevocation`), so a grant made before the allow-list was narrowed can always be revoked.
+- **Re-PUT:** a re-PUT of an existing grant returns `created:false`. It refreshes `updated_at` and keeps the first-submitted `remote_url` and `source`.
+- **Deleting nothing** is `{deleted:0}`, not an error.
+- **`resolved_branch`** in `GET /control/grants/self` is omitted while the default branch is unknown.
+
+**Limits.**
+- `SEXTANT_SERVICE_MAX_GRANTS_PER_PRINCIPAL` (default 200) counts one user's grants in a tenant and does not apply to the `'*'` principal.
+- `SEXTANT_SERVICE_MAX_GRANTS_PER_TENANT` (default 5000) counts every grant row of the tenant, `'*'` included.
+- Both limits are checked only when a PUT would create a row, inside the write transaction, so a refresh of an existing grant is never refused. A refusal is `409 {"status":"rejected","reason":"grant_limit"}`.
+
+**Writes.**
+- A grant write uses its own catalog connection (`BEGIN IMMEDIATE`, `busy_timeout` 30 s), not the service write gate, so it never waits behind a long-running index production.
+- The writer lease is checked before the transaction and again before `COMMIT`. A service that lost the lease writes nothing and answers 503 `unavailable`, and so does a disposed service.
+- The accepted audit row is written in the same transaction as the grant.
+
+**Audit.**
+- Every grant write, accepted or denied, is an `AuditActions.Grant` row:
+  - accepted details: `put_self;created|updated`, `put_tenant;…`, `delete_self;deleted_<n>` and `delete_tenant;…`;
+  - denied details: `<operation>;<reason>`;
+  - the repository scope is the key, or null when the URL was refused.
+- A refusal before admission (401 `caller_required`) is audited with the bearer as actor. `GET` routes are not audited.
+- A user's `not_granted` ensure is an `ensure`/`denied` row with detail `not_granted` and the repository key as scope.
+- **The audit-detail suffix SX-5 deferred** is appended to every caller-attributed control action (ensure, branch retire, retention, backup and grant): `;idp=…;kid=…;via=…;cid=…;dep=…;jti=…`.
+  - A value is written only when it is at most 64 characters of `[A-Za-z0-9._:-]`, else as `-`, so a claim can never inject a separator, a control character or an unbounded value.
+  - An application caller has no `idp`, so its suffix has `idp=-`. A caller whose assertion omits `dep` (SX-5b) has `dep=-`.
+  - A call with no assertion (bearer actor) has no suffix.
+
+**Visibility and selection.**
+- **Caching:** the caller's visible keys are read from the catalog at most once per HTTP request and cached in `HttpContext.Items`, never across requests. The stateless `/mcp` carries one JSON-RPC message per request, so a revocation takes effect on the caller's next call.
+- **Composite:** `CallerReadAuthorizer` routes a delegate-token request to `GrantReadAuthorizer` (`IsEnforcing=true`; a request with no verified caller sees nothing). Every other request keeps the configured authorizer: `PolicyReadAuthorizer` under `READ_POLICY`, else `AllowAll`. The composite is installed only when `DELEGATE_TOKENS` is configured.
+- **Implicit selection** applies only to a delegate request that names neither a repository nor a branch, whether by header or by reserved argument. A branch without a repository stays `repository_required`, as in SVC-2.
+- **Cross-repo tools** with a verified caller default the selection to `provider_repository_url` (SX-5). The provider must therefore be visible and have a complete default-branch snapshot, and each listed consumer repository is then filtered by `AuthorizeRepository`.
+- **Ensure gate order:** the URL policy (400) is checked first, then `not_granted` (403), then the branch guards (400).
+- **Status gate:** a job on a repository the user caller cannot see is the same bare 404 as an unknown id.
+- **Resolve gate** (added in review): `GET /control/resolve` by a user caller checks visibility before resolving the branch, so an ungranted repository is the same bare 404 as an absent repository or branch. Application and assertion-less callers are unchanged. `/control/branches/retire` is not grant-gated (a follow-up).
+- **Header selection:** an `X-Sextant-Repository` header is authorized like a `repository` argument; it never bypasses the grant. When both are sent and name different repositories, the call fails with `selector_conflict` before any grant or catalog lookup.
+- **Failure:** a visibility read that fails (the grant catalog cannot be read) propagates out of the authorizer, so the call fails (a tool error, or a 5xx on HTTP) and never reads as allowed. A grant write that cannot be recorded (lease lost, service disposed) is 503 `unavailable`, and so is a user's ensure whose `not_granted` row cannot be recorded; neither writes a row.
+
+**`list_repositories`.**
+- It is served only to a verified caller. A request with no verified caller (a legacy query token, for example) gets the `caller_required` tool error.
+- It lists every catalog branch of each visible repository, plus any granted branch the catalog does not know yet (status `missing` or `pending`).
+- `meta.index_freshness` is the newest `published_at` among the listed branches.
+- It is in `ToolSelectionFilters.SelectionExemptTools`, so `tools/list` does not add the reserved `repository`/`branch` arguments to it.
 
 ## SVC-F (SX-7): federated `search_symbols` (R, parity)
 
