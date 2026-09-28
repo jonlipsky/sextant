@@ -1,0 +1,31 @@
+name: unwatch-absent
+description: >
+  (#7) Unwatching a repository the caller never watched: the service deletes nothing, no memory entry
+  matches, and the reply says they were not watching it.
+entrypoint: configure-watched-repos
+principal:
+  userId: u-alice
+inputs:
+  # The prompt-trigger envelope `app test` needs to route SendConnectionMessage (the platform sets these).
+  tenantId: "sextant-test"
+  applicationInstanceId: "sextant-test-instance"
+  conversationId: "conv-unwatch-absent"
+  prompt: "stop watching octocat/hello-world"
+  isFirstTurn: false
+  channelType: "web"
+http:
+  - connection: sextant-control
+    method: DELETE
+    path: /control/grants/self
+    body: { deleted: 0 }
+expected:
+  status: Completed
+  variables:
+    verb: unwatch
+    agentResponse: "You were not watching octocat/hello-world."
+  httpCalls:
+    - connection: sextant-control
+      method: DELETE
+      path: /control/grants/self
+      caller: { act: user, idp: processstack, sub: u-alice }
+      count: 1

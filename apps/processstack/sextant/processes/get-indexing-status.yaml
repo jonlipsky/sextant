@@ -1,0 +1,146 @@
+name: get-indexing-status
+description: >
+  Bounded MCP control operation: reads one Sextant indexing job by id (GET /control/status/{jobId}). The
+  service answers only for a job on a repository the caller can see; any other job reads as not found.
+  Returns the job's state and snapshot reference, never semantic data.
+
+inputs:
+  - name: jobId
+    type: string
+    required: true
+    description: The job id start-indexing returned
+
+variables:
+  - name: validJobId
+    type: bool
+    default: false
+  - name: statusCode
+    type: int
+    default: 0
+  - name: responseJson
+    type: json
+
+outputs:
+  - name: found
+    type: bool
+    description: False when the job does not exist or is not visible to the caller
+  - name: indexingState
+    type: string
+    description: queued | running | complete | partial | failed | unsupported | cancelled; "" when not found
+  - name: terminal
+    type: bool
+    description: True when the job will not change again
+  - name: snapshotId
+    type: string
+    description: The published snapshot id; "" when none
+  - name: lastError
+    type: string
+    description: The job's last recorded error; "" when none
+  - name: outcome
+    type: string
+    description: ok | not_found | unauthorized | unavailable | error
+  - name: message
+    type: string
+
+nodes:
+  - id: start
+    type: start
+    next: check-id
+
+  # The id is a path segment: only a plain decimal id is ever sent.
+  - id: check-id
+    type: activity:SetVariable
+    inputs:
+      value: "= /^[0-9]{1,19}$/.test(String(jobId || '').trim())"
+    outputs:
+      result: validJobId
+    next: route-id
+
+  - id: route-id
+    type: decision
+    next:
+      - when: "validJobId"
+        next: read-status
+      - else: not-found
+
+  - id: read-status
+    name: GET /control/status/{jobId}
+    type: activity:HttpRequest
+    inputs:
+      connectionId: sextant-control
+      method: GET
+      url: "= '/control/status/' + String(jobId).trim()"
+      failOnErrorStatus: false
+    outputs:
+      statusCode: statusCode
+      json: responseJson
+    next: route-status
+
+  - id: route-status
+    type: decision
+    next:
+      - when: "statusCode == 200 && responseJson != null && responseJson.job != null"
+        next: map-job
+      - when: "statusCode == 404"
+        next: not-found
+      - else: refused
+
+  - id: map-job
+    name: Map the job row
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var job = responseJson.job;
+        var state = String(job.status || '');
+        var terminalStates = ['complete', 'partial', 'failed', 'unsupported', 'cancelled'];
+        var error = job.last_error == null ? '' : String(job.last_error);
+        context.setVariable('found', true);
+        context.setVariable('indexingState', state);
+        context.setVariable('terminal', terminalStates.indexOf(state) >= 0);
+        context.setVariable('snapshotId', job.snapshot_id == null ? '' : String(job.snapshot_id));
+        context.setVariable('lastError', error.length > 500 ? error.substring(0, 500) : error);
+        context.setVariable('outcome', 'ok');
+        context.setVariable('message', 'Job ' + String(jobId).trim() + ' is ' + state + '.');
+        null;
+    next: end
+
+  - id: not-found
+    type: activity:JavaScript
+    inputs:
+      script: |
+        context.setVariable('found', false);
+        context.setVariable('indexingState', '');
+        context.setVariable('terminal', false);
+        context.setVariable('snapshotId', '');
+        context.setVariable('lastError', '');
+        context.setVariable('outcome', 'not_found');
+        context.setVariable('message', 'No indexing job with that id is visible to you.');
+        null;
+    next: end
+
+  - id: refused
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var unauthorized = statusCode == 401 || statusCode == 403;
+        context.setVariable('found', false);
+        context.setVariable('indexingState', '');
+        context.setVariable('terminal', false);
+        context.setVariable('snapshotId', '');
+        context.setVariable('lastError', '');
+        context.setVariable('outcome', unauthorized ? 'unauthorized' : (statusCode == 0 || statusCode >= 500 ? 'unavailable' : 'error'));
+        context.setVariable('message', unauthorized
+          ? 'The Sextant service refused the request.'
+          : 'The Sextant service could not answer right now; try again later.');
+        null;
+    next: log-refusal
+
+  - id: log-refusal
+    type: activity:Log
+    inputs:
+      level: Warning
+      message: "= 'Sextant job status read failed: HTTP ' + statusCode"
+    next: end
+
+  - id: end
+    type: end

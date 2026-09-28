@@ -1,0 +1,22 @@
+name: unwatch-rejected
+description: >
+  A 400 from DELETE /control/grants/self is reported with the service's reason code only.
+entrypoint: revoke-watch
+principal:
+  userId: u-alice
+inputs:
+  host: github.com
+  owner: octocat
+  repo: hello-world
+  remoteUrl: "https://github.com/octocat/hello-world.git"
+  branch: main
+http:
+  - connection: sextant-control
+    method: DELETE
+    path: /control/grants/self
+    status: 400
+    body: { status: rejected, reason: branch_not_allowed }
+expected:
+  status: Completed
+  variables:
+    message: "The Sextant service would not stop watching octocat/hello-world (branch_not_allowed)."

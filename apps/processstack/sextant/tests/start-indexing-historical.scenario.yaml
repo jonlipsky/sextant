@@ -1,0 +1,41 @@
+name: start-indexing-historical
+description: >
+  (#28) Without a branch, start-indexing only indexes the commit: the ensure carries branch_update "none"
+  and no compare-and-swap, and never default_branch or branch_head_sequence.
+entrypoint: start-indexing
+principal:
+  userId: u-alice
+inputs:
+  repositoryRemoteUrl: "https://github.com/octocat/hello-world.git"
+  commitSha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+# Shape: POST /control/ensure[?wait=false] → EnsureSnapshotResult, 202 while not terminal
+# (src/Sextant.Service.Host/ServiceApp.cs, src/Sextant.Service/ServiceContracts.cs).
+http:
+  - connection: sextant-control
+    method: POST
+    path: /control/ensure
+    status: 202
+    body: { job_id: 42, identity_hash: "9b1d", status: queued, attached: false }
+expected:
+  status: Completed
+  variables:
+    outcome: ok
+    jobId: "42"
+    identityHash: "9b1d"
+    indexingState: queued
+    attached: false
+  httpCalls:
+    - connection: sextant-control
+      method: POST
+      path: /control/ensure
+      caller: { act: user, idp: processstack, sub: u-alice }
+      bodyMatch:
+        repository_remote_url: "https://github.com/octocat/hello-world.git"
+        commit_sha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+        branch_update: none
+        branch_name: null
+        expected_head_commit: null
+        default_branch: null
+        branch_head_sequence: null
+        forced: null
+      count: 1

@@ -1,0 +1,35 @@
+name: unwatch-two-repositories
+description: >
+  "stop watching a and b" revokes each repository in the order typed (one DELETE per repository, every
+  branch) and replies with one line per repository; an invalid token is reported after them.
+entrypoint: configure-watched-repos
+principal:
+  userId: u-alice
+inputs:
+  # The prompt-trigger envelope `app test` needs to route SendConnectionMessage (the platform sets these).
+  tenantId: "sextant-test"
+  applicationInstanceId: "sextant-test-instance"
+  conversationId: "conv-unwatch-two"
+  prompt: "stop watching octocat/hello-world and octocat/spoon-knife, not-a-repo"
+  isFirstTurn: false
+  channelType: "web"
+seed:
+  userMemory:
+    - key: "sextant.watched-repos:github.com/octocat/spoon-knife@main"
+      value: '{"owner":"octocat","repo":"spoon-knife","branch":"main","cloneUrl":"https://github.com/octocat/spoon-knife.git","addedAt":"2026-01-01T00:00:00+00:00"}'
+http:
+  - connection: sextant-control
+    method: DELETE
+    path: /control/grants/self
+    body: { deleted: 0 }
+expected:
+  status: Completed
+  variables:
+    verb: unwatch
+    agentResponse: "You were not watching octocat/hello-world.\nStopped watching octocat/spoon-knife. Existing snapshots are left in place.\n'not-a-repo' is not a repository; use owner/repo, host/owner/repo or an https URL."
+  httpCalls:
+    - connection: sextant-control
+      method: DELETE
+      path: /control/grants/self
+      caller: { act: user, idp: processstack, sub: u-alice }
+      count: 2

@@ -1,0 +1,43 @@
+name: start-indexing-behind-head
+description: >
+  A commit that is not the branch's current head is indexed without moving the branch (branch_update
+  "none"), so a historical commit never regresses it; /control/resolve is not read.
+entrypoint: start-indexing
+principal:
+  userId: u-alice
+inputs:
+  repositoryRemoteUrl: "https://github.com/octocat/hello-world.git"
+  commitSha: "553c2077f0edc3d5dc5d17262f6aa498e69d6f8e"
+  branchName: main
+http:
+  # Shape: GitHub REST GET /repos/{owner}/{repo}/branches (read by GitHubListBranches through Octokit).
+  - connection: github
+    method: GET
+    path: /repos/octocat/hello-world/branches
+    body:
+      - name: main
+        commit: { sha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d", url: "https://api.github.com/repos/octocat/hello-world/commits/7fd1a60b01f91b314f59955a4e4d4e80d8edf11d" }
+        protected: false
+      - name: feature/x
+        commit: { sha: "b3cbd5bbd7e81436d2eee04537ea2b4c0cad4cdf", url: "https://api.github.com/repos/octocat/hello-world/commits/b3cbd5bbd7e81436d2eee04537ea2b4c0cad4cdf" }
+        protected: false
+  - connection: sextant-control
+    method: POST
+    path: /control/ensure
+    status: 202
+    body: { job_id: 43, identity_hash: "8a0c", status: queued, attached: false }
+expected:
+  status: Completed
+  variables:
+    outcome: ok
+    jobId: "43"
+  httpCalls:
+    - connection: sextant-control
+      method: GET
+      path: /control/resolve
+      count: 0
+    - connection: sextant-control
+      method: POST
+      path: /control/ensure
+      bodyMatch: { branch_update: none, expected_head_commit: null }
+      count: 1

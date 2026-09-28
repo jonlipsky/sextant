@@ -1,0 +1,328 @@
+name: start-indexing
+description: >
+  Bounded MCP control operation: requests (ensures) a Sextant snapshot for an exact commit and returns its
+  job reference. It starts or attaches to indexing and never returns semantic data. The service accepts it
+  only for a repository the caller watches (a 403 not_granted otherwise).
+
+  With a branch name, the commit advances that branch only when it is the branch's current head on the
+  workspace's GitHub connection, and only through the compare-and-swap guard (expected_head_commit is the
+  head the service holds now). Any other commit is indexed with branch_update "none", so a historical
+  commit never moves a branch backwards. Without a branch name nothing moves.
+
+inputs:
+  - name: repositoryRemoteUrl
+    type: string
+    required: true
+    description: Clone URL of the repository to index (https://github.com/owner/repo.git)
+  - name: commitSha
+    type: string
+    required: true
+    description: Exact commit SHA to snapshot
+  - name: branchName
+    type: string
+    required: false
+    default: ""
+    description: The branch the commit is on; it advances only when the commit is that branch's head
+  - name: treeSha
+    type: string
+    required: false
+    default: ""
+    description: Optional tree SHA
+  - name: configHash
+    type: string
+    required: false
+    default: ""
+    description: Profile/feature configuration hash (empty uses the service default)
+
+variables:
+  - name: remoteUrl
+    type: string
+    default: ""
+  - name: accepted
+    type: bool
+    default: false
+  - name: urlReason
+    type: string
+    default: ""
+  - name: host
+    type: string
+    default: ""
+  - name: repositoryOwner
+    type: string
+    default: ""
+  - name: repositoryName
+    type: string
+    default: ""
+  - name: branch
+    type: string
+    default: ""
+  - name: branches
+    type: json
+  - name: isHead
+    type: bool
+    default: false
+  - name: resolveStatus
+    type: int
+    default: 0
+  - name: resolveJson
+    type: json
+  - name: expectedHead
+    type: string
+    default: ""
+  - name: ensureStatus
+    type: int
+    default: 0
+
+outputs:
+  - name: jobId
+    type: string
+    description: The durable Sextant job id this request created or attached to
+  - name: identityHash
+    type: string
+    description: The content-addressed identity hash the request resolved to
+  - name: indexingState
+    type: string
+    description: queued | running | complete | partial | failed | unsupported | cancelled; "" when refused
+  - name: snapshotId
+    type: string
+    description: The published snapshot id, when one already exists
+  - name: attached
+    type: bool
+    description: True when this request attached to an existing job or snapshot
+  - name: branchAdvanced
+    type: bool
+    description: True when this request moved the branch pointer
+  - name: outcome
+    type: string
+    description: ok | attached | rejected | unavailable | head_mismatch | not_granted | unauthorized | error
+  - name: reason
+    type: string
+    description: The service's reason code when refused
+  - name: message
+    type: string
+
+nodes:
+  - id: start
+    type: start
+    next: normalize
+
+  - id: normalize
+    name: Check the repository URL
+    type: activity:SextantNormalizeRepository
+    inputs:
+      cloneUrl: "= repositoryRemoteUrl"
+    outputs:
+      remoteUrl: remoteUrl
+      accepted: accepted
+      reason: urlReason
+      host: host
+      repositoryOwner: repositoryOwner
+      repositoryName: repositoryName
+    next: route-url
+
+  - id: route-url
+    type: decision
+    next:
+      - when: "accepted && /^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$/.test(String(commitSha || '').trim())"
+        next: set-branch
+      - else: refuse-input
+
+  - id: set-branch
+    type: activity:SetVariable
+    inputs:
+      value: "= String(branchName || '').trim()"
+    outputs:
+      result: branch
+    next: route-branch
+
+  # Only a branch on the GitHub connection's host can be checked against its head.
+  - id: route-branch
+    type: decision
+    next:
+      - when: "branch != '' && host == 'github.com'"
+        next: list-branches
+      - else: ensure-none
+
+  - id: list-branches
+    name: Read the branch heads
+    type: activity:GitHubListBranches
+    inputs:
+      connectionId: github
+      owner: "= repositoryOwner"
+      repo: "= repositoryName"
+    outputs:
+      branches: branches
+    next: check-head
+
+  - id: check-head
+    type: activity:SetVariable
+    inputs:
+      value: >
+        = (function () {
+            var match = (branches || []).find(function (b) { return b && b.name === branch; });
+            var head = match && match.sha ? String(match.sha).toLowerCase() : '';
+            return head !== '' && head === String(commitSha).trim().toLowerCase();
+          })()
+    outputs:
+      result: isHead
+    next: route-head
+
+  - id: route-head
+    type: decision
+    next:
+      - when: "isHead"
+        next: resolve
+      - else: ensure-none
+
+  # The head the service holds for the branch now becomes the compare-and-swap value.
+  - id: resolve
+    name: GET /control/resolve
+    type: activity:HttpRequest
+    inputs:
+      connectionId: sextant-control
+      method: GET
+      url: /control/resolve
+      query:
+        repository: "= remoteUrl"
+        branch: "= branch"
+      failOnErrorStatus: false
+    outputs:
+      statusCode: resolveStatus
+      json: resolveJson
+    next: route-resolve
+
+  - id: route-resolve
+    type: decision
+    next:
+      - when: "resolveStatus == 200"
+        next: expect-resolved
+      - when: "resolveStatus == 404"
+        next: ensure-advance
+      - else: refuse-resolve
+
+  - id: expect-resolved
+    type: activity:SetVariable
+    inputs:
+      value: "= resolveJson != null && resolveJson.commit_sha != null ? String(resolveJson.commit_sha) : ''"
+    outputs:
+      result: expectedHead
+    next: ensure-advance
+
+  - id: ensure-advance
+    type: process:ensure
+    inputs:
+      repositoryRemoteUrl: "= remoteUrl"
+      commitSha: "= String(commitSha).trim()"
+      branchName: "= branch"
+      branchUpdate: advance
+      expectedHeadCommit: "= expectedHead"
+      treeSha: "= treeSha"
+      configHash: "= configHash"
+    outputs:
+      outcome: outcome
+      reason: reason
+      statusCode: ensureStatus
+      jobId: jobId
+      identityHash: identityHash
+      jobStatus: indexingState
+      snapshotId: snapshotId
+      attached: attached
+      branchAdvanced: branchAdvanced
+    next: describe
+
+  - id: ensure-none
+    type: process:ensure
+    inputs:
+      repositoryRemoteUrl: "= remoteUrl"
+      commitSha: "= String(commitSha).trim()"
+      branchName: "= branch"
+      branchUpdate: none
+      treeSha: "= treeSha"
+      configHash: "= configHash"
+    outputs:
+      outcome: outcome
+      reason: reason
+      statusCode: ensureStatus
+      jobId: jobId
+      identityHash: identityHash
+      jobStatus: indexingState
+      snapshotId: snapshotId
+      attached: attached
+      branchAdvanced: branchAdvanced
+    next: describe
+
+  - id: describe
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var text;
+        switch (outcome) {
+          case 'ok':
+          case 'attached':
+            text = 'Indexing job ' + jobId + ' is ' + indexingState + '.';
+            break;
+          case 'not_granted':
+            text = 'Watch the repository first (for example, "watch owner/repo" in the Sextant chat), then try again.';
+            break;
+          case 'rejected':
+            text = 'The Sextant service rejected the request (' + reason + ').';
+            break;
+          case 'unavailable':
+            text = 'The Sextant service is unavailable right now; try again later.';
+            break;
+          case 'unauthorized':
+            text = 'The Sextant service refused the request.';
+            break;
+          default:
+            text = 'The Sextant service could not start indexing (' + reason + ').';
+        }
+        context.setVariable('message', text);
+        null;
+    next: end
+
+  - id: refuse-input
+    type: activity:JavaScript
+    inputs:
+      script: |
+        context.setVariable('outcome', 'rejected');
+        context.setVariable('reason', accepted ? 'invalid_commit' : urlReason);
+        context.setVariable('jobId', '');
+        context.setVariable('identityHash', '');
+        context.setVariable('indexingState', '');
+        context.setVariable('snapshotId', '');
+        context.setVariable('attached', false);
+        context.setVariable('branchAdvanced', false);
+        context.setVariable('message', accepted
+          ? 'commitSha must be a full commit SHA.'
+          : 'repositoryRemoteUrl is not a repository URL the Sextant service accepts (' + urlReason + ').');
+        null;
+    next: end
+
+  - id: refuse-resolve
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var unauthorized = resolveStatus == 401 || resolveStatus == 403;
+        context.setVariable('outcome', unauthorized ? 'unauthorized' : 'unavailable');
+        context.setVariable('reason', 'http_' + resolveStatus);
+        context.setVariable('jobId', '');
+        context.setVariable('identityHash', '');
+        context.setVariable('indexingState', '');
+        context.setVariable('snapshotId', '');
+        context.setVariable('attached', false);
+        context.setVariable('branchAdvanced', false);
+        context.setVariable('message', unauthorized
+          ? 'The Sextant service refused the request.'
+          : 'The Sextant service could not read the branch head right now; try again later.');
+        null;
+    next: log-resolve
+
+  - id: log-resolve
+    type: activity:Log
+    inputs:
+      level: Warning
+      message: "= 'Sextant resolve failed before start-indexing: HTTP ' + resolveStatus"
+    next: end
+
+  - id: end
+    type: end

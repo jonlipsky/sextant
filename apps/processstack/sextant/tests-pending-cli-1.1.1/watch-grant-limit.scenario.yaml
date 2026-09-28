@@ -1,0 +1,34 @@
+name: watch-grant-limit
+description: >
+  A 409 grant_limit from PUT /control/grants/self is the "watching as many as allowed" reply.
+entrypoint: grant-watch
+principal:
+  userId: u-alice
+inputs:
+  host: github.com
+  owner: octocat
+  repo: hello-world
+http:
+  # Shape: GitHub REST GET /repos/{owner}/{repo} (read by GitHubGetRepository through Octokit).
+  - connection: github
+    method: GET
+    path: /repos/octocat/hello-world
+    body:
+      id: 1296269
+      name: hello-world
+      full_name: octocat/hello-world
+      owner: { login: octocat, id: 1 }
+      private: false
+      default_branch: main
+      html_url: "https://github.com/octocat/hello-world"
+      clone_url: "https://github.com/octocat/hello-world.git"
+  - connection: sextant-control
+    method: PUT
+    path: /control/grants/self
+    status: 409
+    body: { status: rejected, reason: grant_limit }
+expected:
+  status: Completed
+  variables:
+    granted: false
+    message: "You are watching as many repositories as allowed, so octocat/hello-world was not added. Stop watching one first."
