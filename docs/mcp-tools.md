@@ -434,4 +434,4 @@ No parameters. Returns daemon PID, port, state (idle/indexing), current phase, p
 Sextant supports two MCP transport modes:
 
 - **stdio** (primary) — Sextant runs as a child process communicating over stdin/stdout. Used by AI tools like Claude Code.
-- **HTTP** — Sextant runs as a standalone HTTP server with the MCP endpoint at `/mcp`. Started with `sextant serve --port <port>`.
+- **HTTP** — Sextant runs as a standalone HTTP server with the MCP endpoint at `/mcp` (Streamable HTTP). Started with `sextant serve --port <port>`. The legacy HTTP+SSE endpoints (`/mcp/sse`, `/mcp/message`) are not served; the MCP SDK disables them by default.

@@ -73,8 +73,11 @@ public static class McpServerSetup
             provider.AttachRemoteFederation(RemoteBaseSnapshotFederation.Create(SextantConfiguration.Load()));
             return provider;
         });
+        // Stateful, as before the SDK 2.x upgrade: SDK 2.0 flipped the Streamable HTTP default to stateless,
+        // so pin the session-based transport this local host has always served. The multi-tenant service
+        // (Sextant.Service.Host ServiceApp) is the stateless one.
         builder.Services.AddMcpServer()
-            .WithHttpTransport()
+            .WithHttpTransport(transport => transport.Stateless = false)
             .WithToolsFromAssembly();
 
         builder.WebHost.UseUrls($"http://localhost:{port}");
