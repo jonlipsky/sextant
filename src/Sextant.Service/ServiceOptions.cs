@@ -58,8 +58,8 @@ public sealed record ServiceOptions
     /// <summary>
     /// Delegate bearer tokens for the query plane (SVC-3): <c>SEXTANT_SERVICE_DELEGATE_TOKENS</c>, as <c>tok1;tok2</c>.
     /// A delegate token grants nothing by itself. A <c>tools/call</c> or <c>/query/*</c> request made with one needs
-    /// a verified caller assertion, and what that caller may read is decided per caller (deny-all until grants
-    /// exist). Requires <see cref="CallerAssertion"/> keys, and must differ from every other configured token.
+    /// a verified caller assertion, and what that caller may read is decided per caller by its repository grants
+    /// (SVC-4). Requires <see cref="CallerAssertion"/> keys, and must differ from every other configured token.
     /// </summary>
     public IReadOnlyList<string> DelegateTokens { get; init; } = [];
 
@@ -69,6 +69,22 @@ public sealed record ServiceOptions
     /// that carries an assertion is refused.
     /// </summary>
     public CallerAssertionOptions CallerAssertion { get; init; } = CallerAssertionOptions.Disabled;
+
+    /// <summary>
+    /// The most repository grants one user may hold in a tenant (SVC-4, <c>PUT /control/grants/self</c>); creating
+    /// one more is 409 <c>grant_limit</c>. Re-granting an existing grant never counts. Tenant-wide grants are bounded
+    /// by <see cref="MaxGrantsPerTenant"/> only. <c>SEXTANT_SERVICE_MAX_GRANTS_PER_PRINCIPAL</c> (default 200).
+    /// </summary>
+    public int MaxGrantsPerPrincipal { get; init; } = DefaultMaxGrantsPerPrincipal;
+
+    /// <summary>
+    /// The most repository grants a tenant may hold across all its principals, tenant-wide grants included (SVC-4);
+    /// creating one more is 409 <c>grant_limit</c>. <c>SEXTANT_SERVICE_MAX_GRANTS_PER_TENANT</c> (default 5000).
+    /// </summary>
+    public int MaxGrantsPerTenant { get; init; } = DefaultMaxGrantsPerTenant;
+
+    internal const int DefaultMaxGrantsPerPrincipal = 200;
+    internal const int DefaultMaxGrantsPerTenant = 5000;
 
     /// <summary>
     /// Throws when the caller-identity settings are inconsistent (fail closed): invalid <see cref="CallerAssertion"/>
@@ -298,6 +314,10 @@ public sealed record ServiceOptions
             CallerAssertion = ParseCallerAssertion(
                 Env("CALLER_KEYS"), Env("CALLER_AUDIENCE"), Env("CALLER_ISSUERS"), Env("CALLER_HEADER"),
                 Env("CALLER_IDPS"), Env("CALLER_APPS")),
+            MaxGrantsPerPrincipal = EnvInt("MAX_GRANTS_PER_PRINCIPAL") is int perPrincipal and > 0
+                ? perPrincipal : DefaultMaxGrantsPerPrincipal,
+            MaxGrantsPerTenant = EnvInt("MAX_GRANTS_PER_TENANT") is int perTenant and > 0
+                ? perTenant : DefaultMaxGrantsPerTenant,
             BindAddress = EnvHost("BIND_ADDRESS") ?? "localhost",
             ControlPort = EnvInt("CONTROL_PORT") ?? 3011,
             QueryPort = EnvInt("QUERY_PORT"),

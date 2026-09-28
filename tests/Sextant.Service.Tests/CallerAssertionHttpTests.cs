@@ -20,20 +20,21 @@ namespace Sextant.Service.Tests;
 /// <summary>
 /// SVC-3 at the HTTP boundary: delegate tokens and caller assertions on <c>/mcp</c>, <c>/query/*</c> and
 /// <c>/control/*</c>. Keys are generated in-test; the tenants are <c>tenant-a</c> (key <c>kid-a</c>) and
-/// <c>tenant-b</c> (key <c>kid-b</c>). Until per-caller visibility exists, every delegate read is denied (the
-/// interim deny-all authorizer), so a delegate token opens nothing on its own.
+/// <c>tenant-b</c> (key <c>kid-b</c>). No grant exists here, so every delegate read is denied (SVC-4's grant
+/// authorizer: a caller sees only the repositories it holds grants on, <see cref="GrantHttpTests"/>), so a delegate
+/// token opens nothing on its own.
 /// </summary>
 [TestClass]
 public class CallerAssertionHttpTests
 {
-    private const string QueryToken = "query-secret";
-    private const string ControlToken = "control-secret";
-    private const string ContributeToken = "contribute-secret";
-    private const string DelegateToken = "delegate-secret";
-    private const string ReaderToken = "widgets-reader";
-    private const string Widgets = "https://github.com/acme/widgets";
-    private const string Header = CallerAssertionOptions.DefaultHeader;
-    private const string FindSymbolArguments = """{"name":"global::App.Type0"}""";
+    internal const string QueryToken = "query-secret";
+    internal const string ControlToken = "control-secret";
+    internal const string ContributeToken = "contribute-secret";
+    internal const string DelegateToken = "delegate-secret";
+    internal const string ReaderToken = "widgets-reader";
+    internal const string Widgets = "https://github.com/acme/widgets";
+    internal const string Header = CallerAssertionOptions.DefaultHeader;
+    internal const string FindSymbolArguments = """{"name":"global::App.Type0"}""";
 
     // ==== /mcp: discovery ===========================================================================
 
@@ -105,7 +106,7 @@ public class CallerAssertionHttpTests
             DelegateToken, host.UserAssertion());
         var notFound = WithoutTimestamp(JsonDocument.Parse(ResponseBuilder.BuildNotFound()).RootElement);
         Assert.AreEqual(notFound, WithoutTimestamp(selected.Body),
-            "until grants exist every delegate read is the uniform not-found, even of a published repository");
+            "without a grant every delegate read is the uniform not-found, even of a published repository");
 
         var application = await host.CallAsync("find_symbol", """{"name":"global::App.Type0","repository":"acme/widgets"}""",
             DelegateToken, host.Sign(CallerAssertionSigner.ApplicationClaims(DateTimeOffset.UtcNow)));
@@ -308,7 +309,7 @@ public class CallerAssertionHttpTests
         using var published = await host.SnapshotPageAsync(DelegateToken, host.WidgetsHash, host.UserAssertion());
         using var unknown = await host.SnapshotPageAsync(DelegateToken, new string('0', 64), host.UserAssertion());
 
-        Assert.AreEqual(HttpStatusCode.NotFound, published.StatusCode, "a delegate caller reads nothing yet");
+        Assert.AreEqual(HttpStatusCode.NotFound, published.StatusCode, "a delegate caller without a grant reads nothing");
         Assert.AreEqual(HttpStatusCode.NotFound, unknown.StatusCode);
         Assert.AreEqual(await unknown.Content.ReadAsStringAsync(), await published.Content.ReadAsStringAsync(),
             "a published snapshot and an unknown one are indistinguishable");
@@ -571,17 +572,17 @@ public class CallerAssertionHttpTests
 
     // ==== helpers ==================================================================================
 
-    private static string EnsureBody() =>
+    internal static string EnsureBody() =>
         JsonSerializer.Serialize(ServiceTestFixtures.Request(repo: "https://github.com/acme/gadgets", commit: "commit-g1"), ServiceJson.Options);
 
-    private static void AssertUnauthorized(RpcResponse response, string code, string bearerError)
+    internal static void AssertUnauthorized(RpcResponse response, string code, string bearerError)
     {
         Assert.AreEqual(HttpStatusCode.Unauthorized, response.Status, response.Raw);
         Assert.AreEqual($$"""{"error":"{{code}}"}""", response.Raw);
         Assert.AreEqual($"Bearer error=\"{bearerError}\"", response.Challenge);
     }
 
-    private static async Task AssertUnauthorizedAsync(HttpResponseMessage response, string code, string bearerError)
+    internal static async Task AssertUnauthorizedAsync(HttpResponseMessage response, string code, string bearerError)
     {
         var raw = await response.Content.ReadAsStringAsync();
         Assert.AreEqual(HttpStatusCode.Unauthorized, response.StatusCode, raw);
@@ -589,7 +590,7 @@ public class CallerAssertionHttpTests
         Assert.AreEqual($"Bearer error=\"{bearerError}\"", response.Headers.WwwAuthenticate.ToString());
     }
 
-    private static async Task AssertForbiddenAsync(HttpResponseMessage response)
+    internal static async Task AssertForbiddenAsync(HttpResponseMessage response)
     {
         var raw = await response.Content.ReadAsStringAsync();
         Assert.AreEqual(HttpStatusCode.Forbidden, response.StatusCode, raw);
@@ -597,22 +598,22 @@ public class CallerAssertionHttpTests
         Assert.AreEqual(0, response.Headers.WwwAuthenticate.Count, "a policy refusal is not an authentication challenge");
     }
 
-    private static string? ErrorCode(JsonElement body) =>
+    internal static string? ErrorCode(JsonElement body) =>
         body.GetProperty("meta").TryGetProperty("error", out var error) ? error.GetProperty("code").GetString() : null;
 
-    private static string WithoutTimestamp(JsonElement body)
+    internal static string WithoutTimestamp(JsonElement body)
     {
         var node = System.Text.Json.Nodes.JsonNode.Parse(body.GetRawText())!.AsObject();
         node["meta"]!.AsObject().Remove("queried_at");
         return node.ToJsonString();
     }
 
-    private readonly record struct ToolCall(bool IsError, JsonElement Body);
+    internal readonly record struct ToolCall(bool IsError, JsonElement Body);
 
-    private readonly record struct RpcResponse(HttpStatusCode Status, string Raw, string Challenge, JsonElement? Result);
+    internal readonly record struct RpcResponse(HttpStatusCode Status, string Raw, string Challenge, JsonElement? Result);
 
     /// <summary>A call filter registered after the service's own: it sees the caller the tool would see.</summary>
-    private sealed class CallProbe
+    internal sealed class CallProbe
     {
         private int _calls;
         public int Calls => _calls;
@@ -625,7 +626,7 @@ public class CallerAssertionHttpTests
         }
     }
 
-    private sealed class CapturingLoggerProvider : ILoggerProvider
+    internal sealed class CapturingLoggerProvider : ILoggerProvider
     {
         private readonly ConcurrentQueue<string> _lines = new();
 
@@ -657,7 +658,7 @@ public class CallerAssertionHttpTests
         }
     }
 
-    private sealed class Harness : IAsyncDisposable
+    internal sealed class Harness : IAsyncDisposable
     {
         public byte[] KeyA { get; } = CallerAssertionSigner.NewKey();
         public byte[] KeyB { get; } = CallerAssertionSigner.NewKey();
@@ -672,7 +673,9 @@ public class CallerAssertionHttpTests
         private string DbPath { get; set; } = "";
         private int _nextId;
 
-        public static async Task<Harness> StartAsync(bool callerIdentity = true, bool readPolicy = false, string[]? apps = null)
+        public static async Task<Harness> StartAsync(
+            bool callerIdentity = true, bool readPolicy = false, string[]? apps = null,
+            Func<ServiceOptions, ServiceOptions>? configure = null, Action<IndexDatabase>? seed = null)
         {
             var harness = new Harness();
             var dbPath = ServiceTestFixtures.NewDbPath();
@@ -683,6 +686,7 @@ public class CallerAssertionHttpTests
             var snapshots = new SnapshotStore(db.GetConnection());
             var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             snapshots.SetBranchPointer(snapshots.EnsureBranch(snapshots.GetRepositoryId(Widgets)!.Value, "main", true, now), snapId, now);
+            seed?.Invoke(db);
 
             var options = ServiceTestFixtures.NewOptions(dbPath, controlToken: ControlToken, queryToken: readPolicy ? null : QueryToken) with
             {
@@ -711,6 +715,8 @@ public class CallerAssertionHttpTests
             }
 
             var worker = new FakeSnapshotWorker(db);
+            if (configure is not null)
+                options = configure(options);
             var service = SnapshotService.Start(options, worker, db);
 
             var builder = WebApplication.CreateBuilder();
@@ -742,6 +748,21 @@ public class CallerAssertionHttpTests
 
         public string Logs() => _logs.Text;
 
+        /// <summary>How many grant rows the catalog holds (read on its own connection).</summary>
+        public long GrantRows()
+        {
+            using var conn = new Microsoft.Data.Sqlite.SqliteConnection(new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder
+            {
+                DataSource = DbPath,
+                Mode = Microsoft.Data.Sqlite.SqliteOpenMode.ReadOnly,
+                Pooling = false
+            }.ToString());
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM repository_grants;";
+            return (long)cmd.ExecuteScalar()!;
+        }
+
         public string UserAssertion(string tenant = "tenant-a", string sub = "user-1", string jti = "jti-1", byte[]? key = null)
         {
             var kid = tenant == "tenant-b" ? "kid-b" : "kid-a";
@@ -762,7 +783,23 @@ public class CallerAssertionHttpTests
             return new ToolCall(isError, JsonDocument.Parse(text).RootElement.Clone());
         }
 
+        /// <summary>When set, every <c>/mcp</c> request carries it as the <c>X-Sextant-Repository</c> header.</summary>
+        public string? RepositoryHeader { get; set; }
+
         public async Task<RpcResponse> RpcAsync(string method, string paramsJson, string token, params string[] assertions)
+        {
+            var (status, raw, challenge, payload) = await SendRpcAsync(method, paramsJson, token, assertions);
+            if (status != HttpStatusCode.OK)
+                return new RpcResponse(status, raw, challenge, null);
+
+            using var rpc = JsonDocument.Parse(payload);
+            Assert.IsTrue(rpc.RootElement.TryGetProperty("result", out var result), payload);
+            return new RpcResponse(status, raw, challenge, result.Clone());
+        }
+
+        /// <summary>One JSON-RPC exchange on <c>/mcp</c>, returned as sent back (no assertion on its shape).</summary>
+        public async Task<(HttpStatusCode Status, string Raw, string Challenge, string Payload)> SendRpcAsync(
+            string method, string paramsJson, string token, params string[] assertions)
         {
             using var request = new HttpRequestMessage(HttpMethod.Post, "/mcp")
             {
@@ -775,21 +812,42 @@ public class CallerAssertionHttpTests
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
             foreach (var assertion in assertions)
                 request.Headers.TryAddWithoutValidation(Header, assertion);
+            if (RepositoryHeader is not null)
+                request.Headers.TryAddWithoutValidation(ServiceApp.RepositoryHeader, RepositoryHeader);
 
             using var response = await Client.SendAsync(request);
             var raw = await response.Content.ReadAsStringAsync();
             var challenge = response.Headers.WwwAuthenticate.ToString();
-            if (response.StatusCode != HttpStatusCode.OK)
-                return new RpcResponse(response.StatusCode, raw, challenge, null);
-
             var payload = raw.Contains("data:", StringComparison.Ordinal)
                 ? string.Concat(raw.Split('\n')
                     .Where(l => l.StartsWith("data:", StringComparison.Ordinal))
                     .Select(l => l["data:".Length..].Trim()))
                 : raw;
-            using var rpc = JsonDocument.Parse(payload);
-            Assert.IsTrue(rpc.RootElement.TryGetProperty("result", out var result), payload);
-            return new RpcResponse(response.StatusCode, raw, challenge, result.Clone());
+            return (response.StatusCode, raw, challenge, payload);
+        }
+
+        /// <summary>Takes the single-writer lease from this service (another owner claims it) and waits until it notices.</summary>
+        public async Task StealLeaseAsync()
+        {
+            ExecuteOnCatalog("UPDATE writer_lease SET owner_token = 'thief' WHERE id = 1;");
+            var deadline = DateTime.UtcNow.AddSeconds(15);
+            while (!Service.LeaseLost && DateTime.UtcNow < deadline)
+                await Task.Delay(50);
+            Assert.IsTrue(Service.LeaseLost, "the service noticed it lost the lease");
+        }
+
+        /// <summary>Runs one statement on the catalog through a connection of its own (not the service's).</summary>
+        public void ExecuteOnCatalog(string sql)
+        {
+            using var conn = new Microsoft.Data.Sqlite.SqliteConnection(new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder
+            {
+                DataSource = DbPath,
+                Pooling = false
+            }.ToString());
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = sql;
+            cmd.ExecuteNonQuery();
         }
 
         public Task<HttpResponseMessage> SnapshotPageAsync(string token, string identityHash, params string[] assertions)

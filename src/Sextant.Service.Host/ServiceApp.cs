@@ -8,6 +8,7 @@ using Sextant.Mcp;
 using Sextant.Mcp.Tools;
 using Sextant.Service;
 using Sextant.Service.CallerIdentity;
+using Sextant.Service.Grants;
 using Sextant.Service.Observability;
 using Sextant.Store;
 
@@ -58,20 +59,28 @@ public static class ServiceApp
         builder.Services.AddHttpContextAccessor();
         builder.Services.AddSingleton(sp => new CallerAssertionGate(
             options, sp.GetService<TimeProvider>() ?? TimeProvider.System, sp.GetRequiredService<ILoggerFactory>()));
+        // SVC-4: the current request's verified caller, for the service-side list_repositories tool.
+        builder.Services.AddSingleton(sp => new CallerContext(
+            CallerAssertionGate.CallerPrincipalAccessor(sp.GetRequiredService<IHttpContextAccessor>())));
         builder.Services.AddSingleton(sp =>
         {
             var http = sp.GetRequiredService<IHttpContextAccessor>();
             var gate = sp.GetRequiredService<CallerAssertionGate>();
+            var repositoryUrls = RepositoryUrlResolver(options.CatalogDbPath);
             IReadAuthorizer authorizer = options.ReadPolicy.Enabled
                 ? new PolicyReadAuthorizer(
                     options.ReadPolicy,
                     PrincipalTokenAccessor(http),
-                    RepositoryUrlResolver(options.CatalogDbPath))
+                    repositoryUrls)
                 : AllowAllReadAuthorizer.Instance;
-            // SVC-3: a delegate-token read is decided per caller. Until grants exist it is denied outright, so a
-            // delegate token opens nothing; every other request keeps the authorizer above.
+            // SVC-3/SVC-4: a delegate-token read is decided per verified caller by its grants (a request with no
+            // caller sees nothing), so a delegate token opens nothing on its own; every other request keeps the
+            // authorizer above.
             if (gate.DelegateTokensConfigured)
-                authorizer = new CallerReadAuthorizer(authorizer, DenyAllReadAuthorizer.Instance, gate.DelegateRequestAccessor(http));
+                authorizer = new CallerReadAuthorizer(
+                    authorizer,
+                    new GrantReadAuthorizer(CallerVisibility.Accessor(http, service), repositoryUrls),
+                    gate.DelegateRequestAccessor(http));
 
             // The request names the repository it reads via the X-Sextant-Repository header or, per call, the
             // reserved `repository`/`branch` tool arguments (SVC-2, ToolSelectionFilters), and the read planner
@@ -83,7 +92,7 @@ public static class ServiceApp
             // RequireRepositorySelection says it must name one.
             return new DatabaseProvider(options.CatalogDbPath, authorizer)
             {
-                RequestedRepository = RequestedRepositoryAccessor(http),
+                RequestedRepository = RequestedRepositoryAccessor(http, service),
                 RequestedBranch = RequestedBranchAccessor(http),
                 RequireRepositorySelection = RepositorySelectionRequirement(options, CallerAssertionGate.CallerPrincipalAccessor(http))
             };
@@ -131,8 +140,9 @@ public static class ServiceApp
     }
 
     /// <summary>
-    /// The vetted tool types exposed over the remote HTTP MCP surface. Every one takes a
-    /// <see cref="DatabaseProvider"/> and enters through <c>TryBeginRead</c> (fail-closed authz + scope).
+    /// The vetted tool types exposed over the remote HTTP MCP surface. Every index-query tool takes a
+    /// <see cref="DatabaseProvider"/> and enters through <c>TryBeginRead</c> (fail-closed authz + scope); the one
+    /// exception, <see cref="ListRepositoriesTool"/>, reads no index and lists only the verified caller's grants.
     /// Local-only tools that bypass or out-scope that gate are deliberately EXCLUDED so they are never
     /// reachable by a remote principal: <c>get_source_context</c> (reads an arbitrary absolute path),
     /// <c>get_daemon_status</c> (probes a local daemon), and <c>get_base_snapshot_symbols</c> — the last
@@ -151,7 +161,10 @@ public static class ServiceApp
         typeof(GetImpactTool), typeof(GetImplementorsTool), typeof(GetIndexStatusTool),
         typeof(GetNamespaceTreeTool), typeof(GetProjectDependenciesTool), typeof(GetTypeDependentsTool),
         typeof(GetTypeHierarchyTool), typeof(GetTypeMembersTool), typeof(SemanticSearchTool),
-        typeof(TraceValueTool), typeof(ResearchCodebaseTool)
+        typeof(TraceValueTool), typeof(ResearchCodebaseTool),
+        // SVC-4: a service-only tool over the caller's grants (no index read, so no TryBeginRead gate); it answers
+        // only a verified caller and lists only the repositories that caller may read.
+        typeof(ListRepositoriesTool)
     ];
 
     /// <summary>
@@ -282,11 +295,20 @@ public static class ServiceApp
                     return Results.Json(new { status = "rejected", reason = decision.Reason }, ServiceJson.Options,
                         statusCode: StatusCodes.Status400BadRequest);
                 }
+                // SVC-4: a user caller may only ensure a repository it can read (a grant of its own or its
+                // tenant's). An application caller (a trigger) and an assertion-less control call are unchanged.
+                if (CallerRequest.Get(req.HttpContext)?.Principal is { Actor: CallerActor.User } user
+                    && !service.IsRepositoryVisible(user, request.RepositoryRemoteUrl))
+                {
+                    await service.RecordEnsureNotGrantedAsync(RepositoryGrantKey.Of(request.RepositoryRemoteUrl), AuditActor(req), ct);
+                    return Results.Json(new { status = "rejected", reason = GrantReason.NotGranted }, ServiceJson.Options,
+                        statusCode: StatusCodes.Status403Forbidden);
+                }
                 // SVC-6/7: malformed branch guards (both expected_head_commit and branch_head_sequence, or an
                 // unknown branch_update) are refused before any job row exists, audited like the URL policy.
                 if (request.BranchGuardProblem() is { } guardProblem)
                 {
-                    await service.RecordEnsureDeniedAsync(guardProblem, ExtractBearer(req), ct);
+                    await service.RecordEnsureDeniedAsync(guardProblem, AuditActor(req), ct);
                     return Results.Json(new { status = "rejected", reason = guardProblem }, ServiceJson.Options,
                         statusCode: StatusCodes.Status400BadRequest);
                 }
@@ -294,11 +316,12 @@ public static class ServiceApp
                     ? await service.BeginEnsureSnapshotAsync(request, AuditActor(req), ct)
                     : await service.EnsureSnapshotAsync(request, ct, AuditActor(req));
             }
-            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            catch (Exception ex) when ((ex is OperationCanceledException && !ct.IsCancellationRequested) || ex is GrantStoreUnavailableException)
             {
                 // The ensure was stopped by the SERVICE, not this caller: it is shutting down (or its worker
-                // cancelled itself). Claim nothing about the job — it may have been requeued, never
-                // registered, or already settled — the retried ensure reports (and re-attaches to) its real state.
+                // cancelled itself), or a not_granted refusal could not be recorded. Claim nothing about the job —
+                // it may have been requeued, never registered, or already settled — the retried ensure reports
+                // (and re-attaches to) its real state.
                 return Results.Json(
                     new { status = "unavailable", reason = "the index service stopped this ensure before it completed (e.g. it is shutting down); retry the ensure" },
                     ServiceJson.Options, statusCode: StatusCodes.Status503ServiceUnavailable);
@@ -315,15 +338,26 @@ public static class ServiceApp
         });
 
         // Status/resolve read an independent WAL read connection (issue #148), so they answer promptly while a
-        // worker holds the single writer for a long index.
-        control.MapGet("/status/{jobId:long}", (long jobId, SnapshotService service) =>
+        // worker holds the single writer for a long index. SVC-4: a user caller sees only a job on a repository it
+        // can read; any other job is the same 404 as an unknown id.
+        control.MapGet("/status/{jobId:long}", (long jobId, HttpRequest req, SnapshotService service) =>
         {
             var status = service.GetStatus(jobId);
+            if (status is not null
+                && CallerRequest.Get(req.HttpContext)?.Principal is { Actor: CallerActor.User } user
+                && !service.IsRepositoryVisible(user, status.Job.RepositoryUrl))
+                status = null;
             return status is null ? Results.NotFound() : Results.Json(status, ServiceJson.Options);
         });
 
-        control.MapGet("/resolve", (string repository, string? branch, SnapshotService service) =>
+        // SVC-4: a user caller resolves only a repository it can read. The grant is checked BEFORE the branch is
+        // resolved, so an ungranted repository is the same bare 404 as an absent one (no existence oracle).
+        control.MapGet("/resolve", (string repository, string? branch, HttpRequest req, SnapshotService service) =>
         {
+            if (CallerRequest.Get(req.HttpContext)?.Principal is { Actor: CallerActor.User } user
+                && !service.IsRepositoryVisible(user, repository))
+                return Results.NotFound();
+
             var head = service.ResolveBranchHead(repository, branch);
             if (head is null)
                 return Results.NotFound();
@@ -371,6 +405,9 @@ public static class ServiceApp
             var report = await service.RunRetentionAsync(execute ?? false, AuditActor(req), ct);
             return Results.Json(report, ServiceJson.Options);
         });
+
+        // SVC-4: repository grants (per-caller visibility and reconcile targets).
+        GrantEndpoints.Map(control);
 
         // Observability surface (criterion 5). These live under /control so they inherit the CONTROL-token
         // gate — they are OPERATOR-ONLY and must NEVER be reachable by a query-plane tenant, because they
@@ -465,11 +502,11 @@ public static class ServiceApp
 
     /// <summary>
     /// The principal an audited control call is attributed to (SVC-3): the verified caller
-    /// (<see cref="CallerPrincipal.AuditPrincipal"/>) when the call carried a caller assertion, else its bearer.
-    /// The service hashes it before it is stored.
+    /// (<see cref="CallerPrincipal.AuditPrincipal"/>, plus its attribution suffix, SVC-4) when the call carried a
+    /// caller assertion, else its bearer. The service hashes the principal before it is stored.
     /// </summary>
-    private static string? AuditActor(HttpRequest req) =>
-        CallerRequest.Get(req.HttpContext)?.Principal?.AuditPrincipal ?? ExtractBearer(req);
+    internal static AuditCaller AuditActor(HttpRequest req) =>
+        CallerRequest.Get(req.HttpContext)?.Principal is { } caller ? AuditCaller.ForCaller(caller) : ExtractBearer(req);
 
     private static void MapQuery(WebApplication app, ServiceOptions options)
     {
@@ -623,16 +660,21 @@ public static class ServiceApp
     /// <c>repository_required</c> when <see cref="RepositorySelectionRequirement"/> demands a selection).
     /// The selector only NAMES the repository — under a read policy, authorization is still enforced by
     /// <see cref="PolicyReadAuthorizer"/> against the principal's token, so a caller cannot read another
-    /// tenant merely by naming it.
+    /// tenant merely by naming it. SVC-4 implicit selection: a delegate caller's read that names neither a
+    /// repository nor a branch reads the caller's ONE visible repository with a complete default-branch snapshot
+    /// (<see cref="CallerVisibility.ImplicitRepository"/>); with none or several it stays unselected, so the read
+    /// fails with <c>repository_required</c>.
     /// </summary>
-    private static Func<string?> RequestedRepositoryAccessor(IHttpContextAccessor accessor) =>
+    private static Func<string?> RequestedRepositoryAccessor(IHttpContextAccessor accessor, SnapshotService service) =>
         () =>
         {
             if (accessor.HttpContext is not { } ctx)
                 return null;
-            if (ToolCallSelection.Get(ctx) is { } selection)
-                return selection.Repository;
-            return RepositoryHeaderValue(ctx);
+            var selection = ToolCallSelection.Get(ctx);
+            var named = selection is not null ? selection.Repository : RepositoryHeaderValue(ctx);
+            if (named is not null || selection?.Branch is not null)
+                return named;
+            return CallerVisibility.ImplicitRepository(ctx, service);
         };
 
     /// <summary>

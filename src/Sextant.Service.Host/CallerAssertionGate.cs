@@ -279,28 +279,11 @@ internal sealed partial class CallerAssertionGate
 }
 
 /// <summary>
-/// SVC-3 interim: the delegate-read authorizer until per-caller visibility (grants) exists. It denies every read,
-/// so a delegate token opens nothing on its own. Enforcing, so every denial collapses to the uniform not-found.
-/// </summary>
-internal sealed class DenyAllReadAuthorizer : IReadAuthorizer
-{
-    public static readonly DenyAllReadAuthorizer Instance = new();
-
-    private static readonly ReadAuthorization Denied =
-        ReadAuthorization.Deny("The current principal is not authorized to read the requested index.");
-
-    public bool IsEnforcing => true;
-
-    public ReadAuthorization Authorize(SnapshotRow? selected) => Denied;
-
-    public ReadAuthorization AuthorizeRepository(long repositoryId, string remoteUrl) => Denied;
-}
-
-/// <summary>
 /// Routes each read to the authorizer for its kind of caller (SVC-3): a delegate request to
-/// <paramref name="delegateReads"/>, any other request to <paramref name="legacy"/> (the read policy or the
-/// permissive default, unchanged). Delegate requests are always enforcing, so their denials are uniform. Only
-/// installed when delegate tokens are configured, so a deployment without them keeps its authorizer as is.
+/// <paramref name="delegateReads"/> (SVC-4: the caller's grants, <see cref="Sextant.Service.Grants.GrantReadAuthorizer"/>),
+/// any other request to <paramref name="legacy"/> (the read policy or the permissive default, unchanged). Delegate
+/// requests are always enforcing, so their denials are uniform. Only installed when delegate tokens are configured,
+/// so a deployment without them keeps its authorizer as is.
 /// </summary>
 internal sealed class CallerReadAuthorizer(IReadAuthorizer legacy, IReadAuthorizer delegateReads, Func<bool> isDelegateRequest)
     : IReadAuthorizer

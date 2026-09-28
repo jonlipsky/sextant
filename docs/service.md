@@ -69,6 +69,8 @@ of the box.
 | `SEXTANT_SERVICE_CALLER_HEADER` | The request header that carries the caller assertion | `X-ProcessStack-Caller` |
 | `SEXTANT_SERVICE_CALLER_IDPS` | Comma-separated identity providers whose users may act as `act=user` callers (`[a-z0-9-]{1,32}` each) | `processstack` |
 | `SEXTANT_SERVICE_CALLER_APPS` | Optional comma-separated allow-list on the signed `app` claim | none (any app) |
+| `SEXTANT_SERVICE_MAX_GRANTS_PER_PRINCIPAL` | Most repository grants one user caller may hold in a tenant (see [Repository grants](#repository-grants-and-visibility-svc-4)); creating one more is `409 grant_limit`. The tenant-wide `'*'` grants are not counted. A missing or non-positive value uses the default | `200` |
+| `SEXTANT_SERVICE_MAX_GRANTS_PER_TENANT` | Most repository grant rows a tenant may hold, tenant-wide grants included; creating one more is `409 grant_limit` | `5000` |
 | `SEXTANT_SERVICE_BIND_ADDRESS` | Network interface the HTTP surface binds to | `localhost` |
 | `SEXTANT_SERVICE_CONTROL_PORT` | HTTP port | `3011` |
 | `SEXTANT_SERVICE_QUERY_PORT` | Optional dedicated query port (shares the control port when unset) | none (shared) |
@@ -638,12 +640,15 @@ The host deliberately **separates control endpoints from query endpoints**, and 
 | --- | --- | --- | --- |
 | `GET /health` | — | open | Service **AVAILABILITY**: the process is up and the catalog is reachable. |
 | `GET /ready` | — | open | Worker **CAPACITY**: `503` when this node has no worker (query-only), so an operator can tell "up" from "can index". |
-| `POST /control/ensure` | control | control token | Idempotent ensure-snapshot (criterion 1). Accepts an optional monotonic `branch_head_sequence` for forward-only branch-head advance (Phase 14, issue #84), **or** an `expected_head_commit` head CAS, plus `forced` and `branch_update` (see [Branch-pointer guards](#branch-pointer-guards-head-cas-branch_update-none-retire-svc-67)); the result carries `branch_advanced`. Blocks until terminal (`200`; `202` when transient-requeued) unless `?wait=false`, which returns `202` at once with the job to poll (issue #148). A caller disconnect/timeout **never** cancels production. A repository URL the [repository URL policy](#repository-url-policy-svc-5) refuses, both branch guards together (`conflicting_branch_guards`) or an unknown `branch_update` (`invalid_branch_update`) is `400 {"status":"rejected","reason":"<code>"}` before any job exists (audited `ensure`/`denied`). |
+| `POST /control/ensure` | control | control token | Idempotent ensure-snapshot (criterion 1). Accepts an optional monotonic `branch_head_sequence` for forward-only branch-head advance (Phase 14, issue #84), **or** an `expected_head_commit` head CAS, plus `forced` and `branch_update` (see [Branch-pointer guards](#branch-pointer-guards-head-cas-branch_update-none-retire-svc-67)); the result carries `branch_advanced`. Blocks until terminal (`200`; `202` when transient-requeued) unless `?wait=false`, which returns `202` at once with the job to poll (issue #148). A caller disconnect/timeout **never** cancels production. A repository URL the [repository URL policy](#repository-url-policy-svc-5) refuses, both branch guards together (`conflicting_branch_guards`) or an unknown `branch_update` (`invalid_branch_update`) is `400 {"status":"rejected","reason":"<code>"}` before any job exists (audited `ensure`/`denied`). A user caller (`act=user` assertion) may ensure only a repository it can read: otherwise `403 {"status":"rejected","reason":"not_granted"}` (SVC-4). |
 | `POST /control/contribute` | control | control **or** contribute token | Ingest a client/CI semantic contribution (Phase 16); the least-privilege contribute token authorizes this endpoint only. |
-| `GET /control/status/{jobId}` | control | control token | Job status + per-project diagnostics (criterion 5) + checkout `coverage` (#119). |
-| `GET /control/resolve` | control | control token | Resolve a repository branch (`?branch=`, else the default) to its current published snapshot (+ its `coverage`, #119), plus `commit_sha`, the resolved `branch` name, `is_default` and `head_sequence` (SVC-7; a null `commit_sha`/`head_sequence` is omitted). |
+| `GET /control/status/{jobId}` | control | control token | Job status + per-project diagnostics (criterion 5) + checkout `coverage` (#119). For a user caller, a job on a repository it cannot read is the same `404` as an unknown id (SVC-4). |
+| `GET /control/resolve` | control | control token | Resolve a repository branch (`?branch=`, else the default) to its current published snapshot (+ its `coverage`, #119), plus `commit_sha`, the resolved `branch` name, `is_default` and `head_sequence` (SVC-7; a null `commit_sha`/`head_sequence` is omitted). For a user caller, a repository it cannot read is the same bare `404` as an absent one (SVC-4). |
 | `POST /control/branches/retire` | control | control token | Delete a branch pointer (`{repository, branch, expected_head_commit?}`, SVC-6); its snapshots stay for retention. `200 {"retired":true}`, or `{"retired":false}` for a missing branch (idempotent). The default branch or a head-CAS mismatch is `409 {"status":"rejected","reason":"default_branch"\|"head_mismatch"}`; a refused URL or blank branch is `400`. Audited `retire`. |
 | `POST /control/retention` | control | control token | Run the service-owned retention/GC pass (`?execute=true` to apply). |
+| `PUT`/`DELETE`/`GET /control/grants/self` | control | control token + `act=user` assertion | The caller's own repository grants (see [Repository grants](#repository-grants-and-visibility-svc-4)). |
+| `PUT`/`DELETE /control/grants/tenant` | control | control token + `act=application` assertion | The tenant-wide repository grants. |
+| `GET /control/grants?scope=tenant` | control | control token + `act=application` assertion | The tenant's distinct reconcile targets, with counts and no user ids. |
 | `GET /control/metrics` | control | control token | Observability snapshot (criterion 5); `?format=prometheus` for text exposition, else JSON. |
 | `GET /control/audit` | control | control token | Durable audit log (criterion 5); optional `action`/`repository`/`limit` filters. **Operator-only.** |
 | `GET /control/pilot` | control | control token | Pilot-readiness gate (criterion 7); `?workload=trusted\|untrusted&hard_isolation=&recent_backup=`. |
@@ -686,7 +691,8 @@ per call through two reserved arguments. The service adds them in MCP request fi
 `/mcp` (`ToolSelectionFilters`); the tools themselves are unchanged.
 
 - **`tools/list`** advertises two optional string arguments, `repository` and `branch`, on every
-  repository-scoped remote tool (today every tool on the remote allowlist). A tool that already declares an
+  repository-scoped remote tool (every tool on the remote allowlist except `list_repositories`, which reads no
+  index). A tool that already declares an
   argument of the same name keeps its own: `find_cross_repository_usages` and `find_submodule_consumers`
   keep their consumer-filter `branch`, so they get only `repository`.
 - **`tools/call`** removes the reserved arguments before the tool binds its own, so a tool never sees them.
@@ -756,13 +762,83 @@ With no `CALLER_KEYS`, an assertion on `/control/*` is `assertion_not_allowed`. 
 the assertion, another claim or a token.
 
 **What a caller may read.** A verified caller must name its repository (as if
-`REQUIRE_REPOSITORY_SELECTION` were on for that request). Per-caller grants are not implemented yet, so
-**every delegate read is denied** with the uniform not-found, and a delegate snapshot-page request is the
-uniform `404`. A delegate token therefore opens nothing on its own. A request without a delegate token is
-unchanged.
+`REQUIRE_REPOSITORY_SELECTION` were on for that request), unless implicit selection picks it (below). A
+delegate read is decided by the caller's [repository grants](#repository-grants-and-visibility-svc-4): a
+repository the caller holds no grant for gets the uniform not-found, and a delegate snapshot-page request for
+it is the uniform `404`. A delegate token therefore opens nothing on its own. A request without a delegate
+token is unchanged.
 
 **Audit.** A control call that carries a verified assertion is audited as `HashActor("{tid}/{sub}")` for a
-user caller or `HashActor("{tid}/app:{app}")` for an application caller, instead of its bearer.
+user caller or `HashActor("{tid}/app:{app}")` for an application caller, instead of its bearer. Its audit
+detail gains the suffix `;idp=…;kid=…;via=…;cid=…;dep=…;jti=…` (SVC-4). Each value is written only when it is
+at most 64 characters of `[A-Za-z0-9._:-]`, else as `-`; an application caller has `idp=-`, and an assertion
+without `dep` has `dep=-`.
+
+### Repository grants and visibility (SVC-4)
+
+A **grant** makes a repository visible to a caller. Grants live in the catalog (`repository_grants`,
+migration `024`), keyed by `(tenant, principal, repository, branch)`:
+
+- **Principal:** the full, exact `sub` of an `act=user` caller, or `'*'` for a tenant-wide grant. The
+  principal and tenant come **only** from the verified assertion. A body or query that names one (`tenant_id`,
+  `tid`, `principal`, `sub`, `user`, `user_id`, …) is refused with `400 principal_in_body`.
+- **Repository:** the canonical `https://{host}/{owner}/{repo}` key, with the first-submitted spelling kept
+  for reconcile.
+- **Branch:** `''` for the repository's default branch.
+
+**Visibility is repository-level.** A user caller sees a repository when it holds a grant of its own on it
+or its tenant holds a `'*'` grant. An application caller sees only the tenant's `'*'` grants. Every indexed
+branch of a visible repository is readable; the grant's branch only drives indexing and reconcile. The same
+`sub` under another tenant's key sees nothing. Visibility is read once per HTTP request and never cached
+across requests, so a revocation takes effect on the next call. Once a request has a verified caller:
+
+- **Reads:** a delegate read of a repository the caller cannot see is indistinguishable from a repository that
+  does not exist.
+- **Cross-repository tools** list only consumer repositories the caller can see.
+- **Implicit selection:** a delegate read that names neither a repository nor a branch reads the caller's
+  **one** visible repository with a complete default-branch snapshot. With none or several, it fails with
+  `repository_required`.
+- **`/control/ensure`** by a user caller needs the repository to be visible, otherwise `403 not_granted`
+  (audited `ensure`/`denied`). An application caller (a trigger) and an assertion-less call are unchanged.
+- **`/control/status/{jobId}`** by a user caller is `404` for a job on a repository it cannot see.
+- **`/control/resolve`** by a user caller is the same bare `404` as an absent repository when it cannot see
+  the repository (checked before the branch is resolved). An application caller and an assertion-less call
+  are unchanged.
+- **Failures fail closed:** if the grant catalog cannot be read, the read fails (a tool error or a `5xx`)
+  rather than reading as allowed. A grant write, or a user's `not_granted` ensure refusal, that cannot be
+  recorded (the service lost its writer lease or is stopping) is `503 unavailable` and writes nothing.
+
+**Routes.** Every route needs the control token **and** a verified assertion with the stated `act`.
+
+| Route | `act` | Request | Response |
+| --- | --- | --- | --- |
+| `PUT /control/grants/self` | user | `{repository, branch?}` | `200 {grant:{repository, branch, source, created_at}, created}` |
+| `DELETE /control/grants/self?repository=&branch=` | user | `branch` omitted = the default-branch grant; `branch=*` = every branch | `200 {deleted: n}` |
+| `GET /control/grants/self` | user | — | `{grants:[{repository, branch, source, created_at, status}], result_count}` |
+| `PUT /control/grants/tenant` | application | `{repository, branch?}` | As for self, principal `'*'` |
+| `DELETE /control/grants/tenant?repository=&branch=` | application | As for self | `200 {deleted: n}` |
+| `GET /control/grants?scope=tenant` | application | — | `{targets:[{repository, branch, sources, watchers}], result_count}`: the distinct targets to keep indexed, with counts and **no user ids** |
+
+- **`status`** is `{resolved_branch?, snapshot_status, commit_sha?, published_at?, identity_hash?}`.
+  `snapshot_status` is `complete`, `partial`, `pending` (an ensure is queued or running) or `missing`.
+- **Re-PUT:** re-PUT of an existing grant returns `created: false` and keeps its first spelling and source.
+
+**Refusals:**
+- **401:** no verified caller is `401 {"error":"caller_required"}`.
+- **403, wrong actor:** `403 {"status":"rejected","reason":"wrong_actor"}`.
+- **403, `sub` of `*`:** a user whose `sub` is `*` gets `403 {"error":"caller_not_allowed"}`.
+- **400, malformed request:** `invalid_body` (not a JSON object of at most 16 KiB with a string `repository`, or a repeated DELETE parameter), `branch_not_allowed`, `invalid_scope`, or a [URL policy](#repository-url-policy-svc-5) code. A DELETE is accepted for a host or owner no longer on the allow-list, so an old grant can always be revoked.
+- **409, limit:** `409 grant_limit` at `MAX_GRANTS_PER_PRINCIPAL` or `MAX_GRANTS_PER_TENANT`.
+- **503:** returned when the service cannot record the write (lost writer lease, shutdown).
+
+Every PUT and DELETE, accepted or refused, is audited as action `grant` with a detail like
+`put_self;created` or `delete_tenant;deleted_2`; the `GET` routes are not audited.
+
+**`list_repositories`** is an MCP tool on the service `/mcp` only. For the verified caller it returns
+`{repositories:[{repository, sources, branches:[{branch, is_default, status, commit_sha?, published_at?}]}], meta}`:
+every visible repository, with its catalog branches plus any granted branch not indexed yet. It takes no
+arguments and is exempt from the reserved `repository`/`branch` arguments. A request with no verified caller
+gets the tool error `caller_required`.
 
 ## The `SnapshotService` data plane
 
@@ -1202,9 +1278,10 @@ slice-1/2 additions; `020_audit_log.sql` adds the durable operational + security
 slice 3, criterion 5); `021_branch_head_sequence.sql` adds `branches.head_sequence` for the forward-only
 branch-head advance on the ensure path (Phase 14, issue #84); `022_snapshot_coverage.sql` adds the durable
 per-snapshot `snapshot_coverage` record (issue #119); `023_partial_occurrence_source_index.sql` rebuilds
-`ix_occ_source` as a partial index over call edges only (issue #160). All are additive/forward-only. See
+`ix_occ_source` as a partial index over call edges only (issue #160); `024_repository_grants.sql` adds the
+`repository_grants` table behind per-caller visibility (SVC-4). All are additive/forward-only. See
 [`schema.md`](schema.md) for the table definitions. `LatestSchemaVersion` auto-derives from the highest
-migration and is **23**.
+migration and is **24**.
 
 ## Testing
 

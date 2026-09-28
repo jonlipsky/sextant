@@ -90,10 +90,12 @@ internal static class ToolSelectionFilters
 
     /// <summary>
     /// Tools on the remote surface that are NOT repository-scoped: they declare their own selection arguments,
-    /// so the reserved arguments are neither advertised nor stripped for them. Empty today; a tool that spans
-    /// repositories by design (for example a repository listing or a federated search) belongs here.
+    /// so the reserved arguments are neither advertised nor stripped for them. A tool that spans repositories by
+    /// design belongs here: <c>list_repositories</c> (SVC-4) reads the caller's grants, not one index (a federated
+    /// search joins it later).
     /// </summary>
-    internal static readonly IReadOnlySet<string> SelectionExemptTools = new HashSet<string>(StringComparer.Ordinal);
+    internal static readonly IReadOnlySet<string> SelectionExemptTools =
+        new HashSet<string>(StringComparer.Ordinal) { "list_repositories" };
 
     /// <summary>
     /// Cross-repository tools whose read gate otherwise names no repository. When the call must select one
