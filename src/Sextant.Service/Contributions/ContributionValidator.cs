@@ -31,7 +31,7 @@ public sealed class ContributionValidator(
     /// <summary>Validator wired with the running service's own schema/analyzer versions.</summary>
     public static ContributionValidator ForService(
         ContributionPolicy policy, IGitContentProvider gitContent, IContributionAuthorizer authorizer) =>
-        new(IndexDatabase.LatestSchemaVersion, IndexConfigurationHash.AnalyzerVersion, policy, gitContent, authorizer);
+        new(IndexDatabase.SnapshotSchemaVersion, IndexConfigurationHash.AnalyzerVersion, policy, gitContent, authorizer);
 
     /// <summary>
     /// Validates a contribution against the payload catalog (opened read-only) and the caller's auth token.

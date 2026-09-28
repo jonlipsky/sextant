@@ -288,7 +288,7 @@ public class OrchestratorProviderCoverageTests
         {
             RepositoryRemoteUrl = ProviderRemote,
             CommitSha = ProviderCommit,
-            SchemaVersion = IndexDatabase.LatestSchemaVersion,
+            SchemaVersion = IndexDatabase.SnapshotSchemaVersion,
             AnalyzerVersion = "test",
             ToolchainFingerprint = "test"
         };

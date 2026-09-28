@@ -93,7 +93,7 @@ internal static class ContributionTestFixtures
             RepositoryRemoteUrl = repository,
             CommitSha = commit,
             TreeSha = "tree-" + commit,
-            SchemaVersion = IndexDatabase.LatestSchemaVersion,
+            SchemaVersion = IndexDatabase.SnapshotSchemaVersion,
             AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
             ConfigHash = null,
             ToolchainFingerprint = ToolchainFingerprint.Current,

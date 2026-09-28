@@ -504,7 +504,7 @@ public class GrantServiceTests
         Id = 1,
         IdentityHash = "hash",
         RepositoryId = repositoryId,
-        SchemaVersion = IndexDatabase.LatestSchemaVersion,
+        SchemaVersion = IndexDatabase.SnapshotSchemaVersion,
         AnalyzerVersion = "test",
         Status = SnapshotStatus.Complete,
         CreatedAt = 1
