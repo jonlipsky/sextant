@@ -13,7 +13,6 @@ apps/processstack/
     orchestrations/                              the chat entry point and the per-repository watch/unwatch
     processes/                                   ensure, the MCP processes, the v1 memory dual-write
     tests/*.scenario.yaml                        `processstack app test` scenarios
-    tests-pending-cli-1.1.1/                     scenarios that need CLI 1.1.1 (see its README)
     Sextant.ProcessStack.slnx                    the app's own solution (NOT part of Sextant.slnx)
     Directory.Build.props                        moves bin/ and obj/ out to apps/processstack/artifacts/
     build.sh / build.ps1                         publish the activities bundle to activities/sextant/
@@ -96,7 +95,7 @@ publishing, validating or running scenarios. That covers a secret that is not co
 request from a fork.
 
 After publishing the bundle, the job installs the `processstack` CLI (`ProcessStack.Cli`, pinned to
-1.1.0) from the same feed and runs `processstack app validate` and `processstack app test` on
+1.1.1) from the same feed and runs `processstack app validate` and `processstack app test` on
 `apps/processstack/sextant`.
 
 ## Validating and testing the app
@@ -106,7 +105,7 @@ directory's `nuget.config`. It maps `ProcessStack.Cli` to the private feed. Then
 (`app validate` and `app test` load it from `activities/sextant/`) and run:
 
 ```bash
-cd apps/processstack && dotnet tool install -g ProcessStack.Cli --version 1.1.0 && cd ../..
+cd apps/processstack && dotnet tool install -g ProcessStack.Cli --version 1.1.1 && cd ../..
 bash apps/processstack/sextant/build.sh
 processstack app validate -p apps/processstack/sextant
 processstack app test -p apps/processstack/sextant --all      # or -s <scenario name>
@@ -114,4 +113,10 @@ processstack app test -p apps/processstack/sextant --all      # or -s <scenario 
 
 The scenarios run offline. They stub the Sextant control plane with `http:` stubs on connection
 `sextant-control`, seed user memory, and assert the requests the flows send, including the
-`act=user` caller claims. The scenarios that call GitHub wait in `tests-pending-cli-1.1.1/`.
+`act=user` caller claims. The GitHub activities (`GitHubGetRepository`, `GitHubListBranches`) run for
+real against `http:` stubs on connection `github`, with GitHub REST paths (`/repos/{owner}/{repo}`,
+`/repos/{owner}/{repo}/branches`) and response shapes. An error status raises Octokit's own exception
+(404 `NotFoundException`, 403 `ForbiddenException`, 5xx `ApiException`), which the flows route on.
+A bare `connection: github` criterion (one with no `path`) in `expected.httpCalls` also matches the
+`sextant-control` requests, because only GitHub requests carry a bound connection id and the GitHub
+connection has no base URL. Scope a GitHub assertion by path (`/repos/**`).

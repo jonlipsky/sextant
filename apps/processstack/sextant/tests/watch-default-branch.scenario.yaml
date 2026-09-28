@@ -54,6 +54,13 @@ expected:
     verb: watch
     agentResponse: "Now watching octocat/hello-world on main (the default branch)."
   httpCalls:
+    - connection: github
+      method: GET
+      path: /repos/octocat/hello-world
+      count: 1
+    - connection: github
+      path: /repos/octocat/hello-world/branches
+      count: 0
     - connection: sextant-control
       method: PUT
       path: /control/grants/self

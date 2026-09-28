@@ -43,7 +43,14 @@ expected:
   variables:
     outcome: ok
     jobId: "42"
+    advanceRequested: true
+    # A queued job has made no branch decision yet (no branch_advanced), so nothing is said about the branch.
+    message: "Indexing job 42 is queued."
   httpCalls:
+    - connection: github
+      method: GET
+      path: /repos/octocat/hello-world/branches
+      count: 1
     - connection: sextant-control
       method: POST
       path: /control/ensure

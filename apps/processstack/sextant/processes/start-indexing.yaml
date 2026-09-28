@@ -6,8 +6,10 @@ description: >
 
   With a branch name, the commit advances that branch only when it is the branch's current head on the
   workspace's GitHub connection, and only through the compare-and-swap guard (expected_head_commit is the
-  head the service holds now). Any other commit is indexed with branch_update "none", so a historical
-  commit never moves a branch backwards. Without a branch name nothing moves.
+  head the service holds). The service's head is read BEFORE GitHub's, so a push the service processes in
+  between fails the compare-and-swap instead of being rolled back. Any other commit is indexed with
+  branch_update "none", so a historical commit never moves a branch backwards. Without a branch name
+  nothing moves.
 
 inputs:
   - name: repositoryRemoteUrl
@@ -72,6 +74,12 @@ variables:
   - name: ensureStatus
     type: int
     default: 0
+  - name: advanceRequested
+    type: bool
+    default: false
+  - name: ensurePublished
+    type: bool
+    default: false
 
 outputs:
   - name: jobId
@@ -140,8 +148,45 @@ nodes:
     type: decision
     next:
       - when: "branch != '' && host == 'github.com'"
-        next: list-branches
+        next: resolve
       - else: ensure-none
+
+  # The head the service holds for the branch becomes the compare-and-swap value. It is read before
+  # GitHub's head: the guard only rejects pushes the service processes after this read, so with GitHub's
+  # listing first, a push processed in between would pass it and be rolled back to the listed head.
+  - id: resolve
+    name: GET /control/resolve
+    type: activity:HttpRequest
+    inputs:
+      connectionId: sextant-control
+      method: GET
+      url: /control/resolve
+      query:
+        repository: "= remoteUrl"
+        branch: "= branch"
+      failOnErrorStatus: false
+    outputs:
+      statusCode: resolveStatus
+      json: resolveJson
+    next: route-resolve
+
+  # 404: the service holds no head for the branch yet, so the compare-and-swap expects none ("").
+  - id: route-resolve
+    type: decision
+    next:
+      - when: "resolveStatus == 200"
+        next: expect-resolved
+      - when: "resolveStatus == 404"
+        next: list-branches
+      - else: refuse-resolve
+
+  - id: expect-resolved
+    type: activity:SetVariable
+    inputs:
+      value: "= resolveJson != null && resolveJson.commit_sha != null ? String(resolveJson.commit_sha) : ''"
+    outputs:
+      result: expectedHead
+    next: list-branches
 
   - id: list-branches
     name: Read the branch heads
@@ -171,41 +216,15 @@ nodes:
     type: decision
     next:
       - when: "isHead"
-        next: resolve
+        next: mark-advance
       - else: ensure-none
 
-  # The head the service holds for the branch now becomes the compare-and-swap value.
-  - id: resolve
-    name: GET /control/resolve
-    type: activity:HttpRequest
-    inputs:
-      connectionId: sextant-control
-      method: GET
-      url: /control/resolve
-      query:
-        repository: "= remoteUrl"
-        branch: "= branch"
-      failOnErrorStatus: false
-    outputs:
-      statusCode: resolveStatus
-      json: resolveJson
-    next: route-resolve
-
-  - id: route-resolve
-    type: decision
-    next:
-      - when: "resolveStatus == 200"
-        next: expect-resolved
-      - when: "resolveStatus == 404"
-        next: ensure-advance
-      - else: refuse-resolve
-
-  - id: expect-resolved
+  - id: mark-advance
     type: activity:SetVariable
     inputs:
-      value: "= resolveJson != null && resolveJson.commit_sha != null ? String(resolveJson.commit_sha) : ''"
+      value: "= true"
     outputs:
-      result: expectedHead
+      result: advanceRequested
     next: ensure-advance
 
   - id: ensure-advance
@@ -225,6 +244,7 @@ nodes:
       jobId: jobId
       identityHash: identityHash
       jobStatus: indexingState
+      published: ensurePublished
       snapshotId: snapshotId
       attached: attached
       branchAdvanced: branchAdvanced
@@ -260,6 +280,13 @@ nodes:
           case 'ok':
           case 'attached':
             text = 'Indexing job ' + jobId + ' is ' + indexingState + '.';
+            // A compare-and-swap that no longer matches is not an error: the ensure attaches and reports
+            // branch_advanced false (the pointer is already there, or a newer head won meanwhile). Only a
+            // published result carries that decision; a queued or running job moves the branch when it
+            // publishes, if the guard still holds then.
+            if (advanceRequested && ensurePublished && branchAdvanced === false) {
+              text += ' The ' + branch + ' branch was not moved to it: it already points there, or its head changed meanwhile.';
+            }
             break;
           case 'not_granted':
             text = 'Watch the repository first (for example, "watch owner/repo" in the Sextant chat), then try again.';
@@ -303,8 +330,11 @@ nodes:
     inputs:
       script: |
         var unauthorized = resolveStatus == 401 || resolveStatus == 403;
-        context.setVariable('outcome', unauthorized ? 'unauthorized' : 'unavailable');
-        context.setVariable('reason', 'http_' + resolveStatus);
+        var rejected = resolveStatus == 400;
+        var code = resolveJson != null && /^[a-z0-9_]{1,64}$/.test(String(resolveJson.reason || ''))
+          ? String(resolveJson.reason) : 'http_' + resolveStatus;
+        context.setVariable('outcome', unauthorized ? 'unauthorized' : (rejected ? 'rejected' : 'unavailable'));
+        context.setVariable('reason', rejected ? code : 'http_' + resolveStatus);
         context.setVariable('jobId', '');
         context.setVariable('identityHash', '');
         context.setVariable('indexingState', '');
@@ -313,7 +343,9 @@ nodes:
         context.setVariable('branchAdvanced', false);
         context.setVariable('message', unauthorized
           ? 'The Sextant service refused the request.'
-          : 'The Sextant service could not read the branch head right now; try again later.');
+          : (rejected
+            ? 'The Sextant service rejected the request (' + code + ').'
+            : 'The Sextant service could not read the branch head right now; try again later.'));
         null;
     next: log-resolve
 

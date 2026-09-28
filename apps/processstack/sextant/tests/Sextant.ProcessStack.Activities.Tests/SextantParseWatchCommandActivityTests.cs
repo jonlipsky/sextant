@@ -142,6 +142,7 @@ public sealed class SextantParseWatchCommandActivityTests
         var activity = await ParseAsync(prompt);
 
         Assert.AreEqual(branch, activity.Branch);
+        Assert.IsFalse(activity.BranchInvalid);
         Assert.HasCount(1, activity.Repositories);
         Assert.IsEmpty(activity.Errors);
     }
@@ -171,13 +172,28 @@ public sealed class SextantParseWatchCommandActivityTests
     [DataRow("watch octo/repo on", "Name the branch after \"on\".")]
     [DataRow("watch octo/repo on branch", "Name the branch after \"on\".")]
     [DataRow("watch octo/repo on a b", "'a b' is not a valid branch name.")]
+    [DataRow("stop watching octo/repo on bad..name", "'bad..name' is not a valid branch name.")]
+    [DataRow("stop watching octo/repo on", "Name the branch after \"on\".")]
     public async Task An_invalid_branch_is_an_error(string prompt, string error)
     {
         var activity = await ParseAsync(prompt);
 
+        // The branch stays "", so the flow must refuse on branchInvalid: "" alone would mean the default
+        // branch (watch) or every branch (unwatch).
         Assert.AreEqual(string.Empty, activity.Branch);
+        Assert.IsTrue(activity.BranchInvalid);
         CollectionAssert.AreEqual(new[] { error }, activity.Errors);
         Assert.HasCount(1, activity.Repositories);
+    }
+
+    [TestMethod]
+    public async Task An_invalid_repository_does_not_mark_the_branch_invalid()
+    {
+        var activity = await ParseAsync("stop watching octo/repo not-a-repo");
+
+        Assert.IsFalse(activity.BranchInvalid);
+        Assert.HasCount(1, activity.Repositories);
+        Assert.HasCount(1, activity.Errors);
     }
 
     // ---- repositories ----
