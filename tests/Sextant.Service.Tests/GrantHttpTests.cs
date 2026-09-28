@@ -881,7 +881,7 @@ public class GrantHttpTests
     }
 
     [TestMethod]
-    public async Task RepositoryHeader_AndArgument_ArgumentTakesPrecedence_AndADisagreementIsAConflict()
+    public async Task RepositoryHeader_AndArgument_AgreeingIsAccepted_AndADisagreementIsAConflict()
     {
         await using var host = await Harness.StartAsync(seed: db => GrantServiceTests.PublishOnBranch(db, Gadgets, "commit-g1", "main", isDefault: true));
         await PutSelfAsync(host, host.UserAssertion(), Widgets);
