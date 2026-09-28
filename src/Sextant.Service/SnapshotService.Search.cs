@@ -35,9 +35,10 @@ public sealed partial class SnapshotService
     /// <summary>
     /// One page of <c>search_symbols</c> for <paramref name="caller"/> (SVC-F). The targets are the caller's visible
     /// grants (narrowed by the query's repository and branch) resolved to their branch's complete snapshot; the
-    /// snapshots are deduplicated by identity hash, ordered by it, and at most <see cref="ServiceOptions.SearchMaxWidth"/>
-    /// of them are read per call. <paramref name="resume"/> is honored only for snapshots still visible. A failure to
-    /// read the grants propagates: it never becomes an empty or unscoped result.
+    /// snapshots are deduplicated by identity hash, up to <see cref="ServiceOptions.SearchMaxWidthCeiling"/> of them are
+    /// tracked in hash order, and at most <see cref="ServiceOptions.SearchMaxWidth"/> of those are read per call,
+    /// round-robin. <paramref name="resume"/> is honored only for snapshots still visible. A failure to read the grants
+    /// propagates: it never becomes an empty or unscoped result.
     /// </summary>
     internal SymbolSearchOutcome SearchSymbols(CallerPrincipal caller, SymbolSearchQuery query, SymbolSearchCursorState? resume)
     {
@@ -71,22 +72,25 @@ public sealed partial class SnapshotService
                 snapshots[snapshot.IdentityHash] = new SearchSnapshot(snapshot, [target.Target]);
         }
 
-        var (active, watermark) = Admit(snapshots, resume, width);
+        var (tracked, watermark, start) = Admit(snapshots, resume, ServiceOptions.SearchMaxWidthCeiling);
         var hits = new List<(SymbolSearchHit Hit, long Id)>();
         var next = new List<SymbolSearchPosition>();
         var deferred = new List<string>();
+        string? rotation = null;
+        var read = 0;
         long freshness = 0;
-        for (var i = 0; i < active.Count; i++)
+        foreach (var position in tracked)
         {
-            var position = active[i];
-            if (i >= width)
+            if (read >= width || (start is not null && string.CompareOrdinal(position.IdentityHash, start) <= 0))
             {
-                // Honored positions beyond the width (the cap shrank since the cursor was issued) wait, unread.
+                // Not this page's turn: kept unread, for a later page of this round or for the next round.
                 next.Add(position);
                 deferred.Add(position.IdentityHash);
                 continue;
             }
 
+            read++;
+            rotation = position.IdentityHash;
             var snapshot = snapshots[position.IdentityHash];
             List<(SymbolSearchHit Hit, long Id)> rows;
             try
@@ -122,7 +126,8 @@ public sealed partial class SnapshotService
                 .ToList(),
             Next = next.Count == 0 && unadmitted.Count == 0
                 ? null
-                : new SymbolSearchCursorState(next.OrderBy(p => p.IdentityHash, StringComparer.Ordinal).ToList(), watermark),
+                : new SymbolSearchCursorState(
+                    next.OrderBy(p => p.IdentityHash, StringComparer.Ordinal).ToList(), watermark, rotation),
             Pending = Ordered(pending),
             Unavailable = Ordered(unavailable),
             Truncated = Ordered(deferred.SelectMany(h => snapshots[h].Targets)),
@@ -130,23 +135,35 @@ public sealed partial class SnapshotService
         };
     }
 
-    // The positions this call pages: the cursor's positions whose snapshot is still visible (anything else, revoked or
-    // forged, is dropped without a trace), then the next visible hashes after the watermark, up to the width.
-    private static (List<SymbolSearchPosition> Active, string? Watermark) Admit(
-        SortedDictionary<string, SearchSnapshot> snapshots, SymbolSearchCursorState? resume, int width)
+    // The snapshots this page tracks, in hash order, and the hash its turn starts after (issue #176 fairness). Pages read
+    // the tracked snapshots round-robin: each page reads, in hash order, at most `width` of those after the previous
+    // page's last read (`r`), never wrapping past the end, and once none is left after `r` the next round starts from
+    // the lowest hash. The cursor's positions are kept only while their snapshot is still visible (anything else,
+    // revoked or forged, is dropped without a trace). The next visible hashes after the watermark join, up to
+    // `capacity` (the most positions a cursor can carry), only while no tracked snapshot is waiting at or before `r` for
+    // the next round, so they always join at the tail of a round. With V visible snapshots, each tracked one is then read
+    // at least once every ceil(min(V, capacity) / width) pages.
+    private static (List<SymbolSearchPosition> Tracked, string? Watermark, string? Start) Admit(
+        SortedDictionary<string, SearchSnapshot> snapshots, SymbolSearchCursorState? resume, int capacity)
     {
-        var active = resume?.Active.Where(p => snapshots.ContainsKey(p.IdentityHash)).ToList() ?? [];
+        var tracked = resume?.Active.Where(p => snapshots.ContainsKey(p.IdentityHash)).ToList() ?? [];
         var watermark = resume?.Watermark;
+        var start = resume?.Rotation;
+        if (start is not null && !tracked.Exists(p => string.CompareOrdinal(p.IdentityHash, start) > 0))
+            start = null;
+        if (start is not null && tracked.Exists(p => string.CompareOrdinal(p.IdentityHash, start) <= 0))
+            return (tracked, watermark, start);
+
         foreach (var hash in snapshots.Keys)
         {
-            if (active.Count >= width)
+            if (tracked.Count >= capacity)
                 break;
             if (watermark is not null && string.CompareOrdinal(hash, watermark) <= 0)
                 continue;
-            active.Add(new SymbolSearchPosition(hash, 0));
+            tracked.Add(new SymbolSearchPosition(hash, 0));
             watermark = hash;
         }
-        return (active, watermark);
+        return (tracked, watermark, start);
     }
 
     // The caller's search targets: one per (repository, branch), ordered by repository key then branch. With no branch

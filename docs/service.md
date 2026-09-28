@@ -71,7 +71,7 @@ of the box.
 | `SEXTANT_SERVICE_CALLER_APPS` | Optional comma-separated allow-list on the signed `app` claim | none (any app) |
 | `SEXTANT_SERVICE_MAX_GRANTS_PER_PRINCIPAL` | Most repository grants one user caller may hold in a tenant (see [Repository grants](#repository-grants-and-visibility-svc-4)); creating one more is `409 grant_limit`. The tenant-wide `'*'` grants are not counted. A missing or non-positive value uses the default | `200` |
 | `SEXTANT_SERVICE_MAX_GRANTS_PER_TENANT` | Most repository grant rows a tenant may hold, tenant-wide grants included; creating one more is `409 grant_limit` | `5000` |
-| `SEXTANT_SERVICE_SEARCH_MAX_WIDTH` | Most snapshots one [`search_symbols`](#search_symbols-svc-f) call reads; the rest are listed in `truncated` and searched on later pages. Values above `100` are clamped to `100` (so a cursor stays within 16 KiB); a missing or non-positive value uses the default | `50` |
+| `SEXTANT_SERVICE_SEARCH_MAX_WIDTH` | Most snapshots one [`search_symbols`](#search_symbols-svc-f) call reads (round-robin over the tracked ones); the rest are listed in `truncated` and searched on later pages. Values above `100` are clamped to `100` (the most snapshots a search tracks at once, which keeps a cursor within 16 KiB); a missing or non-positive value uses the default | `50` |
 | `SEXTANT_SERVICE_BIND_ADDRESS` | Network interface the HTTP surface binds to | `localhost` |
 | `SEXTANT_SERVICE_CONTROL_PORT` | HTTP port | `3011` |
 | `SEXTANT_SERVICE_QUERY_PORT` | Optional dedicated query port (shares the control port when unset) | none (shared) |
@@ -880,15 +880,19 @@ own `repository`/`branch` narrow the search, and neither can widen it beyond the
   `/query/snapshots/{identityHash}/symbols` still emits them as integers.)
 - `pending` lists granted branches with no complete snapshot yet (`branch` is `""` when the default branch is
   not known yet). `unavailable` lists branches whose snapshot could not be read on this call; they keep their
-  place in the cursor and are retried on the next page. `truncated` lists branches beyond `SEARCH_MAX_WIDTH`,
-  searched on later pages.
+  place in the cursor and are retried on a later page (within the same round-robin bound). `truncated` lists
+  branches not read on this call because of `SEARCH_MAX_WIDTH`; they are searched on later pages.
 - Branches that share one snapshot are searched once, labeled with the first (repository, branch) in order.
 - `next_cursor` is always present, and is `null` once every snapshot is exhausted.
 
-**Paging.** Targets are deduplicated by snapshot identity hash and searched in hash order, at most
-`SEARCH_MAX_WIDTH` per call. Each page reads up to `limit` rows from each of those snapshots and orders them by
-name, then identity hash, then row. While the grants and branch heads do not change, walking every page returns
-every match exactly once. The cursor is opaque
+**Paging.** Targets are deduplicated by snapshot identity hash. Up to 100 snapshots are tracked at a time, in hash
+order. Each call reads at most `SEARCH_MAX_WIDTH` of them, round-robin: a page continues in hash order after the
+last snapshot the previous page read, and once it reaches the end the next page starts a new round from the lowest
+hash. A snapshot that has not been searched yet joins, as tracked ones are exhausted, at the end of a round. So a
+snapshot with many matches never keeps the others waiting: with V visible snapshots, each tracked one is read at
+least once every ⌈min(V, 100) / `SEARCH_MAX_WIDTH`⌉ pages. Each page reads up to `limit` rows from each snapshot
+it reads and orders them by name, then identity hash, then row. While the grants and branch heads do not change,
+walking every page returns every match exactly once. The cursor is opaque
 base64url JSON of at most 16 KiB. It carries each snapshot's position, and a digest binds it to the tenant, the
 caller and the query arguments other than `limit`. A tampered or oversized cursor, or one issued to another caller,
 tenant or query, gets `invalid_cursor`. The digest is not an authorization control. Every call reads the caller's

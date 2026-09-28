@@ -354,6 +354,7 @@ public sealed partial class SnapshotService
     {
         private readonly SnapshotStore _snapshots = new(conn);
         private List<(string Key, long Id, string Url)>? _repositories;
+        private Dictionary<string, long>? _repositoryIds;
         private List<(string Key, string? Branch)>? _activeJobs;
 
         // Every consumer (non-provider) repository with its key, in id order.
@@ -441,8 +442,18 @@ public sealed partial class SnapshotService
                 ? _snapshots.GetDefaultBranchId(repositoryId) is long id ? _snapshots.GetBranchById(id) : null
                 : _snapshots.GetBranch(repositoryId, branch);
 
-        public long? RepositoryId(string key) =>
-            Repositories().Where(r => r.Key == key).Select(r => (long?)r.Id).FirstOrDefault();
+        // The lowest-id consumer repository with the key. The map is built once per reader, since a search resolves
+        // every grant of the caller.
+        public long? RepositoryId(string key)
+        {
+            if (_repositoryIds is null)
+            {
+                _repositoryIds = new Dictionary<string, long>(StringComparer.Ordinal);
+                foreach (var (repositoryKey, id, _) in Repositories())
+                    _repositoryIds.TryAdd(repositoryKey, id);
+            }
+            return _repositoryIds.TryGetValue(key, out var found) ? found : null;
+        }
 
         private List<BranchRow> CatalogBranches(long repositoryId)
         {
