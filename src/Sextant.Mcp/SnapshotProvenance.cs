@@ -60,7 +60,7 @@ public sealed record CompatibilityInputs(
     string? CapabilityFingerprint = null)
 {
     public static CompatibilityInputs Current => new(
-        IndexDatabase.LatestSchemaVersion,
+        IndexDatabase.SnapshotSchemaVersion,
         IndexConfigurationHash.AnalyzerVersion,
         Core.ToolchainFingerprint.Current,
         WorkerCapability.LocalDefault.Fingerprint);

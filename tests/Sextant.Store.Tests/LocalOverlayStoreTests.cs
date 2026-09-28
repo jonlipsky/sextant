@@ -186,7 +186,7 @@ public class LocalOverlayStoreTests
         RepositoryRemoteUrl = RepoUrl,
         CommitSha = "commit_base",
         TreeSha = "tree_commit_base",
-        SchemaVersion = IndexDatabase.LatestSchemaVersion,
+        SchemaVersion = IndexDatabase.SnapshotSchemaVersion,
         AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
         ConfigHash = "cfg",
         ToolchainFingerprint = "tc",

@@ -372,7 +372,7 @@ public class RepositorySelectionTests
         var identity = new SnapshotIdentity
         {
             RepositoryRemoteUrl = url, CommitSha = commit, TreeSha = "t1",
-            SchemaVersion = IndexDatabase.LatestSchemaVersion,
+            SchemaVersion = IndexDatabase.SnapshotSchemaVersion,
             AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
             ConfigHash = "cfg", ToolchainFingerprint = ToolchainFingerprint.Current
         };

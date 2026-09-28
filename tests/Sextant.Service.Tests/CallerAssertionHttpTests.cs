@@ -845,7 +845,31 @@ public class CallerAssertionHttpTests
         public async Task<(HttpStatusCode Status, string Raw, string Challenge, string Payload)> SendRpcAsync(
             string method, string paramsJson, string token, params string[] assertions)
         {
-            using var request = new HttpRequestMessage(HttpMethod.Post, "/mcp")
+            using var request = RpcRequest(method, paramsJson, token, assertions);
+            using var response = await Client.SendAsync(request);
+            var raw = await response.Content.ReadAsStringAsync();
+            var challenge = response.Headers.WwwAuthenticate.ToString();
+            var payload = raw.Contains("data:", StringComparison.Ordinal)
+                ? string.Concat(raw.Split('\n')
+                    .Where(l => l.StartsWith("data:", StringComparison.Ordinal))
+                    .Select(l => l["data:".Length..].Trim()))
+                : raw;
+            return (response.StatusCode, raw, challenge, payload);
+        }
+
+        /// <summary>Sends one JSON-RPC request on <c>/mcp</c> that the caller can abandon: the request is aborted when
+        /// <paramref name="cancellationToken"/> is cancelled.</summary>
+        public async Task SendAbortableRpcAsync(
+            string method, string paramsJson, string token, string assertion, CancellationToken cancellationToken)
+        {
+            using var request = RpcRequest(method, paramsJson, token, [assertion]);
+            using var response = await Client.SendAsync(request, cancellationToken);
+            await response.Content.ReadAsStringAsync(cancellationToken);
+        }
+
+        private HttpRequestMessage RpcRequest(string method, string paramsJson, string token, string[] assertions)
+        {
+            var request = new HttpRequestMessage(HttpMethod.Post, "/mcp")
             {
                 Content = new StringContent(
                     $$"""{"jsonrpc":"2.0","id":{{Interlocked.Increment(ref _nextId)}},"method":"{{method}}","params":{{paramsJson}}}""",
@@ -858,16 +882,7 @@ public class CallerAssertionHttpTests
                 request.Headers.TryAddWithoutValidation(Header, assertion);
             if (RepositoryHeader is not null)
                 request.Headers.TryAddWithoutValidation(ServiceApp.RepositoryHeader, RepositoryHeader);
-
-            using var response = await Client.SendAsync(request);
-            var raw = await response.Content.ReadAsStringAsync();
-            var challenge = response.Headers.WwwAuthenticate.ToString();
-            var payload = raw.Contains("data:", StringComparison.Ordinal)
-                ? string.Concat(raw.Split('\n')
-                    .Where(l => l.StartsWith("data:", StringComparison.Ordinal))
-                    .Select(l => l["data:".Length..].Trim()))
-                : raw;
-            return (response.StatusCode, raw, challenge, payload);
+            return request;
         }
 
         /// <summary>Takes the single-writer lease from this service (another owner claims it) and waits until it notices.</summary>

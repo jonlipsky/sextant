@@ -69,7 +69,8 @@ public static class SearchSymbolsTool
         "arguments, for the next page; it is null when the search is complete. `pending` lists branches that are not " +
         "indexed yet, `unavailable` those that could not be read this time, and `truncated` those left for later pages.")]
     public static CallToolResult SearchSymbols(
-        RequestContext<CallToolRequestParams> context, SnapshotService service, CallerContext caller, ServiceOptions options)
+        RequestContext<CallToolRequestParams> context, SnapshotService service, CallerContext caller, ServiceOptions options,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(context);
         ArgumentNullException.ThrowIfNull(service);
@@ -89,7 +90,9 @@ public static class SearchSymbolsTool
             && !SymbolSearchCursor.TryDecode(cursor, binding, ServiceOptions.SearchMaxWidthCeiling, out resume))
             return Error(InvalidCursorCode, InvalidCursorMessage);
 
-        var outcome = service.SearchSymbols(principal, query, resume);
+        // The request's cancellation (a closed connection or notifications/cancelled) stops the search: it is checked
+        // between statements and interrupts the one running (issue #196).
+        var outcome = service.SearchSymbols(principal, query, resume, cancellationToken);
         if (outcome.NoTargets)
             return Error(NoVisibleRepositoriesCode, NoVisibleRepositoriesMessage);
 
@@ -171,7 +174,8 @@ public static class SearchSymbolsTool
                 },
                 [LimitArgument] = Property("integer",
                     $"Optional: the most symbols read from each snapshot per page (default {SymbolSearchQuery.DefaultLimit}; " +
-                    $"clamped to 1..{SymbolSearchQuery.MaxLimit}).")
+                    $"clamped to 1..{SymbolSearchQuery.MaxLimit}). A page also returns at most the service's per-call " +
+                    "total, which the snapshots it reads share; the rest follow on later pages.")
             },
             ["required"] = new JsonArray(NamePrefixArgument),
             ["additionalProperties"] = false

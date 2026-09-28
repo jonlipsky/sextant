@@ -192,7 +192,7 @@ public class SnapshotReselectableTests
     {
         RepositoryRemoteUrl = RepoUrl,
         CommitSha = commit,
-        SchemaVersion = IndexDatabase.LatestSchemaVersion,
+        SchemaVersion = IndexDatabase.SnapshotSchemaVersion,
         AnalyzerVersion = "test-analyzer",
         ToolchainFingerprint = "test-toolchain"
     };

@@ -180,7 +180,7 @@ public class FederatedReadContextTests
 
         // Simulate the running binary/config having drifted from the base snapshot's stored fingerprint.
         var drift = new CompatibilityInputs(
-            SchemaVersion: IndexDatabase.LatestSchemaVersion,
+            SchemaVersion: IndexDatabase.SnapshotSchemaVersion,
             AnalyzerVersion: "999",
             ToolchainFingerprint: "some-other-toolchain");
 
@@ -248,7 +248,7 @@ public class FederatedReadContextTests
     private static SnapshotRow CompatRow(string? capability) => new()
     {
         Id = 1, RepositoryId = 1, IdentityHash = "h", Status = "complete", CreatedAt = 1,
-        SchemaVersion = IndexDatabase.LatestSchemaVersion,
+        SchemaVersion = IndexDatabase.SnapshotSchemaVersion,
         AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
         ToolchainFingerprint = Sextant.Core.ToolchainFingerprint.Current,
         CapabilityFingerprint = capability
@@ -477,7 +477,7 @@ public class FederatedReadContextTests
         RepositoryRemoteUrl = RepoUrl,
         CommitSha = "commit_base",
         TreeSha = "tree_base",
-        SchemaVersion = IndexDatabase.LatestSchemaVersion,
+        SchemaVersion = IndexDatabase.SnapshotSchemaVersion,
         AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
         ConfigHash = "cfg",
         ToolchainFingerprint = Sextant.Core.ToolchainFingerprint.Current,

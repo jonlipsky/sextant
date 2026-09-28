@@ -221,7 +221,7 @@ public class CrossRepositoryUsageResolverTests
         {
             RepositoryRemoteUrl = ProviderUrl,
             CommitSha = ProviderCommit,
-            SchemaVersion = IndexDatabase.LatestSchemaVersion,
+            SchemaVersion = IndexDatabase.SnapshotSchemaVersion,
             AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
             ConfigHash = "cfg",
             ToolchainFingerprint = "tc"
@@ -249,7 +249,7 @@ public class CrossRepositoryUsageResolverTests
             RepositoryRemoteUrl = repoUrl,
             CommitSha = commitSha,
             TreeSha = $"tree_{commitSha}",
-            SchemaVersion = IndexDatabase.LatestSchemaVersion,
+            SchemaVersion = IndexDatabase.SnapshotSchemaVersion,
             AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
             ConfigHash = "cfg",
             ToolchainFingerprint = "tc"

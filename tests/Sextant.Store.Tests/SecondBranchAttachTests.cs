@@ -105,7 +105,7 @@ public class SecondBranchAttachTests
         {
             RepositoryRemoteUrl = "https://github.com/org/app",
             CommitSha = commit,
-            SchemaVersion = IndexDatabase.LatestSchemaVersion,
+            SchemaVersion = IndexDatabase.SnapshotSchemaVersion,
             AnalyzerVersion = "test-analyzer",
             ToolchainFingerprint = "test-toolchain"
         };

@@ -203,7 +203,7 @@ public class BranchHeadCasTests
         {
             RepositoryRemoteUrl = Repo,
             CommitSha = commit,
-            SchemaVersion = IndexDatabase.LatestSchemaVersion,
+            SchemaVersion = IndexDatabase.SnapshotSchemaVersion,
             AnalyzerVersion = "test-analyzer",
             ToolchainFingerprint = "test-toolchain"
         };
