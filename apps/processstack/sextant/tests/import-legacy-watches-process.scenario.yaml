@@ -1,0 +1,105 @@
+name: import-legacy-watches-process
+description: >
+  (#12) import-legacy-watches grants each readable v1 watch the caller does not already hold, using GitHub's
+  spelling of the repository: a watch on the repository's default branch becomes a default-branch grant, any
+  other branch is granted by name. An entry the caller already holds counts as imported without a GitHub
+  check; an entry not on github.com and one that is not JSON are skipped unchecked; a tombstone is not
+  counted. Nothing is left to retry, so the import flag is set.
+entrypoint: import-legacy-watches
+principal:
+  userId: u-alice
+inputs:
+  retryUnresolved: false
+seed:
+  userMemory:
+    - key: "sextant.watched-repos:github.com/octocat/hello-world@main"
+      value: '{"owner":"octocat","repo":"hello-world","branch":"main","cloneUrl":"https://github.com/octocat/hello-world.git","addedAt":"2026-01-01T00:00:00+00:00"}'
+    - key: "sextant.watched-repos:github.com/octocat/hello-world@feature/x"
+      value: '{"owner":"octocat","repo":"hello-world","branch":"feature/x","cloneUrl":"git@github.com:octocat/hello-world.git","addedAt":"2026-01-01T00:00:00+00:00"}'
+    - key: "sextant.watched-repos:github.com/octocat/spoon-knife@main"
+      value: '{"owner":"octocat","repo":"spoon-knife","branch":"main","cloneUrl":"https://github.com/octocat/spoon-knife.git","addedAt":"2026-01-01T00:00:00+00:00"}'
+    - key: "sextant.watched-repos:gitlab.example.com/octocat/elsewhere@main"
+      value: '{"owner":"octocat","repo":"elsewhere","branch":"main","cloneUrl":"https://gitlab.example.com/octocat/elsewhere.git","addedAt":"2026-01-01T00:00:00+00:00"}'
+    - key: "sextant.watched-repos:github.com/octocat/garbled@main"
+      value: "not json"
+    - key: "sextant.watched-repos:github.com/octocat/removed@main"
+      value: "null"
+http:
+  # Shape: GET /control/grants/self → {grants: [GrantView], result_count} (src/Sextant.Service/Grants/GrantContracts.cs).
+  # spoon-knife is already watched on its default branch, which the service resolved to main.
+  - connection: sextant-control
+    method: GET
+    path: /control/grants/self
+    body:
+      grants:
+        - repository: "https://github.com/octocat/spoon-knife.git"
+          branch: ""
+          source: self
+          created_at: 1760000000
+          status: { resolved_branch: main, snapshot_status: complete }
+      result_count: 1
+  # Shape: GitHub REST GET /repos/{owner}/{repo} (read by GitHubGetRepository through Octokit).
+  - connection: github
+    method: GET
+    path: /repos/octocat/hello-world
+    body:
+      id: 1296269
+      name: Hello-World
+      full_name: octocat/Hello-World
+      owner: { login: octocat, id: 1 }
+      private: false
+      default_branch: main
+      html_url: "https://github.com/octocat/Hello-World"
+      clone_url: "https://github.com/octocat/Hello-World.git"
+  # Shape: PUT /control/grants/self → {grant, created} (src/Sextant.Service.Host/GrantEndpoints.cs).
+  - connection: sextant-control
+    method: PUT
+    path: /control/grants/self
+    body:
+      grant: { repository: "https://github.com/octocat/Hello-World.git", branch: "", source: self, created_at: 1760000000 }
+      created: true
+expected:
+  status: Completed
+  variables:
+    imported: 3
+    newlyImported: 2
+    skipped: 2
+    failed: 0
+    remaining: 0
+    complete: true
+    outcome: ok
+    message: "Imported 3 earlier Sextant watches.\n2 earlier watches could not be imported: not on github.com, not visible to this workspace's GitHub connection, or refused by the Sextant service."
+    importedAt: "!not_empty"
+    attemptsText: "{}"
+  httpCalls:
+    - connection: sextant-control
+      method: GET
+      path: /control/grants/self
+      caller: { act: user, idp: processstack, sub: u-alice }
+      count: 1
+    # One check per entry to import; the held spoon-knife watch and the skipped entries are never checked.
+    - connection: github
+      method: GET
+      path: /repos/octocat/hello-world
+      count: 2
+    - connection: github
+      path: "/repos/**"
+      count: 2
+    - connection: sextant-control
+      method: PUT
+      path: /control/grants/self
+      caller: { act: user, idp: processstack, sub: u-alice }
+      bodyMatch: { repository: "https://github.com/octocat/Hello-World.git", branch: null }
+      count: 1
+    - connection: sextant-control
+      method: PUT
+      path: /control/grants/self
+      caller: { act: user, idp: processstack, sub: u-alice }
+      bodyMatch: { repository: "https://github.com/octocat/Hello-World.git", branch: "feature/x" }
+      count: 1
+    - connection: sextant-control
+      method: PUT
+      count: 2
+    - connection: sextant-control
+      method: POST
+      count: 0

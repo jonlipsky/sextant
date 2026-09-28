@@ -10,8 +10,9 @@ apps/processstack/
   nuget.config                                   package sources for everything under this directory
   sextant/
     psapp.yaml                                   the app manifest (name sextant, v2.0.0)
+    README.md                                    deploying: connections, publish, API keys, v1 import, rollback
     orchestrations/                              the chat entry point and the per-repository watch/unwatch
-    processes/                                   ensure, the MCP processes, the v1 memory dual-write
+    processes/                                   ensure, the MCP processes (incl. the v1 watch import), the v1 memory dual-write
     tests/*.scenario.yaml                        `processstack app test` scenarios
     Sextant.ProcessStack.slnx                    the app's own solution (NOT part of Sextant.slnx)
     Directory.Build.props                        moves bin/ and obj/ out to apps/processstack/artifacts/
@@ -20,7 +21,8 @@ apps/processstack/
     tests/Sextant.ProcessStack.Activities.Tests/ MSTest tests for them
 ```
 
-The design lives in `specs/20260927-processstack-app-extraction/` (`app.md` and `app-activities.md`).
+The design lives in `specs/20260927-processstack-app-extraction/` (`app.md` and `app-activities.md`), and
+the deploy steps in [`sextant/README.md`](sextant/README.md).
 
 ## Why a separate solution
 

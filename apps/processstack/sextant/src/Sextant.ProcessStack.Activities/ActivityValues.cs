@@ -29,16 +29,65 @@ internal static class ActivityValues
     /// then holds that same literal.
     /// </para>
     /// </summary>
-    public static object? Input(AbstractActivity activity, string name, object? propertyValue)
+    public static object? Input(AbstractActivity activity, string name, object? propertyValue) =>
+        Unwrap(RawInput(activity, name, propertyValue));
+
+    /// <summary>
+    /// <see cref="Input"/> without unwrapping: the value as it arrived, so a JSON object keeps keys that differ
+    /// only by case (<see cref="AsMap"/> folds them). Read it with <see cref="Pairs"/>.
+    /// </summary>
+    public static object? RawInput(AbstractActivity activity, string name, object? propertyValue)
     {
         var parameters = activity.Definition?.Parameters;
-        if (parameters is not null && parameters.TryGetValue(name, out var value) && value is not null)
+        if (parameters is not null && parameters.TryGetValue(name, out var value) && value is not null
+            && !IsAuthoredExpression(value))
+            return value;
+        return propertyValue;
+    }
+
+    /// <summary>
+    /// The string-keyed entries of an object value (a CLR dictionary, a JSON object, or JSON object text) in
+    /// their original order and case, each value unwrapped. Unlike <see cref="AsMap"/>, keys that differ only by
+    /// case are all kept. Empty for anything else.
+    /// </summary>
+    public static IReadOnlyList<KeyValuePair<string, object?>> Pairs(object? value)
+    {
+        var pairs = new List<KeyValuePair<string, object?>>();
+        switch (value)
         {
-            var parameter = Unwrap(value);
-            if (!IsAuthoredExpression(parameter))
-                return parameter;
+            case JsonElement { ValueKind: JsonValueKind.Object } element:
+                foreach (var property in element.EnumerateObject())
+                    pairs.Add(new(property.Name, Unwrap(property.Value)));
+                break;
+            case JsonObject node:
+                foreach (var (key, item) in node)
+                    pairs.Add(new(key, Unwrap(item)));
+                break;
+            case string text when text.TrimStart().StartsWith('{'):
+                try
+                {
+                    using var document = JsonDocument.Parse(text);
+                    return Pairs(document.RootElement);
+                }
+                catch (JsonException)
+                {
+                    break;
+                }
+            case IDictionary dictionary:
+                foreach (DictionaryEntry entry in dictionary)
+                {
+                    if (entry.Key?.ToString() is { } key)
+                        pairs.Add(new(key, Unwrap(entry.Value)));
+                }
+                break;
+            case IEnumerable<KeyValuePair<string, object?>> objectPairs:
+                pairs.AddRange(objectPairs.Select(p => new KeyValuePair<string, object?>(p.Key, Unwrap(p.Value))));
+                break;
+            case IEnumerable<KeyValuePair<string, string?>> stringPairs:
+                pairs.AddRange(stringPairs.Select(p => new KeyValuePair<string, object?>(p.Key, p.Value)));
+                break;
         }
-        return Unwrap(propertyValue);
+        return pairs;
     }
 
     /// <summary>

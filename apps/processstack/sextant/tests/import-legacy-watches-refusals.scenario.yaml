@@ -1,0 +1,72 @@
+name: import-legacy-watches-refusals
+description: >
+  The service's answer decides what happens to an entry: 400 (the repository or branch is refused) is
+  skipped and 409 (the watch limit) failed, and neither is tried again by itself; any other answer (here a
+  503) is failed and tried again next run, so the import is not complete and its flag is not set.
+entrypoint: import-legacy-watches
+principal:
+  userId: u-alice
+inputs:
+  retryUnresolved: false
+seed:
+  userMemory:
+    - key: "sextant.watched-repos:github.com/octo/alpha@main"
+      value: '{"owner":"octo","repo":"alpha","branch":"main","cloneUrl":"https://github.com/octo/alpha.git","addedAt":"2026-01-01T00:00:00+00:00"}'
+    - key: "sextant.watched-repos:github.com/octo/beta@main"
+      value: '{"owner":"octo","repo":"beta","branch":"main","cloneUrl":"https://github.com/octo/beta.git","addedAt":"2026-01-01T00:00:00+00:00"}'
+    - key: "sextant.watched-repos:github.com/octo/gamma@main"
+      value: '{"owner":"octo","repo":"gamma","branch":"main","cloneUrl":"https://github.com/octo/gamma.git","addedAt":"2026-01-01T00:00:00+00:00"}'
+http:
+  - connection: sextant-control
+    method: GET
+    path: /control/grants/self
+    body: { grants: [], result_count: 0 }
+  - connection: github
+    method: GET
+    path: /repos/octo/alpha
+    body: { id: 1, name: alpha, full_name: octo/alpha, owner: { login: octo, id: 1 }, default_branch: main }
+  - connection: github
+    method: GET
+    path: /repos/octo/beta
+    body: { id: 2, name: beta, full_name: octo/beta, owner: { login: octo, id: 1 }, default_branch: main }
+  - connection: github
+    method: GET
+    path: /repos/octo/gamma
+    body: { id: 3, name: gamma, full_name: octo/gamma, owner: { login: octo, id: 1 }, default_branch: main }
+  # Shape: 400 {reason} and 409 {reason: grant_limit} (src/Sextant.Service.Host/GrantEndpoints.cs).
+  - connection: sextant-control
+    method: PUT
+    path: /control/grants/self
+    bodyMatch: { repository: "https://github.com/octo/alpha.git" }
+    status: 400
+    body: { status: rejected, reason: owner_not_allowed }
+  - connection: sextant-control
+    method: PUT
+    path: /control/grants/self
+    bodyMatch: { repository: "https://github.com/octo/beta.git" }
+    status: 409
+    body: { status: rejected, reason: grant_limit }
+  - connection: sextant-control
+    method: PUT
+    path: /control/grants/self
+    bodyMatch: { repository: "https://github.com/octo/gamma.git" }
+    status: 503
+    body: { status: unavailable }
+expected:
+  status: Completed
+  variables:
+    imported: 0
+    newlyImported: 0
+    skipped: 1
+    failed: 2
+    remaining: 0
+    complete: false
+    outcome: ok
+    message: "1 earlier watch could not be imported: not on github.com, not visible to this workspace's GitHub connection, or refused by the Sextant service.\n2 earlier watches could not be imported right now: the Sextant service did not accept it, or you are watching as many repositories as allowed."
+    attemptsText: '{"github.com/octo/alpha@main":2,"github.com/octo/beta@main":2,"github.com/octo/gamma@main":1}'
+    importedAt: ""
+  httpCalls:
+    - connection: sextant-control
+      method: PUT
+      path: /control/grants/self
+      count: 3

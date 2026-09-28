@@ -14,6 +14,7 @@ public sealed class ActivityMetadataTests
         typeof(SextantInterpretEnsureResultActivity),
         typeof(SextantPlanReconcileActivity),
         typeof(SextantParseWatchCommandActivity),
+        typeof(SextantPlanLegacyImportActivity),
     ];
 
     // The Sextant activities that ship built into the platform today (v1). A bundled activity may not
@@ -35,7 +36,7 @@ public sealed class ActivityMetadataTests
             new[]
             {
                 "SextantNormalizeRepository", "SextantPlanRepositoryChange", "SextantInterpretEnsureResult",
-                "SextantPlanReconcile", "SextantParseWatchCommand",
+                "SextantPlanReconcile", "SextantParseWatchCommand", "SextantPlanLegacyImport",
             },
             names);
         Assert.HasCount(names.Count, names.Distinct(StringComparer.OrdinalIgnoreCase));

@@ -1,0 +1,497 @@
+name: import-legacy-watches
+description: >
+  Imports your v1 Sextant watches (the watched-repos memory the v1 app kept) as repository grants, so the
+  Sextant service indexes and serves them to you. Idempotent: an entry you already watch counts as imported.
+  Each repository must still be on github.com and visible to the workspace's GitHub connection. Returns
+  counts only; the chat runs it once on your first message in an internal channel.
+
+# Each entry costs a GitHub check and a grant; 200 entries fit well inside this bound.
+mcp:
+  timeoutSeconds: 300
+
+inputs:
+  - name: retryUnresolved
+    type: bool
+    required: false
+    default: false
+    description: >
+      Check again the entries earlier imports could not finish (a repository GitHub did not show, or one
+      the service refused). They are skipped otherwise.
+
+variables:
+  - name: facts
+    type: json
+  - name: hasLive
+    type: bool
+    default: false
+  - name: grantsStatus
+    type: int
+    default: 0
+  - name: grantsJson
+    type: json
+  - name: attemptsRaw
+    type: string
+    default: ""
+  - name: attemptsText
+    type: string
+    default: ""
+  - name: lastWritten
+    type: string
+    default: ""
+  - name: writeAttempts
+    type: bool
+    default: false
+  - name: pending
+    type: json
+  - name: index
+    type: int
+    default: 0
+  - name: maxAttempts
+    type: int
+    default: 0
+  - name: alreadyImported
+    type: int
+    default: 0
+  - name: unresolved
+    type: int
+    default: 0
+  - name: unreadable
+    type: int
+    default: 0
+  - name: currentOwner
+    type: string
+    default: ""
+  - name: currentRepo
+    type: string
+    default: ""
+  - name: currentBranch
+    type: string
+    default: ""
+  - name: currentSlug
+    type: string
+    default: ""
+  - name: resolvedSlug
+    type: string
+    default: ""
+  - name: resolution
+    type: string
+    default: ""
+  - name: fullName
+    type: string
+    default: ""
+  - name: defaultBranch
+    type: string
+    default: ""
+  - name: remoteUrl
+    type: string
+    default: ""
+  - name: accepted
+    type: bool
+    default: false
+  - name: putStatus
+    type: int
+    default: 0
+  - name: putJson
+    type: json
+  - name: importedAt
+    type: string
+    default: ""
+
+outputs:
+  - name: imported
+    type: int
+    description: Entries you now watch, including ones already watched before this run
+  - name: newlyImported
+    type: int
+    description: Entries this run granted
+  - name: skipped
+    type: int
+    description: >
+      Entries that cannot be imported: unreadable, not on github.com, refused by the service, or left from
+      earlier imports that could not finish (see retryUnresolved). Removed (tombstoned) entries are not counted
+  - name: failed
+    type: int
+    description: Entries the service did not grant this run (unavailable, refused, or at your watch limit)
+  - name: remaining
+    type: int
+    description: Entries left for the next run (at most 200 are checked per run)
+  - name: complete
+    type: bool
+    description: True when nothing is left to retry, so the chat does not import again
+  - name: outcome
+    type: string
+    description: ok | unavailable
+  - name: message
+    type: string
+
+nodes:
+  - id: start
+    type: start
+    next: init
+
+  # A tools/call argument naming a variable or output seeds it, and a default only fills an unset name
+  # (elevenworks/ProcessStack#3286), so every one is assigned here before anything reads it.
+  - id: init
+    name: Reset every variable and output
+    type: activity:JavaScript
+    inputs:
+      script: |
+        ['attemptsRaw', 'attemptsText', 'lastWritten', 'currentOwner', 'currentRepo', 'currentBranch',
+         'currentSlug', 'resolvedSlug', 'resolution', 'fullName', 'defaultBranch', 'remoteUrl', 'importedAt',
+         'outcome', 'message'].forEach(function (name) { context.setVariable(name, ''); });
+        ['grantsStatus', 'index', 'maxAttempts', 'alreadyImported', 'unresolved', 'unreadable', 'putStatus',
+         'imported', 'newlyImported', 'skipped', 'failed', 'remaining'].forEach(function (name) {
+          context.setVariable(name, 0);
+        });
+        ['hasLive', 'writeAttempts', 'accepted', 'complete'].forEach(function (name) {
+          context.setVariable(name, false);
+        });
+        ['facts', 'grantsJson', 'pending', 'putJson'].forEach(function (name) { context.setVariable(name, null); });
+        null;
+    next: list-memory
+
+  # The caller's own memory: the *MyMemory activities take no user id, and a run's senderId cannot be set
+  # from a tool argument (the platform strips reserved names).
+  - id: list-memory
+    type: activity:ListMyMemory
+    inputs:
+      scope: sextant.watched-repos
+    outputs:
+      facts: facts
+    next: check-live
+
+  # A removal left the JSON null tombstone ("null"), which v1 skips too.
+  - id: check-live
+    type: activity:SetVariable
+    inputs:
+      value: >
+        = (function () {
+            var entries = facts || {};
+            return Object.keys(entries).some(function (key) {
+              var raw = entries[key];
+              return raw != null && String(raw).trim() !== '' && String(raw).trim() !== 'null';
+            });
+          })()
+    outputs:
+      result: hasLive
+    next: route-live
+
+  - id: route-live
+    type: decision
+    next:
+      - when: "hasLive"
+        next: read-grants
+      - else: nothing-to-import
+
+  - id: nothing-to-import
+    type: activity:JavaScript
+    inputs:
+      script: |
+        context.setVariable('complete', true);
+        context.setVariable('outcome', 'ok');
+        null;
+    next: stamp-flag
+
+  - id: read-grants
+    name: GET /control/grants/self
+    type: activity:HttpRequest
+    inputs:
+      connectionId: sextant-control
+      method: GET
+      url: /control/grants/self
+      failOnErrorStatus: false
+    outputs:
+      statusCode: grantsStatus
+      json: grantsJson
+    next: route-grants
+
+  - id: route-grants
+    type: decision
+    next:
+      - when: "grantsStatus == 200 && grantsJson != null"
+        next: read-attempts
+      - else: unavailable
+
+  # {slug: count}: how many runs started checking each entry without finishing it. Untrusted; the plan
+  # reads anything unusable as empty.
+  - id: read-attempts
+    type: activity:GetMyMemory
+    inputs:
+      scope: sextant.app
+      key: legacy-import-attempts
+    outputs:
+      value: attemptsRaw
+    next: plan
+
+  - id: plan
+    type: activity:SextantPlanLegacyImport
+    inputs:
+      facts: "= facts"
+      grants: "= grantsJson"
+      attempts: "= attemptsRaw"
+      retryUnresolved: "= retryUnresolved"
+    outputs:
+      pending: pending
+      attemptsJson: attemptsText
+      maxAttempts: maxAttempts
+      alreadyImported: alreadyImported
+      unresolved: unresolved
+      unreadable: unreadable
+      remaining: remaining
+    next: count-plan
+
+  - id: count-plan
+    type: activity:JavaScript
+    inputs:
+      script: |
+        context.setVariable('imported', alreadyImported);
+        context.setVariable('skipped', unreadable + unresolved);
+        context.setVariable('lastWritten', String(attemptsRaw || '').trim());
+        context.setVariable('index', 0);
+        null;
+    next: import-loop
+
+  # Processes have no for-each node: each pass takes the next planned entry.
+  - id: import-loop
+    type: decision
+    next:
+      - when: "pending != null && index < pending.length"
+        next: next-entry
+      - else: finish-attempts
+
+  # The entry is marked before GitHub is asked: a failed check fails the whole run (a process has no error
+  # route), and the mark lets the next run go past it. The previous entry's outcome is applied first: a
+  # grant clears its mark, and a refusal marks it unresolved.
+  - id: next-entry
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var marks = {};
+        try { marks = JSON.parse(attemptsText || '{}') || {}; } catch (e) { marks = {}; }
+        if (resolvedSlug !== '') {
+          if (resolution === 'imported') delete marks[resolvedSlug];
+          else if (resolution === 'final') marks[resolvedSlug] = Math.max(maxAttempts, marks[resolvedSlug] || 0);
+        }
+        var entry = pending[index];
+        var slug = String(entry.slug);
+        marks[slug] = (marks[slug] || 0) + 1;
+        context.setVariable('index', index + 1);
+        context.setVariable('currentOwner', String(entry.owner));
+        context.setVariable('currentRepo', String(entry.repo));
+        context.setVariable('currentBranch', String(entry.branch));
+        context.setVariable('currentSlug', slug);
+        context.setVariable('resolvedSlug', '');
+        context.setVariable('resolution', '');
+        context.setVariable('fullName', '');
+        context.setVariable('defaultBranch', '');
+        context.setVariable('remoteUrl', '');
+        context.setVariable('accepted', false);
+        context.setVariable('putStatus', 0);
+        context.setVariable('putJson', null);
+        var text = JSON.stringify(marks);
+        context.setVariable('lastWritten', text);
+        text;
+    outputs:
+      result: attemptsText
+    next: mark-attempt
+
+  - id: mark-attempt
+    type: activity:SetMyMemory
+    inputs:
+      scope: sextant.app
+      key: legacy-import-attempts
+      value: "= attemptsText"
+    next: get-repository
+
+  # The same gate as a chat watch: the workspace's GitHub connection must see the repository.
+  - id: get-repository
+    name: Is the repository visible to the workspace's GitHub connection?
+    type: activity:GitHubGetRepository
+    inputs:
+      connectionId: github
+      owner: "= currentOwner"
+      repo: "= currentRepo"
+    outputs:
+      fullName: fullName
+      defaultBranch: defaultBranch
+    next: normalize
+
+  # GitHub's spelling, as grant-watch sends it, so an imported watch and a chat watch are the same grant.
+  - id: normalize
+    type: activity:SextantNormalizeRepository
+    inputs:
+      repo: "= fullName"
+    outputs:
+      remoteUrl: remoteUrl
+      accepted: accepted
+    next: route-normalized
+
+  - id: route-normalized
+    type: decision
+    next:
+      - when: "accepted"
+        next: put-grant
+      - else: mark-refused
+
+  # A v1 watch on the repository's default branch becomes a default-branch watch, as "watch owner/repo"
+  # records it; any other branch is watched by name.
+  - id: put-grant
+    name: PUT /control/grants/self
+    type: activity:HttpRequest
+    inputs:
+      connectionId: sextant-control
+      method: PUT
+      url: /control/grants/self
+      body: "= currentBranch == defaultBranch ? { repository: remoteUrl } : { repository: remoteUrl, branch: currentBranch }"
+      failOnErrorStatus: false
+    outputs:
+      statusCode: putStatus
+      json: putJson
+    next: classify
+
+  # 400 (the service refuses the repository or branch) and 409 (the watch limit) will not change by
+  # themselves, so the entry is marked unresolved; anything else (401/403, 5xx) is tried again next run.
+  - id: classify
+    type: activity:JavaScript
+    inputs:
+      script: |
+        if (putStatus == 200) {
+          context.setVariable('imported', imported + 1);
+          context.setVariable('newlyImported', newlyImported + 1);
+          context.setVariable('resolution', 'imported');
+        } else if (putStatus == 400) {
+          context.setVariable('skipped', skipped + 1);
+          context.setVariable('resolution', 'final');
+        } else if (putStatus == 409) {
+          context.setVariable('failed', failed + 1);
+          context.setVariable('resolution', 'final');
+        } else {
+          context.setVariable('failed', failed + 1);
+          context.setVariable('resolution', 'retry');
+        }
+        context.setVariable('resolvedSlug', currentSlug);
+        null;
+    next: import-loop
+
+  - id: mark-refused
+    type: activity:JavaScript
+    inputs:
+      script: |
+        context.setVariable('skipped', skipped + 1);
+        context.setVariable('resolution', 'final');
+        context.setVariable('resolvedSlug', currentSlug);
+        null;
+    next: import-loop
+
+  # Nothing is left to retry when every planned entry was checked and every remaining mark is unresolved.
+  - id: finish-attempts
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var marks = {};
+        try { marks = JSON.parse(attemptsText || '{}') || {}; } catch (e) { marks = {}; }
+        if (resolvedSlug !== '') {
+          if (resolution === 'imported') delete marks[resolvedSlug];
+          else if (resolution === 'final') marks[resolvedSlug] = Math.max(maxAttempts, marks[resolvedSlug] || 0);
+        }
+        var text = JSON.stringify(marks);
+        var retryable = Object.keys(marks).some(function (slug) { return marks[slug] < maxAttempts; });
+        context.setVariable('complete', remaining == 0 && !retryable);
+        context.setVariable('writeAttempts', text !== lastWritten && !(text === '{}' && lastWritten === ''));
+        context.setVariable('outcome', 'ok');
+        text;
+    outputs:
+      result: attemptsText
+    next: route-write
+
+  - id: route-write
+    type: decision
+    next:
+      - when: "writeAttempts"
+        next: write-attempts
+      - else: route-complete
+
+  - id: write-attempts
+    type: activity:SetMyMemory
+    inputs:
+      scope: sextant.app
+      key: legacy-import-attempts
+      value: "= attemptsText"
+    next: route-complete
+
+  - id: route-complete
+    type: decision
+    next:
+      - when: "complete"
+        next: stamp-flag
+      - else: build-message
+
+  # The chat reads this flag and does not import again. The import sets it, so an MCP import counts too.
+  - id: stamp-flag
+    type: activity:SetVariable
+    inputs:
+      value: "= new Date().toISOString()"
+    outputs:
+      result: importedAt
+    next: set-flag
+
+  - id: set-flag
+    type: activity:SetMyMemory
+    inputs:
+      scope: sextant.app
+      key: legacy-import-v1
+      value: "= importedAt"
+    next: build-message
+
+  - id: build-message
+    type: activity:JavaScript
+    inputs:
+      script: |
+        function plural(n, one, many) { return n + ' ' + (n == 1 ? one : many); }
+        var lines = [];
+        if (imported + skipped + failed + remaining == 0) {
+          lines.push('You have no earlier Sextant watches to import.');
+        } else {
+          if (imported > 0) {
+            lines.push('Imported ' + plural(imported, 'earlier Sextant watch', 'earlier Sextant watches') + '.');
+          }
+          if (skipped > 0) {
+            lines.push(plural(skipped, 'earlier watch', 'earlier watches') + " could not be imported: not on github.com, "
+              + "not visible to this workspace's GitHub connection, or refused by the Sextant service.");
+          }
+          if (failed > 0) {
+            lines.push(plural(failed, 'earlier watch', 'earlier watches') + ' could not be imported right now: the '
+              + 'Sextant service did not accept it, or you are watching as many repositories as allowed.');
+          }
+          if (remaining > 0) {
+            lines.push(plural(remaining, 'more earlier watch is', 'more earlier watches are') + ' left for the next import.');
+          }
+          if (unresolved > 0 && retryUnresolved !== true) {
+            lines.push('Run import-legacy-watches with retryUnresolved to check the ones earlier imports could not finish again.');
+          }
+        }
+        lines.join('\n');
+    outputs:
+      result: message
+    next: end
+
+  - id: unavailable
+    type: activity:JavaScript
+    inputs:
+      script: |
+        context.setVariable('outcome', 'unavailable');
+        context.setVariable('complete', false);
+        context.setVariable('message',
+          'The Sextant service could not answer right now, so your earlier watches were not imported yet. Try again later.');
+        null;
+    next: log-unavailable
+
+  - id: log-unavailable
+    type: activity:Log
+    inputs:
+      level: Warning
+      message: "= 'Sextant legacy import: GET /control/grants/self failed: HTTP ' + grantsStatus"
+    next: end
+
+  - id: end
+    type: end

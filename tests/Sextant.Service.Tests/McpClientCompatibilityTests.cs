@@ -154,6 +154,60 @@ public class McpClientCompatibilityTests
             $"a delegate read is denied until grants exist: {readText}");
     }
 
+    /// <summary>
+    /// elevenworks/ProcessStack#3258: the platform's MCP gateway keeps ONE pooled client per connection and signs
+    /// each request's own caller into it. The service authorizes every <c>tools/call</c> by the caller of that
+    /// request, never by the connection: the granted caller reads, another caller on the same client gets the
+    /// uniform not-found, the granted caller reads again, and a request with no caller is refused, including
+    /// when the calls are in flight together.
+    /// </summary>
+    [TestMethod]
+    public async Task SdkClient_OnePooledClient_AuthorizesEachRequestByItsOwnCaller()
+    {
+        var key = CallerAssertionSigner.NewKey();
+        await using var host = await Harness.StartAsync(callerKey: key, grantedUser: "user-1");
+        var caller = new AsyncLocal<string?>();
+        await using var pooled = await McpClient.CreateAsync(host.CreatePooledTransport(DelegateToken, () => caller.Value));
+
+        async Task<(bool IsError, string Text)> FindAs(string? sub)
+        {
+            caller.Value = sub is null
+                ? null
+                : CallerAssertionSigner.Sign(key, "kid-a", CallerAssertionSigner.UserClaims(DateTimeOffset.UtcNow, sub: sub, jti: $"jti-{Guid.NewGuid():N}"));
+            var result = await pooled.CallToolAsync(
+                "find_symbol", new Dictionary<string, object?> { ["name"] = "global::App.Type0", ["repository"] = "org/app" });
+            return (result.IsError is true, string.Concat(result.Content.OfType<TextContentBlock>().Select(c => c.Text)));
+        }
+
+        static int Results(string text) =>
+            System.Text.Json.JsonDocument.Parse(text).RootElement.GetProperty("results").GetArrayLength();
+
+        var granted = await FindAs("user-1");
+        Assert.IsFalse(granted.IsError, granted.Text);
+        Assert.AreEqual(1, Results(granted.Text), $"the granted caller reads the repository: {granted.Text}");
+
+        var other = await FindAs("user-2");
+        Assert.IsFalse(other.IsError, other.Text);
+        Assert.AreEqual(0, Results(other.Text), $"another caller on the same client reads nothing: {other.Text}");
+
+        var again = await FindAs("user-1");
+        Assert.AreEqual(1, Results(again.Text), $"the grant still applies after another caller's request: {again.Text}");
+
+        var anonymous = await FindAs(null);
+        Assert.IsTrue(anonymous.IsError, anonymous.Text);
+        StringAssert.Contains(anonymous.Text, "\"caller_required\"");
+
+        // In flight together over the one client: each request is still decided by its own caller.
+        var subjects = new[] { "user-1", "user-2", "user-1", "user-2", "user-1", "user-2" };
+        var concurrent = await Task.WhenAll(subjects.Select(sub => Task.Run(() => FindAs(sub))));
+        for (var i = 0; i < subjects.Length; i++)
+        {
+            Assert.IsFalse(concurrent[i].IsError, concurrent[i].Text);
+            Assert.AreEqual(subjects[i] == "user-1" ? 1 : 0, Results(concurrent[i].Text),
+                $"concurrent call {i} as {subjects[i]}: {concurrent[i].Text}");
+        }
+    }
+
     /// <summary>The MCP tool names declared by the remote allowlist (<see cref="ServiceApp.RemoteQueryTools"/>).</summary>
     private static List<string> RemoteToolNames()
     {
@@ -178,7 +232,7 @@ public class McpClientCompatibilityTests
         /// <summary>The complete snapshot of the second repository, when one was published.</summary>
         public long? SecondRepositorySnapshot { get; private init; }
 
-        public static async Task<Harness> StartAsync(string? secondRepository = null, byte[]? callerKey = null)
+        public static async Task<Harness> StartAsync(string? secondRepository = null, byte[]? callerKey = null, string? grantedUser = null)
         {
             var dbPath = ServiceTestFixtures.NewDbPath();
             var db = new IndexDatabase(dbPath);
@@ -190,6 +244,13 @@ public class McpClientCompatibilityTests
             var snapshots = new SnapshotStore(db.GetConnection());
             var repoId = snapshots.GetById(snapId)!.RepositoryId;
             snapshots.SetBranchPointer(snapshots.EnsureBranch(repoId, "main", isDefault: true, now: 1), snapId, now: 1);
+            if (grantedUser is not null)
+            {
+                var repository = ServiceTestFixtures.Request().RepositoryRemoteUrl;
+                new RepositoryGrantStore(db.GetConnection()).Upsert(
+                    "tenant-a", grantedUser, Sextant.Service.Grants.RepositoryGrantKey.Of(repository), repository, "",
+                    RepositoryGrantSource.Self, now: 1);
+            }
             long? secondSnapId = null;
             if (secondRepository is not null)
             {
@@ -251,13 +312,50 @@ public class McpClientCompatibilityTests
             }, Client);
         }
 
+        /// <summary>
+        /// One Streamable-HTTP client over a static delegate bearer, whose handler stamps the caller assertion
+        /// <paramref name="assertion"/> returns into each request as it is sent: the shape of the platform's pooled
+        /// gateway client, which signs every forwarded call's own caller.
+        /// </summary>
+        public HttpClientTransport CreatePooledTransport(string bearer, Func<string?> assertion)
+        {
+            var client = new HttpClient(new CallerStampingHandler(assertion) { InnerHandler = App.GetTestServer().CreateHandler() })
+            {
+                BaseAddress = Client.BaseAddress
+            };
+            _pooledClients.Add(client);
+            return new HttpClientTransport(new HttpClientTransportOptions
+            {
+                Endpoint = new Uri(Client.BaseAddress!, "/mcp"),
+                TransportMode = HttpTransportMode.StreamableHttp,
+                AdditionalHeaders = new Dictionary<string, string> { ["Authorization"] = $"Bearer {bearer}" },
+                Name = "pooled-gateway-client"
+            }, client);
+        }
+
+        private readonly List<HttpClient> _pooledClients = [];
+
         public async ValueTask DisposeAsync()
         {
+            foreach (var pooled in _pooledClients)
+                pooled.Dispose();
             Client.Dispose();
             await App.StopAsync();
             await App.DisposeAsync();
             Service.Dispose();
             SqliteTestDatabase.Delete(DbPath, Db);
+        }
+    }
+
+    /// <summary>Stamps the current caller assertion (none when null) into each request it sends.</summary>
+    private sealed class CallerStampingHandler(Func<string?> assertion) : DelegatingHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            request.Headers.Remove(Sextant.Service.CallerIdentity.CallerAssertionOptions.DefaultHeader);
+            if (assertion() is { } value)
+                request.Headers.TryAddWithoutValidation(Sextant.Service.CallerIdentity.CallerAssertionOptions.DefaultHeader, value);
+            return base.SendAsync(request, cancellationToken);
         }
     }
 }
