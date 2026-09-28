@@ -16,7 +16,8 @@ namespace Sextant.Service;
 // Issue #196 bounds what one call costs. Each snapshot page is an index seek (ix_symbols_project_name_nocase, migration
 // 025) over the prefix's NOCASE key range, so it reads only the rows it returns. The call returns at most
 // ServiceOptions.SearchMaxHits symbols in all. The caller's repositories are found by one indexed query over the
-// caller's own keys. And the request's cancellation stops the call between statements and interrupts the one running.
+// caller's own keys. And the request's cancellation stops the call between statements and rows and interrupts the
+// statement running.
 public sealed partial class SnapshotService
 {
     /// <summary>Test seam: runs with the identity hash before each snapshot page is read (a throw marks it unavailable).</summary>
@@ -24,7 +25,8 @@ public sealed partial class SnapshotService
 
     /// <summary>
     /// Test seam: runs with the identity hash and the call's cancellation token after each row of a snapshot page is
-    /// read, while its statement runs. The row loop itself never checks the token: only SQLite's interrupt stops it.
+    /// read, while its statement runs. The row loop checks the token only as each row arrives, before this hook, so a
+    /// cancellation raised here is stopped by SQLite's interrupt at the statement's next step.
     /// </summary>
     internal Action<string, CancellationToken>? SearchRowReadHook { get; set; }
 
@@ -377,6 +379,9 @@ public sealed partial class SnapshotService
         {
             while (hits.Count <= share && reader.Read())
             {
+                // CancellationTokenSource sets the token before it runs the interrupt callback, so a row the step
+                // produced in between is dropped here rather than returned.
+                page.CancellationToken.ThrowIfCancellationRequested();
                 examined++;
                 lastExamined = reader.GetInt64(0);
                 SearchRowReadHook?.Invoke(snapshot.Row.IdentityHash, page.CancellationToken);
