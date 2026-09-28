@@ -38,6 +38,9 @@ Sextant.Core        — models, project identity, configuration
 `.Daemon`/`.Mcp`) must **never** reference the service or ProcessStack — Phase 14 will orchestrate *over*
 the service's APIs, not the reverse (`ArchitectureBoundaryTests` asserts this).
 
+**Specs:** in-flight initiative specs live in `specs/<YYYYMMDD>-<kebab-name>/` (currently
+`specs/20260927-processstack-app-extraction/`); `docs/` remains the durable reference.
+
 ## Critical Rules
 
 - **MSBuildLocator.RegisterDefaults()** must be called before any Roslyn type loads (first call in `Program.cs`).

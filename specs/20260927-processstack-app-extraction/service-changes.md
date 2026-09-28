@@ -1,0 +1,402 @@
+# Service changes (SVC units)
+
+> **Approved at G1 (2026-09-27). Tracking: elevenworks/ProcessStack#3159.** Evidence refers to `jonlipsky/sextant` `origin/main` `9544f76`. **R** = required for the app; **N** = nice-to-have.
+> Global constraints for every unit:
+> - The core libraries get only generic, default-off hooks, and `ArchitectureBoundaryTests` stays green.
+> - The local stdio/CLI/daemon path stays byte-identical.
+> - The wire format stays snake_case (`src/Sextant.Service/ServiceJson.cs:9-13`).
+> - Migrations are forward-only and additive.
+> - Every new control route is audited (`src/Sextant.Store/AuditLogStore.cs:91`, actor hashed via `HashActor` `:218`).
+
+## Summary
+
+| SX | SVC | Unit | R/N | Main files |
+|---|---|---|---|---|
+| SX-1 | SVC-5 | Repository URL/host policy at intake | R | new `Sextant.Service/RepositoryUrlPolicy.cs`, `ServiceOptions.cs`, `ServiceApp.cs` ensure route |
+| SX-2 | SVC-1 | Selector always wired; opt-in fail-closed selection | R | `ServiceApp.cs:61-66`, `Sextant.Mcp/DatabaseProvider.cs`, `FederatedReadContext.cs` |
+| SX-3 | SVC-8 | Generic MCP-client compatibility test + comment cleanup | R (verification) | `tests/Sextant.Service.Tests`, `ServiceApp.cs:80-92` comment |
+| SX-4 | SVC-2 | Per-call selection through reserved tool args (`repository`, `branch`) | R | `ServiceApp.cs` MCP builder, `DatabaseProvider`, `SnapshotStore` |
+| SX-5 | SVC-3 | Caller-assertion verification + delegate tokens | R | new `Sextant.Service.Host/CallerAssertion*.cs`, `ServiceOptions.cs`, middleware `ServiceApp.cs:138-165` |
+| SX-6 | SVC-4 | Grants: migration 024, `/control/grants*`, grant authorizer, `list_repositories` | R | migration `024`, `Sextant.Store/RepositoryGrantStore.cs`, `Sextant.Service/GrantReadAuthorizer.cs`, `ServiceApp.cs` |
+| SX-7 | SVC-F | Federated `search_symbols` MCP tool | R (parity) | new `Sextant.Service/Mcp/SearchSymbolsTool.cs`, `ServiceApp.cs:115-125` |
+| SX-8 | SVC-6+7 | Branch-pointer semantics: `expected_head_commit`, `branch_update`, retire, resolve `commit_sha` | R | `ServiceContracts.cs`, `SnapshotService.cs`, `SnapshotStore.cs`, `IndexOrchestrator.cs`, `ServiceApp.cs` |
+| SX-12 | SVC-16 | Docs (service.md, onboarding Mode A rewrite, CLAUDE.md drift) | R at cutover | `docs/*`, `CLAUDE.md` |
+
+> **Allow-list mismatch.** PS's default gateway allow-list is `find_usages` / `search_symbols` (PS:`src/ProcessStack.Activities.Sextant/SextantGatewayOptions.cs:145-165`).
+> - **`find_usages` does not exist in the service.** The real tool is `find_references` (`src/Sextant.Mcp/Tools/FindReferencesTool.cs:11`).
+> - **`search_symbols` was gateway-native.** SVC-F now makes it a real service tool.
+> - Any PS-side default must use the names in `ServiceApp.RemoteQueryTools` (`src/Sextant.Service.Host/ServiceApp.cs:115-125`) plus the two tools added here.
+
+---
+
+## SVC-5 (SX-1): repository URL/host policy (R)
+
+**Today:**
+- `/control/ensure` passes `repository_remote_url` straight to `EnsureJob`, with no validation (`src/Sextant.Service.Host/ServiceApp.cs:224-251` → `SnapshotService.cs:424`).
+- Clone mode allows `https:http:file:ssh:git` for the top level (`src/Sextant.Service/CloningCheckoutProvider.cs:77`).
+- The only other checks are a hex commit and no userinfo (`:285-304`).
+- The file-transport test flag exists for **submodules only** (`:61-66`).
+
+**Contract.** A new pure class, `RepositoryUrlPolicy.Evaluate(string url) → {ok, canonical, host, owner, repo, reason}`, modeled on `SubmoduleUrlPolicy`.
+
+| Rule | Reject reason |
+|---|---|
+| Scheme must be `https`. `file` is allowed only under a new internal test-only `RepositoryUrlPolicy.AllowFileTransportForTesting`, which mirrors the submodule flag at `CloningCheckoutProvider.cs:61-66` | `scheme_not_allowed` |
+| No userinfo, query, fragment or non-443 port | `url_component_not_allowed` |
+| Host must match the DNS-label regex (`SubmoduleUrlPolicy.cs:45`) and have ≥2 labels. No IP literal, no `localhost`, no trailing dot | `host_not_allowed` |
+| Host must be in `REPOSITORY_HOSTS` (default `github.com`; `*` = any host that passes the shape rules) | `host_not_allowed` |
+| Path must be exactly `/{owner}/{repo}` with an optional `.git`. Segments match `[A-Za-z0-9._-]{1,100}`, must not start with `-`, and must not be `.` or `..` | `path_not_allowed` |
+| Optional owner allow-list: `REPOSITORY_OWNERS` = `host/owner` entries, `host/*` allowed | `owner_not_allowed` |
+
+- **Canonical form:** `https://{host}/{owner}/{repo}` folded with `RemoteUrlIdentity.Normalize` (`src/Sextant.Core/RemoteUrlIdentity.cs:39-89`). It is used for policy checks and grant keys (`repository_key`). **Submitted URLs are NOT rewritten**, because identity hashes the raw spelling (`ServiceContracts.cs:86-97`), so rewriting would re-index every repo once. Ensure uses the request URL as-is, and a grant stores its submitted spelling in `remote_url`. Identity canonicalization is SVC-15 (N).
+- **Applied at:**
+  - `/control/ensure`, before any job row exists;
+  - `/control/grants*` (SVC-4);
+  - `/control/branches/retire` (SVC-6+7);
+  - the `repository` tool arg (SVC-2), canonicalization only.
+- **Refusal:** `400 {"status":"rejected","reason":"<code>"}`, audited as `ensure`/`denied`. The URL is never echoed.
+
+| Env (`SEXTANT_SERVICE_…`) | Default | Notes |
+|---|---|---|
+| `REPOSITORY_HOSTS` | `github.com` | Comma list. A malformed entry fails startup. `*` logs a startup warning |
+| `REPOSITORY_OWNERS` | unset (any owner) | Recommended before a second tenant (see `security.md`) |
+
+**Tests:**
+- A table-driven policy test covering IPv4/IPv6 literals, `localhost`, single-label hosts, a trailing dot, userinfo, a port, a query, a fragment, a `-` prefix, `..`, `http`, `ssh`, scp-like, `file`, and an off-list host.
+- Canonicalization is idempotent.
+- The ensure route returns 400 with no job row created.
+- HTTP tests that ensure `file://` fixtures set the test flag. `SnapshotService`-direct clone tests bypass the route, so they are unaffected.
+- **Migration note:** a deployment in locate mode with non-GitHub remotes must set `REPOSITORY_HOSTS`. This is documented in SX-12.
+
+## SVC-1 (SX-2): selector always wired; fail-closed selection (R)
+
+**Today:**
+- `X-Sextant-Repository` is read only when `READ_POLICY` is on (`ServiceApp.cs:61-66`).
+- With several repos and no selector, a read is `Unscoped`, meaning across all repos (`src/Sextant.Mcp/FederatedReadContext.cs:83-86,115-121`; `SnapshotStore.GetSelectedSnapshotRow` `:848`).
+
+**Contract:**
+- **Always wire `RequestedRepositoryAccessor`** (`ServiceApp.cs:506-513`).
+- **New generic hook** `DatabaseProvider.RequireRepositorySelection : Func<bool>`, default `() => false`, so the local path is unchanged. When it returns true and no selector is present, `TryBeginRead` fails with a request-shaped error `repository_required` that names no repository and depends only on the request, so it is not an oracle.
+- **Service wiring:** `RequireRepositorySelection = () => options.RequireRepositorySelection || caller != null`. The caller half is wired in SX-5.
+- **Legacy `QUERY_TOKEN` with no header** keeps today's `Unscoped` behavior until G3, because the old PS gateway sends no selector.
+
+| Env | Default | Notes |
+|---|---|---|
+| `SEXTANT_SERVICE_REQUIRE_REPOSITORY_SELECTION` | `false` | Set `true` after G3 to fail closed for everyone |
+
+**Tests:**
+- The header is honored with `READ_POLICY` off.
+- A legacy token with no header is still Unscoped (a regression pin).
+- With the env on, a request with no selector gets `repository_required`.
+- Stdio `McpServerSetup` is unaffected.
+
+## SVC-8 (SX-3): generic MCP-client compatibility (R, verification)
+
+**Contract.** No behavior change.
+- **Test:** the MCP SDK `McpClient` + `HttpClientTransport` with static `AdditionalHeaders` (bearer). This is the shape PS uses at PS:`src/ProcessStack.Connections.Mcp/McpConnection.cs:431-437`. The test runs initialize → tools/list → tools/call against the stateless `/mcp` in a `WebApplicationFactory`.
+- **Cleanup:** rewrite the PS-gateway rationale comment at `ServiceApp.cs:80-92` as "stateless: any proxy or pooled client", and rename the framing of `tests/Sextant.Service.Tests/ServiceHttpTests.cs:219-287`.
+- **Extension:** SX-5 adds the case "delegate bearer, no assertion: initialize + tools/list succeed; tools/call → `caller_required`".
+
+## SVC-2 (SX-4): per-call selection through reserved tool args (R)
+
+**Why:**
+- PS-8 (F3) forwards `arguments` verbatim over a pooled connection that has only static headers, so per-call selection must travel in args.
+- Reads always pin the **default** branch (`SnapshotStore.cs:877`).
+
+**Contract.** The mechanism is MCP SDK 1.0.0 request filters (`WithRequestFilters` → `AddListToolsFilter` / `AddCallToolFilter`; package `ModelContextProtocol` 1.0.0 at `src/Sextant.Mcp/Sextant.Mcp.csproj:18`). The filters live in Service.Host only; stdio is unchanged.
+
+| Aspect | Rule |
+|---|---|
+| `tools/list` | Adds `repository` (string: `https://host/owner/repo[.git]`, `host/owner/repo`, or `owner/repo` when `REPOSITORY_HOSTS` has exactly one non-`*` host) and `branch` (string) to the `inputSchema` of every repo-scoped tool in `RemoteQueryTools`. Not added to `list_repositories` or `search_symbols`, which declare their own |
+| `tools/call` | Removes `repository`/`branch` from `arguments`, canonicalizes with SVC-5, and stores them in `HttpContext.Items`. Precedence: args > `X-Sextant-Repository` header. If both are present and differ: tool error `selector_conflict` |
+| Cross-repo tools | `find_cross_repository_usages` / `find_submodule_consumers` take `provider_repository_url` and call `TryBeginRead` with no selector (`src/Sextant.Mcp/Tools/FindCrossRepositoryUsagesTool.cs:19,29,36`). The selector defaults to `provider_repository_url` |
+| Branch | New generic `DatabaseProvider.RequestedBranch : Func<string?>` (default null) plus `SnapshotStore.GetSelectedSnapshotRowForRepositoryBranch(url, branch)`, which reads the branch pointer's complete snapshot, next to `:865-895`. `branch` without `repository` gives `repository_required` |
+| Miss | Unknown branch or no complete snapshot → the existing uniform not-found (enforcing) or the actionable message (local) |
+
+**Tests:**
+- The list schema contains both args.
+- A call strips the args and pins the repository; `branch` pins that branch's snapshot.
+- Conflict handling.
+- The cross-repo default.
+- Stdio `tools/list` is byte-identical.
+
+## SVC-3 (SX-5): caller-assertion verification (R)
+
+The contract is **PS-7 (F4)** (ProcessStack-side spec `20260927-outbound-caller-identity`). It is implemented in Service.Host, with no PS types. PS stamps an immutable `RunCaller` at run start, so the service never sees a caller derived from a run variable.
+
+| Env (`SEXTANT_SERVICE_…`) | Format | Startup validation (fail closed) |
+|---|---|---|
+| `DELEGATE_TOKENS` | `tok1;tok2` | Requires `CALLER_KEYS`. A delegate token must not equal the query, control or contribute token |
+| `CALLER_KEYS` | `kid=base64url@tenantId;…` | kid matches `[A-Za-z0-9._-]{1,64}` and is unique. The key decodes to ≥32 bytes. `tenantId` is non-empty. Several kids may map to one tenant (rotation); one kid maps to exactly one tenant |
+| `CALLER_AUDIENCE` | string (prod: `sextant`) | Required when `CALLER_KEYS` is set |
+| `CALLER_ISSUERS` | comma list | Optional. When set, `iss` must be one of them (PS `ApiBaseUrl`) |
+| `CALLER_HEADER` | default `X-ProcessStack-Caller` | Must match the connection's `callerIdentity.header` |
+| `CALLER_IDPS` | comma list, default `processstack` | Optional. The `idp` values allowed to act as `act=user`. Each entry matches `[a-z0-9-]{1,32}`. **v2.0: leave the default** (decided at G1, see below) |
+| `CALLER_APPS` | comma list (prod: `sextant`) | Optional; **R** to set in prod. An allow-list on the signed `app` claim. Unset = any app. The cheap mitigation for "another app bound to the same connection" (PS has no generic binding restriction; a generic PS issue tracks it) |
+
+**Verification, in this order.** Any failure in steps 1-9 → 401 `{"error":"invalid_caller_assertion"}` with `WWW-Authenticate: Bearer error="invalid_token"`. The reason is only logged, never with token material.
+1. Compact JWS with 3 base64url segments, ≤ 8 KiB.
+2. The JOSE header has `alg == "HS256"` exactly (no `none`, `HS512` or `RS*`), `typ` absent or `JWT`, and a `kid` that is known.
+3. HMAC-SHA256 over `b64(header).b64(payload)`, compared with `CryptographicOperations.FixedTimeEquals`.
+4. `aud` (a string, or an array containing it) equals `CALLER_AUDIENCE`, and `iss` passes when `CALLER_ISSUERS` is set.
+5. Timing, with `now` in UTC seconds and 60s skew:
+   - `nbf - 60 ≤ now ≤ exp + 60`;
+   - `iat ≤ now + 60`;
+   - `exp - iat ≤ 300`.
+6. **`tid == CALLER_KEYS[kid].tenantId`.** This is the multi-tenant guard.
+7. `act ∈ {user, application}`, with the claims tied to it:
+   - `act=user` ⇒ `idp` and `sub` are both non-empty;
+   - `act=application` ⇒ `idp` and `sub` are both absent.
+8. **`sub` shape matches `idp`.** This is a namespace guard: grants key on the full `sub`, so a platform id must never collide with an external peer id.
+   - `idp == processstack` ⇒ `sub` contains no `:` (a platform user id);
+   - any other `idp` ⇒ `sub` matches `{idp}:{connectionInstanceId}:{peerId}` (the prefix equals `idp`; both later segments are non-empty).
+9. `jti` is non-empty. `via ∈ {mcp-surface, activity}`. `tslug`, `app`, `dep` and `cid` are strings (recorded; `app` is also checked in step 11). Unknown claims are ignored.
+
+**Policy checks** run after a valid assertion. A failure → 403 `{"error":"caller_not_allowed"}` (for MCP `tools/call`, the tool error `caller_not_allowed`). The reason (`idp` or `app`) is only logged.
+
+10. `act=user` ⇒ `idp ∈ CALLER_IDPS`.
+11. If `CALLER_APPS` is set ⇒ `app ∈ CALLER_APPS`. This applies to every assertion-bearing request (delegate reads and grant routes), so another app bound to the same connections gets nothing. **Assertion-less control calls stay full-power until SVC-17.**
+
+**Output:** `CallerPrincipal {TenantId, Actor, Idp?, UserId?, App, Deployment, Connection, Via, Run?, KeyId, Jti}` in `HttpContext.Items`, exposed as `Func<CallerPrincipal?>`, like `PrincipalTokenAccessor` (`ServiceApp.cs:494`). `UserId` is the full `sub` string.
+
+> **Decided at G1: which idps act as users?**
+> - **Decision: `processstack` only in v2.0.** Then only PS-authenticated users (agents, CLI, web/api/cli chat) can hold per-user grants.
+> - **Consequence:** v1 keyed Slack-chat watches by the Slack id, and these would become `slack:{cid}:{peer}` grants. They are **not visible** to that person's PS-key agents, since that key's `sub` is the platform user id. So v2.0 refuses Slack-chat watch commands (`app.md`) and does not import Slack-keyed legacy memory.
+> - **Rejected alternative:** add `slack` to `CALLER_IDPS`. Slack users could then watch, but those grants would be visible only to Slack-originated calls. There is no cross-idp linking, which would be a separate PS identity-linking feature.
+
+| Request | Bearer | Assertion |
+|---|---|---|
+| `/mcp` `initialize`, `notifications/*`, `ping`, `tools/list` | delegate | Optional (pool connect, discovery); if present, it must verify |
+| `/mcp` `tools/call` | delegate | **Required**: the call-tool filter returns tool error `caller_required` |
+| `/query/*` | delegate | **Required** (401 in middleware) |
+| `/mcp`, `/query/*` | legacy `QUERY_TOKEN` or `READ_POLICY` principal | **Must be absent**; if present → 401 `assertion_not_allowed` |
+| `/control/grants*` | control | **Required** (SVC-4) |
+| other `/control/*` | control | Optional; if present it must verify, and it drives audit and the `act=user` checks (SVC-4) |
+
+- **Interim state:** in SX-5 alone, delegate reads use a deny-all authorizer, because there is no visibility source until SX-6. SX-5 and SX-6 deploy together at G2b.
+- **Audit actor:** `HashActor("{tid}/{sub}")` (`sub` is already idp-namespaced) or `HashActor("{tid}/app:{app}")`. The detail suffix is `idp,kid,via,cid,dep,jti`.
+
+**Tests:**
+- Positive vectors: a user caller (`idp=processstack`); an application caller; two kids for one tenant; `idp=slack` with a namespaced `sub` when `CALLER_IDPS=processstack,slack`.
+- Negative vectors:
+  - tampered payload; tampered signature;
+  - `alg` `none`, `HS512` and `RS256`;
+  - an unknown kid; a wrong `aud` or `iss`;
+  - expired beyond skew; `nbf` in the future; ttl above 300;
+  - **`tid` ≠ the kid's tenant**;
+  - `user` without `sub`; `user` without `idp`; `application` with `sub`; `application` with `idp`;
+  - `idp=processstack` with a `sub` containing `:`; `idp=slack` with an un-namespaced `sub` or a wrong prefix;
+  - oversized; a malformed segment.
+- Policy: `idp=slack` under the default `CALLER_IDPS` → 403 `caller_not_allowed`; `app=other` with `CALLER_APPS=sextant` → 403 on reads and grant routes; an assertion-less control call is unaffected.
+- The pool-connect case (SVC-8 extension).
+- A header sent with a legacy token → 401.
+- 20 parallel calls with distinct `sub`s each resolve their own caller.
+- Startup failures for a short key, a duplicate kid, a missing audience, and a malformed `CALLER_IDPS` entry.
+- Log redaction.
+
+## SVC-4 (SX-6): grants, visibility and `list_repositories` (R)
+
+**Migration `024_repository_grants.sql`.** Additive; `LatestSchemaVersion` auto-derives to 24.
+
+```sql
+CREATE TABLE repository_grants (
+    id INTEGER PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    principal TEXT NOT NULL,          -- the verified full `sub` (PS user id, or `{idp}:{cid}:{peer}`), or '*' = tenant-wide enrollment
+    repository_key TEXT NOT NULL,     -- RemoteUrlIdentity.Normalize(url): uniqueness + visibility match
+    remote_url TEXT NOT NULL,         -- first-submitted spelling (validated; e.g. GitHub clone_url), kept on
+                                      -- re-PUT so reconcile ensures hit the same snapshot identity
+    branch TEXT NOT NULL DEFAULT '',  -- '' = repository default branch
+    source TEXT NOT NULL,             -- 'self' | 'tenant' | 'import'
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (tenant_id, principal, repository_key, branch)
+);
+CREATE INDEX ix_grants_tenant_repo ON repository_grants(tenant_id, repository_key);
+```
+
+**Schema decisions:**
+- **No foreign key to `repositories`.** Watching usually happens before the first index. Creating `repositories` rows at grant time would add catalog rows with no snapshots and perturb the single-repository rule of `GetSelectedSnapshotRow` (`SnapshotStore.cs:848`).
+- **Sentinels `''` / `'*'` instead of NULL**, because SQLite `UNIQUE` treats NULLs as distinct.
+
+**Control API.** Every route needs the control bearer **and** a verified assertion. The principal comes **only** from the assertion. A body or query that contains `tenant_id`, `principal`, `sub` or `user` → 400 `principal_in_body`.
+
+| Route | `act` | Request | Response |
+|---|---|---|---|
+| `PUT /control/grants/self` | user | `{repository, branch?}` | `200 {grant:{repository, branch, source, created_at}, created}` |
+| `DELETE /control/grants/self?repository=&branch=` | user | `branch` omitted = the default-branch grant; `branch=*` = all branches | `200 {deleted: n}` |
+| `GET /control/grants/self` | user | — | `{grants:[{repository, branch, source, created_at, status}], result_count}` |
+| `PUT /control/grants/tenant` | application | `{repository, branch?}` | as for self (`principal='*'`) |
+| `DELETE /control/grants/tenant?repository=&branch=` | application | — | `{deleted: n}` |
+| `GET /control/grants?scope=tenant` | application | — | `{targets:[{repository, branch, sources:[self\|tenant\|import], watchers}], result_count}`. The **distinct** (repository, branch) set for reconcile, with counts only and **no user ids** |
+
+- **`targets[].repository`** is the `remote_url` of the oldest `'*'` grant for that key, or else of the oldest grant. `branch` is `''` for the default branch.
+- **`status`:** `{resolved_branch, snapshot_status: complete|partial|pending|missing, commit_sha?, published_at?, identity_hash?}`, read through `ReadCatalog` (never the writer), as `ResolveBranch` does (`SnapshotService.cs:1240-1257`).
+- **Error mapping:**
+  - 400 `rejected` (SVC-5 reason);
+  - 401 (no or invalid assertion);
+  - 403 `caller_not_allowed` (SVC-3 steps 10-11: idp or app not allowed);
+  - 403 `wrong_actor`;
+  - 409 `grant_limit` (`MAX_GRANTS_PER_PRINCIPAL`, default 200; `MAX_GRANTS_PER_TENANT`, default 5000).
+- **Audit:** a new `AuditActions.Grant` with outcome `accepted` or `denied`.
+
+**Visibility.** A repository is visible to a caller iff a grant exists for `(tid, sub, key)` or `(tid, '*', key)`, where `sub` is compared as the full, exact string (no idp stripping or cross-idp linking). For `act=application`, only `'*'` counts. Visibility is **repository-level**: any indexed branch of a visible repository is readable, and the `branch` column only drives indexing and reconcile targets.
+
+| Component | Rule |
+|---|---|
+| `GrantReadAuthorizer : IReadAuthorizer` (`src/Sextant.Mcp/SnapshotProvenance.cs:125-150`) | Lives in `Sextant.Service` and is built from delegates, like `PolicyReadAuthorizer` (`src/Sextant.Mcp/PolicyReadAuthorizer.cs:1-79`). `Authorize(selected)` and `AuthorizeRepository(id, url)` both apply the rule above, so the cross-repo tools inherit it |
+| Per-request composite (Service.Host) | Delegate caller → grants (`IsEnforcing=true`); `READ_POLICY` principal → `PolicyReadAuthorizer`; legacy query token → `AllowAll`. `IsEnforcing` is evaluated per call at `DatabaseProvider.cs:119`, so a per-request value works |
+| Implicit selection | A delegate request with no selector and exactly **one** visible repository that has a complete default-branch snapshot → select it; otherwise `repository_required` |
+| `/query/snapshots/{hash}/symbols` | For a delegate caller, authorized by grants in place of `AuthorizedForSnapshot`'s policy check (`ServiceApp.cs:422-433`), with the same uniform 404 |
+| `/control/ensure` with `act=user` | The repository must be visible → otherwise 403 `not_granted`. Trigger (`act=application`) and assertion-less control calls are unchanged |
+| `/control/status/{id}` with `act=user` | 404 unless the job's repository is visible (#77 opaque ids stays N) |
+
+**`list_repositories` MCP tool** (in `Sextant.Service`, added to `RemoteQueryTools`):
+- Input: `{}`.
+- Output: `{repositories:[{repository, sources, branches:[{branch, is_default, status, commit_sha?, published_at?}]}], meta}`.
+- A request with no caller gets `caller_required`.
+
+**Tests:**
+- Migration up plus the schema version.
+- Actor rules for every route; `principal_in_body`.
+- Union visibility.
+- **Cross-tenant:** with the same user id under a different kid/tenant, nothing is visible.
+- Revocation takes effect on the next call.
+- Cross-repo tools are filtered.
+- An ungranted repository gets a uniform not-found.
+- Implicit selection.
+- The limits; the ensure/status `act=user` gates; audit rows.
+- Reconcile targets contain no user ids.
+
+## SVC-F (SX-7): federated `search_symbols` (R, parity)
+
+**Replaces** PS's gateway-native `sextant.search_symbols` and `sextant.list_watched`; `list_watched` becomes `list_repositories`.
+
+**Semantic reference:**
+- Targets, auth and cursor handling: PS:`src/ProcessStack.Api/Mcp/SextantMcpProxy.cs:390-452`.
+- Result shape: PS `:553-600`.
+- Input schema: PS `:740-778`.
+- Page defaults: PS `:505-509` (50/200).
+- Field names follow the service page, because PS's DTO does not match it (overview finding 2).
+- **Renames.** Input `repo` → `repository` (consistent with SVC-2). Output is snake_case (`next_cursor`, not `nextCursor`).
+
+| Input | Type | Rule |
+|---|---|---|
+| `repository` | string? | Narrows to that repository's visible grants. `owner/repo` or a URL, canonicalized by SVC-5 |
+| `branch` | string? | Narrows to grants on that branch (ordinal; a `''` grant matches its resolved default branch name). **Absent = every granted branch** of each target, as in PS (`:406-414`) |
+| `name_prefix` | string? | **N, additive.** Case-insensitive prefix on `display_name` (PS had no text filter) |
+| `cursor` | string? | Opaque; a non-string is rejected |
+| `limit` | int? | Per snapshot; default 50, clamped to 1…200 |
+
+`additionalProperties: false`.
+
+**Algorithm:**
+1. Targets = the caller's visible grants, narrowed by `repository`/`branch`, → branch pointer → a complete snapshot.
+   - An empty target set gives the tool error `no_visible_repositories`. This error is uniform: an ungranted `repository` looks the same as no grants (PS: "you have no watched repos to search", `:416-423`).
+2. Dedup by `identity_hash` and order by it (ordinal).
+3. Cap the width at `SEARCH_MAX_WIDTH` (default 50); overflow is deferred into the cursor.
+4. Fetch each snapshot's page with `LocalBaseSnapshotSource` (`src/Sextant.Store/BaseSnapshotSource.cs`; cursor = `symbols.id`, `SnapshotPageRequest.CursorId` `:91-100`).
+5. Merge by `display_name` (ordinal) → `identity_hash` → cursor.
+6. A snapshot that fails to read goes into `unavailable` and keeps its resume position.
+7. A granted target that has no complete snapshot goes into `pending`.
+
+**Cursor:** `base64url(JSON {v:1, s:{hash: cursorId|"done"}, d:[deferred hashes]})`, at most 16 KiB. On resume, **only hashes still in the caller's visible set are honored**, so a forged or stale hash is dropped. It needs no HMAC because it is re-authorized on every call.
+
+**Output:** `{symbols:[{repository, branch, identity_hash, symbol_key, name, fully_qualified_name, kind, accessibility, project}], next_cursor, pending:[{repository, branch}], unavailable:[{repository, branch}], meta}`. `kind` and `accessibility` are rendered as enum **names**. Delivered as a text block plus `structuredContent`.
+
+**Tests:**
+- Two-repository merge order.
+- Resume across pages.
+- Width-cap deferral.
+- A grant revoked mid-pagination drops its hash.
+- A forged hash is ignored.
+- `pending`; `unavailable`; the branch filter; narrowing; the limit clamp; a non-string cursor.
+
+## SVC-6+7 (SX-8): branch-pointer semantics (R)
+
+**Today:**
+- The forward-only guard is `branch_head_sequence` (#84): `SnapshotStore.AdvanceBranchPointerForwardOnly` `:624-638`. A **null** sequence advances unconditionally on the worker path (`src/Sextant.Indexer/IndexOrchestrator.cs:1690-1707`).
+- The reuse paths are `SnapshotService.cs:1033-1053` (#162 attach-or-upgrade) and `:1070-1107` (sequence; `AdvanceOrAttachBranchPointer` / `…Core` `:1085`).
+- There is no retire.
+- `/control/resolve` has no `commit_sha`.
+
+**`EnsureSnapshotRequest` additions** (`src/Sextant.Service/ServiceContracts.cs:14-98`). None of them enter `ToIdentity`.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `expected_head_commit` | string? | Push `before`. `""` or an all-zero SHA = "the branch must have no pointer" (branch create) |
+| `forced` | bool? | Informational: audited, and **does not bypass the CAS** |
+| `branch_update` | `"advance"` (default) \| `"none"` | `none` = publish or attach the snapshot, and create or move **no** branch pointer (PR head/base, historical commits) |
+
+**Result addition:** `branch_advanced: bool?`.
+
+**Precedence** (evaluated inside the existing branch-advance write transaction on every path: the worker `AdvanceBranchToSnapshot`, both reuse paths, and #85 re-select):
+
+| # | Request carries | Decision |
+|---|---|---|
+| 0 | `branch_update: none` | No pointer change (the other guards are ignored) |
+| 1 | `expected_head_commit` + `branch_head_sequence` | 400 `conflicting_branch_guards` |
+| 2 | `expected_head_commit` | **CAS.** Advance iff the pointer is unset and the expected value is `""`, **or** the pointer's commit (`GetCommitSha`, `SnapshotStore.cs:454`) equals the expected value, **or** the pointer's target is unusable (not complete, or reclaimed). Otherwise attach only. The #85 re-select is allowed only when the CAS passes |
+| 3 | `branch_head_sequence` | Unchanged #84/#85 |
+| 4 | neither (NULL) | Unchanged: the worker advances unconditionally; reuse is #162 attach-or-upgrade |
+
+- **Plumbing:** `SnapshotContext` gains the generic nullable fields `ExpectedHeadCommit` and `SuppressBranchUpdate`. The local path leaves them null, so it is byte-identical. A new store method is `SnapshotStore.AdvanceBranchPointerIfHeadMatches(branchId, snapshotId, expected, now)`.
+- **Divergence from PS (decided at G1):** PS `BranchHeadGuard` made `forced` attach-only. **Here `forced` does not bypass the CAS:** the CAS on `before` already orders events, so a force-push whose `before` matches advances immediately instead of waiting for the nightly reconcile. Parity would have been "forced ⇒ attach only".
+
+**Retire.** `POST /control/branches/retire`, body `{repository, branch, expected_head_commit?}`:
+- Deletes the branch row; the snapshots remain for retention.
+- Idempotent: a missing branch returns `200 {retired:false}`.
+- A CAS mismatch → 409 `head_mismatch`, because a newer push re-created the branch.
+- The default branch → 409 `default_branch`.
+- SVC-5 policy applies; audited.
+
+**`/control/resolve` additions** (`ServiceApp.cs:261-273`): `commit_sha`, `branch` (the resolved name), `is_default`, `head_sequence`.
+
+**Tests:**
+- CAS:
+  - a match advances; a stale `before` attaches only;
+  - branch create with no pointer advances; with a pointer it attaches;
+  - forced with a match advances;
+  - two pushes out of order converge on the newer one;
+  - the worker path and the pre-built reuse path converge.
+- Guards:
+  - `none` never creates a branch row;
+  - both guards → 400.
+- Retire: with and without CAS; the default branch; idempotence.
+- `resolve` returns `commit_sha`.
+- The local CLI's branch state is byte-identical.
+
+---
+
+## N units (not needed for the cutover)
+
+| SVC | Unit | Note |
+|---|---|---|
+| 9 | Bounded background retry of transient requeues | #155 |
+| 10 | Service-side reconcile over grants (`ls-remote`) | Needs #111 for private repos. The app covers this in the meantime |
+| 11 | Per-request checkout token on ensure | #111; **R before a second org/tenant** (see `security.md`) |
+| 12 | `GET /control/repositories`, `/control/snapshots` | Operator UX |
+| 13 | MCP control tools | Not needed; the app exposes processes |
+| 14 | #145 absolute paths, #134 scope fails open, #77 opaque ids | **Strongly advised before multi-tenant** |
+| 15 | Identity-hash URL canonicalization | Needs a re-index plan |
+| 17 | Scoped app control token (`APP_CONTROL_TOKENS`: ensure, status, resolve, grants, branches only; no retention, backup, pilot or contribute) | Least privilege for `sextant-control`. Until it lands, **assertion-less control calls stay full-power**: `CALLER_APPS` gates only assertion-bearing requests. N for the single-app, single-tenant cutover; **R before a second app or tenant** |
+| 18 | `jti` replay cache (bounded, until `exp`) | PS-7 mints one assertion per HTTP request, so this is safe to add |
+| 19 | HTTP routes for PR retention roots (`RegisterPullRequestSnapshot` / `ClosePullRequestSnapshot`, `SnapshotService.cs:1407,1447`) + the app on `pull_request.closed` | Keeps open-PR snapshots from being GC'd |
+| 20 | `commit` selector arg (SVC-2 extension) | Lets agents query PR-head snapshots created with `branch_update: none` |
+
+## PR order and conflicts
+
+`ServiceApp.cs` is the hotspot:
+- the DI block `:51-71`;
+- the MCP builder `:93-102`;
+- `RemoteQueryTools` `:115-125`;
+- the middleware `:138-165`;
+- the control maps `:216-362`.
+
+| SX | Touches in `ServiceApp.cs` | Stack |
+|---|---|---|
+| SX-1 | the ensure route | Independent; land first |
+| SX-3 | a comment at `:80-92` | Parallel; trivial rebase |
+| SX-2 → SX-4 → SX-5 → SX-6 → SX-7 | DI, MCP filters, middleware, control maps, tool list | **Stacked** (same regions) |
+| SX-8 | resolve route, new retire route | Parallel with the chain. Rebase after SX-6 (both add control maps). Also touches `SnapshotService`/`IndexOrchestrator`, which the chain does not |
+| SX-12 | docs | Last |
