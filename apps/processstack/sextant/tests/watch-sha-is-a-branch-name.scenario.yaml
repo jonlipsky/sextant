@@ -1,0 +1,81 @@
+name: watch-sha-is-a-branch-name
+description: >
+  (#203 item 1) A commit SHA in a chat message never reaches an ensure. "watch X on <sha>" names a branch,
+  so the grant is recorded for that branch name. GitHub has no branch of that name, so there is no head to
+  index and no ensure is sent. A first ensure's commit only ever comes from GitHub's branch listing.
+entrypoint: configure-watched-repos
+principal:
+  userId: u-alice
+inputs:
+  # The prompt-trigger envelope `app test` needs to route SendConnectionMessage (the platform sets these).
+  tenantId: "sextant-test"
+  applicationInstanceId: "sextant-test-instance"
+  conversationId: "conv-watch-sha-is-a-branch-name"
+  prompt: "watch octocat/hello-world on 553c2077f0edc3d5dc5d17262f6aa498e69d6f8e"
+  isFirstTurn: false
+  channelType: "web"
+http:
+  # Shape: GitHub REST GET /repos/{owner}/{repo} (read by GitHubGetRepository through Octokit).
+  - connection: github
+    method: GET
+    path: /repos/octocat/hello-world
+    body:
+      id: 1296269
+      name: hello-world
+      full_name: octocat/hello-world
+      owner: { login: octocat, id: 1 }
+      private: false
+      default_branch: main
+      html_url: "https://github.com/octocat/hello-world"
+      clone_url: "https://github.com/octocat/hello-world.git"
+  # Shape: GitHub REST GET /repos/{owner}/{repo}/branches (read by GitHubListBranches through Octokit).
+  - connection: github
+    method: GET
+    path: /repos/octocat/hello-world/branches
+    body:
+      - name: main
+        commit: { sha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d", url: "https://api.github.com/repos/octocat/hello-world/commits/7fd1a60b01f91b314f59955a4e4d4e80d8edf11d" }
+        protected: false
+  # Shape: PUT /control/grants/self → {grant, created} (src/Sextant.Service.Host/GrantEndpoints.cs).
+  - connection: sextant-control
+    method: PUT
+    path: /control/grants/self
+    body:
+      grant: { repository: "https://github.com/octocat/hello-world.git", branch: "553c2077f0edc3d5dc5d17262f6aa498e69d6f8e", source: self, created_at: 1760000000 }
+      created: true
+  # Shape: GET /control/grants/self → {grants: [{repository, branch, source, created_at, status}], result_count}
+  # (src/Sextant.Service.Host/GrantEndpoints.cs, src/Sextant.Service/Grants/GrantContracts.cs).
+  - connection: sextant-control
+    method: GET
+    path: /control/grants/self
+    body:
+      grants:
+        - repository: "https://github.com/octocat/hello-world.git"
+          branch: "553c2077f0edc3d5dc5d17262f6aa498e69d6f8e"
+          source: self
+          created_at: 1760000000
+          status: { resolved_branch: "553c2077f0edc3d5dc5d17262f6aa498e69d6f8e", snapshot_status: missing }
+      result_count: 1
+  - connection: sextant-control
+    method: POST
+    path: /control/ensure
+    status: 500
+expected:
+  status: Completed
+  variables:
+    verb: watch
+    agentResponse: "Now watching octocat/hello-world on 553c2077f0edc3d5dc5d17262f6aa498e69d6f8e. The branch has no commits on GitHub yet; it will be indexed when it is pushed."
+  httpCalls:
+    - connection: github
+      method: GET
+      path: /repos/octocat/hello-world/branches
+      count: 1
+    - connection: sextant-control
+      method: PUT
+      path: /control/grants/self
+      bodyMatch: { repository: "https://github.com/octocat/hello-world.git", branch: "553c2077f0edc3d5dc5d17262f6aa498e69d6f8e" }
+      count: 1
+    - connection: sextant-control
+      method: POST
+      path: /control/ensure
+      count: 0

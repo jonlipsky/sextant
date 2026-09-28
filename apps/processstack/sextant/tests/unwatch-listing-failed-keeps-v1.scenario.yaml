@@ -1,0 +1,45 @@
+name: unwatch-listing-failed-keeps-v1
+description: >
+  "stop watching X on feature/x" removes the named grant, but the caller's grant listing then fails (503),
+  so a default-branch watch resolving to feature/x cannot be ruled out: the reply reports the removal, and
+  the v1 entry is kept rather than dropping a watch the service may still hold.
+entrypoint: revoke-watch
+principal:
+  userId: u-alice
+inputs:
+  host: github.com
+  owner: octocat
+  repo: hello-world
+  remoteUrl: "https://github.com/octocat/hello-world.git"
+  branch: feature/x
+seed:
+  userMemory:
+    - key: "sextant.watched-repos:github.com/octocat/hello-world@feature/x"
+      value: '{"owner":"octocat","repo":"hello-world","branch":"feature/x","cloneUrl":"https://github.com/octocat/hello-world.git","addedAt":"2026-01-01T00:00:00+00:00"}'
+http:
+  - connection: sextant-control
+    method: DELETE
+    path: /control/grants/self
+    body: { deleted: 1 }
+  - connection: sextant-control
+    method: GET
+    path: /control/grants/self
+    status: 503
+    body: { status: unavailable }
+expected:
+  status: Completed
+  variables:
+    deleted: 1
+    tombstoned: 0
+    serviceClear: false
+    memoryKeys: ""
+    message: "Stopped watching octocat/hello-world on feature/x. Existing snapshots are left in place."
+  httpCalls:
+    - connection: sextant-control
+      method: DELETE
+      path: /control/grants/self
+      count: 1
+    - connection: sextant-control
+      method: GET
+      path: /control/grants/self
+      count: 1

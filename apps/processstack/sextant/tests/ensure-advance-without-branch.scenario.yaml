@@ -1,0 +1,30 @@
+name: ensure-advance-without-branch
+description: >
+  An advance with no branch name cannot move a pointer, so it is sent as branch_update "none" without a
+  compare-and-swap.
+entrypoint: ensure
+principal:
+  userId: u-alice
+inputs:
+  repositoryRemoteUrl: "https://github.com/octocat/hello-world.git"
+  commitSha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+  branchUpdate: advance
+  expectedHeadCommit: "1111111111111111111111111111111111111111"
+http:
+  - connection: sextant-control
+    method: POST
+    path: /control/ensure
+    body: { job_id: 42, identity_hash: "9b1d", status: complete, snapshot_id: 7, attached: true }
+expected:
+  status: Completed
+  variables:
+    outcome: attached
+    effectiveUpdate: none
+    snapshotId: "7"
+    terminal: true
+  httpCalls:
+    - connection: sextant-control
+      method: POST
+      path: /control/ensure
+      bodyMatch: { branch_update: none, expected_head_commit: null }
+      count: 1

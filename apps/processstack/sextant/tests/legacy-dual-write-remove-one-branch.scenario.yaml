@@ -1,0 +1,24 @@
+name: legacy-dual-write-remove-one-branch
+description: >
+  Removing one branch tombstones only that branch's entry (the value "null", which v1 skips).
+entrypoint: legacy-dual-write
+principal:
+  userId: u-alice
+inputs:
+  operation: remove
+  host: github.com
+  owner: octocat
+  repo: hello-world
+  branch: main
+seed:
+  userMemory:
+    - key: "sextant.watched-repos:github.com/octocat/hello-world@main"
+      value: '{"owner":"octocat","repo":"hello-world","branch":"main","cloneUrl":"https://github.com/octocat/hello-world.git","addedAt":"2026-01-01T00:00:00+00:00"}'
+    - key: "sextant.watched-repos:github.com/octocat/hello-world@feature/x"
+      value: '{"owner":"octocat","repo":"hello-world","branch":"feature/x","cloneUrl":"https://github.com/octocat/hello-world.git","addedAt":"2026-01-01T00:00:00+00:00"}'
+expected:
+  status: Completed
+  variables:
+    keys: "github.com/octocat/hello-world@main"
+    count: 1
+    value: "null"

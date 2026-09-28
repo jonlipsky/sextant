@@ -1,0 +1,31 @@
+name: ensure-refuses-invalid-branch
+description: >
+  ensure validates its own inputs (elevenworks/ProcessStack#3287: internal is not enforced on a direct run).
+  The branch name must pass the chat parser's rule (git check-ref-format --branch, through
+  SextantNormalizeRepository); an invalid one is refused without calling the service.
+entrypoint: ensure
+principal:
+  userId: u-alice
+inputs:
+  repositoryRemoteUrl: "https://github.com/octocat/hello-world.git"
+  commitSha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+  branchName: "main..x"
+  branchUpdate: advance
+  expectedHeadCommit: ""
+http:
+  - connection: sextant-control
+    method: POST
+    path: /control/ensure
+    status: 202
+    body: { job_id: 42, identity_hash: "9b1d", status: queued, attached: false }
+expected:
+  status: Completed
+  variables:
+    outcome: rejected
+    reason: invalid_branch
+    statusCode: 0
+  httpCalls:
+    - connection: sextant-control
+      method: POST
+      path: /control/ensure
+      count: 0

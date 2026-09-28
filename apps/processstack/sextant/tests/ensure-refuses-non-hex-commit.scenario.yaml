@@ -1,0 +1,30 @@
+name: ensure-refuses-non-hex-commit
+description: >
+  ensure validates its own inputs (elevenworks/ProcessStack#3287: internal is not enforced on a direct run).
+  commit_sha must be a full lower-case commit SHA; a ref name is refused without calling the service.
+entrypoint: ensure
+principal:
+  userId: u-alice
+inputs:
+  repositoryRemoteUrl: "https://github.com/octocat/hello-world.git"
+  commitSha: "main"
+  branchName: main
+  branchUpdate: advance
+  expectedHeadCommit: ""
+http:
+  - connection: sextant-control
+    method: POST
+    path: /control/ensure
+    status: 202
+    body: { job_id: 42, identity_hash: "9b1d", status: queued, attached: false }
+expected:
+  status: Completed
+  variables:
+    outcome: rejected
+    reason: invalid_commit
+    statusCode: 0
+  httpCalls:
+    - connection: sextant-control
+      method: POST
+      path: /control/ensure
+      count: 0

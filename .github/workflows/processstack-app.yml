@@ -1,6 +1,7 @@
 name: ProcessStack app
 
-# Tests and publishes the Sextant ProcessStack app's activities (apps/processstack/). The app builds
+# Tests and publishes the Sextant ProcessStack app's activities (apps/processstack/), then validates the
+# app and runs its scenario tests with the processstack CLI. The app builds
 # against ProcessStack.Abstractions from a private package feed, so it has its own solution
 # (apps/processstack/sextant/Sextant.ProcessStack.slnx) and this separate workflow; the public
 # "Build & Test" gate never needs the feed.
@@ -58,7 +59,7 @@ jobs:
           PACKAGES_TOKEN: ${{ secrets.PROCESSSTACK_PACKAGES_TOKEN }}
         run: |
           if [ -z "${PACKAGES_TOKEN}" ]; then
-            echo "::notice title=ProcessStack app skipped::The PROCESSSTACK_PACKAGES_TOKEN secret is not available to this run (not configured, or a fork PR), so the app's activities were not restored, tested or published. Add the secret (a token with read:packages on the package feed) to enable this job."
+            echo "::notice title=ProcessStack app skipped::The PROCESSSTACK_PACKAGES_TOKEN secret is not available to this run (not configured, or a fork PR), so the app's activities were not restored, tested or published and the app was not validated or tested. Add the secret (a token with read:packages on the package feed) to enable this job."
             echo "available=false" >> "${GITHUB_OUTPUT}"
           else
             echo "available=true" >> "${GITHUB_OUTPUT}"
@@ -90,6 +91,24 @@ jobs:
           MSBUILDDISABLENODEREUSE: '1'
           DOTNET_CLI_USE_MSBUILD_SERVER: '0'
         run: bash apps/processstack/sextant/build.sh
+
+      # The CLI comes from the same feed (apps/processstack/nuget.config maps ProcessStack.Cli to it). It
+      # runs from apps/processstack so NuGet reads that config, credentials included.
+      - name: Install the processstack CLI
+        if: steps.feed.outputs.available == 'true'
+        working-directory: apps/processstack
+        run: |
+          dotnet tool install -g ProcessStack.Cli --version 1.1.1
+          echo "${HOME}/.dotnet/tools" >> "${GITHUB_PATH}"
+
+      # Both load the bundle published above (activities/sextant/, gitignored), so they run after it.
+      - name: Validate the app
+        if: steps.feed.outputs.available == 'true'
+        run: processstack app validate -p apps/processstack/sextant
+
+      - name: Run the app's scenario tests
+        if: steps.feed.outputs.available == 'true'
+        run: processstack app test -p apps/processstack/sextant --all
 
       - name: Remove the feed credential
         if: always() && steps.feed.outputs.available == 'true'

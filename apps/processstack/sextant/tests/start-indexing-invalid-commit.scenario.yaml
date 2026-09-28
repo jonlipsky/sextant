@@ -1,0 +1,18 @@
+name: start-indexing-invalid-commit
+description: >
+  A commit that is not a full hex SHA is refused before any service call.
+entrypoint: start-indexing
+principal:
+  userId: u-alice
+inputs:
+  repositoryRemoteUrl: "https://github.com/octocat/hello-world.git"
+  commitSha: "main"
+http:
+  - path: "/**"
+    status: 500
+expected:
+  status: Completed
+  variables:
+    outcome: rejected
+  httpCalls:
+    - count: 0

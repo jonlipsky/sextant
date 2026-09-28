@@ -32,6 +32,9 @@ public sealed class SextantNormalizeRepositoryActivity : AbstractActivity
     [ActivityInput("defaultHost", Description = "The host for owner/repo (default github.com).", DefaultValue = RepositoryReference.DefaultHost)]
     public string? DefaultHost { get; set; } = RepositoryReference.DefaultHost;
 
+    [ActivityInput("branch", Description = "Optional branch name to check with the chat parser's rule: a leading refs/heads/ is dropped, then git check-ref-format --branch. Independent of the URL verdict.")]
+    public string? Branch { get; set; }
+
     [ActivityOutput("remoteUrl", Description = "The URL to send as repository_remote_url / repository; \"\" when not accepted.")]
     public string RemoteUrl { get; set; } = string.Empty;
 
@@ -52,6 +55,12 @@ public sealed class SextantNormalizeRepositoryActivity : AbstractActivity
 
     [ActivityOutput("reason", Description = "Why the URL is not accepted: an SVC-5 reason code, or missing_repository; \"\" when accepted.")]
     public string Reason { get; set; } = string.Empty;
+
+    [ActivityOutput("branchName", Description = "The checked branch name (without refs/heads/); \"\" when branch is empty or invalid.")]
+    public string BranchName { get; set; } = string.Empty;
+
+    [ActivityOutput("branchValid", Description = "True when branch is empty or a valid branch name; false when a branch was named and is invalid.")]
+    public bool BranchValid { get; set; } = true;
 
     public SextantNormalizeRepositoryActivity() => Name = TypeName;
 
@@ -77,9 +86,16 @@ public sealed class SextantNormalizeRepositoryActivity : AbstractActivity
         RepositoryOwner = verdict.SpelledOwner;
         RepositoryName = verdict.SpelledRepo;
 
-        // Never log the URL: a refused one may carry credentials.
+        var named = ActivityValues.Text(ActivityValues.Input(this, "branch", Branch));
+        var branch = GitRefs.StripHeadsPrefix(named);
+        BranchValid = named.Length == 0 || GitRefs.IsValidBranchName(branch);
+        BranchName = BranchValid ? branch : string.Empty;
+
+        // Never log the URL or the branch: a refused URL may carry credentials, and both are caller text.
         if (!verdict.Ok)
             context.LogWarning($"{TypeName}: repository not accepted ({verdict.Reason}).");
+        if (!BranchValid)
+            context.LogWarning($"{TypeName}: branch name not accepted.");
         return Task.CompletedTask;
     }
 

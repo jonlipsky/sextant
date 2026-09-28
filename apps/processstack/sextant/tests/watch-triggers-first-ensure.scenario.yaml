@@ -1,0 +1,81 @@
+name: watch-triggers-first-ensure
+description: >
+  (#5) When the watched branch has no snapshot (snapshot_status missing), the head is read from GitHub
+  and the first ensure advances the branch with the compare-and-swap expected_head_commit "".
+entrypoint: grant-watch
+principal:
+  userId: u-alice
+inputs:
+  host: github.com
+  owner: octocat
+  repo: hello-world
+http:
+  # Shape: GitHub REST GET /repos/{owner}/{repo} (read by GitHubGetRepository through Octokit).
+  - connection: github
+    method: GET
+    path: /repos/octocat/hello-world
+    body:
+      id: 1296269
+      name: hello-world
+      full_name: octocat/hello-world
+      owner: { login: octocat, id: 1 }
+      private: false
+      default_branch: main
+      html_url: "https://github.com/octocat/hello-world"
+      clone_url: "https://github.com/octocat/hello-world.git"
+  # Shape: GitHub REST GET /repos/{owner}/{repo}/branches (read by GitHubListBranches through Octokit).
+  - connection: github
+    method: GET
+    path: /repos/octocat/hello-world/branches
+    body:
+      - name: main
+        commit: { sha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d", url: "https://api.github.com/repos/octocat/hello-world/commits/7fd1a60b01f91b314f59955a4e4d4e80d8edf11d" }
+        protected: false
+      - name: feature/x
+        commit: { sha: "b3cbd5bbd7e81436d2eee04537ea2b4c0cad4cdf", url: "https://api.github.com/repos/octocat/hello-world/commits/b3cbd5bbd7e81436d2eee04537ea2b4c0cad4cdf" }
+        protected: false
+  # Shape: PUT /control/grants/self → {grant, created} (src/Sextant.Service.Host/GrantEndpoints.cs).
+  - connection: sextant-control
+    method: PUT
+    path: /control/grants/self
+    body:
+      grant: { repository: "https://github.com/octocat/hello-world.git", branch: "", source: self, created_at: 1760000000 }
+      created: true
+  # Shape: GET /control/grants/self → {grants: [{repository, branch, source, created_at, status}], result_count}
+  # (src/Sextant.Service.Host/GrantEndpoints.cs, src/Sextant.Service/Grants/GrantContracts.cs).
+  - connection: sextant-control
+    method: GET
+    path: /control/grants/self
+    body:
+      grants:
+        - repository: "https://github.com/octocat/hello-world.git"
+          branch: ""
+          source: self
+          created_at: 1760000000
+          status: { resolved_branch: main, snapshot_status: missing }
+      result_count: 1
+  - connection: sextant-control
+    method: POST
+    path: /control/ensure
+    status: 202
+    body: { job_id: 42, identity_hash: "9b1d", status: queued, attached: false }
+expected:
+  status: Completed
+  variables:
+    needsIndex: true
+    ensureOutcome: ok
+    message: "Now watching octocat/hello-world on main (the default branch). Indexing has started."
+  httpCalls:
+    - connection: sextant-control
+      method: POST
+      path: /control/ensure
+      caller: { act: user, idp: processstack, sub: u-alice }
+      bodyMatch:
+        repository_remote_url: "https://github.com/octocat/hello-world.git"
+        commit_sha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+        branch_name: main
+        branch_update: advance
+        expected_head_commit: ""
+        default_branch: null
+        branch_head_sequence: null
+      count: 1

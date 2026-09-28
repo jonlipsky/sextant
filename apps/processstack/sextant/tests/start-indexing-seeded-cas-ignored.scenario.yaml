@@ -1,0 +1,76 @@
+name: start-indexing-seeded-cas-ignored
+description: >
+  Pins elevenworks/ProcessStack#3286: an MCP tools/call turns every argument into a run input, declared or
+  not, and a variables default only fills a name that is still unset. So a caller can seed the internal
+  compare-and-swap value expectedHead (and resolveJson, read on the resolve-200 path). The service holds no
+  head for the branch (resolve 404), so the only correct CAS is "" (the branch must not exist yet). Before
+  the fix, the 404 route never assigned expectedHead and the ensure carried the seeded head: a push that
+  moved the service to that head between the resolve and the ensure would pass the CAS and be rolled back.
+entrypoint: start-indexing
+principal:
+  userId: u-alice
+inputs:
+  repositoryRemoteUrl: "https://github.com/octocat/hello-world.git"
+  commitSha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+  branchName: main
+  # Undeclared arguments naming internal variables.
+  expectedHead: "553c2077f0edc3d5dc5d17262f6aa498e69d6f8e"
+  resolveJson: { commit_sha: "553c2077f0edc3d5dc5d17262f6aa498e69d6f8e" }
+  advanceRequested: false
+  ensurePublished: true
+  githubHead: "553c2077f0edc3d5dc5d17262f6aa498e69d6f8e"
+  branch: other
+http:
+  # Shape: GitHub REST GET /repos/{owner}/{repo} (read by GitHubGetRepository through Octokit).
+  - connection: github
+    method: GET
+    path: /repos/octocat/hello-world
+    body:
+      id: 1296269
+      name: hello-world
+      full_name: octocat/hello-world
+      owner: { login: octocat, id: 1 }
+      private: false
+      default_branch: main
+      html_url: "https://github.com/octocat/hello-world"
+      clone_url: "https://github.com/octocat/hello-world.git"
+  # Shape: GitHub REST GET /repos/{owner}/{repo}/branches (read by GitHubListBranches through Octokit).
+  - connection: github
+    method: GET
+    path: /repos/octocat/hello-world/branches
+    body:
+      - name: main
+        commit: { sha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d", url: "https://api.github.com/repos/octocat/hello-world/commits/7fd1a60b01f91b314f59955a4e4d4e80d8edf11d" }
+        protected: false
+  # Shape: GET /control/resolve → 404 when the service holds no head for the branch
+  # (src/Sextant.Service.Host/ServiceApp.cs).
+  - connection: sextant-control
+    method: GET
+    path: /control/resolve
+    status: 404
+    body: { status: not_found }
+  # Shape: POST /control/ensure?wait=false → EnsureSnapshotResult, 202 while not terminal
+  # (src/Sextant.Service.Host/ServiceApp.cs, src/Sextant.Service/ServiceContracts.cs).
+  - connection: sextant-control
+    method: POST
+    path: /control/ensure
+    status: 202
+    body: { job_id: 42, identity_hash: "9b1d", status: queued, attached: false }
+expected:
+  status: Completed
+  variables:
+    outcome: ok
+    jobId: "42"
+    expectedHead: ""
+    advanceRequested: true
+    message: "Indexing job 42 is queued."
+  httpCalls:
+    - connection: sextant-control
+      method: POST
+      path: /control/ensure
+      bodyMatch:
+        branch_name: main
+        branch_update: advance
+        commit_sha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+        expected_head_commit: ""
+      count: 1
