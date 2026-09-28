@@ -1,7 +1,7 @@
 name: repo-pr-opened
 description: >
-  (#19) An opened pull request publishes its base and head commits with branch_update none, so no branch
-  pointer moves and no grant is recorded. The head is in the base repository, so it is ensured too, under
+  (#19) An opened pull request waits for the tenant grant (the application-only answer), then publishes its
+  base and head commits with branch_update none, so no branch pointer moves. The head is in the base repository, so it is ensured too, under
   its own branch name.
 entrypoint: on-repository-change
 event:
@@ -20,6 +20,13 @@ event:
   headCloneUrl: "https://github.com/octocat/hello-world.git"
   merged: "false"
 http:
+  # Shape: 200 {grant, created} (src/Sextant.Service.Host/GrantEndpoints.cs). Every call waits for it.
+  - connection: sextant-control
+    method: PUT
+    path: /control/grants/tenant
+    body:
+      grant: { repository: "https://github.com/octocat/hello-world.git", branch: "", source: tenant, created_at: 1760000000 }
+      created: false
   - connection: sextant-control
     method: POST
     path: /control/ensure
@@ -36,14 +43,17 @@ expected:
   variables:
     action: ensure
     reason: ""
-    grantOutcome: ""
+    grantOutcome: granted
     ensureOutcome: attached
     headEnsureOutcome: ok
     enrollment: ""
   httpCalls:
     - connection: sextant-control
+      method: PUT
       path: /control/grants/tenant
-      count: 0
+      caller: { act: "!absent" }
+      bodyMatch: { repository: "https://github.com/octocat/hello-world.git" }
+      count: 1
     - connection: sextant-control
       method: POST
       path: /control/ensure

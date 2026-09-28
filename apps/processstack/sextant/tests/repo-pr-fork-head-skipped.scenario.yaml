@@ -20,6 +20,13 @@ event:
   headCloneUrl: "https://github.com/contributor/hello-world.git"
   merged: "false"
 http:
+  # Shape: 200 {grant, created} (src/Sextant.Service.Host/GrantEndpoints.cs). Every call waits for it.
+  - connection: sextant-control
+    method: PUT
+    path: /control/grants/tenant
+    body:
+      grant: { repository: "https://github.com/octocat/hello-world.git", branch: "", source: tenant, created_at: 1760000000 }
+      created: false
   - connection: sextant-control
     method: POST
     path: /control/ensure
@@ -29,11 +36,17 @@ expected:
   variables:
     action: ensure
     reason: fork_head
-    grantOutcome: ""
+    grantOutcome: granted
     ensureOutcome: attached
     headEnsureOutcome: ""
     enrollment: ""
   httpCalls:
+    - connection: sextant-control
+      method: PUT
+      path: /control/grants/tenant
+      caller: { act: "!absent" }
+      bodyMatch: { repository: "https://github.com/octocat/hello-world.git" }
+      count: 1
     - connection: sextant-control
       method: POST
       path: /control/ensure
@@ -47,6 +60,3 @@ expected:
         branch_name: main
         branch_update: none
       count: 1
-    - connection: sextant-control
-      path: /control/grants/tenant
-      count: 0

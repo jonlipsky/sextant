@@ -14,6 +14,13 @@ event:
   refType: branch
   branch: feature/x
 http:
+  # Shape: 200 {grant, created} (src/Sextant.Service.Host/GrantEndpoints.cs). Every call waits for it.
+  - connection: sextant-control
+    method: PUT
+    path: /control/grants/tenant
+    body:
+      grant: { repository: "https://github.com/octocat/hello-world.git", branch: "", source: tenant, created_at: 1760000000 }
+      created: false
   - connection: github
     method: GET
     path: /repos/octocat/hello-world/branches
@@ -30,4 +37,10 @@ expected:
     retireOutcome: ""
   httpCalls:
     - connection: sextant-control
-      count: 0
+      method: PUT
+      path: /control/grants/tenant
+      caller: { act: "!absent" }
+      bodyMatch: { repository: "https://github.com/octocat/hello-world.git" }
+      count: 1
+    - connection: sextant-control
+      count: 1

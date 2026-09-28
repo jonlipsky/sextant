@@ -128,11 +128,13 @@ As built (SX-9), `ensure` sends neither `default_branch` nor `forced`: SX-10's p
 
 ### `on-repository-change` (`act=application`)
 
-| Event / condition (as built, SX-10) | Steps |
+**Every actionable event runs `tenant-grant` first** with `{repository: cloneUrl}` (`PUT /control/grants/tenant`, the default-branch enrollment, idempotent; there is no per-feature-branch tenant grant). Only an answer of `granted` or `limit`, which only an application caller gets, lets the steps below run. Any other answer (a user's direct run gets 403) sends nothing else: no ensure, no GitHub listing, no retire.
+
+| Event / condition (as built, SX-10) | Steps (after the grant) |
 |---|---|
 | push, `refType == tag`; `create`; closed or edited pull request; malformed event | No-op (`Log`; the planner's `reason`) |
 | push, `deleted == true` | `HttpRequest POST /control/branches/retire {repository: cloneUrl, branch, expected_head_commit: before}` (409 `head_mismatch`/`default_branch` → `Log`). Then, **only for the default branch and only after the service accepted the retire**, `DeleteAppValue` removes the enrolled row. v1 enrolls only on branch-head advance |
-| push, otherwise | 1. Process `tenant-grant` with `{repository: cloneUrl}` (`PUT /control/grants/tenant`, the default-branch enrollment, idempotent; there is no per-feature-branch tenant grant). **Only when it answers `granted` or `limit`** (an application answer): 2. `POST /control/ensure?wait=false` with the planner's body `{repository_remote_url: cloneUrl, commit_sha: after, branch_name, default_branch: branch == defaultBranch, expected_head_commit: before, forced, branch_update: advance}`. 3. If `branch == defaultBranch` and the grant was `granted`: `SetAppValue` upserts `enrolled/{connectionId}/{slug}` |
+| push, otherwise | 1. `POST /control/ensure?wait=false` with the planner's body `{repository_remote_url: cloneUrl, commit_sha: after, branch_name, default_branch: branch == defaultBranch, expected_head_commit: before, forced, branch_update: advance}`. 2. If `branch == defaultBranch` and the grant was `granted`: `SetAppValue` upserts `enrolled/{connectionId}/{slug}` |
 | delete (`refType == branch`) | `GitHubListBranches` first: only when GitHub confirms the branch is still gone, `HttpRequest POST /control/branches/retire {repository: cloneUrl, branch}` (no CAS). Branch present → `branch_exists`; listing failed → `github_unavailable`; not a github.com URL → `not_verifiable`; all skip the retire |
 | pr (opened/synchronize/reopened) | `POST /control/ensure?wait=false` with the planner's base body `{cloneUrl, baseSha, baseRef, branch_update: none}`, then its head body `{cloneUrl, headSha, headRef, branch_update: none}`. The head is sent only when `headCloneUrl` names the base repository (the same SVC-5 canonical key), under the base's spelling. A fork's head is skipped with `fork_head`, as is a deleted head repository (`head_repository_deleted`), and a side repeating the base's repository and commit is sent once. **No branch pointer moves** (PS:`GitHubRepositoryEventMapper.cs:202,216` parity) |
 
@@ -355,8 +357,10 @@ SX-10 adds the GitHub repository-event triggers, the nightly schedule, `on-repos
 
 **`on-repository-change`**
 - **It reads `event.*` only.** `init` copies the fields `SextantPlanRepositoryChange` reads into `ev`, each as a string (an object or null becomes `""`). `senderLogin` is never read, so it is never identity.
-- **The push ensure and the enrolled row wait for the tenant grant.** A user's direct run runs as that user, with an `event` of its choosing. `tenant-grant`'s `granted` (200) and `limit` (409 `grant_limit`) come only from an application caller: `GrantEndpoints` checks the actor before the write, so a user gets 403 `wrong_actor`. Any other answer, including a 5xx or no response, is logged and ends the run. **Only the reconcile repairs a missed push ensure.** A later push carries its own `before` as the CAS, and that fails while the pointer is still behind, so the branch waits for the nightly run (or a run started by the operator). Re-sending a missed ensure under the resolved commit would not be safe: a late, older push would roll the branch back.
-  - `repo-push-user-run-refused` pins that a user's run sends only the refused grant.
+- **Every send waits for the tenant grant: push, deleted push, delete event and pull request alike.** A user's direct run runs as that user, with an `event` of its choosing (its pull request commits, its branch to retire). `tenant-grant`'s `granted` (200) and `limit` (409 `grant_limit`) come only from an application caller: `GrantEndpoints` checks the actor before the write, so a user gets 403 `wrong_actor`. Any other answer, including a 5xx or no response, is logged and ends the run. The service's own checks stay behind it, but without the gate a user's run would reach the service as a user ensure with caller-chosen commits.
+  - **Only the reconcile repairs a missed push ensure.** A later push carries its own `before` as the CAS, and that fails while the pointer is still behind, so the branch waits for the nightly run (or a run started by the operator). Re-sending a missed ensure under the resolved commit would not be safe: a late, older push would roll the branch back.
+  - **A pull request, deleted push or delete event also creates or holds the repository's tenant grant** (a deviation from v1, which enrolled a repository only on a push). The grant is idempotent and names a repository the installation already delivers pushes for; the enrolled row is still written only by a default-branch push.
+  - `repo-push-user-run-refused`, `repo-push-deleted-user-run-refused`, `repo-delete-event-user-run-refused` and `repo-pr-user-run-refused` pin that a user's run sends only the refused grant (no ensure, retire or GitHub call), each checked by mutation (a gate that never matches fails all of them).
   - `repo-push-grant-limit` pins that the ensure is still sent at the tenant's limit, without an enrolled row.
 - **The enrolled row is written inline** with `SetAppValue` (not through `legacy-dual-write`, which keeps the per-user memory). It is written only when all of these hold:
   - the grant answered `granted` (not `limit`);
@@ -371,7 +375,7 @@ SX-10 adds the GitHub repository-event triggers, the nightly schedule, `on-repos
   - `not_verifiable`: the repository is not on github.com.
 
   The window that remains is between the listing and the retire. The reconcile later retires a watched branch the check kept, under a CAS.
-- **Pull requests publish base, then head, with `branch_update: none`.** Neither is gated on a grant (v1 parity): nothing moves, and a user's run is bounded by the service's own grant and SX-6d checks.
+- **Pull requests publish base, then head, with `branch_update: none`,** after the tenant grant like every other event. Nothing moves. The commits are the event's, checked for shape only, so the grant gate is what keeps a user's direct run from choosing them.
 - **A fork's head is not indexed (a deviation from v1).** `SextantPlanRepositoryChange` sends the head only when `headCloneUrl` passes the shape check and has the base repository's SVC-5 canonical key, and then under the base's spelling. Otherwise the reason is `fork_head` and only the base is sent.
   - Why: a fork's head is code its author controls, and anyone can open a pull request against a public repository in the installation. A trigger's ensure is the application's, which the service neither grant-checks nor bounds (SX-6d applies to users). The worker's MSBuild evaluation of a hostile project is not contained (`EvaluationSandbox`, #76), so indexing the fork would run the author's code with the service's credentials.
   - The service's SVC-5 `REPOSITORY_HOSTS`/`REPOSITORY_OWNERS` policy stays a second line of defense; set `REPOSITORY_OWNERS` for production.
@@ -422,6 +426,7 @@ SX-10 adds the GitHub repository-event triggers, the nightly schedule, `on-repos
 - **Added:**
   - `repo-delete-event-branch-recreated` and `repo-delete-event-github-unavailable`;
   - `repo-push-user-run-refused` and `repo-push-grant-limit`;
+  - `repo-push-deleted-user-run-refused`, `repo-delete-event-user-run-refused` and `repo-pr-user-run-refused`;
   - `repo-pr-fork-head-skipped`;
   - `reconcile-sets-default`, `reconcile-several-targets`, `reconcile-grants-refused` and `reconcile-legacy-already-granted`;
   - `reconcile-target-refuses-heads-prefixed-branch` and `tenant-grant-granted`.

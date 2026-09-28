@@ -1,8 +1,11 @@
-name: repo-delete-event-branch-recreated
+name: repo-delete-event-user-run-refused
 description: >
-  A delete event processed after a push that re-created the branch must not remove it. The retire has no
-  compare-and-swap, so GitHub is asked first; it has the branch again, so no retire is sent.
+  A user starts on-repository-change directly with a delete event of their choosing. The service refuses
+  the tenant grant (403 wrong_actor), so the flow sends nothing else: GitHub is not asked, and no retire is
+  sent (a delete event's retire has no compare-and-swap).
 entrypoint: on-repository-change
+principal:
+  userId: u-mallory
 event:
   event: delete
   owner: octocat
@@ -14,13 +17,11 @@ event:
   refType: branch
   branch: feature/x
 http:
-  # Shape: 200 {grant, created} (src/Sextant.Service.Host/GrantEndpoints.cs). Every call waits for it.
   - connection: sextant-control
     method: PUT
     path: /control/grants/tenant
-    body:
-      grant: { repository: "https://github.com/octocat/hello-world.git", branch: "", source: tenant, created_at: 1760000000 }
-      created: false
+    status: 403
+    body: { status: rejected, reason: wrong_actor }
   - connection: github
     method: GET
     path: /repos/octocat/hello-world/branches
@@ -28,25 +29,27 @@ http:
       - name: main
         commit: { sha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d", url: "https://api.github.com/repos/octocat/hello-world/commits/7fd1a60b01f91b314f59955a4e4d4e80d8edf11d" }
         protected: false
-      - name: feature/x
-        commit: { sha: "b3cbd5bbd7e81436d2eee04537ea2b4c0cad4cdf", url: "https://api.github.com/repos/octocat/hello-world/commits/b3cbd5bbd7e81436d2eee04537ea2b4c0cad4cdf" }
-        protected: false
   - connection: sextant-control
-    path: "/**"
-    status: 500
+    method: POST
+    path: /control/branches/retire
+    body: { retired: true }
 expected:
   status: Completed
   variables:
     action: retire
-    retireSkipped: branch_exists
+    grantOutcome: unauthorized
+    retireSkipped: ""
     retireOutcome: ""
     retired: false
+    enrollment: ""
   httpCalls:
     - connection: sextant-control
       method: PUT
       path: /control/grants/tenant
-      caller: { act: "!absent" }
-      bodyMatch: { repository: "https://github.com/octocat/hello-world.git" }
+      caller: { act: user, sub: u-mallory }
       count: 1
     - connection: sextant-control
       count: 1
+    - connection: github
+      path: "/repos/**"
+      count: 0
