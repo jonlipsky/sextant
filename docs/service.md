@@ -771,7 +771,8 @@ token is unchanged.
 **Audit.** A control call that carries a verified assertion is audited as `HashActor("{tid}/{sub}")` for a
 user caller or `HashActor("{tid}/app:{app}")` for an application caller, instead of its bearer. Its audit
 detail gains the suffix `;idp=…;kid=…;via=…;cid=…;dep=…;jti=…` (SVC-4). Each value is written only when it is
-at most 64 characters of `[A-Za-z0-9._:-]`, else as `-`; an application caller has `idp=-`.
+at most 64 characters of `[A-Za-z0-9._:-]`, else as `-`; an application caller has `idp=-`, and an assertion
+without `dep` has `dep=-`.
 
 ### Repository grants and visibility (SVC-4)
 

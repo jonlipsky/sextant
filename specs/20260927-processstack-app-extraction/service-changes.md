@@ -376,7 +376,7 @@ The contract above is implemented as written. These are the places where the cod
 - A user's `not_granted` ensure is an `ensure`/`denied` row with detail `not_granted` and the repository key as scope.
 - **The audit-detail suffix SX-5 deferred** is appended to every caller-attributed control action (ensure, branch retire, retention, backup and grant): `;idp=…;kid=…;via=…;cid=…;dep=…;jti=…`.
   - A value is written only when it is at most 64 characters of `[A-Za-z0-9._:-]`, else as `-`, so a claim can never inject a separator, a control character or an unbounded value.
-  - An application caller has no `idp`, so its suffix has `idp=-`.
+  - An application caller has no `idp`, so its suffix has `idp=-`. A caller whose assertion omits `dep` (SX-5b) has `dep=-`.
   - A call with no assertion (bearer actor) has no suffix.
 
 **Visibility and selection.**
