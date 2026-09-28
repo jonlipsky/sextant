@@ -120,12 +120,68 @@ public sealed class SextantPlanReconcileActivityTests
     public async Task A_branch_at_the_github_head_is_up_to_date()
     {
         var activity = await PlanAsync(
-            [Target(RepoA, "main", 200, Resolve(New.ToUpperInvariant(), "main"))],
+            [Target(RepoA, "main", 200, Resolve(New.ToUpperInvariant(), "main", isDefault: true))],
             [Listing(RepoA, "main", ("main", New))]);
 
         Assert.AreEqual(1, activity.UpToDate);
         Assert.IsEmpty(activity.Ensures);
         Assert.AreEqual(0, activity.Skipped);
+    }
+
+    [TestMethod]
+    public async Task A_non_default_branch_at_the_github_head_is_up_to_date()
+    {
+        var activity = await PlanAsync(
+            [Target(RepoA, "dev", 200, Resolve(New, "dev"))],
+            [Listing(RepoA, "main", ("dev", New))]);
+
+        Assert.AreEqual(1, activity.UpToDate);
+        Assert.IsEmpty(activity.Ensures);
+    }
+
+    [TestMethod]
+    [DataRow("")]
+    [DataRow("main")]
+    public async Task The_github_default_at_its_head_but_not_the_service_default_is_promoted_in_place(string targetBranch)
+    {
+        // #199: a user watched GitHub's default first and could not claim the default. The ensure's CAS is the
+        // current commit, so it moves no pointer; default_branch: true only promotes the branch.
+        var activity = await PlanAsync(
+            [Target(RepoA, targetBranch, 200, Resolve(New, "main", isDefault: false))],
+            [Listing(RepoA, "main", ("main", New))]);
+
+        Assert.AreEqual(0, activity.UpToDate);
+        var request = AsEnsureRequest(activity.Ensures.Single());
+        Assert.AreEqual(New, request.CommitSha);
+        Assert.AreEqual(New, request.ExpectedHeadCommit);
+        Assert.AreEqual("main", request.BranchName);
+        Assert.IsTrue(request.IsDefaultBranch);
+        Assert.AreEqual("advance", request.BranchUpdate);
+    }
+
+    [TestMethod]
+    public async Task A_resolve_without_is_default_is_not_promoted()
+    {
+        var resolve = ActivityHarness.Map(("status", "complete"), ("commit_sha", New), ("branch", "main"));
+        var activity = await PlanAsync(
+            [Target(RepoA, string.Empty, 200, resolve)],
+            [Listing(RepoA, "main", ("main", New))]);
+
+        Assert.AreEqual(1, activity.UpToDate);
+        Assert.IsEmpty(activity.Ensures);
+    }
+
+    [TestMethod]
+    public async Task A_promotion_counts_against_the_ensure_limit()
+    {
+        var activity = await PlanAsync(
+            [Target(RepoA, "main", 200, Resolve(New, "main"))],
+            [Listing(RepoA, "main", ("main", New))],
+            maxEnsures: 0);
+
+        Assert.IsEmpty(activity.Ensures);
+        Assert.IsTrue(activity.Truncated);
+        Assert.AreEqual(SextantPlanReconcileActivity.ReasonEnsureLimit, SkipReason(activity));
     }
 
     [TestMethod]

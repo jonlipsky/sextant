@@ -1,0 +1,415 @@
+name: reconcile-target
+description: >
+  Brings one watched (repository, branch) target of the nightly reconcile in line with GitHub (one
+  iteration of reconcile). In this order, so the compare-and-swap guards against every push the service
+  processes after the resolve:
+    1. GitHubGetRepository reads the default branch's name (a target with branch "" is the default).
+    2. GET /control/resolve reads the commit the service points the branch at (404 when it has none).
+    3. GitHubListBranches reads GitHub's heads.
+    4. SextantPlanReconcile plans at most one call: an ensure (branch_update advance) under the CAS of the
+       resolved commit ("" after a 404), a retire of a non-default branch GitHub no longer has under the CAS
+       of the resolved commit, or nothing when the branch is up to date. GitHub's default branch at its
+       head that is not the service's default yet (#199) is ensured under the CAS of its current commit with
+       default_branch true, which only promotes it.
+    5. The planned body is sent verbatim, so the repository keeps the spelling the grant stored.
+  A target outside github.com, a malformed one, a repository the tenant's GitHub connection cannot read, or
+  a failed call is skipped and reported; the next run tries again.
+
+  It runs as the application (the schedule). A direct run is not refused (elevenworks/ProcessStack#3287),
+  but a user's run carries the user's caller, and the service refuses a user's retire and bounds a user's
+  ensure. Every variable and output is reset first (elevenworks/ProcessStack#3286).
+
+inputs:
+  - name: repository
+    type: string
+    required: true
+    description: The target's repository URL, as GET /control/grants?scope=tenant reports it
+  - name: branch
+    type: string
+    required: false
+    default: ""
+    description: The target's branch; empty for the repository's default branch
+
+variables:
+  - name: urlAccepted
+    type: bool
+    default: false
+  - name: checkedUrl
+    type: string
+    default: ""
+  - name: repoHost
+    type: string
+    default: ""
+  - name: repoOwner
+    type: string
+    default: ""
+  - name: repoName
+    type: string
+    default: ""
+  - name: branchValid
+    type: bool
+    default: false
+  - name: checkedBranch
+    type: string
+    default: ""
+  - name: problem
+    type: string
+    default: ""
+  - name: defaultBranch
+    type: string
+    default: ""
+  - name: resolveBranch
+    type: string
+    default: ""
+  - name: resolveStatus
+    type: int
+    default: 0
+  - name: resolveJson
+    type: json
+  - name: branches
+    type: json
+  - name: ensures
+    type: json
+  - name: retires
+    type: json
+  - name: planUpToDate
+    type: int
+    default: 0
+  - name: planSkipped
+    type: json
+  - name: ensureBody
+    type: json
+  - name: retireBody
+    type: json
+  - name: callStatus
+    type: int
+    default: 0
+  - name: callText
+    type: string
+    default: ""
+  - name: callOutcome
+    type: string
+    default: ""
+  - name: callReason
+    type: string
+    default: ""
+
+outputs:
+  - name: result
+    type: string
+    description: up_to_date | ensured | retired | skipped | failed
+  - name: reason
+    type: string
+    description: Why the target was skipped or its call failed (a code); "" otherwise
+  - name: ensureOutcome
+    type: string
+    description: The ensure's outcome; "" when none was sent
+  - name: retireOutcome
+    type: string
+    description: The retire's outcome; "" when none was sent
+
+nodes:
+  - id: start
+    type: start
+    next: init
+
+  - id: init
+    name: Reset every variable and output
+    type: activity:JavaScript
+    inputs:
+      script: |
+        ['checkedUrl', 'repoHost', 'repoOwner', 'repoName', 'checkedBranch', 'problem', 'defaultBranch',
+         'resolveBranch', 'callText', 'callOutcome', 'callReason', 'result', 'reason', 'ensureOutcome',
+         'retireOutcome'].forEach(function (name) { context.setVariable(name, ''); });
+        context.setVariable('urlAccepted', false);
+        context.setVariable('branchValid', false);
+        context.setVariable('resolveStatus', 0);
+        context.setVariable('planUpToDate', 0);
+        context.setVariable('callStatus', 0);
+        ['resolveJson', 'branches', 'ensures', 'retires', 'planSkipped', 'ensureBody', 'retireBody'
+        ].forEach(function (name) { context.setVariable(name, null); });
+        null;
+    next: check
+
+  - id: check
+    name: Check the repository URL and the branch name
+    type: activity:SextantNormalizeRepository
+    inputs:
+      cloneUrl: "= repository"
+      branch: "= branch"
+    outputs:
+      accepted: urlAccepted
+      remoteUrl: checkedUrl
+      host: repoHost
+      repositoryOwner: repoOwner
+      repositoryName: repoName
+      branchValid: branchValid
+      branchName: checkedBranch
+    next: validate
+
+  # The GitHub connection answers for github.com only. The service reports branch names without
+  # refs/heads/, so a name that still starts with it is refused rather than stripped.
+  - id: validate
+    type: activity:SetVariable
+    inputs:
+      value: >
+        = urlAccepted !== true || checkedUrl === '' ? 'invalid_repository'
+          : repoHost !== 'github.com' ? 'not_github'
+          : branchValid !== true || checkedBranch !== String(branch == null ? '' : branch) ? 'invalid_branch'
+          : ''
+    outputs:
+      result: problem
+    next: route-validated
+
+  - id: route-validated
+    type: decision
+    next:
+      - when: "problem == ''"
+        next: get-repository
+      - else: skip
+
+  - id: get-repository
+    name: Read the default branch
+    type: activity:GitHubGetRepository
+    inputs:
+      connectionId: github
+      owner: "= repoOwner"
+      repo: "= repoName"
+    outputs:
+      defaultBranch: defaultBranch
+    next: set-resolve-branch
+    on-error: skip-unreachable
+
+  - id: skip-unreachable
+    type: activity:SetVariable
+    inputs:
+      value: not_reachable
+    outputs:
+      result: problem
+    next: log-unreachable
+
+  - id: log-unreachable
+    type: activity:Log
+    inputs:
+      level: Warning
+      message: "= 'Sextant reconcile: a target is not reachable by the tenant GitHub connection: ' + _lastErrorType"
+    next: skip
+
+  - id: set-resolve-branch
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var name = checkedBranch !== '' ? checkedBranch : String(defaultBranch == null ? '' : defaultBranch).trim();
+        context.setVariable('resolveBranch', name);
+        context.setVariable('problem', name === '' ? 'default_branch_unknown' : '');
+        null;
+    next: route-resolve-branch
+
+  - id: route-resolve-branch
+    type: decision
+    next:
+      - when: "problem == ''"
+        next: resolve
+      - else: skip
+
+  # A default target is resolved with GitHub's default branch name, not without a branch: without one the
+  # service answers for its own default, which says nothing about a changed GitHub default.
+  - id: resolve
+    name: GET /control/resolve
+    type: activity:HttpRequest
+    inputs:
+      connectionId: sextant-control
+      method: GET
+      url: /control/resolve
+      query:
+        repository: "= checkedUrl"
+        branch: "= resolveBranch"
+      failOnErrorStatus: false
+    outputs:
+      statusCode: resolveStatus
+      json: resolveJson
+    next: list-branches
+    on-error: skip-resolve-failed
+
+  - id: skip-resolve-failed
+    type: activity:SetVariable
+    inputs:
+      value: resolve_failed
+    outputs:
+      result: problem
+    next: skip
+
+  - id: list-branches
+    name: Read GitHub's branch heads
+    type: activity:GitHubListBranches
+    inputs:
+      connectionId: github
+      owner: "= repoOwner"
+      repo: "= repoName"
+    outputs:
+      branches: branches
+    next: plan
+    on-error: skip-unreachable
+
+  - id: plan
+    type: activity:SextantPlanReconcile
+    inputs:
+      serviceTargets: "= [{ repository: checkedUrl, branch: checkedBranch, resolveStatusCode: resolveStatus, resolve: resolveJson }]"
+      githubBranches: "= [{ repository: checkedUrl, defaultBranch: defaultBranch, branches: branches }]"
+    outputs:
+      ensures: ensures
+      retires: retires
+      upToDate: planUpToDate
+      skippedTargets: planSkipped
+    next: shape-plan
+
+  - id: shape-plan
+    type: activity:JavaScript
+    inputs:
+      script: |
+        context.setVariable('ensureBody', ensures != null && ensures.length > 0 ? ensures[0] : null);
+        context.setVariable('retireBody', retires != null && retires.length > 0 ? retires[0] : null);
+        var skipped = planSkipped != null && planSkipped.length > 0 && planSkipped[0] ? String(planSkipped[0].reason || '') : '';
+        context.setVariable('problem', /^[a-z0-9_]{1,64}$/.test(skipped) ? skipped : 'not_planned');
+        null;
+    next: route-plan
+
+  - id: route-plan
+    type: decision
+    next:
+      - when: "ensureBody != null"
+        next: post-ensure
+      - when: "retireBody != null"
+        next: post-retire
+      - when: "planUpToDate > 0"
+        next: mark-up-to-date
+      - else: skip
+
+  - id: mark-up-to-date
+    type: activity:SetVariable
+    inputs:
+      value: up_to_date
+    outputs:
+      result: result
+    next: end
+
+  - id: skip
+    type: activity:JavaScript
+    inputs:
+      script: |
+        context.setVariable('result', 'skipped');
+        context.setVariable('reason', problem !== '' ? problem : 'not_planned');
+        null;
+    next: end
+
+  - id: post-ensure
+    name: POST /control/ensure
+    type: activity:HttpRequest
+    inputs:
+      connectionId: sextant-control
+      method: POST
+      url: /control/ensure
+      query:
+        wait: "false"
+      body: "= ensureBody"
+      failOnErrorStatus: false
+    outputs:
+      statusCode: callStatus
+      body: callText
+    next: interpret-ensure
+    on-error: ensure-no-response
+
+  - id: ensure-no-response
+    type: activity:SetVariable
+    inputs:
+      value: 0
+    outputs:
+      result: callStatus
+    next: interpret-ensure
+
+  - id: interpret-ensure
+    type: activity:SextantInterpretEnsureResult
+    inputs:
+      statusCode: "= callStatus"
+      body: "= callText"
+      branchUpdate: advance
+      operation: ensure
+    outputs:
+      outcome: callOutcome
+      reason: callReason
+    next: shape-ensure
+
+  - id: shape-ensure
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var ok = callOutcome === 'ok' || callOutcome === 'attached';
+        var code = String(callReason == null ? '' : callReason);
+        context.setVariable('ensureOutcome', String(callOutcome || ''));
+        context.setVariable('result', ok ? 'ensured' : 'failed');
+        context.setVariable('reason', ok ? '' : (/^[a-z0-9_]{1,64}$/.test(code) ? code : 'http_' + callStatus));
+        null;
+    next: route-called
+
+  - id: post-retire
+    name: POST /control/branches/retire
+    type: activity:HttpRequest
+    inputs:
+      connectionId: sextant-control
+      method: POST
+      url: /control/branches/retire
+      body: "= retireBody"
+      failOnErrorStatus: false
+    outputs:
+      statusCode: callStatus
+      body: callText
+    next: interpret-retire
+    on-error: retire-no-response
+
+  - id: retire-no-response
+    type: activity:SetVariable
+    inputs:
+      value: 0
+    outputs:
+      result: callStatus
+    next: interpret-retire
+
+  - id: interpret-retire
+    type: activity:SextantInterpretEnsureResult
+    inputs:
+      statusCode: "= callStatus"
+      body: "= callText"
+      operation: retire
+    outputs:
+      outcome: callOutcome
+      reason: callReason
+    next: shape-retire
+
+  - id: shape-retire
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var ok = callOutcome === 'ok';
+        var code = String(callReason == null ? '' : callReason);
+        context.setVariable('retireOutcome', String(callOutcome || ''));
+        context.setVariable('result', ok ? 'retired' : 'failed');
+        context.setVariable('reason', ok ? '' : (/^[a-z0-9_]{1,64}$/.test(code) ? code : 'http_' + callStatus));
+        null;
+    next: route-called
+
+  - id: route-called
+    type: decision
+    next:
+      - when: "result == 'failed'"
+        next: log-failed
+      - else: end
+
+  - id: log-failed
+    type: activity:Log
+    inputs:
+      level: Warning
+      message: "= 'Sextant reconcile: a planned call was not accepted: ' + (ensureOutcome != '' ? ensureOutcome : retireOutcome) + ' (' + reason + ', HTTP ' + callStatus + ')'"
+    next: end
+
+  - id: end
+    type: end

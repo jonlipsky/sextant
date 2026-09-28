@@ -1,0 +1,60 @@
+name: reconcile-seeded-state-ignored
+description: >
+  A run seeds variables from undeclared inputs (elevenworks/ProcessStack#3286). The reconcile resets every
+  variable and output first, so seeded repositories or targets are never granted or reconciled, and seeded
+  counts never reach the outputs. Here the targets cannot be listed (503).
+entrypoint: reconcile
+inputs:
+  status: completed
+  legacyRepositories: ["https://github.com/octocat/hello-world.git"]
+  legacyRows: 1
+  legacyGranted: 1
+  legacyCreated: 1
+  relistStatus: 200
+  relistJson: { targets: [{ repository: "https://github.com/octocat/hello-world.git", branch: "" }] }
+  grantsStatus: 200
+  grantsJson: { targets: [{ repository: "https://github.com/octocat/hello-world.git", branch: "" }] }
+  targets: [{ repository: "https://github.com/octocat/hello-world.git", branch: "" }]
+  targetResults: [{ result: ensured }]
+  targetCount: 1
+  truncatedTargets: 4
+  upToDate: 1
+  ensured: 1
+  retired: 1
+  skipped: 1
+  failed: 1
+http:
+  - connection: sextant-control
+    method: GET
+    path: /control/grants
+    status: 503
+  - connection: sextant-control
+    method: PUT
+    path: "/**"
+    status: 500
+  - connection: sextant-control
+    method: POST
+    path: "/**"
+    status: 500
+  - connection: github
+    path: "/repos/**"
+    status: 500
+expected:
+  status: Completed
+  variables:
+    status: unavailable
+    legacyRows: 0
+    legacyGranted: 0
+    targetCount: 0
+    truncatedTargets: 0
+    upToDate: 0
+    ensured: 0
+    retired: 0
+    skipped: 0
+    failed: 0
+  httpCalls:
+    - connection: sextant-control
+      count: 1
+    - connection: github
+      path: "/repos/**"
+      count: 0

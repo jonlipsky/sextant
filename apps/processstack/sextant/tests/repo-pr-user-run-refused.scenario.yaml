@@ -1,0 +1,50 @@
+name: repo-pr-user-run-refused
+description: >
+  A user starts on-repository-change directly (the platform does not refuse it, elevenworks/ProcessStack#3287)
+  with a pull request event of their choosing, so its base and head commits are the user's. The run carries
+  the user's caller, so the service refuses the tenant grant (403 wrong_actor), and the flow sends nothing
+  else: no base or head ensure.
+entrypoint: on-repository-change
+principal:
+  userId: u-mallory
+event:
+  event: pull_request
+  action: opened
+  owner: octocat
+  repo: hello-world
+  connectionId: conn-1
+  cloneUrl: "https://github.com/octocat/hello-world.git"
+  defaultBranch: main
+  pullNumber: "7"
+  baseRef: main
+  baseSha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+  headRef: fix/typo
+  headSha: "6dcb09b5b57875f334f61aebed695e2e4193db5e"
+  headCloneUrl: "https://github.com/octocat/hello-world.git"
+  merged: "false"
+http:
+  # Shape: 403 {"status":"rejected","reason":"wrong_actor"} (src/Sextant.Service.Host/GrantEndpoints.cs).
+  - connection: sextant-control
+    method: PUT
+    path: /control/grants/tenant
+    status: 403
+    body: { status: rejected, reason: wrong_actor }
+  - connection: sextant-control
+    method: POST
+    path: /control/ensure
+    body: { job_id: 50, identity_hash: "aa01", status: complete, attached: true, branch_advanced: false }
+expected:
+  status: Completed
+  variables:
+    action: ensure
+    grantOutcome: unauthorized
+    ensureOutcome: ""
+    headEnsureOutcome: ""
+  httpCalls:
+    - connection: sextant-control
+      method: PUT
+      path: /control/grants/tenant
+      caller: { act: user, sub: u-mallory }
+      count: 1
+    - connection: sextant-control
+      count: 1

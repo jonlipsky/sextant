@@ -3,17 +3,21 @@ description: >
   Sextant semantic code index for ProcessStack. A user watches the repositories they want indexed from
   chat ("watch owner/repo on main"), and agents start and check indexing jobs over MCP. Every watch is a
   repository grant held by the Sextant service (PUT /control/grants/self), so the service decides what
-  each caller can see; the app stores no secrets, URLs or grants of its own. Semantic queries are served
-  by the Sextant service, never proxied through these flows.
+  each caller can see. GitHub repository events keep the watched branches indexed: a push records the
+  tenant grant (PUT /control/grants/tenant) and advances its branch, a delete retires it, and a pull
+  request indexes its base and head. A nightly reconcile heals whatever an event missed. The app stores no
+  secrets or grants of its own; in v2.0.x it keeps the v1 enrolled rows in App State for a rollback.
+  Semantic queries are served by the Sextant service, never proxied through these flows.
 
   The flows talk to the service through the sextant-control connection only. The platform signs the run's
-  caller into each request (act=user for chat and MCP), so no flow ever names a user.
+  caller into each request (act=user for chat and MCP, act=application for repository events and the
+  schedule), so no flow ever names a user.
 version: 2.0.0
 author: Sextant
 license: MIT
 
 # Only the two control processes are MCP tools. Orchestrations are never eligible, and the internal
-# processes (ensure, legacy-dual-write) stay out of `include`.
+# processes (ensure, legacy-dual-write, tenant-grant) stay out of `include`.
 mcp:
   expose: true
   displayName: "Sextant"
@@ -69,6 +73,35 @@ entrypoints:
     path: processes/legacy-dual-write.yaml
     internal: true
 
+  - name: on-repository-change
+    description: >
+      Keeps the service in step with a GitHub repository event (branch push or delete, pull request opened,
+      synchronized or reopened). Started by the connection-event triggers; runs as the application.
+    type: orchestration
+    path: orchestrations/on-repository-change.yaml
+    internal: true
+
+  - name: reconcile
+    description: >
+      The nightly reconcile: lists the watched branches, imports the v1 enrolled rows as tenant grants, then
+      brings every watched branch in line with GitHub. Started by the nightly-reconcile schedule; runs as the
+      application.
+    type: orchestration
+    path: orchestrations/reconcile.yaml
+    internal: true
+
+  - name: reconcile-target
+    description: Brings one watched (repository, branch) target in line with GitHub (one reconcile iteration)
+    type: orchestration
+    path: orchestrations/reconcile-target.yaml
+    internal: true
+
+  - name: tenant-grant
+    description: Records one tenant-wide repository grant (PUT /control/grants/tenant); application callers only
+    type: process
+    path: processes/tenant-grant.yaml
+    internal: true
+
 connections:
   # The workspace's GitHub App connection. The chat flow asks it whether a repository is visible before
   # granting it, and reads branch heads from it.
@@ -83,6 +116,66 @@ connections:
     type: http-api
 
 triggers:
+  # GitHub repository events. Each trigger names its event, and only the first matching trigger fires, so
+  # every event starts on-repository-change once. The flow reads the normalized fields from `event.*` (every
+  # value a string, "" when absent), so no inputs are mapped. The run's caller is the application, whoever
+  # sent the event. Deliveries are not de-duplicated; every step is idempotent.
+  - id: gh-push
+    type: connection-event
+    inputs:
+      connection: github
+      event: push
+    action:
+      type: start-orchestration
+      orchestration: on-repository-change
+
+  - id: gh-delete
+    type: connection-event
+    inputs:
+      connection: github
+      event: delete
+    action:
+      type: start-orchestration
+      orchestration: on-repository-change
+
+  - id: gh-pr-open
+    type: connection-event
+    inputs:
+      connection: github
+      event: pull_request.opened
+    action:
+      type: start-orchestration
+      orchestration: on-repository-change
+
+  - id: gh-pr-sync
+    type: connection-event
+    inputs:
+      connection: github
+      event: pull_request.synchronize
+    action:
+      type: start-orchestration
+      orchestration: on-repository-change
+
+  - id: gh-pr-reopen
+    type: connection-event
+    inputs:
+      connection: github
+      event: pull_request.reopened
+    action:
+      type: start-orchestration
+      orchestration: on-repository-change
+
+  # The nightly reconcile, as the application. At G2c the operator fires it once with the trigger run-now to
+  # import the v1 enrolled rows.
+  - id: nightly-reconcile
+    type: schedule
+    inputs:
+      cron: "0 3 * * *"
+      timezone: Etc/UTC
+    action:
+      type: start-orchestration
+      orchestration: reconcile
+
   - id: prompt
     type: prompt
     listed: true
@@ -107,7 +200,8 @@ chat:
     api: explicit
     cli: explicit
 
-# The flows only ever touch the caller's own grants and memory.
+# The flows reach the service only through the connections (which sign the run's caller), and otherwise touch
+# only the caller's own memory and the app's own App State (the v1 enrolled rows). None needs a permission.
 permissions: []
 
 testDirectory: tests

@@ -1,0 +1,46 @@
+name: repo-delete-event-github-unavailable
+description: >
+  A delete event whose branch GitHub cannot confirm gone (the listing fails) keeps the branch: without a
+  compare-and-swap the retire is never sent on a guess. The nightly reconcile retires it later under its CAS.
+entrypoint: on-repository-change
+event:
+  event: delete
+  owner: octocat
+  repo: hello-world
+  connectionId: conn-1
+  cloneUrl: "https://github.com/octocat/hello-world.git"
+  defaultBranch: main
+  ref: feature/x
+  refType: branch
+  branch: feature/x
+http:
+  # Shape: 200 {grant, created} (src/Sextant.Service.Host/GrantEndpoints.cs). Every call waits for it.
+  - connection: sextant-control
+    method: PUT
+    path: /control/grants/tenant
+    body:
+      grant: { repository: "https://github.com/octocat/hello-world.git", branch: "", source: tenant, created_at: 1760000000 }
+      created: false
+  - connection: github
+    method: GET
+    path: /repos/octocat/hello-world/branches
+    status: 503
+    body: { message: "Service Unavailable" }
+  - connection: sextant-control
+    path: "/**"
+    status: 500
+expected:
+  status: Completed
+  variables:
+    action: retire
+    retireSkipped: github_unavailable
+    retireOutcome: ""
+  httpCalls:
+    - connection: sextant-control
+      method: PUT
+      path: /control/grants/tenant
+      caller: { act: "!absent" }
+      bodyMatch: { repository: "https://github.com/octocat/hello-world.git" }
+      count: 1
+    - connection: sextant-control
+      count: 1

@@ -1,0 +1,62 @@
+name: repo-pr-fork-head-skipped
+description: >
+  A pull request from a fork publishes only its base. The head is code the fork's author controls, and the
+  trigger's ensure is the application's, so it is skipped with fork_head: no ensure names the fork. The base
+  is still published with branch_update none.
+entrypoint: on-repository-change
+event:
+  event: pull_request
+  action: synchronize
+  owner: octocat
+  repo: hello-world
+  connectionId: conn-1
+  cloneUrl: "https://github.com/octocat/hello-world.git"
+  defaultBranch: main
+  pullNumber: "7"
+  baseRef: main
+  baseSha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+  headRef: fix/typo
+  headSha: "6dcb09b5b57875f334f61aebed695e2e4193db5e"
+  headCloneUrl: "https://github.com/contributor/hello-world.git"
+  merged: "false"
+http:
+  # Shape: 200 {grant, created} (src/Sextant.Service.Host/GrantEndpoints.cs). Every call waits for it.
+  - connection: sextant-control
+    method: PUT
+    path: /control/grants/tenant
+    body:
+      grant: { repository: "https://github.com/octocat/hello-world.git", branch: "", source: tenant, created_at: 1760000000 }
+      created: false
+  - connection: sextant-control
+    method: POST
+    path: /control/ensure
+    body: { job_id: 50, identity_hash: "aa01", status: complete, attached: true, branch_advanced: false }
+expected:
+  status: Completed
+  variables:
+    action: ensure
+    reason: fork_head
+    grantOutcome: granted
+    ensureOutcome: attached
+    headEnsureOutcome: ""
+    enrollment: ""
+  httpCalls:
+    - connection: sextant-control
+      method: PUT
+      path: /control/grants/tenant
+      caller: { act: "!absent" }
+      bodyMatch: { repository: "https://github.com/octocat/hello-world.git" }
+      count: 1
+    - connection: sextant-control
+      method: POST
+      path: /control/ensure
+      count: 1
+    - connection: sextant-control
+      method: POST
+      path: /control/ensure
+      bodyMatch:
+        repository_remote_url: "https://github.com/octocat/hello-world.git"
+        commit_sha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+        branch_name: main
+        branch_update: none
+      count: 1

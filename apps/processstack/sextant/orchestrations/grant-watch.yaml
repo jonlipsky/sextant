@@ -305,8 +305,9 @@ nodes:
     next: find-head
     on-error: mark-head-unreadable
 
-  # The grant is recorded; only the first ensure is missed, so the reply says indexing starts with the
-  # next push rather than that the branch has no commits.
+  # The grant is recorded; only the first ensure is missed, so the reply says the nightly reconcile starts
+  # indexing rather than that the branch has no commits. A push cannot: its CAS is its own `before`, which
+  # a branch the service has no pointer for yet never matches.
   - id: mark-head-unreadable
     type: activity:SetVariable
     inputs:
@@ -369,7 +370,7 @@ nodes:
           } else if (headSha === '' && ensureOutcome === '') {
             text += ' The branch has no commits on GitHub yet; it will be indexed when it is pushed.';
           } else {
-            text += ' Indexing could not start yet; it will start with the next push.';
+            text += ' Indexing could not start yet; the nightly reconcile will start it.';
           }
         }
         text;
