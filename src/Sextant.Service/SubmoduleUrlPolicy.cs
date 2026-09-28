@@ -42,8 +42,9 @@ internal static partial class SubmoduleUrlPolicy
     /// <summary>Longest URL accepted from <c>.gitmodules</c>.</summary>
     internal const int MaxUrlLength = 2048;
 
+    /// <summary>A lower-case DNS host name: dot-separated labels, no trailing dot (shared with <see cref="RepositoryUrlPolicy"/>).</summary>
     [GeneratedRegex(@"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$")]
-    private static partial Regex HostPattern();
+    internal static partial Regex HostPattern();
 
     /// <summary>
     /// Resolves <paramref name="rawUrl"/> declared by a repository whose clean URL is

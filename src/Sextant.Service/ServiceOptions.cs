@@ -99,6 +99,24 @@ public sealed record ServiceOptions
     public IReadOnlyList<string> SubmoduleHosts { get; init; } = [];
 
     /// <summary>
+    /// SSRF policy applied to every <c>POST /control/ensure</c> repository URL BEFORE any job row exists
+    /// (SVC-5): https only, no userinfo/query/fragment/non-443 port, a multi-label DNS host (no IP literal or
+    /// <c>localhost</c>) on the host allow-list, a path of exactly <c>/{owner}/{repo}</c>, and an optional owner
+    /// allow-list. Bound from <c>SEXTANT_SERVICE_REPOSITORY_HOSTS</c> (default <c>github.com</c>; <c>*</c> = any
+    /// host that passes the shape rules) and <c>SEXTANT_SERVICE_REPOSITORY_OWNERS</c> (<c>host/owner</c> or
+    /// <c>host/*</c>; unset = any owner). A malformed entry fails startup (fail closed). Applies in both
+    /// checkout modes; direct <see cref="SnapshotService"/> callers bypass it.
+    /// </summary>
+    public RepositoryUrlPolicy RepositoryUrlPolicy { get; init; } = RepositoryUrlPolicy.Default;
+
+    /// <summary>
+    /// How long an intake refusal waits for its <c>ensure</c>/<c>denied</c> audit row before answering 400
+    /// (SVC-5). The refusal itself is a pure decision; the bound only stops it waiting out a running production
+    /// that holds the single writer. The write stays service-owned and lands once the writer frees.
+    /// </summary>
+    internal TimeSpan DeniedAuditWait { get; init; } = TimeSpan.FromSeconds(2);
+
+    /// <summary>
     /// Upper bound on how many times an identity's job may run before a persistently-RETRYABLE provisioning
     /// failure (a transient clone/fetch error in <see cref="ServiceCheckoutMode.Clone"/> mode — network,
     /// DNS, timeout, remote 5xx/429) is recorded as a terminal <see cref="SnapshotJobStatus.Failed"/> instead
@@ -229,6 +247,7 @@ public sealed record ServiceOptions
             CheckoutMode = ParseCheckoutMode(Env("CHECKOUT_MODE")),
             CheckoutToken = Env("CHECKOUT_TOKEN"),
             SubmoduleHosts = ParseSubmoduleHosts(Env("SUBMODULE_HOSTS")),
+            RepositoryUrlPolicy = ParseRepositoryUrlPolicy(Env("REPOSITORY_HOSTS"), Env("REPOSITORY_OWNERS")),
             // Bound retryable-provisioning re-attempts. Out-of-range/invalid values fall back to the default
             // (5) rather than failing start, and are clamped to a sane ceiling so a huge configured value
             // cannot defeat the safety bound.
@@ -331,6 +350,41 @@ public sealed record ServiceOptions
                 hosts.Add(normalized);
         }
         return hosts;
+    }
+
+    /// <summary>
+    /// Parses <c>SEXTANT_SERVICE_REPOSITORY_HOSTS</c> (comma-separated DNS host names or <c>*</c>; unset →
+    /// <c>github.com</c>) and <c>SEXTANT_SERVICE_REPOSITORY_OWNERS</c> (comma-separated <c>host/owner</c> or
+    /// <c>host/*</c>; unset → any owner) into the ensure-intake <see cref="Service.RepositoryUrlPolicy"/>.
+    /// A malformed entry, an owner entry on a host that is not allow-listed, or a set variable with no
+    /// entries THROWS: these lists gate outbound fetches, so a typo must fail startup loudly (fail closed).
+    /// </summary>
+    internal static RepositoryUrlPolicy ParseRepositoryUrlPolicy(string? hosts, string? owners)
+    {
+        if (hosts is null && owners is null)
+            return RepositoryUrlPolicy.Default;
+        string[] hostEntries = hosts is null ? [RepositoryUrlPolicy.DefaultHost] : SplitEntries(hosts, "REPOSITORY_HOSTS");
+        var ownerEntries = owners is null ? null : SplitEntries(owners, "REPOSITORY_OWNERS");
+        try
+        {
+            return new RepositoryUrlPolicy(hostEntries, ownerEntries);
+        }
+        catch (FormatException ex)
+        {
+            throw new InvalidOperationException(
+                $"Environment variables {EnvPrefix}REPOSITORY_HOSTS/{EnvPrefix}REPOSITORY_OWNERS are invalid: " +
+                $"{ex.Message} Refusing to start with an ambiguous repository URL policy (fail closed).", ex);
+        }
+    }
+
+    private static string[] SplitEntries(string value, string name)
+    {
+        var entries = value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (entries.Length == 0)
+            throw new InvalidOperationException(
+                $"Environment variable {EnvPrefix}{name} is set but has no entries. Refusing to start with an " +
+                "ambiguous repository URL policy (fail closed).");
+        return entries;
     }
 
     /// <summary>
