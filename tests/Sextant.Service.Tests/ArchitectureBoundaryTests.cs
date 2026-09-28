@@ -35,6 +35,74 @@ public class ArchitectureBoundaryTests
                 "— service/hosting code depends on core, never the reverse (criterion 6).");
     }
 
+    // The app under apps/processstack/ builds against a private SDK feed, so nothing the public build
+    // restores may reference that SDK or the app's projects, and Sextant.slnx must not include the app.
+    private const string AppTree = "apps/processstack/";
+    private const string SdkPackagePrefix = "Include=\"ProcessStack.";
+    private static readonly string[] SkippedDirectories = ["bin", "obj", ".git", "TestResults", "node_modules"];
+
+    [TestMethod]
+    public void PlatformSdk_AndAppProjects_AreReferencedOnlyFromTheAppTree()
+    {
+        var root = RepositoryRoot();
+        var offenders = new List<string>();
+        foreach (var file in MsBuildFiles(root))
+        {
+            var relative = Path.GetRelativePath(root, file).Replace('\\', '/');
+            if (relative.StartsWith(AppTree, StringComparison.OrdinalIgnoreCase))
+                continue;
+            var text = File.ReadAllText(file).Replace('\\', '/');
+            if (text.Contains(SdkPackagePrefix, StringComparison.OrdinalIgnoreCase)
+                || text.Contains(AppTree, StringComparison.OrdinalIgnoreCase))
+                offenders.Add(relative);
+        }
+
+        Assert.IsEmpty(offenders,
+            $"only {AppTree} may reference the platform SDK packages or the app projects: {string.Join(", ", offenders)}");
+    }
+
+    [TestMethod]
+    public void PublicSolution_DoesNotIncludeTheAppTree()
+    {
+        var solution = File.ReadAllText(Path.Combine(RepositoryRoot(), "Sextant.slnx")).Replace('\\', '/');
+
+        Assert.IsFalse(solution.Contains("apps/", StringComparison.OrdinalIgnoreCase),
+            "Sextant.slnx must build without the private SDK feed, so it must not include the app tree.");
+    }
+
+    private static string RepositoryRoot()
+    {
+        for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir is not null; dir = dir.Parent)
+        {
+            if (File.Exists(Path.Combine(dir.FullName, "Sextant.slnx")))
+                return dir.FullName;
+        }
+        throw new InvalidOperationException("Could not find Sextant.slnx above the test output directory.");
+    }
+
+    private static IEnumerable<string> MsBuildFiles(string root)
+    {
+        var pending = new Stack<string>([root]);
+        while (pending.Count > 0)
+        {
+            var dir = pending.Pop();
+            foreach (var child in Directory.EnumerateDirectories(dir))
+            {
+                if (!SkippedDirectories.Contains(Path.GetFileName(child), StringComparer.OrdinalIgnoreCase))
+                    pending.Push(child);
+            }
+            foreach (var file in Directory.EnumerateFiles(dir))
+            {
+                var name = Path.GetFileName(file);
+                if (name.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase)
+                    || name.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase)
+                    || name.EndsWith(".props", StringComparison.OrdinalIgnoreCase)
+                    || name.EndsWith(".targets", StringComparison.OrdinalIgnoreCase))
+                    yield return file;
+            }
+        }
+    }
+
     [TestMethod]
     public void LocalQueryPath_WorksWithoutAnyServiceType()
     {
