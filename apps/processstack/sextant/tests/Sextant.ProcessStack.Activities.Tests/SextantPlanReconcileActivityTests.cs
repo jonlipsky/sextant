@@ -175,9 +175,23 @@ public sealed class SextantPlanReconcileActivityTests
     }
 
     [TestMethod]
+    public async Task A_changed_github_default_is_created_and_promoted_under_an_empty_cas()
+    {
+        // The service's default is `develop`; GitHub's is now `main`, resolved by name: 404, so the ensure
+        // creates the pointer and marks it default.
+        var activity = await PlanAsync([Target(RepoA, string.Empty, 404)], [Listing(RepoA, "main", ("main", New))]);
+
+        var request = AsEnsureRequest(activity.Ensures.Single());
+        Assert.AreEqual(("main", New, ""), (request.BranchName, request.CommitSha, request.ExpectedHeadCommit));
+        Assert.IsTrue(request.IsDefaultBranch);
+        Assert.AreEqual("advance", request.BranchUpdate);
+    }
+
+    [TestMethod]
     public async Task A_resolve_answered_for_another_branch_is_skipped()
     {
-        // The service's default is `trunk`, GitHub's is `main`: the default resolve says nothing about main.
+        // The flow resolved without a branch: the service's default is `trunk`, GitHub's is `main`, so the
+        // resolve says nothing about main.
         var activity = await PlanAsync(
             [Target(RepoA, string.Empty, 200, Resolve(Old, "trunk", isDefault: true))],
             [Listing(RepoA, "main", ("main", New))]);
