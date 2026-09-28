@@ -22,9 +22,11 @@ public static class ReadContextGate
         FederationMode mode = FederationMode.Federated,
         IReadAuthorizer? authorizer = null,
         CompatibilityInputs? compatibility = null,
-        Func<string?>? requestedRepository = null)
+        Func<string?>? requestedRepository = null,
+        Func<string?>? requestedBranch = null)
     {
-        context = FederatedReadContext.Resolve(db, mode, authorizer, compatibility, requestedRepository);
+        context = FederatedReadContext.Resolve(
+            db, mode, authorizer, compatibility, requestedRepository, requestedBranch);
         if (context.Authorization.Allowed && !context.SelectionUnresolved)
         {
             errorResponse = string.Empty;
@@ -35,7 +37,9 @@ public static class ReadContextGate
         // rather than an empty "no matches" (there is no authorization to protect, so no oracle to avoid).
         if (context.SelectionUnresolved && authorizer is not { IsEnforcing: true })
         {
-            errorResponse = ResponseBuilder.BuildSelectionUnresolved();
+            errorResponse = context.BranchRequested
+                ? ResponseBuilder.BuildBranchSelectionUnresolved()
+                : ResponseBuilder.BuildSelectionUnresolved();
             return false;
         }
 

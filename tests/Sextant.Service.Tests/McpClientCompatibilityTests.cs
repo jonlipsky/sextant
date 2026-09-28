@@ -82,6 +82,39 @@ public class McpClientCompatibilityTests
             "the query-token gate rejects the client before any MCP method runs");
     }
 
+    [TestMethod]
+    public async Task SdkClient_RepositoryToolArgument_SelectsThatRepository()
+    {
+        const string gadgets = "https://github.com/acme/gadgets";
+        await using var host = await Harness.StartAsync(secondRepository: gadgets);
+        await using var client = await McpClient.CreateAsync(host.CreateTransport(QueryToken));
+
+        // tools/list: the reserved selector arguments are advertised as optional string arguments.
+        var findSymbol = (await client.ListToolsAsync()).Single(t => t.Name == "find_symbol");
+        var properties = findSymbol.JsonSchema.GetProperty("properties");
+        Assert.AreEqual("string", properties.GetProperty("repository").GetProperty("type").GetString());
+        Assert.AreEqual("string", properties.GetProperty("branch").GetProperty("type").GetString());
+
+        // tools/call: the SDK forwards the argument verbatim over the static-header connection, and it
+        // selects the repository for this call only.
+        var result = await client.CallToolAsync(
+            "find_symbol", new Dictionary<string, object?> { ["name"] = "global::App.Type0", ["repository"] = "acme/gadgets" });
+        var text = string.Concat(result.Content.OfType<TextContentBlock>().Select(c => c.Text));
+        Assert.IsFalse(result.IsError is true, $"tools/call is not a tool error: {text}");
+        var results = System.Text.Json.JsonDocument.Parse(text).RootElement.GetProperty("results");
+        Assert.AreEqual(1, results.GetArrayLength(), text);
+        Assert.AreEqual($"proj_{host.SecondRepositorySnapshot}", results[0].GetProperty("project_id").GetString(),
+            "the repository argument pinned the read to that repository's snapshot");
+
+        // A named branch without a complete snapshot never widens to another snapshot.
+        var miss = await client.CallToolAsync(
+            "find_symbol",
+            new Dictionary<string, object?> { ["name"] = "global::App.Type0", ["repository"] = gadgets, ["branch"] = "nope" });
+        var missText = string.Concat(miss.Content.OfType<TextContentBlock>().Select(c => c.Text));
+        Assert.AreEqual(0, System.Text.Json.JsonDocument.Parse(missText).RootElement.GetProperty("results").GetArrayLength(),
+            missText);
+    }
+
     /// <summary>The MCP tool names declared by the remote allowlist (<see cref="ServiceApp.RemoteQueryTools"/>).</summary>
     private static List<string> RemoteToolNames()
     {
@@ -103,7 +136,10 @@ public class McpClientCompatibilityTests
         private IndexDatabase Db { get; init; } = null!;
         private string DbPath { get; init; } = "";
 
-        public static async Task<Harness> StartAsync()
+        /// <summary>The complete snapshot of the second repository, when one was published.</summary>
+        public long? SecondRepositorySnapshot { get; private init; }
+
+        public static async Task<Harness> StartAsync(string? secondRepository = null)
         {
             var dbPath = ServiceTestFixtures.NewDbPath();
             var db = new IndexDatabase(dbPath);
@@ -115,6 +151,15 @@ public class McpClientCompatibilityTests
             var snapshots = new SnapshotStore(db.GetConnection());
             var repoId = snapshots.GetById(snapId)!.RepositoryId;
             snapshots.SetBranchPointer(snapshots.EnsureBranch(repoId, "main", isDefault: true, now: 1), snapId, now: 1);
+            long? secondSnapId = null;
+            if (secondRepository is not null)
+            {
+                secondSnapId = ServiceTestFixtures.PublishComplete(
+                    db, ServiceTestFixtures.Request(secondRepository, "commit-bbbb"));
+                var secondRepoId = snapshots.GetById(secondSnapId.Value)!.RepositoryId;
+                snapshots.SetBranchPointer(
+                    snapshots.EnsureBranch(secondRepoId, "main", isDefault: true, now: 1), secondSnapId.Value, now: 1);
+            }
 
             var options = ServiceTestFixtures.NewOptions(dbPath, controlToken: ControlToken, queryToken: QueryToken);
             var service = SnapshotService.Start(options, null, db);
@@ -127,7 +172,11 @@ public class McpClientCompatibilityTests
             ServiceApp.MapEndpoints(app, options);
             await app.StartAsync();
 
-            return new Harness { Client = app.GetTestClient(), App = app, Service = service, Db = db, DbPath = dbPath };
+            return new Harness
+            {
+                Client = app.GetTestClient(), App = app, Service = service, Db = db, DbPath = dbPath,
+                SecondRepositorySnapshot = secondSnapId
+            };
         }
 
         /// <summary>
