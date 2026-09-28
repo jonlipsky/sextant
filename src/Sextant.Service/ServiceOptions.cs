@@ -23,8 +23,21 @@ public sealed record ServiceOptions
     /// <summary>Persistent checkout/artifact/cache volumes, kept SEPARATE from worker scratch.</summary>
     public required ServiceVolumes Volumes { get; init; }
 
-    /// <summary>Bearer token required by the control endpoints (<c>/control/*</c>). Null disables control auth (dev only).</summary>
+    /// <summary>Bearer token required by the control endpoints (<c>/control/*</c>). The service refuses to start without one unless <see cref="InsecureOpenControlPlane"/> is set (SX-6d).</summary>
     public string? ControlToken { get; init; }
+
+    /// <summary>
+    /// The explicit, DANGEROUS opt-out that lets the service start with no <see cref="ControlToken"/>, leaving the
+    /// whole control plane (<c>/control/*</c>: ensure, retire, retention, backup, grants, audit) open to anyone who
+    /// can reach the control port (SX-6d, issue #198). Off by default: without a control token the service refuses to
+    /// start (<see cref="ValidateControlPlane"/>). Meant only for a loopback-bound single-node dev service or tests;
+    /// the service logs a loud warning when it is in effect. Ignored when a control token is set.
+    /// <c>SEXTANT_SERVICE_INSECURE_OPEN_CONTROL_PLANE</c>.
+    /// </summary>
+    public bool InsecureOpenControlPlane { get; init; }
+
+    /// <summary>True when the control plane has no token and the service was told to run it open anyway.</summary>
+    public bool ControlPlaneIsOpen => string.IsNullOrEmpty(ControlToken) && InsecureOpenControlPlane;
 
     /// <summary>Bearer token required by the query endpoints (<c>/mcp</c>, <c>/query/*</c>). Null allows anonymous read (local default).</summary>
     public string? QueryToken { get; init; }
@@ -138,6 +151,38 @@ public sealed record ServiceOptions
                     "act as a legacy credential. Refusing to start (fail closed).");
         }
     }
+
+    /// <summary>
+    /// Throws when the control plane would start unauthenticated by accident (SX-6d, issue #198): no
+    /// <see cref="ControlToken"/> and no <see cref="InsecureOpenControlPlane"/> opt-out, or a control token that is
+    /// only whitespace (no bearer can ever match it). Run by the host before it serves; the offline backup and restore
+    /// commands build their options from the same environment but serve nothing, so they do not call it.
+    /// Messages never contain a token.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">The control plane is not safely configured.</exception>
+    public void ValidateControlPlane()
+    {
+        if (!string.IsNullOrEmpty(ControlToken))
+        {
+            if (string.IsNullOrWhiteSpace(ControlToken))
+                throw new InvalidOperationException(
+                    $"{EnvPrefix}CONTROL_TOKEN is blank (only whitespace), so no bearer can match it. Set a real " +
+                    "control token. Refusing to start (fail closed).");
+            return;
+        }
+        if (!InsecureOpenControlPlane)
+            throw new InvalidOperationException(
+                $"{EnvPrefix}CONTROL_TOKEN is not set, which would leave the control plane (/control/*: ensure, " +
+                "retire, retention, backup, grants, audit) open to anyone who can reach the control port. Set " +
+                $"{EnvPrefix}CONTROL_TOKEN, or, for a loopback-only dev service, set " +
+                $"{EnvPrefix}INSECURE_OPEN_CONTROL_PLANE=true to run it open. Refusing to start (fail closed).");
+    }
+
+    /// <summary>The loud startup warning printed (and logged) while <see cref="ControlPlaneIsOpen"/> holds.</summary>
+    public const string OpenControlPlaneWarning =
+        "WARNING: INSECURE: " + EnvPrefix + "INSECURE_OPEN_CONTROL_PLANE is set and " + EnvPrefix + "CONTROL_TOKEN is " +
+        "not: the control plane (/control/*: ensure, retire, retention, backup, grants, audit) is OPEN to anyone who " +
+        "can reach the control port. Use this only for a loopback-bound dev service; set a control token otherwise.";
 
     /// <summary>
     /// The network interface the HTTP surface binds to. Defaults to <c>localhost</c> (loopback only),
@@ -322,6 +367,7 @@ public sealed record ServiceOptions
                 cacheRoot: Env("CACHE_ROOT"),
                 scratchRoot: Env("SCRATCH_ROOT")),
             ControlToken = Env("CONTROL_TOKEN"),
+            InsecureOpenControlPlane = EnvBool("INSECURE_OPEN_CONTROL_PLANE") ?? false,
             QueryToken = Env("QUERY_TOKEN"),
             ContributeToken = Env("CONTRIBUTE_TOKEN"),
             ReadPolicy = ReadAuthorizationPolicy.Parse(Env("READ_POLICY")),

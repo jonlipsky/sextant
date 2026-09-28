@@ -70,6 +70,14 @@ public sealed record SnapshotContext
     public bool? SuppressBranchUpdate { get; init; }
 
     /// <summary>
+    /// When <c>false</c>, the branch advance never makes this branch its repository's default just because the
+    /// repository has none yet (the issue #104 first-branch safety net, withheld by issue #199). It still owns
+    /// the default when <see cref="IsDefaultBranch"/> is set or it already is the default. <c>null</c>/<c>true</c>
+    /// (the local CLI/daemon path) keeps today's behavior.
+    /// </summary>
+    public bool? AllowImplicitDefault { get; init; }
+
+    /// <summary>
     /// The checkout coverage the producing worker computed for this snapshot (issue #119), or <c>null</c>
     /// when the caller does not compute coverage (the local CLI/daemon path). For a baseless remote-base
     /// overlay (#108) the local reconciler sets it to the peer-reported coverage of the committed base.

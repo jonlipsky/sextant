@@ -43,6 +43,8 @@ public static class ServiceApp
     {
         // SVC-3: refuse inconsistent caller-identity settings (fail closed), however the options were built.
         options.ValidateCallerIdentity();
+        // SX-6d: refuse an unauthenticated control plane unless it was explicitly (and loudly) opted into.
+        options.ValidateControlPlane();
         builder.Services.AddSingleton(options);
         builder.Services.AddSingleton(service);
         // Bind request bodies with the SAME snake_case wire format the service emits (ServiceJson), so a
@@ -184,6 +186,8 @@ public static class ServiceApp
     /// <summary>Wires the auth middleware and maps the control/query/health endpoints onto a built app.</summary>
     public static void MapEndpoints(WebApplication app, ServiceOptions options)
     {
+        if (options.ControlPlaneIsOpen)
+            app.Logger.LogWarning("{Warning}", ServiceOptions.OpenControlPlaneWarning);
         var callerGate = app.Services.GetRequiredService<CallerAssertionGate>();
         app.Use(async (context, next) =>
         {
@@ -305,8 +309,10 @@ public static class ServiceApp
                 }
                 // SVC-4: a user caller may only ensure a repository it can read (a grant of its own or its
                 // tenant's). An application caller (a trigger) and an assertion-less control call are unchanged.
-                if (CallerRequest.Get(req.HttpContext)?.Principal is { Actor: CallerActor.User } user
-                    && !service.IsRepositoryVisible(user, request.RepositoryRemoteUrl))
+                // Visibility is decided BEFORE any body rule below, so a user that cannot see the repository gets
+                // the same not_granted whatever the body asks for.
+                var user = CallerRequest.Get(req.HttpContext)?.Principal is { Actor: CallerActor.User } caller ? caller : null;
+                if (user is not null && !service.IsRepositoryVisible(user, request.RepositoryRemoteUrl))
                 {
                     await service.RecordEnsureNotGrantedAsync(RepositoryGrantKey.Of(request.RepositoryRemoteUrl), AuditActor(req), ct);
                     return Results.Json(new { status = "rejected", reason = GrantReason.NotGranted }, ServiceJson.Options,
@@ -320,6 +326,19 @@ public static class ServiceApp
                     return Results.Json(new { status = "rejected", reason = guardProblem }, ServiceJson.Options,
                         statusCode: StatusCodes.Status400BadRequest);
                 }
+                // SX-6d (issue #198): a user caller may not change shared branch state beyond a guarded advance: no
+                // default_branch claim, no head sequence, and either the head CAS or branch_update: none. Decided from
+                // the body alone (no catalog read), before any job row exists; audited like not_granted.
+                if (user is not null && request.UserCallerBranchProblem() is { } userProblem)
+                {
+                    await service.RecordUserEnsureDeniedAsync(RepositoryGrantKey.Of(request.RepositoryRemoteUrl), userProblem, AuditActor(req), ct);
+                    return Results.Json(new { status = "rejected", reason = userProblem }, ServiceJson.Options,
+                        statusCode: StatusCodes.Status400BadRequest);
+                }
+                // Issue #199: nor may a user pick the repository's default by being its first branch: the #104
+                // first-branch default goes only to the branch the remote itself names as its default.
+                if (user is not null)
+                    request = request with { RestrictsImplicitDefault = true };
                 result = wait == false
                     ? await service.BeginEnsureSnapshotAsync(request, AuditActor(req), ct)
                     : await service.EnsureSnapshotAsync(request, ct, AuditActor(req));

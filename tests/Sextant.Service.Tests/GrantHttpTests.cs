@@ -563,11 +563,11 @@ public class GrantHttpTests
         await using var host = await Harness.StartAsync();
         await PutSelfAsync(host, host.UserAssertion(sub: "user-1"), Gadgets);
 
-        using var own = await host.ControlAsync(HttpMethod.Post, "/control/ensure", ControlToken, host.UserAssertion(sub: "user-1"), EnsureBody());
-        using var other = await host.ControlAsync(HttpMethod.Post, "/control/ensure", ControlToken, host.UserAssertion(sub: "user-2"), EnsureBody());
+        using var own = await host.ControlAsync(HttpMethod.Post, "/control/ensure", ControlToken, host.UserAssertion(sub: "user-1"), UserEnsureBody());
+        using var other = await host.ControlAsync(HttpMethod.Post, "/control/ensure", ControlToken, host.UserAssertion(sub: "user-2"), UserEnsureBody());
         using (var tenant = await host.ControlAsync(HttpMethod.Put, TenantPath, ControlToken, AppAssertion(host), Body(Gadgets)))
             Assert.AreEqual(HttpStatusCode.OK, tenant.StatusCode);
-        using var viaTenant = await host.ControlAsync(HttpMethod.Post, "/control/ensure", ControlToken, host.UserAssertion(sub: "user-2"), EnsureBody());
+        using var viaTenant = await host.ControlAsync(HttpMethod.Post, "/control/ensure", ControlToken, host.UserAssertion(sub: "user-2"), UserEnsureBody());
 
         Assert.AreEqual(HttpStatusCode.OK, own.StatusCode, await own.Content.ReadAsStringAsync());
         await AssertRejectedAsync(other, HttpStatusCode.Forbidden, GrantReason.NotGranted);
