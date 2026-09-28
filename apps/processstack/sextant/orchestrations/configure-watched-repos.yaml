@@ -9,6 +9,8 @@ description: >
     anything else → help
   Slack is refused in v2.0: a Slack peer's caller (idp=slack) is not a platform user, so every command
   replies "not enabled for this channel" and makes no service call.
+  On an internal channel, the caller's v1 watches are imported once first (import-legacy-watches), until the
+  sextant.app:legacy-import-v1 memory flag is set; the reply then starts with a note on what was imported.
   A reply is built from the service's typed fields only; a response body is never echoed.
 
 inputs:
@@ -53,6 +55,30 @@ variables:
     default: ""
   - name: stateUpdate
     type: json
+  - name: importDone
+    type: bool
+    default: false
+  - name: importNote
+    type: string
+    default: ""
+  - name: importMessage
+    type: string
+    default: ""
+  - name: importOutcome
+    type: string
+    default: ""
+  - name: importNewlyImported
+    type: int
+    default: 0
+  - name: importSkipped
+    type: int
+    default: 0
+  - name: importFailed
+    type: int
+    default: 0
+  - name: importRemaining
+    type: int
+    default: 0
 
 outputs:
   - name: agentResponse
@@ -86,6 +112,14 @@ nodes:
         context.setVariable('grantsStatus', 0);
         context.setVariable('grantsJson', null);
         context.setVariable('agentResponse', '');
+        context.setVariable('importDone', false);
+        context.setVariable('importNote', '');
+        context.setVariable('importMessage', '');
+        context.setVariable('importOutcome', '');
+        context.setVariable('importNewlyImported', 0);
+        context.setVariable('importSkipped', 0);
+        context.setVariable('importFailed', 0);
+        context.setVariable('importRemaining', 0);
         null;
     next: init-state
 
@@ -102,10 +136,77 @@ nodes:
     next:
       - when: "String(channelType || '').toLowerCase() == 'slack'"
         next: refuse-slack
-      - else: parse
+      - else: read-import-flag
 
-  # SX-11 inserts the one-time lazy import of v1 watches (import-legacy-watches) between the Slack gate and
-  # the parse, for internal channels only.
+  # The one-time import of the caller's v1 watches (internal channels only: Slack is refused above). The
+  # import sets the flag itself once nothing is left to retry, so it runs on each turn until then, and an
+  # import run over MCP counts too.
+  - id: read-import-flag
+    type: activity:GetMyMemory
+    inputs:
+      scope: sextant.app
+      key: legacy-import-v1
+    outputs:
+      found: importDone
+    next: route-import
+    on-error: log-import-flag
+
+  - id: log-import-flag
+    type: activity:Log
+    inputs:
+      level: Warning
+      message: "Sextant legacy import: the import flag could not be read"
+    next: parse
+
+  - id: route-import
+    type: decision
+    next:
+      - when: "importDone == true"
+        next: parse
+      - else: import-legacy
+
+  - id: import-legacy
+    type: process:import-legacy-watches
+    inputs:
+      retryUnresolved: false
+    outputs:
+      message: importMessage
+      outcome: importOutcome
+      newlyImported: importNewlyImported
+      skipped: importSkipped
+      failed: importFailed
+      remaining: importRemaining
+    next: note-import
+    on-error: import-failed
+
+  # Said once, before the reply to the command: nothing is said when there was nothing to import or every
+  # entry was already watched.
+  - id: note-import
+    type: activity:SetVariable
+    inputs:
+      value: >
+        = importOutcome != 'ok' || importNewlyImported > 0 || importSkipped > 0 || importFailed > 0 || importRemaining > 0
+          ? String(importMessage || '') : ''
+    outputs:
+      result: importNote
+    next: parse
+
+  # A failed repository check fails the whole import; the entry it stopped at is tried last next time.
+  - id: import-failed
+    type: activity:SetVariable
+    inputs:
+      value: "I couldn't finish importing your earlier Sextant watches yet; I'll try again next time."
+    outputs:
+      result: importNote
+    next: log-import
+
+  - id: log-import
+    type: activity:Log
+    inputs:
+      level: Warning
+      message: "= 'Sextant legacy import failed: ' + _lastErrorType"
+    next: parse
+
   - id: parse
     type: activity:SextantParseWatchCommand
     inputs:
@@ -183,7 +284,7 @@ nodes:
         lines.join('\n');
     outputs:
       result: agentResponse
-    next: send-reply
+    next: compose-reply
 
   - id: reply-errors
     type: activity:JavaScript
@@ -199,7 +300,7 @@ nodes:
         lines.join('\n');
     outputs:
       result: agentResponse
-    next: send-reply
+    next: compose-reply
 
   - id: list-grants
     name: GET /control/grants/self
@@ -259,7 +360,7 @@ nodes:
         text;
     outputs:
       result: agentResponse
-    next: send-reply
+    next: compose-reply
 
   - id: list-unavailable
     type: activity:SetVariable
@@ -274,7 +375,7 @@ nodes:
     inputs:
       level: Warning
       message: "= 'Sextant list: GET /control/grants/self failed: HTTP ' + grantsStatus"
-    next: send-reply
+    next: compose-reply
 
   - id: help
     type: activity:SetVariable
@@ -284,12 +385,24 @@ nodes:
           + '"watch owner/repo on main", "stop watching owner/repo", or "what am I watching".'
     outputs:
       result: agentResponse
-    next: send-reply
+    next: compose-reply
 
   - id: refuse-slack
     type: activity:SetVariable
     inputs:
       value: "Watch management isn't enabled for this channel; use the web chat or CLI."
+    outputs:
+      result: agentResponse
+    next: compose-reply
+
+  # The import's note, when there is one, goes before the reply to the command.
+  - id: compose-reply
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var note = String(importNote || '');
+        var reply = String(agentResponse || '');
+        note === '' ? reply : note + '\n\n' + reply;
     outputs:
       result: agentResponse
     next: send-reply
