@@ -29,6 +29,9 @@ namespace Sextant.Service.Host;
 /// </summary>
 public static class ServiceApp
 {
+    /// <summary>The request header that names the repository a query-plane read selects.</summary>
+    internal const string RepositoryHeader = "X-Sextant-Repository";
+
     /// <summary>Registers the service, MCP tools, and read database provider into the builder's container.</summary>
     public static void RegisterServices(WebApplicationBuilder builder, ServiceOptions options, SnapshotService service)
     {
@@ -50,24 +53,26 @@ public static class ServiceApp
         builder.Services.AddHttpContextAccessor();
         builder.Services.AddSingleton(sp =>
         {
+            var http = sp.GetRequiredService<IHttpContextAccessor>();
             IReadAuthorizer authorizer = options.ReadPolicy.Enabled
                 ? new PolicyReadAuthorizer(
                     options.ReadPolicy,
-                    PrincipalTokenAccessor(sp.GetRequiredService<IHttpContextAccessor>()),
+                    PrincipalTokenAccessor(http),
                     RepositoryUrlResolver(options.CatalogDbPath))
                 : AllowAllReadAuthorizer.Instance;
-            var provider = new DatabaseProvider(options.CatalogDbPath, authorizer);
 
-            // Under an enforced multi-tenant policy the request names its authorized repository via the
-            // X-Sextant-Repository header, so the read planner pins THAT repository's snapshot instead of
-            // deny-all (Phase 17, criterion 1). The accessor reads the ambient request at call time, so the
-            // singleton provider stays correct under concurrent requests. With no policy the default
-            // (() => null) keeps the single-repository local path byte-identical.
-            if (options.ReadPolicy.Enabled)
-                provider.RequestedRepository =
-                    RequestedRepositoryAccessor(sp.GetRequiredService<IHttpContextAccessor>());
-
-            return provider;
+            // The request names the repository it reads via the X-Sextant-Repository header, and the read
+            // planner pins THAT repository's default-branch snapshot. It is wired whether or not a read
+            // policy is enabled: under a policy the authorizer still decides whether the principal may read
+            // it, and without one the header scopes an otherwise unselected (all-repository) read. The
+            // accessors read the ambient request at call time, so the singleton provider stays correct under
+            // concurrent requests. A request with no header reads the unselected default unless
+            // RequireRepositorySelection says it must name one.
+            return new DatabaseProvider(options.CatalogDbPath, authorizer)
+            {
+                RequestedRepository = RequestedRepositoryAccessor(http),
+                RequireRepositorySelection = RepositorySelectionRequirement(options)
+            };
         });
         // Explicit ALLOWLIST for the remote HTTP MCP surface (hardening review, criterion 1): register ONLY
         // the index-query tools that route through DatabaseProvider.TryBeginRead and thus enforce the
@@ -495,11 +500,12 @@ public static class ServiceApp
         () => accessor.HttpContext is { } ctx ? BearerToken(ctx) : null;
 
     /// <summary>
-    /// Resolves the caller-declared authorized repository (its git remote URL) from the
-    /// <c>X-Sextant-Repository</c> request header for the Phase-17 multi-tenant read selector. Reads the
-    /// ambient request at call time so a singleton <see cref="DatabaseProvider"/> stays request-correct;
-    /// returns null when the header is absent/blank (the read planner then denies rather than guessing).
-    /// The header only NAMES the repository — authorization is still enforced by
+    /// Resolves the caller-declared repository (its git remote URL) from the <c>X-Sextant-Repository</c>
+    /// request header, the request-level repository selector. Reads the ambient request at call time so a
+    /// singleton <see cref="DatabaseProvider"/> stays request-correct; returns null when the header is
+    /// absent/blank (the read planner then reads the unselected default, or fails with
+    /// <c>repository_required</c> when <see cref="RepositorySelectionRequirement"/> demands a selection).
+    /// The header only NAMES the repository — under a read policy, authorization is still enforced by
     /// <see cref="PolicyReadAuthorizer"/> against the principal's token, so a caller cannot read another
     /// tenant merely by naming it.
     /// </summary>
@@ -508,9 +514,19 @@ public static class ServiceApp
         {
             if (accessor.HttpContext is not { } ctx)
                 return null;
-            var value = ctx.Request.Headers["X-Sextant-Repository"].ToString();
+            var value = ctx.Request.Headers[RepositoryHeader].ToString();
             return string.IsNullOrWhiteSpace(value) ? null : value.Trim();
         };
+
+    /// <summary>
+    /// Decides, per request, whether a query-plane read must name a repository
+    /// (<see cref="DatabaseProvider.RequireRepositorySelection"/>). Today that is the operator switch
+    /// <see cref="ServiceOptions.RequireRepositorySelection"/> alone, so with it off a legacy caller that
+    /// sends no selector keeps reading the unselected default. Any other per-request reason to require a
+    /// selection composes here with <c>||</c>.
+    /// </summary>
+    private static Func<bool> RepositorySelectionRequirement(ServiceOptions options) =>
+        () => options.RequireRepositorySelection;
 
     /// <summary>
     /// Maps a repository row id to its remote URL for <see cref="PolicyReadAuthorizer"/>, caching results

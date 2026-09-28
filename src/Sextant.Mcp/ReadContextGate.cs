@@ -25,10 +25,18 @@ public static class ReadContextGate
         Func<string?>? requestedRepository = null)
     {
         context = FederatedReadContext.Resolve(db, mode, authorizer, compatibility, requestedRepository);
-        if (context.Authorization.Allowed)
+        if (context.Authorization.Allowed && !context.SelectionUnresolved)
         {
             errorResponse = string.Empty;
             return true;
+        }
+
+        // A named repository with no complete snapshot, on a NON-enforcing path, gets an actionable message
+        // rather than an empty "no matches" (there is no authorization to protect, so no oracle to avoid).
+        if (context.SelectionUnresolved && authorizer is not { IsEnforcing: true })
+        {
+            errorResponse = ResponseBuilder.BuildSelectionUnresolved();
+            return false;
         }
 
         // Fail closed with the UNIFORM not-found (criterion 1): the denial reveals nothing an unauthorized
