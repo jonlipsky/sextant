@@ -38,18 +38,19 @@ internal static class GrantEndpoints
 
     public static void Map(RouteGroupBuilder control)
     {
+        // Every grant route applies its own actor rule (Admit), so a user caller reaches it (issue #193).
         control.MapPut("/grants/self", (HttpRequest req, SnapshotService service, ServiceOptions options, CancellationToken ct) =>
-            PutAsync(req, service, options, GrantScope.Self, ct));
+            PutAsync(req, service, options, GrantScope.Self, ct)).DecidesUserCallers();
         control.MapDelete("/grants/self", (HttpRequest req, SnapshotService service, ServiceOptions options, CancellationToken ct) =>
-            DeleteAsync(req, service, options, GrantScope.Self, ct));
+            DeleteAsync(req, service, options, GrantScope.Self, ct)).DecidesUserCallers();
         control.MapGet("/grants/self", (HttpRequest req, SnapshotService service) =>
-            ListOwn(req, service));
+            ListOwn(req, service)).DecidesUserCallers();
         control.MapPut("/grants/tenant", (HttpRequest req, SnapshotService service, ServiceOptions options, CancellationToken ct) =>
-            PutAsync(req, service, options, GrantScope.Tenant, ct));
+            PutAsync(req, service, options, GrantScope.Tenant, ct)).DecidesUserCallers();
         control.MapDelete("/grants/tenant", (HttpRequest req, SnapshotService service, ServiceOptions options, CancellationToken ct) =>
-            DeleteAsync(req, service, options, GrantScope.Tenant, ct));
+            DeleteAsync(req, service, options, GrantScope.Tenant, ct)).DecidesUserCallers();
         control.MapGet("/grants", (string? scope, HttpRequest req, SnapshotService service) =>
-            ListTargets(scope, req, service));
+            ListTargets(scope, req, service)).DecidesUserCallers();
     }
 
     private static async Task<IResult> PutAsync(

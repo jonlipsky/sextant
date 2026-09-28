@@ -23,7 +23,8 @@ namespace Sextant.Service.Host;
 ///   <item><c>/ready</c> — worker CAPACITY (can this node accept production work), no auth; 503 when a
 ///   query-only node has no worker, so an operator can tell "up" from "can index".</item>
 ///   <item><c>/control/*</c> — ensure-snapshot, status, branch resolution, retention. Requires the CONTROL
-///   token.</item>
+///   token. A user caller (a verified <c>act=user</c> assertion) reaches only ensure, status, resolve and the grant
+///   routes (<see cref="ControlCallerRules"/>).</item>
 ///   <item><c>/mcp</c> + <c>/query/*</c> — authenticated HTTP MCP semantic queries and remote base-snapshot
 ///   pages. Requires the QUERY token (or a read-policy principal, or a delegate token whose reads are decided
 ///   per verified caller assertion, SVC-3 <see cref="CallerAssertionGate"/>). Criterion 4: a complete snapshot
@@ -207,6 +208,8 @@ public static class ServiceApp
 
                 // SVC-3: an optional caller assertion names the control call's caller (audit actor).
                 if (!await callerGate.AdmitControlAsync(context, isContribution)) return;
+                // Issue #193: a user caller reaches only the control routes that apply their own act=user rule.
+                if (!await ControlCallerRules.AdmitAsync(context)) return;
             }
             else if (path.StartsWithSegments("/mcp") || path.StartsWithSegments("/query"))
             {
@@ -340,7 +343,7 @@ public static class ServiceApp
                 ? StatusCodes.Status200OK
                 : StatusCodes.Status202Accepted;
             return Results.Json(result, ServiceJson.Options, statusCode: statusCode);
-        });
+        }).DecidesUserCallers();
 
         // Status/resolve read an independent WAL read connection (issue #148), so they answer promptly while a
         // worker holds the single writer for a long index. SVC-4: a user caller sees only a job on a repository it
@@ -353,7 +356,7 @@ public static class ServiceApp
                 && !service.IsRepositoryVisible(user, status.Job.RepositoryUrl))
                 status = null;
             return status is null ? Results.NotFound() : Results.Json(status, ServiceJson.Options);
-        });
+        }).DecidesUserCallers();
 
         // SVC-4: a user caller resolves only a repository it can read. The grant is checked BEFORE the branch is
         // resolved, so an ungranted repository is the same bare 404 as an absent one (no existence oracle).
@@ -380,11 +383,14 @@ public static class ServiceApp
             if (head.HeadSequence is long headSequence)
                 body["head_sequence"] = headSequence;
             return Results.Json(body, ServiceJson.Options);
-        });
+        }).DecidesUserCallers();
 
         // SVC-6: retire a branch pointer (the branch was deleted upstream). The SVC-5 repository URL policy
         // applies as at ensure intake; the 400 body carries only the reason code (never the URL). A missing
         // branch is 200 {retired:false} (idempotent); the default branch and a head-CAS mismatch are 409.
+        // Issue #193: retire is application/operator-only. A user caller is refused (403 caller_not_allowed,
+        // audited retire/denied) before the body is read, even for a repository it can see: retiring a branch
+        // of a repository other users watch is a destructive cross-user action.
         control.MapPost("/branches/retire", async (RetireBranchRequest request, HttpRequest req, SnapshotService service, ServiceOptions options, CancellationToken ct) =>
         {
             var decision = options.RepositoryUrlPolicy.Evaluate(request.Repository);
@@ -403,20 +409,23 @@ public static class ServiceApp
                 ? Results.Json(new { retired = result.Retired }, ServiceJson.Options)
                 : Results.Json(new { status = "rejected", reason = result.Reason }, ServiceJson.Options,
                     statusCode: StatusCodes.Status409Conflict);
-        });
+        }).AuditsRefusedUserCallsAs(AuditAction.Retire);
 
+        // Issue #193: retention, backup and the observability routes below are operator-only. A user caller is
+        // refused with 403 caller_not_allowed (retention and backup audit the refusal); see ControlCallerRules.
         control.MapPost("/retention", async (bool? execute, HttpRequest req, SnapshotService service, CancellationToken ct) =>
         {
             var report = await service.RunRetentionAsync(execute ?? false, AuditActor(req), ct);
             return Results.Json(report, ServiceJson.Options);
-        });
+        }).AuditsRefusedUserCallsAs(AuditAction.Retention);
 
         // SVC-4: repository grants (per-caller visibility and reconcile targets).
         GrantEndpoints.Map(control);
 
         // Observability surface (criterion 5). These live under /control so they inherit the CONTROL-token
         // gate — they are OPERATOR-ONLY and must NEVER be reachable by a query-plane tenant, because they
-        // aggregate cross-tenant repository scopes, counts, and cost (criterion-1 leakage guard).
+        // aggregate cross-tenant repository scopes, counts, and cost (criterion-1 leakage guard). For the same
+        // reason a user caller is refused (issue #193): it must never read other callers' audit rows or metrics.
 
         // Metrics: JSON by default, or Prometheus text exposition with ?format=prometheus for a scraper.
         control.MapGet("/metrics", (string? format, SnapshotService service) =>
@@ -456,7 +465,7 @@ public static class ServiceApp
                 return Results.BadRequest("query parameter 'dir' is required.");
             var manifest = await service.CreateBackupAsync(dir, AuditActor(req), ct);
             return Results.Json(manifest, ServiceJson.Options);
-        });
+        }).AuditsRefusedUserCallsAs(AuditAction.Backup);
 
         // Client/CI contribution ingest (Phase 16). The raw artifact bytes are the request body; finalize /
         // branch / default_branch are query params. The contributor identity is the bearer token (the

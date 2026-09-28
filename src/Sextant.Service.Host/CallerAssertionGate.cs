@@ -46,8 +46,9 @@ internal sealed record CallerRequest(bool IsDelegate, CallerPrincipal? Principal
 ///   open plane): an assertion header is refused with 401 <see cref="AssertionNotAllowedCode"/>, so a caller never
 ///   believes a legacy credential is scoped to it.</item>
 ///   <item><c>/control/*</c>: the assertion is optional; when present it must verify, and it then names the audit
-///   actor. With no keys configured, or on <c>/control/contribute</c> (whose identity is its bearer), an
-///   assertion is refused with 401 <see cref="AssertionNotAllowedCode"/>.</item>
+///   actor. A verified user caller then reaches only the routes <see cref="ControlCallerRules"/> admits. With no keys
+///   configured, or on <c>/control/contribute</c> (whose identity is its bearer), an assertion is refused with 401
+///   <see cref="AssertionNotAllowedCode"/>.</item>
 /// </list>
 /// A failed verification (steps 1-9) is 401 <see cref="InvalidAssertionCode"/> with
 /// <c>WWW-Authenticate: Bearer error="invalid_token"</c>; a failed policy check (steps 10-11) is 403
@@ -262,7 +263,7 @@ internal sealed partial class CallerAssertionGate
         return WriteErrorAsync(context, code);
     }
 
-    private static Task WriteForbiddenAsync(HttpContext context)
+    internal static Task WriteForbiddenAsync(HttpContext context)
     {
         context.Response.StatusCode = StatusCodes.Status403Forbidden;
         return WriteErrorAsync(context, NotAllowedCode);
