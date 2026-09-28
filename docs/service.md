@@ -23,8 +23,11 @@ It lives in two new projects that depend on the core libraries — **never the r
 ## Running it
 
 ```bash
-# Single-node development: zero config. DB + volumes default under the repo's .sextant/service.
-sextant service
+# Single-node development on loopback. DB + volumes default under the repo's .sextant/service.
+# The service refuses to start without a control token (SX-6d), so set one...
+SEXTANT_SERVICE_CONTROL_TOKEN=... sextant service
+# ...or, for a loopback-only dev service, opt out explicitly. INSECURE: /control/* is open, and a loud warning is logged.
+SEXTANT_SERVICE_INSECURE_OPEN_CONTROL_PLANE=true sextant service
 
 # Scaled deployment: point volumes at durable storage and require tokens.
 SEXTANT_SERVICE_DB_PATH=/data/sextant/catalog.db \
@@ -40,8 +43,8 @@ local stdio MCP, `retention`, …) is unchanged and needs no service.
 ## Configuration (`ServiceOptions`)
 
 All settings bind from `SEXTANT_SERVICE_*` environment variables, falling back to the repo `sextant.json`
-for the database path and to `<db-dir>/service` for the volume root, so a bare `sextant service` works out
-of the box.
+for the database path and to `<db-dir>/service` for the volume root, so `sextant service` needs nothing but a
+control token (or the explicit dev opt-out below) to start.
 
 | Env var | Purpose | Default |
 | --- | --- | --- |
@@ -57,7 +60,8 @@ of the box.
 | `SEXTANT_SERVICE_REPOSITORY_HOSTS` | Comma-separated DNS host names a `POST /control/ensure` repository URL may name (see [Repository URL policy](#repository-url-policy-svc-5)). `*` admits any host that passes the URL shape rules and logs a startup warning. A malformed entry **fails startup** | `github.com` |
 | `SEXTANT_SERVICE_REPOSITORY_OWNERS` | Optional comma-separated `host/owner` (or `host/*`) allow-list for ensure repository URLs; each host must also be allowed by `REPOSITORY_HOSTS`. A malformed entry **fails startup** | none (any owner) |
 | `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS` | In `clone` mode, how many times a **transient** clone/provisioning failure is retried across re-ensures before the job settles to terminal `failed` (clamped to 1–100; deterministic failures are never retried). Also bounds the requeue of a checkout whose neutralized `global.json` SDK pin could not be restored (`sdk_pin_restore_failed`, #113), in any checkout mode | `5` |
-| `SEXTANT_SERVICE_CONTROL_TOKEN` | Bearer token for `/control/*` | none (open, dev only) |
+| `SEXTANT_SERVICE_CONTROL_TOKEN` | Bearer token for `/control/*`. **Required:** the service refuses to start without it (SX-6d, #198). A whitespace-only value also fails startup | none (startup fails) |
+| `SEXTANT_SERVICE_INSECURE_OPEN_CONTROL_PLANE` | **INSECURE, dev only.** Lets the service start with no control token, leaving the whole control plane (`/control/*`: ensure, retire, retention, backup, grants, audit) open to anyone who can reach the control port. The service prints and logs a loud `WARNING: INSECURE` line at startup while it is in effect. Ignored when a control token is set. A malformed value **fails startup** | `false` |
 | `SEXTANT_SERVICE_QUERY_TOKEN` | Bearer token for `/mcp` + `/query/*` | none (anonymous read) |
 | `SEXTANT_SERVICE_CONTRIBUTE_TOKEN` | Least-privilege token for `/control/contribute` only (issue #71); the control token remains a superset that also authorizes it | none (falls back to control token) |
 | `SEXTANT_SERVICE_READ_POLICY` | Enforced query-plane read-authorization policy (Phase 17) | disabled (open read) |
@@ -641,7 +645,7 @@ The host deliberately **separates control endpoints from query endpoints**, and 
 | --- | --- | --- | --- |
 | `GET /health` | — | open | Service **AVAILABILITY**: the process is up and the catalog is reachable. |
 | `GET /ready` | — | open | Worker **CAPACITY**: `503` when this node has no worker (query-only), so an operator can tell "up" from "can index". |
-| `POST /control/ensure` | control | control token | Idempotent ensure-snapshot (criterion 1). Accepts an optional monotonic `branch_head_sequence` for forward-only branch-head advance (Phase 14, issue #84), **or** an `expected_head_commit` head CAS, plus `forced` and `branch_update` (see [Branch-pointer guards](#branch-pointer-guards-head-cas-branch_update-none-retire-svc-67)); the result carries `branch_advanced`. Blocks until terminal (`200`; `202` when transient-requeued) unless `?wait=false`, which returns `202` at once with the job to poll (issue #148). A caller disconnect/timeout **never** cancels production. A repository URL the [repository URL policy](#repository-url-policy-svc-5) refuses, both branch guards together (`conflicting_branch_guards`) or an unknown `branch_update` (`invalid_branch_update`) is `400 {"status":"rejected","reason":"<code>"}` before any job exists (audited `ensure`/`denied`). A user caller (`act=user` assertion) may ensure only a repository it can read: otherwise `403 {"status":"rejected","reason":"not_granted"}` (SVC-4). |
+| `POST /control/ensure` | control | control token | Idempotent ensure-snapshot (criterion 1). Accepts an optional monotonic `branch_head_sequence` for forward-only branch-head advance (Phase 14, issue #84), **or** an `expected_head_commit` head CAS, plus `forced` and `branch_update` (see [Branch-pointer guards](#branch-pointer-guards-head-cas-branch_update-none-retire-svc-67)); the result carries `branch_advanced`. Blocks until terminal (`200`; `202` when transient-requeued) unless `?wait=false`, which returns `202` at once with the job to poll (issue #148). A caller disconnect/timeout **never** cancels production. A repository URL the [repository URL policy](#repository-url-policy-svc-5) refuses, both branch guards together (`conflicting_branch_guards`) or an unknown `branch_update` (`invalid_branch_update`) is `400 {"status":"rejected","reason":"<code>"}` before any job exists (audited `ensure`/`denied`). A user caller (`act=user` assertion) may ensure only a repository it can read: otherwise `403 {"status":"rejected","reason":"not_granted"}` (SVC-4), whatever the body asks. A user caller's ensure is then bounded (SX-6d, see [User callers on the control plane](#user-callers-on-the-control-plane-issue-193)): `default_branch: true`, any `branch_head_sequence`, or an advance with no `expected_head_commit` or no `branch_name` is `400` (`default_branch_not_allowed`, `branch_head_sequence_not_allowed`, `branch_guard_required`, `branch_required`). |
 | `POST /control/contribute` | control | control **or** contribute token | Ingest a client/CI semantic contribution (Phase 16); the least-privilege contribute token authorizes this endpoint only. |
 | `GET /control/status/{jobId}` | control | control token | Job status + per-project diagnostics (criterion 5) + checkout `coverage` (#119). For a user caller, a job on a repository it cannot read is the same `404` as an unknown id (SVC-4). |
 | `GET /control/resolve` | control | control token | Resolve a repository branch (`?branch=`, else the default) to its current published snapshot (+ its `coverage`, #119), plus `commit_sha`, the resolved `branch` name, `is_default` and `head_sequence` (SVC-7; a null `commit_sha`/`head_sequence` is omitted). For a user caller, a repository it cannot read is the same bare `404` as an absent one (SVC-4). |
@@ -657,7 +661,9 @@ The host deliberately **separates control endpoints from query endpoints**, and 
 | `GET /query/snapshots/{identityHash}/symbols` | query | query token (or delegate token + caller assertion) | One immutable page of a snapshot's symbols, cursor-paged (federation, issue #51). |
 | `POST /mcp` | query | query token (or delegate token; `tools/call` needs a caller assertion) | Authenticated HTTP MCP semantic queries (criterion 4). |
 
-A null token disables that plane's auth (single-node development). Token checks are constant-time. Query
+A null query token allows anonymous reads (single-node development). The control plane has no such default:
+the service refuses to start without a control token unless `SEXTANT_SERVICE_INSECURE_OPEN_CONTROL_PLANE=true`
+explicitly opens it, with a loud startup warning (SX-6d). Token checks are constant-time. Query
 reads use a connection **independent** of the service writer (Phase-9 WAL supports concurrent readers), so
 a low-latency query never blocks behind a running index. Control-plane **reads** — `/control/status`,
 `/control/resolve` (and its coverage), metrics, audit — do the same (issue #148), so they answer promptly
@@ -800,7 +806,9 @@ across requests, so a revocation takes effect on the next call. Once a request h
   **one** visible repository with a complete default-branch snapshot. With none or several, it fails with
   `repository_required`.
 - **`/control/ensure`** by a user caller needs the repository to be visible, otherwise `403 not_granted`
-  (audited `ensure`/`denied`). An application caller (a trigger) and an assertion-less call are unchanged.
+  (audited `ensure`/`denied`), and its body is then bounded (SX-6d, see
+  [User callers on the control plane](#user-callers-on-the-control-plane-issue-193)). An application caller
+  (a trigger) and an assertion-less call are unchanged.
 - **`/control/status/{jobId}`** by a user caller is `404` for a job on a repository it cannot see.
 - **`/control/resolve`** by a user caller is the same bare `404` as an absent repository when it cannot see
   the repository (checked before the branch is resolved). An application caller and an assertion-less call
@@ -808,7 +816,7 @@ across requests, so a revocation takes effect on the next call. Once a request h
 - **Every other control route** (retire, retention, backup, metrics, audit, pilot) refuses a user caller with
   `403 caller_not_allowed`, whatever it can see ([issue #193](#user-callers-on-the-control-plane-issue-193)).
 - **Failures fail closed:** if the grant catalog cannot be read, the read fails (a tool error or a `5xx`)
-  rather than reading as allowed. A grant write, or a user's `not_granted` ensure refusal, that cannot be
+  rather than reading as allowed. A grant write, or a user's `not_granted` or SX-6d bound ensure refusal, that cannot be
   recorded (the service lost its writer lease or is stopping) is `503 unavailable` and writes nothing.
 
 **Routes.** Every route needs the control token **and** a verified assertion with the stated `act`.
@@ -917,7 +925,8 @@ route added later refuses user callers too unless it opts in with its own rule (
 
 | Route | `act=user` | `act=application` or no assertion |
 | --- | --- | --- |
-| `POST /control/ensure`, `GET /control/status/{jobId}`, `GET /control/resolve` | Gated by visibility (SVC-4) | Unchanged |
+| `POST /control/ensure` | Gated by visibility (SVC-4), then the body is bounded (SX-6d, below) | Unchanged (`default_branch`, sequences and unguarded advances still work) |
+| `GET /control/status/{jobId}`, `GET /control/resolve` | Gated by visibility (SVC-4) | Unchanged |
 | `/control/grants/self` | Allowed (own grants) | `403 wrong_actor` for an application; `401 caller_required` without an assertion |
 | `/control/grants/tenant`, `GET /control/grants?scope=tenant` | `403 wrong_actor` | Allowed for an application; `401 caller_required` without an assertion |
 | `POST /control/branches/retire` | `403 caller_not_allowed`, audited `retire`/`denied` | Unchanged |
@@ -941,6 +950,45 @@ route added later refuses user callers too unless it opts in with its own rule (
   rows, and `metrics`/`pilot` (cross-tenant counts and cost) stay operator data.
 - An application caller and an assertion-less control call are unchanged, and a deployment without
   `CALLER_KEYS` never has a verified caller on `/control/*` (an assertion there is `401 assertion_not_allowed`).
+- **Request targets are normalized before these rules.** On a real Kestrel socket, `%2e%2e`, `./`,
+  percent-encoded letters, a case change and an absolute-form target all reach the route they normalize to
+  and get the same refusal. `;x`, `//` and an encoded `%2f` match no route: they are `403` under `/control` and
+  `404` outside it (`KestrelControlPathTests`, #198).
+
+**User ensure bounds (SX-6d, issue #198).** A grant lets a user read a repository and index a commit of it. It
+does not let the user change the branch state every reader of that repository shares. For a user caller only,
+after the visibility gate (so an ungranted user sees only `not_granted`, whatever the body), the ensure body is
+checked in this order, reading nothing but the body:
+
+| Body | Response (`400 {"status":"rejected","reason":…}`, audited `ensure`/`denied` with the repository scope) |
+| --- | --- |
+| `default_branch: true` | `default_branch_not_allowed` |
+| any `branch_head_sequence` | `branch_head_sequence_not_allowed` |
+| `branch_update: none` | allowed (moves no pointer) |
+| no `expected_head_commit` | `branch_guard_required` |
+| a missing or blank `branch_name` | `branch_required` (an ensure that names no branch claims the default) |
+
+A user's CAS (`expected_head_commit` plus `branch_name`) moves only the branch it names, and only while that
+branch still points at the expected commit. A stale CAS attaches without moving anything. `default_branch: false`
+and `forced` are allowed. A body that also trips an SVC-6+7 conflict (`conflicting_branch_guards`,
+`invalid_branch_update`) keeps that code. The service cannot verify the upstream head, so a user CAS can still
+move its branch, the default included, from the head it observed to a commit it names. The calling app is
+expected to check the head upstream first.
+
+**No implicit default for a user (issue #199).** A repository's first branch normally becomes its default (the
+#104 safety net). For a user caller it does so only when that branch is the one the remote's `HEAD` names. The
+service looks that up itself by running `git ls-remote --symref` in clone mode, with the same credential scoping
+as a clone and a 30 s timeout. The request never supplies it. The lookup happens only while the repository has no
+default and only for an ensure that may move a pointer, never under `branch_update: none`. Lookups are bounded:
+- concurrent lookups of one repository share one call;
+- an answer is remembered for 60 s;
+- at most 4 run at once.
+
+Such an ensure, `?wait=false` included, is registered only after its lookup finishes. The branch is created
+non-default when the lookup is unavailable: in locate mode, when every lookup slot is busy, or when the remote is
+unreachable or its answer is unparseable. The repository then gets a default from an application
+ensure (a push or reconcile) or from a user ensure of the remote's default branch. Application and
+assertion-less callers are unchanged.
 
 ## The `SnapshotService` data plane
 

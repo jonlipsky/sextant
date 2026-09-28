@@ -491,7 +491,7 @@ public class EnsureBranchCasConvergenceTests
 
     // The real worker's orchestrator step over an in-memory solution: the SAME SnapshotContext mapping as
     // LocalIndexerSnapshotWorker, so the branch decision is the orchestrator's own.
-    private static SnapshotWorkResult IndexWithOrchestrator(IndexDatabase db, string root, EnsureSnapshotRequest request)
+    internal static SnapshotWorkResult IndexWithOrchestrator(IndexDatabase db, string root, EnsureSnapshotRequest request)
     {
         var context = LocalIndexerSnapshotWorker.CreateSnapshotContext(request, capability: null);
         new IndexOrchestrator(db, useDocumentExtractor: true)
@@ -503,7 +503,7 @@ public class EnsureBranchCasConvergenceTests
             : SnapshotWorkResult.Failed("the orchestrator did not publish the requested identity", []);
     }
 
-    private static List<string> State(IndexDatabase db)
+    internal static List<string> State(IndexDatabase db)
     {
         var conn = db.GetConnection();
         var state = new List<string>();
@@ -534,7 +534,7 @@ public class EnsureBranchCasConvergenceTests
         return state;
     }
 
-    private static Solution BuildSolution(string root)
+    internal static Solution BuildSolution(string root)
     {
         var projectDir = Path.Combine(root, "src", "App");
         Directory.CreateDirectory(projectDir);

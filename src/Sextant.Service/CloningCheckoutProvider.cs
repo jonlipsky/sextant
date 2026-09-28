@@ -841,7 +841,11 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
     /// timeout vs spawn failure) so provisioning can distinguish a TRANSIENT transport failure (retryable)
     /// from a DETERMINISTIC one (permanent).
     /// </summary>
-    private GitResult RunGit(string workingDir, GitEnvironment environment, params string[] args)
+    private GitResult RunGit(string workingDir, GitEnvironment environment, params string[] args) =>
+        RunGit(workingDir, environment, GitTimeout, args);
+
+    /// <summary><see cref="RunGit(string, GitEnvironment, string[])"/> under a caller-chosen deadline.</summary>
+    private GitResult RunGit(string workingDir, GitEnvironment environment, TimeSpan timeout, params string[] args)
     {
         Process? process = null;
         try
@@ -896,11 +900,11 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
 
             process.StandardInput.Close();
 
-            using var cts = new CancellationTokenSource(GitTimeout);
+            using var cts = new CancellationTokenSource(timeout);
             var stdoutTask = process.StandardOutput.ReadToEndAsync(cts.Token);
             var stderrTask = process.StandardError.ReadToEndAsync(cts.Token);
 
-            if (!process.WaitForExit((int)GitTimeout.TotalMilliseconds))
+            if (!process.WaitForExit((int)timeout.TotalMilliseconds))
             {
                 cts.Cancel();
                 KillTree(process);
