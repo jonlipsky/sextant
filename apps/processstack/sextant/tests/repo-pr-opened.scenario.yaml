@@ -1,7 +1,7 @@
 name: repo-pr-opened
 description: >
   (#19) An opened pull request publishes its base and head commits with branch_update none, so no branch
-  pointer moves and no grant is recorded. The head is ensured in the head repository (a fork here), under
+  pointer moves and no grant is recorded. The head is in the base repository, so it is ensured too, under
   its own branch name.
 entrypoint: on-repository-change
 event:
@@ -17,7 +17,7 @@ event:
   baseSha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
   headRef: fix/typo
   headSha: "6dcb09b5b57875f334f61aebed695e2e4193db5e"
-  headCloneUrl: "https://github.com/contributor/hello-world.git"
+  headCloneUrl: "https://github.com/octocat/hello-world.git"
   merged: "false"
 http:
   - connection: sextant-control
@@ -59,7 +59,7 @@ expected:
       method: POST
       path: /control/ensure
       bodyMatch:
-        repository_remote_url: "https://github.com/contributor/hello-world.git"
+        repository_remote_url: "https://github.com/octocat/hello-world.git"
         commit_sha: "6dcb09b5b57875f334f61aebed695e2e4193db5e"
         branch_name: fix/typo
         branch_update: none
