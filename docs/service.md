@@ -729,7 +729,8 @@ The header parameters `jku`, `jwk`, `x5u`, `x5c` and `crit` are refused. The pay
 | `tslug` | Tenant slug (recorded) |
 | `act` | `user` or `application` |
 | `idp`, `sub` | For `act=user` only: the identity provider and the full subject. `idp=processstack` needs a `sub` with no `:`; any other `idp` needs `{idp}:{connectionInstanceId}:{peerId}` |
-| `app`, `dep`, `cid`, `via` | Calling app, deployment, connection and surface (`via` is `mcp-surface` or `activity`) |
+| `app`, `cid`, `via` | Calling app, connection and surface (`via` is `mcp-surface` or `activity`) |
+| `dep` | Optional deployment id, sent only when the calling run is bound to a deployment (recorded). When present it must be a non-empty string |
 | `run` | Optional run id |
 | `jti`, `iat`, `nbf`, `exp` | Assertion id and times: 60 s skew, at most 300 s from `iat` to `exp` |
 

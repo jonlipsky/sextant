@@ -137,6 +137,22 @@ public class CallerAssertionHttpTests
     }
 
     [TestMethod]
+    public async Task Mcp_DelegateCall_WithoutDeployment_ReachesTheToolWithANullDeployment()
+    {
+        await using var host = await Harness.StartAsync();
+        var claims = CallerAssertionSigner.UserClaims(DateTimeOffset.UtcNow, sub: "user-8", jti: "jti-8");
+        claims.Remove("dep");
+
+        await host.CallAsync("find_symbol", FindSymbolArguments, DelegateToken, host.Sign(claims));
+
+        Assert.AreEqual(1, host.Probe.Calls, "an assertion without dep is admitted and reaches the tool");
+        var principal = host.Probe.Principals.Single().Principal!;
+        Assert.AreEqual("user-8", principal.UserId);
+        Assert.IsNull(principal.Deployment, "a run bound to no deployment carries no dep");
+        Assert.AreEqual("tenant-a/user-8", principal.AuditPrincipal);
+    }
+
+    [TestMethod]
     public async Task Mcp_TwentyParallelCallers_EachResolveTheirOwn()
     {
         await using var host = await Harness.StartAsync();
@@ -383,6 +399,42 @@ public class CallerAssertionHttpTests
         Assert.AreEqual(2, retires.Count);
         Assert.IsTrue(retires.All(r => r.Actor == AuditLogStore.HashActor("tenant-a/user-1")),
             "both a completed and a refused retire are attributed to the verified caller");
+    }
+
+    [TestMethod]
+    public async Task Control_VerifiedCallerWithoutDeployment_IsTheAuditActor()
+    {
+        await using var host = await Harness.StartAsync();
+        var claims = CallerAssertionSigner.UserClaims(DateTimeOffset.UtcNow);
+        claims.Remove("dep");
+
+        using var retention = await host.ControlAsync(HttpMethod.Post, "/control/retention", ControlToken, host.Sign(claims));
+
+        Assert.AreEqual(HttpStatusCode.OK, retention.StatusCode, await retention.Content.ReadAsStringAsync());
+        Assert.AreEqual(AuditLogStore.HashActor("tenant-a/user-1"),
+            host.Service.RecentAudit(action: AuditAction.Retention).Single().Actor);
+    }
+
+    [TestMethod]
+    [DataRow("null")]
+    [DataRow("1")]
+    [DataRow("\"\"")]
+    public async Task PresentDeployment_ThatIsNotANonEmptyString_Is401_OnEveryPlane(string depJson)
+    {
+        await using var host = await Harness.StartAsync();
+        var claims = CallerAssertionSigner.UserClaims(DateTimeOffset.UtcNow);
+        claims["dep"] = JsonSerializer.Deserialize<JsonElement>(depJson);
+        var assertion = host.Sign(claims);
+
+        AssertUnauthorized(await host.RpcAsync("tools/list", "{}", DelegateToken, assertion),
+            CallerAssertionGate.InvalidAssertionCode, "invalid_token");
+        using (var query = await host.SnapshotPageAsync(DelegateToken, host.WidgetsHash, assertion))
+            await AssertUnauthorizedAsync(query, CallerAssertionGate.InvalidAssertionCode, "invalid_token");
+        using (var control = await host.ControlAsync(HttpMethod.Post, "/control/retention", ControlToken, assertion))
+            await AssertUnauthorizedAsync(control, CallerAssertionGate.InvalidAssertionCode, "invalid_token");
+        Assert.AreEqual(0, host.Probe.Calls);
+        Assert.AreEqual(0, host.Service.RecentAudit(action: AuditAction.Retention).Count);
+        StringAssert.Contains(host.Logs(), CallerAssertionReasons.BadClaims);
     }
 
     [TestMethod]
