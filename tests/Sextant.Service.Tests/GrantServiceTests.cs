@@ -322,6 +322,16 @@ public class GrantServiceTests
         Assert.AreEqual("tenant-b/app:sextant", AuditCaller.ForCaller(App("tenant-b")).Principal);
     }
 
+    [TestMethod]
+    public void AuditCaller_NullDeployment_RendersDepDash()
+    {
+        var caller = AuditCaller.ForCaller(User("tenant-a", "user-1") with { Deployment = null });
+
+        Assert.AreEqual(";idp=processstack;kid=kid-a;via=mcp-surface;cid=conn-1;dep=-;jti=jti-1", caller.DetailSuffix);
+        StringAssert.Contains(caller.DetailSuffix, ";dep=-;");
+        Assert.AreEqual("tenant-a/user-1", caller.Principal, "an absent dep does not change the actor");
+    }
+
     // ==== write availability ========================================================================
 
     [TestMethod]

@@ -953,6 +953,28 @@ public class GrantHttpTests
         }
     }
 
+    [TestMethod]
+    public async Task VerifiedCallerWithoutDeployment_IsAuditedWithDepDash()
+    {
+        await using var host = await Harness.StartAsync();
+        var claims = CallerAssertionSigner.UserClaims(DateTimeOffset.UtcNow);
+        claims.Remove("dep");
+        var assertion = host.Sign(claims);
+
+        await PutSelfAsync(host, assertion, Widgets);
+        using (var refused = await host.ControlAsync(HttpMethod.Put, SelfPath, ControlToken, assertion, Body(Widgets, "bad branch")))
+            await AssertRejectedAsync(refused, HttpStatusCode.BadRequest, GrantReason.BranchNotAllowed);
+        using (var ensure = await host.ControlAsync(HttpMethod.Post, "/control/ensure", ControlToken, assertion, EnsureBody()))
+            await AssertRejectedAsync(ensure, HttpStatusCode.Forbidden, GrantReason.NotGranted);
+
+        const string noDep = ";idp=processstack;kid=kid-a;via=mcp-surface;cid=conn-1;dep=-;jti=jti-1";
+        var grants = host.Service.RecentAudit(action: AuditAction.Grant).OrderBy(r => r.Id).ToList();
+        CollectionAssert.AreEqual(new[] { "put_self;created" + noDep, "put_self;" + GrantReason.BranchNotAllowed + noDep },
+            grants.Select(r => r.Detail).ToList());
+        Assert.AreEqual(GrantReason.NotGranted + noDep, host.Service.RecentAudit(action: AuditAction.Ensure).Single().Detail);
+        Assert.IsTrue(grants.All(r => r.Actor == AuditLogStore.HashActor("tenant-a/user-1")));
+    }
+
     // ==== helpers ===================================================================================
 
     // Gadgets and Gizmos pin Widgets (the provider) and each use its symbol global::App.Type0 once.
