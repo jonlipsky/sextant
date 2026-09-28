@@ -7,6 +7,13 @@ namespace Sextant.ProcessStack.Activities;
 /// the service in line: an ensure for every branch whose GitHub head the service does not point at, and a
 /// retire for every non-default branch GitHub no longer has. Deterministic (sorted, de-duplicated, capped)
 /// and pure: the flow gathers the inputs and sends the planned bodies.
+/// <para>
+/// Every CAS is the commit the service pointed at when resolved, so the flow must resolve every target
+/// <b>before</b> it lists GitHub's branches (a default target with GitHub's default branch name, read first).
+/// A push the service processes after the resolve then fails the CAS (the plan only attaches); with the
+/// listing first, a push processed between the two would pass it, and the ensure would roll the branch back
+/// to the stale listing head (or the retire remove a branch the push re-created).
+/// </para>
 /// </summary>
 [ActivityName(TypeName)]
 [ActivityDescription("Plans the CAS-guarded ensures and retires that reconcile the Sextant service's branch pointers with GitHub (pure computation).")]
@@ -38,7 +45,7 @@ public sealed class SextantPlanReconcileActivity : AbstractActivity
     public const string ReasonEnsureLimit = "ensure_limit";
     public const string ReasonRetireLimit = "retire_limit";
 
-    [ActivityInput("serviceTargets", Required = true, Description = "The watched (repository, branch) targets, each with the /control/resolve result for its effective branch: {repository, branch ('' = default), resolveStatusCode, resolve}.")]
+    [ActivityInput("serviceTargets", Required = true, Description = "The watched (repository, branch) targets, each with its /control/resolve result: {repository, branch ('' = default), resolveStatusCode, resolve}. Resolve every target BEFORE listing githubBranches (the CAS only guards against pushes processed after the resolve), a default target with GitHub's default branch name.")]
     public object? ServiceTargets { get; set; }
 
     [ActivityInput("githubBranches", Required = true, Description = "GitHub's branches: per repository {repository, defaultBranch, branches:[{name, sha}], truncated?} or flat {repository, name, sha, isDefault?}. A repository without a branches list is treated as unreachable; one marked truncated:true or complete:false is never retired from.")]
@@ -142,8 +149,8 @@ public sealed class SextantPlanReconcileActivity : AbstractActivity
         if (target.ResolveStatusCode == 200 && resolvedBranch.Length > 0
             && !string.Equals(resolvedBranch, branch, StringComparison.Ordinal))
         {
-            // The resolve answered for another branch (it was asked for the service's default, which is not
-            // GitHub's): its commit says nothing about this branch.
+            // The resolve answered for another branch (GitHub's default changed between reading its name and
+            // listing, or the flow resolved without a branch): its commit says nothing about this branch.
             Skip(target, branch, ReasonResolveBranchMismatch);
             return;
         }
@@ -201,9 +208,9 @@ public sealed class SextantPlanReconcileActivity : AbstractActivity
             target.Repository, head, branch, isDefault, expected, null, ServiceRequests.Advance));
     }
 
-    // GitHub no longer has the branch: retire it under a CAS on the commit the service points at, so a
-    // branch re-created since the listing (a newer push moved the pointer) is kept. The default is never
-    // retired (the service refuses it too).
+    // GitHub no longer has the branch: retire it under a CAS on the commit the service pointed at when
+    // resolved (before the listing), so a branch re-created since then (its push moved the pointer) is kept.
+    // The default is never retired (the service refuses it too).
     private void PlanAbsent(Target target, GitHubListing listing, string branch, int maxRetires)
     {
         if (target.Branch.Length == 0)

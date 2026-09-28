@@ -199,6 +199,7 @@ public sealed class SextantParseWatchCommandActivityTests
 
     [TestMethod]
     [DataRow("watch <https://github.com/Octo/Repo|github.com/Octo/Repo>")]
+    [DataRow("watch <http://github.com/Octo/Repo|github.com/Octo/Repo>")]
     [DataRow("watch <https://github.com/Octo/Repo>")]
     [DataRow("watch https://github.com/Octo/Repo.git")]
     [DataRow("watch github.com/Octo/Repo")]
@@ -212,6 +213,45 @@ public sealed class SextantParseWatchCommandActivityTests
         Assert.IsEmpty(activity.Errors);
         Assert.AreEqual("https://github.com/Octo/Repo.git", Repository(activity)["remoteUrl"]);
         Assert.AreEqual("https://github.com/octo/repo", Repository(activity)["repositoryKey"]);
+    }
+
+    [TestMethod]
+    public async Task A_slack_auto_link_is_what_was_typed()
+    {
+        var activity = await ParseAsync("watch <http://ghe.example.com/Team/Tool|ghe.example.com/Team/Tool> on main");
+
+        Assert.IsEmpty(activity.Errors);
+        Assert.AreEqual("ghe.example.com/Team/Tool", Repository(activity)["input"]);
+        Assert.AreEqual("https://ghe.example.com/Team/Tool", Repository(activity)["repositoryKey"]);
+        Assert.AreEqual("main", activity.Branch);
+    }
+
+    [TestMethod]
+    public async Task A_labelled_slack_link_names_its_url_even_with_spaces_or_on_in_the_label()
+    {
+        var activity = await ParseAsync("watch <https://github.com/octo/real|the octo/other repo on dev> on main");
+
+        Assert.IsEmpty(activity.Errors);
+        CollectionAssert.AreEqual(new[] { "https://github.com/octo/real" }, Keys(activity));
+        Assert.AreEqual("main", activity.Branch);
+    }
+
+    [TestMethod]
+    public async Task A_plain_http_slack_link_is_still_refused()
+    {
+        var activity = await ParseAsync("watch <http://github.com/octo/repo>");
+
+        Assert.IsEmpty(activity.Repositories);
+        CollectionAssert.AreEqual(new[] { "Only https repository URLs are supported." }, activity.Errors);
+    }
+
+    [TestMethod]
+    public async Task A_slack_escaped_ampersand_separates_repositories()
+    {
+        var activity = await ParseAsync("watch octo/a &amp; octo/b");
+
+        Assert.IsEmpty(activity.Errors);
+        CollectionAssert.AreEqual(new[] { "https://github.com/octo/a", "https://github.com/octo/b" }, Keys(activity));
     }
 
     [TestMethod]

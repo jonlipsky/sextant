@@ -1,3 +1,4 @@
+using System.Text;
 using ProcessStack.Abstractions;
 
 namespace Sextant.ProcessStack.Activities;
@@ -86,7 +87,7 @@ public sealed class SextantParseWatchCommandActivity : AbstractActivity
     private void ParseTargets(string verb, string rest, string host, int maxRepositories)
     {
         Verb = verb;
-        var (repositories, branch) = SplitBranch(rest);
+        var (repositories, branch) = SplitBranch(ResolveSlackLinks(rest));
         if (branch is not null)
         {
             var name = GitRefs.StripHeadsPrefix(StripDecoration(branch));
@@ -167,20 +168,54 @@ public sealed class SextantParseWatchCommandActivity : AbstractActivity
         return (rest, null);
     }
 
-    // Repository references separated by commas, whitespace or "and"; Slack links `<url|label>` become the url.
+    // Repository references separated by commas, whitespace, "and" or "&" (Slack escapes it as "&amp;").
     private static IEnumerable<string> Tokenize(string repositories)
     {
         foreach (var raw in repositories.Split([',', ' '], StringSplitOptions.RemoveEmptyEntries))
         {
-            if (raw.Equals("and", StringComparison.OrdinalIgnoreCase) || raw == "&")
+            if (raw.Equals("and", StringComparison.OrdinalIgnoreCase) || raw is "&" or "&amp;")
                 continue;
-            var token = raw;
-            if (token.StartsWith('<') && token.Contains('|'))
-                token = token[1..token.IndexOf('|')];
-            token = StripDecoration(token);
+            var token = StripDecoration(raw);
             if (token.Length > 0)
                 yield return token;
         }
+    }
+
+    // Replaces every Slack link `<url>`/`<url|label>` with what it names, before the text is split (a label
+    // may hold spaces or "on").
+    private static string ResolveSlackLinks(string text)
+    {
+        var builder = new StringBuilder(text.Length);
+        var index = 0;
+        while (index < text.Length)
+        {
+            var open = text.IndexOf('<', index);
+            var close = open < 0 ? -1 : text.IndexOf('>', open + 1);
+            if (close < 0)
+            {
+                builder.Append(text, index, text.Length - index);
+                break;
+            }
+            builder.Append(text, index, open - index).Append(SlackLinkTarget(text[(open + 1)..close]));
+            index = close + 1;
+        }
+        return builder.ToString();
+    }
+
+    // A link names its url, except an auto-link: Slack turns a typed `github.com/o/r` into
+    // `<http://github.com/o/r|github.com/o/r>`, so when the url is only a scheme plus the label, the label is
+    // what the user wrote.
+    private static string SlackLinkTarget(string link)
+    {
+        var bar = link.IndexOf('|');
+        if (bar < 0)
+            return link;
+        var url = link[..bar];
+        var label = link[(bar + 1)..];
+        var autoLink = label.Length > 0
+            && (url.Equals("http://" + label, StringComparison.OrdinalIgnoreCase)
+                || url.Equals("https://" + label, StringComparison.OrdinalIgnoreCase));
+        return autoLink ? label : url;
     }
 
     private static string StripDecoration(string token) =>

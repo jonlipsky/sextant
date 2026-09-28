@@ -83,7 +83,9 @@ SX-13 follows the service code where it differs from the table above. Each activ
 - **Push:** an ensure with `branch_update: advance` and `expected_head_commit: before`, where all zeros becomes `""`.
   - A push with no usable `before` cannot be CAS-guarded. It still publishes, but with `branch_update: none` and `reason: missing_before`, so it never moves a pointer.
   - A tag is ignored with `tag`, and a create event with `handled_by_push`.
-- **Delete:** a deleted push retires with the CAS `before`. It retires without a CAS (and `missing_before`) when `before` is unusable. A branch delete event retires without a CAS.
+- **Delete:** a deleted push retires with the CAS `before`. It retires without a CAS (and `missing_before`) when `before` is unusable. A branch delete event retires without a CAS (`app.md` scenario 18).
+  - **The no-CAS delete-event retire is a deliberate trade-off,** flagged for review. It removes a deleted branch whose delete push failed its CAS because the pointer was still behind `before`. That happens when the last push's index failed, or when the retire timed out waiting behind that index. The reconcile never covers an unwatched branch, so without this retire such a branch would stay in the service for good.
+  - **The cost is the reverse race:** a delete event processed after a push that re-created the branch removes it again. Every later push then fails the CAS until a reconcile, which also covers only watched branches. A flow can narrow the window by checking that GitHub still lacks the branch before it sends the retire.
 - **Pull requests** (opened, synchronize, reopened) publish base and head with `branch_update: none`. The head uses `headCloneUrl`; when that is empty, the head repository was deleted and only the base is sent.
   - A side naming the same repository and commit as an earlier one is sent once, because identity ignores the branch.
   - Closed and edited pull requests are ignored.
@@ -110,11 +112,15 @@ SX-13 follows the service code where it differs from the table above. Each activ
 
 **`SextantPlanReconcile`**
 - **The input contract:**
-  - `serviceTargets` is the watched `(repository, branch)` list. `branch: ""` means the default branch. Each target carries the `/control/resolve` result for its effective branch (`resolveStatusCode`, `resolve`).
+  - `serviceTargets` is the watched `(repository, branch)` list. `branch: ""` means the default branch. Each target carries its `/control/resolve` result (`resolveStatusCode`, `resolve`).
   - `githubBranches` is either per repository `{repository, defaultBranch, branches:[{name, sha}], truncated?}` or flat `{repository, name, sha, isDefault?}` (`commit.sha` is also read).
-  - The flow must resolve with the effective branch. A resolve that answers for another branch is skipped with `resolve_branch_mismatch`.
+  - **Every resolve happens before the GitHub branch listing,** which amends the order of `app.md` steps 3b and 3c. The order is: `GetRepository` (for the default branch's name), then the resolve, then `ListBranches`.
+    - The CAS only guards against pushes the service processes after the resolve.
+    - With the listing first, a push processed between the listing and the resolve passes the CAS. The ensure would then roll the branch back to the listing's head, or the retire would remove a branch the push had just re-created.
+    - A default target (`branch: ""`) is resolved with GitHub's default branch name from `GetRepository`, not without a branch. A resolve without a branch answers for the service's default, so after GitHub's default changes, that target would be skipped on every run. Resolving with GitHub's name gets a 404 for a new default, which is then ensured and promoted under an empty CAS.
+    - A resolve that answers for a branch other than the listing's default is skipped with `resolve_branch_mismatch`. Under this order, that only happens when the default changes between `GetRepository` and `ListBranches`.
 - **A branch GitHub has at a different head** is ensured under the CAS of the service's resolved commit. A 404 resolve is ensured under an empty CAS, which creates the pointer.
-- **Retires (amending `app.md` step 3b, "retire is left to delete events").** A branch GitHub no longer has is retired under the CAS of the service's resolved commit, so a re-created branch is never retired.
+- **Retires (amending `app.md` step 3b, "retire is left to delete events").** A branch GitHub no longer has is retired under the CAS of the service's resolved commit. A branch re-created after the listing has had its pointer moved by its push, so it fails the CAS and is kept.
   - The default branch is never retired (`default_branch`, `default_branch_absent`).
   - A listing marked `truncated:true` or `complete:false` (either form) is never retired from (`branch_listing_incomplete`).
   - A repository with no `branches` list is treated as unreachable.
@@ -137,6 +143,8 @@ SX-13 follows the service code where it differs from the table above. Each activ
   - Anything else, including an empty prompt, is `help`.
   - Leading mentions (`<@U…>`, `@name`) and trailing sentence punctuation are ignored.
 - **Repositories:** `owner/repo`, `host/owner/repo`, https and ssh URLs, `<url>` and Slack `<url|label>` links. They are normalized as in `SextantNormalizeRepository`, de-duplicated by `repositoryKey`, and capped by `maxRepositories` (default 10, at most 50).
+  - A Slack link gives its URL, unless the URL is only `http://` or `https://` plus the label. Slack auto-links a typed `github.com/owner/repo` as `<http://github.com/owner/repo|github.com/owner/repo>`, so the label is what was typed.
+  - `&amp;` (Slack's escaped `&`) separates repositories, like `&`, `,` and `and`.
 - **Branch:** the extra `branch` output comes from `on <branch>` or `on branch <branch>` (the last spaced `on`). `""` means the default branch.
 - **Errors** are human-readable and capped at 10.
   - An echoed reference is truncated to 64 characters.
