@@ -1,0 +1,56 @@
+name: import-legacy-watches-retry-unresolved
+description: >
+  retryUnresolved checks an unresolved entry again; once it is granted its mark is cleared.
+entrypoint: import-legacy-watches
+principal:
+  userId: u-alice
+inputs:
+  retryUnresolved: true
+seed:
+  userMemory:
+    - key: "sextant.watched-repos:github.com/octocat/hello-world@main"
+      value: '{"owner":"octocat","repo":"hello-world","branch":"main","cloneUrl":"https://github.com/octocat/hello-world.git","addedAt":"2026-01-01T00:00:00+00:00"}'
+    - key: "sextant.app:legacy-import-attempts"
+      value: '{"github.com/octocat/hello-world@main":2}'
+http:
+  - connection: sextant-control
+    method: GET
+    path: /control/grants/self
+    body: { grants: [], result_count: 0 }
+  - connection: github
+    method: GET
+    path: /repos/octocat/hello-world
+    body:
+      id: 1296269
+      name: hello-world
+      full_name: octocat/hello-world
+      owner: { login: octocat, id: 1 }
+      private: false
+      default_branch: main
+  - connection: sextant-control
+    method: PUT
+    path: /control/grants/self
+    body:
+      grant: { repository: "https://github.com/octocat/hello-world.git", branch: "", source: self, created_at: 1760000000 }
+      created: true
+expected:
+  status: Completed
+  variables:
+    imported: 1
+    newlyImported: 1
+    skipped: 0
+    failed: 0
+    complete: true
+    message: "Imported 1 earlier Sextant watch."
+    attemptsText: "{}"
+    importedAt: "!not_empty"
+  httpCalls:
+    - connection: github
+      method: GET
+      path: /repos/octocat/hello-world
+      count: 1
+    - connection: sextant-control
+      method: PUT
+      path: /control/grants/self
+      bodyMatch: { repository: "https://github.com/octocat/hello-world.git", branch: null }
+      count: 1

@@ -1,0 +1,44 @@
+name: import-legacy-watches-unresolved-skipped
+description: >
+  An entry two earlier imports started checking without finishing is unresolved: it is counted as skipped
+  and never checked again unless retryUnresolved is set, so the import completes and sets its flag. The
+  message says how to retry it.
+entrypoint: import-legacy-watches
+principal:
+  userId: u-alice
+inputs:
+  retryUnresolved: false
+seed:
+  userMemory:
+    - key: "sextant.watched-repos:github.com/octocat/private-repo@main"
+      value: '{"owner":"octocat","repo":"private-repo","branch":"main","cloneUrl":"https://github.com/octocat/private-repo.git","addedAt":"2026-01-01T00:00:00+00:00"}'
+    - key: "sextant.app:legacy-import-attempts"
+      value: '{"github.com/octocat/private-repo@main":2}'
+http:
+  - connection: sextant-control
+    method: GET
+    path: /control/grants/self
+    body: { grants: [], result_count: 0 }
+expected:
+  status: Completed
+  variables:
+    imported: 0
+    newlyImported: 0
+    skipped: 1
+    failed: 0
+    remaining: 0
+    complete: true
+    outcome: ok
+    message: "1 earlier watch could not be imported: not on github.com, not visible to this workspace's GitHub connection, or refused by the Sextant service.\nRun import-legacy-watches with retryUnresolved to check the ones earlier imports could not finish again."
+    importedAt: "!not_empty"
+  httpCalls:
+    - connection: sextant-control
+      method: GET
+      path: /control/grants/self
+      count: 1
+    - connection: github
+      path: "/repos/**"
+      count: 0
+    - connection: sextant-control
+      method: PUT
+      count: 0

@@ -1,0 +1,43 @@
+name: lazy-import-failed-note
+description: >
+  A failed import (here a v1 watch GitHub does not show, which fails the import process) does not fail the
+  turn: the command is still answered, after a note that the import will be tried again. The flag is not
+  set, so the next turn imports again, checking the failed entry last.
+entrypoint: configure-watched-repos
+principal:
+  userId: u-alice
+inputs:
+  # The prompt-trigger envelope `app test` needs to route SendConnectionMessage (the platform sets these).
+  tenantId: "sextant-test"
+  applicationInstanceId: "sextant-test-instance"
+  conversationId: "conv-lazy-import-failed-note"
+  prompt: "hello there"
+  isFirstTurn: true
+  channelType: "web"
+seed:
+  userMemory:
+    - key: "sextant.watched-repos:github.com/octocat/private-repo@main"
+      value: '{"owner":"octocat","repo":"private-repo","branch":"main","cloneUrl":"https://github.com/octocat/private-repo.git","addedAt":"2026-01-01T00:00:00+00:00"}'
+http:
+  - connection: sextant-control
+    method: GET
+    path: /control/grants/self
+    body: { grants: [], result_count: 0 }
+  - connection: github
+    method: GET
+    path: /repos/octocat/private-repo
+    status: 404
+    body: { message: "Not Found" }
+expected:
+  status: Completed
+  variables:
+    verb: help
+    agentResponse: "I couldn't finish importing your earlier Sextant watches yet; I'll try again next time.\n\nI can manage the repositories you watch for Sextant indexing. Try: \"watch owner/repo on main\", \"stop watching owner/repo\", or \"what am I watching\"."
+  httpCalls:
+    - connection: github
+      method: GET
+      path: /repos/octocat/private-repo
+      count: 1
+    - connection: sextant-control
+      method: PUT
+      count: 0
