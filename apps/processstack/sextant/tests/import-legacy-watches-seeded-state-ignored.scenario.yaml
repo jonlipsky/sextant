@@ -23,6 +23,7 @@ inputs:
   skipped: 99
   failed: 99
   remaining: 99
+  retried: true
   complete: true
   outcome: seeded
   message: seeded

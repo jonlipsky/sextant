@@ -48,6 +48,9 @@ to a connection registered in the tenant:
 | `sextant-control` | `type: http-api`, base URL `<sextant-service-url>` | `<control-token>` (the service's control token) as the bearer, plus `callerIdentity` |
 | `github` | the workspace's GitHub App connection | its webhook must deliver `push`, `delete` and `pull_request` |
 
+Use an `https://` service URL unless the service is reachable only on a private network: both Sextant
+connections carry a bearer token and a signed caller assertion on every request.
+
 Both Sextant connections carry the same `callerIdentity` block:
 `{mode: signed-header, audience: sextant, keyId: <kid>, signingKey: <signing-key>}`. Set `keyId`
 explicitly on both. It defaults to the connection's own id, which would give the two connections different

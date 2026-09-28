@@ -1,0 +1,51 @@
+name: import-legacy-watches-retry-keeps-attempts
+description: >
+  A service failure on the PUT (here a 503 again, on an entry an earlier run already marked once) uses no
+  attempt: GitHub answered, so the mark stays at 1 and the import stays incomplete with no flag. The next
+  run tries the entry again instead of leaving it unresolved.
+entrypoint: import-legacy-watches
+principal:
+  userId: u-alice
+inputs:
+  retryUnresolved: false
+seed:
+  userMemory:
+    - key: "sextant.watched-repos:github.com/octo/gamma@main"
+      value: '{"owner":"octo","repo":"gamma","branch":"main","cloneUrl":"https://github.com/octo/gamma.git","addedAt":"2026-01-01T00:00:00+00:00"}'
+    - key: "sextant.app:legacy-import-attempts"
+      value: '{"github.com/octo/gamma@main":1}'
+http:
+  - connection: sextant-control
+    method: GET
+    path: /control/grants/self
+    body: { grants: [], result_count: 0 }
+  - connection: github
+    method: GET
+    path: /repos/octo/gamma
+    body: { id: 3, name: gamma, full_name: octo/gamma, owner: { login: octo, id: 1 }, default_branch: main }
+  - connection: sextant-control
+    method: PUT
+    path: /control/grants/self
+    status: 503
+    body: { status: unavailable }
+expected:
+  status: Completed
+  variables:
+    imported: 0
+    newlyImported: 0
+    skipped: 0
+    failed: 1
+    remaining: 0
+    complete: false
+    outcome: ok
+    attemptsText: '{"github.com/octo/gamma@main":1}'
+    importedAt: ""
+  httpCalls:
+    - connection: github
+      method: GET
+      path: /repos/octo/gamma
+      count: 1
+    - connection: sextant-control
+      method: PUT
+      path: /control/grants/self
+      count: 1

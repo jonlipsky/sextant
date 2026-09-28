@@ -1,0 +1,56 @@
+name: import-legacy-watches-already-held
+description: >
+  A PUT for a grant the caller already holds answers 200 with created false. The plan cannot see it as held
+  here (a default-branch grant the service has not resolved to a branch yet), so it is checked and PUT again,
+  and it counts as imported but not newly imported.
+entrypoint: import-legacy-watches
+principal:
+  userId: u-alice
+inputs:
+  retryUnresolved: false
+seed:
+  userMemory:
+    - key: "sextant.watched-repos:github.com/octocat/hello-world@main"
+      value: '{"owner":"octocat","repo":"hello-world","branch":"main","cloneUrl":"https://github.com/octocat/hello-world.git","addedAt":"2026-01-01T00:00:00+00:00"}'
+http:
+  - connection: sextant-control
+    method: GET
+    path: /control/grants/self
+    body:
+      grants:
+        - repository: "https://github.com/octocat/hello-world.git"
+          branch: ""
+          source: self
+          created_at: 1760000000
+          status: { resolved_branch: null, snapshot_status: missing }
+      result_count: 1
+  - connection: github
+    method: GET
+    path: /repos/octocat/hello-world
+    body: { id: 1296269, name: hello-world, full_name: octocat/hello-world, owner: { login: octocat, id: 1 }, default_branch: main }
+  - connection: sextant-control
+    method: PUT
+    path: /control/grants/self
+    body:
+      grant: { repository: "https://github.com/octocat/hello-world.git", branch: "", source: self, created_at: 1760000000 }
+      created: false
+expected:
+  status: Completed
+  variables:
+    imported: 1
+    newlyImported: 0
+    skipped: 0
+    failed: 0
+    remaining: 0
+    complete: true
+    outcome: ok
+    message: "Imported 1 earlier Sextant watch."
+    attemptsText: "{}"
+    importedAt: "!not_empty"
+  httpCalls:
+    - connection: sextant-control
+      method: PUT
+      path: /control/grants/self
+      caller: { act: user, idp: processstack, sub: u-alice }
+      bodyMatch: { repository: "https://github.com/octocat/hello-world.git", branch: null }
+      count: 1

@@ -2,7 +2,8 @@ name: import-legacy-watches-refusals
 description: >
   The service's answer decides what happens to an entry: 400 (the repository or branch is refused) is
   skipped and 409 (the watch limit) failed, and neither is tried again by itself; any other answer (here a
-  503) is failed and tried again next run, so the import is not complete and its flag is not set.
+  503) is failed and uses no attempt (its mark is taken back), so the import is not complete, its flag is
+  not set, and the next run tries it again (import-legacy-watches-retry-keeps-attempts).
 entrypoint: import-legacy-watches
 principal:
   userId: u-alice
@@ -63,7 +64,7 @@ expected:
     complete: false
     outcome: ok
     message: "1 earlier watch could not be imported: not on github.com, not visible to this workspace's GitHub connection, or refused by the Sextant service.\n2 earlier watches could not be imported right now: the Sextant service did not accept it, or you are watching as many repositories as allowed."
-    attemptsText: '{"github.com/octo/alpha@main":2,"github.com/octo/beta@main":2,"github.com/octo/gamma@main":1}'
+    attemptsText: '{"github.com/octo/alpha@main":2,"github.com/octo/beta@main":2}'
     importedAt: ""
   httpCalls:
     - connection: sextant-control
