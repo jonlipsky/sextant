@@ -271,7 +271,7 @@ internal sealed partial class CallerAssertionGate
     private static Task WriteErrorAsync(HttpContext context, string code)
     {
         context.Response.ContentType = "application/json";
-        return context.Response.WriteAsync($$"""{"error":"{{code}}"}""");
+        return context.Response.WriteAsync($$"""{"error":"{{code}}"}""", context.RequestAborted);
     }
 
     private static CallToolResult ErrorResult(string code, string message) =>
