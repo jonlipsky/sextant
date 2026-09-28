@@ -1,8 +1,0 @@
-<Solution>
-  <Folder Name="/src/">
-    <Project Path="src/Sextant.ProcessStack.Activities/Sextant.ProcessStack.Activities.csproj" />
-  </Folder>
-  <Folder Name="/tests/">
-    <Project Path="tests/Sextant.ProcessStack.Activities.Tests/Sextant.ProcessStack.Activities.Tests.csproj" />
-  </Folder>
-</Solution>

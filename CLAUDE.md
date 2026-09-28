@@ -31,8 +31,6 @@ Sextant.Core        — models, project identity, configuration
 Sextant.Service      — standalone index-service data plane (Core + Store + Indexer + Mcp)
   ← Sextant.Service.Host — ASP.NET Core host (control/query HTTP + HTTP MCP)
 Sextant.Cli          — CLI entry point (Daemon + Indexer + Mcp + Service.Host)
-apps/processstack/sextant/ — the ProcessStack app (psapp.yaml + Sextant.ProcessStack.Activities → Core);
-                             NOT in Sextant.slnx, built against the private ProcessStack SDK feed
 ```
 
 **Dependencies point OUTWARD from core.** `Sextant.Service` references `.Core`/`.Store`/`.Indexer`/`.Mcp`
@@ -41,18 +39,15 @@ references only `.Service` (it reaches `.Mcp` transitively); `Sextant.Cli` refer
 `.Mcp`/`.Service.Host`. The core libraries (`.Core`/`.Store`/`.Indexer`/`.Daemon`/`.Mcp`) must **never**
 reference the service or ProcessStack (`ArchitectureBoundaryTests` asserts this).
 
-**The ProcessStack integration is an app, never platform code in this repo's libraries.** ProcessStack
-reaches Sextant only through the app at `apps/processstack/sextant/` (its MCP surface is
-`/v1/{tenant}/mcp/sextant`) and the service's generic HTTP APIs (a delegate token plus a signed caller
-assertion, grants, the control plane). The retired ProcessStack-embedded `_sextant` gateway is summarized in
-`specs/20260922-processstack-query-gateway-archive.md`. Only `apps/processstack/` may reference a
-`ProcessStack.*` SDK package or the app's projects, and `Sextant.slnx` must not include `apps/`
+**Nothing in this repo references ProcessStack.** ProcessStack reaches Sextant only through the service's
+generic HTTP APIs (a delegate token plus a signed caller assertion, grants, the control plane). No project
+may reference a `ProcessStack.*` package, and no `apps/processstack/` tree or `psapp.yaml` may come back
 (`ArchitectureBoundaryTests`). Service code uses generic names (caller, assertion, tenant, delegate), never
-ProcessStack types; the one ProcessStack-flavoured default is the `CALLER_HEADER` name
-`X-ProcessStack-Caller`, which is configurable.
+ProcessStack types; the ProcessStack-flavoured defaults (the `CALLER_HEADER` name `X-ProcessStack-Caller`
+and the `CALLER_IDPS` value `processstack`) are configurable.
 
-**Specs:** in-flight initiative specs live in `specs/<YYYYMMDD>-<kebab-name>/` (currently
-`specs/20260927-processstack-app-extraction/`); `docs/` remains the durable reference.
+**Specs:** in-flight initiative specs live in `specs/<YYYYMMDD>-<kebab-name>/`; `docs/` remains the durable
+reference.
 
 ## Critical Rules
 
@@ -140,7 +135,7 @@ ProcessStack types; the one ProcessStack-flavoured default is the `CALLER_HEADER
   - **Fail closed:** a grants read failure propagates (never `no_visible_repositories`, never unscoped); no verified caller is `caller_required`.
   - **Cursor:** `SymbolSearchCursor` (≤ 16 KiB base64url `{v:2, a:[[hash, afterId]], w:watermark, r:rotation, b:digest}`). The unkeyed digest binds the tenant, the caller and the query, so any other use is `invalid_cursor`. It is NOT authorization: positions are honored only for hashes still visible, so a revoked or forged hash is dropped exactly like an unknown one (no oracle); `r` is only a comparison point.
   - **Output:** `pending`/`unavailable`/`truncated` target lists, and `kind`/`accessibility` rendered as names like the local tools (the `/query/snapshots` page keeps ints). The tool is in `SelectionExemptTools`, declares its own strict schema via `SearchSymbolsTool.ListToolsFilter`, and ignores the `X-Sextant-Repository` header.
-- **The ProcessStack app (`apps/processstack/sextant/`, SX-9…SX-11, SX-13) is a CLIENT of the service, outside the public build.** Its `psapp.yaml` flows reach the service only through the two tenant connections `sextant-query` (the delegate token on `/mcp`) and `sextant-control` (the control token on `/control/*`), each signing the caller assertion; the service decides everything from that assertion and its grants. Its activities (`Sextant.ProcessStack.Activities`) reference only `Sextant.Core` plus the private `ProcessStack.Abstractions` package, and its CI (`processstack-app.yml`) is separate from `Build & Test`. `ProcessStackAppManifestTests` (in `Sextant.Service.Tests`) pins `mcp.connectionTools.include` to exactly `ServiceApp.RemoteQueryTools` minus `research_codebase`, so **adding or removing a remote query tool fails the public build until the manifest is updated**. The app's user-facing flows must never reach an application-only flow (`tenant-grant`), and every flow resets its variables first (elevenworks/ProcessStack#3286). Deploy and rollback steps live in the app's `README.md` and `specs/20260927-processstack-app-extraction/cutover-runbook.md`.
+- **The ProcessStack integration app lives in a separate private repository;** this repo keeps only the service contracts it uses (the control API, the MCP query surface and the caller-identity headers), and changes to those contracts are breaking changes for that consumer.
 - **Migrations:** hand-written SQL in `src/Sextant.Store/Migrations/`, numbered `001_`, `002_`, … (last on disk is `025_symbol_name_prefix_index`; `009_api_surface_stable_identity` decouples snapshots from the live-symbol cascade, `010` adds the per-project evaluation fingerprint, `011` normalizes files + unifies occurrences and is **rebuild-required**). Migrations `012`–`025` are **additive/forward-only** (new tables/columns/indexes only, `index_runs` never cleared): `012` per-run config/profile hash, `013` immutable snapshot catalog, `014` local overlay, `015` cross-repo `snapshot_dependencies`, `016` the service job catalog (`snapshot_jobs`/`snapshot_job_diagnostics`/`writer_lease`), `017` capability fingerprint, `018` client contributions, `019` PR retention roots, `020` audit log, `021` branch head sequence, `022` snapshot coverage, `023` partial `ix_occ_source` (issue #160), `024` repository grants (SVC-4), `025` the `search_symbols` prefix + repository-URL `NOCASE` indexes (issue #196). `LatestSchemaVersion` auto-derives from `LoadMigrations().Max()` and is currently **25**.
   - **Identity-neutral migrations.** Snapshot identities fold `IndexDatabase.SnapshotSchemaVersion`, not `LatestSchemaVersion`. It is the highest migration NOT in `IndexDatabase.IdentityNeutralMigrations` (= {25}, so currently **24**). An index-only migration that changes no row can join that set and force no re-index (`SymbolNamePrefixIndexMigrationTests` asserts such a migration only creates or drops indexes). Any migration that changes what is stored must NOT join it.
   - **Identity sites.** Every identity site uses `SnapshotSchemaVersion`: the orchestrator, the overlay reconciler, the service request identity, the daemon, provenance and contribution validation. Readiness still gates on `LatestSchemaVersion`.

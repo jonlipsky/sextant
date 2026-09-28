@@ -36,8 +36,8 @@ There are **two supported modes**. Pick one:
 - Your AI coding tool of choice. Sextant ships MCP install support for `claude-code`, `cursor`,
   `copilot`, `vscode`, `codex`, and `opencode`.
 - For Mode A: access to a ProcessStack tenant where the `sextant` app is deployed, and an API key for it
-  (see below). Setting the app up is an operator task:
-  [`apps/processstack/sextant/README.md`](../apps/processstack/sextant/README.md).
+  (see below). Setting the app up is an operator task; the app and its operator docs have moved to a
+  separate private repository.
 
 ---
 
@@ -318,6 +318,4 @@ upgrade, `get_index_status` surfaces an actionable readiness message instead of 
   endpoints.
 - [service.md](service.md) — the standalone index service behind Mode A (control/query planes, tokens,
   caller assertions, grants and the read-authorization policy).
-- [apps/processstack/sextant/README.md](../apps/processstack/sextant/README.md) — deploying and operating
-  the `sextant` ProcessStack app (operators).
 - [indexing.md](indexing.md) — the Roslyn extraction pipeline and project identity model.
