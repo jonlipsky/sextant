@@ -46,6 +46,15 @@ public sealed record ServiceOptions
     public ReadAuthorizationPolicy ReadPolicy { get; init; } = ReadAuthorizationPolicy.Disabled;
 
     /// <summary>
+    /// When true, every query-plane read must name the repository it reads (the <c>X-Sextant-Repository</c>
+    /// header); a read that names none fails with <c>repository_required</c> instead of reading the
+    /// unselected default (which spans every repository of a multi-repository catalog). The default
+    /// (false) keeps the legacy behavior for callers that send no selector. Independent of
+    /// <see cref="ReadPolicy"/>: the selector is honored either way. <c>SEXTANT_SERVICE_REQUIRE_REPOSITORY_SELECTION</c>.
+    /// </summary>
+    public bool RequireRepositorySelection { get; init; }
+
+    /// <summary>
     /// The network interface the HTTP surface binds to. Defaults to <c>localhost</c> (loopback only),
     /// preserving the original dev-safe behavior. Set it to a routable address (e.g. <c>0.0.0.0</c> or a
     /// specific IP) to make the service reachable from other hosts/containers — that widens exposure, so
@@ -213,6 +222,7 @@ public sealed record ServiceOptions
             QueryToken = Env("QUERY_TOKEN"),
             ContributeToken = Env("CONTRIBUTE_TOKEN"),
             ReadPolicy = ReadAuthorizationPolicy.Parse(Env("READ_POLICY")),
+            RequireRepositorySelection = EnvBool("REQUIRE_REPOSITORY_SELECTION") ?? false,
             BindAddress = EnvHost("BIND_ADDRESS") ?? "localhost",
             ControlPort = EnvInt("CONTROL_PORT") ?? 3011,
             QueryPort = EnvInt("QUERY_PORT"),

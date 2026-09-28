@@ -75,6 +75,28 @@ public static class ResponseBuilder
     /// </summary>
     public static string BuildNotFound() => BuildEmpty(message: null, provenance: null);
 
+    /// <summary>The <c>meta.error.code</c> of <see cref="BuildRepositoryRequired"/>.</summary>
+    public const string RepositoryRequiredCode = "repository_required";
+
+    private const string RepositoryRequiredMessage =
+        "This request must select a repository to read. Name the repository and retry.";
+
+    /// <summary>
+    /// The error returned when a request that must select a repository names none
+    /// (<see cref="DatabaseProvider.RequireRepositorySelection"/>). Its bytes depend only on the request, never
+    /// on the catalog: it names no repository, carries no provenance or counts, and is identical whether the
+    /// service is provisioned, empty, or holds many repositories, so it is not an existence oracle.
+    /// </summary>
+    public static string BuildRepositoryRequired() => BuildError(RepositoryRequiredCode, RepositoryRequiredMessage);
+
+    /// <summary>
+    /// The actionable response for a NAMED repository selection that resolves to no complete default-branch
+    /// snapshot on a NON-enforcing read path. It never echoes the requested repository. Under an enforced
+    /// policy the same case is the uniform <see cref="BuildNotFound"/> instead.
+    /// </summary>
+    public static string BuildSelectionUnresolved() =>
+        BuildEmpty("No complete default-branch snapshot is available for the requested repository.");
+
     public static string BuildEmpty(string? message = null, SnapshotProvenance? provenance = null)
     {
         var response = new

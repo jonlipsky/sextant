@@ -52,6 +52,17 @@ public sealed class DatabaseProvider : IDisposable
     /// </summary>
     public Func<string?> RequestedRepository { get; set; } = () => null;
 
+    /// <summary>
+    /// Whether the current request MUST name a repository through <see cref="RequestedRepository"/>. When it
+    /// returns true and no repository is named, <see cref="TryBeginRead"/> fails with the
+    /// <see cref="ResponseBuilder.RepositoryRequiredCode"/> error before touching the database, so the
+    /// response depends only on the request and names no repository (it is not an existence oracle). The
+    /// default (<c>() =&gt; false</c>) keeps the local path byte-identical: a read with no selector resolves
+    /// the single-repository default exactly as before. A host evaluates it per request, so it can require a
+    /// selection for some callers only.
+    /// </summary>
+    public Func<bool> RequireRepositorySelection { get; set; } = () => false;
+
     public bool DatabaseExists => File.Exists(_dbPath);
 
     public IndexDatabase? GetDatabase()
@@ -104,6 +115,8 @@ public sealed class DatabaseProvider : IDisposable
     /// rebuild/not-ready message first, then the permissive gate (which always allows) — so a single-node
     /// local index stays byte-identical.</item>
     /// </list>
+    /// Before either, a request that must select a repository (<see cref="RequireRepositorySelection"/>) but
+    /// names none fails with the request-shaped <see cref="ResponseBuilder.BuildRepositoryRequired"/> error.
     /// Returns true with a ready <paramref name="database"/> and resolved <paramref name="context"/>; on
     /// false, <paramref name="failureResponse"/> is the ready-made JSON the tool returns verbatim.
     /// </summary>
@@ -116,6 +129,13 @@ public sealed class DatabaseProvider : IDisposable
     {
         database = null!;
         context = null!;
+
+        // Checked FIRST, before readiness or authorization, so the verdict depends only on the request.
+        if (RequireRepositorySelection() && string.IsNullOrWhiteSpace(RequestedRepository()))
+        {
+            failureResponse = ResponseBuilder.BuildRepositoryRequired();
+            return false;
+        }
 
         if (Authorizer.IsEnforcing)
         {

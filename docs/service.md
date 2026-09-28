@@ -59,6 +59,7 @@ of the box.
 | `SEXTANT_SERVICE_QUERY_TOKEN` | Bearer token for `/mcp` + `/query/*` | none (anonymous read) |
 | `SEXTANT_SERVICE_CONTRIBUTE_TOKEN` | Least-privilege token for `/control/contribute` only (issue #71); the control token remains a superset that also authorizes it | none (falls back to control token) |
 | `SEXTANT_SERVICE_READ_POLICY` | Enforced query-plane read-authorization policy (Phase 17) | disabled (open read) |
+| `SEXTANT_SERVICE_REQUIRE_REPOSITORY_SELECTION` | Require every `/mcp` read to name its repository in the `X-Sextant-Repository` header; a read without one fails with `repository_required` (see [Repository selection](#repository-selection-on-mcp)). A malformed value fails startup | `false` (a read with no header reads the unselected default) |
 | `SEXTANT_SERVICE_BIND_ADDRESS` | Network interface the HTTP surface binds to | `localhost` |
 | `SEXTANT_SERVICE_CONTROL_PORT` | HTTP port | `3011` |
 | `SEXTANT_SERVICE_QUERY_PORT` | Optional dedicated query port (shares the control port when unset) | none (shared) |
@@ -616,6 +617,23 @@ a low-latency query never blocks behind a running index. Control-plane **reads**
 `/control/resolve` (and its coverage), metrics, audit — do the same (issue #148), so they answer promptly
 for the whole duration of a long index.
 
+### Repository selection on `/mcp`
+
+A catalog can hold several repositories. An `/mcp` read names the one it wants in the
+`X-Sextant-Repository` request header (its remote URL). The host always honors the header, whether or not
+a read policy is configured, and the read then pins that repository's default-branch snapshot:
+
+| Request | `REQUIRE_REPOSITORY_SELECTION=false` (default) | `REQUIRE_REPOSITORY_SELECTION=true` |
+| --- | --- | --- |
+| Header names an indexed repository | That repository's default-branch snapshot (subject to the read policy, when one is set) | Same |
+| Header names a repository with no complete default-branch snapshot | Nothing: an empty result under an open read, the uniform not-found under an enforced read policy. Never widened to other repositories | Same |
+| No header (or a blank one) | The unselected default: the only repository of a single-repository catalog, or **every** repository of a multi-repository catalog | `meta.error.code = repository_required`, with no results |
+
+The `repository_required` error names no repository and depends only on the request, so it reveals nothing
+about what the catalog holds. The default keeps a caller that sends no header (for example a legacy gateway
+using the plain query token) working unchanged; turn the requirement on once every caller sends the header.
+The local stdio MCP server has no header and never requires one.
+
 ## The `SnapshotService` data plane
 
 `SnapshotService` owns the durable snapshot catalog + semantic store on a **single writer connection**,
@@ -979,7 +997,7 @@ catalog, and a `FakeSnapshotWorker`. The suite maps to the acceptance criteria:
 | 1 — idempotent ensure | `SnapshotServiceTests` (concurrent ensures attach to one job; worker runs once); `EnsureCallerDisconnectTests` / `EnsureCallerDisconnectHttpTests` (#148: caller disconnect never cancels production, re-ensure attaches to the in-flight run, `wait=false`, prompt status/resolve during a run, shutdown requeues) |
 | 2 — restart recovery | `SnapshotServiceTests` (catalog survives restart; orphaned `running` jobs reconciled) |
 | 3 — scratch cannot delete published | `ServicePathsTests` (scratch/persistent separation + `ReleaseScratch` refusal) |
-| 4 — query via HTTP MCP without ProcessStack | `ServiceHttpTests` (`/mcp` mapped + auth-gated; `/query` paging) |
+| 4 — query via HTTP MCP without ProcessStack | `ServiceHttpTests` (`/mcp` mapped + auth-gated; `/query` paging); `RepositorySelectionHttpTests` (the `X-Sextant-Repository` header without a read policy, the legacy no-header unscoped read, `repository_required`) |
 | 5 — structured per-project diagnostics | `SnapshotServiceTests` (partial/failed/unsupported diagnostics) |
 | 6 — local-only remains functional | `ArchitectureBoundaryTests` (core assemblies never reference the service; local query without a service) |
 
