@@ -182,8 +182,7 @@ internal static class ActivityValues
     public static Dictionary<string, object?> NewMap() => new(StringComparer.OrdinalIgnoreCase);
 
     private static bool IsWhole(double real) =>
-        !double.IsNaN(real) && !double.IsInfinity(real) && Math.Floor(real) == real
-        && real is >= long.MinValue and < long.MaxValue;
+        double.IsInteger(real) && real is >= long.MinValue and < long.MaxValue;
 
     // Parses JSON text that starts with `opening` into CLR values; anything else (or invalid JSON) is null.
     private static object? ParseJsonText(string text, char opening)
