@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Text.RegularExpressions;
 using ModelContextProtocol.Server;
 using Sextant.Mcp.Tools;
 using Sextant.Service.Host;
@@ -72,10 +73,60 @@ public class ProcessStackAppManifestTests
 
         Assert.IsNotEmpty(manifest.McpInclude, "the app exposes its own processes as MCP tools");
         var clashes = entry.Include
-            .Intersect(manifest.McpInclude.Concat(manifest.Entrypoints), StringComparer.Ordinal)
+            .Intersect(manifest.McpInclude.Concat(manifest.Entrypoints.Select(e => e.Name)), StringComparer.Ordinal)
             .ToList();
         Assert.IsEmpty(clashes, $"a query tool name must not shadow an app entrypoint: {string.Join(", ", clashes)}");
     }
+
+    [TestMethod]
+    public void McpInclude_NamesOnlyPublicEntrypoints()
+    {
+        var manifest = Manifest.Load();
+        var byName = manifest.Entrypoints.ToDictionary(e => e.Name, StringComparer.Ordinal);
+        Assert.IsTrue(manifest.Entrypoints.Any(e => e.Internal), "the parser sees the app's internal entrypoints");
+
+        foreach (var name in manifest.McpInclude)
+        {
+            Assert.IsTrue(byName.TryGetValue(name, out var entrypoint), $"mcp.include names an entrypoint: {name}");
+            Assert.IsFalse(entrypoint.Internal, $"an internal entrypoint must not be an MCP tool: {name}");
+        }
+    }
+
+    // A flow a user starts through the app's own surfaces (the chat and the MCP tools, the entrypoints that are
+    // not internal) must never reach an application-only flow, even through another flow it starts.
+    [TestMethod]
+    public void UserFacingFlows_NeverReachApplicationOnlyFlows()
+    {
+        var manifest = Manifest.Load();
+        var byName = manifest.Entrypoints.ToDictionary(e => e.Name, StringComparer.Ordinal);
+        var roots = manifest.Entrypoints.Where(e => !e.Internal).Select(e => e.Name).ToList();
+        CollectionAssert.IsSubsetOf(new[] { "configure-watched-repos", "import-legacy-watches" }, roots,
+            "the chat and the import are user-facing roots");
+
+        var reached = new HashSet<string>(StringComparer.Ordinal);
+        var queue = new Queue<string>(roots);
+        while (queue.TryDequeue(out var name))
+        {
+            if (!reached.Add(name))
+                continue;
+            Assert.IsTrue(byName.TryGetValue(name, out var entrypoint), $"a flow starts an entrypoint the manifest declares: {name}");
+            Assert.IsFalse(string.IsNullOrEmpty(entrypoint.Path), $"entrypoint {name} has a path");
+            var file = Path.Combine(Manifest.AppDirectory(), entrypoint.Path!.Replace('/', Path.DirectorySeparatorChar));
+            Assert.IsTrue(File.Exists(file), $"entrypoint {name}'s file exists at {file}");
+            foreach (Match started in FlowReference.Matches(File.ReadAllText(file)))
+                queue.Enqueue(started.Groups["name"].Value);
+        }
+
+        var leaked = reached.Intersect(ApplicationOnlyFlows, StringComparer.Ordinal).ToList();
+        Assert.IsEmpty(leaked, $"a user-facing flow reaches {string.Join(", ", leaked)}");
+    }
+
+    private static readonly string[] ApplicationOnlyFlows = ["tenant-grant"];
+
+    // How one flow starts another: StartOrchestration/RunProcess inputs, or a process node.
+    private static readonly Regex FlowReference = new(
+        @"^\s*(?:orchestrationName|processName):\s*[""']?(?<name>[A-Za-z0-9._-]+)|^\s*type:\s*process:(?<name>[A-Za-z0-9._-]+)",
+        RegexOptions.Multiline | RegexOptions.CultureInvariant);
 
     private static ConnectionToolsEntry SingleConnectionToolsEntry(Manifest manifest)
     {
@@ -96,6 +147,8 @@ public class ProcessStackAppManifestTests
 
     private sealed record Connection(string? Type, bool HasConfig);
 
+    private sealed record Entrypoint(string Name, string? Path, bool Internal);
+
     /// <summary>
     /// The parts of psapp.yaml this test pins, read line by line. It understands only the block-style shape the
     /// manifest uses (two-space indents, <c>- key: value</c> list items, no flow collections or anchors) and
@@ -105,12 +158,14 @@ public class ProcessStackAppManifestTests
     {
         public List<string> McpInclude { get; } = [];
         public List<ConnectionToolsEntry> ConnectionTools { get; } = [];
-        public List<string> Entrypoints { get; } = [];
+        public List<Entrypoint> Entrypoints { get; } = [];
         public Dictionary<string, Connection> Connections { get; } = new(StringComparer.Ordinal);
+
+        public static string AppDirectory() => Path.Combine(RepositoryRoot(), "apps", "processstack", "sextant");
 
         public static Manifest Load()
         {
-            var path = Path.Combine(RepositoryRoot(), "apps", "processstack", "sextant", "psapp.yaml");
+            var path = Path.Combine(AppDirectory(), "psapp.yaml");
             Assert.IsTrue(File.Exists(path), $"the app manifest exists at {path}");
             var lines = File.ReadAllLines(path)
                 .Select(StripComment)
@@ -145,9 +200,12 @@ public class ProcessStackAppManifestTests
         {
             foreach (var item in ListItems(block, indent: 2))
             {
-                var name = Fields(item, indent: 4).GetValueOrDefault("name");
+                var fields = Fields(item, indent: 4);
+                var name = fields.GetValueOrDefault("name");
                 Assert.IsFalse(string.IsNullOrEmpty(name), "every entrypoint has a name");
-                Entrypoints.Add(name);
+                var flag = fields.GetValueOrDefault("internal");
+                Assert.IsTrue(flag is null or "true" or "false", $"entrypoint {name}: internal is true or false, got '{flag}'");
+                Entrypoints.Add(new Entrypoint(name, fields.GetValueOrDefault("path"), flag == "true"));
             }
         }
 
