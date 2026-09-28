@@ -189,6 +189,26 @@ public sealed class SextantPlanLegacyImportActivityTests
     // ---- already imported ----
 
     [TestMethod]
+    public async Task An_entry_on_a_repository_with_any_grant_may_be_held()
+    {
+        var facts = ActivityHarness.Map(
+            ("a", V1("octo", "alpha", "dev")),
+            ("b", V1("octo", "beta", "main")),
+            ("c", V1("octo", "gamma", "main")));
+        var grants = GrantsBody(
+            Grant("https://github.com/Octo/Alpha", "", "main"),
+            Grant("https://github.com/octo/beta.git", ""));
+
+        var activity = await PlanAsync(facts, grants);
+
+        CollectionAssert.AreEqual(
+            new[] { "github.com/octo/alpha@dev", "github.com/octo/beta@main", "github.com/octo/gamma@main" },
+            Slugs(activity));
+        var mayBeHeld = activity.Pending.Select(p => ((IDictionary<string, object?>)p!)["mayBeHeld"]).ToList();
+        CollectionAssert.AreEqual(new object?[] { true, true, false }, mayBeHeld);
+    }
+
+    [TestMethod]
     public async Task A_grant_on_the_branch_or_a_default_grant_resolving_to_it_covers_the_entry()
     {
         var facts = ActivityHarness.Map(

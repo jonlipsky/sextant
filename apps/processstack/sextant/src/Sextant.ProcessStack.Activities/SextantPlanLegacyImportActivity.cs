@@ -54,7 +54,7 @@ public sealed class SextantPlanLegacyImportActivity : AbstractActivity
     [ActivityInput("maxEntries", Description = "At most this many entries are planned (default 200, at most 1000); the rest are counted in remaining.", DefaultValue = DefaultMaxEntries)]
     public object? MaxEntries { get; set; }
 
-    [ActivityOutput("pending", Description = "The entries to check and grant, {owner, repo, branch, slug}: never-attempted ones first, then by slug.")]
+    [ActivityOutput("pending", Description = "The entries to check and grant, {owner, repo, branch, slug, mayBeHeld}: never-attempted ones first, then by slug. mayBeHeld is true when the caller holds a grant on the same repository (on another branch, or a default-branch grant the service has not resolved), so the entry may already be granted.")]
     public List<object?> Pending { get; set; } = [];
 
     // JSON text rather than a map, so the flow's script parses, edits and stores a plain JavaScript object.
@@ -89,7 +89,7 @@ public sealed class SextantPlanLegacyImportActivity : AbstractActivity
         cancellationToken.ThrowIfCancellationRequested();
 
         var facts = ActivityValues.Pairs(ActivityValues.RawInput(this, "facts", Facts));
-        var held = HeldGrants(ActivityValues.Input(this, "grants", Grants));
+        var (held, heldKeys) = HeldGrants(ActivityValues.Input(this, "grants", Grants));
         var attempts = ParseAttempts(ActivityValues.RawInput(this, "attempts", Attempts));
         var retry = ActivityValues.AsBool(ActivityValues.Input(this, "retryUnresolved", RetryUnresolved)) == true;
         var maxEntries = ActivityValues.Limit(
@@ -142,7 +142,7 @@ public sealed class SextantPlanLegacyImportActivity : AbstractActivity
             .ThenBy(c => c.Entry.Slug, StringComparer.Ordinal)
             .ToList();
         foreach (var (entry, _) in ordered.Take(maxEntries))
-            Pending.Add(entry.ToMap());
+            Pending.Add(entry.ToMap(mayBeHeld: heldKeys.Contains(entry.Key)));
         Remaining = Math.Max(0, ordered.Count - maxEntries);
         AttemptsJson = JsonSerializer.Serialize(kept);
 
@@ -159,10 +159,12 @@ public sealed class SextantPlanLegacyImportActivity : AbstractActivity
     };
 
     // Every (repository key, branch) the caller's grants cover: a grant's own branch, and for a default-branch
-    // grant (branch "") the branch the service resolved it to.
-    private static HashSet<(string Key, string Branch)> HeldGrants(object? value)
+    // grant (branch "") the branch the service resolved it to. Also every repository key with any grant: an
+    // entry on such a repository may map to a grant the pairs cannot show (an unresolved default branch).
+    private static (HashSet<(string Key, string Branch)> Held, HashSet<string> Keys) HeldGrants(object? value)
     {
         var held = new HashSet<(string, string)>();
+        var keys = new HashSet<string>(StringComparer.Ordinal);
         var grants = ActivityValues.AsList(value) ?? ActivityValues.AsList(ActivityValues.Get(ActivityValues.AsMap(value), "grants"));
         foreach (var item in grants ?? [])
         {
@@ -170,6 +172,7 @@ public sealed class SextantPlanLegacyImportActivity : AbstractActivity
             var key = RepositoryReference.KeyFor(ActivityValues.Text(ActivityValues.Get(grant, "repository")));
             if (grant is null || key.Length == 0)
                 continue;
+            keys.Add(key);
             var branch = ActivityValues.Text(ActivityValues.Get(grant, "branch"));
             if (branch.Length > 0)
             {
@@ -181,7 +184,7 @@ public sealed class SextantPlanLegacyImportActivity : AbstractActivity
             if (resolved.Length > 0)
                 held.Add((key, resolved));
         }
-        return held;
+        return (held, keys);
     }
 
     // The stored {slug: count} map; a non-object, or an entry that is not a whole number from 1, is dropped.
@@ -237,13 +240,14 @@ public sealed class SextantPlanLegacyImportActivity : AbstractActivity
             return recorded.Ok && recorded.Canonical == canonical;
         }
 
-        public Dictionary<string, object?> ToMap()
+        public Dictionary<string, object?> ToMap(bool mayBeHeld)
         {
             var map = ActivityValues.NewMap();
             map["owner"] = Owner;
             map["repo"] = Repo;
             map["branch"] = Branch;
             map["slug"] = Slug;
+            map["mayBeHeld"] = mayBeHeld;
             return map;
         }
     }

@@ -1,9 +1,11 @@
 name: import-legacy-watches-grant-limit-stops
 description: >
-  The watch limit ends the import: after the first 409 grant_limit every later entry would be refused too,
-  so none of them is checked with GitHub or sent to the service. They are marked unresolved and counted as
-  failed, as their own 409 would have left them, and the import is complete (retryUnresolved checks them
-  again once the caller has room).
+  After the first 409 grant_limit, a new grant would be refused too, so an entry on a repository the caller
+  has no grant on (gamma) is not checked with GitHub or sent to the service: it is marked unresolved and
+  counted as failed, as its own 409 would have left it. An entry that may already be held (beta: the caller
+  holds a default-branch grant the service has not resolved) is still checked, and the service's 200
+  created: false imports it. The import is complete (retryUnresolved checks the others again once the
+  caller has room).
 entrypoint: import-legacy-watches
 principal:
   userId: u-alice
@@ -21,7 +23,14 @@ http:
   - connection: sextant-control
     method: GET
     path: /control/grants/self
-    body: { grants: [], result_count: 0 }
+    body:
+      grants:
+        - repository: "https://github.com/octo/beta.git"
+          branch: ""
+          source: self
+          created_at: 1760000000
+          status: { resolved_branch: null, snapshot_status: missing }
+      result_count: 1
   - connection: github
     method: GET
     path: /repos/octo/alpha
@@ -37,20 +46,28 @@ http:
   - connection: sextant-control
     method: PUT
     path: /control/grants/self
+    bodyMatch: { repository: "https://github.com/octo/beta.git" }
+    body:
+      grant: { repository: "https://github.com/octo/beta.git", branch: "", source: self, created_at: 1760000000 }
+      created: false
+  - connection: sextant-control
+    method: PUT
+    path: /control/grants/self
+    bodyMatch: { repository: "https://github.com/octo/alpha.git" }
     status: 409
     body: { status: rejected, reason: grant_limit }
 expected:
   status: Completed
   variables:
-    imported: 0
+    imported: 1
     newlyImported: 0
     skipped: 0
-    failed: 3
+    failed: 2
     remaining: 0
     complete: true
     outcome: ok
-    message: "3 earlier watches could not be imported right now: the Sextant service did not accept it, or you are watching as many repositories as allowed."
-    attemptsText: '{"github.com/octo/alpha@main":2,"github.com/octo/beta@main":2,"github.com/octo/gamma@main":2}'
+    message: "Imported 1 earlier Sextant watch.\n2 earlier watches could not be imported right now: the Sextant service did not accept it, or you are watching as many repositories as allowed."
+    attemptsText: '{"github.com/octo/alpha@main":2,"github.com/octo/gamma@main":2}'
     importedAt: "!not_empty"
   httpCalls:
     - connection: github
@@ -59,7 +76,7 @@ expected:
       count: 1
     - connection: github
       path: /repos/octo/beta
-      count: 0
+      count: 1
     - connection: github
       path: /repos/octo/gamma
       count: 0
@@ -71,4 +88,8 @@ expected:
       count: 1
     - connection: sextant-control
       method: PUT
+      bodyMatch: { repository: "https://github.com/octo/beta.git" }
       count: 1
+    - connection: sextant-control
+      method: PUT
+      count: 2
