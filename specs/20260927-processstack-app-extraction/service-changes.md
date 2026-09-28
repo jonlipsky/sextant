@@ -120,6 +120,15 @@
 - The cross-repo default.
 - Stdio `tools/list` is byte-identical.
 
+**As implemented (SX-4).** `src/Sextant.Service.Host/ToolSelectionFilters.cs`; the tests are `ToolArgumentSelectionHttpTests`, `ToolSelectionFiltersTests`, the `McpClientCompatibilityTests` argument case, `RepositorySelectionTests` (Mcp) and `BranchSnapshotSelectionTests` (Store). These decisions refine the contract:
+- **Per-tool reserved set.** A reserved name the tool already declares is neither advertised nor stripped. The cross-repo tools already take a `branch` argument, which filters consumers, so they get only `repository` and keep their own `branch`. `SelectionExemptTools` (empty today) is where `list_repositories` and `search_symbols` go when they land.
+- **Cross-repo default only under the requirement.** The `provider_repository_url` default applies only when `RequireRepositorySelection()` holds and neither the arg nor the header names a repository. With the requirement off, these tools keep today's unselected read, so the default never regresses them.
+  - **Known limitation:** the gate pins the provider's default-branch snapshot through `GetSelectedSnapshotRowForRepository`, which excludes provider-only repositories (`is_provider = 1`). So a provider indexed only as a submodule gets the uniform not-found. A caller can still name a readable consumer in `repository`, and a provider ensured directly is served.
+- **`invalid_selector`.** A reserved arg that is not a string, or a `repository` refused by the SVC-5 policy, gives the tool error `invalid_selector`. The message carries only the policy reason code, never the value. The `owner/repo` short form without exactly one explicit host is refused as `host_required`. JSON `null` or blank means absent.
+- **Where each error comes from.** `selector_conflict` and `invalid_selector` come from the filter as MCP tool errors (`isError: true`, carrying the usual `meta.error` JSON). `repository_required` for a `branch` without a repository comes from `TryBeginRead`, so it applies wherever `RequestedBranch` is wired, whatever the requirement setting. A `branch` arg with a header-selected repository is allowed.
+- **Conflict comparison.** The conflict check compares `RemoteUrlIdentity.Normalize(header)` with the canonical arg. A header-only selection is passed through as sent, as before SX-4.
+- **Blank branch, and a branch miss.** A blank `branch` means the default branch. A permissive branch miss says "No complete snapshot is available for the requested repository branch."; an enforcing one is the uniform not-found.
+
 ## SVC-3 (SX-5): caller-assertion verification (R)
 
 The contract is **PS-7 (F4)** (ProcessStack-side spec `20260927-outbound-caller-identity`). It is implemented in Service.Host, with no PS types. PS stamps an immutable `RunCaller` at run start, so the service never sees a caller derived from a run variable.

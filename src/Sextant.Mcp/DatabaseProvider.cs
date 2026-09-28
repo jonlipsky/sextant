@@ -63,6 +63,17 @@ public sealed class DatabaseProvider : IDisposable
     /// </summary>
     public Func<bool> RequireRepositorySelection { get; set; } = () => false;
 
+    /// <summary>
+    /// The per-request branch selector (SVC-2): yields the name of the branch the current request reads,
+    /// or null for the named repository's default branch. A branch is meaningful only together with a
+    /// repository (<see cref="RequestedRepository"/>): a request that names a branch but no repository
+    /// fails with the <see cref="ResponseBuilder.RepositoryRequiredCode"/> error in
+    /// <see cref="TryBeginRead"/>, and a branch with no complete snapshot resolves to nothing (never the
+    /// default branch or the unselected fallback). The default (<c>() =&gt; null</c>) keeps the local path
+    /// byte-identical.
+    /// </summary>
+    public Func<string?> RequestedBranch { get; set; } = () => null;
+
     public bool DatabaseExists => File.Exists(_dbPath);
 
     public IndexDatabase? GetDatabase()
@@ -115,8 +126,9 @@ public sealed class DatabaseProvider : IDisposable
     /// rebuild/not-ready message first, then the permissive gate (which always allows) — so a single-node
     /// local index stays byte-identical.</item>
     /// </list>
-    /// Before either, a request that must select a repository (<see cref="RequireRepositorySelection"/>) but
-    /// names none fails with the request-shaped <see cref="ResponseBuilder.BuildRepositoryRequired"/> error.
+    /// Before either, a request that must select a repository (<see cref="RequireRepositorySelection"/>), or
+    /// that names a branch (<see cref="RequestedBranch"/>), but names no repository fails with the
+    /// request-shaped <see cref="ResponseBuilder.BuildRepositoryRequired"/> error.
     /// Returns true with a ready <paramref name="database"/> and resolved <paramref name="context"/>; on
     /// false, <paramref name="failureResponse"/> is the ready-made JSON the tool returns verbatim.
     /// </summary>
@@ -130,8 +142,10 @@ public sealed class DatabaseProvider : IDisposable
         database = null!;
         context = null!;
 
-        // Checked FIRST, before readiness or authorization, so the verdict depends only on the request.
-        if (RequireRepositorySelection() && string.IsNullOrWhiteSpace(RequestedRepository()))
+        // Checked FIRST, before readiness or authorization, so the verdict depends only on the request. A
+        // named branch needs a named repository too: a branch alone selects nothing.
+        if ((RequireRepositorySelection() || !string.IsNullOrWhiteSpace(RequestedBranch()))
+            && string.IsNullOrWhiteSpace(RequestedRepository()))
         {
             failureResponse = ResponseBuilder.BuildRepositoryRequired();
             return false;
@@ -151,7 +165,8 @@ public sealed class DatabaseProvider : IDisposable
             }
 
             if (!ReadContextGate.TryResolve(
-                    ready, out context, out failureResponse, mode, Authorizer, compatibility, RequestedRepository))
+                    ready, out context, out failureResponse, mode, Authorizer, compatibility, RequestedRepository,
+                    RequestedBranch))
                 return false; // the gate already produced the uniform not-found
 
             database = ready;
@@ -169,7 +184,8 @@ public sealed class DatabaseProvider : IDisposable
         }
 
         if (!ReadContextGate.TryResolve(
-                database, out context, out failureResponse, mode, Authorizer, compatibility, RequestedRepository))
+                database, out context, out failureResponse, mode, Authorizer, compatibility, RequestedRepository,
+                RequestedBranch))
             return false;
 
         failureResponse = string.Empty;

@@ -97,6 +97,14 @@ public static class ResponseBuilder
     public static string BuildSelectionUnresolved() =>
         BuildEmpty("No complete default-branch snapshot is available for the requested repository.");
 
+    /// <summary>
+    /// The actionable response for a NAMED repository branch selection (SVC-2) that resolves to no complete
+    /// snapshot on a NON-enforcing read path. It never echoes the requested repository or branch. Under an
+    /// enforced policy the same case is the uniform <see cref="BuildNotFound"/> instead.
+    /// </summary>
+    public static string BuildBranchSelectionUnresolved() =>
+        BuildEmpty("No complete snapshot is available for the requested repository branch.");
+
     public static string BuildEmpty(string? message = null, SnapshotProvenance? provenance = null)
     {
         var response = new

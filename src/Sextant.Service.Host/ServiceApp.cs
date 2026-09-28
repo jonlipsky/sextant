@@ -61,16 +61,18 @@ public static class ServiceApp
                     RepositoryUrlResolver(options.CatalogDbPath))
                 : AllowAllReadAuthorizer.Instance;
 
-            // The request names the repository it reads via the X-Sextant-Repository header, and the read
-            // planner pins THAT repository's default-branch snapshot. It is wired whether or not a read
-            // policy is enabled: under a policy the authorizer still decides whether the principal may read
-            // it, and without one the header scopes an otherwise unselected (all-repository) read. The
+            // The request names the repository it reads via the X-Sextant-Repository header or, per call, the
+            // reserved `repository`/`branch` tool arguments (SVC-2, ToolSelectionFilters), and the read planner
+            // pins THAT repository's default-branch (or named-branch) snapshot. It is wired whether or not a
+            // read policy is enabled: under a policy the authorizer still decides whether the principal may
+            // read it, and without one the selector scopes an otherwise unselected (all-repository) read. The
             // accessors read the ambient request at call time, so the singleton provider stays correct under
-            // concurrent requests. A request with no header reads the unselected default unless
+            // concurrent requests. A request with no selector reads the unselected default unless
             // RequireRepositorySelection says it must name one.
             return new DatabaseProvider(options.CatalogDbPath, authorizer)
             {
                 RequestedRepository = RequestedRepositoryAccessor(http),
+                RequestedBranch = RequestedBranchAccessor(http),
                 RequireRepositorySelection = RepositorySelectionRequirement(options)
             };
         });
@@ -103,7 +105,14 @@ public static class ServiceApp
             // tool type, finds no [McpServerTool] methods on IReadOnlyList<Type>, and registers ZERO tools —
             // so tools/list/tools/call answer -32601. The cast selects the non-generic
             // WithTools(IEnumerable<Type>) overload that reflects each element type's attributed methods.
-            .WithTools((IEnumerable<Type>)RemoteQueryTools);
+            .WithTools((IEnumerable<Type>)RemoteQueryTools)
+            // SVC-2: per-call repository/branch selection through reserved tool arguments. The list filter
+            // advertises `repository`/`branch` on every repository-scoped tool; the call filter strips them
+            // and records the call's ToolCallSelection, which the DatabaseProvider accessors read. Further
+            // per-call checks over the same selection are added to this pipeline.
+            .WithRequestFilters(filters => filters
+                .AddListToolsFilter(ToolSelectionFilters.ListToolsFilter(options.RepositoryUrlPolicy, RepositoryScopedTools))
+                .AddCallToolFilter(ToolSelectionFilters.CallToolFilter(options.RepositoryUrlPolicy, RepositoryScopedTools)));
     }
 
     /// <summary>
@@ -129,6 +138,14 @@ public static class ServiceApp
         typeof(GetTypeHierarchyTool), typeof(GetTypeMembersTool), typeof(SemanticSearchTool),
         typeof(TraceValueTool), typeof(ResearchCodebaseTool)
     ];
+
+    /// <summary>
+    /// The names of the <see cref="RemoteQueryTools"/> that read one selected repository and so take the
+    /// reserved <c>repository</c>/<c>branch</c> arguments (SVC-2); see
+    /// <see cref="ToolSelectionFilters.SelectionExemptTools"/> for the exceptions.
+    /// </summary>
+    internal static readonly IReadOnlySet<string> RepositoryScopedTools =
+        ToolSelectionFilters.RepositoryScopedToolNames(RemoteQueryTools);
 
     /// <summary>Wires the auth middleware and maps the control/query/health endpoints onto a built app.</summary>
     public static void MapEndpoints(WebApplication app, ServiceOptions options)
@@ -509,12 +526,14 @@ public static class ServiceApp
         () => accessor.HttpContext is { } ctx ? BearerToken(ctx) : null;
 
     /// <summary>
-    /// Resolves the caller-declared repository (its git remote URL) from the <c>X-Sextant-Repository</c>
-    /// request header, the request-level repository selector. Reads the ambient request at call time so a
-    /// singleton <see cref="DatabaseProvider"/> stays request-correct; returns null when the header is
-    /// absent/blank (the read planner then reads the unselected default, or fails with
+    /// Resolves the caller-declared repository (its git remote URL) for the current request: the call's
+    /// <see cref="ToolCallSelection"/> when <see cref="ToolSelectionFilters"/> recorded one (the reserved
+    /// <c>repository</c> argument, the header, or a cross-repository tool's provider default), else the
+    /// <c>X-Sextant-Repository</c> request header. Reads the ambient request at call time so a
+    /// singleton <see cref="DatabaseProvider"/> stays request-correct; returns null when nothing names a
+    /// repository (the read planner then reads the unselected default, or fails with
     /// <c>repository_required</c> when <see cref="RepositorySelectionRequirement"/> demands a selection).
-    /// The header only NAMES the repository — under a read policy, authorization is still enforced by
+    /// The selector only NAMES the repository — under a read policy, authorization is still enforced by
     /// <see cref="PolicyReadAuthorizer"/> against the principal's token, so a caller cannot read another
     /// tenant merely by naming it.
     /// </summary>
@@ -523,9 +542,24 @@ public static class ServiceApp
         {
             if (accessor.HttpContext is not { } ctx)
                 return null;
-            var value = ctx.Request.Headers[RepositoryHeader].ToString();
-            return string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+            if (ToolCallSelection.Get(ctx) is { } selection)
+                return selection.Repository;
+            return RepositoryHeaderValue(ctx);
         };
+
+    /// <summary>
+    /// Resolves the branch the current call selected through the reserved <c>branch</c> tool argument
+    /// (SVC-2), or null for the selected repository's default branch.
+    /// </summary>
+    private static Func<string?> RequestedBranchAccessor(IHttpContextAccessor accessor) =>
+        () => ToolCallSelection.Get(accessor.HttpContext)?.Branch;
+
+    /// <summary>The trimmed <c>X-Sextant-Repository</c> header, or null when it is absent or blank.</summary>
+    internal static string? RepositoryHeaderValue(HttpContext context)
+    {
+        var value = context.Request.Headers[RepositoryHeader].ToString();
+        return string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+    }
 
     /// <summary>
     /// Decides, per request, whether a query-plane read must name a repository
