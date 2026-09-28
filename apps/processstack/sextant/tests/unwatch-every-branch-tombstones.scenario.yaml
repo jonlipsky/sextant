@@ -1,0 +1,42 @@
+name: unwatch-every-branch-tombstones
+description: >
+  revoke-watch with no branch deletes every watched branch (branch "*") and tombstones each matching v1
+  entry: a canonical key, a non-canonical key matched by its value, but not another repository's entry or
+  an existing tombstone.
+entrypoint: revoke-watch
+principal:
+  userId: u-alice
+inputs:
+  host: github.com
+  owner: octocat
+  repo: hello-world
+  remoteUrl: "https://github.com/octocat/hello-world.git"
+seed:
+  userMemory:
+    - key: "sextant.watched-repos:github.com/octocat/hello-world@main"
+      value: '{"owner":"octocat","repo":"hello-world","branch":"main","cloneUrl":"https://github.com/octocat/hello-world.git","addedAt":"2026-01-01T00:00:00+00:00"}'
+    - key: "sextant.watched-repos:legacy-spelling"
+      value: '{"owner":"Octocat","repo":"Hello-World.git","branch":"feature/x","cloneUrl":"https://GitHub.com/Octocat/Hello-World.git","addedAt":"2026-01-02T00:00:00+00:00"}'
+    - key: "sextant.watched-repos:github.com/octocat/spoon-knife@main"
+      value: '{"owner":"octocat","repo":"spoon-knife","branch":"main","cloneUrl":"https://github.com/octocat/spoon-knife.git","addedAt":"2026-01-03T00:00:00+00:00"}'
+    - key: "sextant.watched-repos:github.com/octocat/hello-world@old"
+      value: "null"
+http:
+  - connection: sextant-control
+    method: DELETE
+    path: /control/grants/self
+    body: { deleted: 2 }
+expected:
+  status: Completed
+  variables:
+    branchQuery: "*"
+    deleted: 2
+    tombstoned: 2
+    memoryKeys: "github.com/octocat/hello-world@main,legacy-spelling"
+    message: "Stopped watching octocat/hello-world. Existing snapshots are left in place."
+  httpCalls:
+    - connection: sextant-control
+      method: DELETE
+      path: /control/grants/self
+      caller: { act: user, idp: processstack, sub: u-alice }
+      count: 1

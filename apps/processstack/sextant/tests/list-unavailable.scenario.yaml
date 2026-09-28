@@ -1,0 +1,24 @@
+name: list-unavailable
+description: >
+  A failing grants read replies with a neutral "couldn't read" line and never echoes the response body.
+entrypoint: configure-watched-repos
+principal:
+  userId: u-alice
+inputs:
+  # The prompt-trigger envelope `app test` needs to route SendConnectionMessage (the platform sets these).
+  tenantId: "sextant-test"
+  applicationInstanceId: "sextant-test-instance"
+  conversationId: "conv-list-unavailable"
+  prompt: "what am i watching"
+  isFirstTurn: false
+  channelType: "web"
+http:
+  - connection: sextant-control
+    method: GET
+    path: /control/grants/self
+    status: 503
+    body: { status: unavailable, detail: "internal detail that must not be shown" }
+expected:
+  status: Completed
+  variables:
+    agentResponse: "!contains:couldn't read your watched repositories"

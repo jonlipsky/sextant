@@ -1,0 +1,276 @@
+name: configure-watched-repos
+description: >
+  The chat entry point: watch, unwatch or list the repositories Sextant indexes for the calling user.
+  Started on every prompt turn. The service sees only the run's caller assertion (act=user, idp=processstack),
+  never the senderId variable, so a message can only change its own sender's grants.
+    watch    → grant-watch per repository (GitHub visibility check, PUT /control/grants/self, first ensure)
+    unwatch  → revoke-watch per repository (DELETE /control/grants/self)
+    list     → GET /control/grants/self, formatted (branch, snapshot status, short commit)
+    anything else → help
+  Slack is refused in v2.0: a Slack peer's caller (idp=slack) is not a platform user, so every command
+  replies "not enabled for this channel" and makes no service call.
+  A reply is built from the service's typed fields only; a response body is never echoed.
+
+inputs:
+  # Hydrated by the prompt trigger. The reserved identity names (senderId, conversationId, tenantId, ...)
+  # are deliberately not declared: the platform threads them itself and they are never read here.
+  - name: prompt
+    type: string
+    required: false
+  - name: isFirstTurn
+    type: bool
+    required: false
+  - name: channelType
+    type: string
+    required: false
+  - name: conversationState
+    type: json
+    required: false
+
+variables:
+  - name: verb
+    type: string
+    default: ""
+  - name: repositories
+    type: json
+  - name: branch
+    type: string
+    default: ""
+  - name: errors
+    type: json
+  - name: perRepo
+    type: json
+  - name: grantsStatus
+    type: int
+    default: 0
+  - name: grantsJson
+    type: json
+  - name: agentResponse
+    type: string
+    default: ""
+  - name: stateUpdate
+    type: json
+
+outputs:
+  - name: agentResponse
+    type: string
+    description: The reply sent to the conversation
+  - name: stateUpdate
+    type: json
+    description: Patch merged into the conversation state (nothing is kept there)
+  - name: verb
+    type: string
+    description: The parsed command (watch, unwatch, list or help)
+
+nodes:
+  - id: start
+    type: start
+    next: init-state
+
+  - id: init-state
+    type: activity:SetVariable
+    inputs:
+      value: "= {}"
+    outputs:
+      result: stateUpdate
+    next: slack-gate
+
+  - id: slack-gate
+    type: decision
+    next:
+      - when: "String(channelType || '').toLowerCase() == 'slack'"
+        next: refuse-slack
+      - else: parse
+
+  # SX-11 inserts the one-time lazy import of v1 watches (import-legacy-watches) between the Slack gate and
+  # the parse, for internal channels only.
+  - id: parse
+    type: activity:SextantParseWatchCommand
+    inputs:
+      prompt: "= prompt || ''"
+    outputs:
+      verb: verb
+      repositories: repositories
+      branch: branch
+      errors: errors
+    next: route
+
+  - id: route
+    type: decision
+    next:
+      - when: "(verb == 'watch' || verb == 'unwatch') && (repositories == null || repositories.length == 0)"
+        next: reply-errors
+      - when: "verb == 'watch'"
+        next: watch-each
+      - when: "verb == 'unwatch'"
+        next: unwatch-each
+      - when: "verb == 'list'"
+        next: list-grants
+      - else: help
+
+  # Sequential, so replies keep the order the user typed and the grant limit is counted one at a time.
+  - id: watch-each
+    type: for-each
+    collection: "= repositories"
+    itemVariable: target
+    parallel: false
+    continueOnError: true
+    orchestrationName: grant-watch
+    inputs:
+      host: "= target.host"
+      owner: "= target.owner"
+      repo: "= target.repo"
+      branch: "= branch"
+    resultsVariable: perRepo
+    next: reply-each
+
+  - id: unwatch-each
+    type: for-each
+    collection: "= repositories"
+    itemVariable: target
+    parallel: false
+    continueOnError: true
+    orchestrationName: revoke-watch
+    inputs:
+      host: "= target.host"
+      owner: "= target.owner"
+      repo: "= target.repo"
+      remoteUrl: "= target.remoteUrl"
+      branch: "= branch"
+    resultsVariable: perRepo
+    next: reply-each
+
+  - id: reply-each
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var lines = [];
+        (perRepo || []).forEach(function (r, i) {
+          var target = (repositories || [])[i] || {};
+          var name = String(target.owner || '') + '/' + String(target.repo || '');
+          if (r && r.message) {
+            lines.push(String(r.message));
+          } else {
+            lines.push('Something went wrong with ' + name + '; nothing was changed for it. Try again later.');
+          }
+        });
+        (errors || []).forEach(function (e) { lines.push(String(e)); });
+        lines.join('\n');
+    outputs:
+      result: agentResponse
+    next: send-reply
+
+  - id: reply-errors
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var lines = (errors || []).map(function (e) { return String(e); });
+        if (lines.length === 0) {
+          lines.push('Name a repository, for example "watch owner/repo on main".');
+        }
+        lines.join('\n');
+    outputs:
+      result: agentResponse
+    next: send-reply
+
+  - id: list-grants
+    name: GET /control/grants/self
+    type: activity:HttpRequest
+    inputs:
+      connectionId: sextant-control
+      method: GET
+      url: /control/grants/self
+      failOnErrorStatus: false
+    outputs:
+      statusCode: grantsStatus
+      json: grantsJson
+    next: route-list
+    on-error: list-unavailable
+
+  - id: route-list
+    type: decision
+    next:
+      - when: "grantsStatus == 200 && grantsJson != null"
+        next: list-reply
+      - else: list-unavailable
+
+  - id: list-reply
+    type: activity:JavaScript
+    inputs:
+      script: |
+        function display(url) {
+          var s = String(url || '').trim().replace(/\/+$/, '').replace(/\.git$/i, '');
+          var m = /^https:\/\/([^\/]+)\/([^\/]+)\/([^\/]+)$/i.exec(s);
+          if (!m) return s;
+          return m[1].toLowerCase() === 'github.com' ? m[2] + '/' + m[3] : m[1] + '/' + m[2] + '/' + m[3];
+        }
+        var states = {
+          complete: 'indexed',
+          partial: 'partly indexed',
+          pending: 'indexing',
+          missing: 'not indexed yet'
+        };
+        var grants = grantsJson.grants || [];
+        var text;
+        if (grants.length === 0) {
+          text = 'You are not watching any repositories yet. Try "watch owner/repo on main".';
+        } else {
+          var lines = ['You are watching ' + grants.length + (grants.length === 1 ? ' repository:' : ' repositories:')];
+          grants.forEach(function (g) {
+            var status = g.status || {};
+            var branchLabel = g.branch ? String(g.branch)
+              : (status.resolved_branch ? String(status.resolved_branch) + ' (default)' : 'the default branch');
+            var line = '- ' + display(g.repository) + ' on ' + branchLabel + ': '
+              + (states[status.snapshot_status] || 'unknown');
+            var sha = String(status.commit_sha || '');
+            if (/^[0-9a-f]{7,64}$/i.test(sha)) line += ' at ' + sha.substring(0, 7);
+            lines.push(line);
+          });
+          text = lines.join('\n');
+        }
+        text;
+    outputs:
+      result: agentResponse
+    next: send-reply
+
+  - id: list-unavailable
+    type: activity:SetVariable
+    inputs:
+      value: "I couldn't read your watched repositories from the Sextant service right now. Try again later."
+    outputs:
+      result: agentResponse
+    next: log-list
+
+  - id: log-list
+    type: activity:Log
+    inputs:
+      level: Warning
+      message: "= 'Sextant list: GET /control/grants/self failed: HTTP ' + grantsStatus"
+    next: send-reply
+
+  - id: help
+    type: activity:SetVariable
+    inputs:
+      value: >
+        = 'I can manage the repositories you watch for Sextant indexing. Try: '
+          + '"watch owner/repo on main", "stop watching owner/repo", or "what am I watching".'
+    outputs:
+      result: agentResponse
+    next: send-reply
+
+  - id: refuse-slack
+    type: activity:SetVariable
+    inputs:
+      value: "Watch management isn't enabled for this channel; use the web chat or CLI."
+    outputs:
+      result: agentResponse
+    next: send-reply
+
+  - id: send-reply
+    type: activity:SendConnectionMessage
+    inputs:
+      message: "= agentResponse"
+    next: end
+
+  - id: end
+    type: end

@@ -1,0 +1,47 @@
+name: get-indexing-status-found
+description: >
+  (#29) GET /control/status/{jobId} as the calling user; job.status, job.snapshot_id and job.last_error map
+  to the outputs.
+entrypoint: get-indexing-status
+principal:
+  userId: u-alice
+inputs:
+  jobId: "42"
+# Shape: SnapshotStatusResponse {job: SnapshotJobRow, diagnostics, coverage?} (src/Sextant.Service/ServiceContracts.cs,
+# src/Sextant.Store/SnapshotJobStore.cs); route GET /control/status/{jobId:long} (src/Sextant.Service.Host/ServiceApp.cs).
+http:
+  - connection: sextant-control
+    method: GET
+    path: /control/status/42
+    body:
+      job:
+        id: 42
+        identity_hash: "9b1d"
+        repository_url: "https://github.com/octocat/hello-world.git"
+        commit_sha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+        branch_name: main
+        status: complete
+        snapshot_id: 7
+        owner_token: null
+        attempts: 1
+        created_at: 1760000000
+        updated_at: 1760000100
+        started_at: 1760000010
+        completed_at: 1760000100
+        last_error: null
+      diagnostics: []
+expected:
+  status: Completed
+  variables:
+    found: true
+    indexingState: complete
+    terminal: true
+    snapshotId: "7"
+    lastError: ""
+    outcome: ok
+  httpCalls:
+    - connection: sextant-control
+      method: GET
+      path: /control/status/42
+      caller: { act: user, idp: processstack, sub: u-alice }
+      count: 1

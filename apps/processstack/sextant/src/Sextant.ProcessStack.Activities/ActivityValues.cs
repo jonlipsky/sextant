@@ -16,17 +16,43 @@ internal static class ActivityValues
 {
     /// <summary>
     /// The value of input <paramref name="name"/>: the node's <c>Definition.Parameters</c> entry when it has a
-    /// non-null one, otherwise <paramref name="propertyValue"/> (the bound or directly set property). The host
-    /// binds parameters onto the properties before <c>ExecuteAsync</c>, but a caller that fills only
-    /// <c>Definition.Parameters</c> must see its inputs too (the dual-resolution rule).
+    /// non-null, already-resolved one, otherwise <paramref name="propertyValue"/> (the bound or directly set
+    /// property). The host binds parameters onto the properties before <c>ExecuteAsync</c>, but a caller that
+    /// fills only <c>Definition.Parameters</c> must see its inputs too (the dual-resolution rule).
+    /// <para>
+    /// In-process, <c>Definition.Parameters</c> keeps the node's authored text (<c>"= prompt"</c>, a
+    /// <c>${...}</c> template, a <c>{{ }}</c> Scriban template): the host resolves it only into the bound
+    /// property. Such an entry is never the value, so the property wins.
+    /// </para>
     /// </summary>
     public static object? Input(AbstractActivity activity, string name, object? propertyValue)
     {
         var parameters = activity.Definition?.Parameters;
         if (parameters is not null && parameters.TryGetValue(name, out var value) && value is not null)
-            return Unwrap(value);
+        {
+            var parameter = Unwrap(value);
+            if (!IsAuthoredExpression(parameter))
+                return parameter;
+        }
         return Unwrap(propertyValue);
     }
+
+    /// <summary>
+    /// True when <paramref name="value"/> (or any value nested in it) is text the host still has to resolve:
+    /// the three expression modes of the ProcessStack string resolver.
+    /// </summary>
+    public static bool IsAuthoredExpression(object? value) => Unwrap(value) switch
+    {
+        string text => text.StartsWith("= ", StringComparison.Ordinal)
+            || TemplatePattern.IsMatch(text)
+            || text.Contains("{{", StringComparison.Ordinal),
+        IDictionary map => map.Values.Cast<object?>().Any(item => IsAuthoredExpression(Unwrap(item))),
+        IEnumerable items => items.Cast<object?>().Any(item => IsAuthoredExpression(Unwrap(item))),
+        _ => false,
+    };
+
+    private static readonly System.Text.RegularExpressions.Regex TemplatePattern =
+        new(@"\$\{([^}]+)\}", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
 
     /// <summary>Unwraps a JSON wrapper into plain CLR values (string, long, double, bool, list, map, null).</summary>
     public static object? Unwrap(object? value) => value switch

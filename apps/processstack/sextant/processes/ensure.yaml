@@ -1,0 +1,187 @@
+name: ensure
+description: >
+  Sends one POST /control/ensure?wait=false to the Sextant service and interprets the answer. Every
+  request carries a branch guard: either the compare-and-swap expected_head_commit with
+  branch_update "advance", or branch_update "none" (index the commit, move no branch pointer). A request
+  with no branch name never advances. The process has no input for default_branch or branch_head_sequence,
+  so a chat or MCP caller can never set them. Refusals are logged by outcome and reason code only; the
+  response body is never passed on.
+
+inputs:
+  - name: repositoryRemoteUrl
+    type: string
+    required: true
+    description: The repository URL, sent verbatim as repository_remote_url (the identity hashes this spelling)
+  - name: commitSha
+    type: string
+    required: true
+    description: The exact commit to snapshot
+  - name: branchName
+    type: string
+    required: false
+    default: ""
+    description: The branch the commit belongs to; empty for none
+  - name: branchUpdate
+    type: string
+    required: false
+    default: "none"
+    description: >
+      "advance" moves the branch pointer when expectedHeadCommit still matches it; anything else sends
+      branch_update "none"
+  - name: expectedHeadCommit
+    type: string
+    required: false
+    default: ""
+    description: >
+      The branch head the advance expects (compare-and-swap). Empty or all zeros means the branch must not
+      exist yet, or must point at an unusable snapshot
+  - name: treeSha
+    type: string
+    required: false
+    default: ""
+  - name: configHash
+    type: string
+    required: false
+    default: ""
+
+variables:
+  - name: requestBody
+    type: json
+  - name: effectiveUpdate
+    type: string
+    default: "none"
+  - name: responseText
+    type: string
+    default: ""
+
+outputs:
+  - name: outcome
+    type: string
+    description: ok | attached | rejected | unavailable | head_mismatch | not_granted | unauthorized | error
+  - name: reason
+    type: string
+    description: The service's reason code, or http_<status>
+  - name: statusCode
+    type: int
+  - name: jobId
+    type: string
+  - name: identityHash
+    type: string
+  - name: jobStatus
+    type: string
+    description: queued | running | complete | partial | failed | unsupported | cancelled
+  - name: terminal
+    type: bool
+  - name: published
+    type: bool
+  - name: snapshotId
+    type: string
+  - name: attached
+    type: bool
+  - name: branchAdvanced
+    type: bool
+  - name: effectiveUpdate
+    type: string
+    description: The branch_update actually sent (advance or none)
+
+nodes:
+  - id: start
+    type: start
+    next: build-request
+
+  - id: build-request
+    name: Build the guarded ensure body
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var branch = (branchName || '').trim();
+        var advance = (branchUpdate || '') === 'advance' && branch !== '';
+        var expected = (expectedHeadCommit || '').trim();
+        if (/^0+$/.test(expected)) expected = '';
+        var body = { repository_remote_url: repositoryRemoteUrl, commit_sha: commitSha };
+        if (treeSha) body.tree_sha = treeSha;
+        if (configHash) body.config_hash = configHash;
+        if (branch !== '') body.branch_name = branch;
+        if (advance) {
+          body.expected_head_commit = expected;
+          body.branch_update = 'advance';
+        } else {
+          body.branch_update = 'none';
+        }
+        context.setVariable('effectiveUpdate', advance ? 'advance' : 'none');
+        body;
+    outputs:
+      result: requestBody
+    next: post
+
+  - id: post
+    name: POST /control/ensure
+    type: activity:HttpRequest
+    inputs:
+      connectionId: sextant-control
+      method: POST
+      url: /control/ensure
+      query:
+        wait: "false"
+      body: "= requestBody"
+      failOnErrorStatus: false
+    outputs:
+      statusCode: statusCode
+      body: responseText
+    next: interpret
+
+  - id: interpret
+    name: Interpret the answer
+    type: activity:SextantInterpretEnsureResult
+    inputs:
+      statusCode: "= statusCode"
+      body: "= responseText"
+      branchUpdate: "= effectiveUpdate"
+      operation: ensure
+    outputs:
+      outcome: outcome
+      reason: reason
+      jobId: jobId
+      identityHash: identityHash
+      jobStatus: jobStatus
+      terminal: terminal
+      published: published
+      snapshotId: snapshotId
+      attached: attached
+      branchAdvanced: branchAdvanced
+    next: shape-outputs
+
+  # Only a code-shaped reason leaves the process (a 503 or a job's recorded reason can be free text), and
+  # an absent id is "" rather than null.
+  - id: shape-outputs
+    name: Keep reason codes only
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var code = String(reason == null ? '' : reason);
+        if (!/^[a-z0-9_]{1,64}$/.test(code)) {
+          code = (outcome === 'ok' || outcome === 'attached') ? '' : 'http_' + statusCode;
+        }
+        context.setVariable('reason', code);
+        context.setVariable('jobId', jobId == null ? '' : String(jobId));
+        context.setVariable('snapshotId', snapshotId == null ? '' : String(snapshotId));
+        context.setVariable('identityHash', identityHash == null ? '' : String(identityHash));
+        code;
+    next: check-outcome
+
+  - id: check-outcome
+    type: decision
+    next:
+      - when: "outcome == 'ok' || outcome == 'attached'"
+        next: end
+      - else: log-refusal
+
+  - id: log-refusal
+    type: activity:Log
+    inputs:
+      level: Warning
+      message: "= 'Sextant ensure was not accepted: ' + outcome + ' (' + reason + ', HTTP ' + statusCode + ')'"
+    next: end
+
+  - id: end
+    type: end

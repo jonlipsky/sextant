@@ -1,0 +1,20 @@
+name: legacy-dual-write-upsert
+description: >
+  The v1 memory entry keeps v1's exact shape: key {host}/{owner}/{repo}@{branch} lower-cased without .git or
+  a port, and the camelCase value {owner, repo, branch, cloneUrl, addedAt}.
+entrypoint: legacy-dual-write
+principal:
+  userId: u-alice
+inputs:
+  operation: upsert
+  host: "GitHub.com:443"
+  owner: Octocat
+  repo: Hello-World.git
+  branch: " feature/x "
+  cloneUrl: "https://github.com/Octocat/Hello-World.git"
+expected:
+  status: Completed
+  variables:
+    keys: "github.com/octocat/hello-world@feature/x"
+    count: 1
+    value: '!contains:{"owner":"Octocat","repo":"Hello-World.git","branch":"feature/x","cloneUrl":"https://github.com/Octocat/Hello-World.git","addedAt":"'

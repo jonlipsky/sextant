@@ -18,6 +18,31 @@ public sealed class ActivityValuesTests
     }
 
     [TestMethod]
+    [DataRow("= prompt || ''")]
+    [DataRow("https://${host}/x")]
+    [DataRow("{{ prompt }}")]
+    public void An_authored_expression_parameter_never_wins_over_the_bound_property(string authored)
+    {
+        var activity = new SextantNormalizeRepositoryActivity();
+        activity.Definition.Parameters["cloneUrl"] = authored;
+
+        Assert.AreEqual("resolved", ActivityValues.Input(activity, "cloneUrl", "resolved"));
+        Assert.IsNull(ActivityValues.Input(activity, "cloneUrl", null));
+    }
+
+    [TestMethod]
+    public void A_parameter_map_or_list_holding_an_expression_is_authored()
+    {
+        Assert.IsTrue(ActivityValues.IsAuthoredExpression(ActivityHarness.Map(("a", 1), ("b", "= x"))));
+        Assert.IsTrue(ActivityValues.IsAuthoredExpression(new List<object?> { "plain", new List<object?> { "${y}" } }));
+        Assert.IsTrue(ActivityValues.IsAuthoredExpression(ActivityHarness.Json("""{"a":["= z"]}""")));
+        Assert.IsFalse(ActivityValues.IsAuthoredExpression(ActivityHarness.Map(("a", "=x"), ("b", "$y {z}"))));
+        Assert.IsFalse(ActivityValues.IsAuthoredExpression("watch octocat/hello-world"));
+        Assert.IsFalse(ActivityValues.IsAuthoredExpression(42));
+        Assert.IsFalse(ActivityValues.IsAuthoredExpression(null));
+    }
+
+    [TestMethod]
     public void Json_wrappers_unwrap_to_clr_values()
     {
         var element = ActivityHarness.Json("""{"a":1,"b":[true,"x",1.5],"c":null}""");

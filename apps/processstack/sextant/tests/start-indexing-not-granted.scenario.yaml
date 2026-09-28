@@ -1,0 +1,23 @@
+name: start-indexing-not-granted
+description: >
+  A repository the caller has not watched is refused by the service (403 not_granted); start-indexing
+  reports it through its outputs and tells the caller to watch it first.
+entrypoint: start-indexing
+principal:
+  userId: u-alice
+inputs:
+  repositoryRemoteUrl: "https://github.com/octocat/hello-world.git"
+  commitSha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+http:
+  - connection: sextant-control
+    method: POST
+    path: /control/ensure
+    status: 403
+    body: { status: rejected, reason: not_granted }
+expected:
+  status: Completed
+  variables:
+    outcome: not_granted
+    reason: not_granted
+    jobId: ""
+    message: "!contains:Watch the repository first"

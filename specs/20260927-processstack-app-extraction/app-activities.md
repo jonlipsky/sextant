@@ -22,6 +22,7 @@ apps/processstack/sextant/
   tests/Sextant.ProcessStack.Activities.Tests/   # MSTest, no mocking frameworks; dual direct-property + Definition.Parameters tests
   build.ps1 / build.sh      # dotnet publish -c Release -o activities/sextant/  (output not committed; .gitignore)
   Sextant.ProcessStack.slnx # NOT part of Sextant.slnx: the public build must not need the private feed
+  Directory.Build.props     # SX-9: bin/obj go to apps/processstack/artifacts/, since `app test` reads every JSON file under tests/
 ```
 
 ## Activities

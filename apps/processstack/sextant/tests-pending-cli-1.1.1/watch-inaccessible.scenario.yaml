@@ -1,0 +1,30 @@
+name: watch-inaccessible
+description: >
+  (#3) A repository the workspace's GitHub connection cannot see (404) is refused before any grant.
+entrypoint: configure-watched-repos
+principal:
+  userId: u-alice
+inputs:
+  # The prompt-trigger envelope `app test` needs to route SendConnectionMessage (the platform sets these).
+  tenantId: "sextant-test"
+  applicationInstanceId: "sextant-test-instance"
+  conversationId: "conv-watch-inaccessible"
+  prompt: "watch octocat/hello-world"
+  isFirstTurn: false
+  channelType: "web"
+http:
+  - connection: github
+    method: GET
+    path: /repos/octocat/hello-world
+    status: 404
+    body: { message: "Not Found" }
+  - connection: sextant-control
+    path: "/**"
+    status: 500
+expected:
+  status: Completed
+  variables:
+    agentResponse: "octocat/hello-world isn't visible to this workspace's GitHub connection, so I can't watch it."
+  httpCalls:
+    - connection: sextant-control
+      count: 0

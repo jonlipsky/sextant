@@ -18,9 +18,11 @@ apps/processstack/sextant/
   psapp.yaml
   README.md
   orchestrations/  on-repository-change.yaml  reconcile.yaml  configure-watched-repos.yaml
+                   grant-watch.yaml  revoke-watch.yaml
   processes/       start-indexing.yaml  get-indexing-status.yaml  import-legacy-watches.yaml
-                   reconcile-target.yaml  ensure.yaml  grant-watch.yaml  tenant-grant.yaml  legacy-dual-write.yaml
+                   reconcile-target.yaml  ensure.yaml  tenant-grant.yaml  legacy-dual-write.yaml
   tests/           *.scenario.yaml   (list below)
+  tests-pending-cli-1.1.1/  scenarios that call GitHub (until CLI 1.1.1, see "Implementation notes (SX-9)")
 .github/workflows/processstack-app.yml
 ```
 
@@ -121,7 +123,7 @@ testDirectory: tests
 | Step | Activity | Detail |
 |---|---|---|
 | 1 | `SetVariable` | `exp = before == "0000000000000000000000000000000000000000" ? "" : before` |
-| 2 | `HttpRequest` | `POST /control/ensure?wait=false`, body `{repository_remote_url, commit_sha, branch_name?, is_default_branch?, expected_head_commit?, forced?, branch_update?}` |
+| 2 | `HttpRequest` | `POST /control/ensure?wait=false`, body `{repository_remote_url, commit_sha, branch_name?, default_branch?, expected_head_commit?, forced?, branch_update?}` |
 | 3 | decision | 200/202 → outputs `{job_id, identity_hash, status, snapshot_id, attached, branch_advanced}`. 400 `rejected` → `Log` + outcome `rejected`. 503 → outcome `unavailable`, and the nightly reconcile heals it |
 
 ### `on-repository-change` (`act=application`)
@@ -130,7 +132,7 @@ testDirectory: tests
 |---|---|
 | push, `refType == tag` | No-op (`Log`) |
 | push, `deleted == true` | `HttpRequest POST /control/branches/retire {repository: cloneUrl, branch, expected_head_commit: before}` (409 `head_mismatch`/`default_branch` → `Log`). Then `legacy-dual-write` removes the enrolled row, **only for the default branch**. v1 enrolls only on branch-head advance |
-| push, otherwise | 1. Process `tenant-grant` with `{repository: cloneUrl}` (`PUT /control/grants/tenant`, the default-branch enrollment, idempotent; there is no per-feature-branch tenant grant). 2. `ensure` with `{cloneUrl, after, branch, is_default_branch: branch == defaultBranch, expected_head_commit: before, forced}`. 3. If `branch == defaultBranch`: `legacy-dual-write` upserts `enrolled/{connectionId}/{slug}` |
+| push, otherwise | 1. Process `tenant-grant` with `{repository: cloneUrl}` (`PUT /control/grants/tenant`, the default-branch enrollment, idempotent; there is no per-feature-branch tenant grant). 2. `ensure` with `{cloneUrl, after, branch, default_branch: branch == defaultBranch, expected_head_commit: before, forced}`. 3. If `branch == defaultBranch`: `legacy-dual-write` upserts `enrolled/{connectionId}/{slug}` |
 | delete (`refType == branch`) | `HttpRequest POST /control/branches/retire {repository: cloneUrl, branch}` (no CAS; a newer re-create push is ordered by its own CAS) |
 | pr (opened/synchronize/reopened) | `ensure` base `{cloneUrl, baseSha, baseRef, branch_update: none}`; `ensure` head `{headCloneUrl, headSha, headRef, branch_update: none}`. For a fork head, the SVC-5 host policy still applies. **No branch pointer moves** (PS:`GitHubRepositoryEventMapper.cs:202,216` parity) |
 
@@ -146,7 +148,7 @@ testDirectory: tests
 | 3a | `GetRepository` (github) | 404/403 → `Log` "not reachable by the tenant connection", skip. `branch == ""` → `defaultBranch` |
 | 3b | `ListBranches` (github) | Branch absent → skip. Retire is left to delete events, so a missed delete stays harmless |
 | 3c | `HttpRequest GET /control/resolve?repository=&branch=` | 200 with `commit_sha == head` → up to date. 200 otherwise → `exp = commit_sha`. 404 → `exp = ""` |
-| 3d | `ensure` | `{repository, head, branch, is_default_branch, expected_head_commit: exp}` |
+| 3d | `ensure` | `{repository, head, branch, default_branch, expected_head_commit: exp}` |
 | 4 | `Log` | Counts: up-to-date / re-ensured / skipped / failed |
 
 - **The head comparison relies on SVC-6+7** (`commit_sha` in resolve).
@@ -203,8 +205,8 @@ These assume the PS-6 scenario stubs: `principal`, `seed.userMemory`, `seed.appS
 | 10 | help-fallback | No HTTP calls |
 | 11 | lazy-legacy-import | Seeded memory (2 entries + 1 tombstone) → 2 `PUT`s + flag set; the second turn does not re-import |
 | 12 | import-legacy-watches-process | Output counts |
-| 13 | push-default-branch | `PUT grants/tenant`, ensure (CAS `before`, `is_default_branch: true`), enrolled PascalCase upsert |
-| 14 | push-feature-branch | Ensure with `is_default_branch: false`; no enrolled write |
+| 13 | push-default-branch | `PUT grants/tenant`, ensure (CAS `before`, `default_branch: true`), enrolled PascalCase upsert |
+| 14 | push-feature-branch | Ensure with `default_branch: false`; no enrolled write |
 | 15 | push-branch-create | `before` = zeros → `expected_head_commit: ""` |
 | 16 | push-deleted | Retire with CAS `before`; no ensure |
 | 17 | push-tag | No calls |
@@ -228,7 +230,7 @@ These assume the PS-6 scenario stubs: `principal`, `seed.userMemory`, `seed.appS
 | Item | Value |
 |---|---|
 | Triggers | `pull_request` + `push` to `main`, path filter `apps/processstack/**` and the workflow file |
-| Steps | checkout → `actions/setup-dotnet` → `dotnet nuget add source https://nuget.pkg.github.com/elevenworks/index.json -n elevenworks -u x -p ${{ secrets.PROCESSSTACK_PACKAGES_TOKEN }} --store-password-in-clear-text` → `dotnet tool install -g ProcessStack.Cli --version <pinned>` → `processstack app validate apps/processstack/sextant` → `processstack app test apps/processstack/sextant` |
+| Steps | checkout → `actions/setup-dotnet` → `dotnet nuget add source https://nuget.pkg.github.com/elevenworks/index.json -n elevenworks -u x -p ${{ secrets.PROCESSSTACK_PACKAGES_TOKEN }} --store-password-in-clear-text` → `dotnet tool install -g ProcessStack.Cli --version <pinned>` → `processstack app validate -p apps/processstack/sextant` → `processstack app test -p apps/processstack/sextant --all` |
 | Secret | **`PROCESSSTACK_PACKAGES_TOKEN`: a classic PAT with `read:packages` on elevenworks. The human must add it** to `jonlipsky/sextant`. The package is private and org-owned, so a repo outside the elevenworks org cannot be granted Actions access to it; that is why the public-repo option needs this PAT. If it is absent, the job emits `::notice::` and skips, so it does not fail fork PRs. Under option B (private elevenworks repo; see "Open: app repo location") it is replaced by `GITHUB_TOKEN` with `packages: read` plus "Manage Actions access" on the package |
 | Prerequisite | **First `cli-v*` release to the private elevenworks GitHub Packages feed (approved; cut by the orchestrator after PS-6 merges).** `ProcessStack.Cli` has not been published yet: the PS "Publish CLI Tool" workflow has 0 runs, and there are no `cli-v*` tags. It is never published to nuget.org. The release must contain PS-8 (F3), the PS-6 scenario stubs and PS-5 trigger validation before this job can install `--version <pinned>` |
 | Not in CI | `publish` / `activate`, which stay manual per the runbook |
@@ -249,10 +251,45 @@ These assume the PS-6 scenario stubs: `principal`, `seed.userMemory`, `seed.appS
    - `sextant-query` (mcp http, delegate bearer, callerIdentity);
    - `sextant-control` (http-api, control bearer, the same callerIdentity **and the same explicit `keyId`**);
    - `github` with webhook events `push`, `delete` and `pull_request`.
-3. **Publish:** `processstack app validate apps/processstack/sextant && processstack app test apps/processstack/sextant && processstack app publish apps/processstack/sextant`.
+3. **Publish:** `processstack app validate -p apps/processstack/sextant && processstack app test -p apps/processstack/sextant --all && processstack app publish apps/processstack/sextant`.
 4. **Activate:** `processstack app activate sextant --version 2.0.0` with bindings `github`, `sextant-query` and `sextant-control`.
 5. **Import:**
    - each user runs `import-legacy-watches` (or it happens lazily on first internal-channel chat);
    - enrollments: fire `nightly-reconcile` once with trigger run-now, `POST /v1/{tenant}/triggers/run/{triggerId}` (needs `triggers:write`). It runs as `act=application`, and its step 1 imports the `enrolled/*` rows.
 6. **Agents:** `processstack api-key create --name sextant-agents --app sextant`, then point clients at `POST /v1/{tenant}/mcp/sextant`.
 7. **Rollback:** `processstack app activate sextant --version 1.0.1`. The dual-write keeps v1's stores current.
+
+## Implementation notes (SX-9, as built)
+
+SX-9 builds the manifest, the chat, the MCP processes, `ensure` and the v1 memory dual-write. SX-10 adds the GitHub triggers and `reconcile`; SX-11 adds `mcp.connectionTools`, `import-legacy-watches` and the lazy import. Where the code differs from the sections above, the code wins.
+
+**Manifest**
+- **The `prompt` trigger maps only `prompt`, `isFirstTurn`, `channelType` and `conversationState`.** `conversationId` and `senderId` are server-hydrated reserved names. The app never maps, defaults or sets them, and nothing reads `senderId`: the service sees only the run's caller (PS-7).
+- **`mcp.include` is `[start-indexing, get-indexing-status]`.** SX-11 adds `import-legacy-watches` and `connectionTools`.
+
+**Flows**
+- **`grant-watch` and `revoke-watch` are orchestrations**, not processes. A GitHub activity throws on a 404, and `HttpRequest` throws on a network failure. Only an orchestration can route that with `on-error` to a reply instead of failing the chat turn. Each returns one reply line in `message`; `configure-watched-repos` runs one per repository with a sequential `for-each` (`continueOnError`, so a failed child becomes a "Something went wrong" line).
+- **The command parse is the `SextantParseWatchCommand` activity**, not a command node. Its `errors` (an invalid token, too many repositories) are appended to the reply.
+- **Only github.com repositories are watchable.** The workspace's GitHub connection answers for github.com only, so another host is refused before any call.
+- **`GitHubGetRepository` returns no clone URL.** `grant-watch` normalizes GitHub's `fullName` with `SextantNormalizeRepository`, which gives `https://github.com/{owner}/{repo}.git`: the `clone_url` spelling push events carry, so the first ensure and later push-time ensures hash to the same identity.
+- **The first ensure needs the watched branch in the grant listing.** `grant-watch` reads `GET /control/grants/self` after the `PUT` and ensures only when that grant's `status.snapshot_status` is `missing`. The ensure advances the branch with `expected_head_commit: ""`.
+- **Unwatch without a branch sends `branch=*`** (every branch of the repository) and tombstones every matching v1 entry.
+- **Refusals are outputs, not failures.** `ensure`, `start-indexing` and `get-indexing-status` complete with an `outcome` (`SextantInterpretEnsureResult`'s set, or `not_found`/`rejected`) and a code-shaped `reason` (`^[a-z0-9_]{1,64}$`, else `http_<status>`). A free-text reason from the service is never passed on. The chat shows a service reason only in that shape.
+- **`ensure` builds the body itself and has no input for `default_branch`, `forced` or `branch_head_sequence`.** Every body carries `branch_update`:
+  - `advance` with `expected_head_commit`, when the caller asks to advance and names a branch (all zeros becomes `""`);
+  - otherwise `none`.
+
+  A user or MCP caller can therefore never set the default flag (SX-6d refuses it for `act=user`). SX-10's push flows, which run as `act=application` and need `default_branch`/`forced`, send `SextantPlanRepositoryChange`'s bodies through their own `HttpRequest`, not through this process.
+- **`start-indexing` with a branch on github.com** reads the head with `GitHubListBranches`. When the commit is the head, it reads `GET /control/resolve` (200 → CAS `commit_sha`; 404 → CAS `""`; anything else refuses) and advances. Otherwise it sends `branch_update: none`. A `ListBranches` failure fails the MCP call, because a process has no `on-error`.
+- **`get-indexing-status`** accepts only a decimal `jobId` (`^[0-9]{1,19}$`) and never builds a URL from anything else.
+- **`legacy-dual-write`** writes the v1 slug and the camelCase value. A remove lists the scope and tombstones (`"null"`) each live entry that matches by value (owner, repo, host from `cloneUrl`, branch) or, when the value does not parse, by key. That covers entries v1 wrote under a non-canonical spelling.
+
+**Tests and CI**
+- **`processstack app validate`/`app test` take the app directory as `-p`**, and `app test` needs `--all` (or `-s <name>`). Both load `activities/sextant/`, so CI runs `build.sh` first.
+- **Scenarios that call GitHub wait in `tests-pending-cli-1.1.1/`.** Under CLI 1.1.0 the GitHub activities cannot be stubbed: they fail with `CredentialConnectionProvider is not configured`, which the ProcessStack fix PS-19 (CLI 1.1.1) addresses. They cover scenarios #1–5, #27 and #28 with a branch. When 1.1.1 ships, re-pin the CLI and move them into `tests/` (jonlipsky/sextant#201).
+- **A chat scenario passes the prompt envelope as inputs** (`tenantId`, `applicationInstanceId`, `conversationId`), which `app test` needs to route `SendConnectionMessage`. `expected.httpCalls` records requests only when the scenario has an `http:` block, so the no-call scenarios stub `/**` with a 500.
+- **The CLI installs from `apps/processstack/`,** whose `nuget.config` maps `ProcessStack.Cli` to the private feed, so it is never resolved from nuget.org.
+- **Build output leaves the app directory.** `app test` reads every `.yaml`/`.yml`/`.json` file under `tests/` as a scenario (PS `TestScenarioFiles`), including the MSTest project's `bin/`/`obj/` JSON. `sextant/Directory.Build.props` therefore sets the artifacts output to `apps/processstack/artifacts/`.
+- **For G2c:** `app publish` packs every file under the app directory (PS `ApplicationPacker`), including `src/` and the MSTest project's sources. Build output is no longer among them.
+
+**A fix to SX-13's activities.** In-process, PS binds each resolved input onto the activity's property but leaves `Definition.Parameters` holding the authored expression text (`= prompt || ''`); only an off-host dispatch overlays resolved values. `ActivityValues.Input` preferred the parameter, so every expression input read its own source text, and the parse always returned `help`. It now skips a parameter that is an authored expression (a `= ` prefix, a `${…}` template or `{{ … }}`, also inside a map or list) and uses the bound property. A literal parameter still wins.

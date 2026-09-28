@@ -1,0 +1,38 @@
+name: unwatch
+description: >
+  (#6) "stop watching owner/repo on main" deletes the caller's own grant for that branch
+  (DELETE /control/grants/self?repository=&branch=main) and tombstones the v1 watched-repos memory entry.
+entrypoint: configure-watched-repos
+principal:
+  userId: u-alice
+inputs:
+  # The prompt-trigger envelope `app test` needs to route SendConnectionMessage (the platform sets these).
+  tenantId: "sextant-test"
+  applicationInstanceId: "sextant-test-instance"
+  conversationId: "conv-unwatch"
+  prompt: "stop watching octocat/hello-world on main"
+  isFirstTurn: false
+  channelType: "web"
+seed:
+  userMemory:
+    - key: "sextant.watched-repos:github.com/octocat/hello-world@main"
+      value: '{"owner":"octocat","repo":"hello-world","branch":"main","cloneUrl":"https://github.com/octocat/hello-world.git","addedAt":"2026-01-01T00:00:00+00:00"}'
+# Shape: GrantEndpoints DELETE /control/grants/self → {deleted: N} (src/Sextant.Service.Host/GrantEndpoints.cs).
+http:
+  - connection: sextant-control
+    method: DELETE
+    path: /control/grants/self
+    body: { deleted: 1 }
+expected:
+  status: Completed
+  variables:
+    verb: unwatch
+    agentResponse: "Stopped watching octocat/hello-world on main. Existing snapshots are left in place."
+  httpCalls:
+    - connection: sextant-control
+      method: DELETE
+      path: /control/grants/self
+      caller: { act: user, idp: processstack, sub: u-alice }
+      count: 1
+    - method: PUT
+      count: 0
