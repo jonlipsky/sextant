@@ -91,6 +91,29 @@
 | Revocation | Effective on the next request, with no caching of the grant set across requests |
 | Legacy token | Unscoped until G3. Then set `REQUIRE_REPOSITORY_SELECTION=true` and delete the legacy token |
 
+## Control routes by caller (SVC-3/SVC-4, #193)
+
+A control call needs the control token (or the contribute token on `/control/contribute`). A verified caller
+assertion then decides what the call may do. The `act=user` rule is **default-deny**: a user caller reaches only
+the routes that apply their own user rule, and every other control route, including one added later, is
+403 `caller_not_allowed` (`ControlCallerRules`). The refusal runs after the assertion is verified (a bad one
+is still 401) and before the route reads its request or the catalog, so it is not an existence oracle.
+
+| Route | `act=user` | `act=application` | No assertion (control bearer) |
+|---|---|---|---|
+| `POST /control/ensure` | Repository must be visible, else 403 `not_granted` | Unchanged (trigger) | Unchanged |
+| `GET /control/status/{id}` | 404 unless the job's repository is visible | Unchanged | Unchanged |
+| `GET /control/resolve` | Bare 404 unless the repository is visible | Unchanged | Unchanged |
+| `/control/grants/self` | Own grants only | 403 `wrong_actor` | 401 `caller_required` |
+| `/control/grants/tenant`, `GET /control/grants?scope=tenant` | 403 `wrong_actor` | Own tenant's `'*'` grants and targets | 401 `caller_required` |
+| `POST /control/branches/retire` | **403 `caller_not_allowed`**, even for a visible repository (a destructive cross-user action); audited `retire`/`denied` | Unchanged (repository delete, reconcile) | Unchanged |
+| `POST /control/retention`, `POST /control/backup` | 403 `caller_not_allowed`; audited `denied` | Unchanged | Unchanged |
+| `GET /control/metrics`, `/control/audit`, `/control/pilot` | 403 `caller_not_allowed` (cross-tenant operator data) | Unchanged | Unchanged |
+| `POST /control/contribute` | Any assertion → 401 `assertion_not_allowed` | Same | Unchanged (contribute or control token) |
+| Any other `/control/*` path | 403 `caller_not_allowed` | Unchanged (404/405) | Unchanged (404/405) |
+
+Assertion-less calls stay full-power until SVC-17 (see "Trust boundaries").
+
 ## Self-service watch implications (#111)
 
 **Risk.**
@@ -125,4 +148,4 @@ The app's pre-check is **UX plus defense in depth, not a boundary**. The durable
 | ensure / resolve / retire / grant / query | `HashActor("{tid}/{sub}")` (`sub` is idp-namespaced) or `HashActor("{tid}/app:{app}")` (SHA-256 with a domain prefix, `src/Sextant.Store/AuditLogStore.cs:218-224`) | `idp, kid, via, cid, dep, jti` (`dep=-` when the assertion carries none; `dep` is optional since 2026-09-28), outcome, and the repository scope (canonical URL) |
 
 - Grant rows necessarily store `tenant_id` and the full `sub` in clear, because lookups need them. They are PS ULIDs (or namespaced peer ids if another idp is allowed), not names or emails.
-- `/control/audit` stays control-token only.
+- `/control/audit` stays control-token only, and a user caller (`act=user`) is refused there (403 `caller_not_allowed`, #193), so a user can never read another caller's audit rows. Application callers and assertion-less operator calls read it as before.

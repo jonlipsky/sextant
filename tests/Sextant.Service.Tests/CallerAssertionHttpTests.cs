@@ -379,26 +379,33 @@ public class CallerAssertionHttpTests
     public async Task Control_VerifiedCaller_IsTheAuditActor()
     {
         await using var host = await Harness.StartAsync();
+        var application = host.Sign(CallerAssertionSigner.ApplicationClaims(DateTimeOffset.UtcNow));
 
-        using (var retention = await host.ControlAsync(HttpMethod.Post, "/control/retention", ControlToken, host.UserAssertion()))
+        using (var retention = await host.ControlAsync(HttpMethod.Post, "/control/retention", ControlToken, application))
             Assert.AreEqual(HttpStatusCode.OK, retention.StatusCode, await retention.Content.ReadAsStringAsync());
         using (var ensure = await host.ControlAsync(HttpMethod.Post, "/control/ensure", ControlToken,
             host.Sign(CallerAssertionSigner.ApplicationClaims(DateTimeOffset.UtcNow, tenantId: "tenant-b"), "kid-b"), EnsureBody()))
             Assert.AreEqual(HttpStatusCode.OK, ensure.StatusCode, await ensure.Content.ReadAsStringAsync());
         using (var retire = await host.ControlAsync(HttpMethod.Post, "/control/branches/retire", ControlToken,
-            host.UserAssertion(), """{"repository":"https://github.com/acme/widgets","branch":"gone"}"""))
+            application, """{"repository":"https://github.com/acme/widgets","branch":"gone"}"""))
             Assert.AreEqual(HttpStatusCode.OK, retire.StatusCode, await retire.Content.ReadAsStringAsync());
         using (var refused = await host.ControlAsync(HttpMethod.Post, "/control/branches/retire", ControlToken,
-            host.UserAssertion(), """{"repository":"https://github.com/acme/widgets","branch":" "}"""))
+            application, """{"repository":"https://github.com/acme/widgets","branch":" "}"""))
             Assert.AreEqual(HttpStatusCode.BadRequest, refused.StatusCode, await refused.Content.ReadAsStringAsync());
+        using (var user = await host.ControlAsync(HttpMethod.Post, "/control/ensure", ControlToken, host.UserAssertion(), EnsureBody()))
+            Assert.AreEqual(HttpStatusCode.Forbidden, user.StatusCode, await user.Content.ReadAsStringAsync());
 
-        Assert.AreEqual(AuditLogStore.HashActor("tenant-a/user-1"),
+        Assert.AreEqual(AuditLogStore.HashActor("tenant-a/app:sextant"),
             host.Service.RecentAudit(action: AuditAction.Retention).Single().Actor);
-        Assert.AreEqual(AuditLogStore.HashActor("tenant-b/app:sextant"),
-            host.Service.RecentAudit(action: AuditAction.Ensure).Single().Actor);
+        var ensures = host.Service.RecentAudit(action: AuditAction.Ensure);
+        Assert.AreEqual(2, ensures.Count);
+        CollectionAssert.AreEquivalent(
+            new[] { AuditLogStore.HashActor("tenant-b/app:sextant"), AuditLogStore.HashActor("tenant-a/user-1") },
+            ensures.Select(e => e.Actor).ToArray(),
+            "an application and a user caller are each the actor of their own ensure row");
         var retires = host.Service.RecentAudit(action: AuditAction.Retire);
         Assert.AreEqual(2, retires.Count);
-        Assert.IsTrue(retires.All(r => r.Actor == AuditLogStore.HashActor("tenant-a/user-1")),
+        Assert.IsTrue(retires.All(r => r.Actor == AuditLogStore.HashActor("tenant-a/app:sextant")),
             "both a completed and a refused retire are attributed to the verified caller");
     }
 
@@ -406,14 +413,15 @@ public class CallerAssertionHttpTests
     public async Task Control_VerifiedCallerWithoutDeployment_IsTheAuditActor()
     {
         await using var host = await Harness.StartAsync();
-        var claims = CallerAssertionSigner.UserClaims(DateTimeOffset.UtcNow);
+        var claims = CallerAssertionSigner.ApplicationClaims(DateTimeOffset.UtcNow);
         claims.Remove("dep");
 
         using var retention = await host.ControlAsync(HttpMethod.Post, "/control/retention", ControlToken, host.Sign(claims));
 
         Assert.AreEqual(HttpStatusCode.OK, retention.StatusCode, await retention.Content.ReadAsStringAsync());
-        Assert.AreEqual(AuditLogStore.HashActor("tenant-a/user-1"),
-            host.Service.RecentAudit(action: AuditAction.Retention).Single().Actor);
+        var row = host.Service.RecentAudit(action: AuditAction.Retention).Single();
+        Assert.AreEqual(AuditLogStore.HashActor("tenant-a/app:sextant"), row.Actor);
+        StringAssert.Contains(row.Detail, ";dep=-;", "a missing deployment renders as '-'");
     }
 
     [TestMethod]
@@ -747,6 +755,13 @@ public class CallerAssertionHttpTests
         }
 
         public string Logs() => _logs.Text;
+
+        /// <summary>Every route endpoint the app maps (for route-inventory guards).</summary>
+        public IReadOnlyList<Microsoft.AspNetCore.Routing.RouteEndpoint> RouteEndpoints() =>
+            ((Microsoft.AspNetCore.Routing.IEndpointRouteBuilder)App).DataSources
+                .SelectMany(source => source.Endpoints)
+                .OfType<Microsoft.AspNetCore.Routing.RouteEndpoint>()
+                .ToList();
 
         /// <summary>How many grant rows the catalog holds (read on its own connection).</summary>
         public long GrantRows()

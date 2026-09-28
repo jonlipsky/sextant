@@ -182,7 +182,7 @@ The contract is **PS-7 (F4)** (ProcessStack-side spec `20260927-outbound-caller-
 | `/query/*` | delegate | **Required** (401 in middleware) |
 | `/mcp`, `/query/*` | legacy `QUERY_TOKEN` or `READ_POLICY` principal | **Must be absent**; if present → 401 `assertion_not_allowed` |
 | `/control/grants*` | control | **Required** (SVC-4) |
-| other `/control/*` | control | Optional; if present it must verify, and it drives audit and the `act=user` checks (SVC-4) |
+| other `/control/*` | control | Optional; if present it must verify, and it drives audit and the `act=user` checks (SVC-4). A verified `act=user` caller reaches only ensure, status, resolve and the grant routes; every other control route is 403 `caller_not_allowed` (#193, see §SVC-4 "As implemented") |
 
 - **Interim state:** in SX-5 alone, delegate reads use a deny-all authorizer, because there is no visibility source until SX-6. SX-5 and SX-6 deploy together at G2b.
 - **Audit actor:** `HashActor("{tid}/{sub}")` (`sub` is already idp-namespaced) or `HashActor("{tid}/app:{app}")`. The detail suffix is `idp,kid,via,cid,dep,jti`; an absent `dep` is written as `dep=-`.
@@ -386,7 +386,13 @@ The contract above is implemented as written. These are the places where the cod
 - **Cross-repo tools** with a verified caller default the selection to `provider_repository_url` (SX-5). The provider must therefore be visible and have a complete default-branch snapshot, and each listed consumer repository is then filtered by `AuthorizeRepository`.
 - **Ensure gate order:** the URL policy (400) is checked first, then `not_granted` (403), then the branch guards (400).
 - **Status gate:** a job on a repository the user caller cannot see is the same bare 404 as an unknown id.
-- **Resolve gate** (added in review): `GET /control/resolve` by a user caller checks visibility before resolving the branch, so an ungranted repository is the same bare 404 as an absent repository or branch. Application and assertion-less callers are unchanged. `/control/branches/retire` is not grant-gated (a follow-up).
+- **Resolve gate** (added in review): `GET /control/resolve` by a user caller checks visibility before resolving the branch, so an ungranted repository is the same bare 404 as an absent repository or branch. Application and assertion-less callers are unchanged.
+- **Every other control route refuses user callers** (SX-6c, #193). A verified `act=user` caller reaches only the routes that apply their own user rule: ensure, status and resolve (the gates above) and the grant routes (their `act` rule). Every other control route returns 403 `{"error":"caller_not_allowed"}`. That covers branch retire, retention, backup, metrics, audit, pilot and any route added later, because the rule is default-deny (`ControlCallerRules`: a route opts in with `.DecidesUserCallers()`, and a route-inventory test pins the admitted set).
+  - **Order:** the refusal runs in the control middleware after the assertion is verified (a bad assertion is still 401, and an SVC-3 idp/app refusal is still its own 403) and before the route binds its request or reads any catalog state. The response is identical whether the named repository or branch exists.
+  - **Retire:** refused even when the user can see the repository. "Require visibility" was rejected: a grant makes a repository readable, and a user retiring a branch of a repository other users watch would be a destructive cross-user action. The app's retire flows (repository delete, reconcile) run as `act=application`.
+  - **Audit:** a refused retire, retention or backup writes a `<action>`/`denied` row with detail `caller_not_allowed` plus the caller suffix, attributed to the user caller and with no repository scope (the refusal precedes reading the request). The `GET` routes (metrics, audit, pilot) are not audited, like the grant `GET`s.
+  - **`/control/audit`** is therefore never readable by a user caller, so a user cannot read another caller's rows.
+  - Application and assertion-less callers are unchanged on every route. An unknown `/control/*` path is also 403 for a user caller (uniform, no route oracle), and still 404/405 otherwise.
 - **Header selection:** an `X-Sextant-Repository` header is authorized like a `repository` argument; it never bypasses the grant. When both are sent and name different repositories, the call fails with `selector_conflict` before any grant or catalog lookup.
 - **Failure:** a visibility read that fails (the grant catalog cannot be read) propagates out of the authorizer, so the call fails (a tool error, or a 5xx on HTTP) and never reads as allowed. A grant write that cannot be recorded (lease lost, service disposed) is 503 `unavailable`, and so is a user's ensure whose `not_granted` row cannot be recorded; neither writes a row.
 
@@ -577,6 +583,13 @@ implementation settled it as follows (see `docs/service.md`, "Branch-pointer gua
     under the single writer. Retire therefore waits behind a running production, as retention does.
   - Deleting the row also drops `head_sequence`, so a late **sequence**-guarded ensure can re-create a
     retired branch. The CAS path cannot. Mixing the two guards on one branch is unsupported.
+  - **Caller (SX-6c, #193).** Retire is application/operator-only. A verified `act=user` caller is refused
+    with 403 `caller_not_allowed` before the body is read, so the response is the same for an existing, an
+    absent or a refused repository or branch, and the same even when the user holds a grant on the
+    repository. "Require visibility" was rejected because a user retiring a branch of a repository other
+    users watch would be a destructive cross-user action. The refusal is audited `retire`/`denied` (detail
+    `caller_not_allowed` plus the caller suffix, no repository scope). Application and assertion-less callers
+    are unchanged.
 - **Not changed.** Overlays (local-only) and the contribution ingest's branch advance.
 - **No migration.** The CAS reads the existing `branches`/`snapshots`/`commits` columns.
 - **No format validation of `expected_head_commit`** beyond the empty/all-zero check.

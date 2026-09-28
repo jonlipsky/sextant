@@ -645,15 +645,15 @@ The host deliberately **separates control endpoints from query endpoints**, and 
 | `POST /control/contribute` | control | control **or** contribute token | Ingest a client/CI semantic contribution (Phase 16); the least-privilege contribute token authorizes this endpoint only. |
 | `GET /control/status/{jobId}` | control | control token | Job status + per-project diagnostics (criterion 5) + checkout `coverage` (#119). For a user caller, a job on a repository it cannot read is the same `404` as an unknown id (SVC-4). |
 | `GET /control/resolve` | control | control token | Resolve a repository branch (`?branch=`, else the default) to its current published snapshot (+ its `coverage`, #119), plus `commit_sha`, the resolved `branch` name, `is_default` and `head_sequence` (SVC-7; a null `commit_sha`/`head_sequence` is omitted). For a user caller, a repository it cannot read is the same bare `404` as an absent one (SVC-4). |
-| `POST /control/branches/retire` | control | control token | Delete a branch pointer (`{repository, branch, expected_head_commit?}`, SVC-6); its snapshots stay for retention. `200 {"retired":true}`, or `{"retired":false}` for a missing branch (idempotent). The default branch or a head-CAS mismatch is `409 {"status":"rejected","reason":"default_branch"\|"head_mismatch"}`; a refused URL or blank branch is `400`. Audited `retire`. |
-| `POST /control/retention` | control | control token | Run the service-owned retention/GC pass (`?execute=true` to apply). |
+| `POST /control/branches/retire` | control | control token | Delete a branch pointer (`{repository, branch, expected_head_commit?}`, SVC-6); its snapshots stay for retention. `200 {"retired":true}`, or `{"retired":false}` for a missing branch (idempotent). The default branch or a head-CAS mismatch is `409 {"status":"rejected","reason":"default_branch"\|"head_mismatch"}`; a refused URL or blank branch is `400`. Audited `retire`. A user caller is refused with `403 {"error":"caller_not_allowed"}` (issue #193, see [User callers on the control plane](#user-callers-on-the-control-plane-issue-193)). |
+| `POST /control/retention` | control | control token | Run the service-owned retention/GC pass (`?execute=true` to apply). A user caller is refused (`403 caller_not_allowed`). |
 | `PUT`/`DELETE`/`GET /control/grants/self` | control | control token + `act=user` assertion | The caller's own repository grants (see [Repository grants](#repository-grants-and-visibility-svc-4)). |
 | `PUT`/`DELETE /control/grants/tenant` | control | control token + `act=application` assertion | The tenant-wide repository grants. |
 | `GET /control/grants?scope=tenant` | control | control token + `act=application` assertion | The tenant's distinct reconcile targets, with counts and no user ids. |
-| `GET /control/metrics` | control | control token | Observability snapshot (criterion 5); `?format=prometheus` for text exposition, else JSON. |
-| `GET /control/audit` | control | control token | Durable audit log (criterion 5); optional `action`/`repository`/`limit` filters. **Operator-only.** |
-| `GET /control/pilot` | control | control token | Pilot-readiness gate (criterion 7); `?workload=trusted\|untrusted&hard_isolation=&recent_backup=`. |
-| `POST /control/backup` | control | control token | Write a consistent catalog + artifact backup to `?dir=` (criterion 6). |
+| `GET /control/metrics` | control | control token | Observability snapshot (criterion 5); `?format=prometheus` for text exposition, else JSON. A user caller is refused (`403 caller_not_allowed`). |
+| `GET /control/audit` | control | control token | Durable audit log (criterion 5); optional `action`/`repository`/`limit` filters. **Operator-only**: a user caller is refused (`403 caller_not_allowed`). |
+| `GET /control/pilot` | control | control token | Pilot-readiness gate (criterion 7); `?workload=trusted\|untrusted&hard_isolation=&recent_backup=`. A user caller is refused (`403 caller_not_allowed`). |
+| `POST /control/backup` | control | control token | Write a consistent catalog + artifact backup to `?dir=` (criterion 6). A user caller is refused (`403 caller_not_allowed`). |
 | `GET /query/snapshots/{identityHash}/symbols` | query | query token (or delegate token + caller assertion) | One immutable page of a snapshot's symbols, cursor-paged (federation, issue #51). |
 | `POST /mcp` | query | query token (or delegate token; `tools/call` needs a caller assertion) | Authenticated HTTP MCP semantic queries (criterion 4). |
 
@@ -752,7 +752,7 @@ every assertion needs its `app` in it.
 | `/mcp` `tools/call` | delegate | Required: without one the call is the tool error `caller_required`; a caller refused by `CALLER_IDPS`/`CALLER_APPS` is the tool error `caller_not_allowed` |
 | `/query/*` | delegate | Required: `401 {"error":"caller_required"}` |
 | `/mcp`, `/query/*` | query token, read-policy principal, or an open plane | Refused: `401 {"error":"assertion_not_allowed"}` |
-| `/control/*` except `/control/contribute` | control | Optional; when present it must verify, and the audit actor becomes the caller |
+| `/control/*` except `/control/contribute` | control | Optional; when present it must verify, and the audit actor becomes the caller. A verified user caller reaches only ensure, status, resolve and the grant routes ([below](#user-callers-on-the-control-plane-issue-193)) |
 | `/control/contribute` | control or contribute | Refused: `401 {"error":"assertion_not_allowed"}` |
 
 An assertion that fails verification is `401 {"error":"invalid_caller_assertion"}` with
@@ -805,6 +805,8 @@ across requests, so a revocation takes effect on the next call. Once a request h
 - **`/control/resolve`** by a user caller is the same bare `404` as an absent repository when it cannot see
   the repository (checked before the branch is resolved). An application caller and an assertion-less call
   are unchanged.
+- **Every other control route** (retire, retention, backup, metrics, audit, pilot) refuses a user caller with
+  `403 caller_not_allowed`, whatever it can see ([issue #193](#user-callers-on-the-control-plane-issue-193)).
 - **Failures fail closed:** if the grant catalog cannot be read, the read fails (a tool error or a `5xx`)
   rather than reading as allowed. A grant write, or a user's `not_granted` ensure refusal, that cannot be
   recorded (the service lost its writer lease or is stopping) is `503 unavailable` and writes nothing.
@@ -904,6 +906,41 @@ type, an unknown argument or `kind`), `invalid_selector` (a `repository` the URL
 `invalid_cursor`, and `no_visible_repositories` (nothing to search: no grants, or an explicit `repository` or
 `branch` that matches nothing visible). A failure to read the grants fails the call; it is never presented as
 `no_visible_repositories` or as an unscoped search.
+
+### User callers on the control plane (issue #193)
+
+A control call with a verified `act=user` assertion reaches **only** the routes that apply their own user
+rule: `/control/ensure`, `/control/status/{jobId}` and `/control/resolve` (the SVC-4 visibility gates above)
+and the grant routes (their `act` rule). Every other control route refuses a user caller with
+`403 {"error":"caller_not_allowed"}` (no `WWW-Authenticate` challenge). The rule is default-deny, so a control
+route added later refuses user callers too unless it opts in with its own rule (`ControlCallerRules`).
+
+| Route | `act=user` | `act=application` or no assertion |
+| --- | --- | --- |
+| `POST /control/ensure`, `GET /control/status/{jobId}`, `GET /control/resolve` | Gated by visibility (SVC-4) | Unchanged |
+| `/control/grants/self` | Allowed (own grants) | `403 wrong_actor` for an application; `401 caller_required` without an assertion |
+| `/control/grants/tenant`, `GET /control/grants?scope=tenant` | `403 wrong_actor` | Allowed for an application; `401 caller_required` without an assertion |
+| `POST /control/branches/retire` | `403 caller_not_allowed`, audited `retire`/`denied` | Unchanged |
+| `POST /control/retention` | `403 caller_not_allowed`, audited `retention`/`denied` | Unchanged |
+| `POST /control/backup` | `403 caller_not_allowed`, audited `backup`/`denied` | Unchanged |
+| `GET /control/metrics`, `GET /control/audit`, `GET /control/pilot` | `403 caller_not_allowed` (not audited, like the grant `GET`s) | Unchanged |
+| `POST /control/contribute` | Any assertion is `401 assertion_not_allowed` (SVC-3) | Unchanged |
+| Any other `/control/*` path | `403 caller_not_allowed` | Unchanged (`404`/`405`) |
+
+- **Order:** the refusal runs after the assertion is verified (a bad assertion is still `401
+  invalid_caller_assertion`, and an idp/app allow-list refusal is still the SVC-3 `403`) and before the route
+  reads its request or any catalog state. The response is therefore identical whether the named repository
+  or branch exists, and it is the same even when the user holds a grant on the repository.
+- **Retire is application/operator-only.** Visibility is not enough, because a grant makes a repository
+  readable, not retirable: a user retiring a branch of a repository other users watch would be a destructive
+  cross-user action. The app retires branches as its application identity (repository delete and reconcile).
+- **Audit rows:** a refused retire, retention or backup writes a `denied` row under that action with detail
+  `caller_not_allowed` plus the caller suffix (`dep=-` when the assertion has no `dep`), attributed to the
+  user caller, with no repository scope (the refusal precedes reading the request).
+- **`/control/audit`** is never readable by a user caller, so a user can never read another caller's audit
+  rows, and `metrics`/`pilot` (cross-tenant counts and cost) stay operator data.
+- An application caller and an assertion-less control call are unchanged, and a deployment without
+  `CALLER_KEYS` never has a verified caller on `/control/*` (an assertion there is `401 assertion_not_allowed`).
 
 ## The `SnapshotService` data plane
 
@@ -1104,7 +1141,10 @@ names a real `before` commit fails the CAS, so seed the branch first with an ens
 
 **Retire.** `POST /control/branches/retire` with `{repository, branch, expected_head_commit?}` deletes the
 branch row for a branch deleted upstream. The snapshots stay in the catalog, and retention reclaims them once
-nothing else protects them. The endpoint applies the [repository URL policy](#repository-url-policy-svc-5)
+nothing else protects them. It is application/operator-only: a user caller is refused with
+`403 caller_not_allowed` before the body is read, audited `retire`/`denied` (issue #193, see
+[User callers on the control plane](#user-callers-on-the-control-plane-issue-193)). The endpoint applies the
+[repository URL policy](#repository-url-policy-svc-5)
 exactly as ensure intake does. A refused URL (or a blank `branch`) is a `400` whose body carries only the
 reason code, audited `retire`/`denied` with no repository scope. Then, in one write transaction under the
 single writer:
@@ -1291,6 +1331,9 @@ that is already complete. `ProviderGrowthImmutabilityTests` is the regression.
 The service exposes a **clean, dependency-free** observability surface on the **control plane only** — every
 signal is operator data, so none of it is reachable with a query token (criterion-1 leakage guard: audit
 rows and per-repository cost would otherwise reveal repository/snapshot existence and cross-tenant counts).
+For the same reason a user caller (`act=user` assertion) on the control plane is refused with
+`403 caller_not_allowed` on metrics, audit and pilot (issue #193), so it can never read other callers' audit
+rows.
 
 - **`GET /control/metrics`** returns a point-in-time [`MetricsSnapshot`](../src/Sextant.Service/Observability/MetricsSnapshot.cs):
   indexing latency (worker run time), queue delay (wait before a worker claimed a job), success &
