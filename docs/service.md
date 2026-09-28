@@ -5,17 +5,29 @@ committed-branch snapshots so a client only has to index its local diff, dedupli
 once for everyone, and answers low-latency semantic queries over authenticated HTTP MCP. It is the server
 the distributed-indexing initiative was built toward.
 
-It lives in two new projects that depend on the core libraries — **never the reverse**:
+It lives in two projects that depend on the core libraries — **never the reverse**:
 
 - **`Sextant.Service`** — the data-plane library: the `SnapshotService` control core, service contracts,
-  on-disk volume management, and the base-snapshot federation sources. It depends on `Sextant.Store`,
-  `Sextant.Indexer`, and `Sextant.Core`.
+  on-disk volume management, caller identity, repository grants, and the service-only MCP tools
+  (`list_repositories`, `search_symbols`). It references `Sextant.Core`, `Sextant.Store`, `Sextant.Indexer`
+  and `Sextant.Mcp`.
 - **`Sextant.Service.Host`** — the ASP.NET Core composition root: the HTTP surface, auth middleware, and
-  MCP transport. It depends on `Sextant.Service` and `Sextant.Mcp`.
+  MCP transport. It references only `Sextant.Service` (and reaches `Sextant.Mcp` through it). The CLI's
+  `sextant service` command references the host.
 
 > **Core stays ProcessStack-agnostic.** `Sextant.Core`, `.Store`, `.Indexer`, `.Daemon`, and `.Mcp` never
-> reference the service or ProcessStack. Phase 14 will integrate ProcessStack as an orchestrator *over*
-> this service's APIs; the dependency must not invert. `ArchitectureBoundaryTests` asserts this.
+> reference the service or ProcessStack, and the service itself uses only generic concepts (a delegate
+> token, a signed caller assertion, a tenant, a grant). `ArchitectureBoundaryTests` asserts the dependency
+> direction.
+
+> **ProcessStack is a client, through an app.** The ProcessStack integration is the `sextant` ProcessStack
+> app in [`apps/processstack/sextant/`](../apps/processstack/sextant/README.md): its chat and GitHub triggers
+> drive the control plane, and its MCP surface `/v1/{tenant}/mcp/sextant` forwards the service's query tools
+> with each caller's signed identity. The older ProcessStack-embedded `_sextant` gateway is being retired
+> (deleted from the platform at the cutover's G3 step) and is summarized in
+> [`specs/20260922-processstack-query-gateway-archive.md`](../specs/20260922-processstack-query-gateway-archive.md).
+> See [Production deployment checklist](#production-deployment-checklist-gateways-and-the-processstack-app)
+> before exposing the service to more than one user.
 
 > **The service is additive, never required.** The local stdio MCP path and standalone local indexing
 > remain fully functional with **zero** service dependency (acceptance criterion 6).
@@ -58,7 +70,7 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_CHECKOUT_TOKEN` | Access token for cloning a **private** `https` repo in `clone` mode (sent transiently as an env-scoped `Authorization` header to the repository's own host and same-host submodules only; public repos need none) | none |
 | `SEXTANT_SERVICE_SUBMODULE_HOSTS` | In `clone` mode, comma-separated `host[:port]` list of **additional** hosts submodules may be fetched from — **anonymously** (the token is never sent to them). Invalid entries fail startup | none (same host only) |
 | `SEXTANT_SERVICE_REPOSITORY_HOSTS` | Comma-separated DNS host names a `POST /control/ensure` repository URL may name (see [Repository URL policy](#repository-url-policy-svc-5)). `*` admits any host that passes the URL shape rules and logs a startup warning. A malformed entry **fails startup** | `github.com` |
-| `SEXTANT_SERVICE_REPOSITORY_OWNERS` | Optional comma-separated `host/owner` (or `host/*`) allow-list for ensure repository URLs; each host must also be allowed by `REPOSITORY_HOSTS`. A malformed entry **fails startup** | none (any owner) |
+| `SEXTANT_SERVICE_REPOSITORY_OWNERS` | Comma-separated `host/owner` (or `host/*`) allow-list for ensure and grant repository URLs; each host must also be allowed by `REPOSITORY_HOSTS`. A malformed entry **fails startup**. Optional for a single-user service, but **required in production whenever a tenant has members besides its owner** (see [Production deployment checklist](#production-deployment-checklist-gateways-and-the-processstack-app)) | none (any owner) |
 | `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS` | In `clone` mode, how many times a **transient** clone/provisioning failure is retried across re-ensures before the job settles to terminal `failed` (clamped to 1–100; deterministic failures are never retried). Also bounds the requeue of a checkout whose neutralized `global.json` SDK pin could not be restored (`sdk_pin_restore_failed`, #113), in any checkout mode | `5` |
 | `SEXTANT_SERVICE_CONTROL_TOKEN` | Bearer token for `/control/*`. **Required:** the service refuses to start without it (SX-6d, #198). A whitespace-only value also fails startup | none (startup fails) |
 | `SEXTANT_SERVICE_INSECURE_OPEN_CONTROL_PLANE` | **INSECURE, dev only.** Lets the service start with no control token, leaving the whole control plane (`/control/*`: ensure, retire, retention, backup, grants, audit) open to anyone who can reach the control port. The service prints and logs a loud `WARNING: INSECURE` line at startup while it is in effect. Ignored when a control token is set. A malformed value **fails startup** | `false` |
@@ -1438,6 +1450,73 @@ the immutable snapshot it serves is byte-for-byte the one that was backed up. `P
 a backup from a running service under its writer gate; restore is offline (it must precede startup). See
 [`runbooks.md`](runbooks.md) for the schema-upgrade rehearsal and DR drill.
 
+## Production deployment checklist (gateways and the ProcessStack app)
+
+Use this list for any service that more than one person reaches, whether through the ProcessStack app
+([`apps/processstack/sextant/README.md`](../apps/processstack/sextant/README.md)) or through another gateway
+that pools many callers behind one delegate token. The ProcessStack rollout itself is in
+[`specs/20260927-processstack-app-extraction/cutover-runbook.md`](../specs/20260927-processstack-app-extraction/cutover-runbook.md).
+
+| Setting | Production value | Why |
+| --- | --- | --- |
+| `CONTROL_TOKEN` | A long random secret, held only by the gateway's control connection and operators | Startup fails without it. Never set `INSECURE_OPEN_CONTROL_PLANE` |
+| `DELEGATE_TOKENS` | One random token per pooled gateway connection | A delegate token opens nothing on its own: every read is decided by the verified caller's grants |
+| `CALLER_KEYS` | `kid=base64url-key@tenantId` entries with keys of at least 32 random bytes (`openssl rand 48 \| base64 -w0 \| tr '+/' '-_' \| tr -d '='`). A kid belongs to exactly one tenant: never share a kid or a key across tenants | The verifier binds each kid to its tenant, so an assertion signed with one tenant's key can never name another tenant. The gateway must sign with the same key bytes under a kid the service knows (the ProcessStack app's two connections share one key, so both set the same explicit `keyId`) |
+| `CALLER_AUDIENCE` | The audience the gateway signs (the ProcessStack app uses `sextant`) | Required with `CALLER_KEYS` |
+| `CALLER_APPS` | The gateway app's name (`sextant`) | Only that app's assertions are accepted, so another app that is bound to the same connection is refused (`caller_not_allowed`) |
+| `CALLER_IDPS` | `processstack` (the default; set it explicitly) | Only these identity providers' users act as `act=user` callers |
+| `REPOSITORY_HOSTS` | An explicit list, never `*` | The ensure/grant SSRF policy ([above](#repository-url-policy-svc-5)) |
+| `REPOSITORY_OWNERS` | The `host/owner` entries of the organisations you index, comma-separated (for example `github.com/<org>,github.com/<user>`) | **Required whenever a tenant has members besides its owner** (below) |
+| `CHECKOUT_MODE` | `clone` (recommended) | A user's first ensure becomes a repository's default branch only when `git ls-remote` confirms the remote's `HEAD` names it (#199). In `locate` mode an application ensure (a push or the reconcile) has to set the default |
+| `BIND_ADDRESS` / TLS | A routable address, with TLS terminated in front of the service | The service serves plain HTTP. Both connections carry a bearer token and a signed assertion on every request, so plain HTTP is acceptable only on a private network |
+
+Before deploying, check that every repository already in the catalog passes the new host and owner lists:
+a repository they refuse can no longer be ensured or granted (an old grant can still be revoked).
+
+### Why `REPOSITORY_OWNERS` is required for a tenant with other members
+
+With only the host list, any tenant member can make the service index any public repository on that host.
+The ProcessStack app's watch and import check only that the workspace's GitHub connection can see the
+repository, which every public repository passes, and a grant on a repository also lets its holder index any
+commit reachable in it, fork-network commits included, with a `branch_update: none` ensure (the app's
+`start-indexing`, #209). Indexing runs the repository's MSBuild evaluation on the worker, inside an
+in-process sandbox that is defense in depth only (#76, see [Untrusted evaluation
+sandbox](#untrusted-evaluation-sandbox-phase-17-criterion-2)). The owner list keeps grants and ensures to
+the organisations you trust; it does not stop a fork commit under an allowed base repository (#209), which
+only #76 or a commit-reachability check closes.
+
+### Known residuals
+
+- **Workspace-level visibility (#210).** A ProcessStack workspace's members can watch, and so read, every
+  repository its GitHub connection can see. Treat everyone in a workspace as trusted with what that
+  connection reads.
+- **A missed push is repaired only by the nightly reconcile.** Each push ensure carries its own `before` as
+  the head CAS. If one push's ensure is lost, the branch pointer stays behind and every later push's CAS
+  misses (the ensure indexes but does not advance), until the app's nightly `reconcile` (or an operator's
+  run of it) re-ensures the branch under the CAS of the service's current head.
+- **A deleted tenant grant comes back.** `DELETE /control/grants/tenant` removes the grant, but two app paths
+  create it again: every repository event from the GitHub App installation first creates or holds the
+  repository's tenant grant (by design), and until the app's v2.1 the reconcile still imports the legacy
+  `enrolled/*` App State rows as tenant grants (a default-branch push keeps that row current). To stop
+  indexing a repository for the tenant, remove it from the GitHub App installation; its enrolled row still
+  restores the grant on each reconcile until the v2.1 cleanup drops that import and the rows.
+- **`internal: true` app flows can be run directly** (elevenworks/ProcessStack#3287). The app assumes any
+  flow may run with inputs of the caller's choosing; the service's grant gate, the SX-6d user-ensure bounds and
+  the URL policy stay the authority.
+
+### After the cutover (G3), not before
+
+Once no client uses the legacy query token (the ProcessStack-embedded `_sextant` gateway, deleted at G3, was
+its only user):
+
+1. Set `REQUIRE_REPOSITORY_SELECTION=true`. A read without a verified caller must then name its repository.
+   Delegate reads are unaffected: implicit selection still picks a caller's only visible repository.
+2. Retire the legacy `QUERY_TOKEN` by **replacing** it with a fresh random value that no client holds (or by
+   configuring a `READ_POLICY`). **Do not simply unset it:** with no query token and no read policy the query
+   plane is open, and a request with no bearer can read every repository (the service logs a startup warning
+   when delegate tokens are configured on an open query plane). Only a trusted federation peer that pages
+   snapshots from this service over `/query/*` should be given the new value.
+
 ## Migration & schema
 
 Migration `016_service_job_catalog.sql` adds `snapshot_jobs`, `snapshot_job_diagnostics`, and
@@ -1452,7 +1531,20 @@ per-snapshot `snapshot_coverage` record (issue #119); `023_partial_occurrence_so
 `NOCASE` name and repository-URL indexes that bound `search_symbols` (issue #196). All are additive/forward-only. See
 [`schema.md`](schema.md) for the table definitions. `LatestSchemaVersion` auto-derives from the highest
 migration and is **25**. Snapshot identities fold `SnapshotSchemaVersion` instead, which skips identity-neutral
-(index-only) migrations such as `025` and is **24**, so upgrading to 25 re-indexes nothing.
+(index-only) migrations such as `025` and is **24**.
+
+> **One-time full re-index when upgrading from schema 23.** Migration `024` moves `SnapshotSchemaVersion`
+> from 23 to 24, which changes every snapshot's identity hash. Each repository is therefore re-indexed once,
+> on its next ensure (a push, or a manual ensure of its current head), into a new schema-24 snapshot; until
+> that snapshot publishes, the branch keeps pointing at the existing one. The ProcessStack app's nightly
+> `reconcile` counts a branch already at GitHub's head as up to date (it ensures one only to promote a
+> GitHub-default branch the service does not mark default, #199), so a repository that gets no push keeps
+> serving its schema-23 snapshot until its head is ensured by hand (`branch_name` and `commit_sha` from
+> `/control/resolve`'s `branch` and `commit_sha`, and that commit as `expected_head_commit`).
+> Deploy at low traffic, watch CPU, disk and the ensure queue while the re-index runs, and check that queries
+> keep answering meanwhile. Migration `025` is identity-neutral, so upgrading from 24 to 25 re-indexes
+> nothing. (A `search_symbols` cursor issued by a build before SX-7b answers `invalid_cursor`, because the
+> cursor is now v2; the client re-queries.)
 
 ## Testing
 

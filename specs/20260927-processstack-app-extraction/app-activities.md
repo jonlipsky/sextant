@@ -6,7 +6,7 @@
 The finished extraction must prove that a complex app is built **on top of** ProcessStack:
 - it brings its **own activities**, compiled in this repository against the published SDK;
 - it depends on **its own assemblies** (`Sextant.Core`), bundled with it;
-- it depends on **an external process** (the Sextant service, through connections) and on a **CLI** (the `processstack` CLI to validate, test, publish and activate it).
+- it depends on **an external process** (the Sextant service, through connections) and on a **CLI** (the `processstack` CLI to validate, test, publish and deploy it).
 
 None of this may require anything Sextant-specific in ProcessStack.
 
@@ -55,7 +55,7 @@ SX-13 adds the workflow through `build.sh`; SX-9 adds the `processstack app vali
 
 ## G2 impact
 - **Prerequisites:** prod needs the PS-15 API/silo, a runner image (`runner-v*`) containing the isolated loader, and the dispatcher redeployed (the worker host). The tenant's plan must also have `CustomActivitiesEnabled`.
-- **Rollback is unchanged:** reactivate v1.0.1, which bundles no activities.
+- **Rollback is unchanged:** roll back to v1.0.1 (`app rollback sextant 1.0.1`, then `app deployment upgrade`; `cutover-runbook.md`, "Rollback"), which bundles no activities.
 
 ## Implementation notes
 SX-13 follows the service code where it differs from the table above. Each activity's `[ActivityInput]`/`[ActivityOutput]` descriptions document its full contract.

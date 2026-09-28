@@ -2,7 +2,9 @@
 
 > **Approved at G1 (2026-09-27). Tracking: elevenworks/ProcessStack#3159.** This file names Sextant on purpose, so it lives in `jonlipsky/sextant` `specs/20260927-processstack-app-extraction/`, not in ProcessStack specs. The PS-11 PR body links here and to elevenworks/ProcessStack#3159.
 > Inventory verified at ProcessStack `origin/main` `0f30c358f`. Re-run the two regeneration commands on the PS-11 base before starting.
-> Prod-specific values (`<prod-host>`, `<platform-checkout>`, `<tenant>`, `<rollback_tag>`, `<leaked-host-key>`) are placeholders. The operator holds the concrete values.
+> Prod-specific values (`<prod-host>`, `<platform-checkout>`, `<tenant>`, `<rollback_tag>`, `<leaked-key-prefix>`) are placeholders. The operator holds the concrete values.
+> Issue and PR numbers: a bare `#NNNN` of 3000 or more is in elevenworks/ProcessStack.
+> **Status (as built, 2026-09-28):** not started. PS-11 opens only after the G2c soak; the "As-built refresh" at the end updates the inventory against a newer ProcessStack `main`.
 
 ## Preconditions
 Each item below must hold before PS-11 is opened for merge:
@@ -26,8 +28,8 @@ Each item below must hold before PS-11 is opened for merge:
 | `tests/ProcessStack.Core.Tests/Applications/SextantWatchedRepoSampleTests.cs` | |
 | `tests/**/RepositoryEventPublisherTests.cs`, `GitHubRepositoryEventMapperTests.cs`, `GitHubConnectionBranchHeadSourceTests.cs` | |
 | `samples/applications/sextant/` | Now lives at `jonlipsky/sextant` `apps/processstack/sextant/` |
-| `docs/SEXTANT_INTEGRATION.md`, `docs/SEXTANT_REDEPLOY_RUNBOOK.md` | Content moves to the sextant repo's docs |
-| `specs/20260922-sextant-query-gateway/` | Moves to `specs/archived/` in the sextant repo (history) |
+| `docs/SEXTANT_INTEGRATION.md`, `docs/SEXTANT_REDEPLOY_RUNBOOK.md` | Delete. A summary (not a copy) is in `jonlipsky/sextant` [`specs/20260922-processstack-query-gateway-archive.md`](../20260922-processstack-query-gateway-archive.md); the durable Sextant docs are `docs/service.md` and `docs/onboarding.md`. The originals stay in ProcessStack git history |
+| `specs/20260922-sextant-query-gateway/` | Delete. Summarized in the same archive file (the spec is private, so it is not copied); the original stays in ProcessStack git history |
 
 **Keep, per the history exemption:** the four `Migration_3_70_0_SextantEnrolledRepos` / `Migration_3_71_0_RemoveSextantEnrolledRepos` files (Postgres and SQLite). The 3.71 migration already drops the table. No new migration is added.
 
@@ -73,7 +75,7 @@ Run these after the PS-11 image is deployed, with prod dispatch done through the
        processstack permissions prune-unregistered --only mcp:sextant:read --execute
 
    This emits audit events. Re-run the dry run and expect it to be empty.
-4. **Retire the old gateway key(s)** through the normal API-key revoke endpoint, as the human owner. Separately, rotate the leaked host key `<leaked-host-key>`: mint a live-bounded replacement and revoke the old key.
+4. **Retire the old gateway key(s)** through the normal API-key revoke endpoint, as the human owner. Separately, rotate the leaked host key `<leaked-key-prefix>`: mint a live-bounded replacement and revoke the old key.
 
 ## 4. Prod compose
 - On `<prod-host>`, remove the uncommitted `SextantGateway__*` environment block from `<platform-checkout>/docker-compose.yml` (a local edit).
@@ -91,3 +93,19 @@ Run these after the PS-11 image is deployed, with prod dispatch done through the
 ## 6. Post-delete
 - The app ships v2.1: it stops dual-writing the legacy stores, and it cleans the legacy user-memory and App State keys, including the service URL/token that v1 kept in App State, **through the app**.
 - PS-12 (enforce): close elevenworks/ProcessStack#3159 and elevenworks/ProcessStack#3138 with evidence.
+
+## As-built refresh (2026-09-28, against ProcessStack `origin/main` `8db9546f6`)
+- **Counts:**
+  - 51 Sextant-named `src` files and 46 Sextant-named test files, unchanged;
+  - 32 other `src` files mention Sextant, up from 24. The increase is mostly comments added by earlier Sextant-era work plus the PS-5 wiring comments. PS-11 re-runs the scan at its base and treats that result as authoritative.
+- **`RepositoryEvents/` is safe to delete whole.**
+  - PS-5's generic repository connection events (#3210) are produced by `GitHubEventHandler.Map`, not by `RepositoryEvents/`.
+  - In `GitHubConnectionProvider.ProcessWebhookAsync`, remove the `GitHubRepositoryEventMapper.Handles` side-effect branch, `PublishRepositoryEventAsync`, and the `IRepositoryEventPublisher` resolution. Keep the `GitHubEventHandler.Map` return unchanged.
+  - Delete `tests/ProcessStack.Connections.GitHub.Tests/{GitHubRepositoryEventMapperTests,RepositoryEventPublisherTests}.cs`.
+  - Keep and pass PS-5's `repo-activity-log` tests; they prove the generic path is intact.
+- **Comment-only edits the list above misses:**
+  - `src/ProcessStack.Composition/PlatformServiceCollectionExtensions.cs:53`, the comment explaining that `IRepositoryEventPublisher` depends on `IPlatformEventPublisher`. Keep the registration if other consumers need it, and reword the comment generically.
+  - `src/ProcessStack.Silo/Program.cs:323`, the same kind of comment.
+- **Deploy vars:** also remove the `SEXTANT_*` / `SextantGateway__*` api env vars that #3202 committed to `deploy/compose-standalone`. That is a separate PR, so first check that it merged.
+- **Expected side effect:** #3145, where `DateTimeUtcConventionTests` is red because of Sextant `DateTimeOffset` members, should go green. Verify it, and close #3145 with a `Fixes`.
+- **Boundary test:** after the deletion the allow-list must have **zero** `sextant` entries (only the 4 permanent historical-migration exemptions remain), and `sextant` moves into `StrictApplicationNames` in PS-12.

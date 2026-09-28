@@ -59,7 +59,7 @@
 | Env (`SEXTANT_SERVICE_…`) | Default | Notes |
 |---|---|---|
 | `REPOSITORY_HOSTS` | `github.com` | Comma list. A malformed entry fails startup. `*` logs a startup warning |
-| `REPOSITORY_OWNERS` | unset (any owner) | Recommended before a second tenant (see `security.md`) |
+| `REPOSITORY_OWNERS` | unset (any owner) | Comma list of `host/owner` or `host/*`; a malformed entry, or one whose host is not on `REPOSITORY_HOSTS`, fails startup. **Required in production whenever a tenant has members besides its owner** (`security.md`; `docs/service.md`, "Production deployment checklist") |
 
 **Tests:**
 - A table-driven policy test covering IPv4/IPv6 literals, `localhost`, single-label hosts, a trailing dot, userinfo, a port, a query, a fragment, a `-` prefix, `..`, `http`, `ssh`, scp-like, `file`, and an off-list host.
