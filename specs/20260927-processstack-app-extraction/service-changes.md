@@ -159,14 +159,16 @@ The contract is **PS-7 (F4)** (ProcessStack-side spec `20260927-outbound-caller-
 8. **`sub` shape matches `idp`.** This is a namespace guard: grants key on the full `sub`, so a platform id must never collide with an external peer id.
    - `idp == processstack` ⇒ `sub` contains no `:` (a platform user id);
    - any other `idp` ⇒ `sub` matches `{idp}:{connectionInstanceId}:{peerId}` (the prefix equals `idp`; both later segments are non-empty).
-9. `jti` is non-empty. `via ∈ {mcp-surface, activity}`. `tslug`, `app`, `dep` and `cid` are strings (recorded; `app` is also checked in step 11). Unknown claims are ignored.
+9. `jti` is non-empty. `via ∈ {mcp-surface, activity}`. `tslug`, `app` and `cid` are strings (recorded; `app` is also checked in step 11). `dep` is **optional**: absent, or a non-empty string (recorded). Unknown claims are ignored.
+
+   > **Amended 2026-09-28: `dep` optional (present iff the calling run is bound to a deployment); orchestrator decision after the signer review.** The signer knows the deployment id only for a run bound to a deployment, and cannot supply it on many legitimate user paths (for example direct starts). `dep` is audit-only (it plays no part in steps 10-11), so an absent `dep` verifies with `CallerPrincipal.Deployment = null`, and the audit suffix renders it as `dep=-`. A present `dep` that is JSON `null` or not a string still fails step 9 (401 `invalid_caller_assertion`), and so does an empty `dep`, which is a tightening: before the amendment an empty `dep` was accepted, so a signer must omit an unknown `dep` rather than send `""`. `tslug`, `app` and `cid` stay required.
 
 **Policy checks** run after a valid assertion. A failure → 403 `{"error":"caller_not_allowed"}` (for MCP `tools/call`, the tool error `caller_not_allowed`). The reason (`idp` or `app`) is only logged.
 
 10. `act=user` ⇒ `idp ∈ CALLER_IDPS`.
 11. If `CALLER_APPS` is set ⇒ `app ∈ CALLER_APPS`. This applies to every assertion-bearing request (delegate reads and grant routes), so another app bound to the same connections gets nothing. **Assertion-less control calls stay full-power until SVC-17.**
 
-**Output:** `CallerPrincipal {TenantId, Actor, Idp?, UserId?, App, Deployment, Connection, Via, Run?, KeyId, Jti}` in `HttpContext.Items`, exposed as `Func<CallerPrincipal?>`, like `PrincipalTokenAccessor` (`ServiceApp.cs:494`). `UserId` is the full `sub` string.
+**Output:** `CallerPrincipal {TenantId, Actor, Idp?, UserId?, App, Deployment?, Connection, Via, Run?, KeyId, Jti}` in `HttpContext.Items`, exposed as `Func<CallerPrincipal?>`, like `PrincipalTokenAccessor` (`ServiceApp.cs:494`). `UserId` is the full `sub` string. `Deployment` is null when the assertion carries no `dep`.
 
 > **Decided at G1: which idps act as users?**
 > - **Decision: `processstack` only in v2.0.** Then only PS-authenticated users (agents, CLI, web/api/cli chat) can hold per-user grants.
@@ -183,10 +185,10 @@ The contract is **PS-7 (F4)** (ProcessStack-side spec `20260927-outbound-caller-
 | other `/control/*` | control | Optional; if present it must verify, and it drives audit and the `act=user` checks (SVC-4) |
 
 - **Interim state:** in SX-5 alone, delegate reads use a deny-all authorizer, because there is no visibility source until SX-6. SX-5 and SX-6 deploy together at G2b.
-- **Audit actor:** `HashActor("{tid}/{sub}")` (`sub` is already idp-namespaced) or `HashActor("{tid}/app:{app}")`. The detail suffix is `idp,kid,via,cid,dep,jti`.
+- **Audit actor:** `HashActor("{tid}/{sub}")` (`sub` is already idp-namespaced) or `HashActor("{tid}/app:{app}")`. The detail suffix is `idp,kid,via,cid,dep,jti`; an absent `dep` is written as `dep=-`.
 
 **Tests:**
-- Positive vectors: a user caller (`idp=processstack`); an application caller; two kids for one tenant; `idp=slack` with a namespaced `sub` when `CALLER_IDPS=processstack,slack`.
+- Positive vectors: a user caller (`idp=processstack`); an application caller; two kids for one tenant; `idp=slack` with a namespaced `sub` when `CALLER_IDPS=processstack,slack`; a user and an application caller without `dep` (amended 2026-09-28).
 - Negative vectors:
   - tampered payload; tampered signature;
   - `alg` `none`, `HS512` and `RS256`;
@@ -195,6 +197,7 @@ The contract is **PS-7 (F4)** (ProcessStack-side spec `20260927-outbound-caller-
   - **`tid` ≠ the kid's tenant**;
   - `user` without `sub`; `user` without `idp`; `application` with `sub`; `application` with `idp`;
   - `idp=processstack` with a `sub` containing `:`; `idp=slack` with an un-namespaced `sub` or a wrong prefix;
+  - `dep` present as `null`, `1` or `""` (amended 2026-09-28);
   - oversized; a malformed segment.
 - Policy: `idp=slack` under the default `CALLER_IDPS` → 403 `caller_not_allowed`; `app=other` with `CALLER_APPS=sextant` → 403 on reads and grant routes; an assertion-less control call is unaffected.
 - The pool-connect case (SVC-8 extension).
@@ -215,7 +218,7 @@ The contract above is implemented as written. These are the places where the cod
 **JWS and claims (stricter than the spec).**
 - Each segment must be canonical unpadded base64url. The header and payload must be JSON objects with no duplicate member names, and every string (member names included, at any depth) must decode. A lone-surrogate escape or an invalid UTF-8 byte is `bad_header`/`bad_payload`, never a server error.
 - The JOSE header also refuses `jku`, `jwk`, `x5u`, `x5c` and `crit`, so a key or critical extension can never ride in the header. `typ`, when present, must be exactly `JWT` (case-sensitive).
-- `tslug`, `app`, `dep` and `cid` must be present as strings (empty is allowed); `run` is an optional string. `iat`, `nbf` and `exp` must be present as integers in `[0, 253402300799]`.
+- `tslug`, `app` and `cid` must be present as strings (empty is allowed). `dep` is optional, but when present it must be a non-empty string (amended 2026-09-28, see step 9; before the amendment it was required and could be empty). `run` is an optional string. `iat`, `nbf` and `exp` must be present as integers in `[0, 253402300799]`.
 - A `tenantId` in `CALLER_KEYS` is restricted to `[A-Za-z0-9._-]{1,128}`.
 
 **Startup validation (fail closed, in addition to the table).**
