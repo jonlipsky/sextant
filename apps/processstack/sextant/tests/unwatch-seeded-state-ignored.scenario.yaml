@@ -1,0 +1,32 @@
+name: unwatch-seeded-state-ignored
+description: >
+  A run seeds a variable from an undeclared input (elevenworks/ProcessStack#3286), and the refusal path assigns
+  only the message. The orchestration resets every variable first, so a seeded deleted/tombstoned count never
+  reports a removal that did not happen.
+entrypoint: revoke-watch
+principal:
+  userId: u-alice
+inputs:
+  host: github.com
+  owner: octocat
+  repo: hello-world
+  remoteUrl: "https://github.com/octocat/hello-world.git"
+  branch: main
+  deleted: 3
+  tombstoned: 2
+  memoryKeys: "seeded"
+  serviceClear: true
+http:
+  - connection: sextant-control
+    method: DELETE
+    path: /control/grants/self
+    status: 400
+    body: { status: rejected, reason: branch_not_allowed }
+expected:
+  status: Completed
+  variables:
+    deleted: 0
+    tombstoned: 0
+    memoryKeys: ""
+    serviceClear: false
+    message: "The Sextant service would not stop watching octocat/hello-world (branch_not_allowed)."

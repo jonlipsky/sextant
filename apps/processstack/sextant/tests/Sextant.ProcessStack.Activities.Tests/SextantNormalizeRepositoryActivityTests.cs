@@ -164,4 +164,54 @@ public sealed class SextantNormalizeRepositoryActivityTests
         Assert.AreEqual(string.Empty, activity.Host);
         Assert.AreEqual(string.Empty, activity.RepositoryOwner);
     }
+
+    [TestMethod]
+    [DataRow(null, true, "")]
+    [DataRow("", true, "")]
+    [DataRow("  ", true, "")]
+    [DataRow("main", true, "main")]
+    [DataRow(" feature/x ", true, "feature/x")]
+    [DataRow("refs/heads/release/1.0", true, "release/1.0")]
+    [DataRow("main..x", false, "")]
+    [DataRow("-main", false, "")]
+    [DataRow("HEAD", false, "")]
+    [DataRow("a b", false, "")]
+    [DataRow("refs/heads/", false, "")]
+    public async Task A_branch_is_checked_with_the_chat_parser_rule(string? branch, bool valid, string name)
+    {
+        var activity = new SextantNormalizeRepositoryActivity { CloneUrl = "https://github.com/octo/repo.git", Branch = branch };
+
+        var logs = await ActivityHarness.RunAsync(activity);
+
+        Assert.AreEqual(valid, activity.BranchValid);
+        Assert.AreEqual(name, activity.BranchName);
+        Assert.IsTrue(activity.Accepted, "the branch verdict is independent of the URL verdict");
+        if (!valid)
+            Assert.IsFalse(logs.Any(line => line.Contains(branch!.Trim(), StringComparison.Ordinal)));
+    }
+
+    [TestMethod]
+    public async Task A_branch_from_definition_parameters_is_checked()
+    {
+        var activity = new SextantNormalizeRepositoryActivity()
+            .WithParameters(("cloneUrl", "https://github.com/octo/repo.git"), ("branch", "feature..x"));
+
+        await ActivityHarness.RunAsync(activity);
+
+        Assert.IsFalse(activity.BranchValid);
+        Assert.AreEqual(string.Empty, activity.BranchName);
+    }
+
+    [TestMethod]
+    public async Task Rerunning_resets_the_branch_verdict()
+    {
+        var activity = new SextantNormalizeRepositoryActivity { CloneUrl = "https://github.com/octo/repo.git", Branch = "main..x" };
+        await ActivityHarness.RunAsync(activity);
+
+        activity.Branch = null;
+        await ActivityHarness.RunAsync(activity);
+
+        Assert.IsTrue(activity.BranchValid);
+        Assert.AreEqual(string.Empty, activity.BranchName);
+    }
 }

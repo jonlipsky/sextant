@@ -110,6 +110,27 @@ outputs:
 nodes:
   - id: start
     type: start
+    next: init
+
+  # A run seeds variables from undeclared inputs, and a default only fills an unset name
+  # (elevenworks/ProcessStack#3286; internal is not enforced on a direct run, #3287). Every variable and
+  # output is assigned here before anything reads it.
+  - id: init
+    name: Reset every variable and output
+    type: activity:JavaScript
+    inputs:
+      script: |
+        ['fullName', 'defaultBranch', 'remoteUrl', 'repoHost', 'repoOwner', 'repoName', 'targetBranch',
+         'headSha', 'ensureOutcome', 'memoryKeys', 'memoryValue', 'message'].forEach(function (name) {
+          context.setVariable(name, '');
+        });
+        ['accepted', 'needsIndex', 'granted'].forEach(function (name) { context.setVariable(name, false); });
+        context.setVariable('putStatus', 0);
+        context.setVariable('grantsStatus', 0);
+        context.setVariable('putJson', null);
+        context.setVariable('grantsJson', null);
+        context.setVariable('branches', null);
+        null;
     next: check-host
 
   # The GitHub connection answers for github.com only.

@@ -68,6 +68,25 @@ outputs:
 nodes:
   - id: start
     type: start
+    next: init
+
+  # Every variable and output is assigned before anything reads it: a default only fills an unset name, and
+  # a run can seed one from an undeclared input (elevenworks/ProcessStack#3286).
+  - id: init
+    name: Reset every variable and output
+    type: activity:JavaScript
+    inputs:
+      script: |
+        context.setVariable('verb', '');
+        context.setVariable('repositories', null);
+        context.setVariable('branch', '');
+        context.setVariable('branchInvalid', false);
+        context.setVariable('errors', null);
+        context.setVariable('perRepo', null);
+        context.setVariable('grantsStatus', 0);
+        context.setVariable('grantsJson', null);
+        context.setVariable('agentResponse', '');
+        null;
     next: init-state
 
   - id: init-state

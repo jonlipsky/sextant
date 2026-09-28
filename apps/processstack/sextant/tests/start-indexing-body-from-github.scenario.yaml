@@ -67,10 +67,11 @@ expected:
       method: GET
       path: /repos/OctoCat/Hello-World
       count: 1
+    # start-indexing reads the heads to choose an advance, and ensure reads them again to enforce it.
     - connection: github
       method: GET
       path: /repos/octocat/hello-world/branches
-      count: 1
+      count: 2
     - connection: sextant-control
       method: POST
       path: /control/ensure

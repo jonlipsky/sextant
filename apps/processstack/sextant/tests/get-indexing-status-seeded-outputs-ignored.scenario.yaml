@@ -1,0 +1,33 @@
+name: get-indexing-status-seeded-outputs-ignored
+description: >
+  A tools/call argument naming an output seeds it (elevenworks/ProcessStack#3286). The not-found path resets
+  the job outputs itself but not errorCode, so the init reset is what keeps a seeded errorCode (and any
+  output a later path might skip) from leaving the process.
+entrypoint: get-indexing-status
+principal:
+  userId: u-alice
+inputs:
+  jobId: "../grants/self"
+  found: true
+  indexingState: complete
+  terminal: true
+  snapshotId: "9"
+  lastError: "seeded"
+  errorCode: seeded
+  validJobId: true
+http:
+  - path: "/**"
+    status: 500
+expected:
+  status: Completed
+  variables:
+    validJobId: false
+    found: false
+    indexingState: ""
+    terminal: false
+    snapshotId: ""
+    lastError: ""
+    errorCode: ""
+    outcome: not_found
+  httpCalls:
+    - count: 0

@@ -35,7 +35,13 @@ outputs:
     description: The published snapshot id; "" when none
   - name: lastError
     type: string
-    description: The job's last recorded error; "" when none
+    description: >
+      The first line of the job's last recorded error, without control characters and at most 200
+      characters; "" when none
+  - name: errorCode
+    type: string
+    description: >
+      The code that starts the job's last recorded error (a "code: message" error); "" when it has none
   - name: outcome
     type: string
     description: ok | not_found | unauthorized | unavailable | error
@@ -45,6 +51,27 @@ outputs:
 nodes:
   - id: start
     type: start
+    next: init
+
+  # A tools/call argument naming a variable or output seeds it, and a default only fills an unset name
+  # (elevenworks/ProcessStack#3286), so every one is assigned here before anything reads it.
+  - id: init
+    name: Reset every variable and output
+    type: activity:JavaScript
+    inputs:
+      script: |
+        context.setVariable('validJobId', false);
+        context.setVariable('statusCode', 0);
+        context.setVariable('responseJson', null);
+        context.setVariable('found', false);
+        context.setVariable('indexingState', '');
+        context.setVariable('terminal', false);
+        context.setVariable('snapshotId', '');
+        context.setVariable('lastError', '');
+        context.setVariable('errorCode', '');
+        context.setVariable('outcome', '');
+        context.setVariable('message', '');
+        null;
     next: check-id
 
   # The id is a path segment: only a plain decimal id is ever sent.
@@ -85,6 +112,8 @@ nodes:
         next: not-found
       - else: refused
 
+  # The service's last_error is free text (an exception message, a coverage reason naming projects), so only
+  # a short first line leaves, plus the code a "code: message" error starts with.
   - id: map-job
     name: Map the job row
     type: activity:JavaScript
@@ -93,12 +122,15 @@ nodes:
         var job = responseJson.job;
         var state = String(job.status || '');
         var terminalStates = ['complete', 'partial', 'failed', 'unsupported', 'cancelled'];
-        var error = job.last_error == null ? '' : String(job.last_error);
+        var raw = job.last_error == null ? '' : String(job.last_error);
+        var line = raw.split(/\r?\n/)[0].replace(/[\u0000-\u001f\u007f]/g, ' ').trim();
+        var code = /^([a-z0-9_]{1,64}):/.exec(line);
         context.setVariable('found', true);
         context.setVariable('indexingState', state);
         context.setVariable('terminal', terminalStates.indexOf(state) >= 0);
         context.setVariable('snapshotId', job.snapshot_id == null ? '' : String(job.snapshot_id));
-        context.setVariable('lastError', error.length > 500 ? error.substring(0, 500) : error);
+        context.setVariable('lastError', line.length > 200 ? line.substring(0, 200) : line);
+        context.setVariable('errorCode', code ? code[1] : '');
         context.setVariable('outcome', 'ok');
         context.setVariable('message', 'Job ' + String(jobId).trim() + ' is ' + state + '.');
         null;

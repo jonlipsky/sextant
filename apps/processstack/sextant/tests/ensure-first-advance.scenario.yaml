@@ -12,6 +12,15 @@ inputs:
   branchUpdate: advance
   expectedHeadCommit: "0000000000000000000000000000000000000000"
 http:
+  # Shape: GitHub REST GET /repos/{owner}/{repo}/branches (read by GitHubListBranches through Octokit): ensure
+  # advances only to the branch's GitHub head.
+  - connection: github
+    method: GET
+    path: /repos/octocat/hello-world/branches
+    body:
+      - name: main
+        commit: { sha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d", url: "https://api.github.com/repos/octocat/hello-world/commits/7fd1a60b01f91b314f59955a4e4d4e80d8edf11d" }
+        protected: false
   - connection: sextant-control
     method: POST
     path: /control/ensure

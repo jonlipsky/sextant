@@ -89,6 +89,26 @@ outputs:
 nodes:
   - id: start
     type: start
+    next: init
+
+  # A run seeds variables from undeclared inputs, and a default only fills an unset name
+  # (elevenworks/ProcessStack#3286; internal is not enforced on a direct run, #3287). Every variable and
+  # output is assigned here before anything reads it.
+  - id: init
+    name: Reset every variable and output
+    type: activity:JavaScript
+    inputs:
+      script: |
+        ['branchQuery', 'defaultState', 'githubDefault', 'memoryKeys', 'message'].forEach(function (name) {
+          context.setVariable(name, '');
+        });
+        ['deleteStatus', 'deleted', 'listStatus', 'tombstoned'].forEach(function (name) {
+          context.setVariable(name, 0);
+        });
+        context.setVariable('deleteJson', null);
+        context.setVariable('listJson', null);
+        context.setVariable('serviceClear', false);
+        null;
     next: set-branch-query
 
   - id: set-branch-query
