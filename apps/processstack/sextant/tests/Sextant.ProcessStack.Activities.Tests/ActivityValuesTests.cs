@@ -18,6 +18,74 @@ public sealed class ActivityValuesTests
     }
 
     [TestMethod]
+    [DataRow("= prompt || ''")]
+    [DataRow("https://${host}/x")]
+    [DataRow("{{ prompt }}")]
+    public void An_authored_expression_parameter_never_wins_over_the_bound_property(string authored)
+    {
+        var activity = new SextantNormalizeRepositoryActivity();
+        activity.Definition.Parameters["cloneUrl"] = authored;
+
+        Assert.AreEqual("resolved", ActivityValues.Input(activity, "cloneUrl", "resolved"));
+        Assert.IsNull(ActivityValues.Input(activity, "cloneUrl", null));
+    }
+
+    [TestMethod]
+    public void A_parameter_map_or_list_holding_an_expression_is_authored()
+    {
+        Assert.IsTrue(ActivityValues.IsAuthoredExpression(ActivityHarness.Map(("a", 1), ("b", "= x"))));
+        Assert.IsTrue(ActivityValues.IsAuthoredExpression(new List<object?> { "plain", new List<object?> { "${y}" } }));
+        Assert.IsTrue(ActivityValues.IsAuthoredExpression(ActivityHarness.Json("""{"a":["= z"]}""")));
+        Assert.IsTrue(ActivityValues.IsAuthoredExpression(ActivityHarness.Map(("a", 1), ("b", "=x"))));
+        Assert.IsFalse(ActivityValues.IsAuthoredExpression(ActivityHarness.Map(("a", "x="), ("b", "$y {z}"))));
+        Assert.IsFalse(ActivityValues.IsAuthoredExpression("watch octocat/hello-world"));
+        Assert.IsFalse(ActivityValues.IsAuthoredExpression(42));
+        Assert.IsFalse(ActivityValues.IsAuthoredExpression(null));
+    }
+
+    [TestMethod]
+    [DataRow("= prompt", true)]
+    [DataRow("=prompt", true)]
+    [DataRow("=${prompt}", true)]
+    [DataRow("  = prompt", true)]
+    [DataRow("\t\n=prompt", true)]
+    [DataRow("=", true)]
+    [DataRow("a = b", false)]
+    [DataRow("x=", false)]
+    [DataRow("", false)]
+    [DataRow("   ", false)]
+    public void Any_text_whose_trimmed_start_is_an_equals_sign_is_authored(string text, bool authored)
+    {
+        Assert.AreEqual(authored, ActivityValues.IsAuthoredExpression(text));
+    }
+
+    [TestMethod]
+    [DataRow("=prompt")]
+    [DataRow("  = prompt")]
+    [DataRow("=${prompt}")]
+    public void A_parameter_with_any_equals_prefix_never_wins_over_the_bound_property(string authored)
+    {
+        var activity = new SextantParseWatchCommandActivity();
+        activity.Definition.Parameters["prompt"] = authored;
+
+        Assert.AreEqual("watch octocat/hello-world", ActivityValues.Input(activity, "prompt", "watch octocat/hello-world"));
+    }
+
+    [TestMethod]
+    [DataRow("${a}", true)]
+    [DataRow("x ${} then ${b}", true)]
+    [DataRow("${a${b}", true)]
+    [DataRow("${\n}", true)]
+    [DataRow("${}", false)]
+    [DataRow("${a", false)]
+    [DataRow("} ${", false)]
+    [DataRow("$ {a}", false)]
+    public void A_template_is_dollar_brace_then_at_least_one_character_then_a_closing_brace(string text, bool authored)
+    {
+        Assert.AreEqual(authored, ActivityValues.IsAuthoredExpression(text));
+    }
+
+    [TestMethod]
     public void Json_wrappers_unwrap_to_clr_values()
     {
         var element = ActivityHarness.Json("""{"a":1,"b":[true,"x",1.5],"c":null}""");

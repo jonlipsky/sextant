@@ -1,0 +1,51 @@
+name: unwatch-other-branch-keeps-watch
+description: >
+  "stop watching X on feature/x" when the service holds only the default-branch watch (main): nothing is
+  removed and the default-branch grant is left alone (no second DELETE). The service holds no feature/x
+  watch, so the stale v1 entry for feature/x is tombstoned and the reply says the watch stopped.
+entrypoint: revoke-watch
+principal:
+  userId: u-alice
+inputs:
+  host: github.com
+  owner: octocat
+  repo: hello-world
+  remoteUrl: "https://github.com/octocat/hello-world.git"
+  branch: feature/x
+seed:
+  userMemory:
+    - key: "sextant.watched-repos:github.com/octocat/hello-world@feature/x"
+      value: '{"owner":"octocat","repo":"hello-world","branch":"feature/x","cloneUrl":"https://github.com/octocat/hello-world.git","addedAt":"2026-01-01T00:00:00+00:00"}'
+http:
+  - connection: sextant-control
+    method: DELETE
+    path: /control/grants/self
+    body: { deleted: 0 }
+  - connection: sextant-control
+    method: GET
+    path: /control/grants/self
+    body:
+      grants:
+        - repository: "https://github.com/octocat/hello-world.git"
+          branch: ""
+          source: self
+          created_at: 1767225600
+          status: { resolved_branch: main, snapshot_status: complete, commit_sha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d" }
+      result_count: 1
+expected:
+  status: Completed
+  variables:
+    deleted: 0
+    tombstoned: 1
+    memoryKeys: "github.com/octocat/hello-world@feature/x"
+    defaultState: none
+    message: "Stopped watching octocat/hello-world on feature/x. Existing snapshots are left in place."
+  httpCalls:
+    - connection: sextant-control
+      method: DELETE
+      path: /control/grants/self
+      count: 1
+    - connection: sextant-control
+      method: GET
+      path: /control/grants/self
+      count: 1

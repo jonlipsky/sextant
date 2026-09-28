@@ -1,0 +1,70 @@
+name: chat-prompt-expression-reaches-parse
+description: >
+  Pins the in-process input symptom (elevenworks/ProcessStack#3269). configure-watched-repos passes the
+  prompt to SextantParseWatchCommand as the expression `= prompt || ''`. In-process, the node's
+  Definition.Parameters still hold that authored text, and only the bound property holds the resolved
+  prompt. When an activity read the parameter, the parse saw "= prompt || ''" and every message became
+  help. Here the parse gets the resolved message: verb watch, the repository, and the branch named after
+  "on branch".
+entrypoint: configure-watched-repos
+principal:
+  userId: u-alice
+inputs:
+  # The prompt-trigger envelope `app test` needs to route SendConnectionMessage (the platform sets these).
+  tenantId: "sextant-test"
+  applicationInstanceId: "sextant-test-instance"
+  conversationId: "conv-chat-prompt-expression-reaches-parse"
+  prompt: "watch octocat/hello-world on branch feature/x"
+  isFirstTurn: false
+  channelType: "web"
+http:
+  # Shape: GitHub REST GET /repos/{owner}/{repo} (read by GitHubGetRepository through Octokit).
+  - connection: github
+    method: GET
+    path: /repos/octocat/hello-world
+    body:
+      id: 1296269
+      name: hello-world
+      full_name: octocat/hello-world
+      owner: { login: octocat, id: 1 }
+      private: false
+      default_branch: main
+      html_url: "https://github.com/octocat/hello-world"
+      clone_url: "https://github.com/octocat/hello-world.git"
+  # Shape: PUT /control/grants/self → {grant, created} (src/Sextant.Service.Host/GrantEndpoints.cs).
+  - connection: sextant-control
+    method: PUT
+    path: /control/grants/self
+    body:
+      grant: { repository: "https://github.com/octocat/hello-world.git", branch: "feature/x", source: self, created_at: 1760000000 }
+      created: true
+  # Shape: GET /control/grants/self → {grants: [{repository, branch, source, created_at, status}], result_count}
+  # (src/Sextant.Service.Host/GrantEndpoints.cs, src/Sextant.Service/Grants/GrantContracts.cs).
+  - connection: sextant-control
+    method: GET
+    path: /control/grants/self
+    body:
+      grants:
+        - repository: "https://github.com/octocat/hello-world.git"
+          branch: "feature/x"
+          source: self
+          created_at: 1760000000
+          status: { resolved_branch: "feature/x", snapshot_status: complete }
+      result_count: 1
+expected:
+  status: Completed
+  variables:
+    verb: watch
+    branch: feature/x
+    branchInvalid: false
+    agentResponse: "Now watching octocat/hello-world on feature/x."
+  httpCalls:
+    - connection: github
+      method: GET
+      path: /repos/octocat/hello-world
+      count: 1
+    - connection: sextant-control
+      method: PUT
+      path: /control/grants/self
+      bodyMatch: { repository: "https://github.com/octocat/hello-world.git", branch: feature/x }
+      count: 1

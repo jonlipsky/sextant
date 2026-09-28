@@ -1,0 +1,22 @@
+name: ensure-unavailable
+description: >
+  A 503 from the service is the outcome "unavailable" (logged by reason code only); the process still
+  completes, so the caller can report it.
+entrypoint: ensure
+principal:
+  userId: u-alice
+inputs:
+  repositoryRemoteUrl: "https://github.com/octocat/hello-world.git"
+  commitSha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+http:
+  - connection: sextant-control
+    method: POST
+    path: /control/ensure
+    status: 503
+    body: { status: unavailable, reason: "the index service stopped this ensure before it completed" }
+expected:
+  status: Completed
+  variables:
+    outcome: unavailable
+    statusCode: 503
+    jobId: ""

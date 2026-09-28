@@ -1,0 +1,28 @@
+name: watch-forbidden
+description: >
+  A 403 from GitHub (the connection's installation has no access to the repository; Octokit raises
+  ForbiddenException) is the same refusal as a 404: the repository is not visible, and no grant is written.
+entrypoint: grant-watch
+principal:
+  userId: u-alice
+inputs:
+  host: github.com
+  owner: octocat
+  repo: hello-world
+http:
+  - connection: github
+    method: GET
+    path: /repos/octocat/hello-world
+    status: 403
+    body: { message: "Resource not accessible by integration" }
+  - connection: sextant-control
+    path: "/**"
+    status: 500
+expected:
+  status: Completed
+  variables:
+    granted: false
+    message: "octocat/hello-world isn't visible to this workspace's GitHub connection, so I can't watch it."
+  httpCalls:
+    - connection: sextant-control
+      count: 0

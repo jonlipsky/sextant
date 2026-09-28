@@ -1,0 +1,44 @@
+name: get-indexing-status-error-first-line
+description: >
+  The service's last_error is free text: an exception message can run to several lines. Only the first line
+  leaves the process, with control characters replaced and at most 200 characters, and the code that starts
+  a "code: message" error is its own output (errorCode).
+entrypoint: get-indexing-status
+principal:
+  userId: u-alice
+inputs:
+  jobId: "43"
+# Shape: SnapshotStatusResponse {job: SnapshotJobRow, diagnostics, coverage?} (src/Sextant.Service/ServiceContracts.cs,
+# src/Sextant.Store/SnapshotJobStore.cs); a failed job's last_error is "code: message" or an exception message
+# (src/Sextant.Service/SnapshotService.cs, MarkResult).
+http:
+  - connection: sextant-control
+    method: GET
+    path: /control/status/43
+    body:
+      job:
+        id: 43
+        identity_hash: "9b1d"
+        repository_url: "https://github.com/octocat/hello-world.git"
+        commit_sha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+        branch_name: main
+        status: failed
+        snapshot_id: null
+        owner_token: null
+        attempts: 3
+        created_at: 1760000000
+        updated_at: 1760000100
+        started_at: 1760000010
+        completed_at: 1760000100
+        last_error: "sdk_resolution_failed:\tno installed SDK satisfies the global.json pin\n   at Worker.Load(/tmp/work/checkout)\n   at Worker.Run()"
+      diagnostics: []
+expected:
+  status: Completed
+  variables:
+    found: true
+    indexingState: failed
+    terminal: true
+    snapshotId: ""
+    lastError: "sdk_resolution_failed: no installed SDK satisfies the global.json pin"
+    errorCode: sdk_resolution_failed
+    outcome: ok

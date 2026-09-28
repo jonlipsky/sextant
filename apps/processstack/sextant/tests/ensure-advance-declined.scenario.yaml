@@ -1,0 +1,48 @@
+name: ensure-advance-declined
+description: >
+  A compare-and-swap the branch no longer matches is not an error: /control/ensure attaches (200) and
+  reports branch_advanced false, so the outcome is attached and branchAdvanced is false.
+entrypoint: ensure
+principal:
+  userId: u-alice
+inputs:
+  repositoryRemoteUrl: "https://github.com/octocat/hello-world.git"
+  commitSha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+  branchName: main
+  branchUpdate: advance
+  expectedHeadCommit: "1111111111111111111111111111111111111111"
+# Shape: EnsureSnapshotResult (src/Sextant.Service/ServiceContracts.cs); a CAS mismatch only attaches
+# (SnapshotStore.AdvanceBranchPointerIfHeadMatches) and never answers 409.
+http:
+  # Shape: GitHub REST GET /repos/{owner}/{repo}/branches (read by GitHubListBranches through Octokit): ensure
+  # advances only to the branch's GitHub head.
+  - connection: github
+    method: GET
+    path: /repos/octocat/hello-world/branches
+    body:
+      - name: main
+        commit: { sha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d", url: "https://api.github.com/repos/octocat/hello-world/commits/7fd1a60b01f91b314f59955a4e4d4e80d8edf11d" }
+        protected: false
+  - connection: sextant-control
+    method: POST
+    path: /control/ensure
+    status: 200
+    body: { job_id: 41, identity_hash: "9b1d", status: complete, snapshot_id: 7, attached: true, branch_advanced: false }
+expected:
+  status: Completed
+  variables:
+    outcome: attached
+    reason: ""
+    jobId: "41"
+    jobStatus: complete
+    attached: true
+    branchAdvanced: false
+    effectiveUpdate: advance
+  httpCalls:
+    - connection: sextant-control
+      method: POST
+      path: /control/ensure
+      bodyMatch:
+        branch_update: advance
+        expected_head_commit: "1111111111111111111111111111111111111111"
+      count: 1

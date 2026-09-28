@@ -1,0 +1,26 @@
+name: help-fallback
+description: >
+  (#10) A message that is not a watch command gets the help text and makes no service call.
+entrypoint: configure-watched-repos
+principal:
+  userId: u-alice
+inputs:
+  # The prompt-trigger envelope `app test` needs to route SendConnectionMessage (the platform sets these).
+  tenantId: "sextant-test"
+  applicationInstanceId: "sextant-test-instance"
+  conversationId: "conv-help-fallback"
+  prompt: "hello there"
+  isFirstTurn: true
+  channelType: "web"
+# Answers anything, so the harness records every request and `count: 0` proves none was made.
+http:
+  - path: "/**"
+    status: 500
+    body: { error: unexpected }
+expected:
+  status: Completed
+  variables:
+    verb: help
+    agentResponse: "!contains:I can manage the repositories you watch"
+  httpCalls:
+    - count: 0

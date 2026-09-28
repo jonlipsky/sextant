@@ -1,0 +1,113 @@
+name: sextant
+description: >
+  Sextant semantic code index for ProcessStack. A user watches the repositories they want indexed from
+  chat ("watch owner/repo on main"), and agents start and check indexing jobs over MCP. Every watch is a
+  repository grant held by the Sextant service (PUT /control/grants/self), so the service decides what
+  each caller can see; the app stores no secrets, URLs or grants of its own. Semantic queries are served
+  by the Sextant service, never proxied through these flows.
+
+  The flows talk to the service through the sextant-control connection only. The platform signs the run's
+  caller into each request (act=user for chat and MCP), so no flow ever names a user.
+version: 2.0.0
+author: Sextant
+license: MIT
+
+# Only the two control processes are MCP tools. Orchestrations are never eligible, and the internal
+# processes (ensure, legacy-dual-write) stay out of `include`.
+mcp:
+  expose: true
+  displayName: "Sextant"
+  description: "Start and check Sextant indexing jobs for the repositories you watch."
+  defaultTimeoutSeconds: 60
+  include:
+    - start-indexing
+    - get-indexing-status
+
+entrypoints:
+  - name: configure-watched-repos
+    description: >
+      Chat: watch, unwatch and list the caller's repositories, or show help. Started by the conversation
+      gateway on each prompt.
+    type: orchestration
+    path: orchestrations/configure-watched-repos.yaml
+    isDefault: true
+
+  - name: grant-watch
+    description: >
+      Watches one repository for the caller: checks that the workspace's GitHub connection can see it,
+      records the grant, starts the first index when the branch has no snapshot, and keeps the legacy
+      watched-repos memory in step.
+    type: orchestration
+    path: orchestrations/grant-watch.yaml
+    internal: true
+
+  - name: revoke-watch
+    description: Stops watching one repository (one branch, or every branch) for the caller.
+    type: orchestration
+    path: orchestrations/revoke-watch.yaml
+    internal: true
+
+  - name: start-indexing
+    description: Request (ensure) a Sextant snapshot for an exact commit of a watched repository and return its job reference
+    type: process
+    path: processes/start-indexing.yaml
+
+  - name: get-indexing-status
+    description: Read the current state of one Sextant indexing job by id
+    type: process
+    path: processes/get-indexing-status.yaml
+
+  - name: ensure
+    description: Sends one guarded POST /control/ensure and interprets the answer
+    type: process
+    path: processes/ensure.yaml
+    internal: true
+
+  - name: legacy-dual-write
+    description: Mirrors a watch or unwatch into the v1 sextant.watched-repos user memory (dropped in v2.1)
+    type: process
+    path: processes/legacy-dual-write.yaml
+    internal: true
+
+connections:
+  # The workspace's GitHub App connection. The chat flow asks it whether a repository is visible before
+  # granting it, and reads branch heads from it.
+  - id: github
+    type: github
+  # The Sextant service's MCP endpoint (bearer + signed caller identity). Its tools are exposed through
+  # mcp.connectionTools in a later version; nothing calls it yet.
+  - id: sextant-query
+    type: mcp
+  # The Sextant service's control plane (bearer + signed caller identity). Every HttpRequest step names it.
+  - id: sextant-control
+    type: http-api
+
+triggers:
+  - id: prompt
+    type: prompt
+    listed: true
+    action:
+      type: start-orchestration
+      orchestration: configure-watched-repos
+      # The server stamps the identity and scope variables (senderId, conversationId, tenantId, ...) on
+      # every turn; they are not mapped here, and no flow uses them. The service sees only the run's
+      # caller.
+      inputs:
+        prompt: "= event.text"
+        isFirstTurn: "= event.isFirstTurn"
+        channelType: "= event.channelType"
+        conversationState: "= event.conversationState"
+
+chat:
+  entryOrchestration: configure-watched-repos
+  channels: [slack, web, api, cli]
+  conversationDefaultsTo:
+    slack: thread-ts
+    web: explicit
+    api: explicit
+    cli: explicit
+
+# The flows only ever touch the caller's own grants and memory.
+permissions: []
+
+testDirectory: tests

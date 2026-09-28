@@ -22,6 +22,7 @@ apps/processstack/sextant/
   tests/Sextant.ProcessStack.Activities.Tests/   # MSTest, no mocking frameworks; dual direct-property + Definition.Parameters tests
   build.ps1 / build.sh      # dotnet publish -c Release -o activities/sextant/  (output not committed; .gitignore)
   Sextant.ProcessStack.slnx # NOT part of Sextant.slnx: the public build must not need the private feed
+  Directory.Build.props     # SX-9: bin/obj go to apps/processstack/artifacts/, since `app test` reads every JSON file under tests/
 ```
 
 ## Activities
@@ -29,11 +30,11 @@ All of them are pure computation: deterministic, no network, no secrets. Authent
 
 | Name | Inputs → outputs | Replaces (app.md) |
 |---|---|---|
-| `SextantNormalizeRepository` | `cloneUrl` / `htmlUrl` / `owner` / `repo` → `remoteUrl`, `repositoryKey`, `host`, `accepted` (host shape only; the service's SVC-5 policy stays authoritative) | the URL `SetVariable`/JS in the flows; uses `Sextant.Core.GitRemoteNormalizer` / `RemoteUrlIdentity`, the same code the service uses |
+| `SextantNormalizeRepository` | `cloneUrl` / `htmlUrl` / `owner` / `repo` (+ optional `branch`) → `remoteUrl`, `repositoryKey`, `host`, `accepted` (host shape only; the service's SVC-5 policy stays authoritative), `branchName`, `branchValid` | the URL `SetVariable`/JS in the flows; uses `Sextant.Core.GitRemoteNormalizer` / `RemoteUrlIdentity`, the same code the service uses |
 | `SextantPlanRepositoryChange` | the event metadata (`kind`: push/delete/pr, plus PS-5 keys) → `action` (`ensure`\|`retire`\|`ignore`), `ensureBody` (`commit_sha`, `branch_name`, `default_branch`, `expected_head_commit` with all-zeros → `""`, `branch_update`, `forced`), `retireBody`, `reason` | the `ensure` steps 1–2 and the `on-repository-change` decision chain; enforces **CAS mode only** (SX-8 note) |
 | `SextantInterpretEnsureResult` | `statusCode`, `body` → `outcome` (`ok`\|`attached`\|`rejected`\|`unavailable`\|`head_mismatch`\|`not_granted`), `jobId`, `snapshotId`, `branchAdvanced`, `retryAdvised` | the `ensure` step 3 decision table, including the SX-8 out-of-order convergence (`branch_advanced:false` → `retryAdvised`) |
 | `SextantPlanReconcile` | `githubBranches[]`, `serviceTargets[]` (from `?scope=tenant` / resolve), limits → `ensures[]`, `retires[]`, `truncated` | the reconcile diff JS |
-| `SextantParseWatchCommand` | `prompt` → `verb` (`watch`\|`unwatch`\|`list`\|`help`), `repositories[]` (normalized), `errors[]` | the `configure-watched-repos` parser |
+| `SextantParseWatchCommand` | `prompt` → `verb` (`watch`\|`unwatch`\|`list`\|`help`), `repositories[]` (normalized), `branch`, `branchInvalid`, `errors[]` | the `configure-watched-repos` parser |
 
 Names are unique to this app and do not collide with built-ins; PS-15 rejects any collision at publish.
 
@@ -74,6 +75,7 @@ SX-13 follows the service code where it differs from the table above. Each activ
   - `htmlUrl` gets `.git` appended, and `owner`/`repo` build `https://{defaultHost}/{owner}/{repo}.git`.
   - `repositoryKey` is the service's policy key, `https://{host}/{owner}/{repo}` folded by `RemoteUrlIdentity.Normalize`.
 - **Extra inputs and outputs:** `defaultHost` (default `github.com`), `repositoryOwner`, `repositoryName` and `reason`. When the URL is not accepted, every URL output is `""`. The log names only the reason, never the input, which could carry a credential.
+- **An optional `branch` is checked with the chat parser's rule** (SX-9): a leading `refs/heads/` is dropped, then `git check-ref-format --branch` (`GitRefs.IsValidBranchName`, at most 255 characters). `branchValid` is true when no branch is named or the name is valid, and `branchName` is the checked name, `""` when none or invalid. The verdict is independent of the URL's. `start-indexing` and `ensure` use it, so an MCP or direct-run caller's branch passes the same check as a chat one. The log never names the branch.
 
 **`SextantPlanRepositoryChange`**
 - **The PS-5 metadata map is the `metadata` input.** Individual inputs override its keys.
@@ -146,6 +148,7 @@ SX-13 follows the service code where it differs from the table above. Each activ
   - A Slack link gives its URL, unless the URL is only `http://` or `https://` plus the label. Slack auto-links a typed `github.com/owner/repo` as `<http://github.com/owner/repo|github.com/owner/repo>`, so the label is what was typed.
   - `&amp;` (Slack's escaped `&`) separates repositories, like `&`, `,` and `and`.
 - **Branch:** the extra `branch` output comes from `on <branch>` or `on branch <branch>` (the last spaced `on`). `""` means the default branch.
+  - **`branchInvalid`** (added by SX-9) is true when the command named a branch that is not a valid name (`on bad..name`, `on HEAD`, a bare `on`). `branch` is then `""`, which reads as the default branch (watch) or every branch (unwatch), so the flow refuses the whole command on it.
 - **Errors** are human-readable and capped at 10.
   - An echoed reference is truncated to 64 characters.
   - A reference containing `@` is never echoed, since it may carry a credential.

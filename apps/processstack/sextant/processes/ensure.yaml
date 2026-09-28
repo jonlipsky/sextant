@@ -1,0 +1,375 @@
+name: ensure
+description: >
+  Sends one POST /control/ensure?wait=false to the Sextant service and interprets the answer. Every
+  request carries a branch guard: either the compare-and-swap expected_head_commit with
+  branch_update "advance", or branch_update "none" (index the commit, move no branch pointer). A request
+  with no branch name never advances. The process has no input for default_branch or branch_head_sequence,
+  so a chat or MCP caller can never set them. Refusals are logged by outcome and reason code only; the
+  response body is never passed on.
+
+  The platform does not enforce internal on a direct run (elevenworks/ProcessStack#3287), and a run takes
+  undeclared inputs as variables (elevenworks/ProcessStack#3286), so this process trusts neither its caller
+  nor its variable defaults. It first resets every variable and output, then checks its inputs and refuses,
+  without calling the service, anything malformed: a repository URL outside the service's shape rules, a
+  commit, tree or expected head that is not full lower-case hex, a configuration hash that is not
+  lower-case hex, or a branch name the chat parser would refuse (or one that still starts with refs/heads/,
+  which every caller has already dropped).
+
+  It also enforces the advance rule itself, rather than trusting its callers to: a branch moves only to its
+  current GitHub head, and only for the default profile of a github.com repository. An advance with a tree
+  or configuration hash, on another host, or for a commit that is not the branch's GitHub head is sent as
+  branch_update "none". A GitHub failure fails the run, because a process has no error route.
+
+inputs:
+  - name: repositoryRemoteUrl
+    type: string
+    required: true
+    description: The repository URL, sent as repository_remote_url (the identity hashes this spelling)
+  - name: commitSha
+    type: string
+    required: true
+    description: The exact commit to snapshot (a full lower-case SHA)
+  - name: branchName
+    type: string
+    required: false
+    default: ""
+    description: The branch the commit belongs to; empty for none
+  - name: branchUpdate
+    type: string
+    required: false
+    default: "none"
+    description: >
+      "advance" moves the branch pointer when expectedHeadCommit still matches it, and only when commitSha is
+      the branch's GitHub head with no tree or configuration hash; anything else sends branch_update "none"
+  - name: expectedHeadCommit
+    type: string
+    required: false
+    default: ""
+    description: >
+      The branch head the advance expects (compare-and-swap): "" or a full lower-case SHA. Empty or all
+      zeros means the branch must not exist yet, or must point at an unusable snapshot
+  - name: treeSha
+    type: string
+    required: false
+    default: ""
+  - name: configHash
+    type: string
+    required: false
+    default: ""
+
+variables:
+  - name: requestBody
+    type: json
+  - name: effectiveUpdate
+    type: string
+    default: "none"
+  - name: responseText
+    type: string
+    default: ""
+  - name: urlAccepted
+    type: bool
+    default: false
+  - name: checkedUrl
+    type: string
+    default: ""
+  - name: branchValid
+    type: bool
+    default: false
+  - name: checkedBranch
+    type: string
+    default: ""
+  - name: requestProblem
+    type: string
+    default: ""
+  - name: repoHost
+    type: string
+    default: ""
+  - name: repoOwner
+    type: string
+    default: ""
+  - name: repoName
+    type: string
+    default: ""
+  - name: wantsAdvance
+    type: bool
+    default: false
+  - name: branches
+    type: json
+  - name: headConfirmed
+    type: bool
+    default: false
+
+outputs:
+  - name: outcome
+    type: string
+    description: ok | attached | rejected | unavailable | head_mismatch | not_granted | unauthorized | error
+  - name: reason
+    type: string
+    description: The service's reason code, or http_<status>
+  - name: statusCode
+    type: int
+  - name: jobId
+    type: string
+  - name: identityHash
+    type: string
+  - name: jobStatus
+    type: string
+    description: queued | running | complete | partial | failed | unsupported | cancelled
+  - name: terminal
+    type: bool
+  - name: published
+    type: bool
+  - name: snapshotId
+    type: string
+  - name: attached
+    type: bool
+  - name: branchAdvanced
+    type: bool
+  - name: effectiveUpdate
+    type: string
+    description: The branch_update actually sent (advance or none)
+
+nodes:
+  - id: start
+    type: start
+    next: init
+
+  # A run seeds variables from undeclared inputs, and a default only fills a name that is still unset
+  # (elevenworks/ProcessStack#3286). Every variable and output is assigned here, before anything reads it.
+  - id: init
+    name: Reset every variable and output
+    type: activity:JavaScript
+    inputs:
+      script: |
+        context.setVariable('requestBody', null);
+        context.setVariable('effectiveUpdate', 'none');
+        context.setVariable('responseText', '');
+        context.setVariable('urlAccepted', false);
+        context.setVariable('checkedUrl', '');
+        context.setVariable('branchValid', false);
+        context.setVariable('checkedBranch', '');
+        context.setVariable('requestProblem', '');
+        context.setVariable('repoHost', '');
+        context.setVariable('repoOwner', '');
+        context.setVariable('repoName', '');
+        context.setVariable('wantsAdvance', false);
+        context.setVariable('branches', null);
+        context.setVariable('headConfirmed', false);
+        context.setVariable('outcome', '');
+        context.setVariable('reason', '');
+        context.setVariable('statusCode', 0);
+        context.setVariable('jobId', '');
+        context.setVariable('identityHash', '');
+        context.setVariable('jobStatus', '');
+        context.setVariable('terminal', false);
+        context.setVariable('published', false);
+        context.setVariable('snapshotId', '');
+        context.setVariable('attached', false);
+        context.setVariable('branchAdvanced', null);
+        null;
+    next: check
+
+  # The URL and the branch go through the same rules as everywhere else in the app: the service's URL shape
+  # rules, and the chat parser's branch-name rule (which also drops a leading refs/heads/).
+  - id: check
+    name: Check the repository URL and the branch name
+    type: activity:SextantNormalizeRepository
+    inputs:
+      cloneUrl: "= repositoryRemoteUrl"
+      branch: "= branchName"
+    outputs:
+      accepted: urlAccepted
+      remoteUrl: checkedUrl
+      host: repoHost
+      repositoryOwner: repoOwner
+      repositoryName: repoName
+      branchValid: branchValid
+      branchName: checkedBranch
+    next: validate
+
+  # Every caller has already dropped refs/heads/, so a name that still starts with it is refused rather than
+  # stripped again (a branch named refs/heads/x must not become x).
+  - id: validate
+    name: Validate the request
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var sha = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+        var text = function (value) { return value == null ? '' : String(value).trim(); };
+        var commit = text(commitSha);
+        var tree = text(treeSha);
+        var config = text(configHash);
+        var expected = text(expectedHeadCommit);
+        var branch = urlAccepted === true && branchValid === true ? String(checkedBranch || '') : '';
+        var advance = text(branchUpdate) === 'advance' && branch !== '';
+        var problem = urlAccepted !== true || text(checkedUrl) === '' ? 'invalid_repository'
+          : branchValid !== true || branch !== text(branchName) ? 'invalid_branch'
+          : !sha.test(commit) ? 'invalid_commit'
+          : tree !== '' && !sha.test(tree) ? 'invalid_tree_sha'
+          : config !== '' && !/^[0-9a-f]{1,128}$/.test(config) ? 'invalid_config_hash'
+          : advance && expected !== '' && !sha.test(expected) ? 'invalid_expected_head'
+          : '';
+        context.setVariable('requestProblem', problem);
+        context.setVariable('wantsAdvance',
+          problem === '' && advance && tree === '' && config === '' && repoHost === 'github.com');
+        problem;
+    next: route-validated
+
+  - id: route-validated
+    type: decision
+    next:
+      - when: "requestProblem != ''"
+        next: refuse-request
+      - when: "wantsAdvance"
+        next: read-head
+      - else: build-request
+
+  # The advance rule, enforced here because a direct run skips the callers' own check: the branch moves only
+  # to its current GitHub head.
+  - id: read-head
+    name: Read the branch heads
+    type: activity:GitHubListBranches
+    inputs:
+      connectionId: github
+      owner: "= repoOwner"
+      repo: "= repoName"
+    outputs:
+      branches: branches
+    next: confirm-head
+
+  - id: confirm-head
+    type: activity:SetVariable
+    inputs:
+      value: >
+        = (function () {
+            var match = (branches || []).find(function (b) { return b && b.name === checkedBranch; });
+            var head = match && match.sha ? String(match.sha).trim().toLowerCase() : '';
+            return /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(head) && head === String(commitSha).trim();
+          })()
+    outputs:
+      result: headConfirmed
+    next: build-request
+
+  # Only checked values reach the body: the URL and branch as the check returned them, and hashes that are
+  # full lower-case hex. Anything but a confirmed advance is branch_update "none".
+  - id: build-request
+    name: Build the guarded ensure body
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var text = function (value) { return value == null ? '' : String(value).trim(); };
+        var body = null;
+        if (requestProblem === '') {
+          var tree = text(treeSha);
+          var config = text(configHash);
+          var expected = text(expectedHeadCommit);
+          var branch = String(checkedBranch || '');
+          var advance = wantsAdvance === true && headConfirmed === true;
+          if (/^0+$/.test(expected)) expected = '';
+          body = { repository_remote_url: String(checkedUrl), commit_sha: text(commitSha) };
+          if (tree !== '') body.tree_sha = tree;
+          if (config !== '') body.config_hash = config;
+          if (branch !== '') body.branch_name = branch;
+          if (advance) {
+            body.expected_head_commit = expected;
+            body.branch_update = 'advance';
+          } else {
+            body.branch_update = 'none';
+          }
+          context.setVariable('effectiveUpdate', advance ? 'advance' : 'none');
+        }
+        body;
+    outputs:
+      result: requestBody
+    next: route-request
+
+  - id: route-request
+    type: decision
+    next:
+      - when: "requestProblem == '' && requestBody != null"
+        next: post
+      - else: refuse-request
+
+  # Nothing is sent. The outputs already hold their reset values; the refusal names the first bad input.
+  - id: refuse-request
+    name: Refuse a malformed request
+    type: activity:JavaScript
+    inputs:
+      script: |
+        context.setVariable('outcome', 'rejected');
+        context.setVariable('reason', requestProblem !== '' ? requestProblem : 'invalid_request');
+        context.setVariable('statusCode', 0);
+        null;
+    next: log-refusal
+
+  - id: post
+    name: POST /control/ensure
+    type: activity:HttpRequest
+    inputs:
+      connectionId: sextant-control
+      method: POST
+      url: /control/ensure
+      query:
+        wait: "false"
+      body: "= requestBody"
+      failOnErrorStatus: false
+    outputs:
+      statusCode: statusCode
+      body: responseText
+    next: interpret
+
+  - id: interpret
+    name: Interpret the answer
+    type: activity:SextantInterpretEnsureResult
+    inputs:
+      statusCode: "= statusCode"
+      body: "= responseText"
+      branchUpdate: "= effectiveUpdate"
+      operation: ensure
+    outputs:
+      outcome: outcome
+      reason: reason
+      jobId: jobId
+      identityHash: identityHash
+      jobStatus: jobStatus
+      terminal: terminal
+      published: published
+      snapshotId: snapshotId
+      attached: attached
+      branchAdvanced: branchAdvanced
+    next: shape-outputs
+
+  # Only a code-shaped reason leaves the process (a 503 or a job's recorded reason can be free text), and
+  # an absent id is "" rather than null.
+  - id: shape-outputs
+    name: Keep reason codes only
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var code = String(reason == null ? '' : reason);
+        if (!/^[a-z0-9_]{1,64}$/.test(code)) {
+          code = (outcome === 'ok' || outcome === 'attached') ? '' : 'http_' + statusCode;
+        }
+        context.setVariable('reason', code);
+        context.setVariable('jobId', jobId == null ? '' : String(jobId));
+        context.setVariable('snapshotId', snapshotId == null ? '' : String(snapshotId));
+        context.setVariable('identityHash', identityHash == null ? '' : String(identityHash));
+        code;
+    next: check-outcome
+
+  - id: check-outcome
+    type: decision
+    next:
+      - when: "outcome == 'ok' || outcome == 'attached'"
+        next: end
+      - else: log-refusal
+
+  - id: log-refusal
+    type: activity:Log
+    inputs:
+      level: Warning
+      message: "= 'Sextant ensure was not accepted: ' + outcome + ' (' + reason + ', HTTP ' + statusCode + ')'"
+    next: end
+
+  - id: end
+    type: end

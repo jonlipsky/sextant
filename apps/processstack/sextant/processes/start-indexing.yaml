@@ -1,0 +1,495 @@
+name: start-indexing
+description: >
+  Bounded MCP control operation: requests (ensures) a Sextant snapshot for an exact commit and returns its
+  job reference. It starts or attaches to indexing and never returns semantic data. The service accepts it
+  only for a repository the caller watches (a 403 not_granted otherwise).
+
+  The ensure body is built here, never passed through from the arguments. The repository must be on
+  github.com and visible to the workspace's GitHub connection. repository_remote_url is built from GitHub's
+  own spelling (GitHubGetRepository), the same spelling watches and push events use. The commit, tree and
+  configuration hashes must be hex, and are sent lower-cased.
+
+  With a branch name, the branch advances only when the commit is that branch's current head on GitHub.
+  The ensure then carries GitHub's head as commit_sha, and the head the service holds
+  (GET /control/resolve) as the compare-and-swap expected_head_commit. The service's head is read BEFORE
+  GitHub's, so a push the service processes in between fails the compare-and-swap instead of being rolled
+  back. Everything else is indexed with branch_update "none", so it never moves a branch: any other commit,
+  and any request with a tree or configuration hash (a non-default snapshot). Without a branch name nothing
+  moves. A GitHub failure fails the call, because a process has no error route.
+
+  A branch name must pass the chat parser's rule. The process assigns every variable and output before
+  reading it, so an extra tools/call argument naming one (elevenworks/ProcessStack#3286) never seeds the
+  compare-and-swap value or any other internal state.
+
+inputs:
+  - name: repositoryRemoteUrl
+    type: string
+    required: true
+    description: Clone URL of the repository to index (https://github.com/owner/repo.git)
+  - name: commitSha
+    type: string
+    required: true
+    description: Exact commit SHA to snapshot
+  - name: branchName
+    type: string
+    required: false
+    default: ""
+    description: The branch the commit is on; it advances only when the commit is that branch's head
+  - name: treeSha
+    type: string
+    required: false
+    default: ""
+    description: Optional tree SHA; a request with one never moves a branch
+  - name: configHash
+    type: string
+    required: false
+    default: ""
+    description: Profile/feature configuration hash (empty uses the service default); a request with one never moves a branch
+
+variables:
+  - name: remoteUrl
+    type: string
+    default: ""
+  - name: accepted
+    type: bool
+    default: false
+  - name: urlReason
+    type: string
+    default: ""
+  - name: host
+    type: string
+    default: ""
+  - name: repositoryOwner
+    type: string
+    default: ""
+  - name: repositoryName
+    type: string
+    default: ""
+  - name: fullName
+    type: string
+    default: ""
+  - name: commit
+    type: string
+    default: ""
+  - name: tree
+    type: string
+    default: ""
+  - name: config
+    type: string
+    default: ""
+  - name: inputProblem
+    type: string
+    default: ""
+  - name: branch
+    type: string
+    default: ""
+  - name: branchValid
+    type: bool
+    default: false
+  - name: branches
+    type: json
+  - name: githubHead
+    type: string
+    default: ""
+  - name: isHead
+    type: bool
+    default: false
+  - name: resolveStatus
+    type: int
+    default: 0
+  - name: resolveJson
+    type: json
+  - name: expectedHead
+    type: string
+    default: ""
+  - name: ensureStatus
+    type: int
+    default: 0
+  - name: advanceRequested
+    type: bool
+    default: false
+  - name: ensurePublished
+    type: bool
+    default: false
+
+outputs:
+  - name: jobId
+    type: string
+    description: The durable Sextant job id this request created or attached to
+  - name: identityHash
+    type: string
+    description: The content-addressed identity hash the request resolved to
+  - name: indexingState
+    type: string
+    description: queued | running | complete | partial | failed | unsupported | cancelled; "" when refused
+  - name: snapshotId
+    type: string
+    description: The published snapshot id, when one already exists
+  - name: attached
+    type: bool
+    description: True when this request attached to an existing job or snapshot
+  - name: branchAdvanced
+    type: bool
+    description: True when this request moved the branch pointer
+  - name: outcome
+    type: string
+    description: ok | attached | rejected | unavailable | head_mismatch | not_granted | unauthorized | error
+  - name: reason
+    type: string
+    description: The service's reason code when refused
+  - name: message
+    type: string
+
+nodes:
+  - id: start
+    type: start
+    next: init
+
+  # An MCP tools/call turns every argument into a run input, declared or not, and a variables default only
+  # fills a name that is still unset (elevenworks/ProcessStack#3286). So every variable and output is
+  # assigned here, before anything reads it: a caller must not be able to seed the compare-and-swap value
+  # or any other internal state.
+  - id: init
+    name: Reset every variable and output
+    type: activity:JavaScript
+    inputs:
+      script: |
+        ['remoteUrl', 'urlReason', 'host', 'repositoryOwner', 'repositoryName', 'fullName', 'commit', 'tree',
+         'config', 'inputProblem', 'branch', 'githubHead', 'expectedHead', 'jobId', 'identityHash',
+         'indexingState', 'snapshotId', 'outcome', 'reason', 'message'].forEach(function (name) {
+          context.setVariable(name, '');
+        });
+        ['accepted', 'branchValid', 'isHead', 'advanceRequested', 'ensurePublished', 'attached'].forEach(function (name) {
+          context.setVariable(name, false);
+        });
+        context.setVariable('resolveStatus', 0);
+        context.setVariable('ensureStatus', 0);
+        context.setVariable('branches', null);
+        context.setVariable('resolveJson', null);
+        context.setVariable('branchAdvanced', null);
+        null;
+    next: normalize
+
+  # The branch goes through the chat parser's rule (a leading refs/heads/ is dropped).
+  - id: normalize
+    name: Check the repository URL and the branch name
+    type: activity:SextantNormalizeRepository
+    inputs:
+      cloneUrl: "= repositoryRemoteUrl"
+      branch: "= branchName"
+    outputs:
+      accepted: accepted
+      reason: urlReason
+      host: host
+      repositoryOwner: repositoryOwner
+      repositoryName: repositoryName
+      branchValid: branchValid
+      branchName: branch
+    next: check-inputs
+
+  # Only lower-cased hex leaves this node, so no argument reaches the body in its own spelling.
+  - id: check-inputs
+    name: Check the commit, tree and configuration hashes
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var sha = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+        var hex = function (value, pattern) {
+          var text = String(value == null ? '' : value).trim().toLowerCase();
+          return pattern.test(text) ? text : null;
+        };
+        var blank = function (value) { return String(value == null ? '' : value).trim() === ''; };
+        var commitValue = hex(commitSha, sha);
+        var treeValue = blank(treeSha) ? '' : hex(treeSha, sha);
+        var configValue = blank(configHash) ? '' : hex(configHash, /^[0-9a-f]{1,128}$/);
+        var problem = !accepted ? urlReason
+          : host !== 'github.com' ? 'unsupported_host'
+          : branchValid !== true ? 'invalid_branch'
+          : commitValue === null ? 'invalid_commit'
+          : treeValue === null ? 'invalid_tree_sha'
+          : configValue === null ? 'invalid_config_hash'
+          : '';
+        context.setVariable('commit', commitValue || '');
+        context.setVariable('tree', treeValue || '');
+        context.setVariable('config', configValue || '');
+        context.setVariable('inputProblem', problem);
+        problem;
+    next: route-inputs
+
+  - id: route-inputs
+    type: decision
+    next:
+      - when: "inputProblem == ''"
+        next: get-repository
+      - else: refuse-input
+
+  # The workspace's GitHub connection must see the repository, and its answer is GitHub's own spelling of
+  # owner/repo: the clone_url push events carry, so this ensure and push-time ensures hash to one identity.
+  - id: get-repository
+    name: Read the repository from GitHub
+    type: activity:GitHubGetRepository
+    inputs:
+      connectionId: github
+      owner: "= repositoryOwner"
+      repo: "= repositoryName"
+    outputs:
+      fullName: fullName
+    next: canonicalize
+
+  - id: canonicalize
+    name: Build the repository URL from GitHub's spelling
+    type: activity:SextantNormalizeRepository
+    inputs:
+      repo: "= fullName"
+    outputs:
+      remoteUrl: remoteUrl
+      accepted: accepted
+      reason: urlReason
+      repositoryOwner: repositoryOwner
+      repositoryName: repositoryName
+    next: route-canonical
+
+  - id: route-canonical
+    type: decision
+    next:
+      - when: "accepted"
+        next: route-branch
+      - else: refuse-input
+
+  # Only the default profile of a branch's GitHub head can move the branch.
+  - id: route-branch
+    type: decision
+    next:
+      - when: "branch != '' && tree == '' && config == ''"
+        next: resolve
+      - else: ensure-none
+
+  # The head the service holds for the branch becomes the compare-and-swap value. It is read before
+  # GitHub's head: the guard only rejects pushes the service processes after this read, so with GitHub's
+  # listing first, a push processed in between would pass it and be rolled back to the listed head.
+  - id: resolve
+    name: GET /control/resolve
+    type: activity:HttpRequest
+    inputs:
+      connectionId: sextant-control
+      method: GET
+      url: /control/resolve
+      query:
+        repository: "= remoteUrl"
+        branch: "= branch"
+      failOnErrorStatus: false
+    outputs:
+      statusCode: resolveStatus
+      json: resolveJson
+    next: route-resolve
+
+  # 200 and 404 both go through expect-head, the one place expectedHead is computed.
+  - id: route-resolve
+    type: decision
+    next:
+      - when: "resolveStatus == 200 || resolveStatus == 404"
+        next: expect-head
+      - else: refuse-resolve
+
+  # 404: the service holds no head for the branch yet, so the compare-and-swap expects none (""). A 200
+  # head that is not a commit SHA also expects none, which only passes while the branch has no usable
+  # snapshot.
+  - id: expect-head
+    type: activity:SetVariable
+    inputs:
+      value: >
+        = resolveStatus == 200 && resolveJson != null
+            && /^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$/.test(String(resolveJson.commit_sha || ''))
+            ? String(resolveJson.commit_sha).toLowerCase() : ''
+    outputs:
+      result: expectedHead
+    next: list-branches
+
+  - id: list-branches
+    name: Read the branch heads
+    type: activity:GitHubListBranches
+    inputs:
+      connectionId: github
+      owner: "= repositoryOwner"
+      repo: "= repositoryName"
+    outputs:
+      branches: branches
+    next: check-head
+
+  # An advance sends GitHub's head, never the argument's spelling of it.
+  - id: check-head
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var match = (branches || []).find(function (b) { return b && b.name === branch; });
+        var head = match && match.sha ? String(match.sha).trim().toLowerCase() : '';
+        if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(head)) head = '';
+        context.setVariable('githubHead', head);
+        context.setVariable('isHead', head !== '' && head === commit);
+        head;
+    next: route-head
+
+  - id: route-head
+    type: decision
+    next:
+      - when: "isHead"
+        next: mark-advance
+      - else: ensure-none
+
+  - id: mark-advance
+    type: activity:SetVariable
+    inputs:
+      value: "= true"
+    outputs:
+      result: advanceRequested
+    next: ensure-advance
+
+  - id: ensure-advance
+    type: process:ensure
+    inputs:
+      repositoryRemoteUrl: "= remoteUrl"
+      commitSha: "= githubHead"
+      branchName: "= branch"
+      branchUpdate: advance
+      expectedHeadCommit: "= expectedHead"
+    outputs:
+      outcome: outcome
+      reason: reason
+      statusCode: ensureStatus
+      jobId: jobId
+      identityHash: identityHash
+      jobStatus: indexingState
+      published: ensurePublished
+      snapshotId: snapshotId
+      attached: attached
+      branchAdvanced: branchAdvanced
+    next: describe
+
+  - id: ensure-none
+    type: process:ensure
+    inputs:
+      repositoryRemoteUrl: "= remoteUrl"
+      commitSha: "= commit"
+      branchName: "= branch"
+      branchUpdate: none
+      treeSha: "= tree"
+      configHash: "= config"
+    outputs:
+      outcome: outcome
+      reason: reason
+      statusCode: ensureStatus
+      jobId: jobId
+      identityHash: identityHash
+      jobStatus: indexingState
+      snapshotId: snapshotId
+      attached: attached
+      branchAdvanced: branchAdvanced
+    next: describe
+
+  - id: describe
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var text;
+        switch (outcome) {
+          case 'ok':
+          case 'attached':
+            text = 'Indexing job ' + jobId + ' is ' + indexingState + '.';
+            // A compare-and-swap that no longer matches is not an error: the ensure attaches and reports
+            // branch_advanced false (the pointer is already there, or a newer head won meanwhile). Only a
+            // published result carries that decision; a queued or running job moves the branch when it
+            // publishes, if the guard still holds then.
+            if (advanceRequested && ensurePublished && branchAdvanced === false) {
+              text += ' The ' + branch + ' branch was not moved to it: it already points there, or its head changed meanwhile.';
+            }
+            break;
+          case 'not_granted':
+            text = 'Watch the repository first (for example, "watch owner/repo" in the Sextant chat), then try again.';
+            break;
+          case 'rejected':
+            text = 'The Sextant service rejected the request (' + reason + ').';
+            break;
+          case 'unavailable':
+            text = 'The Sextant service is unavailable right now; try again later.';
+            break;
+          case 'unauthorized':
+            text = 'The Sextant service refused the request.';
+            break;
+          default:
+            text = 'The Sextant service could not start indexing (' + reason + ').';
+        }
+        context.setVariable('message', text);
+        null;
+    next: end
+
+  # inputProblem names the first bad argument; a URL GitHub's own spelling cannot build keeps urlReason.
+  - id: refuse-input
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var code = inputProblem !== '' ? inputProblem : urlReason;
+        var text;
+        switch (code) {
+          case 'unsupported_host':
+            text = 'Only github.com repositories can be indexed through the Sextant app.';
+            break;
+          case 'invalid_branch':
+            text = 'branchName is not a valid branch name.';
+            break;
+          case 'invalid_commit':
+            text = 'commitSha must be a full commit SHA.';
+            break;
+          case 'invalid_tree_sha':
+            text = 'treeSha must be a full tree SHA.';
+            break;
+          case 'invalid_config_hash':
+            text = 'configHash must be a hex configuration hash.';
+            break;
+          default:
+            text = 'repositoryRemoteUrl is not a repository URL the Sextant service accepts (' + code + ').';
+        }
+        context.setVariable('outcome', 'rejected');
+        context.setVariable('reason', code);
+        context.setVariable('jobId', '');
+        context.setVariable('identityHash', '');
+        context.setVariable('indexingState', '');
+        context.setVariable('snapshotId', '');
+        context.setVariable('attached', false);
+        context.setVariable('branchAdvanced', false);
+        context.setVariable('message', text);
+        null;
+    next: end
+
+  - id: refuse-resolve
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var unauthorized = resolveStatus == 401 || resolveStatus == 403;
+        var rejected = resolveStatus == 400;
+        var code = resolveJson != null && /^[a-z0-9_]{1,64}$/.test(String(resolveJson.reason || ''))
+          ? String(resolveJson.reason) : 'http_' + resolveStatus;
+        context.setVariable('outcome', unauthorized ? 'unauthorized' : (rejected ? 'rejected' : 'unavailable'));
+        context.setVariable('reason', rejected ? code : 'http_' + resolveStatus);
+        context.setVariable('jobId', '');
+        context.setVariable('identityHash', '');
+        context.setVariable('indexingState', '');
+        context.setVariable('snapshotId', '');
+        context.setVariable('attached', false);
+        context.setVariable('branchAdvanced', false);
+        context.setVariable('message', unauthorized
+          ? 'The Sextant service refused the request.'
+          : (rejected
+            ? 'The Sextant service rejected the request (' + code + ').'
+            : 'The Sextant service could not read the branch head right now; try again later.'));
+        null;
+    next: log-resolve
+
+  - id: log-resolve
+    type: activity:Log
+    inputs:
+      level: Warning
+      message: "= 'Sextant resolve failed before start-indexing: HTTP ' + resolveStatus"
+    next: end
+
+  - id: end
+    type: end

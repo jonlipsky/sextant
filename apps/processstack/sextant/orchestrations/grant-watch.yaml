@@ -1,0 +1,462 @@
+name: grant-watch
+description: >
+  Watches one repository for the calling user (one iteration of the chat's watch command).
+    1. The workspace's GitHub connection must see the repository (GetRepository); otherwise the watch is
+       refused. This keeps a user from granting themselves a repository the workspace cannot read. Only a
+       5xx, a rate limit or a network failure is "try again later"; any other failure is "not visible".
+    2. PUT /control/grants/self records the grant under the run's caller (never a user id from input).
+    3. The v1 watched-repos memory is upserted (legacy-dual-write).
+    4. When the grant's branch has no snapshot yet (snapshot_status missing), the branch head is read from
+       GitHub and the first ensure is sent with the compare-and-swap guard expected_head_commit "" (the
+       branch must not exist yet in the service).
+  This is an orchestration rather than a process so that a GitHub or network failure routes to a reply
+  instead of failing the chat turn. It returns a one-line message; a response body is never echoed.
+
+inputs:
+  - name: host
+    type: string
+    required: true
+  - name: owner
+    type: string
+    required: true
+  - name: repo
+    type: string
+    required: true
+  - name: branch
+    type: string
+    required: false
+    default: ""
+    description: The branch to watch; empty for the repository's default branch
+
+variables:
+  - name: fullName
+    type: string
+    default: ""
+  - name: defaultBranch
+    type: string
+    default: ""
+  - name: remoteUrl
+    type: string
+    default: ""
+  - name: repoHost
+    type: string
+    default: ""
+  - name: repoOwner
+    type: string
+    default: ""
+  - name: repoName
+    type: string
+    default: ""
+  - name: accepted
+    type: bool
+    default: false
+  - name: targetBranch
+    type: string
+    default: ""
+  - name: putStatus
+    type: int
+    default: 0
+  - name: putJson
+    type: json
+  - name: grantsStatus
+    type: int
+    default: 0
+  - name: grantsJson
+    type: json
+  - name: needsIndex
+    type: bool
+    default: false
+  - name: branches
+    type: json
+  - name: headSha
+    type: string
+    default: ""
+  - name: ensureOutcome
+    type: string
+    default: ""
+  - name: memoryKeys
+    type: string
+    default: ""
+  - name: memoryValue
+    type: string
+    default: ""
+  - name: granted
+    type: bool
+    default: false
+  - name: message
+    type: string
+    default: ""
+
+outputs:
+  - name: message
+    type: string
+    description: The reply line for this repository
+  - name: granted
+    type: bool
+    description: True when the service recorded (or already held) the grant
+  - name: needsIndex
+    type: bool
+    description: True when the branch had no snapshot, so a first ensure was due
+  - name: ensureOutcome
+    type: string
+    description: The first ensure's outcome; "" when none was sent
+  - name: memoryKeys
+    type: string
+    description: The legacy memory keys written, comma-separated
+  - name: memoryValue
+    type: string
+    description: The legacy memory value written
+
+nodes:
+  - id: start
+    type: start
+    next: init
+
+  # A run seeds variables from undeclared inputs, and a default only fills an unset name
+  # (elevenworks/ProcessStack#3286; internal is not enforced on a direct run, #3287). Every variable and
+  # output is assigned here before anything reads it.
+  - id: init
+    name: Reset every variable and output
+    type: activity:JavaScript
+    inputs:
+      script: |
+        ['fullName', 'defaultBranch', 'remoteUrl', 'repoHost', 'repoOwner', 'repoName', 'targetBranch',
+         'headSha', 'ensureOutcome', 'memoryKeys', 'memoryValue', 'message'].forEach(function (name) {
+          context.setVariable(name, '');
+        });
+        ['accepted', 'needsIndex', 'granted'].forEach(function (name) { context.setVariable(name, false); });
+        context.setVariable('putStatus', 0);
+        context.setVariable('grantsStatus', 0);
+        context.setVariable('putJson', null);
+        context.setVariable('grantsJson', null);
+        context.setVariable('branches', null);
+        null;
+    next: check-host
+
+  # The GitHub connection answers for github.com only.
+  - id: check-host
+    type: decision
+    next:
+      - when: "host == 'github.com'"
+        next: get-repository
+      - else: refuse-host
+
+  - id: get-repository
+    name: Is the repository visible to the workspace's GitHub connection?
+    type: activity:GitHubGetRepository
+    inputs:
+      connectionId: github
+      owner: "= owner"
+      repo: "= repo"
+    outputs:
+      fullName: fullName
+      defaultBranch: defaultBranch
+    next: normalize
+    on-error: route-repository-error
+
+  # Only a failure that says nothing about visibility and may pass is "try again later": a 5xx (Octokit's
+  # plain ApiException), a rate limit, or a network failure or timeout. Everything else is "not visible":
+  # a 404 or 403, a refused credential, and an App with no installation for the owner (an
+  # InvalidOperationException before any request). An unknown failure therefore fails closed.
+  - id: route-repository-error
+    type: decision
+    next:
+      - when: "_lastErrorType == 'ApiException' || _lastErrorType == 'RateLimitExceededException' || _lastErrorType == 'SecondaryRateLimitExceededException' || _lastErrorType == 'AbuseException' || _lastErrorType == 'HttpRequestException' || _lastErrorType == 'TaskCanceledException' || _lastErrorType == 'OperationCanceledException' || _lastErrorType == 'TimeoutException'"
+        next: refuse-github-unavailable
+      - else: refuse-invisible
+
+  # GitHub's own spelling of owner/repo gives the clone_url push events carry, so the first ensure and
+  # later push-time ensures hash to the same snapshot identity.
+  - id: normalize
+    type: activity:SextantNormalizeRepository
+    inputs:
+      repo: "= fullName"
+    outputs:
+      remoteUrl: remoteUrl
+      host: repoHost
+      repositoryOwner: repoOwner
+      repositoryName: repoName
+      accepted: accepted
+    next: route-normalized
+
+  - id: route-normalized
+    type: decision
+    next:
+      - when: "accepted"
+        next: set-target
+      - else: refuse-invisible
+
+  - id: set-target
+    type: activity:SetVariable
+    inputs:
+      value: "= branch != '' ? branch : defaultBranch"
+    outputs:
+      result: targetBranch
+    next: put-grant
+
+  - id: put-grant
+    name: PUT /control/grants/self
+    type: activity:HttpRequest
+    inputs:
+      connectionId: sextant-control
+      method: PUT
+      url: /control/grants/self
+      body: "= branch != '' ? { repository: remoteUrl, branch: branch } : { repository: remoteUrl }"
+      failOnErrorStatus: false
+    outputs:
+      statusCode: putStatus
+      json: putJson
+    next: route-put
+    on-error: refuse-unavailable
+
+  - id: route-put
+    type: decision
+    next:
+      - when: "putStatus == 200"
+        next: mark-granted
+      - when: "putStatus == 400"
+        next: refuse-rejected
+      - when: "putStatus == 409"
+        next: refuse-limit
+      - when: "putStatus == 401 || putStatus == 403"
+        next: refuse-denied
+      - else: refuse-unavailable
+
+  - id: mark-granted
+    type: activity:SetVariable
+    inputs:
+      value: true
+    outputs:
+      result: granted
+    next: record-memory
+
+  - id: record-memory
+    type: process:legacy-dual-write
+    inputs:
+      operation: upsert
+      host: "= repoHost"
+      owner: "= repoOwner"
+      repo: "= repoName"
+      branch: "= targetBranch"
+      cloneUrl: "= remoteUrl"
+    outputs:
+      keys: memoryKeys
+      value: memoryValue
+    next: read-grants
+    on-error: log-memory
+
+  - id: log-memory
+    type: activity:Log
+    inputs:
+      level: Warning
+      message: "Sextant watch: the legacy watched-repos memory write failed"
+    next: read-grants
+
+  - id: read-grants
+    name: GET /control/grants/self
+    type: activity:HttpRequest
+    inputs:
+      connectionId: sextant-control
+      method: GET
+      url: /control/grants/self
+      failOnErrorStatus: false
+    outputs:
+      statusCode: grantsStatus
+      json: grantsJson
+    next: check-missing
+    on-error: reply
+
+  - id: check-missing
+    name: Does the watched branch have a snapshot yet?
+    type: activity:SetVariable
+    inputs:
+      value: >
+        = (function () {
+            if (grantsStatus != 200 || grantsJson == null) return false;
+            var norm = function (u) {
+              return String(u || '').trim().toLowerCase().replace(/\/+$/, '').replace(/\.git$/, '');
+            };
+            var want = norm(remoteUrl);
+            var grant = (grantsJson.grants || []).find(function (g) {
+              return g && norm(g.repository) === want && String(g.branch || '') === branch;
+            });
+            return !!grant && !!grant.status && grant.status.snapshot_status === 'missing';
+          })()
+    outputs:
+      result: needsIndex
+    next: route-missing
+
+  - id: route-missing
+    type: decision
+    next:
+      - when: "needsIndex && targetBranch != ''"
+        next: list-branches
+      - else: reply
+
+  - id: list-branches
+    name: Read the branch head
+    type: activity:GitHubListBranches
+    inputs:
+      connectionId: github
+      owner: "= repoOwner"
+      repo: "= repoName"
+    outputs:
+      branches: branches
+    next: find-head
+    on-error: mark-head-unreadable
+
+  # The grant is recorded; only the first ensure is missed, so the reply says indexing starts with the
+  # next push rather than that the branch has no commits.
+  - id: mark-head-unreadable
+    type: activity:SetVariable
+    inputs:
+      value: unavailable
+    outputs:
+      result: ensureOutcome
+    next: log-head-unreadable
+
+  - id: log-head-unreadable
+    type: activity:Log
+    inputs:
+      level: Warning
+      message: "= 'Sextant watch: GitHubListBranches failed before the first ensure: ' + _lastErrorType"
+    next: reply
+
+  - id: find-head
+    type: activity:SetVariable
+    inputs:
+      value: >
+        = (function () {
+            var match = (branches || []).find(function (b) { return b && b.name === targetBranch; });
+            var sha = match && match.sha ? String(match.sha).trim().toLowerCase() : '';
+            return /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(sha) ? sha : '';
+          })()
+    outputs:
+      result: headSha
+    next: route-head
+
+  - id: route-head
+    type: decision
+    next:
+      - when: "headSha != ''"
+        next: first-ensure
+      - else: reply
+
+  - id: first-ensure
+    type: process:ensure
+    inputs:
+      repositoryRemoteUrl: "= remoteUrl"
+      commitSha: "= headSha"
+      branchName: "= targetBranch"
+      branchUpdate: advance
+      expectedHeadCommit: ""
+    outputs:
+      outcome: ensureOutcome
+    next: reply
+    on-error: reply
+
+  - id: reply
+    type: activity:JavaScript
+    inputs:
+      script: |
+        var label = branch !== '' ? branch : (defaultBranch + ' (the default branch)');
+        var text = (putJson && putJson.created === false)
+          ? 'You are already watching ' + fullName + ' on ' + label + '.'
+          : 'Now watching ' + fullName + ' on ' + label + '.';
+        if (needsIndex) {
+          if (ensureOutcome === 'ok' || ensureOutcome === 'attached') {
+            text += ' Indexing has started.';
+          } else if (headSha === '' && ensureOutcome === '') {
+            text += ' The branch has no commits on GitHub yet; it will be indexed when it is pushed.';
+          } else {
+            text += ' Indexing could not start yet; it will start with the next push.';
+          }
+        }
+        text;
+    outputs:
+      result: message
+    next: end
+
+  - id: refuse-host
+    type: activity:SetVariable
+    inputs:
+      value: "= 'I can only watch github.com repositories, and ' + host + '/' + owner + '/' + repo + ' is not on github.com.'"
+    outputs:
+      result: message
+    next: end
+
+  - id: refuse-invisible
+    type: activity:SetVariable
+    inputs:
+      value: "= owner + '/' + repo + \" isn't visible to this workspace's GitHub connection, so I can't watch it.\""
+    outputs:
+      result: message
+    next: end
+
+  - id: refuse-github-unavailable
+    type: activity:SetVariable
+    inputs:
+      value: "= 'I could not check ' + owner + '/' + repo + ' with GitHub right now, so it is not watched yet. Try again later.'"
+    outputs:
+      result: message
+    next: log-github-unavailable
+
+  - id: log-github-unavailable
+    type: activity:Log
+    inputs:
+      level: Warning
+      message: "= 'Sextant watch: GitHubGetRepository failed: ' + _lastErrorType"
+    next: end
+
+  # A reason is a service code (host_not_allowed, branch_not_allowed, ...); anything else is not shown.
+  - id: refuse-rejected
+    type: activity:SetVariable
+    inputs:
+      value: >
+        = 'The Sextant service would not watch ' + fullName + ' ('
+          + (putJson != null && /^[a-z0-9_]{1,64}$/.test(String(putJson.reason || '')) ? putJson.reason : 'rejected')
+          + ').'
+    outputs:
+      result: message
+    next: end
+
+  - id: refuse-limit
+    type: activity:SetVariable
+    inputs:
+      value: "= 'You are watching as many repositories as allowed, so ' + fullName + ' was not added. Stop watching one first.'"
+    outputs:
+      result: message
+    next: end
+
+  - id: refuse-denied
+    type: activity:SetVariable
+    inputs:
+      value: "= 'The Sextant service refused to record the watch for ' + fullName + '.'"
+    outputs:
+      result: message
+    next: log-denied
+
+  - id: log-denied
+    type: activity:Log
+    inputs:
+      level: Warning
+      message: "= 'Sextant watch: PUT /control/grants/self was refused: HTTP ' + putStatus"
+    next: end
+
+  - id: refuse-unavailable
+    type: activity:SetVariable
+    inputs:
+      value: "= 'The Sextant service is unavailable right now, so ' + fullName + ' is not watched yet. Try again later.'"
+    outputs:
+      result: message
+    next: log-unavailable
+
+  - id: log-unavailable
+    type: activity:Log
+    inputs:
+      level: Warning
+      message: "= 'Sextant watch: PUT /control/grants/self failed: HTTP ' + putStatus"
+    next: end
+
+  - id: end
+    type: end
