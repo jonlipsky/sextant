@@ -15,7 +15,8 @@ namespace Sextant.Service.Tests;
 /// Generic MCP-client compatibility for the remote query plane. The official MCP C# SDK client connects to
 /// the service's stateless <c>/mcp</c> endpoint over Streamable HTTP with only a static bearer header. That
 /// is how any pooled or proxying MCP client connects, so these tests pin that the surface needs nothing
-/// client-specific: <c>initialize</c>, <c>tools/list</c> and <c>tools/call</c> all succeed, no session
+/// client-specific: the connect handshake (<c>server/discover</c> by default, or <c>initialize</c> for a
+/// client pinned to an older protocol revision), <c>tools/list</c> and <c>tools/call</c> all succeed, no session
 /// affinity is required, and the query-token gate still rejects a wrong or missing bearer. Runs fully
 /// in-process over <see cref="TestServer"/> with an ephemeral SQLite catalog.
 /// </summary>
@@ -29,13 +30,19 @@ public class McpClientCompatibilityTests
     private static readonly string[] LocalOnlyTools = ["get_source_context", "get_daemon_status", "get_base_snapshot_symbols"];
 
     [TestMethod]
-    public async Task SdkClient_StaticBearer_InitializeListAndCall_Succeed()
+    [DataRow(null, DisplayName = "SDK default protocol (server/discover)")]
+    [DataRow("2025-06-18", DisplayName = "pinned older protocol (initialize)")]
+    public async Task SdkClient_StaticBearer_InitializeListAndCall_Succeed(string? protocolVersion)
     {
         await using var host = await Harness.StartAsync();
-        await using var client = await McpClient.CreateAsync(host.CreateTransport(QueryToken));
+        await using var client = await McpClient.CreateAsync(
+            host.CreateTransport(QueryToken), new McpClientOptions { ProtocolVersion = protocolVersion });
 
-        // initialize: the handshake completed and the server advertised its tools capability.
-        Assert.IsNotNull(client.ServerInfo, "initialize returned server info");
+        // connect: the handshake completed and the server advertised its tools capability.
+        Assert.IsNotNull(client.NegotiatedProtocolVersion, "the client negotiated a protocol version");
+        if (protocolVersion is not null)
+            Assert.AreEqual(protocolVersion, client.NegotiatedProtocolVersion, "the server accepted the pinned revision");
+        Assert.IsNotNull(client.ServerInfo, "the handshake returned server info");
         Assert.IsNotNull(client.ServerCapabilities.Tools, "the server advertises the tools capability");
         Assert.IsNull(client.SessionId,
             "the stateless transport issues no Mcp-Session-Id, so a pooled client needs no session affinity");

@@ -103,7 +103,7 @@
 - PS-8 (F3) forwards `arguments` verbatim over a pooled connection that has only static headers, so per-call selection must travel in args.
 - Reads always pin the **default** branch (`SnapshotStore.cs:877`).
 
-**Contract.** The mechanism is MCP SDK 1.0.0 request filters (`WithRequestFilters` → `AddListToolsFilter` / `AddCallToolFilter`; package `ModelContextProtocol` 1.0.0 at `src/Sextant.Mcp/Sextant.Mcp.csproj:18`). The filters live in Service.Host only; stdio is unchanged.
+**Contract.** The mechanism is MCP SDK 2.2.0 request filters: `WithRequestFilters(f => f.AddListToolsFilter(…).AddCallToolFilter(…))` on the service's `AddMcpServer()` builder, package `ModelContextProtocol` 2.2.0 at `src/Sextant.Mcp/Sextant.Mcp.csproj:18`. Each filter is a `McpRequestFilter<ListToolsRequestParams, ListToolsResult>` / `McpRequestFilter<CallToolRequestParams, CallToolResult>` (`next => async (context, ct) => …`); `context.Params.Arguments` is a mutable `IDictionary<string, JsonElement>`, and `context.Services` / `context.User` are the request's. The service `/mcp` is stateless, so the filters run on every request with no session state. The filters live in Service.Host only; stdio is unchanged.
 
 | Aspect | Rule |
 |---|---|

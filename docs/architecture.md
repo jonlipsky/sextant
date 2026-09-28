@@ -60,7 +60,7 @@ Sextant.Core        -- shared models, project identity, configuration
 | MSBuild discovery | `Microsoft.Build.Locator` |
 | Storage | SQLite via `Microsoft.Data.Sqlite` |
 | Text search | SQLite FTS5 (built-in) |
-| MCP protocol | `ModelContextProtocol` NuGet package |
+| MCP protocol | `ModelContextProtocol` + `ModelContextProtocol.AspNetCore` NuGet packages (2.2.0) |
 | Transport | stdio (primary), HTTP (secondary) |
 
 ## Design Principles
