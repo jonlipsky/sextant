@@ -15,14 +15,18 @@ namespace Sextant.ProcessStack.Activities;
 internal static class ActivityValues
 {
     /// <summary>
-    /// The value of input <paramref name="name"/>: the node's <c>Definition.Parameters</c> entry when it has a
-    /// non-null, already-resolved one, otherwise <paramref name="propertyValue"/> (the bound or directly set
-    /// property). The host binds parameters onto the properties before <c>ExecuteAsync</c>, but a caller that
-    /// fills only <c>Definition.Parameters</c> must see its inputs too (the dual-resolution rule).
+    /// The value of input <paramref name="name"/>. The bound property (<paramref name="propertyValue"/>) is the
+    /// source of truth: the host resolves every input into it before <c>ExecuteAsync</c>. A
+    /// <c>Definition.Parameters</c> entry is used only when it is non-null and not authored text, so a caller
+    /// that fills only <c>Definition.Parameters</c> with literal values still sees its inputs (the
+    /// dual-resolution rule).
     /// <para>
-    /// In-process, <c>Definition.Parameters</c> keeps the node's authored text (<c>"= prompt"</c>, a
-    /// <c>${...}</c> template, a <c>{{ }}</c> Scriban template): the host resolves it only into the bound
-    /// property. Such an entry is never the value, so the property wins.
+    /// What <c>Definition.Parameters</c> holds depends on where the activity runs (elevenworks/ProcessStack#3269,
+    /// not covered by the SDK docs). In-process it keeps the node's authored text (<c>"= prompt || ''"</c>, a
+    /// <c>${...}</c> template, a <c>{{ }}</c> Scriban template), and the host resolves that only into the
+    /// bound property; off-host it holds resolved values. An authored entry is never the value, so the property
+    /// wins. Treating a literal that merely looks authored the same way is harmless, because the bound property
+    /// then holds that same literal.
     /// </para>
     /// </summary>
     public static object? Input(AbstractActivity activity, string name, object? propertyValue)
@@ -38,12 +42,14 @@ internal static class ActivityValues
     }
 
     /// <summary>
-    /// True when <paramref name="value"/> (or any value nested in it) is text the host still has to resolve:
-    /// the three expression modes of the ProcessStack string resolver.
+    /// True when <paramref name="value"/> (or any value nested in it) may be text the host still has to resolve.
+    /// ProcessStack is not consistent about the expression prefix (the string resolver takes <c>"= "</c>,
+    /// validators <c>"=${"</c>, and some activities any <c>=</c> after leading whitespace), so any string whose
+    /// trimmed start is <c>=</c> counts, as does a <c>${...}</c> or <c>{{ }}</c> template.
     /// </summary>
     public static bool IsAuthoredExpression(object? value) => Unwrap(value) switch
     {
-        string text => text.StartsWith("= ", StringComparison.Ordinal)
+        string text => text.TrimStart().StartsWith('=')
             || HasTemplate(text)
             || text.Contains("{{", StringComparison.Ordinal),
         IDictionary map => map.Values.Cast<object?>().Any(item => IsAuthoredExpression(Unwrap(item))),
