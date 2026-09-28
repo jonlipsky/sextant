@@ -62,6 +62,13 @@ of the box.
 | `SEXTANT_SERVICE_CONTRIBUTE_TOKEN` | Least-privilege token for `/control/contribute` only (issue #71); the control token remains a superset that also authorizes it | none (falls back to control token) |
 | `SEXTANT_SERVICE_READ_POLICY` | Enforced query-plane read-authorization policy (Phase 17) | disabled (open read) |
 | `SEXTANT_SERVICE_REQUIRE_REPOSITORY_SELECTION` | Require every `/mcp` read to name its repository, in the `repository` tool argument or the `X-Sextant-Repository` header; a read without one fails with `repository_required` (see [Repository selection](#repository-selection-on-mcp)). A malformed value fails startup | `false` (a read that names no repository reads the unselected default) |
+| `SEXTANT_SERVICE_DELEGATE_TOKENS` | `;`-separated query-plane bearer tokens whose reads are decided per verified caller assertion (see [Caller assertions](#caller-assertions-svc-3)). Requires `CALLER_KEYS`; a token equal to the query, control, contribute or a read-policy token **fails startup** | none |
+| `SEXTANT_SERVICE_CALLER_KEYS` | `;`-separated `kid=base64url-key@tenantId` HMAC keys that sign caller assertions. A key shorter than 32 bytes, a duplicate `kid`, or a malformed entry **fails startup** | none (caller assertions off) |
+| `SEXTANT_SERVICE_CALLER_AUDIENCE` | The `aud` a caller assertion must carry. Required when `CALLER_KEYS` is set | none |
+| `SEXTANT_SERVICE_CALLER_ISSUERS` | Optional comma-separated `iss` allow-list | none (any issuer) |
+| `SEXTANT_SERVICE_CALLER_HEADER` | The request header that carries the caller assertion | `X-ProcessStack-Caller` |
+| `SEXTANT_SERVICE_CALLER_IDPS` | Comma-separated identity providers whose users may act as `act=user` callers (`[a-z0-9-]{1,32}` each) | `processstack` |
+| `SEXTANT_SERVICE_CALLER_APPS` | Optional comma-separated allow-list on the signed `app` claim | none (any app) |
 | `SEXTANT_SERVICE_BIND_ADDRESS` | Network interface the HTTP surface binds to | `localhost` |
 | `SEXTANT_SERVICE_CONTROL_PORT` | HTTP port | `3011` |
 | `SEXTANT_SERVICE_QUERY_PORT` | Optional dedicated query port (shares the control port when unset) | none (shared) |
@@ -641,8 +648,8 @@ The host deliberately **separates control endpoints from query endpoints**, and 
 | `GET /control/audit` | control | control token | Durable audit log (criterion 5); optional `action`/`repository`/`limit` filters. **Operator-only.** |
 | `GET /control/pilot` | control | control token | Pilot-readiness gate (criterion 7); `?workload=trusted\|untrusted&hard_isolation=&recent_backup=`. |
 | `POST /control/backup` | control | control token | Write a consistent catalog + artifact backup to `?dir=` (criterion 6). |
-| `GET /query/snapshots/{identityHash}/symbols` | query | query token | One immutable page of a snapshot's symbols, cursor-paged (federation, issue #51). |
-| `POST /mcp` | query | query token | Authenticated HTTP MCP semantic queries (criterion 4). |
+| `GET /query/snapshots/{identityHash}/symbols` | query | query token (or delegate token + caller assertion) | One immutable page of a snapshot's symbols, cursor-paged (federation, issue #51). |
+| `POST /mcp` | query | query token (or delegate token; `tools/call` needs a caller assertion) | Authenticated HTTP MCP semantic queries (criterion 4). |
 
 A null token disables that plane's auth (single-node development). Token checks are constant-time. Query
 reads use a connection **independent** of the service writer (Phase-9 WAL supports concurrent readers), so
@@ -703,6 +710,58 @@ per call through two reserved arguments. The service adds them in MCP request fi
 The filter errors are MCP tool errors (`isError: true`) whose text is the usual JSON error envelope
 (`meta.error.code`). The selection of each call is kept in the request's `HttpContext.Items`
 (`ToolCallSelection`), where later per-call checks can reuse it.
+
+### Caller assertions (SVC-3)
+
+A gateway that serves many callers over one pooled connection authenticates with a **delegate token**
+(`SEXTANT_SERVICE_DELEGATE_TOKENS`) and names the caller of each request in a signed **caller assertion**:
+a compact HS256 JWS in the `SEXTANT_SERVICE_CALLER_HEADER` header (default `X-ProcessStack-Caller`). The
+signing keys are `SEXTANT_SERVICE_CALLER_KEYS`, and each key belongs to exactly one tenant.
+
+**The assertion.** The JOSE header is `{"alg":"HS256","typ":"JWT","kid":"<kid>"}` (`typ` may be omitted).
+The header parameters `jku`, `jwk`, `x5u`, `x5c` and `crit` are refused. The payload carries:
+
+| Claim | Meaning |
+| --- | --- |
+| `iss` | Issuer; checked against `CALLER_ISSUERS` when set |
+| `aud` | Must equal `CALLER_AUDIENCE` (a string, or an array containing it) |
+| `tid` | Tenant id; **must equal the tenant of the signing `kid`** |
+| `tslug` | Tenant slug (recorded) |
+| `act` | `user` or `application` |
+| `idp`, `sub` | For `act=user` only: the identity provider and the full subject. `idp=processstack` needs a `sub` with no `:`; any other `idp` needs `{idp}:{connectionInstanceId}:{peerId}` |
+| `app`, `dep`, `cid`, `via` | Calling app, deployment, connection and surface (`via` is `mcp-surface` or `activity`) |
+| `run` | Optional run id |
+| `jti`, `iat`, `nbf`, `exp` | Assertion id and times: 60 s skew, at most 300 s from `iat` to `exp` |
+
+A verified `act=user` assertion also needs its `idp` in `CALLER_IDPS`, and, when `CALLER_APPS` is set,
+every assertion needs its `app` in it.
+
+**Where an assertion is accepted.**
+
+| Request | Bearer | Assertion |
+| --- | --- | --- |
+| `/mcp` discovery (`initialize`, `ping`, `tools/list`, notifications) | delegate | Optional, so a pooled client connects and lists tools once; verified when present |
+| `/mcp` `tools/call` | delegate | Required: without one the call is the tool error `caller_required`; a caller refused by `CALLER_IDPS`/`CALLER_APPS` is the tool error `caller_not_allowed` |
+| `/query/*` | delegate | Required: `401 {"error":"caller_required"}` |
+| `/mcp`, `/query/*` | query token, read-policy principal, or an open plane | Refused: `401 {"error":"assertion_not_allowed"}` |
+| `/control/*` except `/control/contribute` | control | Optional; when present it must verify, and the audit actor becomes the caller |
+| `/control/contribute` | control or contribute | Refused: `401 {"error":"assertion_not_allowed"}` |
+
+An assertion that fails verification is `401 {"error":"invalid_caller_assertion"}` with
+`WWW-Authenticate: Bearer error="invalid_token"`; a caller refused by the idp or app allow-list is
+`403 {"error":"caller_not_allowed"}`. Sending the header more than once counts as a failed verification.
+With no `CALLER_KEYS`, an assertion on `/control/*` is `assertion_not_allowed`. Each refusal logs one warning
+(category `Sextant.Service.Host.CallerAssertion`) with the reason code, the `kid` and the `jti`, and never
+the assertion, another claim or a token.
+
+**What a caller may read.** A verified caller must name its repository (as if
+`REQUIRE_REPOSITORY_SELECTION` were on for that request). Per-caller grants are not implemented yet, so
+**every delegate read is denied** with the uniform not-found, and a delegate snapshot-page request is the
+uniform `404`. A delegate token therefore opens nothing on its own. A request without a delegate token is
+unchanged.
+
+**Audit.** A control call that carries a verified assertion is audited as `HashActor("{tid}/{sub}")` for a
+user caller or `HashActor("{tid}/app:{app}")` for an application caller, instead of its bearer.
 
 ## The `SnapshotService` data plane
 

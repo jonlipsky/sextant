@@ -16,7 +16,7 @@
 | SX-2 | SVC-1 | Selector always wired; opt-in fail-closed selection | R | `ServiceApp.cs:61-66`, `Sextant.Mcp/DatabaseProvider.cs`, `FederatedReadContext.cs` |
 | SX-3 | SVC-8 | Generic MCP-client compatibility test + comment cleanup | R (verification) | `tests/Sextant.Service.Tests`, `ServiceApp.cs:80-92` comment |
 | SX-4 | SVC-2 | Per-call selection through reserved tool args (`repository`, `branch`) | R | `ServiceApp.cs` MCP builder, `DatabaseProvider`, `SnapshotStore` |
-| SX-5 | SVC-3 | Caller-assertion verification + delegate tokens | R | new `Sextant.Service.Host/CallerAssertion*.cs`, `ServiceOptions.cs`, middleware `ServiceApp.cs:138-165` |
+| SX-5 | SVC-3 | Caller-assertion verification + delegate tokens | R | new `Sextant.Service/CallerIdentity/*.cs` (verifier, key ring, options, principal), new `Sextant.Service.Host/CallerAssertionGate.cs`, `ServiceOptions.cs`, middleware in `ServiceApp.cs` |
 | SX-6 | SVC-4 | Grants: migration 024, `/control/grants*`, grant authorizer, `list_repositories` | R | migration `024`, `Sextant.Store/RepositoryGrantStore.cs`, `Sextant.Service/GrantReadAuthorizer.cs`, `ServiceApp.cs` |
 | SX-7 | SVC-F | Federated `search_symbols` MCP tool | R (parity) | new `Sextant.Service/Mcp/SearchSymbolsTool.cs`, `ServiceApp.cs:115-125` |
 | SX-8 | SVC-6+7 | Branch-pointer semantics: `expected_head_commit`, `branch_update`, retire, resolve `commit_sha` | R | `ServiceContracts.cs`, `SnapshotService.cs`, `SnapshotStore.cs`, `IndexOrchestrator.cs`, `ServiceApp.cs` |
@@ -202,6 +202,46 @@ The contract is **PS-7 (F4)** (ProcessStack-side spec `20260927-outbound-caller-
 - 20 parallel calls with distinct `sub`s each resolve their own caller.
 - Startup failures for a short key, a duplicate kid, a missing audience, and a malformed `CALLER_IDPS` entry.
 - Log redaction.
+
+### As implemented (SX-5)
+
+The contract above is implemented as written. These are the places where the code is more specific than the spec, or deliberately differs from it.
+
+**Placement.**
+- The pure pieces live in `Sextant.Service/CallerIdentity/`: `CallerAssertionVerifier` (steps 1-11), `CallerKeyRing`, `CallerAssertionOptions` and `CallerPrincipal`. They have no ASP.NET dependency, so they are unit-tested without a host.
+- The HTTP pieces live in `Sextant.Service.Host/CallerAssertionGate.cs`: the middleware admission, the `tools/call` filter, the `Func<CallerPrincipal?>` accessor, and the interim `DenyAllReadAuthorizer` behind a `CallerReadAuthorizer` router.
+- `CallerPrincipal` also carries `TenantSlug` (the signed `tslug`).
+
+**JWS and claims (stricter than the spec).**
+- Each segment must be canonical unpadded base64url. The header and payload must be JSON objects with no duplicate member names, and every string (member names included, at any depth) must decode. A lone-surrogate escape or an invalid UTF-8 byte is `bad_header`/`bad_payload`, never a server error.
+- The JOSE header also refuses `jku`, `jwk`, `x5u`, `x5c` and `crit`, so a key or critical extension can never ride in the header. `typ`, when present, must be exactly `JWT` (case-sensitive).
+- `tslug`, `app`, `dep` and `cid` must be present as strings (empty is allowed); `run` is an optional string. `iat`, `nbf` and `exp` must be present as integers in `[0, 253402300799]`.
+- A `tenantId` in `CALLER_KEYS` is restricted to `[A-Za-z0-9._-]{1,128}`.
+
+**Startup validation (fail closed, in addition to the table).**
+- `CALLER_APPS` entries match `[A-Za-z0-9._-]{1,64}`, and `CALLER_ISSUERS` entries must be non-blank.
+- `CALLER_HEADER` must match `[A-Za-z0-9-]{1,64}`. It may not be `Authorization`, `Proxy-Authorization`, `Cookie` or `X-Sextant-Repository` (case-insensitive).
+- A delegate token must also differ from every `READ_POLICY` principal token, as well as from the query, control and contribute tokens.
+- `DELEGATE_TOKENS` with no non-blank entry fails startup, and so does `DELEGATE_TOKENS` without `CALLER_KEYS`.
+- Validation runs in `ServiceOptions.FromEnvironment` and again in `ServiceApp.RegisterServices`, so directly built options are checked too. Error messages name only the entry index and the kid, never a key or token.
+- `CALLER_KEYS` without `DELEGATE_TOKENS` is allowed: control calls can carry an assertion (for the audit actor) while no delegate read path exists.
+
+**Request matrix details.**
+- `/mcp` policy failures (steps 10-11) are not refused in the middleware. The request is admitted, and the `tools/call` filter returns `caller_not_allowed`. Discovery (`initialize`, `ping`, `tools/list`) with a verified but policy-failing assertion therefore still succeeds, like discovery with no assertion. Every other plane refuses a policy failure with 403.
+- `/query/*` with a delegate token and no assertion is 401 `caller_required`, with `WWW-Authenticate: Bearer error="invalid_request"`. `assertion_not_allowed` uses the same challenge. A failed verification uses `error="invalid_token"`, and a 403 carries no challenge.
+- More than one instance of the assertion header is refused with 401 `invalid_caller_assertion` (reason `duplicate_header`).
+- The caller filter is registered before the SVC-2 selection filter, so a delegate call without a caller gets `caller_required` before its selection arguments are read.
+- A verified caller always requires a repository selection (`RequireRepositorySelection` holds whenever `Func<CallerPrincipal?>` returns a principal), because a caller's reads are scoped to its repositories.
+- `/query/snapshots/{identityHash}/symbols` routes a delegate request through the per-caller authorizer, so it is the uniform 404 in SX-5.
+- `/control/contribute` never accepts an assertion (401 `assertion_not_allowed`): its identity is its bearer.
+- With no `CALLER_KEYS`, an assertion header on `/control/*` is 401 `assertion_not_allowed`. An assertion header with a non-delegate bearer on `/mcp` or `/query/*` is 401 `assertion_not_allowed`, whether or not the feature is configured.
+- Delegate tokens are compared as SHA-256 digests in constant time, against every configured token with no early exit.
+
+**Deferred.**
+- The audit detail suffix (`idp,kid,via,cid,dep,jti`) is not written yet. The audit actor is `HashActor("{tid}/{sub}")` or `HashActor("{tid}/app:{app}")` for ensure (including a denied ensure), branch retire (including a denied retire), retention and backup. Contribute keeps its bearer.
+- Security checklist item 10 (`principal_in_body`) belongs to SX-6, which adds the routes that take a principal.
+
+**Logging.** A refusal logs one warning under the `Sextant.Service.Host.CallerAssertion` category, with the plane, the reason code, the configured `kid` and the signed `jti`. The `jti` is logged only when it is at most 64 characters of `[A-Za-z0-9._:-]`, otherwise as `-`. Nothing else from the assertion or any token is logged.
 
 ## SVC-4 (SX-6): grants, visibility and `list_repositories` (R)
 
