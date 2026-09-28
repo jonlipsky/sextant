@@ -54,7 +54,7 @@ Ships SX-1…SX-8.
    - **Watches.** The owner runs `import-legacy-watches`, which executes as the owner, reads the owner's own legacy user memory, and writes grants through the app. Expect 8 imported.
    - **Enrolled repos.** Fire the app's `nightly-reconcile` schedule immediately with the generic trigger run-now endpoint, `POST /v1/<tenant>/triggers/run/{triggerId}` (`TriggersController.cs:399-416`).
      - Run-now re-enqueues the exact recurring-job definition (`HangfireSchedulerService.RunNowCore`), so it runs as `act=application`.
-     - Its v2.0.x step 1 converts the legacy `enrolled/*` rows into tenant grants. Expect N.
+     - Its v2.0.x legacy enrollment import (after the grants listing, which proves the caller) converts the legacy `enrolled/*` rows into tenant grants. Expect N (the run's log line "N of N enrolled repositories are tenant grants").
      - The app needs no extra schedule for this.
    - **Check:** the Sextant grants list for the owner shows 8 repos.
 4. **Keys.** The human mints a live-bounded key: `processstack api-key create --name sextant-agents --app sextant`. The human also rotates the leaked `<leaked-host-key>` host key into a live-bounded replacement and revokes the old one.

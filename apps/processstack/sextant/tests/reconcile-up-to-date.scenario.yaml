@@ -1,0 +1,62 @@
+name: reconcile-up-to-date
+description: >
+  (#22) A watched default branch the service already points at GitHub's head, as the repository's default,
+  is up to date: nothing is sent.
+entrypoint: reconcile
+http:
+  - connection: sextant-control
+    method: GET
+    path: /control/grants
+    body:
+      targets:
+        - { repository: "https://github.com/octocat/hello-world.git", branch: "", sources: [tenant], watchers: 1 }
+      result_count: 1
+  # Shape: GitHub REST GET /repos/{owner}/{repo} (read by GitHubGetRepository through Octokit).
+  - connection: github
+    method: GET
+    path: /repos/octocat/hello-world
+    body:
+      id: 1296269
+      name: hello-world
+      full_name: octocat/hello-world
+      owner: { login: octocat, id: 1 }
+      private: false
+      default_branch: main
+      html_url: "https://github.com/octocat/hello-world"
+      clone_url: "https://github.com/octocat/hello-world.git"
+  # Shape: GET /control/resolve → the snapshot row plus commit_sha, branch, is_default, head_sequence
+  # (src/Sextant.Service.Host/ServiceApp.cs).
+  - connection: sextant-control
+    method: GET
+    path: /control/resolve
+    body: { id: 7, status: complete, commit_sha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d", branch: main, is_default: true }
+  # Shape: GitHub REST GET /repos/{owner}/{repo}/branches (read by GitHubListBranches through Octokit).
+  - connection: github
+    method: GET
+    path: /repos/octocat/hello-world/branches
+    body:
+      - name: main
+        commit: { sha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d", url: "https://api.github.com/repos/octocat/hello-world/commits/7fd1a60b01f91b314f59955a4e4d4e80d8edf11d" }
+        protected: false
+  - connection: sextant-control
+    method: POST
+    path: "/**"
+    status: 500
+expected:
+  status: Completed
+  variables:
+    status: completed
+    targetCount: 1
+    upToDate: 1
+    ensured: 0
+    retired: 0
+    skipped: 0
+    failed: 0
+  httpCalls:
+    - connection: sextant-control
+      method: GET
+      path: /control/resolve
+      count: 1
+    - connection: sextant-control
+      method: POST
+      count: 0

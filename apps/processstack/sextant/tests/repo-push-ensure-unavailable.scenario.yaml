@@ -1,0 +1,45 @@
+name: repo-push-ensure-unavailable
+description: >
+  (#20) The service answers the push ensure with 503. The failure is logged and the run completes (no
+  retry: the nightly reconcile heals the missed advance). The tenant grant was recorded, so the enrolled row
+  that mirrors it is still written.
+entrypoint: on-repository-change
+event:
+  event: push
+  owner: octocat
+  repo: hello-world
+  connectionId: conn-1
+  cloneUrl: "https://github.com/octocat/hello-world.git"
+  defaultBranch: main
+  ref: refs/heads/main
+  refType: branch
+  branch: main
+  before: "553c2077f0edc3d5dc5d17262f6aa498e69d6f8e"
+  after: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+  forced: "false"
+  deleted: "false"
+http:
+  - connection: sextant-control
+    method: PUT
+    path: /control/grants/tenant
+    body:
+      grant: { repository: "https://github.com/octocat/hello-world.git", branch: "", source: tenant, created_at: 1760000000 }
+      created: false
+  - connection: sextant-control
+    method: POST
+    path: /control/ensure
+    status: 503
+    body: { status: unavailable }
+expected:
+  status: Completed
+  variables:
+    action: ensure
+    grantOutcome: granted
+    ensureOutcome: unavailable
+    ensureReason: "!not_empty"
+    enrollment: recorded
+  httpCalls:
+    - connection: sextant-control
+      method: POST
+      path: /control/ensure
+      count: 1

@@ -1,0 +1,38 @@
+name: reconcile-target-seeded-state-ignored
+description: >
+  A run seeds variables from undeclared inputs (elevenworks/ProcessStack#3286). reconcile-target resets every
+  variable and output first, so a seeded ensure or retire body is never sent and a seeded result never
+  reported. The target is outside github.com, so it is skipped before any call.
+entrypoint: reconcile-target
+inputs:
+  repository: "https://gitlab.example.com/octocat/hello-world.git"
+  branch: ""
+  problem: ""
+  ensureBody: { repository_remote_url: "https://github.com/octocat/hello-world.git", commit_sha: "6dcb09b5b57875f334f61aebed695e2e4193db5e", branch_update: advance }
+  retireBody: { repository: "https://github.com/octocat/hello-world.git", branch: main }
+  ensures: [{ repository_remote_url: "https://github.com/octocat/hello-world.git", commit_sha: "6dcb09b5b57875f334f61aebed695e2e4193db5e", branch_update: advance }]
+  planUpToDate: 1
+  result: ensured
+  reason: ""
+  ensureOutcome: ok
+  retireOutcome: ok
+http:
+  - connection: sextant-control
+    path: "/**"
+    status: 500
+  - connection: github
+    path: "/repos/**"
+    status: 500
+expected:
+  status: Completed
+  variables:
+    result: skipped
+    reason: not_github
+    ensureOutcome: ""
+    retireOutcome: ""
+  httpCalls:
+    - connection: sextant-control
+      count: 0
+    - connection: github
+      path: "/repos/**"
+      count: 0

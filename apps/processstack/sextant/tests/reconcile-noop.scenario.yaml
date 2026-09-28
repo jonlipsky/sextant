@@ -1,0 +1,40 @@
+name: reconcile-noop
+description: >
+  (#21) The nightly reconcile with no enrolled rows and no watched targets lists the tenant's targets
+  (GET /control/grants?scope=tenant, as the application) and does nothing else.
+entrypoint: reconcile
+http:
+  # Shape: GET /control/grants?scope=tenant → {targets: [{repository, branch, sources, watchers}], result_count}
+  # (src/Sextant.Service.Host/GrantEndpoints.cs, src/Sextant.Store/RepositoryGrantStore.cs TenantTargets).
+  - connection: sextant-control
+    method: GET
+    path: /control/grants
+    body: { targets: [], result_count: 0 }
+expected:
+  status: Completed
+  variables:
+    status: completed
+    legacyRows: 0
+    legacyGranted: 0
+    targetCount: 0
+    truncatedTargets: 0
+    upToDate: 0
+    ensured: 0
+    retired: 0
+    skipped: 0
+    failed: 0
+  httpCalls:
+    - connection: sextant-control
+      method: GET
+      path: /control/grants
+      caller: { act: "!absent" }
+      count: 1
+    - connection: sextant-control
+      path: /control/grants/tenant
+      count: 0
+    - connection: sextant-control
+      path: /control/resolve
+      count: 0
+    - connection: github
+      path: "/repos/**"
+      count: 0

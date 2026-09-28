@@ -1,0 +1,39 @@
+name: reconcile-legacy-already-granted
+description: >
+  The steady state after the G2c import: every enrolled repository is already a tenant grant (created
+  false), so the import creates nothing and the targets are listed once.
+entrypoint: reconcile
+seed:
+  appState:
+    - tenantId: test-tenant
+      applicationName: sextant
+      kv:
+        - key: "enrolled/conn-1/github.com/octocat/hello-world@main"
+          value: '{"ConnectionId":"conn-1","Host":"github.com","Owner":"octocat","Repo":"hello-world","Branch":"main","CloneUrl":"https://github.com/octocat/hello-world.git","Slug":"github.com/octocat/hello-world@main","EnrolledAt":"2026-01-01T00:00:00+00:00"}'
+http:
+  - connection: sextant-control
+    method: PUT
+    path: /control/grants/tenant
+    body:
+      grant: { repository: "https://github.com/octocat/hello-world.git", branch: "", source: tenant, created_at: 1750000000 }
+      created: false
+  - connection: sextant-control
+    method: GET
+    path: /control/grants
+    body: { targets: [], result_count: 0 }
+expected:
+  status: Completed
+  variables:
+    status: completed
+    legacyRows: 1
+    legacyGranted: 1
+    targetCount: 0
+  httpCalls:
+    - connection: sextant-control
+      method: PUT
+      path: /control/grants/tenant
+      count: 1
+    - connection: sextant-control
+      method: GET
+      path: /control/grants
+      count: 1

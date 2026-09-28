@@ -17,10 +17,10 @@
 apps/processstack/sextant/
   psapp.yaml
   README.md
-  orchestrations/  on-repository-change.yaml  reconcile.yaml  configure-watched-repos.yaml
-                   grant-watch.yaml  revoke-watch.yaml
+  orchestrations/  on-repository-change.yaml  reconcile.yaml  reconcile-target.yaml
+                   configure-watched-repos.yaml  grant-watch.yaml  revoke-watch.yaml
   processes/       start-indexing.yaml  get-indexing-status.yaml  import-legacy-watches.yaml
-                   reconcile-target.yaml  ensure.yaml  tenant-grant.yaml  legacy-dual-write.yaml
+                   ensure.yaml  tenant-grant.yaml  legacy-dual-write.yaml
   tests/           *.scenario.yaml   (list below)
 .github/workflows/processstack-app.yml
 ```
@@ -61,23 +61,22 @@ mcp:
                 get_type_hierarchy, get_type_members, semantic_search, trace_value,
                 list_repositories, search_symbols]      # research_codebase excluded (LLM-backed)
 entrypoints:
-  - { name: on-repository-change,    type: orchestration, path: orchestrations/on-repository-change.yaml, isDefault: true }
-  - { name: reconcile,               type: orchestration, path: orchestrations/reconcile.yaml }
-  - { name: configure-watched-repos, type: orchestration, path: orchestrations/configure-watched-repos.yaml }
+  - { name: configure-watched-repos, type: orchestration, path: orchestrations/configure-watched-repos.yaml, isDefault: true }
   - { name: start-indexing,          type: process, path: processes/start-indexing.yaml }
   - { name: get-indexing-status,     type: process, path: processes/get-indexing-status.yaml }
   - { name: import-legacy-watches,   type: process, path: processes/import-legacy-watches.yaml }
-  # internal processes (reconcile-target, ensure, grant-watch, tenant-grant, legacy-dual-write): type process, not in mcp.include
+  - { name: on-repository-change,    type: orchestration, path: orchestrations/on-repository-change.yaml, internal: true }
+  - { name: reconcile,               type: orchestration, path: orchestrations/reconcile.yaml, internal: true }
+  - { name: reconcile-target,        type: orchestration, path: orchestrations/reconcile-target.yaml, internal: true }
+  # internal (not in mcp.include): grant-watch, revoke-watch (orchestrations); ensure, tenant-grant, legacy-dual-write (processes)
 triggers:
-  - id: gh-push
-    type: connection-event
-    inputs: { connection: github, event: push }
-    action: { type: start-orchestration, orchestration: on-repository-change, inputs: { kind: "push", ev: "= event" } }
-  - { id: gh-delete,     type: connection-event, inputs: { connection: github, event: delete },                   action: { type: start-orchestration, orchestration: on-repository-change, inputs: { kind: "delete", ev: "= event" } } }
-  - { id: gh-pr-open,    type: connection-event, inputs: { connection: github, event: pull_request.opened },      action: { type: start-orchestration, orchestration: on-repository-change, inputs: { kind: "pr", ev: "= event" } } }
-  - { id: gh-pr-sync,    type: connection-event, inputs: { connection: github, event: pull_request.synchronize }, action: { type: start-orchestration, orchestration: on-repository-change, inputs: { kind: "pr", ev: "= event" } } }
-  - { id: gh-pr-reopen,  type: connection-event, inputs: { connection: github, event: pull_request.reopened },    action: { type: start-orchestration, orchestration: on-repository-change, inputs: { kind: "pr", ev: "= event" } } }
-  # G2c: the operator fires this once with trigger run-now (act=application) to import legacy enrollments (reconcile step 1)
+  # the flow reads the normalized fields from `event.*` itself, so no inputs are mapped
+  - { id: gh-push,       type: connection-event, inputs: { connection: github, event: push },                     action: { type: start-orchestration, orchestration: on-repository-change } }
+  - { id: gh-delete,     type: connection-event, inputs: { connection: github, event: delete },                   action: { type: start-orchestration, orchestration: on-repository-change } }
+  - { id: gh-pr-open,    type: connection-event, inputs: { connection: github, event: pull_request.opened },      action: { type: start-orchestration, orchestration: on-repository-change } }
+  - { id: gh-pr-sync,    type: connection-event, inputs: { connection: github, event: pull_request.synchronize }, action: { type: start-orchestration, orchestration: on-repository-change } }
+  - { id: gh-pr-reopen,  type: connection-event, inputs: { connection: github, event: pull_request.reopened },    action: { type: start-orchestration, orchestration: on-repository-change } }
+  # G2c: the operator fires this once with trigger run-now (act=application) to import legacy enrollments (reconcile's legacy import step)
   - { id: nightly-reconcile, type: schedule, inputs: { cron: "0 3 * * *", timezone: Etc/UTC }, action: { type: start-orchestration, orchestration: reconcile } }
   - id: prompt
     type: prompt
@@ -96,8 +95,8 @@ permissions: []
 testDirectory: tests
 ```
 
-- **Passing `ev: "= event"`** (the whole metadata object) is an assumption. If PS requires flat inputs, map each key used below (`= event.owner`, …); v1 maps keys one by one (PS:`samples/applications/sextant/psapp.yaml`).
-- **The enrollment import has no separate entrypoint.** It must run as `act=application`, because `PUT /control/grants/tenant` rejects a user. It is step 1 of `reconcile` (v2.0.x).
+- **No inputs are mapped for repository events** (SX-10). `app test` and the runtime hand a connection-event run the whole normalized metadata as `event`, and `on-repository-change` copies the fields it plans with from `event.*` itself (as strings; see the SX-10 notes). The `kind` input is not needed: the planner reads `event.event`/`event.action`.
+- **The enrollment import has no separate entrypoint.** It must run as `act=application`, because `PUT /control/grants/tenant` rejects a user. It is step 2 of `reconcile` (v2.0.x), after the grants listing that proves the caller.
   - At G2c the operator fires `nightly-reconcile` once with the generic trigger run-now, `POST /v1/{tenant}/triggers/run/{triggerId}` (PS:`TriggersController.cs:399-416`, `triggers:write`).
   - Run-now re-enqueues the exact recurring-job definition (`HangfireSchedulerService.RunNowCore`), so it runs as `act=application`.
   - After that the nightly run keeps it in sync.
@@ -129,13 +128,13 @@ As built (SX-9), `ensure` sends neither `default_branch` nor `forced`: SX-10's p
 
 ### `on-repository-change` (`act=application`)
 
-| `kind` / condition | Steps |
+| Event / condition (as built, SX-10) | Steps |
 |---|---|
-| push, `refType == tag` | No-op (`Log`) |
-| push, `deleted == true` | `HttpRequest POST /control/branches/retire {repository: cloneUrl, branch, expected_head_commit: before}` (409 `head_mismatch`/`default_branch` → `Log`). Then `legacy-dual-write` removes the enrolled row, **only for the default branch**. v1 enrolls only on branch-head advance |
-| push, otherwise | 1. Process `tenant-grant` with `{repository: cloneUrl}` (`PUT /control/grants/tenant`, the default-branch enrollment, idempotent; there is no per-feature-branch tenant grant). 2. `ensure` with `{cloneUrl, after, branch, default_branch: branch == defaultBranch, expected_head_commit: before, forced}`. 3. If `branch == defaultBranch`: `legacy-dual-write` upserts `enrolled/{connectionId}/{slug}` |
-| delete (`refType == branch`) | `HttpRequest POST /control/branches/retire {repository: cloneUrl, branch}` (no CAS; a newer re-create push is ordered by its own CAS) |
-| pr (opened/synchronize/reopened) | `ensure` base `{cloneUrl, baseSha, baseRef, branch_update: none}`; `ensure` head `{headCloneUrl, headSha, headRef, branch_update: none}`. For a fork head, the SVC-5 host policy still applies. **No branch pointer moves** (PS:`GitHubRepositoryEventMapper.cs:202,216` parity) |
+| push, `refType == tag`; `create`; closed or edited pull request; malformed event | No-op (`Log`; the planner's `reason`) |
+| push, `deleted == true` | `HttpRequest POST /control/branches/retire {repository: cloneUrl, branch, expected_head_commit: before}` (409 `head_mismatch`/`default_branch` → `Log`). Then, **only for the default branch and only after the service accepted the retire**, `DeleteAppValue` removes the enrolled row. v1 enrolls only on branch-head advance |
+| push, otherwise | 1. Process `tenant-grant` with `{repository: cloneUrl}` (`PUT /control/grants/tenant`, the default-branch enrollment, idempotent; there is no per-feature-branch tenant grant). **Only when it answers `granted` or `limit`** (an application answer): 2. `POST /control/ensure?wait=false` with the planner's body `{repository_remote_url: cloneUrl, commit_sha: after, branch_name, default_branch: branch == defaultBranch, expected_head_commit: before, forced, branch_update: advance}`. 3. If `branch == defaultBranch` and the grant was `granted`: `SetAppValue` upserts `enrolled/{connectionId}/{slug}` |
+| delete (`refType == branch`) | `GitHubListBranches` first: only when GitHub confirms the branch is still gone, `HttpRequest POST /control/branches/retire {repository: cloneUrl, branch}` (no CAS). Branch present → `branch_exists`; listing failed → `github_unavailable`; not a github.com URL → `not_verifiable`; all skip the retire |
+| pr (opened/synchronize/reopened) | `POST /control/ensure?wait=false` with the planner's base body `{cloneUrl, baseSha, baseRef, branch_update: none}`, then its head body `{headCloneUrl, headSha, headRef, branch_update: none}` (only the base when the head repository was deleted, or when both sides name the same repository and commit). For a fork head, the SVC-5 host policy still applies. **No branch pointer moves** (PS:`GitHubRepositoryEventMapper.cs:202,216` parity) |
 
 **URL spelling rule.** Always send `event.cloneUrl` / `event.headCloneUrl` verbatim. They are GitHub's `clone_url`, the same spelling the v1 publisher sent (PS:`src/ProcessStack.Connections.GitHub/RepositoryEvents/GitHubRepositoryEventMapper.cs:254,277`). The identity hashes the raw URL (`src/Sextant.Service/ServiceContracts.cs:86-97`), so a different spelling re-indexes.
 
@@ -143,17 +142,18 @@ As built (SX-9), `ensure` sends neither `default_branch` nor `forced`: SX-10's p
 
 | Step | Activity | Detail |
 |---|---|---|
-| 1 | (v2.0.x only) legacy enrollment import | `ListAppValues {prefix: "enrolled/"}` → parse the PascalCase JSON → `for-each` process `tenant-grant` (`HttpRequest PUT /control/grants/tenant {repository: CloneUrl}`; non-2xx → `Log`). Idempotent. The G2c run-now does the real import; later runs are no-ops, because after activation only v2 writes enrolled rows and it grants them itself. Removed in v2.1 |
-| 2 | `HttpRequest GET /control/grants?scope=tenant` | `targets[]`: distinct (repository, branch), with no user ids |
-| 3 | `for-each` over targets, `parallel: true`, `maxConcurrency: 4`, process `reconcile-target` | |
-| 3a | `GetRepository` (github) | 404/403 → `Log` "not reachable by the tenant connection", skip. `branch == ""` → `defaultBranch` |
-| 3b | `ListBranches` (github) | Branch absent → skip. Retire is left to delete events, so a missed delete stays harmless |
-| 3c | `HttpRequest GET /control/resolve?repository=&branch=` | 200 with `commit_sha == head` → up to date. 200 otherwise → `exp = commit_sha`. 404 → `exp = ""` |
-| 3d | `ensure` | `{repository, head, branch, default_branch, expected_head_commit: exp}` |
-| 4 | `Log` | Counts: up-to-date / re-ensured / skipped / failed |
+| 1 | `HttpRequest GET /control/grants?scope=tenant` | `targets[]`: distinct (repository, branch), with no user ids. Application only: 401/403 → `status: refused`, anything else → `unavailable`; either ends the run having sent nothing else |
+| 2 | (v2.0.x only) legacy enrollment import | `ListAppValues {prefix: "enrolled/"}` → parse the PascalCase JSON → distinct `CloneUrl`s (at most 500) → sequential `for-each` process `tenant-grant` (`PUT /control/grants/tenant {repository: CloneUrl}`; non-2xx → `Log`). Idempotent. When a grant was created, step 1's listing is repeated so it is reconciled in this run (a failed repeat keeps the first listing). The G2c run-now does the real import; later runs create nothing, because after activation only v2 writes enrolled rows and it grants them itself. Removed in v2.1 |
+| 3 | `for-each` over the targets (sorted, de-duplicated, at most 500), `parallel: true`, `maxConcurrency: 4`, `continueOnError`, orchestration `reconcile-target` | |
+| 3a | `GetRepository` (github) | Failure → `Log` "not reachable by the tenant connection", skip (`not_reachable`). `branch == ""` → `defaultBranch` |
+| 3b | `HttpRequest GET /control/resolve?repository=&branch=` | Before the listing, so the CAS covers every later push (`app-activities.md`). Network failure → skip (`resolve_failed`) |
+| 3c | `ListBranches` (github) | Failure → skip (`not_reachable`) |
+| 3d | `SextantPlanReconcile` | 200 with `commit_sha == head` → up to date (unless it is GitHub's default and `is_default` is false: promote, #199). 200 otherwise → `exp = commit_sha`. 404 → `exp = ""`. Branch gone from GitHub → retire under the CAS `commit_sha` (never the default) |
+| 3e | `POST /control/ensure` or `/control/branches/retire` | The planned body verbatim: `{repository, head, branch, default_branch, expected_head_commit: exp, branch_update: advance}` |
+| 4 | `Log` | Counts: up to date / ensured / retired / skipped / failed (a child that returned no result counts as failed) |
 
 - **The head comparison relies on SVC-6+7** (`commit_sha` in resolve).
-- **URLs.** `targets[].repository` is the grant's stored `remote_url`: the spelling first submitted, i.e. GitHub `clone_url` (see SVC-4). The owner/repo for `GetRepository`/`ListBranches` are parsed from it with `SetVariable` string ops. The ensure sends it verbatim, so it hits the same identity as push-time ensures.
+- **URLs.** `targets[].repository` is the grant's stored `remote_url`: the spelling first submitted, i.e. GitHub `clone_url` (see SVC-4). `reconcile-target` checks it and parses the owner/repo for `GetRepository`/`ListBranches` with `SextantNormalizeRepository`; a target outside github.com is skipped (`not_github`). The ensure sends the checked URL, which keeps an https spelling as submitted, so it hits the same identity as push-time ensures.
 
 ### `configure-watched-repos` (chat, `act=user`; internal channels only in v2.0)
 
@@ -181,13 +181,13 @@ As built (SX-9), `ensure` sends neither `default_branch` nor `forced`: SX-10's p
 | Store | Key | Value (exact shape) | Write | Remove |
 |---|---|---|---|---|
 | User memory (`SetMyMemory`) | scope `sextant.watched-repos`, key `{host}/{owner}/{repo}@{branch}` (PS `WatchedRepoScope.SlugFor`, PS:`src/ProcessStack.Activities.Sextant/WatchedRepos/WatchedRepoScope.cs:205-206`: host lowercased without userinfo/port, owner lowercased, repo lowercased without `.git`, branch trimmed) | camelCase `{"owner","repo","branch","cloneUrl","addedAt"}` | watch | **No `DeleteMyMemory` activity exists yet** (`IUserMemoryStore.DeleteAsync` exists; PS-13 adds the activities). v2.0 writes a JSON `null` tombstone, which v1 skips (PS:`src/ProcessStack.Activities.Sextant/WatchedRepos/WatchedRepoStore.cs:33-35`) |
-| App State (`SetAppValue`, app `sextant`) | `enrolled/{connectionId}/{slug}` (PS:`src/ProcessStack.Activities.Sextant/Gateway/EnrolledRepoState.cs:70,81`) | **PascalCase** `{"ConnectionId","Host","Owner","Repo","Branch","CloneUrl","Slug","EnrolledAt"}` (`JsonSerializerDefaults.General`, `:23-31,72`) | Default-branch push | `DeleteAppValue` on a default-branch delete |
+| App State (`SetAppValue`, app `sextant`) | `enrolled/{connectionId}/{slug}` (PS:`src/ProcessStack.Activities.Sextant/Gateway/EnrolledRepoState.cs:70,81`) | **PascalCase** `{"ConnectionId","Host","Owner","Repo","Branch","CloneUrl","Slug","EnrolledAt"}` (`JsonSerializerDefaults.General`, `:23-31,72`) | Default-branch push whose tenant grant answered `granted` (inline in `on-repository-change`) | `DeleteAppValue` after the service accepted a default-branch retire (inline) |
 
 v2.1 cleanup, run through the app (depends on PS-13):
 - `ListAppValues(enrolled/)` → `DeleteAppValue`;
 - `DeleteAppValue` for `sextant-service-url` and `sextant-control-token`;
 - `DeleteMyMemory` (PS-13) for each user's `sextant.watched-repos` keys, tombstones included, run lazily on that user's next chat or `import-legacy-watches` call, because `*MyMemory` is caller-scoped;
-- drop reconcile step 1.
+- drop reconcile's legacy import step.
 
 ## Scenario tests (`tests/`)
 
@@ -219,7 +219,7 @@ These assume the PS-6 scenario stubs: `principal`, `seed.userMemory`, `seed.appS
 | 23 | reconcile-behind | Ensure with `expected_head_commit = resolved` |
 | 24 | reconcile-missing | resolve 404 → CAS `""` |
 | 25 | reconcile-branch-gone | No ensure |
-| 26 | reconcile-legacy-sync | `reconcile` with seeded `enrolled/…` rows → step 1 issues `PUT grants/tenant` per row before the grants listing; a second run with the same seed is idempotent |
+| 26 | reconcile-legacy-sync | `reconcile` with seeded `enrolled/…` rows → after the grants listing, the import issues `PUT grants/tenant` per distinct repository, then lists the grants again because one was created; `reconcile-legacy-already-granted` pins the idempotent steady state (one listing) |
 | 27 | start-indexing-advance / 28 start-indexing-historical | CAS vs `branch_update: none` |
 | 29 | get-indexing-status found / 30 not-found | Output mapping |
 | 31 | caller-claims | Scenario principal → `act=user`, `idp=processstack` on chat and MCP flows; connection-event and schedule triggers → `act=application` with no `idp`/`sub` (if claims are exposed to `expected`) |
@@ -256,7 +256,7 @@ These assume the PS-6 scenario stubs: `principal`, `seed.userMemory`, `seed.appS
 4. **Activate:** `processstack app activate sextant --version 2.0.0` with bindings `github`, `sextant-query` and `sextant-control`.
 5. **Import:**
    - each user runs `import-legacy-watches` (or it happens lazily on first internal-channel chat);
-   - enrollments: fire `nightly-reconcile` once with trigger run-now, `POST /v1/{tenant}/triggers/run/{triggerId}` (needs `triggers:write`). It runs as `act=application`, and its step 1 imports the `enrolled/*` rows.
+   - enrollments: fire `nightly-reconcile` once with trigger run-now, `POST /v1/{tenant}/triggers/run/{triggerId}` (needs `triggers:write`). It runs as `act=application`, and its legacy import step imports the `enrolled/*` rows.
 6. **Agents:** `processstack api-key create --name sextant-agents --app sextant`, then point clients at `POST /v1/{tenant}/mcp/sextant`.
 7. **Rollback:** `processstack app activate sextant --version 1.0.1`. The dual-write keeps v1's stores current.
 
@@ -342,3 +342,84 @@ SX-9 builds the manifest, the chat, the MCP processes, `ensure` and the v1 memor
 - **For G2c:** `app publish` packs every file under the app directory (PS `ApplicationPacker`), including `src/` and the MSTest project's sources. Build output is no longer among them.
 
 **A fix to SX-13's activities.** In-process, PS binds each resolved input onto the activity's property but leaves `Definition.Parameters` holding the authored expression text (`= prompt || ''`); only an off-host dispatch overlays resolved values (elevenworks/ProcessStack#3269). `ActivityValues.Input` preferred the parameter, so every expression input read its own source text, and the parse always returned `help`. The bound property is now the source of truth. A parameter is used only when it is a literal, not text that may be authored. PS is not consistent about the prefix (`"= "`, `"=${"`, a trimmed `=`), so any text whose trimmed start is `=` counts as authored, as do a `${…}` template and `{{ … }}`, also inside a map or list. A false positive costs nothing: the bound property then holds the same literal. `chat-prompt-expression-reaches-parse` pins the symptom end to end through the real `parse` node.
+
+## Implementation notes (SX-10, as built)
+
+SX-10 adds the GitHub repository-event triggers, the nightly schedule, `on-repository-change`, `reconcile`, `reconcile-target` and `tenant-grant`, and resolves #199 in `SextantPlanReconcile`. The tables above are updated to match. Where the code still differs, the code wins.
+
+**Manifest**
+- **Five connection-event triggers and one schedule.** `gh-push`, `gh-delete`, `gh-pr-open`, `gh-pr-sync` and `gh-pr-reopen` on connection `github` start `on-repository-change`; `nightly-reconcile` (`0 3 * * *`, `Etc/UTC`) starts `reconcile`. The triggers map no inputs, because the run receives the normalized metadata as `event`.
+- **`configure-watched-repos` stays the default entrypoint** (the sketch named `on-repository-change`). The default is what an unnamed run starts, and the chat is the only flow a user should reach that way.
+- **The four new entrypoints are `internal: true`** and not in `mcp.include`. `internal` is not enforced on a direct run (elevenworks/ProcessStack#3287), so each flow assumes a direct run with inputs of the caller's choosing, and each resets every variable and output first (elevenworks/ProcessStack#3286).
+- **`permissions: []` stays.** An app reaches its own App State without a permission (PS `docs/APPLICATION_STATE.md`).
+
+**`on-repository-change`**
+- **It reads `event.*` only.** `init` copies the fields `SextantPlanRepositoryChange` reads into `ev`, each as a string (an object or null becomes `""`). `senderLogin` is never read, so it is never identity.
+- **The push ensure and the enrolled row wait for the tenant grant.** A user's direct run runs as that user, with an `event` of its choosing. `tenant-grant`'s `granted` (200) and `limit` (409 `grant_limit`) come only from an application caller: `GrantEndpoints` checks the actor before the write, so a user gets 403 `wrong_actor`. Any other answer, including a 5xx or no response, is logged and ends the run. A missed ensure is healed by the next push or the reconcile.
+  - `repo-push-user-run-refused` pins that a user's run sends only the refused grant.
+  - `repo-push-grant-limit` pins that the ensure is still sent at the tenant's limit, without an enrolled row.
+- **The enrolled row is written inline** with `SetAppValue` (not through `legacy-dual-write`, which keeps the per-user memory). It is written only when all of these hold:
+  - the grant answered `granted` (not `limit`);
+  - the branch is the event's default branch;
+  - the event's `connectionId` matches `^[A-Za-z0-9_-]{1,128}$` (it is a key segment).
+
+  The key is `enrolled/{connectionId}/{host}/{owner}/{repo}@{branch}` with v1's slug rules, and the value is v1's PascalCase shape with an ISO 8601 `EnrolledAt`. It is written whatever the ensure's outcome, because it mirrors the grant. A failed write is logged.
+- **A deleted push** retires under the CAS `before`. The enrolled row is removed (`DeleteAppValue`) only after the service answered the retire with success, whether it retired the branch or found it absent. The service answers 409 `default_branch` for its own default, and 403 to a user.
+- **A delete event's retire has no CAS, so GitHub is asked first.** This implements the narrowing `app-activities.md` suggests. `GitHubListBranches` (Octokit pages through every branch) must not list the branch. Otherwise the retire is skipped (`retireSkipped`):
+  - `branch_exists`: a push re-created it;
+  - `github_unavailable`: the listing failed, or did not return a list;
+  - `not_verifiable`: the repository is not on github.com.
+
+  The window that remains is between the listing and the retire. The reconcile later retires a watched branch the check kept, under a CAS.
+- **Pull requests publish base, then head, with `branch_update: none`.** Neither is gated on a grant (v1 parity): nothing moves, and a user's run is bounded by the service's own grant and SX-6d checks. **A fork head indexes the fork's code** (v1 parity). The service's SVC-5 `REPOSITORY_HOSTS`/`REPOSITORY_OWNERS` intake policy is the control; set `REPOSITORY_OWNERS` for production.
+- **No retry.** Neither `retryAdvised` nor a 503 is retried: every step is idempotent, deliveries are not de-duplicated, and the reconcile heals a missed advance of a watched branch.
+- **Outputs:** `action`, `reason`, `grantOutcome`, `ensureOutcome`/`ensureReason`, `headEnsureOutcome`, `retireOutcome`/`retireReason`, `retired`, `retireSkipped`, `enrollment` (`recorded`/`removed`), `enrolledKey` and `enrolledValue`. Reasons are code-shaped (`^[a-z0-9_]{1,64}$`, else `http_<status>`), and no response body is logged.
+
+**`tenant-grant` (internal process)**
+- **Input `repository`; outputs `outcome`, `created`, `statusCode` and `reason`.** The outcomes are `granted` (200), `limit` (409 `grant_limit`), `rejected` (other 400/409), `unauthorized` (401/403), `unavailable` (no response, 408, 429, 5xx) and `error`.
+- **The URL is checked first** with `SextantNormalizeRepository`. A URL it refuses gives `rejected`/`invalid_repository`, and nothing is sent.
+- **The body is only `{repository}`,** the checked URL. The service takes the tenant and principal from the caller assertion, and it refuses a body that names one (400 `principal_in_body`).
+- **The body expression is wrapped in parentheses:** `= ({ repository: checkedUrl })`. Jint parses `= { repository: x }` as a block with a label, which sends the bare string. `tenant-grant-granted` pins this.
+
+**`reconcile`**
+- **The grants listing comes first.** It is the application-only call, so a user's run stops after one refused `GET`, with `status: refused` (`reconcile-grants-refused`, with seeded enrolled rows). The sketch imported first, which let a user's run send up to 500 refused `PUT`s.
+- **The legacy import follows the listing.** Repositories are de-duplicated by URL, lower-cased without a trailing `/` or `.git` (the tenant grant has no branch), sorted, and capped at 500 per run. They are granted one at a time, so the grant limit is counted in order. When the import created a grant, the targets are listed again. A failed second listing keeps the first, and the new grants wait for the next run.
+- **Targets** are de-duplicated and sorted by (repository key, branch), and capped at 500 per run (`truncatedTargets`: the rest wait for the next run). They are reconciled four at a time with `continueOnError`. A child run that returned no result counts as `failed`.
+- **The reconcile retires, one target at a time.** This follows the planner's default (`app-activities.md`), amending the sketch's "retire is left to delete events". A branch GitHub no longer has is retired under the CAS of the commit the service resolved, and the service's default branch is never retired.
+- **Outputs:** `status` (`completed`, `refused` or `unavailable`), `legacyRows`, `legacyGranted`, `targetCount`, `truncatedTargets`, `upToDate`, `ensured`, `retired`, `skipped` and `failed`.
+
+**`reconcile-target` (internal orchestration)**
+- **It is an orchestration, not a process,** so a GitHub or network failure routes to a skip instead of failing the run.
+- **Inputs `repository` and `branch`; outputs `result`, `reason`, `ensureOutcome` and `retireOutcome`.** `result` is one of `up_to_date`, `ensured`, `retired`, `skipped` or `failed`.
+- **It refuses before any call:**
+  - `invalid_repository`: a URL `SextantNormalizeRepository` refuses;
+  - `not_github`: another host, which the tenant's GitHub connection cannot read;
+  - `invalid_branch`: a branch the chat parser refuses, or one still starting with `refs/heads/`, which is refused rather than stripped (as in `ensure`).
+- **Order:** `GitHubGetRepository` (the default branch's name), then `GET /control/resolve` with that name (a target with branch `""` is the default), then `GitHubListBranches`, then `SextantPlanReconcile` over this one target. So the planner's limits never bind.
+- **Skips:** `not_reachable` (a GitHub read failed), `default_branch_unknown`, `resolve_failed` (the resolve had no response), or the planner's skip reason.
+
+**#199: the reconcile sets the default**
+- `SextantPlanReconcile` ensures a target when all of these hold: it is at GitHub's head, it is on GitHub's default branch, and its resolve says `is_default: false`. The ensure carries the CAS of the current commit and `default_branch: true`. Before, such a target was up to date and never promoted.
+- The service passes the CAS on the unchanged commit (`BranchHeadMatches`), then `ShouldOwnDefault` and `PromoteSoleDefaultBranch` make the branch the default. No pointer moves (`SnapshotService.ApplyReuseBranchDecision`).
+- This is the case SX-9 left open: a user's first watch creates the branch non-default, and the default-branch grant reports `missing` until an application ensure sets the default. The first reconcile now does that without waiting for a push.
+- `reconcile-sets-default` and the planner's unit tests pin it.
+
+**Scenarios (as built)**
+- **The numbered scenarios map to these files:**
+  - 13 and 33: `repo-push-default-branch` (the sender's login is a user id);
+  - 14: `repo-push-feature-branch`;
+  - 15: `repo-push-branch-create`;
+  - 16: `repo-push-deleted`;
+  - 17: `repo-push-tag-ignored`;
+  - 18: `repo-delete-event-retires`;
+  - 19: `repo-pr-opened`;
+  - 20: `repo-push-ensure-unavailable`;
+  - 21 to 26: `reconcile-noop`, `reconcile-up-to-date`, `reconcile-behind`, `reconcile-missing`, `reconcile-branch-gone` and `reconcile-legacy-sync`.
+- **Added:**
+  - `repo-delete-event-branch-recreated` and `repo-delete-event-github-unavailable`;
+  - `repo-push-user-run-refused` and `repo-push-grant-limit`;
+  - `reconcile-sets-default`, `reconcile-several-targets`, `reconcile-grants-refused` and `reconcile-legacy-already-granted`;
+  - `reconcile-target-refuses-heads-prefixed-branch` and `tenant-grant-granted`.
+- **Seeded-state pins,** each checked by mutation (removing one name from the flow's `init` fails it): `repo-change-seeded-state-ignored`, `reconcile-seeded-state-ignored`, `reconcile-target-seeded-state-ignored` and `tenant-grant-seeded-outputs-ignored`.
+- **The harness exposes no claims for an application run.** `caller: { act: "!absent" }` therefore asserts that no user caller signed the request, which is how 31 and 33 are checked for repository events and the schedule.
+- **`app test` supplies the connection-event envelope.** The scenario's `event:` block is merged over its defaults.

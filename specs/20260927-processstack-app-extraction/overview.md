@@ -54,7 +54,7 @@ flowchart LR
   subgraph APP[apps/processstack/sextant v2.0.0]
     P1[start-indexing / get-indexing-status /<br/>import-legacy-watches]
     O1[on-repository-change]
-    O2[reconcile nightly / run-now<br/>step 1 v2.0.x: legacy enrollment import]
+    O2[reconcile nightly / run-now<br/>v2.0.x: legacy enrollment import]
     O3[configure-watched-repos chat<br/>internal channels in v2.0]
   end
   subgraph SX[Sextant service container]
