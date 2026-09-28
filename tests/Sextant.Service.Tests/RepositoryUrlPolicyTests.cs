@@ -196,14 +196,14 @@ public class RepositoryUrlPolicyTests
     {
         var policy = new RepositoryUrlPolicy(
             ["github.com", "git.example.com"],
-            ["github.com/ElevenWorks", "git.example.com/Team"]);
-        CollectionAssert.AreEqual(new[] { "github.com/elevenworks", "git.example.com/Team" }, policy.Owners!.ToArray());
+            ["github.com/Acme", "git.example.com/Team"]);
+        CollectionAssert.AreEqual(new[] { "github.com/acme", "git.example.com/Team" }, policy.Owners!.ToArray());
 
-        Assert.IsTrue(policy.Evaluate("https://github.com/elevenworks/processstack").Ok);
-        Assert.IsTrue(policy.Evaluate("https://github.com/ELEVENWORKS/ProcessStack.git").Ok,
+        Assert.IsTrue(policy.Evaluate("https://github.com/acme/widgets").Ok);
+        Assert.IsTrue(policy.Evaluate("https://github.com/ACME/Widgets.git").Ok,
             "github.com owners are case-insensitive (RemoteUrlIdentity fold)");
         Assert.AreEqual(RepositoryUrlRejection.OwnerNotAllowed, policy.Evaluate("https://github.com/other/app").Reason);
-        Assert.AreEqual(RepositoryUrlRejection.OwnerNotAllowed, policy.Evaluate("https://github.com/elevenworks-evil/app").Reason);
+        Assert.AreEqual(RepositoryUrlRejection.OwnerNotAllowed, policy.Evaluate("https://github.com/acme-evil/app").Reason);
 
         Assert.IsTrue(policy.Evaluate("https://git.example.com/Team/app").Ok);
         Assert.AreEqual(RepositoryUrlRejection.OwnerNotAllowed, policy.Evaluate("https://git.example.com/team/app").Reason,
