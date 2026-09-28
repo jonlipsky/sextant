@@ -783,7 +783,23 @@ public class CallerAssertionHttpTests
             return new ToolCall(isError, JsonDocument.Parse(text).RootElement.Clone());
         }
 
+        /// <summary>When set, every <c>/mcp</c> request carries it as the <c>X-Sextant-Repository</c> header.</summary>
+        public string? RepositoryHeader { get; set; }
+
         public async Task<RpcResponse> RpcAsync(string method, string paramsJson, string token, params string[] assertions)
+        {
+            var (status, raw, challenge, payload) = await SendRpcAsync(method, paramsJson, token, assertions);
+            if (status != HttpStatusCode.OK)
+                return new RpcResponse(status, raw, challenge, null);
+
+            using var rpc = JsonDocument.Parse(payload);
+            Assert.IsTrue(rpc.RootElement.TryGetProperty("result", out var result), payload);
+            return new RpcResponse(status, raw, challenge, result.Clone());
+        }
+
+        /// <summary>One JSON-RPC exchange on <c>/mcp</c>, returned as sent back (no assertion on its shape).</summary>
+        public async Task<(HttpStatusCode Status, string Raw, string Challenge, string Payload)> SendRpcAsync(
+            string method, string paramsJson, string token, params string[] assertions)
         {
             using var request = new HttpRequestMessage(HttpMethod.Post, "/mcp")
             {
@@ -796,21 +812,42 @@ public class CallerAssertionHttpTests
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
             foreach (var assertion in assertions)
                 request.Headers.TryAddWithoutValidation(Header, assertion);
+            if (RepositoryHeader is not null)
+                request.Headers.TryAddWithoutValidation(ServiceApp.RepositoryHeader, RepositoryHeader);
 
             using var response = await Client.SendAsync(request);
             var raw = await response.Content.ReadAsStringAsync();
             var challenge = response.Headers.WwwAuthenticate.ToString();
-            if (response.StatusCode != HttpStatusCode.OK)
-                return new RpcResponse(response.StatusCode, raw, challenge, null);
-
             var payload = raw.Contains("data:", StringComparison.Ordinal)
                 ? string.Concat(raw.Split('\n')
                     .Where(l => l.StartsWith("data:", StringComparison.Ordinal))
                     .Select(l => l["data:".Length..].Trim()))
                 : raw;
-            using var rpc = JsonDocument.Parse(payload);
-            Assert.IsTrue(rpc.RootElement.TryGetProperty("result", out var result), payload);
-            return new RpcResponse(response.StatusCode, raw, challenge, result.Clone());
+            return (response.StatusCode, raw, challenge, payload);
+        }
+
+        /// <summary>Takes the single-writer lease from this service (another owner claims it) and waits until it notices.</summary>
+        public async Task StealLeaseAsync()
+        {
+            ExecuteOnCatalog("UPDATE writer_lease SET owner_token = 'thief' WHERE id = 1;");
+            var deadline = DateTime.UtcNow.AddSeconds(15);
+            while (!Service.LeaseLost && DateTime.UtcNow < deadline)
+                await Task.Delay(50);
+            Assert.IsTrue(Service.LeaseLost, "the service noticed it lost the lease");
+        }
+
+        /// <summary>Runs one statement on the catalog through a connection of its own (not the service's).</summary>
+        public void ExecuteOnCatalog(string sql)
+        {
+            using var conn = new Microsoft.Data.Sqlite.SqliteConnection(new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder
+            {
+                DataSource = DbPath,
+                Pooling = false
+            }.ToString());
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = sql;
+            cmd.ExecuteNonQuery();
         }
 
         public Task<HttpResponseMessage> SnapshotPageAsync(string token, string identityHash, params string[] assertions)

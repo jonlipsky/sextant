@@ -643,7 +643,7 @@ The host deliberately **separates control endpoints from query endpoints**, and 
 | `POST /control/ensure` | control | control token | Idempotent ensure-snapshot (criterion 1). Accepts an optional monotonic `branch_head_sequence` for forward-only branch-head advance (Phase 14, issue #84), **or** an `expected_head_commit` head CAS, plus `forced` and `branch_update` (see [Branch-pointer guards](#branch-pointer-guards-head-cas-branch_update-none-retire-svc-67)); the result carries `branch_advanced`. Blocks until terminal (`200`; `202` when transient-requeued) unless `?wait=false`, which returns `202` at once with the job to poll (issue #148). A caller disconnect/timeout **never** cancels production. A repository URL the [repository URL policy](#repository-url-policy-svc-5) refuses, both branch guards together (`conflicting_branch_guards`) or an unknown `branch_update` (`invalid_branch_update`) is `400 {"status":"rejected","reason":"<code>"}` before any job exists (audited `ensure`/`denied`). A user caller (`act=user` assertion) may ensure only a repository it can read: otherwise `403 {"status":"rejected","reason":"not_granted"}` (SVC-4). |
 | `POST /control/contribute` | control | control **or** contribute token | Ingest a client/CI semantic contribution (Phase 16); the least-privilege contribute token authorizes this endpoint only. |
 | `GET /control/status/{jobId}` | control | control token | Job status + per-project diagnostics (criterion 5) + checkout `coverage` (#119). For a user caller, a job on a repository it cannot read is the same `404` as an unknown id (SVC-4). |
-| `GET /control/resolve` | control | control token | Resolve a repository branch (`?branch=`, else the default) to its current published snapshot (+ its `coverage`, #119), plus `commit_sha`, the resolved `branch` name, `is_default` and `head_sequence` (SVC-7; a null `commit_sha`/`head_sequence` is omitted). |
+| `GET /control/resolve` | control | control token | Resolve a repository branch (`?branch=`, else the default) to its current published snapshot (+ its `coverage`, #119), plus `commit_sha`, the resolved `branch` name, `is_default` and `head_sequence` (SVC-7; a null `commit_sha`/`head_sequence` is omitted). For a user caller, a repository it cannot read is the same bare `404` as an absent one (SVC-4). |
 | `POST /control/branches/retire` | control | control token | Delete a branch pointer (`{repository, branch, expected_head_commit?}`, SVC-6); its snapshots stay for retention. `200 {"retired":true}`, or `{"retired":false}` for a missing branch (idempotent). The default branch or a head-CAS mismatch is `409 {"status":"rejected","reason":"default_branch"\|"head_mismatch"}`; a refused URL or blank branch is `400`. Audited `retire`. |
 | `POST /control/retention` | control | control token | Run the service-owned retention/GC pass (`?execute=true` to apply). |
 | `PUT`/`DELETE`/`GET /control/grants/self` | control | control token + `act=user` assertion | The caller's own repository grants (see [Repository grants](#repository-grants-and-visibility-svc-4)). |
@@ -800,6 +800,12 @@ across requests, so a revocation takes effect on the next call. Once a request h
 - **`/control/ensure`** by a user caller needs the repository to be visible, otherwise `403 not_granted`
   (audited `ensure`/`denied`). An application caller (a trigger) and an assertion-less call are unchanged.
 - **`/control/status/{jobId}`** by a user caller is `404` for a job on a repository it cannot see.
+- **`/control/resolve`** by a user caller is the same bare `404` as an absent repository when it cannot see
+  the repository (checked before the branch is resolved). An application caller and an assertion-less call
+  are unchanged.
+- **Failures fail closed:** if the grant catalog cannot be read, the read fails (a tool error or a `5xx`)
+  rather than reading as allowed. A grant write, or a user's `not_granted` ensure refusal, that cannot be
+  recorded (the service lost its writer lease or is stopping) is `503 unavailable` and writes nothing.
 
 **Routes.** Every route needs the control token **and** a verified assertion with the stated `act`.
 

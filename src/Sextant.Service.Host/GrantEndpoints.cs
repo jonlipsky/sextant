@@ -189,7 +189,7 @@ internal static class GrantEndpoints
             {
                 if (buffer.Length + read > MaxBodyBytes)
                     return invalid;
-                buffer.Write(chunk, 0, read);
+                await buffer.WriteAsync(chunk.AsMemory(0, read), ct);
             }
             bytes = buffer.ToArray();
         }

@@ -407,6 +407,24 @@ public class GrantServiceTests
     }
 
     [TestMethod]
+    public void Authorizer_VisibilityReadFailure_FailsClosed()
+    {
+        var provider = PublishOnBranch(Widgets, "commit-w1", "main", isDefault: true);
+        SeedConsumer(Gadgets, "commit-g1", provider);
+        var authorizer = new GrantReadAuthorizer(() => throw new InvalidOperationException("the grant catalog is unreadable"), _ => Widgets);
+        var conn = _db.GetConnection();
+
+        // A failed visibility read propagates (the tool call fails) instead of reading as "allowed".
+        Assert.ThrowsExactly<InvalidOperationException>(() => authorizer.Authorize(Row(1)));
+        Assert.ThrowsExactly<InvalidOperationException>(() => authorizer.AuthorizeRepository(1, Widgets));
+        Assert.ThrowsExactly<InvalidOperationException>(() => authorizer.IsVisible(Widgets));
+        Assert.ThrowsExactly<InvalidOperationException>(() =>
+            CrossRepositoryUsageResolver.ResolveConsumers(conn, Widgets, null, CrossRepoUsageScope.DefaultHeads, authorizer));
+        Assert.ThrowsExactly<InvalidOperationException>(() =>
+            CrossRepositoryUsageResolver.Resolve(conn, Widgets, "global::App.Type0", CrossRepoUsageScope.DefaultHeads, authorizer));
+    }
+
+    [TestMethod]
     public void RepositoryGrantKey_FoldsSpellings_AndRevocationSurvivesANarrowedAllowList()
     {
         Assert.AreEqual(Key(Widgets), Key("https://GitHub.com/acme/Widgets.git"));

@@ -302,6 +302,7 @@ CREATE INDEX ix_grants_tenant_repo ON repository_grants(tenant_id, repository_ke
 | `/query/snapshots/{hash}/symbols` | For a delegate caller, authorized by grants in place of `AuthorizedForSnapshot`'s policy check (`ServiceApp.cs:422-433`), with the same uniform 404 |
 | `/control/ensure` with `act=user` | The repository must be visible → otherwise 403 `not_granted`. Trigger (`act=application`) and assertion-less control calls are unchanged |
 | `/control/status/{id}` with `act=user` | 404 unless the job's repository is visible (#77 opaque ids stays N) |
+| `/control/resolve` with `act=user` | The same bare 404 as an absent repository unless the repository is visible. Checked before the branch is resolved. Trigger (`act=application`) and assertion-less control calls are unchanged |
 
 **`list_repositories` MCP tool** (in `Sextant.Service`, added to `RemoteQueryTools`):
 - Input: `{}`.
@@ -317,7 +318,7 @@ CREATE INDEX ix_grants_tenant_repo ON repository_grants(tenant_id, repository_ke
 - Cross-repo tools are filtered.
 - An ungranted repository gets a uniform not-found.
 - Implicit selection.
-- The limits; the ensure/status `act=user` gates; audit rows.
+- The limits; the ensure/status/resolve `act=user` gates; audit rows.
 - Reconcile targets contain no user ids.
 
 ### As implemented (SX-6)
@@ -327,8 +328,8 @@ The contract above is implemented as written. These are the places where the cod
 **Placement.**
 - The storage is `Sextant.Store/RepositoryGrantStore.cs` over migration `024_repository_grants.sql`, exactly as the schema above.
 - The service logic is `Sextant.Service/SnapshotService.Grants.cs`. The pure pieces are in `Sextant.Service/Grants/`: `RepositoryGrantKey`, `GrantReadAuthorizer`, `ListRepositoriesTool`, `CallerContext` and the contracts.
-- The routes and the per-request visibility cache (`CallerVisibility`) are in `Sextant.Service.Host/GrantEndpoints.cs`. `ServiceApp.cs` gains only the authorizer install, the ensure and status gates, implicit selection and one `GrantEndpoints.Map` call.
-- `GrantReadAuthorizer` is built over a `Func<IReadOnlySet<string>?>` (the caller's visible keys) and the catalog's id → URL resolver. `GrantReadAuthorizer.IsVisible(keys, url)` is public so a repository-set filter (SX-7) can reuse the same rule.
+- The routes and the per-request visibility cache (`CallerVisibility`) are in `Sextant.Service.Host/GrantEndpoints.cs`. `ServiceApp.cs` gains only the authorizer install, the ensure, status and resolve gates, implicit selection and one `GrantEndpoints.Map` call.
+- `GrantReadAuthorizer` is built over a `Func<IReadOnlySet<string>?>` (the caller's visible keys) and the catalog's id → URL resolver. `GrantReadAuthorizer.IsVisible(url)` is public so a repository-set filter (SX-7) can reuse the same rule.
 
 **Repository key (differs from the schema comment).**
 - `repository_key` is `RepositoryGrantKey.Of(url)`, the SVC-5 canonical `https://{host}/{owner}/{repo}` form (folded by `RemoteUrlIdentity.Normalize`), not a bare `Normalize`.
@@ -385,6 +386,9 @@ The contract above is implemented as written. These are the places where the cod
 - **Cross-repo tools** with a verified caller default the selection to `provider_repository_url` (SX-5). The provider must therefore be visible and have a complete default-branch snapshot, and each listed consumer repository is then filtered by `AuthorizeRepository`.
 - **Ensure gate order:** the URL policy (400) is checked first, then `not_granted` (403), then the branch guards (400).
 - **Status gate:** a job on a repository the user caller cannot see is the same bare 404 as an unknown id.
+- **Resolve gate** (added in review): `GET /control/resolve` by a user caller checks visibility before resolving the branch, so an ungranted repository is the same bare 404 as an absent repository or branch. Application and assertion-less callers are unchanged. `/control/branches/retire` is not grant-gated (a follow-up).
+- **Header selection:** an `X-Sextant-Repository` header is authorized like a `repository` argument; it never bypasses the grant. When both are sent and name different repositories, the call fails with `selector_conflict` before any grant or catalog lookup.
+- **Failure:** a visibility read that fails (the grant catalog cannot be read) propagates out of the authorizer, so the call fails (a tool error, or a 5xx on HTTP) and never reads as allowed. A grant write that cannot be recorded (lease lost, service disposed) is 503 `unavailable`, and so is a user's ensure whose `not_granted` row cannot be recorded; neither writes a row.
 
 **`list_repositories`.**
 - It is served only to a verified caller. A request with no verified caller (a legacy query token, for example) gets the `caller_required` tool error.

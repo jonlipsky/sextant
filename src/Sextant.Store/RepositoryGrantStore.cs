@@ -139,16 +139,15 @@ public sealed class RepositoryGrantStore(SqliteConnection connection)
     public int Delete(string tenantId, string principal, string repositoryKey, string branch)
     {
         using var cmd = connection.CreateCommand();
-        var allBranches = branch == AllBranches;
-        cmd.CommandText = $"""
+        cmd.CommandText = """
             DELETE FROM repository_grants
             WHERE tenant_id = @tenant AND principal = @principal AND repository_key = @key
-              {(allBranches ? string.Empty : "AND branch = @branch")};
+              AND (@all = 1 OR branch = @branch);
             """;
         Bind(cmd, tenantId, principal);
         cmd.Parameters.AddWithValue("@key", repositoryKey);
-        if (!allBranches)
-            cmd.Parameters.AddWithValue("@branch", branch);
+        cmd.Parameters.AddWithValue("@all", branch == AllBranches ? 1 : 0);
+        cmd.Parameters.AddWithValue("@branch", branch);
         return cmd.ExecuteNonQuery();
     }
 
@@ -191,15 +190,13 @@ public sealed class RepositoryGrantStore(SqliteConnection connection)
     public IReadOnlyList<RepositoryGrantRow> ListVisible(string tenantId, string? userSubject)
     {
         using var cmd = connection.CreateCommand();
+        // An application caller (no subject) matches the tenant-wide principal twice, i.e. only '*'.
         cmd.CommandText = $"""
             SELECT {Columns} FROM repository_grants
-            WHERE tenant_id = @tenant AND (principal = @wide {(userSubject is null ? string.Empty : "OR principal = @principal")})
+            WHERE tenant_id = @tenant AND (principal = @wide OR principal = @principal)
             ORDER BY repository_key, branch, principal <> @wide, created_at, id;
             """;
-        cmd.Parameters.AddWithValue("@tenant", tenantId);
-        cmd.Parameters.AddWithValue("@wide", TenantWide);
-        if (userSubject is not null)
-            cmd.Parameters.AddWithValue("@principal", userSubject);
+        BindVisible(cmd, tenantId, userSubject);
         return ReadAll(cmd);
     }
 
@@ -207,19 +204,23 @@ public sealed class RepositoryGrantStore(SqliteConnection connection)
     public IReadOnlySet<string> VisibleKeys(string tenantId, string? userSubject)
     {
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = $"""
+        cmd.CommandText = """
             SELECT DISTINCT repository_key FROM repository_grants
-            WHERE tenant_id = @tenant AND (principal = @wide {(userSubject is null ? string.Empty : "OR principal = @principal")});
+            WHERE tenant_id = @tenant AND (principal = @wide OR principal = @principal);
             """;
-        cmd.Parameters.AddWithValue("@tenant", tenantId);
-        cmd.Parameters.AddWithValue("@wide", TenantWide);
-        if (userSubject is not null)
-            cmd.Parameters.AddWithValue("@principal", userSubject);
+        BindVisible(cmd, tenantId, userSubject);
         var keys = new HashSet<string>(StringComparer.Ordinal);
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
             keys.Add(reader.GetString(0));
         return keys;
+    }
+
+    private static void BindVisible(SqliteCommand cmd, string tenantId, string? userSubject)
+    {
+        cmd.Parameters.AddWithValue("@tenant", tenantId);
+        cmd.Parameters.AddWithValue("@wide", TenantWide);
+        cmd.Parameters.AddWithValue("@principal", userSubject ?? TenantWide);
     }
 
     /// <summary>
