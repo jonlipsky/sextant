@@ -440,6 +440,54 @@ The contract above is implemented as written. These are the places where the cod
 - A forged hash is ignored.
 - `pending`; `unavailable`; the branch filter; narrowing; the limit clamp; a non-string cursor.
 
+### As implemented (SX-7)
+
+The contract above is implemented, with the differences below. The user docs are in `docs/service.md` ("`search_symbols` (SVC-F)").
+
+**Placement.**
+- The tool is `Sextant.Service/Search/SearchSymbolsTool.cs`, a service-only tool like `list_repositories`. It is last in `ServiceApp.RemoteQueryTools`, so the local stdio server never registers it and its `tools/list` is unchanged.
+- The search is `Sextant.Service/SnapshotService.Search.cs`. The cursor codec is `Search/SymbolSearchCursor.cs`, and the DTOs are in `Search/SymbolSearchModels.cs`.
+- `ServiceApp.cs` gains only the tool type and one `tools/list` filter (`SearchSymbolsTool.ListToolsFilter`), which advertises the tool's own strict schema.
+- `RepositoryUrlPolicy.EvaluateSelector` (moved from `ToolSelectionFilters`) parses the `repository` argument the same way SVC-2 parses the reserved one.
+
+**Inputs (differs from the table).**
+- **`name_prefix` is required** (1-256 characters, trimmed). A required prefix keeps every call a filtered read, and a search without one is what `list_repositories` plus the per-repository tools already cover.
+- The prefix is a literal: `%`, `_` and `\` are escaped in the `LIKE` pattern. SQLite's `LIKE` folds ASCII letters only, so case-insensitivity is ASCII-only.
+- **`kind` (N, additive):** an optional lowercase `SymbolKind` name, advertised as an `enum`.
+- The tool parses its raw arguments itself, so a wrong type, an unknown argument or an unknown `kind` is the tool error `invalid_arguments`. A `repository` the URL policy refuses is `invalid_selector`.
+- `limit` is clamped, never refused, and it is not bound to the cursor, so it may change between pages.
+
+**Callers and selection.**
+- There is no assertion-less mode. A request with no verified caller (a plain query token, or a delegate token without an assertion) gets `caller_required` and reads nothing. The tool did not exist on the remote surface before, so nothing is narrowed or widened.
+- Visibility is `RepositoryGrantStore.ListVisible` over the SX-6 subject (a user's `sub` plus `'*'`; an application's `'*'` only), read inside the same `ReadCatalog` transaction as the branch pointers and every page. A failed read propagates, so the call fails, and it is never an empty result or an unscoped read.
+- The tool is in `ToolSelectionFilters.SelectionExemptTools`, and it **ignores the `X-Sextant-Repository` header**: only its own arguments narrow the search.
+- **Branch.** With no `branch`, each granted branch of each visible repository is searched, and a `''` grant is the default branch. An explicit `branch` matches a granted branch (or a `''` grant whose default branch has that name) **or any indexed branch of a visible repository**, because SVC-4 visibility is repository-level.
+- Branches whose heads point at the same snapshot are searched once, and the rows are labeled with the first (repository key, branch) in order.
+
+**Algorithm (differs from step 4).**
+- The pages are read with one constant, parameterized SQL statement over `snapshot_projects` → `symbols` (`id > @after`, `display_name LIKE @pattern ESCAPE '\'`, an optional kind), not `LocalBaseSnapshotSource`, which has no name filter. No migration or index was added, so the prefix match is a scan of each snapshot's symbols.
+- Each snapshot reads `limit + 1` rows to decide whether it has more. A `SqliteException` for one snapshot makes it `unavailable`, and it keeps its position. The whole call is one read transaction.
+- **`truncated` (N, additive):** the tracked targets not read on this call because of the width cap, plus the ones not tracked yet. A persistently unavailable snapshot keeps `next_cursor` non-null.
+- `SEARCH_MAX_WIDTH` (`SEXTANT_SERVICE_SEARCH_MAX_WIDTH`, default 50) is clamped to 100.
+- **Fairness (issue #176, point 2).** Up to 100 snapshots (`ServiceOptions.SearchMaxWidthCeiling`) are tracked at a time, in hash order. Each call reads at most `SEARCH_MAX_WIDTH` of them **round-robin in rounds**: a page reads, in hash order, only tracked snapshots after the cursor's rotation point `r` (the previous page's last read) and never wraps past the end, so the last page of a round can read fewer than the width. Once no tracked snapshot is after `r`, the next page starts a new round from the lowest hash. A not-yet-searched snapshot is admitted only while no tracked snapshot is waiting at or before `r` for the next round, so it joins at the tail of a round. It never jumps ahead of a long snapshot that is waiting. With V visible snapshots, each tracked one is read at least once every ⌈min(V, 100) / width⌉ pages (strictly, ⌈N / width⌉, where N is the tracked count on the last page before its read on which admission was allowed) (`DeferredSnapshot_IsSearchedWithinABoundedNumberOfPages`, and `LongSnapshot_IsNotStarvedByAdmissions_BeyondTheTrackedCapacity` with 151 visible snapshots). An `unavailable` snapshot keeps its position and is retried within the same bound, not necessarily on the next page. Beyond 100 visible snapshots, the rest wait for tracked ones to finish: a bounded cursor cannot carry a position for every one of an unbounded set. The cursor holds at most 100 positions, so it always fits in 16 KiB.
+- **Resolve fan-out (issue #176, point 1).** The gateway's concern was one HTTP resolve per target. In the service, resolution is in-process indexed lookups (the branch pointer and snapshot row per target, repository ids from a per-read dictionary) in the same read transaction, and the target count is bounded by `MAX_GRANTS_PER_PRINCIPAL` plus the tenant's `'*'` grants (at most `MAX_GRANTS_PER_TENANT`). Only the per-snapshot page scans are expensive, and those are bounded by the width. Resolution is not batched across pages, because the dedup by identity hash must see every target to guarantee no duplicates.
+
+**Cursor (differs from `{v, s, d}`).**
+- The cursor is `base64url(JSON {"v":1, "a":[[hash, afterId], ...], "w":watermark|null, "r":rotation|null, "b":digest})`.
+  - `a` holds the snapshots still being paged.
+  - `w` is the greatest identity hash admitted so far. Any visible hash after it has not been searched yet, which replaces the deferred list.
+  - `r` is the last snapshot the page read, where the next page's round-robin starts. It is only a comparison point (at most `w`, and only with a `w`), so a forged value reads nothing.
+  - `b` is an unkeyed SHA-256 over the state and the binding: the tenant, `user:{sub}` or `app:{app}`, `name_prefix`, `kind`, the repository key and `branch`.
+- A tampered, malformed or oversized cursor, or one issued to another caller, tenant or query, is `invalid_cursor`.
+- The digest is not authorization. Only positions whose hash is still visible are honored, so a revoked, forged or unknown hash is dropped silently, and none of them is an oracle.
+- A snapshot superseded mid-pagination is dropped. Its replacement is searched only if its hash sorts after the watermark.
+
+**Output.**
+- `kind` is the lowercase `SymbolKind` name and `accessibility` is `SymbolStore.FormatAccessibility`, which is how the local tools render them. The snapshot page `/query/snapshots/{hash}/symbols` still emits integers and is unchanged.
+- `next_cursor` is always present (null at the end). `project` is the project's canonical id.
+- `meta.index_freshness` is the newest `published_at` among the snapshots read on this call.
+- Every error, including `caller_required` and `no_visible_repositories`, is an `isError` tool result. `list_repositories`'s `caller_required` is not.
+
 ## SVC-6+7 (SX-8): branch-pointer semantics (R)
 
 **Today:**

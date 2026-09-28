@@ -87,6 +87,22 @@ public sealed record ServiceOptions
     internal const int DefaultMaxGrantsPerTenant = 5000;
 
     /// <summary>
+    /// The most snapshots one <c>search_symbols</c> call reads (SVC-F). The caller's other visible targets are
+    /// deferred to later pages, round-robin, and reported as <c>truncated</c>. <c>SEXTANT_SERVICE_SEARCH_MAX_WIDTH</c>
+    /// (default 50); a missing, non-positive or unparseable value keeps the default, and a larger value is clamped to
+    /// <see cref="SearchMaxWidthCeiling"/>.
+    /// </summary>
+    public int SearchMaxWidth { get; init; } = DefaultSearchMaxWidth;
+
+    internal const int DefaultSearchMaxWidth = 50;
+
+    /// <summary>
+    /// The largest <see cref="SearchMaxWidth"/> honoured, and the most snapshots one search tracks at once (the most
+    /// positions a search cursor carries, which keeps it within its 16 KiB bound).
+    /// </summary>
+    public const int SearchMaxWidthCeiling = 100;
+
+    /// <summary>
     /// Throws when the caller-identity settings are inconsistent (fail closed): invalid <see cref="CallerAssertion"/>
     /// options, delegate tokens without caller keys, or a delegate token that is blank or equal to the control,
     /// query or contribute token or to a read-policy principal's token. Messages never contain a token or key.
@@ -318,6 +334,8 @@ public sealed record ServiceOptions
                 ? perPrincipal : DefaultMaxGrantsPerPrincipal,
             MaxGrantsPerTenant = EnvInt("MAX_GRANTS_PER_TENANT") is int perTenant and > 0
                 ? perTenant : DefaultMaxGrantsPerTenant,
+            SearchMaxWidth = EnvInt("SEARCH_MAX_WIDTH") is int width and > 0
+                ? Math.Min(width, SearchMaxWidthCeiling) : DefaultSearchMaxWidth,
             BindAddress = EnvHost("BIND_ADDRESS") ?? "localhost",
             ControlPort = EnvInt("CONTROL_PORT") ?? 3011,
             QueryPort = EnvInt("QUERY_PORT"),

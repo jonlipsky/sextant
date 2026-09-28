@@ -10,6 +10,7 @@ using Sextant.Service;
 using Sextant.Service.CallerIdentity;
 using Sextant.Service.Grants;
 using Sextant.Service.Observability;
+using Sextant.Service.Search;
 using Sextant.Store;
 
 namespace Sextant.Service.Host;
@@ -136,13 +137,15 @@ public static class ServiceApp
             .WithRequestFilters(filters => filters
                 .AddCallToolFilter(CallerAssertionGate.CallToolFilter())
                 .AddListToolsFilter(ToolSelectionFilters.ListToolsFilter(options.RepositoryUrlPolicy, RepositoryScopedTools))
+                .AddListToolsFilter(SearchSymbolsTool.ListToolsFilter())
                 .AddCallToolFilter(ToolSelectionFilters.CallToolFilter(options.RepositoryUrlPolicy, RepositoryScopedTools)));
     }
 
     /// <summary>
     /// The vetted tool types exposed over the remote HTTP MCP surface. Every index-query tool takes a
-    /// <see cref="DatabaseProvider"/> and enters through <c>TryBeginRead</c> (fail-closed authz + scope); the one
-    /// exception, <see cref="ListRepositoriesTool"/>, reads no index and lists only the verified caller's grants.
+    /// <see cref="DatabaseProvider"/> and enters through <c>TryBeginRead</c> (fail-closed authz + scope); the two
+    /// exceptions, <see cref="ListRepositoriesTool"/> and <see cref="SearchSymbolsTool"/>, answer only a verified caller
+    /// and read only what that caller's grants make visible.
     /// Local-only tools that bypass or out-scope that gate are deliberately EXCLUDED so they are never
     /// reachable by a remote principal: <c>get_source_context</c> (reads an arbitrary absolute path),
     /// <c>get_daemon_status</c> (probes a local daemon), and <c>get_base_snapshot_symbols</c> — the last
@@ -164,7 +167,9 @@ public static class ServiceApp
         typeof(TraceValueTool), typeof(ResearchCodebaseTool),
         // SVC-4: a service-only tool over the caller's grants (no index read, so no TryBeginRead gate); it answers
         // only a verified caller and lists only the repositories that caller may read.
-        typeof(ListRepositoriesTool)
+        typeof(ListRepositoriesTool),
+        // SVC-F: a service-only search across the caller's visible snapshots, re-resolved from its grants on every call.
+        typeof(SearchSymbolsTool)
     ];
 
     /// <summary>
