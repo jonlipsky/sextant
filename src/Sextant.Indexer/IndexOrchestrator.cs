@@ -1702,7 +1702,8 @@ public sealed class IndexOrchestrator
         {
             if (!snapshotStore.BranchHeadMatches(snapshotStore.GetBranchId(repositoryId, ctx.BranchName), expectedHead))
                 return;
-            var casOwnsDefault = snapshotStore.ShouldOwnDefault(repositoryId, ctx.BranchName, ctx.IsDefaultBranch);
+            var casOwnsDefault = snapshotStore.ShouldOwnDefault(
+                repositoryId, ctx.BranchName, ctx.IsDefaultBranch, ctx.AllowImplicitDefault ?? true);
             var casBranchId = snapshotStore.EnsureBranch(repositoryId, ctx.BranchName, casOwnsDefault, completedAt);
             if (casOwnsDefault)
                 snapshotStore.PromoteSoleDefaultBranch(repositoryId, casBranchId);
@@ -1717,7 +1718,9 @@ public sealed class IndexOrchestrator
         // resolve). Computing it first keeps the is_default transition monotonic (EnsureBranch then sets
         // the resolved value, so a re-ensured default is never demoted-then-re-promoted). For the local
         // path ctx.IsDefaultBranch is always true, so this short-circuits to the pre-#104 SQL byte-for-byte.
-        var ownsDefault = snapshotStore.ShouldOwnDefault(repositoryId, ctx.BranchName, ctx.IsDefaultBranch);
+        // A caller that may not pick the default (AllowImplicitDefault false, issue #199) never gets the net.
+        var ownsDefault = snapshotStore.ShouldOwnDefault(
+            repositoryId, ctx.BranchName, ctx.IsDefaultBranch, ctx.AllowImplicitDefault ?? true);
         var branchId = snapshotStore.EnsureBranch(repositoryId, ctx.BranchName, ownsDefault, completedAt);
         if (ownsDefault)
             snapshotStore.PromoteSoleDefaultBranch(repositoryId, branchId);

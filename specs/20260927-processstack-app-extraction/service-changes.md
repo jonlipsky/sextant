@@ -300,7 +300,7 @@ CREATE INDEX ix_grants_tenant_repo ON repository_grants(tenant_id, repository_ke
 | Per-request composite (Service.Host) | Delegate caller → grants (`IsEnforcing=true`); `READ_POLICY` principal → `PolicyReadAuthorizer`; legacy query token → `AllowAll`. `IsEnforcing` is evaluated per call at `DatabaseProvider.cs:119`, so a per-request value works |
 | Implicit selection | A delegate request with no selector and exactly **one** visible repository that has a complete default-branch snapshot → select it; otherwise `repository_required` |
 | `/query/snapshots/{hash}/symbols` | For a delegate caller, authorized by grants in place of `AuthorizedForSnapshot`'s policy check (`ServiceApp.cs:422-433`), with the same uniform 404 |
-| `/control/ensure` with `act=user` | The repository must be visible → otherwise 403 `not_granted`. Trigger (`act=application`) and assertion-less control calls are unchanged |
+| `/control/ensure` with `act=user` | The repository must be visible → otherwise 403 `not_granted`. A visible repository's ensure is then bounded (SX-6d, see "As implemented (SX-6d)" below): no `default_branch: true`, no `branch_head_sequence`, and either `expected_head_commit` with a `branch_name` or `branch_update: none`. Trigger (`act=application`) and assertion-less control calls are unchanged |
 | `/control/status/{id}` with `act=user` | 404 unless the job's repository is visible (#77 opaque ids stays N) |
 | `/control/resolve` with `act=user` | The same bare 404 as an absent repository unless the repository is visible. Checked before the branch is resolved. Trigger (`act=application`) and assertion-less control calls are unchanged |
 
@@ -384,7 +384,7 @@ The contract above is implemented as written. These are the places where the cod
 - **Composite:** `CallerReadAuthorizer` routes a delegate-token request to `GrantReadAuthorizer` (`IsEnforcing=true`; a request with no verified caller sees nothing). Every other request keeps the configured authorizer: `PolicyReadAuthorizer` under `READ_POLICY`, else `AllowAll`. The composite is installed only when `DELEGATE_TOKENS` is configured.
 - **Implicit selection** applies only to a delegate request that names neither a repository nor a branch, whether by header or by reserved argument. A branch without a repository stays `repository_required`, as in SVC-2.
 - **Cross-repo tools** with a verified caller default the selection to `provider_repository_url` (SX-5). The provider must therefore be visible and have a complete default-branch snapshot, and each listed consumer repository is then filtered by `AuthorizeRepository`.
-- **Ensure gate order:** the URL policy (400) is checked first, then `not_granted` (403), then the branch guards (400).
+- **Ensure gate order:** the URL policy (400) is checked first, then `not_granted` (403), then the branch guards (400), then, for a user caller only, the SX-6d body bounds (400, see "As implemented (SX-6d)").
 - **Status gate:** a job on a repository the user caller cannot see is the same bare 404 as an unknown id.
 - **Resolve gate** (added in review): `GET /control/resolve` by a user caller checks visibility before resolving the branch, so an ungranted repository is the same bare 404 as an absent repository or branch. Application and assertion-less callers are unchanged.
 - **Every other control route refuses user callers** (SX-6c, #193). A verified `act=user` caller reaches only the routes that apply their own user rule: ensure, status and resolve (the gates above) and the grant routes (their `act` rule). Every other control route returns 403 `{"error":"caller_not_allowed"}`. That covers branch retire, retention, backup, metrics, audit, pilot and any route added later, because the rule is default-deny (`ControlCallerRules`: a route opts in with `.DecidesUserCallers()`, and a route-inventory test pins the admitted set).
@@ -401,6 +401,90 @@ The contract above is implemented as written. These are the places where the cod
 - It lists every catalog branch of each visible repository, plus any granted branch the catalog does not know yet (status `missing` or `pending`).
 - `meta.index_freshness` is the newest `published_at` among the listed branches.
 - It is in `ToolSelectionFilters.SelectionExemptTools`, so `tools/list` does not add the reserved `repository`/`branch` arguments to it.
+
+### As implemented (SX-6d)
+
+Issue #198. A grant made a user caller's ensure body count in full, so a user could change branch state that every reader of the repository shares. SX-6d bounds that body and refuses to start the service with an open control plane.
+
+**User ensure bounds.** `EnsureSnapshotRequest.UserCallerBranchProblem()` (`Sextant.Service/ServiceContracts.cs`) applies to a verified `act=user` caller only. Application callers and assertion-less control calls are byte-identical to before. The checks read the body only, never the catalog, in this order:
+
+| # | Body | Response |
+|---|---|---|
+| 1 | `default_branch: true` (it would make the branch the sole default every reader resolves) | 400 `default_branch_not_allowed` |
+| 2 | Any `branch_head_sequence` (a maximal one would move the pointer and block every later sequenced advance) | 400 `branch_head_sequence_not_allowed` |
+| 3 | `branch_update: none` | allowed: it moves no pointer, so rules 4 and 5 do not apply |
+| 4 | No `expected_head_commit` (an unguarded advance) | 400 `branch_guard_required` |
+| 5 | A missing or blank `branch_name` | 400 `branch_required` (reused from SVC-6+7) |
+
+- **Why rule 5.** An ensure that names no branch claims the default by the legacy rule (`default_branch ?? branch_name is null`) and is filed under `main`. Without rule 5, a user CAS with `expected_head_commit: ""` against an absent `main` would create `main` as the sole default.
+- **Allowed.** `default_branch: false` is allowed. So is `forced` (informational only). A user CAS moves only the branch it names, and a stale CAS attaches without moving anything (SVC-6+7).
+- **Response shape.** The response is `400 {"status":"rejected","reason":<code>}`, the same shape as the other ensure intake refusals, and it comes before any job row exists.
+- **Audit.** The refusal is audited `ensure`/`denied`, with detail `<code>` plus the caller suffix and the repository key as scope, exactly like `not_granted`. It is written on the grant connection, so it never waits behind a production. When it cannot be recorded, the response is 503 `unavailable` and no row is written.
+
+**Order (no oracle).** URL policy (400) → `not_granted` (403) → the SVC-6+7 guard conflicts (`conflicting_branch_guards`/`invalid_branch_update`, 400, every caller) → the user bounds (400).
+- Visibility is decided first. A user who cannot see the repository gets the same `not_granted` for every body shape, so a bound refusal never reveals anything about a repository the caller cannot see.
+- The bounds read nothing else, so their answer is the same whether the visible repository is indexed or not.
+- A body that trips both an SVC-6+7 conflict and a user bound keeps the existing conflict code.
+
+**Residual risk.**
+- A user CAS still moves the branch it names, the default branch included, from the head the user observed to any commit the user names, because the service cannot verify the upstream head. The app checks the head against GitHub before it sends the CAS (`start-indexing`, `grant-watch`). Closing this fully needs server-side head verification, which is out of scope.
+- A user with a grant can still create the repository's first branch. It no longer becomes the default unless the remote names it (#199, next).
+
+**No implicit default for a user (issue #199).** The #104 safety net makes a repository's first branch its default. For a user caller that would pick the branch every reader resolves, so the service grants it only for the branch the remote itself names as its default. The service determines that branch itself and never reads it from the request.
+- **Marking.** After the user bounds pass, the route sets `EnsureSnapshotRequest.RestrictsImplicitDefault` on a user caller's request. The flag is `[JsonIgnore]`, so it is never bound from the wire, and it is not part of the identity. Application and assertion-less requests are never marked, so their behavior is byte-identical.
+- **Lookup.** `SnapshotService` does the lookup at the start of every restricted ensure, before the write gate:
+  - It first discards any `VerifiedRemoteDefaultBranch` a direct caller preset.
+  - It then looks the default up only when the answer can matter: the repository has no default branch yet (once a default exists the safety net cannot apply), and the ensure may move a pointer (`branch_update: none` never does).
+  - The lookup runs off the request thread, bounded by the service lifetime (a shutdown during it is the ensure's usual 503).
+  - A restricted ensure that does look the default up waits for it before it is registered, `?wait=false` included. The wait is bounded by the resolver's timeout.
+- **Bounds (`RemoteDefaultBranchLookup`).** Because every such user ensure would otherwise spawn git, the lookups are bounded:
+  - Concurrent lookups of one repository (keyed by `RepositoryGrantKey.Of`) share one call.
+  - An answer, `null` included, is remembered for 60 s.
+  - At most 4 calls run at once. A lookup of another repository beyond that answers `null` at once, without a call and without remembering it, so it fails closed.
+  - The remembered table is pruned at 1024 repositories.
+- **Resolver.** In clone mode the resolver is `CloningCheckoutProvider`:
+  - It runs `git ls-remote --symref --end-of-options <url> HEAD` in a fresh `git init` temp directory under the checkout root, which it deletes afterwards.
+  - It uses the same hardened environment and credential scoping as a clone, with a 30 s timeout.
+  - `RemoteDefaultBranch.ParseSymref` accepts only exactly one `ref: refs/heads/<name>\tHEAD` line whose name has no whitespace or control characters and is at most 255 characters.
+- **Where it applies.** Every branch-advance path passes the result as `allowImplicitDefault` to `SnapshotStore.ShouldOwnDefault`:
+  - the worker path, where the orchestrator's `AdvanceBranchToSnapshot` reads it via `SnapshotContext.AllowImplicitDefault`;
+  - on reuse, the CAS guard, the sequence path and the null-sequence attach.
+  
+  A restricted request gets the first-branch default only when its branch equals the verified name (ordinal). The explicit `default_branch: true` rule and "already the default" are unchanged, and a user cannot send `default_branch: true` anyway.
+- **Fail closed.** The branch is created non-default when there is no resolver (locate mode has no outbound git), when every lookup slot is busy, or when the lookup fails, times out or yields nothing parseable. The repository then has no default until something sets one:
+  - an application ensure (a push or reconcile with `default_branch: true`, or its own first branch);
+  - a user ensure of the verified remote default.
+  
+  In locate mode, therefore, a user never makes a default implicitly.
+
+**App contract.** Every user-caller ensure the app sends (SX-9 `start-indexing`, and `grant-watch` step 3 in `configure-watched-repos`) must be either a CAS with a `branch_name` or `branch_update: none`. It must never carry `default_branch: true` or a sequence.
+- `start-indexing` without a `branchName` must send `branch_update: none`.
+- `grant-watch` must resolve the default branch name (`GetRepository.defaultBranch`) for `watch {repo}`. On a repository with no default yet, that branch becomes the default only because the service independently confirms that the remote's `HEAD` names it (#199). A first `watch {repo} on {branch}` of another branch leaves the repository without a default until a trigger sets one.
+- The trigger flows (push, pr, reconcile) run as `act=application` and keep `default_branch`.
+
+**Control token required at startup.**
+- `ServiceOptions.ValidateControlPlane()` fails startup when `SEXTANT_SERVICE_CONTROL_TOKEN` is unset. It runs in `ServiceHostRunner.RunAsync` before the catalog opens and in `ServiceApp.RegisterServices`.
+- The only way to run without a token is the explicit opt-out `SEXTANT_SERVICE_INSECURE_OPEN_CONTROL_PLANE=true`, meant for a loopback-bound dev service or tests. It is off by default, it is ignored when a token is set, and a malformed value fails startup.
+- While it is in effect, the host prints and logs `ServiceOptions.OpenControlPlaneWarning`.
+- A whitespace-only control token also fails startup, even with the opt-out, because no bearer can ever match it.
+- The offline `backup`/`restore` commands serve nothing and do not run the guard.
+
+**Tests.**
+- `UserEnsureBoundsHttpTests` covers each refused body, the not-granted-first order, the CAS and `none` paths for a user, application and assertion-less callers unchanged, and the startup guard with its opt-out.
+- `ServiceOptionsEnvTests` covers the env binding.
+- `ImplicitDefaultBranchTests` (#199) covers each case through a real orchestrator on both the worker path and the reuse path:
+  - a user's first branch that the remote does not name is not the default;
+  - a user's first branch that the remote names is the default;
+  - an application's first branch is the default, with no lookup;
+  - an application `default_branch: true` still moves the default;
+  - an unknown, throwing or missing resolver fails closed;
+  - there is no lookup once a default exists, or under `branch_update: none`;
+  - a preset verified branch is discarded.
+  
+  It also covers the HTTP marking, the wire contract, the worker's context mapping, the store rule and `ParseSymref`. `RemoteDefaultBranchLookupTests` covers the bounds: a shared call, the 60 s memory, the concurrency cap failing closed, a throwing resolver, and the table bound. `CloningCheckoutProviderTests.ResolveDefaultBranch_*` covers the resolver against real `file://` remotes.
+- `KestrelControlPathTests` (issue #198 item 4) sends raw request targets to a real Kestrel socket. Targets it normalizes onto `/control/branches/retire` (`%2e%2e`, `./`, `%63ontrol`, case, absolute-form) get the user refusal and are audited. Targets that match no route (`;x`, `//`, `%2f`) are 403 under `/control` or 404 outside it. The same targets without a token are 401 or 404, and none retires the branch.
+
+**Not done.** #198 item 3 (rate-limiting denied-audit writes) is deferred. So is item 4's second gap (the route-inventory test still covers only `/control/*` patterns).
 
 ## SVC-F (SX-7): federated `search_symbols` (R, parity)
 

@@ -32,6 +32,18 @@ public static class ServiceHostRunner
     {
         var config = SextantConfiguration.Load();
         var options = ServiceOptions.FromEnvironment(config);
+        try
+        {
+            // SX-6d: refuse an unauthenticated control plane before opening the catalog or taking the writer lease.
+            options.ValidateControlPlane();
+        }
+        catch (InvalidOperationException ex)
+        {
+            await Console.Error.WriteLineAsync($"Failed to start Sextant index service: {ex.Message}");
+            return 1;
+        }
+        if (options.ControlPlaneIsOpen)
+            await Console.Error.WriteLineAsync(ServiceOptions.OpenControlPlaneWarning);
         if (options.RepositoryUrlPolicy.AllowsAnyHost)
             await Console.Error.WriteLineAsync(
                 "WARNING: SEXTANT_SERVICE_REPOSITORY_HOSTS contains '*': /control/ensure accepts a repository on ANY " +
@@ -95,7 +107,10 @@ public static class ServiceHostRunner
                 ? GitCliContentProvider.ForVolume(paths)
                 : null;
 
-            service = SnapshotService.Start(options, worker, database, gitContent: gitContent);
+            // Issue #199: in clone mode the provider also looks up a repository's remote default branch for a user
+            // ensure. Locate mode has no outbound git, so there a user's first branch never becomes the default.
+            service = SnapshotService.Start(options, worker, database, gitContent: gitContent,
+                remoteDefaults: checkoutProvider as IRemoteDefaultBranchResolver);
         }
         catch (Exception ex)
         {

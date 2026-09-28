@@ -111,6 +111,33 @@ public sealed record EnsureSnapshotRequest
     }
 
     /// <summary>
+    /// The intake reason code when this ensure asks for more branch control than a user caller (a verified
+    /// <c>act=user</c> assertion) may have, or <c>null</c> when it stays within the user bounds (SX-6d, issue #198).
+    /// A user may never claim the default branch (<c>default_branch: true</c>:
+    /// <see cref="BranchGuardReason.DefaultBranchNotAllowed"/>) or send a head sequence (a large one would move the
+    /// pointer and block every later sequenced advance: <see cref="BranchGuardReason.HeadSequenceNotAllowed"/>). Unless
+    /// the ensure is <c>branch_update: none</c>, it must carry the <see cref="ExpectedHeadCommit"/> CAS
+    /// (<see cref="BranchGuardReason.BranchGuardRequired"/>) and name its branch
+    /// (<see cref="BranchGuardReason.BranchRequired"/>), because an ensure that names no branch claims the default by
+    /// the legacy <see cref="ResolveIsDefaultBranch"/> heuristic. The checks read the request only, never the catalog,
+    /// in this fixed order. Application callers and assertion-less control calls are not subject to them.
+    /// </summary>
+    public string? UserCallerBranchProblem()
+    {
+        if (IsDefaultBranch == true)
+            return BranchGuardReason.DefaultBranchNotAllowed;
+        if (BranchHeadSequence is not null)
+            return BranchGuardReason.HeadSequenceNotAllowed;
+        if (SuppressesBranchUpdate)
+            return null;
+        if (ExpectedHeadCommit is null)
+            return BranchGuardReason.BranchGuardRequired;
+        if (string.IsNullOrWhiteSpace(BranchName))
+            return BranchGuardReason.BranchRequired;
+        return null;
+    }
+
+    /// <summary>
     /// Set by <see cref="SnapshotService"/> — never bound from the wire (internal + ignored) — when this run is
     /// the LAST provisioning attempt the job-wide bound allows (issue #125). A clone-mode checkout then degrades
     /// a still-TRANSIENT submodule failure (an unreachable host, a persistent 5xx) to an unpopulated submodule
@@ -120,6 +147,36 @@ public sealed record EnsureSnapshotRequest
     /// </summary>
     [JsonIgnore]
     internal bool IsFinalProvisioningAttempt { get; init; }
+
+    /// <summary>
+    /// Set by the host — never bound from the wire — for a caller that may not pick the repository's default
+    /// branch (a verified <c>act=user</c> caller; issue #199). Such an ensure gets the issue #104 first-branch
+    /// default (the repository has no default yet) only for the branch the REMOTE names as its default, which
+    /// the service looks up itself (<see cref="IRemoteDefaultBranchResolver"/>) and never takes from the request;
+    /// when that lookup is unavailable or fails, the branch is created without the default (fail closed).
+    /// <c>false</c> (application callers, assertion-less control calls, direct callers) keeps today's behavior.
+    /// Deliberately NOT folded into <see cref="ToIdentity"/>.
+    /// </summary>
+    [JsonIgnore]
+    public bool RestrictsImplicitDefault { get; init; }
+
+    /// <summary>
+    /// The remote's default branch as the service itself resolved it for a <see cref="RestrictsImplicitDefault"/>
+    /// ensure, or <c>null</c> when it was not needed or could not be determined. Set by <see cref="SnapshotService"/>
+    /// only (internal + ignored), which overwrites any value a direct caller supplied.
+    /// </summary>
+    [JsonIgnore]
+    internal string? VerifiedRemoteDefaultBranch { get; init; }
+
+    /// <summary>
+    /// Whether the issue #104 first-branch safety net may make <paramref name="branchName"/> its repository's
+    /// default for this ensure: always, unless <see cref="RestrictsImplicitDefault"/>, in which case only when the
+    /// service verified that <paramref name="branchName"/> is the remote's default branch (issue #199).
+    /// </summary>
+    public bool AllowsImplicitDefault(string branchName) =>
+        !RestrictsImplicitDefault
+        || (VerifiedRemoteDefaultBranch is { } remoteDefault
+            && string.Equals(remoteDefault, branchName, StringComparison.Ordinal));
 
     /// <summary>
     /// Builds the durable identity for this request using the service-side schema/analyzer/toolchain.
@@ -200,6 +257,15 @@ public static class BranchGuardReason
     public const string BranchRequired = "branch_required";
     public const string HeadMismatch = "head_mismatch";
     public const string DefaultBranch = "default_branch";
+
+    /// <summary>A user caller's ensure sent <c>default_branch: true</c> (SX-6d).</summary>
+    public const string DefaultBranchNotAllowed = "default_branch_not_allowed";
+
+    /// <summary>A user caller's ensure sent a <c>branch_head_sequence</c> (SX-6d).</summary>
+    public const string HeadSequenceNotAllowed = "branch_head_sequence_not_allowed";
+
+    /// <summary>A user caller's ensure carried neither <c>expected_head_commit</c> nor <c>branch_update: none</c> (SX-6d).</summary>
+    public const string BranchGuardRequired = "branch_guard_required";
 }
 
 /// <summary>A request to retire (delete) a repository branch's pointer (SVC-6).</summary>

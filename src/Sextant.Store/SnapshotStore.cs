@@ -775,14 +775,16 @@ public sealed class SnapshotStore(SqliteConnection connection)
     /// would otherwise demote a re-ensured default, so the caller passes the result to <c>EnsureBranch</c>
     /// and the <c>is_default</c> transition is monotonic (no demote→re-promote window a concurrent reader
     /// could observe). Pure read; <paramref name="isDefault"/> short-circuits so the local path (always
-    /// default) issues no extra query and stays byte-identical.
+    /// default) issues no extra query and stays byte-identical. <paramref name="allowImplicitDefault"/> false
+    /// withholds the safety net (issue #199): a caller that may not pick the repository's default gets it only
+    /// explicitly or because the branch already is the default, never by being first.
     /// </summary>
-    public bool ShouldOwnDefault(long repositoryId, string branchName, bool isDefault)
+    public bool ShouldOwnDefault(long repositoryId, string branchName, bool isDefault, bool allowImplicitDefault = true)
     {
         if (isDefault)
             return true;
         if (GetDefaultBranchId(repositoryId) is not long currentDefault)
-            return true;
+            return allowImplicitDefault;
         return GetBranchId(repositoryId, branchName) is long id && id == currentDefault;
     }
 

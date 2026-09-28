@@ -7,7 +7,7 @@
 
 | Credential | Held by | Presented on | Grants |
 |---|---|---|---|
-| Control token (`SEXTANT_SERVICE_CONTROL_TOKEN`) | PS secret store (`sextant-control` connection); service env | `/control/*` | Full control plane. **Assertion-less calls stay full-power** until SVC-17 (N now; **R before a second app or tenant**) |
+| Control token (`SEXTANT_SERVICE_CONTROL_TOKEN`) | PS secret store (`sextant-control` connection); service env | `/control/*` | Full control plane. **Required:** the service refuses to start without it unless the explicit, loudly logged `SEXTANT_SERVICE_INSECURE_OPEN_CONTROL_PLANE=true` dev opt-out is set (SX-6d, #198). **Assertion-less calls stay full-power** until SVC-17 (N now; **R before a second app or tenant**) |
 | Legacy query token (`QUERY_TOKEN`) | Old PS gateway (until G3) | `/mcp`, `/query/*` | **Unscoped** read of every repository (today's behavior, kept until G3) |
 | Delegate token (`DELEGATE_TOKENS`, new) | PS secret store (`sextant-query` connection) | `/mcp`, `/query/*` | **Nothing by itself.** Reads need a valid assertion, and data visibility = grants |
 | Caller key (`CALLER_KEYS`, new) | PS secret store (`callerIdentity.signingKey` on both connections); service env | Signs/verifies `X-ProcessStack-Caller` | Binds a caller to **one tenant** |
@@ -87,7 +87,7 @@
 | Cross-repo tools | Rows are filtered per consumer repo via `IReadAuthorizer.AuthorizeRepository` (`src/Sextant.Mcp/SnapshotProvenance.cs:150`) |
 | `search_symbols` cursor | Re-authorized on every page. Hashes not in the visible set are dropped, so no HMAC is needed |
 | `/query/snapshots/{hash}/symbols` | Delegate callers are authorized by grants (uniform 404) |
-| Ensure with `act=user` | The repository must be visible (403 `not_granted`); this blocks "index anything" via `start-indexing` |
+| Ensure with `act=user` | The repository must be visible (403 `not_granted`); this blocks "index anything" via `start-indexing`. A visible repository's ensure is then bounded so a user cannot change shared branch state (SX-6d, see "Control routes by caller") |
 | Revocation | Effective on the next request, with no caching of the grant set across requests |
 | Legacy token | Unscoped until G3. Then set `REQUIRE_REPOSITORY_SELECTION=true` and delete the legacy token |
 
@@ -101,7 +101,7 @@ is still 401) and before the route reads its request or the catalog, so it is no
 
 | Route | `act=user` | `act=application` | No assertion (control bearer) |
 |---|---|---|---|
-| `POST /control/ensure` | Repository must be visible, else 403 `not_granted` | Unchanged (trigger) | Unchanged |
+| `POST /control/ensure` | Repository must be visible, else 403 `not_granted` (for every body). Then the body is bounded (SX-6d, #198): 400 `default_branch_not_allowed`, `branch_head_sequence_not_allowed`, `branch_guard_required` (no `expected_head_commit` and not `branch_update: none`) or `branch_required` (a CAS without a `branch_name`); audited `ensure`/`denied` | Unchanged (trigger) | Unchanged |
 | `GET /control/status/{id}` | 404 unless the job's repository is visible | Unchanged | Unchanged |
 | `GET /control/resolve` | Bare 404 unless the repository is visible | Unchanged | Unchanged |
 | `/control/grants/self` | Own grants only | 403 `wrong_actor` | 401 `caller_required` |
@@ -113,6 +113,19 @@ is still 401) and before the route reads its request or the catalog, so it is no
 | Any other `/control/*` path | 403 `caller_not_allowed` | Unchanged (404/405) | Unchanged (404/405) |
 
 Assertion-less calls stay full-power until SVC-17 (see "Trust boundaries").
+
+**User ensure bounds (SX-6d, #198).**
+- **The problem.** A grant makes a repository readable. It must not let a user redirect branch state that every reader of that repository shares.
+- **What a user may send.** A user ensure must be a CAS (`expected_head_commit` plus a `branch_name`) or `branch_update: none`.
+- **What a user may not send.**
+  - `default_branch: true`, which would re-point the repository's sole default.
+  - A `branch_head_sequence`, because a maximal one would block every later sequenced advance.
+  - An unguarded advance.
+- **Order.** The bounds are checked after visibility, so an ungranted user sees only `not_granted` whatever the body asks. They read nothing but the body.
+- **No implicit default (#199).** On a repository with no default branch yet, the #104 first-branch safety net makes a user's branch the default only if the service confirms, with its own `git ls-remote --symref`, that the remote's `HEAD` names that branch. The branch name is never taken from the request. The check fails closed: with no resolver (locate mode), when the bounded lookup (shared per repository, remembered 60 s, at most 4 at once) has no free slot, or when the lookup fails, the branch is created non-default. Application callers are unchanged.
+- **Residual risk.** A user CAS still moves the branch it names, the default included, from the head the user observed to a commit the user names. The service cannot verify the upstream head. The app checks it against GitHub first (`start-indexing`, `grant-watch`), so closing this fully needs server-side head verification (N).
+
+**Kestrel request targets (#198 item 4).** `KestrelControlPathTests` sends raw targets to a real Kestrel socket. `%2e%2e`, `./`, `%63ontrol`, a case change and the absolute form normalize onto the route and get the same user refusal. `;x`, `//` and `%2f` match no route, so they are 403 under `/control` and 404 outside it. Without a token they are 401 or 404. The #193 default-deny and the control token therefore hold however the path is spelled.
 
 ## Self-service watch implications (#111)
 

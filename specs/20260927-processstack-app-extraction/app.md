@@ -159,7 +159,7 @@ testDirectory: tests
 
 | Command node pattern (same set as v1) | Steps |
 |---|---|
-| `watch {repo} on branch {branch}` · `watch {repo} on {branch}` · `watch {repo}` · track/start-watching variants | Process `grant-watch`: 1. `GetRepository` (github): refuse "not visible to this workspace's GitHub connection" (the #111 mitigation, see `security.md`). 2. `HttpRequest PUT /control/grants/self {repository: repo.cloneUrl, branch?}` (400 → the reason; 409 → the limit). 3. If the target has no snapshot (`status.snapshot_status == missing`), `ListBranches` → head, then `ensure` with CAS. 4. `legacy-dual-write` upserts memory `sextant.watched-repos:{slug}` |
+| `watch {repo} on branch {branch}` · `watch {repo} on {branch}` · `watch {repo}` · track/start-watching variants | Process `grant-watch`: 1. `GetRepository` (github): refuse "not visible to this workspace's GitHub connection" (the #111 mitigation, see `security.md`). 2. `HttpRequest PUT /control/grants/self {repository: repo.cloneUrl, branch?}` (400 → the reason; 409 → the limit). 3. If the target has no snapshot (`status.snapshot_status == missing`), `ListBranches` → head, then `ensure` with CAS (`branch_name` = the watched branch, or `defaultBranch` for `watch {repo}`; never `default_branch: true`, SX-6d; on a repository with no default yet, the watched branch becomes the default only if the service confirms the remote's `HEAD` names it, #199). 4. `legacy-dual-write` upserts memory `sextant.watched-repos:{slug}` |
 | `stop watching {repo} [on {branch}]` · unwatch · untrack | `HttpRequest DELETE /control/grants/self?repository=&branch=`; `legacy-dual-write` writes the tombstone |
 | `what am i watching*` · `list watched*` · `show my watched*` | `HttpRequest GET /control/grants/self` → formatted list (branch, snapshot status, short sha) |
 | anything else | Help text |
@@ -169,7 +169,7 @@ testDirectory: tests
 
 | Process | Inputs → outputs | Steps |
 |---|---|---|
-| `start-indexing` | `repositoryRemoteUrl, commitSha, branchName?, treeSha?, configHash?` → `jobId, identityHash, indexingState, snapshotId, attached, branchAdvanced` | If `branchName` is set: `ListBranches` → head. `commitSha == head` → `ensure` with `expected_head_commit = resolve.commit_sha` (CAS advance). Else `branch_update: none` (historical commit, no regress). 403 `not_granted` → "watch the repository first" |
+| `start-indexing` | `repositoryRemoteUrl, commitSha, branchName?, treeSha?, configHash?` → `jobId, identityHash, indexingState, snapshotId, attached, branchAdvanced` | If `branchName` is set: `ListBranches` → head. `commitSha == head` → `ensure` with `branch_name` and `expected_head_commit = resolve.commit_sha` (CAS advance). Else, or with no `branchName`, `branch_update: none` (historical commit, no regress). Never `default_branch: true` or a `branch_head_sequence`: a user ensure beyond these bounds is 400 (SX-6d, `service-changes.md`). 403 `not_granted` → "watch the repository first" |
 | `get-indexing-status` | `jobId` → `found, indexingState, terminal, snapshotId, lastError` | `HttpRequest GET /control/status/{jobId}`. 404 → `found=false`. Map `job.status`/`job.snapshot_id`/`job.last_error` |
 | `import-legacy-watches` | — → `imported, skipped, failed` | `ListMyMemory {scope: sextant.watched-repos}` → skip null values (tombstones) → `for-each` `PUT /control/grants/self {repository: value.cloneUrl, branch: value.branch}`, with `source` recorded server-side as `self`. Idempotent |
 
