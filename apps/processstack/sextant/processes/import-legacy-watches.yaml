@@ -139,7 +139,7 @@ nodes:
         ['attemptsRaw', 'attemptsText', 'lastWritten', 'currentOwner', 'currentRepo', 'currentBranch',
          'currentSlug', 'resolvedSlug', 'resolution', 'fullName', 'defaultBranch', 'remoteUrl', 'importedAt',
          'outcome', 'message'].forEach(function (name) { context.setVariable(name, ''); });
-        ['grantsStatus', 'index', 'maxAttempts', 'alreadyImported', 'unresolved', 'unreadable', 'putStatus',
+        ['grantsStatus', 'index', 'limitIndex', 'maxAttempts', 'alreadyImported', 'unresolved', 'unreadable', 'putStatus',
          'imported', 'newlyImported', 'skipped', 'failed', 'remaining'].forEach(function (name) {
           context.setVariable(name, 0);
         });
@@ -251,14 +251,26 @@ nodes:
         null;
     next: import-loop
 
-  # Processes have no for-each node: each pass takes the next planned entry. The watch limit ends the loop:
-  # every later entry would be refused too, so none of them costs a GitHub call.
+  # Processes have no for-each node: each pass takes the next planned entry. Once the watch limit is hit, a
+  # new grant would be refused too, so an entry costs a GitHub call only when it may already be held (the
+  # caller holds a grant on its repository, and re-granting one never counts towards the limit).
   - id: import-loop
     type: decision
     next:
-      - when: "pending != null && index < pending.length && !limitReached"
+      - when: "pending != null && index < pending.length && (!limitReached || pending[index].mayBeHeld == true)"
         next: next-entry
+      - when: "pending != null && index < pending.length"
+        next: skip-entry
       - else: finish-attempts
+
+  # Passed over after the watch limit; finish-attempts marks it unresolved and counts it as failed.
+  - id: skip-entry
+    type: activity:JavaScript
+    inputs:
+      script: |
+        context.setVariable('index', index + 1);
+        null;
+    next: import-loop
 
   # The entry is marked before GitHub is asked: a failed check fails the whole run (a process has no error
   # route), and the mark lets the next run go past it. The previous entry's outcome is applied first: a
@@ -376,7 +388,10 @@ nodes:
         } else if (putStatus == 409) {
           context.setVariable('failed', failed + 1);
           context.setVariable('resolution', 'final');
-          if (putJson != null && putJson.reason === 'grant_limit') context.setVariable('limitReached', true);
+          if (putJson != null && putJson.reason === 'grant_limit' && !limitReached) {
+            context.setVariable('limitReached', true);
+            context.setVariable('limitIndex', index);
+          }
         } else {
           context.setVariable('failed', failed + 1);
           context.setVariable('resolution', 'retry');
@@ -397,7 +412,7 @@ nodes:
     next: import-loop
 
   # Nothing is left to retry when every planned entry was checked, the service refused or granted each
-  # one, and every remaining mark is unresolved. After the watch limit, the entries not checked are marked
+  # one, and every remaining mark is unresolved. The entries passed over after the watch limit are marked
   # unresolved and failed, as their own 409 would have left them.
   - id: finish-attempts
     type: activity:JavaScript
@@ -413,12 +428,15 @@ nodes:
             else delete marks[resolvedSlug];
           }
         }
-        if (limitReached && pending != null && index < pending.length) {
-          for (var i = index; i < pending.length; i++) {
+        if (limitReached && pending != null) {
+          var passed = 0;
+          for (var i = limitIndex; i < pending.length; i++) {
+            if (pending[i].mayBeHeld == true) continue;
             var left = String(pending[i].slug);
             marks[left] = Math.max(maxAttempts, marks[left] || 0);
+            passed++;
           }
-          context.setVariable('failed', failed + (pending.length - index));
+          context.setVariable('failed', failed + passed);
         }
         var text = JSON.stringify(marks);
         var retryable = Object.keys(marks).some(function (slug) { return marks[slug] < maxAttempts; });

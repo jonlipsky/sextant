@@ -99,8 +99,9 @@ workspace's GitHub connection, and the URL sent to the service is GitHub's own s
 never the text stored in memory. The tool returns counts only (`imported`, `newlyImported`, `skipped`,
 `failed`, `remaining`, `complete`, `outcome`, `message`). An entry the service refuses (or one over the
 watch limit), or one GitHub did not show in two runs, is not checked again unless the tool is run with
-`retryUnresolved: true`. Once one entry hits the watch limit, the rest of the run is counted as failed
-without being checked. At most 200 entries are checked per run, and `remaining` counts the rest. Once
+`retryUnresolved: true`. Once one entry hits the watch limit, the later entries are counted as failed
+without being checked, except one on a repository you already watch, which may already be imported. At
+most 200 entries are checked per run, and `remaining` counts the rest. Once
 nothing is left to retry, the flag `sextant.app:legacy-import-v1` is set and the chat stops importing.
 
 ## 6. API keys for agents

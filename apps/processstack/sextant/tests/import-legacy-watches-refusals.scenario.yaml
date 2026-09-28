@@ -47,8 +47,8 @@ http:
     bodyMatch: { repository: "https://github.com/octo/beta.git" }
     status: 503
     body: { status: unavailable }
-  # The last entry, so the watch limit (which ends the loop, import-legacy-watches-grant-limit-stops) stops
-  # nothing here.
+  # The last entry, so the watch limit (after it only an entry that may already be held is checked,
+  # import-legacy-watches-grant-limit-stops) passes over nothing here.
   - connection: sextant-control
     method: PUT
     path: /control/grants/self
