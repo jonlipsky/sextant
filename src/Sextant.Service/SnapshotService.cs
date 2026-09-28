@@ -267,6 +267,19 @@ public sealed partial class SnapshotService : IDisposable
         string reason, AuditCaller principal = default, CancellationToken cancellationToken = default) =>
         RecordDeniedAsync(AuditAction.Retire, reason, principal, cancellationToken);
 
+    /// <summary>
+    /// Records the durable <paramref name="action"/>/<c>denied</c> audit row for a control call the host refused
+    /// by caller before reading anything (issue #193: a user caller on an application/operator-only route such
+    /// as retire, retention or backup). The row has no repository scope, because the refusal precedes reading
+    /// the request. Same contract as <see cref="RecordEnsureDeniedAsync"/>.
+    /// </summary>
+    public Task RecordControlDeniedAsync(
+        string action, string reason, AuditCaller principal = default, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(action);
+        return RecordDeniedAsync(action, reason, principal, cancellationToken);
+    }
+
     private async Task RecordDeniedAsync(
         string action, string reason, AuditCaller principal, CancellationToken cancellationToken)
     {
