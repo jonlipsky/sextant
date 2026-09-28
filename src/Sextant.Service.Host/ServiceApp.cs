@@ -3,9 +3,11 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Sextant.Mcp;
 using Sextant.Mcp.Tools;
 using Sextant.Service;
+using Sextant.Service.CallerIdentity;
 using Sextant.Service.Observability;
 using Sextant.Store;
 
@@ -21,8 +23,9 @@ namespace Sextant.Service.Host;
 ///   <item><c>/control/*</c> — ensure-snapshot, status, branch resolution, retention. Requires the CONTROL
 ///   token.</item>
 ///   <item><c>/mcp</c> + <c>/query/*</c> — authenticated HTTP MCP semantic queries and remote base-snapshot
-///   pages. Requires the QUERY token. Criterion 4: a complete snapshot is queryable here WITHOUT
-///   ProcessStack.</item>
+///   pages. Requires the QUERY token (or a read-policy principal, or a delegate token whose reads are decided
+///   per verified caller assertion, SVC-3 <see cref="CallerAssertionGate"/>). Criterion 4: a complete snapshot
+///   is queryable here WITHOUT ProcessStack.</item>
 /// </list>
 /// A null token disables that plane's auth (local single-node development). Query reads use a connection
 /// independent of the service's writer, so a running index never blocks a low-latency query.
@@ -35,6 +38,8 @@ public static class ServiceApp
     /// <summary>Registers the service, MCP tools, and read database provider into the builder's container.</summary>
     public static void RegisterServices(WebApplicationBuilder builder, ServiceOptions options, SnapshotService service)
     {
+        // SVC-3: refuse inconsistent caller-identity settings (fail closed), however the options were built.
+        options.ValidateCallerIdentity();
         builder.Services.AddSingleton(options);
         builder.Services.AddSingleton(service);
         // Bind request bodies with the SAME snake_case wire format the service emits (ServiceJson), so a
@@ -51,15 +56,22 @@ public static class ServiceApp
         // resolved from the ambient HTTP principal; with no policy it stays the permissive local default so
         // single-node operation is byte-identical.
         builder.Services.AddHttpContextAccessor();
+        builder.Services.AddSingleton(sp => new CallerAssertionGate(
+            options, sp.GetService<TimeProvider>() ?? TimeProvider.System, sp.GetRequiredService<ILoggerFactory>()));
         builder.Services.AddSingleton(sp =>
         {
             var http = sp.GetRequiredService<IHttpContextAccessor>();
+            var gate = sp.GetRequiredService<CallerAssertionGate>();
             IReadAuthorizer authorizer = options.ReadPolicy.Enabled
                 ? new PolicyReadAuthorizer(
                     options.ReadPolicy,
                     PrincipalTokenAccessor(http),
                     RepositoryUrlResolver(options.CatalogDbPath))
                 : AllowAllReadAuthorizer.Instance;
+            // SVC-3: a delegate-token read is decided per caller. Until grants exist it is denied outright, so a
+            // delegate token opens nothing; every other request keeps the authorizer above.
+            if (gate.DelegateTokensConfigured)
+                authorizer = new CallerReadAuthorizer(authorizer, DenyAllReadAuthorizer.Instance, gate.DelegateRequestAccessor(http));
 
             // The request names the repository it reads via the X-Sextant-Repository header or, per call, the
             // reserved `repository`/`branch` tool arguments (SVC-2, ToolSelectionFilters), and the read planner
@@ -73,7 +85,7 @@ public static class ServiceApp
             {
                 RequestedRepository = RequestedRepositoryAccessor(http),
                 RequestedBranch = RequestedBranchAccessor(http),
-                RequireRepositorySelection = RepositorySelectionRequirement(options)
+                RequireRepositorySelection = RepositorySelectionRequirement(options, CallerAssertionGate.CallerPrincipalAccessor(http))
             };
         });
         // Explicit ALLOWLIST for the remote HTTP MCP surface (hardening review, criterion 1): register ONLY
@@ -109,8 +121,11 @@ public static class ServiceApp
             // SVC-2: per-call repository/branch selection through reserved tool arguments. The list filter
             // advertises `repository`/`branch` on every repository-scoped tool; the call filter strips them
             // and records the call's ToolCallSelection, which the DatabaseProvider accessors read. Further
-            // per-call checks over the same selection are added to this pipeline.
+            // per-call checks over the same selection are added to this pipeline. SVC-3's caller check is
+            // added FIRST, so it runs before (outside) every other call filter: a delegate call without a
+            // verified caller is answered before its arguments are even read.
             .WithRequestFilters(filters => filters
+                .AddCallToolFilter(CallerAssertionGate.CallToolFilter())
                 .AddListToolsFilter(ToolSelectionFilters.ListToolsFilter(options.RepositoryUrlPolicy, RepositoryScopedTools))
                 .AddCallToolFilter(ToolSelectionFilters.CallToolFilter(options.RepositoryUrlPolicy, RepositoryScopedTools)));
     }
@@ -150,6 +165,7 @@ public static class ServiceApp
     /// <summary>Wires the auth middleware and maps the control/query/health endpoints onto a built app.</summary>
     public static void MapEndpoints(WebApplication app, ServiceOptions options)
     {
+        var callerGate = app.Services.GetRequiredService<CallerAssertionGate>();
         app.Use(async (context, next) =>
         {
             var path = context.Request.Path;
@@ -164,18 +180,27 @@ public static class ServiceApp
                 // dedicated ContributeToken so a CI/client contributor never needs the full control token.
                 // Every OTHER control endpoint still requires the control token, so a contributor token
                 // cannot reach ensure/status/resolve/retention.
-                if (path.StartsWithSegments("/control/contribute"))
+                var isContribution = path.StartsWithSegments("/control/contribute");
+                if (isContribution)
                 {
                     if (!AuthorizedForContribution(context, options)) { await Deny(context); return; }
                 }
                 else if (!Authorized(context, options.ControlToken)) { await Deny(context); return; }
+
+                // SVC-3: an optional caller assertion names the control call's caller (audit actor).
+                if (!await callerGate.AdmitControlAsync(context, isContribution)) return;
             }
             else if (path.StartsWithSegments("/mcp") || path.StartsWithSegments("/query"))
             {
                 // Bind isolation (issue #61): the query plane is reachable ONLY on the query port when one is
                 // configured; a query request on the internal control port is a uniform 404.
                 if (WrongPlanePort(context, options, controlPath: false)) { await NotFound(context); return; }
-                if (!AuthorizedForQuery(context, options)) { await Deny(context); return; }
+
+                // SVC-3: a delegate token authenticates the request, but what it may read is decided per
+                // verified caller (CallerAssertionGate); every other bearer goes through the existing gate.
+                var isDelegate = callerGate.IsDelegateBearer(context);
+                if (!isDelegate && !AuthorizedForQuery(context, options)) { await Deny(context); return; }
+                if (!await callerGate.AdmitQueryAsync(context, isDelegate, isMcp: path.StartsWithSegments("/mcp"))) return;
             }
             await next();
         });
@@ -253,7 +278,7 @@ public static class ServiceApp
                 var decision = options.RepositoryUrlPolicy.Evaluate(request.RepositoryRemoteUrl);
                 if (!decision.Ok)
                 {
-                    await service.RecordEnsureDeniedAsync(decision.Reason!, ExtractBearer(req), ct);
+                    await service.RecordEnsureDeniedAsync(decision.Reason!, AuditActor(req), ct);
                     return Results.Json(new { status = "rejected", reason = decision.Reason }, ServiceJson.Options,
                         statusCode: StatusCodes.Status400BadRequest);
                 }
@@ -266,8 +291,8 @@ public static class ServiceApp
                         statusCode: StatusCodes.Status400BadRequest);
                 }
                 result = wait == false
-                    ? await service.BeginEnsureSnapshotAsync(request, ExtractBearer(req), ct)
-                    : await service.EnsureSnapshotAsync(request, ct, ExtractBearer(req));
+                    ? await service.BeginEnsureSnapshotAsync(request, AuditActor(req), ct)
+                    : await service.EnsureSnapshotAsync(request, ct, AuditActor(req));
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
@@ -329,12 +354,12 @@ public static class ServiceApp
                 : string.IsNullOrWhiteSpace(request.Branch) ? BranchGuardReason.BranchRequired : null;
             if (refusal is not null)
             {
-                await service.RecordRetireDeniedAsync(refusal, ExtractBearer(req), ct);
+                await service.RecordRetireDeniedAsync(refusal, AuditActor(req), ct);
                 return Results.Json(new { status = "rejected", reason = refusal }, ServiceJson.Options,
                     statusCode: StatusCodes.Status400BadRequest);
             }
 
-            var result = await service.RetireBranchAsync(request, ExtractBearer(req), ct);
+            var result = await service.RetireBranchAsync(request, AuditActor(req), ct);
             return result.Reason is null
                 ? Results.Json(new { retired = result.Retired }, ServiceJson.Options)
                 : Results.Json(new { status = "rejected", reason = result.Reason }, ServiceJson.Options,
@@ -343,7 +368,7 @@ public static class ServiceApp
 
         control.MapPost("/retention", async (bool? execute, HttpRequest req, SnapshotService service, CancellationToken ct) =>
         {
-            var report = await service.RunRetentionAsync(execute ?? false, ExtractBearer(req), ct);
+            var report = await service.RunRetentionAsync(execute ?? false, AuditActor(req), ct);
             return Results.Json(report, ServiceJson.Options);
         });
 
@@ -387,7 +412,7 @@ public static class ServiceApp
         {
             if (string.IsNullOrWhiteSpace(dir))
                 return Results.BadRequest("query parameter 'dir' is required.");
-            var manifest = await service.CreateBackupAsync(dir, ExtractBearer(req), ct);
+            var manifest = await service.CreateBackupAsync(dir, AuditActor(req), ct);
             return Results.Json(manifest, ServiceJson.Options);
         });
 
@@ -438,6 +463,14 @@ public static class ServiceApp
             : string.IsNullOrWhiteSpace(header) ? null : header;
     }
 
+    /// <summary>
+    /// The principal an audited control call is attributed to (SVC-3): the verified caller
+    /// (<see cref="CallerPrincipal.AuditPrincipal"/>) when the call carried a caller assertion, else its bearer.
+    /// The service hashes it before it is stored.
+    /// </summary>
+    private static string? AuditActor(HttpRequest req) =>
+        CallerRequest.Get(req.HttpContext)?.Principal?.AuditPrincipal ?? ExtractBearer(req);
+
     private static void MapQuery(WebApplication app, ServiceOptions options)
     {
         // Remote base-snapshot paging (issue #51): serves one immutable page of a snapshot's symbols by its
@@ -451,8 +484,14 @@ public static class ServiceApp
                 // Under an enabled read policy, a query-plane principal may only page a snapshot belonging to
                 // a repository it is authorized to read. An unauthorized OR unknown snapshot returns an
                 // IDENTICAL 404, so this artifact surface is not a cross-tenant existence/artifact oracle
-                // (criterion 1: reveal no artifact access). With no policy configured this is a no-op.
-                if (options.ReadPolicy.Enabled && !AuthorizedForSnapshot(connection, options, http, identityHash))
+                // (criterion 1: reveal no artifact access). With no policy configured this is a no-op. A
+                // delegate caller (SVC-3) is decided by the per-caller authorizer instead, with the same 404.
+                if (http.RequestServices.GetRequiredService<CallerAssertionGate>().IsDelegateRequest(http))
+                {
+                    if (!AuthorizedForDelegateSnapshot(connection, http, identityHash))
+                        return Results.NotFound();
+                }
+                else if (options.ReadPolicy.Enabled && !AuthorizedForSnapshot(connection, options, http, identityHash))
                     return Results.NotFound();
 
                 var source = new LocalBaseSnapshotSource(connection);
@@ -501,6 +540,17 @@ public static class ServiceApp
         return url is not null && options.ReadPolicy.Allows(BearerToken(http), url);
     }
 
+    /// <summary>
+    /// Authorizes a delegate caller's snapshot-page request (SVC-3) through the provider's per-caller read
+    /// authorizer. An unknown snapshot is unauthorized, so the 404 stays uniform.
+    /// </summary>
+    private static bool AuthorizedForDelegateSnapshot(SqliteConnection conn, HttpContext http, string identityHash)
+    {
+        var snapshot = new SnapshotStore(conn).GetByIdentityHash(identityHash);
+        return snapshot is not null
+            && http.RequestServices.GetRequiredService<DatabaseProvider>().Authorizer.Authorize(snapshot).Allowed;
+    }
+
     private static bool Authorized(HttpContext context, string? expectedToken)
     {
         if (string.IsNullOrEmpty(expectedToken))
@@ -539,7 +589,7 @@ public static class ServiceApp
     }
 
     /// <summary>Extracts the raw bearer token from the Authorization header, or null when absent.</summary>
-    private static string? BearerToken(HttpContext context)
+    internal static string? BearerToken(HttpContext context)
     {
         var header = context.Request.Headers.Authorization.ToString();
         const string prefix = "Bearer ";
@@ -601,13 +651,14 @@ public static class ServiceApp
 
     /// <summary>
     /// Decides, per request, whether a query-plane read must name a repository
-    /// (<see cref="DatabaseProvider.RequireRepositorySelection"/>). Today that is the operator switch
-    /// <see cref="ServiceOptions.RequireRepositorySelection"/> alone, so with it off a legacy caller that
-    /// sends no selector keeps reading the unselected default. Any other per-request reason to require a
+    /// (<see cref="DatabaseProvider.RequireRepositorySelection"/>): when the operator switch
+    /// <see cref="ServiceOptions.RequireRepositorySelection"/> is on, or when the request carries a verified caller
+    /// (SVC-3), since a caller's reads are scoped to the repositories it may read. With both off, a legacy caller
+    /// that sends no selector keeps reading the unselected default. Any other per-request reason to require a
     /// selection composes here with <c>||</c>.
     /// </summary>
-    private static Func<bool> RepositorySelectionRequirement(ServiceOptions options) =>
-        () => options.RequireRepositorySelection;
+    private static Func<bool> RepositorySelectionRequirement(ServiceOptions options, Func<CallerPrincipal?> caller) =>
+        () => options.RequireRepositorySelection || caller() is not null;
 
     /// <summary>
     /// Maps a repository row id to its remote URL for <see cref="PolicyReadAuthorizer"/>, caching results
