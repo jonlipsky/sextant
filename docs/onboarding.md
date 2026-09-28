@@ -10,16 +10,16 @@ There are **two supported modes**. Pick one:
 | | Mode A — Thin / server-backed | Mode B — Hybrid / local overlay |
 |---|---|---|
 | **You index locally?** | No | Only your **uncommitted** changes |
-| **Where the index lives** | The shared ProcessStack Sextant gateway | Local SQLite (committed base + a working-tree overlay); optional peer federation for cross-repo base snapshots |
+| **Where the index lives** | A shared Sextant index service, reached through the `sextant` ProcessStack app | Local SQLite (committed base + a working-tree overlay); optional peer federation for cross-repo base snapshots |
 | **Best for** | Large repos, the monorepo, "just query it" | Working on a branch with dirty changes you want reflected in queries |
-| **What you install** | An MCP endpoint config + an API key | The `sextant` CLI + `sextant.json` (+ optional peer config) |
-| **Network dependency** | Always (every query hits the gateway) | Local queries need no network; the `get_base_snapshot_symbols` federation tool fetches remote base snapshots and **falls back to a cached base when offline** |
+| **What you install** | An MCP endpoint config + a ProcessStack API key | The `sextant` CLI + `sextant.json` (+ optional peer config) |
+| **Network dependency** | Always (every query goes through ProcessStack to the service) | Local queries need no network; the `get_base_snapshot_symbols` federation tool fetches remote base snapshots and **falls back to a cached base when offline** |
 
 **Which should I use?**
 
 - **Start with Mode A.** It is the recommended default for large repositories and the monorepo — there is
-  no local indexing, so there is nothing to build or keep fresh. Your agent talks to the central,
-  org-shared index.
+  no local indexing, so there is nothing to build or keep fresh. Your agent talks to the shared index,
+  and sees only the repositories you watch.
 - **Add Mode B** when you are actively editing code and need queries to reflect your **uncommitted**
   working-tree changes. You index the committed state once locally; the daemon then re-indexes only what
   you change and keeps a small **working-tree overlay** layered over that committed base.
@@ -35,34 +35,42 @@ There are **two supported modes**. Pick one:
 - **.NET 10 SDK** (required for the CLI and for local indexing in Mode B).
 - Your AI coding tool of choice. Sextant ships MCP install support for `claude-code`, `cursor`,
   `copilot`, `vscode`, `codex`, and `opencode`.
-- For Mode A: a scoped API key for the ProcessStack Sextant gateway (see below).
+- For Mode A: access to a ProcessStack tenant where the `sextant` app is deployed, and an API key for it
+  (see below). Setting the app up is an operator task:
+  [`apps/processstack/sextant/README.md`](../apps/processstack/sextant/README.md).
 
 ---
 
 ## Mode A — Thin / server-backed (recommended)
 
-In this mode your agent speaks MCP to the **ProcessStack Sextant gateway**. No local indexing, no
-`sextant.json`, no daemon — just an MCP endpoint and a key.
+In this mode your agent speaks MCP to the **`sextant` ProcessStack app**. The app forwards each query to
+the Sextant index service with your signed identity, and the service answers only for the repositories you
+watch. No local indexing, no `sextant.json`, no daemon — just an MCP endpoint and a key.
 
-### A1. Get a scoped API key
+### A1. Get an API key for the app
 
-Obtain an API key for the gateway with the **`mcp:sextant:read`** scope. The key is presented on every
-request via the `X-Api-Key` header. Keep it out of source control — reference it through an input prompt
-or environment variable in your MCP config (examples below), never a literal.
+Mint a key that can reach only the app's MCP surface:
+
+```bash
+processstack api-key create --name <key-name> --app sextant
+```
+
+`--app sextant` grants `mcp:run:sextant` only, and the key is **live-bounded**: it never has more access
+than you do right now, so it stops working when you lose access. Send it in the **`X-API-Key`** header on
+every request. Keep it out of source control — reference it through an input prompt or environment
+variable in your MCP config (examples below), never a literal.
 
 ### A2. Configure the MCP endpoint
 
-The gateway exposes an HTTP MCP endpoint:
+The app's MCP surface is:
 
 ```
-POST https://standalone.processstack.dev/api/v1/{tenant}/mcp/_sextant
+POST <processstack-api>/v1/<tenant>/mcp/sextant
 ```
 
-For the shared org index the tenant is **`processstack`**, so the full URL is:
-
-```
-https://standalone.processstack.dev/api/v1/processstack/mcp/_sextant
-```
+`<processstack-api>` is your ProcessStack API's base URL and `<tenant>` your tenant's slug; ask your
+ProcessStack operator for both. If the tenant runs more than one deployment of the app, add
+`?deployment=<name>` to pick one.
 
 Point your agent at it as an HTTP MCP server. For **Copilot / VS Code**, add to `.vscode/mcp.json`
 (the `servers` key is what Sextant's own installer uses for these tools):
@@ -70,14 +78,14 @@ Point your agent at it as an HTTP MCP server. For **Copilot / VS Code**, add to 
 ```jsonc
 {
   "inputs": [
-    { "id": "sextant_api_key", "type": "promptString", "description": "Sextant gateway API key", "password": true }
+    { "id": "sextant_api_key", "type": "promptString", "description": "ProcessStack API key for the sextant app", "password": true }
   ],
   "servers": {
     "sextant": {
       "type": "http",
-      "url": "https://standalone.processstack.dev/api/v1/processstack/mcp/_sextant",
+      "url": "<processstack-api>/v1/<tenant>/mcp/sextant",
       "headers": {
-        "X-Api-Key": "${input:sextant_api_key}"
+        "X-API-Key": "${input:sextant_api_key}"
       }
     }
   }
@@ -94,29 +102,54 @@ Other tools use the same URL and header, only the config file and root key diffe
 | `codex` | `.codex/config.toml` | `[mcp_servers]` |
 | `opencode` | `opencode.json` | `mcp.mcpServers` |
 
+`tools/list` shows:
+
+- the service's query tools under their own names: `list_repositories`, `search_symbols`, `find_symbol`,
+  `find_references`, `get_type_hierarchy`, `get_call_hierarchy`, `get_impact`, `get_index_status`, and the
+  rest of the remote query set (`research_codebase` and the local-only tools are not offered);
+- the app's own tools: `start-indexing` (index an exact commit of a repository you watch),
+  `get-indexing-status` (poll the job it returns) and `import-legacy-watches` (below).
+
 ### A3. Watch the repositories you need
 
-The gateway's query gate is **deny-by-default per principal**: a repository returns data **only if** the
-principal behind your key has **watched** it, or the repository is connection-enrolled. This is why a
-freshly-issued key returns empty results until you watch something — it is a safety property, not a bug.
+Reads are **deny-by-default per caller**: a repository returns data **only if** you hold a grant for it (a
+watch), or your tenant holds a tenant-wide grant (a repository the tenant's GitHub App installation sends
+events for). A freshly issued key therefore returns nothing until you watch something — it is a safety
+property, not a bug.
 
-Watch a repository through the **Sextant chat assistant**:
+Watch a repository through the **`sextant` chat** in ProcessStack's web chat, API or CLI (watch commands
+are refused on Slack):
 
-- `watch owner/repo on <branch>` — start serving that repo/branch to your principal.
-- `what am I watching` — list your current watches.
-- `stop watching owner/repo` — remove a watch.
+- `watch owner/repo on <branch>` (or just `watch owner/repo` for its default branch) — start serving that
+  repository to you, and start indexing it if it has no snapshot yet.
+- `what am I watching` — list your watches and whether each one is indexed yet.
+- `stop watching owner/repo` — remove a watch (every branch), or `stop watching owner/repo on <branch>`.
+
+Only github.com repositories that the workspace's GitHub connection can see can be watched.
+
+**Coming from the older `_sextant` gateway?** Your v1 watches are imported the first time you send the chat
+a message, and the reply starts with a note on what was imported. You can also run the
+`import-legacy-watches` tool at any time; a watch already imported counts as imported. The old
+`mcp:sextant:read` key and the `/mcp/_sextant` endpoint are retired at the cutover; mint a new key as in A1.
 
 ### A4. Run your first query
 
-Ask your agent something that routes to a Sextant tool, or call one directly. Good first calls:
+Good first calls:
 
-- `get_index_status` — confirms the index is reachable and shows what is available. **Call this first.**
+- `list_repositories` — every repository you can see, with its branches and whether each is indexed.
+  **Call this first.**
 - `find_symbol` — look up any symbol by name (exact or fuzzy).
 - `find_references` — every usage of a symbol.
+- `search_symbols` — a name-prefix search across **every** repository you can see, paged with a cursor.
+
+Name the repository on each call with the optional `repository` argument (`owner/repo` or its full URL)
+and, if you need a branch other than the default, `branch`. When you can see exactly one repository with an
+indexed default branch (your watches plus the tenant's repositories, as `list_repositories` shows them), a
+call that names neither reads that one.
 
 Every response carries a `meta` object (`queried_at`, `index_freshness`, `result_count`) so you can see
-how fresh the served data is. If `get_index_status` succeeds and `find_symbol` returns rows for a repo you
-have watched, Mode A is working.
+how fresh the served data is. If `list_repositories` lists your watch and `find_symbol` returns rows for
+it, Mode A is working.
 
 ---
 
@@ -130,10 +163,10 @@ uncommitted edits without re-indexing the whole repo on every save.
 The overlay always layers over a **local** committed base snapshot (produced by your initial local index).
 Separately, configuring `peers` / `SEXTANT_PEERS` wires **remote base-snapshot federation** for the
 `get_base_snapshot_symbols` MCP tool: when a base snapshot addressed by its identity hash is not in your
-local catalog, Sextant transparently fetches it from a configured peer (for example the server), so you can
-page symbols from a base that lives in **another repository's** service without cloning it. Ordinary
-queries (`find_symbol`, `find_references`, …) read your local index; federation is specifically that
-cross-repo base-snapshot path.
+local catalog, Sextant transparently fetches it from a configured peer (for example a shared Sextant index
+service), so you can page symbols from a base that lives in **another repository's** service without
+cloning it. Ordinary queries (`find_symbol`, `find_references`, …) read your local index; federation is
+specifically that cross-repo base-snapshot path.
 
 ### B1. Install the CLI
 
@@ -165,7 +198,7 @@ At the root of the repository you are working in, create a `sextant.json` descri
 ```json
 {
   "solutions": ["src/App.sln"],
-  "peers": ["https://standalone.processstack.dev"],
+  "peers": ["https://<sextant-service-host>"],
   "remote_fetch_timeout_seconds": 10
 }
 ```
@@ -180,7 +213,8 @@ At the root of the repository you are working in, create a `sextant.json` descri
 
 If the peer's query plane requires a token, add `"peer_query_token": "<token>"`. A remote fetch never
 widens local authorization — the peer authorizes that token against its **own** read policy, so you read
-only what the peer already grants.
+only what the peer already grants. The shared service behind Mode A does not accept ProcessStack API keys
+on its query plane, so federating to it needs a query token that its operator issues to a trusted peer.
 
 Environment variables override `sextant.json` and are handy for keeping secrets and endpoints out of a
 committed file:
@@ -192,7 +226,7 @@ committed file:
 | `SEXTANT_PEER_QUERY_TOKEN` | `peer_query_token` | Shared token presented to every configured peer |
 
 ```bash
-export SEXTANT_PEERS="https://standalone.processstack.dev"
+export SEXTANT_PEERS="https://<sextant-service-host>"
 export SEXTANT_REMOTE_FETCH_TIMEOUT=10
 # export SEXTANT_PEER_QUERY_TOKEN="<token>"   # only if the peer enforces a query token
 ```
@@ -244,15 +278,23 @@ identity hash — ordinary queries such as `find_symbol` read your local index a
 
 ## Troubleshooting
 
-**Empty results in Mode A ⇒ deny-by-default.** The gateway serves a repository only to a principal that has
-**watched** it (or a connection-enrolled repo). A brand-new key returns nothing until you watch a repo. Fix
-it with the chat assistant: `watch owner/repo on <branch>`, then `what am I watching` to confirm. Also
-double-check the key carries the `mcp:sextant:read` scope and is sent as the `X-Api-Key` header.
+**Empty results in Mode A ⇒ you hold no grant.** The service answers only for the repositories you watch
+(or that your tenant's GitHub App installation sends events for), so a new key sees nothing until you watch
+one: `list_repositories` comes back empty, `search_symbols` answers `no_visible_repositories`, and a query
+that names a repository you cannot see gets the same not-found answer as one that does not exist. Fix it
+with the `sextant` chat: `watch owner/repo on <branch>`, then `what am I watching` to confirm. A new watch
+returns data once its first snapshot is published; `list_repositories` shows whether each branch is
+indexed yet.
 
-**`/mcp` read-timeout on the query path.** The gateway's `/mcp` query path can hit a read-timeout under
-load (tracked as ProcessStack #3075). If a query stalls or returns a timeout, retry; prefer narrow queries
-(`get_index_status`, an exact `find_symbol`) over broad ones while the timeout is being addressed. In Mode
-B, `SEXTANT_REMOTE_FETCH_TIMEOUT` bounds each remote base-snapshot fetch independently of this.
+**`repository_required` in Mode A.** A query that names neither a repository nor a branch reads the one
+repository you can see with an indexed default branch. When there are several (or none), it answers
+`repository_required`: name one with the `repository` argument (`owner/repo`). A call that names a `branch`
+must name its `repository` too.
+
+**401 or "upstream unavailable" in Mode A.** Send the key in the **`X-API-Key`** header; a ProcessStack API
+key sent as `Authorization: Bearer` is rejected with 401. A key minted with `--app sextant` reaches only
+`/v1/<tenant>/mcp/sextant`. If the query tools answer "upstream unavailable", the tenant runs more than one
+deployment of the app: add `?deployment=<name>` to the URL (ask your operator which one).
 
 **Offline or peer unreachable (Mode B).** Federation is **cache-first**: once a base-snapshot page has been
 fetched, it keeps answering with `meta.snapshot.origin=remote` even when the peer later goes offline
@@ -274,6 +316,8 @@ upgrade, `get_index_status` surfaces an actionable readiness message instead of 
 - [mcp-tools.md](mcp-tools.md) — every MCP tool, its parameters, and response/`meta` formats.
 - [daemon.md](daemon.md) — file watching, incremental indexing, the working-tree overlay, and status
   endpoints.
-- [service.md](service.md) — the standalone index service that the gateway is built on (control/query
-  planes, tokens, read-authorization policy).
+- [service.md](service.md) — the standalone index service behind Mode A (control/query planes, tokens,
+  caller assertions, grants and the read-authorization policy).
+- [apps/processstack/sextant/README.md](../apps/processstack/sextant/README.md) — deploying and operating
+  the `sextant` ProcessStack app (operators).
 - [indexing.md](indexing.md) — the Roslyn extraction pipeline and project identity model.
