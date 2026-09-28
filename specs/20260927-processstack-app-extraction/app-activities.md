@@ -104,7 +104,7 @@ SX-13 follows the service code where it differs from the table above. Each activ
   - 400 gives `rejected`, with the body's reason: an SVC-5 code, a branch-guard code, or `branch_required`.
   - 409 gives `head_mismatch` when the reason is `head_mismatch`. Any other 409 (`default_branch`) is `rejected`.
   - 0 (no response), 408, 429 and 5xx (including the shutdown 503) give `unavailable`.
-- **`not_granted` is accepted** as either the body's `reason` or its `error`, because the service does not emit it yet (SVC-4 is unmerged).
+- **`not_granted`** is SVC-4's 403 `{status: "rejected", reason: "not_granted"}` for a user caller without a grant. It is also accepted as the body's `error`, and a parity test pins the service's `GrantReason.NotGranted`.
 - **`reason`** is the body's `reason`, else its `error`, else `no_response`/`http_<status>`. For a 2xx ensure it is the job's recorded reason.
 - **Extra outputs:** `identityHash`, `jobStatus`, `terminal`, `published`, `attached` and `retired`. The job statuses mirror `SnapshotJobStatus`, and a test pins them.
 - **`retryAdvised` is true only for an `advance` ensure that reported `branch_advanced:false`.** It is never true for `none`.
@@ -112,7 +112,7 @@ SX-13 follows the service code where it differs from the table above. Each activ
 
 **`SextantPlanReconcile`**
 - **The input contract:**
-  - `serviceTargets` is the watched `(repository, branch)` list. `branch: ""` means the default branch. Each target carries its `/control/resolve` result (`resolveStatusCode`, `resolve`).
+  - `serviceTargets` is the watched `(repository, branch)` list, i.e. the `targets[]` items of SVC-4's `GET /control/grants?scope=tenant` (`{repository, branch, sources, watchers}`). `branch: ""` means the default branch. Each target carries its `/control/resolve` result (`resolveStatusCode`, `resolve`).
   - `githubBranches` is either per repository `{repository, defaultBranch, branches:[{name, sha}], truncated?}` or flat `{repository, name, sha, isDefault?}` (`commit.sha` is also read).
   - **Every resolve happens before the GitHub branch listing,** which amends the order of `app.md` steps 3b and 3c. The order is: `GetRepository` (for the default branch's name), then the resolve, then `ListBranches`.
     - The CAS only guards against pushes the service processes after the resolve.

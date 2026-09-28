@@ -246,6 +246,18 @@ public sealed class SextantInterpretEnsureResultActivityTests
     }
 
     [TestMethod]
+    public async Task The_service_s_not_granted_refusal_is_not_granted()
+    {
+        // SVC-4's ensure refusal for a user caller without a grant, built from the service's own constant.
+        var body = JsonSerializer.Serialize(new { status = "rejected", reason = Sextant.Service.Grants.GrantReason.NotGranted }, ServiceJson.Options);
+
+        var activity = await InterpretAsync(403, body);
+
+        Assert.AreEqual(SextantInterpretEnsureResultActivity.OutcomeNotGranted, activity.Outcome);
+        Assert.AreEqual(Sextant.Service.Grants.GrantReason.NotGranted, activity.Reason);
+    }
+
+    [TestMethod]
     [DataRow(BranchGuardReason.HeadMismatch, "head_mismatch")]
     [DataRow(BranchGuardReason.DefaultBranch, "rejected")]
     public async Task A_409_retire_refusal_is_classified(string reason, string outcome)
