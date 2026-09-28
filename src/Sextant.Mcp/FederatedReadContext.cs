@@ -15,17 +15,26 @@ public sealed class FederatedReadContext
 {
     private FederatedReadContext(
         SnapshotReadScope scope, SnapshotProvenance? provenance, ReadAuthorization authorization,
-        long? selectedSnapshotId, RemoteBaseDescriptor? remoteBase)
+        long? selectedSnapshotId, RemoteBaseDescriptor? remoteBase, bool selectionUnresolved = false)
     {
         Scope = scope;
         Provenance = provenance;
         Authorization = authorization;
         SelectedSnapshotId = selectedSnapshotId;
         RemoteBase = remoteBase;
+        SelectionUnresolved = selectionUnresolved;
     }
 
     /// <summary>The pinned read scope reused by every store in this request.</summary>
     public SnapshotReadScope Scope { get; }
+
+    /// <summary>
+    /// True when the request NAMED a repository that has no complete default-branch snapshot. Such a read
+    /// never widens to the unselected fallback (which spans every repository of a multi-repository
+    /// catalog): its <see cref="Scope"/> is <see cref="SnapshotReadScope.DenyAll"/> and
+    /// <see cref="ReadContextGate"/> refuses it. False for every read without a named repository.
+    /// </summary>
+    public bool SelectionUnresolved { get; }
 
     /// <summary>
     /// Present (non-null) only when the pinned generation is a REMOTE-base overlay (issue #108): an overlay
@@ -60,7 +69,8 @@ public sealed class FederatedReadContext
     /// <paramref name="compatibility"/> are injectable for tests and future remote enforcement.
     /// <paramref name="requestedRepository"/> is the Phase-17 request-level repository selector (criterion
     /// 1): when it yields a non-empty remote URL the request pins THAT repository's default-branch
-    /// snapshot (the multi-tenant path — the caller names its authorized repository), and when it yields
+    /// snapshot (the multi-tenant path — the caller names its authorized repository), or reads nothing
+    /// (<see cref="SelectionUnresolved"/>) when that repository has none, and when it yields
     /// null the resolver falls back to the single-repository default (byte-identical to pre-Phase-17), so
     /// the zero-policy local path is unchanged.
     /// </summary>
@@ -81,9 +91,10 @@ public sealed class FederatedReadContext
         // repository selector (Phase 17) the named repository's snapshot is pinned; otherwise the
         // single-repository default resolves exactly as before.
         var requested = requestedRepository?.Invoke();
-        var selected = string.IsNullOrEmpty(requested)
-            ? snapshots.GetSelectedSnapshotRow()
-            : snapshots.GetSelectedSnapshotRowForRepository(requested);
+        var named = !string.IsNullOrEmpty(requested);
+        var selected = named
+            ? snapshots.GetSelectedSnapshotRowForRepository(requested!)
+            : snapshots.GetSelectedSnapshotRow();
         var authorization = (authorizer ?? AllowAllReadAuthorizer.Instance).Authorize(selected);
 
         // Fail closed: on denial the read gets a DENY-ALL scope (matches no rows), so even a caller that
@@ -91,6 +102,14 @@ public sealed class FederatedReadContext
         // denial into the uniform not-found. No provenance/scope work is done for a denied read.
         if (!authorization.Allowed)
             return new FederatedReadContext(SnapshotReadScope.DenyAll, provenance: null, authorization, selectedSnapshotId: null, remoteBase: null);
+
+        // A NAMED repository with no complete default-branch snapshot must not fall back to the unselected
+        // scope (LegacyPinned / Unscoped, i.e. every repository of a multi-repository catalog): the caller
+        // asked for one repository, so it reads nothing. An enforcing authorizer already denied this above
+        // (a null selection is unauthorized); a permissive one allows it, so it is pinned to DENY-ALL here.
+        if (named && selected == null)
+            return new FederatedReadContext(SnapshotReadScope.DenyAll, provenance: null, authorization,
+                selectedSnapshotId: null, remoteBase: null, selectionUnresolved: true);
 
         var scope = ResolveScope(snapshots, selected, mode);
         var provenance = selected == null
