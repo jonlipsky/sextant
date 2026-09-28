@@ -68,10 +68,11 @@ public static class CallerAssertionReasons
 /// <c>iss</c>; (5) <c>nbf</c>/<c>exp</c>/<c>iat</c> within <see cref="ClockSkewSeconds"/> of now and a lifetime of at
 /// most <see cref="MaxLifetimeSeconds"/>; (6) <c>tid</c> equals the tenant the kid is bound to; (7) <c>act</c> is
 /// <c>user</c> (with <c>idp</c> and <c>sub</c>) or <c>application</c> (with neither); (8) <c>sub</c> is namespaced by
-/// its <c>idp</c>; (9) <c>jti</c>, <c>via</c>, <c>tslug</c>, <c>app</c>, <c>dep</c> and <c>cid</c> are present. Steps
-/// 10-11 are policy and make it <see cref="CallerAssertionOutcome.NotAllowed"/>: (10) a user's <c>idp</c> is in
-/// <see cref="CallerAssertionOptions.Idps"/>; (11) <c>app</c> is in <see cref="CallerAssertionOptions.Apps"/> when
-/// that is set. Unknown claims are ignored.
+/// its <c>idp</c>; (9) <c>jti</c>, <c>via</c>, <c>tslug</c>, <c>app</c> and <c>cid</c> are present, and <c>dep</c>
+/// is either absent or a non-empty string (the signer sends it only when the calling run is bound to a
+/// deployment). Steps 10-11 are policy and make it <see cref="CallerAssertionOutcome.NotAllowed"/>: (10) a user's
+/// <c>idp</c> is in <see cref="CallerAssertionOptions.Idps"/>; (11) <c>app</c> is in
+/// <see cref="CallerAssertionOptions.Apps"/> when that is set. Unknown claims are ignored.
 /// </para>
 /// </summary>
 public sealed class CallerAssertionVerifier
@@ -226,11 +227,11 @@ public sealed class CallerAssertionVerifier
         var via = StringOf(claims, "via");
         var tslug = StringOf(claims, "tslug");
         var app = StringOf(claims, "app");
-        var dep = StringOf(claims, "dep");
         var cid = StringOf(claims, "cid");
         if (loggedJti is null || via is not ("mcp-surface" or "activity")
-            || tslug is null || app is null || dep is null || cid is null
-            || !TryOptionalString(claims, "run", out var run))
+            || tslug is null || app is null || cid is null
+            || !TryOptionalString(claims, "run", out var run)
+            || !TryOptionalString(claims, "dep", out var dep) || dep is { Length: 0 })
             return Invalid(CallerAssertionReasons.BadClaims, keyId, loggedJti);
 
         // Steps 10-11: policy.

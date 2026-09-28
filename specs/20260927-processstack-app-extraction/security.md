@@ -122,7 +122,7 @@ The app's pre-check is **UX plus defense in depth, not a boundary**. The durable
 
 | Event | Actor | Detail |
 |---|---|---|
-| ensure / resolve / retire / grant / query | `HashActor("{tid}/{sub}")` (`sub` is idp-namespaced) or `HashActor("{tid}/app:{app}")` (SHA-256 with a domain prefix, `src/Sextant.Store/AuditLogStore.cs:218-224`) | `idp, kid, via, cid, dep, jti`, outcome, and the repository scope (canonical URL) |
+| ensure / resolve / retire / grant / query | `HashActor("{tid}/{sub}")` (`sub` is idp-namespaced) or `HashActor("{tid}/app:{app}")` (SHA-256 with a domain prefix, `src/Sextant.Store/AuditLogStore.cs:218-224`) | `idp, kid, via, cid, dep, jti` (`dep=-` when the assertion carries none; `dep` is optional since 2026-09-28), outcome, and the repository scope (canonical URL) |
 
 - Grant rows necessarily store `tenant_id` and the full `sub` in clear, because lookups need them. They are PS ULIDs (or namespaced peer ids if another idp is allowed), not names or emails.
 - `/control/audit` stays control-token only.
