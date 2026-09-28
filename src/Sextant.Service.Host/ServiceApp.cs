@@ -257,6 +257,14 @@ public static class ServiceApp
                     return Results.Json(new { status = "rejected", reason = decision.Reason }, ServiceJson.Options,
                         statusCode: StatusCodes.Status400BadRequest);
                 }
+                // SVC-6/7: malformed branch guards (both expected_head_commit and branch_head_sequence, or an
+                // unknown branch_update) are refused before any job row exists, audited like the URL policy.
+                if (request.BranchGuardProblem() is { } guardProblem)
+                {
+                    await service.RecordEnsureDeniedAsync(guardProblem, ExtractBearer(req), ct);
+                    return Results.Json(new { status = "rejected", reason = guardProblem }, ServiceJson.Options,
+                        statusCode: StatusCodes.Status400BadRequest);
+                }
                 result = wait == false
                     ? await service.BeginEnsureSnapshotAsync(request, ExtractBearer(req), ct)
                     : await service.EnsureSnapshotAsync(request, ct, ExtractBearer(req));
@@ -291,16 +299,46 @@ public static class ServiceApp
 
         control.MapGet("/resolve", (string repository, string? branch, SnapshotService service) =>
         {
-            var row = service.ResolveBranch(repository, branch);
-            if (row is null)
+            var head = service.ResolveBranchHead(repository, branch);
+            if (head is null)
                 return Results.NotFound();
 
             // Additive (issue #119): the snapshot's durable coverage rides alongside the snapshot row so a
-            // caller can tell a partial snapshot from a complete one without a second request.
-            var body = System.Text.Json.JsonSerializer.SerializeToNode(row, ServiceJson.Options)!.AsObject();
-            if (service.GetCoverage(row.Id) is { } coverage)
+            // caller can tell a partial snapshot from a complete one without a second request. Additive
+            // (SVC-6): the branch it resolved through and the snapshot's commit.
+            var body = System.Text.Json.JsonSerializer.SerializeToNode(head.Snapshot, ServiceJson.Options)!.AsObject();
+            if (head.Coverage is { } coverage)
                 body["coverage"] = System.Text.Json.JsonSerializer.SerializeToNode(coverage, ServiceJson.Options);
+            if (head.CommitSha is { } commitSha)
+                body["commit_sha"] = commitSha;
+            body["branch"] = head.Branch;
+            body["is_default"] = head.IsDefault;
+            if (head.HeadSequence is long headSequence)
+                body["head_sequence"] = headSequence;
             return Results.Json(body, ServiceJson.Options);
+        });
+
+        // SVC-6: retire a branch pointer (the branch was deleted upstream). The SVC-5 repository URL policy
+        // applies as at ensure intake; the 400 body carries only the reason code (never the URL). A missing
+        // branch is 200 {retired:false} (idempotent); the default branch and a head-CAS mismatch are 409.
+        control.MapPost("/branches/retire", async (RetireBranchRequest request, HttpRequest req, SnapshotService service, ServiceOptions options, CancellationToken ct) =>
+        {
+            var decision = options.RepositoryUrlPolicy.Evaluate(request.Repository);
+            var refusal = !decision.Ok
+                ? decision.Reason!
+                : string.IsNullOrWhiteSpace(request.Branch) ? BranchGuardReason.BranchRequired : null;
+            if (refusal is not null)
+            {
+                await service.RecordRetireDeniedAsync(refusal, ExtractBearer(req), ct);
+                return Results.Json(new { status = "rejected", reason = refusal }, ServiceJson.Options,
+                    statusCode: StatusCodes.Status400BadRequest);
+            }
+
+            var result = await service.RetireBranchAsync(request, ExtractBearer(req), ct);
+            return result.Reason is null
+                ? Results.Json(new { retired = result.Retired }, ServiceJson.Options)
+                : Results.Json(new { status = "rejected", reason = result.Reason }, ServiceJson.Options,
+                    statusCode: StatusCodes.Status409Conflict);
         });
 
         control.MapPost("/retention", async (bool? execute, HttpRequest req, SnapshotService service, CancellationToken ct) =>

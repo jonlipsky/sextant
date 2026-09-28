@@ -59,6 +59,58 @@ public sealed record EnsureSnapshotRequest
     public bool ResolveIsDefaultBranch() => IsDefaultBranch ?? (BranchName is null);
 
     /// <summary>
+    /// An OPTIONAL compare-and-swap guard on the branch pointer (SVC-6): the commit the caller expects the
+    /// branch to point at right now, typically a push's <c>before</c>. <c>""</c> or an all-zero SHA means
+    /// "the branch must have no pointer yet" (a branch create). The branch advances only when the pointer's
+    /// commit equals this value, when the pointer's target is unusable (not complete, or reclaimed by
+    /// retention), or when the branch has no pointer and this value is empty/all zeros. Otherwise the
+    /// snapshot is attached and the branch is left untouched. It cannot be combined with
+    /// <see cref="BranchHeadSequence"/> (<c>conflicting_branch_guards</c>). Deliberately NOT folded into
+    /// <see cref="ToIdentity"/>. Serializes as <c>expected_head_commit</c>.
+    /// </summary>
+    public string? ExpectedHeadCommit { get; init; }
+
+    /// <summary>
+    /// OPTIONAL and informational (SVC-6): the caller reports that the push was a force-push. It is recorded
+    /// in the ensure audit row and does NOT bypass the <see cref="ExpectedHeadCommit"/> CAS, because the CAS
+    /// on the push's <c>before</c> already orders the events. Deliberately NOT folded into
+    /// <see cref="ToIdentity"/>. Serializes as <c>forced</c>.
+    /// </summary>
+    public bool? Forced { get; init; }
+
+    /// <summary>
+    /// OPTIONAL branch-pointer mode (SVC-7): <c>"advance"</c> (the default, also when omitted) or
+    /// <c>"none"</c>. <c>none</c> publishes or attaches the snapshot but creates or moves NO branch pointer
+    /// (for example a pull-request head or a historical commit), and wins over every other branch guard.
+    /// Matched case-insensitively; any other value is refused with <c>invalid_branch_update</c>.
+    /// Deliberately NOT folded into <see cref="ToIdentity"/>. Serializes as <c>branch_update</c>.
+    /// </summary>
+    public string? BranchUpdate { get; init; }
+
+    /// <summary>True when <see cref="BranchUpdate"/> is <c>none</c>: no branch pointer is created or moved.</summary>
+    [JsonIgnore]
+    public bool SuppressesBranchUpdate =>
+        string.Equals(BranchUpdate, BranchUpdateMode.None, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The intake reason code when the branch guards are malformed, or <c>null</c> when they are valid:
+    /// <c>invalid_branch_update</c> for an unknown <see cref="BranchUpdate"/>, and
+    /// <c>conflicting_branch_guards</c> when both <see cref="ExpectedHeadCommit"/> and
+    /// <see cref="BranchHeadSequence"/> are present. <c>branch_update: none</c> takes precedence over both
+    /// guards (SVC-6/7 precedence row 0: they are ignored), so it is never a conflict.
+    /// </summary>
+    public string? BranchGuardProblem()
+    {
+        if (BranchUpdate is not null
+            && !string.Equals(BranchUpdate, BranchUpdateMode.Advance, StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(BranchUpdate, BranchUpdateMode.None, StringComparison.OrdinalIgnoreCase))
+            return BranchGuardReason.InvalidBranchUpdate;
+        if (!SuppressesBranchUpdate && ExpectedHeadCommit is not null && BranchHeadSequence is not null)
+            return BranchGuardReason.ConflictingBranchGuards;
+        return null;
+    }
+
+    /// <summary>
     /// Set by <see cref="SnapshotService"/> — never bound from the wire (internal + ignored) — when this run is
     /// the LAST provisioning attempt the job-wide bound allows (issue #125). A clone-mode checkout then degrades
     /// a still-TRANSIENT submodule failure (an unreachable host, a persistent 5xx) to an unpopulated submodule
@@ -120,6 +172,77 @@ public sealed record EnsureSnapshotResult
     /// The durable checkout coverage recorded for the snapshot (issue #119); null when none was recorded
     /// (no snapshot, or a snapshot from a path that does not compute coverage).
     /// </summary>
+    public SnapshotCoverage? Coverage { get; init; }
+
+    /// <summary>
+    /// Whether THIS ensure moved the requested branch's pointer onto <see cref="SnapshotId"/> (SVC-6):
+    /// <c>true</c> when the pointer now targets the snapshot and targeted something else (or nothing) before
+    /// the decision, <c>false</c> when the branch guards left it where it was (a CAS mismatch, a lower
+    /// sequence, <c>branch_update: none</c>, or the pointer already targeted the snapshot). <c>null</c> when
+    /// the ensure made no branch decision (a non-terminal or failed job, or an attach to another caller's
+    /// in-flight production).
+    /// </summary>
+    public bool? BranchAdvanced { get; init; }
+}
+
+/// <summary>The <see cref="EnsureSnapshotRequest.BranchUpdate"/> values (SVC-7).</summary>
+public static class BranchUpdateMode
+{
+    public const string Advance = "advance";
+    public const string None = "none";
+}
+
+/// <summary>Reason codes for refused branch-guard requests and branch retirement (SVC-6/7).</summary>
+public static class BranchGuardReason
+{
+    public const string ConflictingBranchGuards = "conflicting_branch_guards";
+    public const string InvalidBranchUpdate = "invalid_branch_update";
+    public const string BranchRequired = "branch_required";
+    public const string HeadMismatch = "head_mismatch";
+    public const string DefaultBranch = "default_branch";
+}
+
+/// <summary>A request to retire (delete) a repository branch's pointer (SVC-6).</summary>
+public sealed record RetireBranchRequest
+{
+    public required string Repository { get; init; }
+    public required string Branch { get; init; }
+
+    /// <summary>
+    /// OPTIONAL compare-and-swap guard: retire only while the branch still points at this commit (for
+    /// example a delete push's <c>before</c>), so a newer push that re-created the branch is never
+    /// retired. <c>""</c>/all zeros means "the branch has no pointer". Same rules as
+    /// <see cref="EnsureSnapshotRequest.ExpectedHeadCommit"/>.
+    /// </summary>
+    public string? ExpectedHeadCommit { get; init; }
+}
+
+/// <summary>The outcome of a branch retirement (SVC-6).</summary>
+public sealed record RetireBranchResult
+{
+    /// <summary>True when the branch row was deleted; false when it did not exist (idempotent) or was refused.</summary>
+    public required bool Retired { get; init; }
+
+    /// <summary>
+    /// The refusal reason (<see cref="BranchGuardReason.HeadMismatch"/> or
+    /// <see cref="BranchGuardReason.DefaultBranch"/>), or <c>null</c> when the request was not refused.
+    /// </summary>
+    public string? Reason { get; init; }
+}
+
+/// <summary>
+/// A resolved branch head for <c>/control/resolve</c> (SVC-6): the published snapshot plus the branch it
+/// was resolved through and the snapshot's commit.
+/// </summary>
+public sealed record ResolvedBranchHead
+{
+    public required SnapshotRow Snapshot { get; init; }
+    public required string Branch { get; init; }
+    public required bool IsDefault { get; init; }
+    public long? HeadSequence { get; init; }
+    public string? CommitSha { get; init; }
+
+    /// <summary>The snapshot's durable coverage record (issue #119), or null when none was recorded.</summary>
     public SnapshotCoverage? Coverage { get; init; }
 }
 
