@@ -52,6 +52,24 @@ public sealed record SnapshotContext
     public long? BranchHeadSequence { get; init; }
 
     /// <summary>
+    /// An OPTIONAL compare-and-swap guard on the branch pointer for the SERVICE ensure path (SVC-6): the
+    /// commit the caller expects the branch to point at right now (for example a push's <c>before</c>).
+    /// When set, <c>AdvanceBranchToSnapshot</c> advances the pointer only when the pointer's current commit
+    /// equals this value, when the pointer's target is unusable (not complete, or reclaimed), or when the
+    /// branch has no pointer yet and this value is empty or all zeros (a branch create). Otherwise the
+    /// snapshot is attached and the branch is left untouched. Mutually exclusive with
+    /// <see cref="BranchHeadSequence"/>. <c>null</c> (the local CLI/daemon path) keeps today's behavior.
+    /// </summary>
+    public string? ExpectedHeadCommit { get; init; }
+
+    /// <summary>
+    /// When <c>true</c>, the run publishes or re-selects its snapshot but creates or moves NO branch pointer
+    /// (SVC-7, for example a pull-request head or a historical commit). This wins over every other branch
+    /// guard. <c>null</c>/<c>false</c> (the local CLI/daemon path) keeps today's behavior.
+    /// </summary>
+    public bool? SuppressBranchUpdate { get; init; }
+
+    /// <summary>
     /// The checkout coverage the producing worker computed for this snapshot (issue #119), or <c>null</c>
     /// when the caller does not compute coverage (the local CLI/daemon path). For a baseless remote-base
     /// overlay (#108) the local reconciler sets it to the peer-reported coverage of the committed base.

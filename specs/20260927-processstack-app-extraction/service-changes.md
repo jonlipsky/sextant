@@ -366,6 +366,45 @@ CREATE INDEX ix_grants_tenant_repo ON repository_grants(tenant_id, repository_ke
 - `resolve` returns `commit_sha`.
 - The local CLI's branch state is byte-identical.
 
+**As built (SX-8).** The table above is implemented as written. Where it left something open, the
+implementation settled it as follows (see `docs/service.md`, "Branch-pointer guards"):
+- **Absent branch.** "The pointer is unset" covers a branch that does not exist yet, and also an existing
+  row whose pointer is null (retention reclaimed it). The null-pointer case is also "unusable", so it passes
+  whatever the expected value is. The absent case passes only for `""` or all zeros. A non-empty `before` for
+  a branch the service has never seen therefore attaches only; the client seeds the branch with `""` or a
+  plain ensure.
+- **Commit comparison.** The comparison is case-insensitive. A target with no recorded commit never matches,
+  not even `""`, unless that target is unusable.
+- **Attach only.** On a mismatch no branch row is created and no default is promoted. As a result, a stale
+  push can never re-create a retired branch. A passing CAS supersedes the previous target only when it was
+  `complete` and no other branch points at it (the #128 guard). It never writes `head_sequence`.
+- **`none` (row 0) wins over the other guards,** including both together, so `none` plus both guards is not
+  a 400. `none` still clears the provider-only flag on a reuse, matching the worker's `EnsureRepository`.
+  Any `branch_update` value other than `advance` or `none` (including `""`) is `400 invalid_branch_update`,
+  and so is the row-1 conflict. Both refusals are audited `ensure`/`denied` before any job exists.
+- **The #85 re-select under the CAS.** Any guarded request (sequence, CAS or `none`) restores an intact
+  superseded snapshot to `complete` without the worker, and re-points the branch only when its guard passes.
+  This is exactly what the orchestrator's `SelectExistingSnapshot` does on the worker path (restore, then the
+  guarded advance), so the two paths converge. An unguarded ensure still hands a superseded identity to the
+  worker.
+- **`branch_advanced`.** It is `true` when this request's decision moved the pointer onto the snapshot, and
+  `false` when the decision declined or the pointer was already there. It is absent when there is no snapshot,
+  or when the request shared a non-terminal outcome of another request's production.
+- **Out-of-order convergence needs a retry.** A declined CAS returns `branch_advanced: false`. The newer push
+  lands when it is re-sent after the older one (a cheap reuse), or when the reconcile catches up.
+- **Retire.**
+  - Order of checks: absent (`200 {retired:false}`, even under a CAS), then the default branch (409), then
+    the CAS (409), then the delete. The CAS uses the same match rule as ensure.
+  - A refused URL or a blank `branch` is a `400` whose body carries only the reason code, audited
+    `retire`/`denied` with no repository scope.
+  - The decision, the delete and the audit row (`retired`/`absent`/reason) commit in one write transaction
+    under the single writer. Retire therefore waits behind a running production, as retention does.
+  - Deleting the row also drops `head_sequence`, so a late **sequence**-guarded ensure can re-create a
+    retired branch. The CAS path cannot. Mixing the two guards on one branch is unsupported.
+- **Not changed.** Overlays (local-only) and the contribution ingest's branch advance.
+- **No migration.** The CAS reads the existing `branches`/`snapshots`/`commits` columns.
+- **No format validation of `expected_head_commit`** beyond the empty/all-zero check.
+
 ---
 
 ## N units (not needed for the cutover)

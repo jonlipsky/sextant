@@ -631,10 +631,11 @@ The host deliberately **separates control endpoints from query endpoints**, and 
 | --- | --- | --- | --- |
 | `GET /health` | — | open | Service **AVAILABILITY**: the process is up and the catalog is reachable. |
 | `GET /ready` | — | open | Worker **CAPACITY**: `503` when this node has no worker (query-only), so an operator can tell "up" from "can index". |
-| `POST /control/ensure` | control | control token | Idempotent ensure-snapshot (criterion 1). Accepts an optional monotonic `branch_head_sequence` for forward-only branch-head advance (Phase 14, issue #84). Blocks until terminal (`200`; `202` when transient-requeued) unless `?wait=false`, which returns `202` at once with the job to poll (issue #148). A caller disconnect/timeout **never** cancels production. A repository URL the [repository URL policy](#repository-url-policy-svc-5) refuses is `400 {"status":"rejected","reason":"<code>"}` before any job exists (audited `ensure`/`denied`). |
+| `POST /control/ensure` | control | control token | Idempotent ensure-snapshot (criterion 1). Accepts an optional monotonic `branch_head_sequence` for forward-only branch-head advance (Phase 14, issue #84), **or** an `expected_head_commit` head CAS, plus `forced` and `branch_update` (see [Branch-pointer guards](#branch-pointer-guards-head-cas-branch_update-none-retire-svc-67)); the result carries `branch_advanced`. Blocks until terminal (`200`; `202` when transient-requeued) unless `?wait=false`, which returns `202` at once with the job to poll (issue #148). A caller disconnect/timeout **never** cancels production. A repository URL the [repository URL policy](#repository-url-policy-svc-5) refuses, both branch guards together (`conflicting_branch_guards`) or an unknown `branch_update` (`invalid_branch_update`) is `400 {"status":"rejected","reason":"<code>"}` before any job exists (audited `ensure`/`denied`). |
 | `POST /control/contribute` | control | control **or** contribute token | Ingest a client/CI semantic contribution (Phase 16); the least-privilege contribute token authorizes this endpoint only. |
 | `GET /control/status/{jobId}` | control | control token | Job status + per-project diagnostics (criterion 5) + checkout `coverage` (#119). |
-| `GET /control/resolve` | control | control token | Resolve a repository branch to its current published snapshot (+ its `coverage`, #119). |
+| `GET /control/resolve` | control | control token | Resolve a repository branch (`?branch=`, else the default) to its current published snapshot (+ its `coverage`, #119), plus `commit_sha`, the resolved `branch` name, `is_default` and `head_sequence` (SVC-7; a null `commit_sha`/`head_sequence` is omitted). |
+| `POST /control/branches/retire` | control | control token | Delete a branch pointer (`{repository, branch, expected_head_commit?}`, SVC-6); its snapshots stay for retention. `200 {"retired":true}`, or `{"retired":false}` for a missing branch (idempotent). The default branch or a head-CAS mismatch is `409 {"status":"rejected","reason":"default_branch"\|"head_mismatch"}`; a refused URL or blank branch is `400`. Audited `retire`. |
 | `POST /control/retention` | control | control token | Run the service-owned retention/GC pass (`?execute=true` to apply). |
 | `GET /control/metrics` | control | control token | Observability snapshot (criterion 5); `?format=prometheus` for text exposition, else JSON. |
 | `GET /control/audit` | control | control token | Durable audit log (criterion 5); optional `action`/`repository`/`limit` filters. **Operator-only.** |
@@ -803,6 +804,95 @@ On the terminal-attach fast path (an already-terminal job), checking that the jo
 and advancing the branch to it happen in the same write-gate hold. Otherwise a concurrent ensure could
 supersede the snapshot between the check and the advance, and the head would end up on a `superseded`
 snapshot.
+
+### Branch-pointer guards: head CAS, `branch_update: none`, retire (SVC-6/7)
+
+A coordinator that forwards git push events knows each push's `before` commit but may not have a
+monotonic sequence to hand. For that case an ensure can carry a **head compare-and-swap** instead of a
+`branch_head_sequence`. The fields are additive, and none of them is part of the snapshot identity, so a
+guarded and an unguarded ensure of one commit attach to the same job and snapshot:
+
+- `expected_head_commit` (string): the commit the branch head must currently be at for the pointer to move.
+- `forced` (bool): informational only. It marks a force-push and is appended to the `ensure` audit detail as
+  `;forced`. It **never** bypasses the CAS.
+- `branch_update` (`"advance"`, the default, or `"none"`): `none` builds or attaches the snapshot without
+  touching any branch.
+
+The result carries `branch_advanced`: `true` when this ensure moved the requested branch's pointer onto the
+snapshot, `false` when the decision declined to move it or it already pointed there. It is absent when there
+was no snapshot to decide for (a failed or unsupported job), and when the ensure attached to another
+request's production that did not settle terminally (a transient requeue). A caller that attaches to another
+request's production that did settle re-runs its **own** branch decision on the terminal-attach path above
+and reports that decision.
+
+The service evaluates one precedence table **inside the branch-advance write transaction on every path**:
+the worker's `IndexOrchestrator.AdvanceBranchToSnapshot`, both reuse paths (#162 attach-or-upgrade and the
+#84 sequence path) and the #85 superseded re-select.
+
+| # | Request | Branch decision |
+| --- | --- | --- |
+| 0 | `branch_update: "none"` | No pointer moves and **no branch row is created**; any other guard is ignored (so `none` with both guards is not a conflict). A reuse still clears the provider-only flag, like the worker. |
+| 1 | both `expected_head_commit` and `branch_head_sequence` | `400 conflicting_branch_guards` at intake, before any job. |
+| 2 | `expected_head_commit` only | CAS (below). On a pass the branch advances (created first when absent). On a mismatch the snapshot is **attach-only**: no branch row is created, no default is promoted, and the pointer and `head_sequence` stay as they are. |
+| 3 | `branch_head_sequence` only | The #84/#85 forward-only gate, unchanged. |
+| 4 | neither | Unchanged: the worker advances unconditionally; a reuse follows #162. |
+
+The CAS **passes** when any of these hold:
+
+- the branch does not exist and `expected_head_commit` is empty or all zeros (git's null object id, as a
+  branch-create push reports it);
+- the branch exists and its target's commit equals `expected_head_commit` (case-insensitive);
+- the branch exists but its target is **unusable**: the pointer is null (retention reclaimed it) or the
+  target is not `complete`.
+
+It fails in every other case. In particular it fails when the branch exists at a usable head and the empty or
+zero value is sent, when the branch is absent and a real commit is sent, and when the target snapshot has no
+recorded commit. A passing CAS supersedes the previous target only if it was `complete` and no other branch
+still points at it (the #128 guard), and it never writes `head_sequence`.
+
+A superseded snapshot is re-selected under **any** guard (sequence, CAS or `none`), not only under a
+sequence. When intact it is restored to `complete` without the worker, exactly as the orchestrator's
+`SelectExistingSnapshot` restores it. The branch is re-pointed at it **only when the guard passes**, so a
+reset or force-push whose CAS matches re-points the head and a stale one leaves it alone. An unguarded
+ensure still hands a superseded identity to the worker.
+
+**Out-of-order pushes converge on retry.** Pushes `A→B` then `B→C` delivered in reverse order: `B→C`
+arrives first and its CAS fails (the head is still A), so it builds C and returns `branch_advanced: false`.
+`A→B` then advances the head to B. Re-sending `B→C` (a cheap reuse) advances it to C. A delayed duplicate of
+`A→B` is then declined, because the head is C. The client should retry a declined push once the pushes
+before it have landed, or let its reconcile catch up. A push for a branch the service has never seen that
+names a real `before` commit fails the CAS, so seed the branch first with an ensure that sends
+`expected_head_commit: ""`, or with a plain unguarded ensure.
+
+**Retire.** `POST /control/branches/retire` with `{repository, branch, expected_head_commit?}` deletes the
+branch row for a branch deleted upstream. The snapshots stay in the catalog, and retention reclaims them once
+nothing else protects them. The endpoint applies the [repository URL policy](#repository-url-policy-svc-5)
+exactly as ensure intake does. A refused URL (or a blank `branch`) is a `400` whose body carries only the
+reason code, audited `retire`/`denied` with no repository scope. Then, in one write transaction under the
+single writer:
+
+1. A repository or branch the catalog does not know is `200 {"retired":false}` (idempotent), even under
+   a CAS.
+2. The repository's default branch is `409 default_branch`: it is never retired.
+3. When `expected_head_commit` is present and the CAS above fails, the result is `409 head_mismatch`, so a
+   branch that a newer push re-created is never retired.
+4. Otherwise the row is deleted: `200 {"retired":true}`.
+
+Every outcome writes a `retire` audit row in the same transaction. The detail is `retired`, `absent` or
+the refusal reason, scoped to the request's repository. Retire waits for the single writer as retention does,
+so it queues behind a running production, and the caller's timeout bounds only that wait. Because a failed
+CAS never creates a branch, a stale push that arrives after its branch was retired cannot re-create it. A
+**sequence**-guarded ensure has no such protection: retire deletes the row together with its
+`head_sequence`, so a late sequence-bearing ensure re-creates the branch. Do not mix the two guards on one
+branch; the CAS path never writes `head_sequence`, so that value also goes stale.
+
+**Resolve.** `GET /control/resolve` additionally returns the head's `commit_sha`, the `branch` it resolved
+through (the default branch's own name when `?branch=` is omitted), `is_default` and `head_sequence` (a null
+value is omitted). A reconciler can therefore read the head commit to send as the next push's
+`expected_head_commit`.
+
+The local CLI/daemon path never sets these guards (`SnapshotContext.ExpectedHeadCommit` and
+`SuppressBranchUpdate` stay null), so its branch state is byte-identical.
 
 ### Restart recovery (criterion 2)
 

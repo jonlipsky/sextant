@@ -254,8 +254,21 @@ public sealed class SnapshotService : IDisposable
     /// during the <see cref="Dispose"/> drain, and fails closed if the lease was abandoned). A refusal admitted
     /// after shutdown began throws <see cref="OperationCanceledException"/> on the service lifetime (503).
     /// </summary>
-    public async Task RecordEnsureDeniedAsync(
-        string reason, string? principal = null, CancellationToken cancellationToken = default)
+    public Task RecordEnsureDeniedAsync(
+        string reason, string? principal = null, CancellationToken cancellationToken = default) =>
+        RecordDeniedAsync(AuditAction.Ensure, reason, principal, cancellationToken);
+
+    /// <summary>
+    /// Records the durable <c>retire</c>/<c>denied</c> audit row for a branch retirement the host refused at
+    /// intake (SVC-6: the <see cref="RepositoryUrlPolicy"/>, or a missing branch name), before any catalog read.
+    /// Same contract as <see cref="RecordEnsureDeniedAsync"/>: the reason code only, never the submitted URL.
+    /// </summary>
+    public Task RecordRetireDeniedAsync(
+        string reason, string? principal = null, CancellationToken cancellationToken = default) =>
+        RecordDeniedAsync(AuditAction.Retire, reason, principal, cancellationToken);
+
+    private async Task RecordDeniedAsync(
+        string action, string reason, string? principal, CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrEmpty(reason);
         Task<bool> write;
@@ -268,7 +281,7 @@ public sealed class SnapshotService : IDisposable
                     () =>
                     {
                         new AuditLogStore(_conn).Append(
-                            AuditAction.Ensure, AuditOutcome.Denied,
+                            action, AuditOutcome.Denied,
                             actor: AuditLogStore.HashActor(principal),
                             detail: reason);
                         return Task.FromResult(true);
@@ -324,6 +337,11 @@ public sealed class SnapshotService : IDisposable
     private (Task<EnsureSnapshotResult> Accepted, Task<EnsureSnapshotResult> Completion) StartEnsureOperation(
         EnsureSnapshotRequest request, string? principal)
     {
+        // SVC-6/7: a malformed branch guard is refused before any job exists. The host validates first and
+        // answers 400; this protects direct callers.
+        if (request.BranchGuardProblem() is { } problem)
+            throw new ArgumentException($"The ensure request's branch guards are invalid ({problem}).", nameof(request));
+
         var accepted = new TaskCompletionSource<EnsureSnapshotResult>(TaskCreationOptions.RunContinuationsAsynchronously);
         Task<EnsureSnapshotResult> completion;
         lock (_inFlightLock)
@@ -459,7 +477,8 @@ public sealed class SnapshotService : IDisposable
             // requeue) outcome is shared as-is rather than immediately re-running the worker.
             if (rejoined || !SnapshotJobStatus.IsTerminal(result.Status))
             {
-                var shared = result with { Attached = existed };
+                // The branch decision in `result` was the producing request's, not this one's.
+                var shared = result with { Attached = existed, BranchAdvanced = null };
                 await WithWriteAsync(() =>
                 {
                     RecordEnsureAuditLocked(request, shared, principal);
@@ -481,8 +500,8 @@ public sealed class SnapshotService : IDisposable
         var (row, wasExisting) = jobs.EnsureJob(hash, request.RepositoryRemoteUrl, request.CommitSha, request.BranchName);
         if (!SnapshotJobStatus.IsTerminal(row.Status) || !TerminalResultUsable(row, hash, new SnapshotStore(_conn)))
             return (row, wasExisting, null);
-        AdvanceOrAttachBranchPointer(request, row.SnapshotId);
-        var attached = Attach(row, wasExisting, CoverageFor(row.SnapshotId));
+        var advanced = AdvanceOrAttachBranchPointer(request, row.SnapshotId);
+        var attached = Attach(row, wasExisting, CoverageFor(row.SnapshotId)) with { BranchAdvanced = advanced };
         RecordEnsureAuditLocked(request, attached, principal);
         return (row, wasExisting, attached);
     }
@@ -570,8 +589,8 @@ public sealed class SnapshotService : IDisposable
         var current = jobs.GetJob(jobId)!;
         if (SnapshotJobStatus.IsTerminal(current.Status) && TerminalResultUsable(current, hash, snapshots))
         {
-            AdvanceOrAttachBranchPointer(request, current.SnapshotId);
-            return Attach(current, existed, CoverageFor(current.SnapshotId));
+            var terminalAdvanced = AdvanceOrAttachBranchPointer(request, current.SnapshotId);
+            return Attach(current, existed, CoverageFor(current.SnapshotId)) with { BranchAdvanced = terminalAdvanced };
         }
 
         // A complete snapshot may already be published for this identity (produced by an earlier run
@@ -583,22 +602,28 @@ public sealed class SnapshotService : IDisposable
         {
             var publishedCoverage = CoverageFor(published.Id);
             RecordPublishedVerdict(jobs, jobId, published.Id, publishedCoverage);
-            AdvanceOrAttachBranchPointer(request, published.Id);
-            return Attach(jobs.GetJob(jobId)!, existed, publishedCoverage);
+            var publishedAdvanced = AdvanceOrAttachBranchPointer(request, published.Id);
+            return Attach(jobs.GetJob(jobId)!, existed, publishedCoverage) with { BranchAdvanced = publishedAdvanced };
         }
 
         // Branch reset / force-push A→B→A (issue #85): the identity's snapshot was published but a later
-        // advance superseded it. When the request carries a head sequence, re-select it WITHOUT running
-        // the worker — mirroring the orchestrator's SelectExistingSnapshot — provided it is still intact;
-        // a data-less/unservable one is demoted so the worker below genuinely rebuilds it. A NULL
-        // sequence (the local/legacy path) keeps today's worker path byte-for-byte (#84 criterion 2).
-        if (request.BranchHeadSequence is long && published is { Status: SnapshotStatus.Superseded })
+        // advance superseded it. When the request carries a branch guard (a head sequence, SVC-6's
+        // expected_head_commit, or SVC-7's branch_update: none), re-select it WITHOUT running the worker —
+        // mirroring the orchestrator's SelectExistingSnapshot — provided it is still intact; a
+        // data-less/unservable one is demoted so the worker below genuinely rebuilds it. An unguarded
+        // request (the local/legacy path) keeps today's worker path byte-for-byte (#84 criterion 2).
+        if (HasBranchGuard(request) && published is { Status: SnapshotStatus.Superseded })
         {
-            var (reselected, reselectedCoverage) =
+            var (reselected, reselectedCoverage, reselectedAdvanced) =
                 ReselectOrDemoteSupersededSnapshot(request, jobId, published.Id, jobs, snapshots);
             if (reselected)
-                return Attach(jobs.GetJob(jobId)!, existed, reselectedCoverage);
+                return Attach(jobs.GetJob(jobId)!, existed, reselectedCoverage) with { BranchAdvanced = reselectedAdvanced };
         }
+
+        // The requested branch's pointer before the worker runs, so the result can report whether the
+        // worker's own branch advance (IndexOrchestrator.AdvanceBranchToSnapshot) moved it (SVC-6). The write
+        // gate is held for the whole run, so no other writer can move it in between.
+        var pointerBeforeWorker = RequestedBranchPointer(snapshots, request);
 
         // A STALE terminal result (a complete/partial job whose published snapshot was reclaimed by
         // retention) must be reset to queued before MarkRunning, whose guard only advances a
@@ -694,7 +719,11 @@ public sealed class SnapshotService : IDisposable
 
         jobs.ReplaceDiagnostics(jobId, validated.Projects.Select(p => p.ToDiagnostic(jobId)));
         jobs.MarkResult(jobId, validated.Status, validated.SnapshotId, validated.Error);
-        return Attach(jobs.GetJob(jobId)!, existed, producedCoverage);
+        bool? workerAdvanced = validated.SnapshotId is long producedId
+                               && validated.Status is SnapshotJobStatus.Complete or SnapshotJobStatus.Partial
+            ? BranchAdvancedTo(producedId, pointerBeforeWorker, RequestedBranchPointer(snapshots, request))
+            : null;
+        return Attach(jobs.GetJob(jobId)!, existed, producedCoverage) with { BranchAdvanced = workerAdvanced };
     }
 
     /// <summary>
@@ -1124,13 +1153,14 @@ public sealed class SnapshotService : IDisposable
     // transaction — so a concurrent reader never observes an intermediate state where the branch pointer
     // advanced but its default was not yet set, or a re-ensured default was momentarily demoted (issue
     // #104). Raw DB write — callers must already hold the write gate.
-    private void AdvanceOrAttachBranchPointer(EnsureSnapshotRequest request, long? snapshotId)
+    private bool? AdvanceOrAttachBranchPointer(EnsureSnapshotRequest request, long? snapshotId)
     {
         ExecRaw("BEGIN IMMEDIATE;");
         try
         {
-            AdvanceOrAttachBranchPointerCore(request, snapshotId);
+            var advanced = AdvanceOrAttachBranchPointerCore(request, snapshotId);
             ExecRaw("COMMIT;");
+            return advanced;
         }
         catch
         {
@@ -1139,16 +1169,43 @@ public sealed class SnapshotService : IDisposable
         }
     }
 
-    private void AdvanceOrAttachBranchPointerCore(EnsureSnapshotRequest request, long? snapshotId)
+    // Applies this request's branch decision to an attached snapshot and reports whether it moved the requested
+    // branch's pointer onto it (SVC-6 branch_advanced): null when there is no snapshot to decide for (a failed or
+    // unsupported terminal job). Precedence (SVC-6/7), evaluated inside the caller's write transaction:
+    //  0. branch_update: none — no branch row is created and no pointer moves;
+    //  1. both expected_head_commit and branch_head_sequence — refused at intake, never reaches here;
+    //  2. expected_head_commit — the CAS (ApplyHeadCommitGuard), identical to the worker's AdvanceBranchToSnapshot;
+    //  3. branch_head_sequence — the #84 forward-only advance;
+    //  4. neither — the #162 attach-or-upgrade (EnsureAttachBranchPointer).
+    private bool? AdvanceOrAttachBranchPointerCore(EnsureSnapshotRequest request, long? snapshotId)
     {
-        if (request.BranchHeadSequence is not long seq)
+        if (snapshotId is not long sid)
+            return null;
+        var snapshots = new SnapshotStore(_conn);
+        var before = RequestedBranchPointer(snapshots, request);
+        ApplyReuseBranchDecision(request, sid, snapshots);
+        return BranchAdvancedTo(sid, before, RequestedBranchPointer(snapshots, request));
+    }
+
+    private void ApplyReuseBranchDecision(EnsureSnapshotRequest request, long sid, SnapshotStore snapshots)
+    {
+        if (request.SuppressesBranchUpdate)
         {
-            EnsureAttachBranchPointer(request, snapshotId);
+            // Parity with the worker path, whose EnsureRepository makes a directly ensured repository a consumer.
+            if (snapshots.GetRepositoryId(request.RepositoryRemoteUrl) is long consumerId)
+                snapshots.MarkConsumerRepository(consumerId);
             return;
         }
-        if (snapshotId is not long sid)
+        if (request.ExpectedHeadCommit is { } expectedHead)
+        {
+            ApplyHeadCommitGuard(request, sid, expectedHead, snapshots);
             return;
-        var snapshots = new SnapshotStore(_conn);
+        }
+        if (request.BranchHeadSequence is not long seq)
+        {
+            EnsureAttachBranchPointer(request, sid);
+            return;
+        }
         if (snapshots.GetRepositoryId(request.RepositoryRemoteUrl) is not long repoId)
             return;
         // Mirror CreateSnapshotContext's branch/default resolution so the reuse path and the worker path
@@ -1167,20 +1224,62 @@ public sealed class SnapshotService : IDisposable
         snapshots.AdvanceBranchPointerForwardOnly(branchId, sid, seq, now);
     }
 
-    // Issue #85: re-selects an already-published but SUPERSEDED snapshot for a sequence-bearing ensure — the
-    // branch reset / force-push A@10 → B@20 → A@30 case — mirroring the orchestrator's SelectExistingSnapshot
-    // so the no-worker reuse path converges on the same state the worker path would. Runs in ONE raw
-    // BEGIN IMMEDIATE / COMMIT transaction (callers hold the write gate; WithWrite is not reentrant):
-    //  * INTACT (SnapshotStore.IsReselectable): restore it to Complete, then run the SAME #84 forward-only
-    //    advance — a higher sequence re-points the branch and supersedes the previous head; a lower/equal one
-    //    declines and leaves the pointer + stored sequence untouched while (exactly like SelectExistingSnapshot)
-    //    the snapshot stays Complete, attached and resolvable by commit. The job verdict comes from the
-    //    snapshot's durable coverage row, which is read but never written. Returns (true, coverage).
+    // SVC-6: the expected_head_commit CAS on the reuse paths — the same decision, in the same order, as the
+    // worker's IndexOrchestrator.AdvanceBranchToSnapshot, so a pre-built identity and a freshly built one
+    // converge. A mismatch attaches only: no branch row is created and the default designation is untouched,
+    // so a stale push can neither move the head nor re-create a retired branch.
+    private static void ApplyHeadCommitGuard(
+        EnsureSnapshotRequest request, long sid, string expectedHead, SnapshotStore snapshots)
+    {
+        if (snapshots.GetRepositoryId(request.RepositoryRemoteUrl) is not long repoId)
+            return;
+        snapshots.MarkConsumerRepository(repoId);
+        var branchName = request.BranchName ?? "main";
+        if (!snapshots.BranchHeadMatches(snapshots.GetBranchId(repoId, branchName), expectedHead))
+            return;
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var ownsDefault = snapshots.ShouldOwnDefault(repoId, branchName, request.ResolveIsDefaultBranch());
+        var branchId = snapshots.EnsureBranch(repoId, branchName, ownsDefault, now);
+        if (ownsDefault)
+            snapshots.PromoteSoleDefaultBranch(repoId, branchId);
+        snapshots.AdvanceBranchPointerIfHeadMatches(branchId, sid, expectedHead, now);
+    }
+
+    // True when any SVC-6/7 or #84 branch guard is present; such a request re-selects an intact superseded
+    // snapshot on the reuse path instead of handing it to the worker.
+    private static bool HasBranchGuard(EnsureSnapshotRequest request) =>
+        request.BranchHeadSequence is not null || request.ExpectedHeadCommit is not null || request.SuppressesBranchUpdate;
+
+    // The snapshot the request's branch (BranchName, else "main", as every advance path resolves it) currently
+    // points at, or null when the repository, the branch or its pointer is absent.
+    private static long? RequestedBranchPointer(SnapshotStore snapshots, EnsureSnapshotRequest request) =>
+        snapshots.GetRepositoryId(request.RepositoryRemoteUrl) is long repoId
+        && snapshots.GetBranchId(repoId, request.BranchName ?? "main") is long branchId
+            ? snapshots.GetBranchSnapshotId(branchId)
+            : null;
+
+    // SVC-6 branch_advanced: the decision moved the pointer onto the snapshot (it targeted something else, or
+    // nothing, before).
+    private static bool BranchAdvancedTo(long snapshotId, long? before, long? after) =>
+        after == snapshotId && before != snapshotId;
+
+    // Issue #85 (generalized by SVC-6/7): re-selects an already-published but SUPERSEDED snapshot for a guarded
+    // ensure — the branch reset / force-push A@10 → B@20 → A@30 case — mirroring the orchestrator's
+    // SelectExistingSnapshot so the no-worker reuse path converges on the same state the worker path would.
+    // Runs in ONE raw BEGIN IMMEDIATE / COMMIT transaction (callers hold the write gate; WithWrite is not
+    // reentrant):
+    //  * INTACT (SnapshotStore.IsReselectable): restore it to Complete, then run the SAME guarded decision as
+    //    every other reuse path (AdvanceOrAttachBranchPointerCore). The branch is re-pointed at the snapshot only
+    //    when its guard allows it: a higher #84 sequence, or a passing SVC-6 head CAS; `branch_update: none`
+    //    never moves it. A declined guard (a lower/equal sequence, a head mismatch, none) leaves the pointer +
+    //    stored sequence untouched while (exactly like SelectExistingSnapshot) the snapshot stays Complete,
+    //    attached and resolvable by commit. The job verdict comes from the snapshot's durable coverage row,
+    //    which is read but never written. Returns (true, coverage, branch_advanced).
     //  * NOT intact (data reclaimed, an unpublished provider, never published): demote it to Failed
     //    so the worker's orchestrator genuinely rebuilds the identity (its Failed → Pending retry reset, which
     //    also drops stale coverage) instead of resurrecting a data-less snapshot via SelectExistingSnapshot.
-    //    Returns (false, null); the caller falls through to the requeue/worker path.
-    private (bool Reselected, SnapshotCoverage? Coverage) ReselectOrDemoteSupersededSnapshot(
+    //    Returns (false, null, null); the caller falls through to the requeue/worker path.
+    private (bool Reselected, SnapshotCoverage? Coverage, bool? BranchAdvanced) ReselectOrDemoteSupersededSnapshot(
         EnsureSnapshotRequest request, long jobId, long snapshotId, SnapshotJobStore jobs, SnapshotStore snapshots)
     {
         ExecRaw("BEGIN IMMEDIATE;");
@@ -1191,15 +1290,15 @@ public sealed class SnapshotService : IDisposable
                 if (snapshots.GetById(snapshotId) is { Status: SnapshotStatus.Superseded })
                     snapshots.MarkStatus(snapshotId, SnapshotStatus.Failed);
                 ExecRaw("COMMIT;");
-                return (false, null);
+                return (false, null, null);
             }
 
             snapshots.MarkStatus(snapshotId, SnapshotStatus.Complete);
-            AdvanceOrAttachBranchPointerCore(request, snapshotId);
+            var advanced = AdvanceOrAttachBranchPointerCore(request, snapshotId);
             var coverage = CoverageFor(snapshotId);
             RecordPublishedVerdict(jobs, jobId, snapshotId, coverage);
             ExecRaw("COMMIT;");
-            return (true, coverage);
+            return (true, coverage, advanced);
         }
         catch
         {
@@ -1294,7 +1393,16 @@ public sealed class SnapshotService : IDisposable
     /// pointed snapshot is not complete. Read-only; never creates catalog rows. Served from an independent
     /// read connection (issue #148), so branch resolution never waits behind a running index.
     /// </summary>
-    public SnapshotRow? ResolveBranch(string repositoryRemoteUrl, string? branchName)
+    public SnapshotRow? ResolveBranch(string repositoryRemoteUrl, string? branchName) =>
+        ResolveBranchHead(repositoryRemoteUrl, branchName)?.Snapshot;
+
+    /// <summary>
+    /// <see cref="ResolveBranch"/> plus the branch it resolved through — its name (the default branch's own
+    /// name when <paramref name="branchName"/> is null), default designation and #84 head sequence — the
+    /// snapshot's commit SHA and its durable coverage (SVC-6, <c>/control/resolve</c>). One consistent read
+    /// on an independent read connection; null exactly when <see cref="ResolveBranch"/> is.
+    /// </summary>
+    public ResolvedBranchHead? ResolveBranchHead(string repositoryRemoteUrl, string? branchName)
     {
         return ReadCatalog(conn =>
         {
@@ -1305,12 +1413,81 @@ public sealed class SnapshotService : IDisposable
             var branchId = branchName is null
                 ? snapshots.GetDefaultBranchId(repoId)
                 : snapshots.GetBranchId(repoId, branchName);
-            if (branchId is not long bid || snapshots.GetBranchSnapshotId(bid) is not long snapId)
+            if (branchId is not long bid || snapshots.GetBranchById(bid) is not { SnapshotId: long snapId } branch)
                 return null;
 
             var row = snapshots.GetById(snapId);
-            return row is { Status: SnapshotStatus.Complete } ? row : null;
+            if (row is not { Status: SnapshotStatus.Complete })
+                return null;
+            return new ResolvedBranchHead
+            {
+                Snapshot = row,
+                Branch = branch.Name,
+                IsDefault = branch.IsDefault,
+                HeadSequence = branch.HeadSequence,
+                CommitSha = snapshots.GetCommitSha(row.CommitId),
+                Coverage = CoverageOn(conn, row.Id)
+            };
         });
+    }
+
+    /// <summary>
+    /// Retires (deletes) a repository branch's pointer row (SVC-6, <c>POST /control/branches/retire</c>).
+    /// The snapshots it pointed at stay in the catalog for retention to reclaim once nothing protects them.
+    /// Idempotent: an unknown repository or branch is <c>retired: false</c> with no reason. The repository's
+    /// default branch is never retired (<see cref="BranchGuardReason.DefaultBranch"/>), and when
+    /// <see cref="RetireBranchRequest.ExpectedHeadCommit"/> is present the branch is retired only while
+    /// <see cref="SnapshotStore.BranchHeadMatches"/> passes, so a newer push that re-created the branch is
+    /// never retired (<see cref="BranchGuardReason.HeadMismatch"/>). The decision, the delete and the
+    /// <c>retire</c> audit row commit in ONE write transaction under the single writer. The caller's
+    /// <paramref name="cancellationToken"/> bounds only the wait for the writer (a running production holds
+    /// it), like <see cref="RunRetentionAsync"/>; a retirement that never acquired it changed nothing.
+    /// The host applies the repository URL policy before calling this.
+    /// </summary>
+    public async Task<RetireBranchResult> RetireBranchAsync(
+        RetireBranchRequest request, string? principal = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentException.ThrowIfNullOrEmpty(request.Repository);
+        ArgumentException.ThrowIfNullOrEmpty(request.Branch);
+        using var activity = ServiceTelemetry.Source.StartActivity("retire_branch");
+        return await WithWriteAsync(
+            () => Task.FromResult(RetireBranchLocked(request, principal)), cancellationToken).ConfigureAwait(false);
+    }
+
+    private RetireBranchResult RetireBranchLocked(RetireBranchRequest request, string? principal)
+    {
+        var snapshots = new SnapshotStore(_conn);
+        ExecRaw("BEGIN IMMEDIATE;");
+        try
+        {
+            var branch = snapshots.GetRepositoryId(request.Repository) is long repoId
+                ? snapshots.GetBranch(repoId, request.Branch)
+                : null;
+            RetireBranchResult result;
+            if (branch is null)
+                result = new RetireBranchResult { Retired = false };
+            else if (branch.IsDefault)
+                result = new RetireBranchResult { Retired = false, Reason = BranchGuardReason.DefaultBranch };
+            else if (request.ExpectedHeadCommit is { } expected && !snapshots.BranchHeadMatches(branch.Id, expected))
+                result = new RetireBranchResult { Retired = false, Reason = BranchGuardReason.HeadMismatch };
+            else
+                result = new RetireBranchResult { Retired = snapshots.DeleteBranch(branch.Id) };
+
+            new AuditLogStore(_conn).Append(
+                AuditAction.Retire,
+                result.Reason is null ? AuditOutcome.Complete : AuditOutcome.Denied,
+                actor: AuditLogStore.HashActor(principal),
+                repositoryScope: request.Repository,
+                detail: result.Reason ?? (result.Retired ? "retired" : "absent"));
+            ExecRaw("COMMIT;");
+            return result;
+        }
+        catch
+        {
+            ExecRaw("ROLLBACK;");
+            throw;
+        }
     }
 
     /// <summary>
@@ -1654,9 +1831,12 @@ public sealed class SnapshotService : IDisposable
             MapOutcome(result.Status),
             actor: AuditLogStore.HashActor(principal),
             repositoryScope: request.RepositoryRemoteUrl,
-            detail: $"job_{result.JobId}{SdkPinAuditSuffix(jobs.GetDiagnostics(result.JobId))}",
+            detail: $"job_{result.JobId}{SdkPinAuditSuffix(jobs.GetDiagnostics(result.JobId))}{ForcedAuditSuffix(request)}",
             costIndexMs: costMs);
     }
+
+    // SVC-6: `forced` is informational only (it never bypasses the head CAS); the audit trail records it.
+    private static string ForcedAuditSuffix(EnsureSnapshotRequest request) => request.Forced == true ? ";forced" : "";
 
     // Issue #113: the audit row flags a job whose snapshot was built with a substituted SDK (or that failed
     // SDK resolution / could not restore a neutralized global.json), e.g. "job_42;sdk_pin_overridden", so the
