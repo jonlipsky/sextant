@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="8.0.0">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.3.0" />
+    <PackageReference Include="MSTest.TestFramework" Version="4.1.0" />
+    <PackageReference Include="MSTest.TestAdapter" Version="4.1.0" />
+    <!-- The tests run the activities in-process, so they need the SDK's runtime assembly (the activities
+         project compiles against it only). -->
+    <PackageReference Include="ProcessStack.Abstractions" Version="1.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Microsoft.VisualStudio.TestTools.UnitTesting" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Sextant.ProcessStack.Activities\Sextant.ProcessStack.Activities.csproj" />
+    <!-- Test-only: pins the activities to the service's own URL policy, wire contracts and job statuses. The
+         bundle never references the service. -->
+    <ProjectReference Include="..\..\..\..\..\src\Sextant.Service\Sextant.Service.csproj" />
+  </ItemGroup>
+
+</Project>
