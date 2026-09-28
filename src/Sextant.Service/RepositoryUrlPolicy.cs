@@ -21,6 +21,9 @@ public static class RepositoryUrlRejection
 
     /// <summary>An owner allow-list is configured and the URL's <c>host/owner</c> is not on it.</summary>
     public const string OwnerNotAllowed = "owner_not_allowed";
+
+    /// <summary>An <c>owner/repo</c> selector was sent, but the policy has no single host to expand it with.</summary>
+    public const string HostRequired = "host_required";
 }
 
 /// <summary>
@@ -130,6 +133,26 @@ public sealed partial class RepositoryUrlPolicy
         if (!string.Equals(scheme, "https", StringComparison.OrdinalIgnoreCase))
             return RepositoryUrlDecision.Reject(RepositoryUrlRejection.SchemeNotAllowed);
         return EvaluateHttps(url, url[(schemeEnd + "://".Length)..]);
+    }
+
+    /// <summary>
+    /// Evaluates a repository SELECTOR (a tool's <c>repository</c> argument): a URL as <see cref="Evaluate"/> takes
+    /// it, or the short forms <c>host/owner/repo</c> and, when the policy allow-lists exactly one explicit host,
+    /// <c>owner/repo</c> (otherwise refused with <see cref="RepositoryUrlRejection.HostRequired"/>).
+    /// </summary>
+    public RepositoryUrlDecision EvaluateSelector(string selector)
+    {
+        ArgumentNullException.ThrowIfNull(selector);
+        if (selector.Contains("://", StringComparison.Ordinal))
+            return Evaluate(selector);
+
+        return selector.Split('/').Length switch
+        {
+            3 => Evaluate("https://" + selector),
+            2 when Hosts.Count == 1 => Evaluate($"https://{Hosts[0]}/{selector}"),
+            2 => RepositoryUrlDecision.Reject(RepositoryUrlRejection.HostRequired),
+            _ => RepositoryUrlDecision.Reject(RepositoryUrlRejection.PathNotAllowed)
+        };
     }
 
     // `rest` is everything after `https://`.

@@ -378,11 +378,7 @@ public sealed partial class SnapshotService
 
         public VisibleRepository Describe(string key, IReadOnlyList<RepositoryGrantRow> grants)
         {
-            var repository = grants
-                .OrderBy(g => g.Principal == RepositoryGrantStore.TenantWide ? 0 : 1)
-                .ThenBy(g => g.CreatedAt)
-                .ThenBy(g => g.Id)
-                .First().RemoteUrl;
+            var repository = GrantedSpelling(grants);
             var branches = new List<VisibleBranch>();
             var catalogBranches = RepositoryId(key) is long id ? CatalogBranches(id) : [];
             foreach (var row in catalogBranches)
@@ -432,12 +428,20 @@ public sealed partial class SnapshotService
             return (pending ? GrantSnapshotStatus.Pending : GrantSnapshotStatus.Missing, null);
         }
 
-        private BranchRow? BranchFor(long repositoryId, string branch) =>
+        // How a repository is spelled back to the caller: the tenant-wide grant's spelling first, then the oldest grant's.
+        public static string GrantedSpelling(IEnumerable<RepositoryGrantRow> grants) =>
+            grants
+                .OrderBy(g => g.Principal == RepositoryGrantStore.TenantWide ? 0 : 1)
+                .ThenBy(g => g.CreatedAt)
+                .ThenBy(g => g.Id)
+                .First().RemoteUrl;
+
+        public BranchRow? BranchFor(long repositoryId, string branch) =>
             branch.Length == 0
                 ? _snapshots.GetDefaultBranchId(repositoryId) is long id ? _snapshots.GetBranchById(id) : null
                 : _snapshots.GetBranch(repositoryId, branch);
 
-        private long? RepositoryId(string key) =>
+        public long? RepositoryId(string key) =>
             Repositories().Where(r => r.Key == key).Select(r => (long?)r.Id).FirstOrDefault();
 
         private List<BranchRow> CatalogBranches(long repositoryId)

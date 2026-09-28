@@ -83,7 +83,7 @@ internal static class ToolSelectionFilters
     public const string InvalidSelectorCode = "invalid_selector";
 
     /// <summary>The reason code for an <c>owner/repo</c> short form when the policy has no single host to expand it with.</summary>
-    public const string ShortFormHostRequired = "host_required";
+    public const string ShortFormHostRequired = RepositoryUrlRejection.HostRequired;
 
     /// <summary>The cross-repository tools' own argument naming the provider repository.</summary>
     public const string ProviderRepositoryArgument = "provider_repository_url";
@@ -91,11 +91,12 @@ internal static class ToolSelectionFilters
     /// <summary>
     /// Tools on the remote surface that are NOT repository-scoped: they declare their own selection arguments,
     /// so the reserved arguments are neither advertised nor stripped for them. A tool that spans repositories by
-    /// design belongs here: <c>list_repositories</c> (SVC-4) reads the caller's grants, not one index (a federated
-    /// search joins it later).
+    /// design belongs here: <c>list_repositories</c> (SVC-4) reads the caller's grants, not one index, and
+    /// <c>search_symbols</c> (SVC-F) searches every visible repository and declares its own <c>repository</c> and
+    /// <c>branch</c> narrowing arguments.
     /// </summary>
     internal static readonly IReadOnlySet<string> SelectionExemptTools =
-        new HashSet<string>(StringComparer.Ordinal) { "list_repositories" };
+        new HashSet<string>(StringComparer.Ordinal) { "list_repositories", "search_symbols" };
 
     /// <summary>
     /// Cross-repository tools whose read gate otherwise names no repository. When the call must select one
@@ -242,19 +243,8 @@ internal static class ToolSelectionFilters
     /// Evaluates a <c>repository</c> selector with the SVC-5 policy, accepting the short forms
     /// <c>host/owner/repo</c> and, when the policy allow-lists exactly one explicit host, <c>owner/repo</c>.
     /// </summary>
-    internal static RepositoryUrlDecision EvaluateRepository(string selector, RepositoryUrlPolicy policy)
-    {
-        if (selector.Contains("://", StringComparison.Ordinal))
-            return policy.Evaluate(selector);
-
-        return selector.Split('/').Length switch
-        {
-            3 => policy.Evaluate("https://" + selector),
-            2 when policy.Hosts.Count == 1 => policy.Evaluate($"https://{policy.Hosts[0]}/{selector}"),
-            2 => Rejected(ShortFormHostRequired),
-            _ => Rejected(RepositoryUrlRejection.PathNotAllowed)
-        };
-    }
+    internal static RepositoryUrlDecision EvaluateRepository(string selector, RepositoryUrlPolicy policy) =>
+        policy.EvaluateSelector(selector);
 
     // Removes `key` from the call's arguments when it is reserved for this tool. False when it is present but
     // is neither a string nor null; `value` is the trimmed string, or null when absent/null/blank.
@@ -339,8 +329,6 @@ internal static class ToolSelectionFilters
         return $"Optional: the repository to read, as {forms}. Omit it to use the request's " +
                $"{ServiceApp.RepositoryHeader} header; when both are sent they must name the same repository.";
     }
-
-    private static RepositoryUrlDecision Rejected(string reason) => new(false, null, null, null, null, reason);
 
     private static SelectionOutcome Fail(string code, string message) =>
         new(null, ResponseBuilder.BuildError(code, message));

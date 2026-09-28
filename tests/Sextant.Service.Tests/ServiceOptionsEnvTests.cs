@@ -20,6 +20,7 @@ public class ServiceOptionsEnvTests
     private const string MaxProvisioningAttempts = "SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS";
     private const string MaxGrantsPerPrincipal = "SEXTANT_SERVICE_MAX_GRANTS_PER_PRINCIPAL";
     private const string MaxGrantsPerTenant = "SEXTANT_SERVICE_MAX_GRANTS_PER_TENANT";
+    private const string SearchMaxWidth = "SEXTANT_SERVICE_SEARCH_MAX_WIDTH";
     private const string RequireRepositorySelection = "SEXTANT_SERVICE_REQUIRE_REPOSITORY_SELECTION";
     private const string RepositoryHosts = "SEXTANT_SERVICE_REPOSITORY_HOSTS";
     private const string RepositoryOwners = "SEXTANT_SERVICE_REPOSITORY_OWNERS";
@@ -305,6 +306,30 @@ public class ServiceOptionsEnvTests
         {
             Environment.SetEnvironmentVariable(MaxGrantsPerPrincipal, null);
             Environment.SetEnvironmentVariable(MaxGrantsPerTenant, null);
+        }
+    }
+
+    [TestMethod]
+    [DataRow(null, 50)]
+    [DataRow("7", 7)]
+    [DataRow(" 12 ", 12)]
+    [DataRow("100", 100)]
+    [DataRow("500", 100)]
+    [DataRow("0", 50)]
+    [DataRow("-1", 50)]
+    [DataRow("abc", 50)]
+    public void SearchMaxWidth_BindsClampsOrFallsBackToDefault(string? value, int expected)
+    {
+        // SVC-F: a missing, non-positive or unparseable width keeps the default; a large one is clamped to the
+        // ceiling that keeps a search cursor under its 16 KiB bound.
+        Environment.SetEnvironmentVariable(SearchMaxWidth, value);
+        try
+        {
+            Assert.AreEqual(expected, ServiceOptions.FromEnvironment(Config()).SearchMaxWidth);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(SearchMaxWidth, null);
         }
     }
 
