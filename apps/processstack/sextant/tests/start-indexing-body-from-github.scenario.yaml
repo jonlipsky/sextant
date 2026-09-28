@@ -1,19 +1,23 @@
-name: start-indexing-advance
+name: start-indexing-body-from-github
 description: >
-  (#27) start-indexing of a branch's current head advances the branch with the compare-and-swap on the
-  service's current head (GET /control/resolve → commit_sha).
+  (#203 item 1) The ensure body is built from GitHub and the service, never from the tool's arguments. The
+  arguments spell the repository https://github.com/OctoCat/Hello-World (no .git) and the commit in upper
+  case, and name main. GitHub's own spelling gives repository_remote_url, GitHub's branch head gives
+  commit_sha, and the service's head (GET /control/resolve) gives expected_head_commit. Neither argument
+  appears in the body as the caller spelled it.
 entrypoint: start-indexing
 principal:
   userId: u-alice
 inputs:
-  repositoryRemoteUrl: "https://github.com/octocat/hello-world.git"
-  commitSha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+  repositoryRemoteUrl: "https://github.com/OctoCat/Hello-World"
+  commitSha: " 7FD1A60B01F91B314F59955A4E4D4E80D8EDF11D "
   branchName: main
 http:
-  # Shape: GitHub REST GET /repos/{owner}/{repo} (read by GitHubGetRepository through Octokit).
+  # Shape: GitHub REST GET /repos/{owner}/{repo} (read by GitHubGetRepository through Octokit). GitHub
+  # matches owner/repo case-insensitively and answers with its own spelling in full_name.
   - connection: github
     method: GET
-    path: /repos/octocat/hello-world
+    path: /repos/OctoCat/Hello-World
     body:
       id: 1296269
       name: hello-world
@@ -31,9 +35,6 @@ http:
       - name: main
         commit: { sha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d", url: "https://api.github.com/repos/octocat/hello-world/commits/7fd1a60b01f91b314f59955a4e4d4e80d8edf11d" }
         protected: false
-      - name: feature/x
-        commit: { sha: "b3cbd5bbd7e81436d2eee04537ea2b4c0cad4cdf", url: "https://api.github.com/repos/octocat/hello-world/commits/b3cbd5bbd7e81436d2eee04537ea2b4c0cad4cdf" }
-        protected: false
   # Shape: GET /control/resolve → the snapshot row plus commit_sha, branch, is_default, head_sequence?
   # (src/Sextant.Service.Host/ServiceApp.cs).
   - connection: sextant-control
@@ -46,6 +47,8 @@ http:
       commit_sha: "553c2077f0edc3d5dc5d17262f6aa498e69d6f8e"
       branch: main
       is_default: true
+  # Shape: POST /control/ensure[?wait=false] → EnsureSnapshotResult, 202 while not terminal
+  # (src/Sextant.Service.Host/ServiceApp.cs, src/Sextant.Service/ServiceContracts.cs).
   - connection: sextant-control
     method: POST
     path: /control/ensure
@@ -55,11 +58,15 @@ expected:
   status: Completed
   variables:
     outcome: ok
-    jobId: "42"
     advanceRequested: true
-    # A queued job has made no branch decision yet (no branch_advanced), so nothing is said about the branch.
-    message: "Indexing job 42 is queued."
+    remoteUrl: "https://github.com/octocat/hello-world.git"
+    githubHead: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+    expectedHead: "553c2077f0edc3d5dc5d17262f6aa498e69d6f8e"
   httpCalls:
+    - connection: github
+      method: GET
+      path: /repos/OctoCat/Hello-World
+      count: 1
     - connection: github
       method: GET
       path: /repos/octocat/hello-world/branches
@@ -67,10 +74,15 @@ expected:
     - connection: sextant-control
       method: POST
       path: /control/ensure
+      caller: { act: user, idp: processstack, sub: u-alice }
       bodyMatch:
+        repository_remote_url: "https://github.com/octocat/hello-world.git"
+        commit_sha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
         branch_name: main
         branch_update: advance
         expected_head_commit: "553c2077f0edc3d5dc5d17262f6aa498e69d6f8e"
+        tree_sha: null
+        config_hash: null
         default_branch: null
         branch_head_sequence: null
       count: 1

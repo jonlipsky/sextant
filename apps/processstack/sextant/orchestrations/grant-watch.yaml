@@ -2,8 +2,8 @@ name: grant-watch
 description: >
   Watches one repository for the calling user (one iteration of the chat's watch command).
     1. The workspace's GitHub connection must see the repository (GetRepository); otherwise the watch is
-       refused. This keeps a user from granting themselves a repository the workspace cannot read. A
-       404 or 403 is "not visible"; any other GitHub failure is "try again later".
+       refused. This keeps a user from granting themselves a repository the workspace cannot read. Only a
+       5xx, a rate limit or a network failure is "try again later"; any other failure is "not visible".
     2. PUT /control/grants/self records the grant under the run's caller (never a user id from input).
     3. The v1 watched-repos memory is upserted (legacy-dual-write).
     4. When the grant's branch has no snapshot yet (snapshot_status missing), the branch head is read from
@@ -133,15 +133,16 @@ nodes:
     next: normalize
     on-error: route-repository-error
 
-  # GitHub answers 404 for a repository the connection cannot see, and 403 when the installation has no
-  # access to it. Anything else (a 5xx, a rate limit, a credential or network failure) says nothing about
-  # visibility, so it is reported as GitHub being unavailable instead.
+  # Only a failure that says nothing about visibility and may pass is "try again later": a 5xx (Octokit's
+  # plain ApiException), a rate limit, or a network failure or timeout. Everything else is "not visible":
+  # a 404 or 403, a refused credential, and an App with no installation for the owner (an
+  # InvalidOperationException before any request). An unknown failure therefore fails closed.
   - id: route-repository-error
     type: decision
     next:
-      - when: "_lastErrorType == 'NotFoundException' || _lastErrorType == 'ForbiddenException'"
-        next: refuse-invisible
-      - else: refuse-github-unavailable
+      - when: "_lastErrorType == 'ApiException' || _lastErrorType == 'RateLimitExceededException' || _lastErrorType == 'SecondaryRateLimitExceededException' || _lastErrorType == 'AbuseException' || _lastErrorType == 'HttpRequestException' || _lastErrorType == 'TaskCanceledException' || _lastErrorType == 'OperationCanceledException' || _lastErrorType == 'TimeoutException'"
+        next: refuse-github-unavailable
+      - else: refuse-invisible
 
   # GitHub's own spelling of owner/repo gives the clone_url push events carry, so the first ensure and
   # later push-time ensures hash to the same snapshot identity.
@@ -306,7 +307,8 @@ nodes:
       value: >
         = (function () {
             var match = (branches || []).find(function (b) { return b && b.name === targetBranch; });
-            return match && match.sha ? String(match.sha) : '';
+            var sha = match && match.sha ? String(match.sha).trim().toLowerCase() : '';
+            return /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(sha) ? sha : '';
           })()
     outputs:
       result: headSha

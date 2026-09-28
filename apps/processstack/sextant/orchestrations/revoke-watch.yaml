@@ -4,10 +4,12 @@ description: >
   DELETE /control/grants/self removes the caller's own grants (branch "*" when no branch was named, so every
   watched branch of the repository goes). A default-branch watch is held with branch "" and the service
   resolves its name, so with a named branch the caller's grant listing is read too, and a default-branch
-  grant that resolves to that name is removed as well. The v1 watched-repos memory entries are tombstoned
-  (legacy-dual-write) once the service is known to hold no watch on what was named, including a v1 entry
-  the service never had. They are kept when that is not known (the listing failed, or a default-branch
-  grant's branch is not resolved yet), so the v1 copy never drops a watch the service still holds.
+  grant that resolves to that name is removed as well. When that grant's branch is not resolved yet (the
+  repository has no default in the catalog), GitHub's default branch decides it. The v1 watched-repos memory
+  entries are tombstoned (legacy-dual-write) once the service is known to hold no watch on what was named,
+  including a v1 entry the service never had. They are kept when that is not known (the listing failed, or
+  an unresolved default-branch grant GitHub could not name), so the v1 copy never drops a watch the service
+  still holds.
   Snapshots are left in place; retention reclaims them once nothing points at them.
   An orchestration so that a network failure routes to a reply instead of failing the chat turn.
 
@@ -49,6 +51,9 @@ variables:
   - name: listJson
     type: json
   - name: defaultState
+    type: string
+    default: ""
+  - name: githubDefault
     type: string
     default: ""
   - name: serviceClear
@@ -201,6 +206,36 @@ nodes:
         next: delete-default
       - when: "defaultState == 'none'"
         next: mark-clear
+      - when: "host == 'github.com'"
+        next: get-default-name
+      - else: route-unresolved
+
+  # The service has no default for the repository yet; the application ensure that sets one takes GitHub's
+  # default branch, so GitHub answers which branch the unresolved grant is.
+  - id: get-default-name
+    name: Read the default branch from GitHub
+    type: activity:GitHubGetRepository
+    inputs:
+      connectionId: github
+      owner: "= owner"
+      repo: "= repo"
+    outputs:
+      defaultBranch: githubDefault
+    next: route-github-default
+    on-error: route-unresolved
+
+  - id: route-github-default
+    type: decision
+    next:
+      - when: "githubDefault != '' && githubDefault == branch"
+        next: delete-default
+      - when: "githubDefault != ''"
+        next: mark-clear
+      - else: route-unresolved
+
+  - id: route-unresolved
+    type: decision
+    next:
       - when: "deleted > 0"
         next: reply
       - else: reply-unresolved-default
@@ -210,7 +245,8 @@ nodes:
     inputs:
       value: >
         = 'You are watching the default branch of ' + owner + '/' + repo + ', which may be ' + branch
-          + '. To stop watching it, say "stop watching ' + owner + '/' + repo + '".'
+          + ". I couldn't check which branch that is, so it is still watched. Try again later, or say \"stop watching "
+          + owner + '/' + repo + '", which stops every branch of ' + owner + '/' + repo + ' you watch.'
     outputs:
       result: message
     next: end

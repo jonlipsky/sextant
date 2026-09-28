@@ -1,8 +1,9 @@
 name: unwatch-default-unresolved-keeps-v1
 description: >
   "stop watching X on main" while the caller's only grant is a default-branch watch whose branch the
-  service has not resolved yet (no resolved_branch: the repository has no default in the catalog). It may
-  be main, so nothing more is deleted, the v1 entry is kept, and the reply says how to stop the watch.
+  service has not resolved yet (no resolved_branch: the repository has no default in the catalog), and
+  GitHub cannot say which branch is the default (502). It may be main, so nothing more is deleted, the v1
+  entry is kept, and the reply says the watch remains and what the no-branch command would stop.
 entrypoint: revoke-watch
 principal:
   userId: u-alice
@@ -18,6 +19,11 @@ seed:
       value: '{"owner":"octocat","repo":"hello-world","branch":"main","cloneUrl":"https://github.com/octocat/hello-world.git","addedAt":"2026-01-01T00:00:00+00:00"}'
 # Shape: GrantStatus (src/Sextant.Service/Grants/GrantContracts.cs); a null resolved_branch is omitted.
 http:
+  - connection: github
+    method: GET
+    path: /repos/octocat/hello-world
+    status: 502
+    body: { message: "Server Error" }
   - connection: sextant-control
     method: DELETE
     path: /control/grants/self
@@ -39,8 +45,12 @@ expected:
     deleted: 0
     tombstoned: 0
     defaultState: unknown
-    message: "You are watching the default branch of octocat/hello-world, which may be main. To stop watching it, say \"stop watching octocat/hello-world\"."
+    message: "You are watching the default branch of octocat/hello-world, which may be main. I couldn't check which branch that is, so it is still watched. Try again later, or say \"stop watching octocat/hello-world\", which stops every branch of octocat/hello-world you watch."
   httpCalls:
+    - connection: github
+      method: GET
+      path: /repos/octocat/hello-world
+      count: 1
     - connection: sextant-control
       method: DELETE
       path: /control/grants/self
