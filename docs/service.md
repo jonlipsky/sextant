@@ -21,12 +21,11 @@ It lives in two projects that depend on the core libraries — **never the rever
 > direction.
 
 > **ProcessStack is a client, through an app.** The ProcessStack integration is the `sextant` ProcessStack
-> app in [`apps/processstack/sextant/`](../apps/processstack/sextant/README.md): its chat and GitHub triggers
-> drive the control plane, and its MCP surface `/v1/{tenant}/mcp/sextant` forwards the service's query tools
-> with each caller's signed identity. The older ProcessStack-embedded `_sextant` gateway is being retired
-> (deleted from the platform at the cutover's G3 step) and is summarized in
-> [`specs/20260922-processstack-query-gateway-archive.md`](../specs/20260922-processstack-query-gateway-archive.md).
-> See [Production deployment checklist](#production-deployment-checklist-gateways-and-the-processstack-app)
+> app, which has moved to a separate private repository. Its chat and GitHub triggers drive the control
+> plane, and its MCP surface `/v1/{tenant}/mcp/sextant` forwards the service's query tools with each
+> caller's signed identity. The older ProcessStack-embedded `_sextant` gateway is being retired (deleted
+> from the platform at the cutover's G3 step).
+> See [Production deployment checklist](#production-deployment-checklist-gateways)
 > before exposing the service to more than one user.
 
 > **The service is additive, never required.** The local stdio MCP path and standalone local indexing
@@ -70,7 +69,7 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_CHECKOUT_TOKEN` | Access token for cloning a **private** `https` repo in `clone` mode (sent transiently as an env-scoped `Authorization` header to the repository's own host and same-host submodules only; public repos need none) | none |
 | `SEXTANT_SERVICE_SUBMODULE_HOSTS` | In `clone` mode, comma-separated `host[:port]` list of **additional** hosts submodules may be fetched from — **anonymously** (the token is never sent to them). Invalid entries fail startup | none (same host only) |
 | `SEXTANT_SERVICE_REPOSITORY_HOSTS` | Comma-separated DNS host names a `POST /control/ensure` repository URL may name (see [Repository URL policy](#repository-url-policy-svc-5)). `*` admits any host that passes the URL shape rules and logs a startup warning. A malformed entry **fails startup** | `github.com` |
-| `SEXTANT_SERVICE_REPOSITORY_OWNERS` | Comma-separated `host/owner` (or `host/*`) allow-list for ensure and grant repository URLs; each host must also be allowed by `REPOSITORY_HOSTS`. A malformed entry **fails startup**. Optional for a single-user service, but **required in production whenever a tenant has members besides its owner** (see [Production deployment checklist](#production-deployment-checklist-gateways-and-the-processstack-app)) | none (any owner) |
+| `SEXTANT_SERVICE_REPOSITORY_OWNERS` | Comma-separated `host/owner` (or `host/*`) allow-list for ensure and grant repository URLs; each host must also be allowed by `REPOSITORY_HOSTS`. A malformed entry **fails startup**. Optional for a single-user service, but **required in production whenever a tenant has members besides its owner** (see [Production deployment checklist](#production-deployment-checklist-gateways)) | none (any owner) |
 | `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS` | In `clone` mode, how many times a **transient** clone/provisioning failure is retried across re-ensures before the job settles to terminal `failed` (clamped to 1–100; deterministic failures are never retried). Also bounds the requeue of a checkout whose neutralized `global.json` SDK pin could not be restored (`sdk_pin_restore_failed`, #113), in any checkout mode | `5` |
 | `SEXTANT_SERVICE_CONTROL_TOKEN` | Bearer token for `/control/*`. **Required:** the service refuses to start without it (SX-6d, #198). A whitespace-only value also fails startup | none (startup fails) |
 | `SEXTANT_SERVICE_INSECURE_OPEN_CONTROL_PLANE` | **INSECURE, dev only.** Lets the service start with no control token, leaving the whole control plane (`/control/*`: ensure, retire, retention, backup, grants, audit) open to anyone who can reach the control port. The service prints and logs a loud `WARNING: INSECURE` line at startup while it is in effect. Ignored when a control token is set. A malformed value **fails startup** | `false` |
@@ -1450,12 +1449,11 @@ the immutable snapshot it serves is byte-for-byte the one that was backed up. `P
 a backup from a running service under its writer gate; restore is offline (it must precede startup). See
 [`runbooks.md`](runbooks.md) for the schema-upgrade rehearsal and DR drill.
 
-## Production deployment checklist (gateways and the ProcessStack app)
+## Production deployment checklist (gateways)
 
 Use this list for any service that more than one person reaches, whether through the ProcessStack app
-([`apps/processstack/sextant/README.md`](../apps/processstack/sextant/README.md)) or through another gateway
-that pools many callers behind one delegate token. The ProcessStack rollout itself is in
-[`specs/20260927-processstack-app-extraction/cutover-runbook.md`](../specs/20260927-processstack-app-extraction/cutover-runbook.md).
+(which has moved to a separate private repository) or through another gateway that pools many callers
+behind one delegate token.
 
 | Setting | Production value | Why |
 | --- | --- | --- |
