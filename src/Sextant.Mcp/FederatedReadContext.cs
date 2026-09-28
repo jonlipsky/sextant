@@ -15,7 +15,8 @@ public sealed class FederatedReadContext
 {
     private FederatedReadContext(
         SnapshotReadScope scope, SnapshotProvenance? provenance, ReadAuthorization authorization,
-        long? selectedSnapshotId, RemoteBaseDescriptor? remoteBase, bool selectionUnresolved = false)
+        long? selectedSnapshotId, RemoteBaseDescriptor? remoteBase, bool selectionUnresolved = false,
+        bool branchRequested = false)
     {
         Scope = scope;
         Provenance = provenance;
@@ -23,18 +24,27 @@ public sealed class FederatedReadContext
         SelectedSnapshotId = selectedSnapshotId;
         RemoteBase = remoteBase;
         SelectionUnresolved = selectionUnresolved;
+        BranchRequested = branchRequested;
     }
 
     /// <summary>The pinned read scope reused by every store in this request.</summary>
     public SnapshotReadScope Scope { get; }
 
     /// <summary>
-    /// True when the request NAMED a repository that has no complete default-branch snapshot. Such a read
-    /// never widens to the unselected fallback (which spans every repository of a multi-repository
+    /// True when the request NAMED a repository that has no complete default-branch snapshot (or, with a
+    /// named branch, no complete snapshot on that branch), or named a branch without a repository. Such a
+    /// read never widens to the unselected fallback (which spans every repository of a multi-repository
     /// catalog): its <see cref="Scope"/> is <see cref="SnapshotReadScope.DenyAll"/> and
-    /// <see cref="ReadContextGate"/> refuses it. False for every read without a named repository.
+    /// <see cref="ReadContextGate"/> refuses it. False for every read without a named repository or branch.
     /// </summary>
     public bool SelectionUnresolved { get; }
+
+    /// <summary>
+    /// True when the request named a branch (SVC-2), so the selection pinned that branch's snapshot instead
+    /// of the repository's default branch. <see cref="ReadContextGate"/> uses it to word the actionable
+    /// unresolved-selection message on a non-enforcing path.
+    /// </summary>
+    public bool BranchRequested { get; }
 
     /// <summary>
     /// Present (non-null) only when the pinned generation is a REMOTE-base overlay (issue #108): an overlay
@@ -72,14 +82,18 @@ public sealed class FederatedReadContext
     /// snapshot (the multi-tenant path — the caller names its authorized repository), or reads nothing
     /// (<see cref="SelectionUnresolved"/>) when that repository has none, and when it yields
     /// null the resolver falls back to the single-repository default (byte-identical to pre-Phase-17), so
-    /// the zero-policy local path is unchanged.
+    /// the zero-policy local path is unchanged. <paramref name="requestedBranch"/> (SVC-2) narrows a named
+    /// repository's selection to THAT branch's complete snapshot instead of the default branch; a branch
+    /// named without a repository, or one with no complete snapshot, reads nothing
+    /// (<see cref="SelectionUnresolved"/>) and never falls back to the default branch.
     /// </summary>
     public static FederatedReadContext Resolve(
         IndexDatabase db,
         FederationMode mode = FederationMode.Federated,
         IReadAuthorizer? authorizer = null,
         CompatibilityInputs? compatibility = null,
-        Func<string?>? requestedRepository = null)
+        Func<string?>? requestedRepository = null,
+        Func<string?>? requestedBranch = null)
     {
         // Read through a PRIVATE short-lived reader, never the shared writer connection (issue #57): the
         // read gate runs concurrently with other MCP tool invocations, so it must not share one
@@ -91,10 +105,13 @@ public sealed class FederatedReadContext
         // repository selector (Phase 17) the named repository's snapshot is pinned; otherwise the
         // single-repository default resolves exactly as before.
         var requested = requestedRepository?.Invoke();
-        var named = !string.IsNullOrEmpty(requested);
-        var selected = named
-            ? snapshots.GetSelectedSnapshotRowForRepository(requested!)
-            : snapshots.GetSelectedSnapshotRow();
+        // A blank branch names nothing (the repository's default branch), matching DatabaseProvider's
+        // "branch without repository" check.
+        var branch = requestedBranch?.Invoke() is { } rawBranch && !string.IsNullOrWhiteSpace(rawBranch) ? rawBranch : null;
+        var repositoryNamed = !string.IsNullOrEmpty(requested);
+        var branchNamed = branch is not null;
+        var named = repositoryNamed || branchNamed;
+        var selected = SelectSnapshot(snapshots, requested, branch);
         var authorization = (authorizer ?? AllowAllReadAuthorizer.Instance).Authorize(selected);
 
         // Fail closed: on denial the read gets a DENY-ALL scope (matches no rows), so even a caller that
@@ -103,13 +120,13 @@ public sealed class FederatedReadContext
         if (!authorization.Allowed)
             return new FederatedReadContext(SnapshotReadScope.DenyAll, provenance: null, authorization, selectedSnapshotId: null, remoteBase: null);
 
-        // A NAMED repository with no complete default-branch snapshot must not fall back to the unselected
+        // A NAMED repository (or branch) with no complete snapshot must not fall back to the unselected
         // scope (LegacyPinned / Unscoped, i.e. every repository of a multi-repository catalog): the caller
         // asked for one repository, so it reads nothing. An enforcing authorizer already denied this above
         // (a null selection is unauthorized); a permissive one allows it, so it is pinned to DENY-ALL here.
         if (named && selected == null)
             return new FederatedReadContext(SnapshotReadScope.DenyAll, provenance: null, authorization,
-                selectedSnapshotId: null, remoteBase: null, selectionUnresolved: true);
+                selectedSnapshotId: null, remoteBase: null, selectionUnresolved: true, branchRequested: branchNamed);
 
         var scope = ResolveScope(snapshots, selected, mode);
         var provenance = selected == null
@@ -126,6 +143,19 @@ public sealed class FederatedReadContext
                 : null;
 
         return new FederatedReadContext(scope, provenance, authorization, selected?.Id, remoteBase);
+    }
+
+    // The single selected-generation read. A branch without a repository selects nothing (it must never
+    // widen to the unselected default); a repository with a branch pins that branch; a repository alone
+    // pins its default branch; neither keeps the pre-Phase-17 single-repository default.
+    private static SnapshotRow? SelectSnapshot(SnapshotStore snapshots, string? repository, string? branch)
+    {
+        if (string.IsNullOrEmpty(repository))
+            return branch is null ? snapshots.GetSelectedSnapshotRow() : null;
+
+        return branch is null
+            ? snapshots.GetSelectedSnapshotRowForRepository(repository)
+            : snapshots.GetSelectedSnapshotRowForRepositoryBranch(repository, branch);
     }
 
     private static SnapshotReadScope ResolveScope(
