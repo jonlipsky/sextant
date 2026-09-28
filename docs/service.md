@@ -71,6 +71,7 @@ of the box.
 | `SEXTANT_SERVICE_CALLER_APPS` | Optional comma-separated allow-list on the signed `app` claim | none (any app) |
 | `SEXTANT_SERVICE_MAX_GRANTS_PER_PRINCIPAL` | Most repository grants one user caller may hold in a tenant (see [Repository grants](#repository-grants-and-visibility-svc-4)); creating one more is `409 grant_limit`. The tenant-wide `'*'` grants are not counted. A missing or non-positive value uses the default | `200` |
 | `SEXTANT_SERVICE_MAX_GRANTS_PER_TENANT` | Most repository grant rows a tenant may hold, tenant-wide grants included; creating one more is `409 grant_limit` | `5000` |
+| `SEXTANT_SERVICE_SEARCH_MAX_WIDTH` | Most snapshots one [`search_symbols`](#search_symbols-svc-f) call reads (round-robin over the tracked ones); the rest are listed in `truncated` and searched on later pages. Values above `100` are clamped to `100` (the most snapshots a search tracks at once, which keeps a cursor within 16 KiB); a missing or non-positive value uses the default | `50` |
 | `SEXTANT_SERVICE_BIND_ADDRESS` | Network interface the HTTP surface binds to | `localhost` |
 | `SEXTANT_SERVICE_CONTROL_PORT` | HTTP port | `3011` |
 | `SEXTANT_SERVICE_QUERY_PORT` | Optional dedicated query port (shares the control port when unset) | none (shared) |
@@ -692,7 +693,7 @@ per call through two reserved arguments. The service adds them in MCP request fi
 
 - **`tools/list`** advertises two optional string arguments, `repository` and `branch`, on every
   repository-scoped remote tool (every tool on the remote allowlist except `list_repositories`, which reads no
-  index). A tool that already declares an
+  index, and `search_symbols`, which declares its own `repository`/`branch` narrowing arguments). A tool that already declares an
   argument of the same name keeps its own: `find_cross_repository_usages` and `find_submodule_consumers`
   keep their consumer-filter `branch`, so they get only `repository`.
 - **`tools/call`** removes the reserved arguments before the tool binds its own, so a tool never sees them.
@@ -839,6 +840,70 @@ Every PUT and DELETE, accepted or refused, is audited as action `grant` with a d
 every visible repository, with its catalog branches plus any granted branch not indexed yet. It takes no
 arguments and is exempt from the reserved `repository`/`branch` arguments. A request with no verified caller
 gets the tool error `caller_required`.
+
+### `search_symbols` (SVC-F)
+
+`search_symbols` is a service-only MCP tool on `/mcp` (the local stdio server does not register it). It searches
+symbol names across every repository the verified caller can see under its [grants](#repository-grants-and-visibility-svc-4):
+a user caller sees its own grants plus the tenant-wide ones, and an application caller sees the tenant-wide ones only.
+A request with no verified caller (a plain query token) gets the tool error `caller_required` and reads nothing.
+
+| Argument | Type | Rule |
+|---|---|---|
+| `name_prefix` | string, **required** | Case-insensitive (ASCII) literal prefix of the symbol's name (`display_name`); `%`, `_` and `\` match themselves. Trimmed; 1–256 characters |
+| `repository` | string? | Search only this repository: `https://{host}/{owner}/{repo}`, `{host}/{owner}/{repo}` or, with one host in `REPOSITORY_HOSTS`, `{owner}/{repo}`, under the [URL policy](#repository-url-policy-svc-5). A repository the caller cannot see is the same `no_visible_repositories` error as one that does not exist |
+| `branch` | string? | Search only this branch. Visibility is repository-level, so it can name any indexed branch of a visible repository. Absent = every **granted** branch (a default-branch grant searches the default branch) |
+| `kind` | string? | Only symbols of this kind: a lowercase `SymbolKind` name such as `class`, `method` or `typeparameter` |
+| `cursor` | string? | The previous page's `next_cursor`, passed back with the same other arguments |
+| `limit` | int? | The most symbols read from each snapshot per page; default 50, clamped to 1–200 |
+
+The schema has `additionalProperties: false`, so an unknown argument is an error. The tool is exempt from the
+[reserved selector arguments](#reserved-tool-arguments-svc-2) and ignores the `X-Sextant-Repository` header: its
+own `repository`/`branch` narrow the search, and neither can widen it beyond the caller's grants.
+
+**Result.** A text block and the same JSON as `structuredContent`:
+
+```json
+{
+  "symbols": [{"repository": "...", "branch": "main", "identity_hash": "...", "symbol_key": "...",
+               "name": "TypeA", "fully_qualified_name": "global::App.TypeA", "kind": "class",
+               "accessibility": "public", "project": "..."}],
+  "next_cursor": "...",
+  "pending": [{"repository": "...", "branch": ""}],
+  "unavailable": [{"repository": "...", "branch": "main"}],
+  "truncated": [{"repository": "...", "branch": "main"}],
+  "meta": {"queried_at": 0, "index_freshness": 0, "result_count": 1}
+}
+```
+
+- `kind` and `accessibility` are **names**, rendered as the local tools render them. (The snapshot page
+  `/query/snapshots/{identityHash}/symbols` still emits them as integers.)
+- `pending` lists granted branches with no complete snapshot yet (`branch` is `""` when the default branch is
+  not known yet). `unavailable` lists branches whose snapshot could not be read on this call; they keep their
+  place in the cursor and are retried on a later page (within the same round-robin bound). `truncated` lists
+  branches not read on this call because of `SEARCH_MAX_WIDTH`; they are searched on later pages.
+- Branches that share one snapshot are searched once, labeled with the first (repository, branch) in order.
+- `next_cursor` is always present, and is `null` once every snapshot is exhausted.
+
+**Paging.** Targets are deduplicated by snapshot identity hash. Up to 100 snapshots are tracked at a time, in hash
+order. Each call reads at most `SEARCH_MAX_WIDTH` of them, round-robin: a page continues in hash order after the
+last snapshot the previous page read, and once it reaches the end the next page starts a new round from the lowest
+hash. A snapshot that has not been searched yet joins, as tracked ones are exhausted, at the end of a round. So a
+snapshot with many matches never keeps the others waiting: with V visible snapshots, each tracked one is read at
+least once every ⌈min(V, 100) / `SEARCH_MAX_WIDTH`⌉ pages. Each page reads up to `limit` rows from each snapshot
+it reads and orders them by name, then identity hash, then row. While the grants and branch heads do not change,
+walking every page returns every match exactly once. The cursor is opaque
+base64url JSON of at most 16 KiB. It carries each snapshot's position, and a digest binds it to the tenant, the
+caller and the query arguments other than `limit`. A tampered or oversized cursor, or one issued to another caller,
+tenant or query, gets `invalid_cursor`. The digest is not an authorization control. Every call reads the caller's
+grants again, so a revoked grant stops being searched on the next page, and a cursor naming a snapshot the caller
+cannot see is treated exactly like one naming a snapshot that does not exist.
+
+**Errors** (all tool errors): `caller_required`, `invalid_arguments` (a missing or blank `name_prefix`, a wrong
+type, an unknown argument or `kind`), `invalid_selector` (a `repository` the URL policy refuses),
+`invalid_cursor`, and `no_visible_repositories` (nothing to search: no grants, or an explicit `repository` or
+`branch` that matches nothing visible). A failure to read the grants fails the call; it is never presented as
+`no_visible_repositories` or as an unscoped search.
 
 ## The `SnapshotService` data plane
 
