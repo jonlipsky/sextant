@@ -1690,6 +1690,26 @@ public sealed class IndexOrchestrator
     private static void AdvanceBranchToSnapshot(
         SnapshotStore snapshotStore, long repositoryId, SnapshotContext ctx, long snapshotId, long completedAt)
     {
+        // SVC-7: `branch_update: none` publishes (or re-selects) the snapshot but creates or moves NO branch
+        // pointer, and wins over every other guard. Null/false for every local CLI/daemon run.
+        if (ctx.SuppressBranchUpdate == true)
+            return;
+
+        // SVC-6: a compare-and-swap on the pointer's current commit. A mismatch leaves the branch untouched —
+        // no row is created and its default designation is not changed — so a stale push can neither move the
+        // head nor re-create a retired branch. Null for every local CLI/daemon run.
+        if (ctx.ExpectedHeadCommit is { } expectedHead)
+        {
+            if (!snapshotStore.BranchHeadMatches(snapshotStore.GetBranchId(repositoryId, ctx.BranchName), expectedHead))
+                return;
+            var casOwnsDefault = snapshotStore.ShouldOwnDefault(repositoryId, ctx.BranchName, ctx.IsDefaultBranch);
+            var casBranchId = snapshotStore.EnsureBranch(repositoryId, ctx.BranchName, casOwnsDefault, completedAt);
+            if (casOwnsDefault)
+                snapshotStore.PromoteSoleDefaultBranch(repositoryId, casBranchId);
+            snapshotStore.AdvanceBranchPointerIfHeadMatches(casBranchId, snapshotId, expectedHead, completedAt);
+            return;
+        }
+
         // Decide default ownership BEFORE EnsureBranch (issue #104): whether the just-indexed branch owns
         // the repo default is decoupled from the "no branch name" heuristic — it is the ctx flag, or the
         // "first/sole consumer branch becomes default" safety net when the repo has no default yet (so a
@@ -1733,7 +1753,10 @@ public sealed class IndexOrchestrator
     /// idempotent duplicate-publish path (a Complete snapshot) and the branch-rollback / older-commit
     /// re-checkout path (a Superseded snapshot). Restores the snapshot to Complete (un-supersedes it) and
     /// (re)points the branch at it via <see cref="AdvanceBranchToSnapshot"/>. Never touches the snapshot's
-    /// data rows, so the immutable snapshot stays byte-identical (criteria 1 &amp; 2).
+    /// data rows, so the immutable snapshot stays byte-identical (criteria 1 &amp; 2). When the branch guard
+    /// declines the pointer move (a lower #84 sequence, an SVC-6 head mismatch, or SVC-7
+    /// <c>branch_update: none</c>) the snapshot is still restored to Complete, so it stays attached and
+    /// resolvable by commit without becoming the branch head.
     /// </summary>
     private static void SelectExistingSnapshot(
         SnapshotStore snapshotStore, long repositoryId, SnapshotContext ctx, long snapshotId, long completedAt)

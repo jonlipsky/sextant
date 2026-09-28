@@ -78,6 +78,22 @@ public sealed record SnapshotRow
 /// </summary>
 public sealed class LogicalProjectConflictException(string message) : Exception(message);
 
+/// <summary>A row of the <c>branches</c> table: a repository branch and the snapshot it points at.</summary>
+public sealed record BranchRow
+{
+    public required long Id { get; init; }
+    public required long RepositoryId { get; init; }
+    public required string Name { get; init; }
+
+    /// <summary>The snapshot the branch points at, or null (no pointer, or the target was reclaimed).</summary>
+    public long? SnapshotId { get; init; }
+
+    public required bool IsDefault { get; init; }
+
+    /// <summary>The control-plane head sequence the pointer has advanced to (issue #84), or null.</summary>
+    public long? HeadSequence { get; init; }
+}
+
 /// <summary>
 /// Reads and writes the Phase-9 immutable-snapshot tables (<c>repositories</c>, <c>commits</c>,
 /// <c>logical_projects</c>, <c>snapshots</c>, <c>branches</c>, <c>snapshot_projects</c>). The store is
@@ -638,6 +654,68 @@ public sealed class SnapshotStore(SqliteConnection connection)
     }
 
     /// <summary>
+    /// True when <paramref name="expectedHeadCommit"/> means "the branch has no pointer yet" (SVC-6): the
+    /// empty string, or an all-zero SHA (the <c>before</c> of a branch-create push).
+    /// </summary>
+    public static bool IsAbsentHeadCommit(string expectedHeadCommit) =>
+        expectedHeadCommit.Length == 0 || expectedHeadCommit.All(c => c == '0');
+
+    /// <summary>
+    /// The compare-and-swap predicate on a branch pointer for the SERVICE ensure and retire paths (SVC-6).
+    /// Passes when:
+    /// <list type="bullet">
+    /// <item>the branch row does not exist (<paramref name="branchId"/> is null) and
+    /// <paramref name="expectedHeadCommit"/> is empty or all zeros (<see cref="IsAbsentHeadCommit"/>), a
+    /// branch create;</item>
+    /// <item>the branch row exists but its pointer is NULL. Every advance writes the pointer in the same
+    /// transaction that creates the row, so a NULL pointer only remains after retention reclaimed the target
+    /// (<c>ON DELETE SET NULL</c>): an unusable target;</item>
+    /// <item>the pointer's target is not <see cref="SnapshotStatus.Complete"/> (unusable); or</item>
+    /// <item>the target's commit SHA (<see cref="GetCommitSha"/>) equals the expected value (compared
+    /// case-insensitively, like hex SHAs).</item>
+    /// </list>
+    /// Pure read on the caller's connection, so a caller evaluates it inside its own write transaction.
+    /// </summary>
+    public bool BranchHeadMatches(long? branchId, string expectedHeadCommit)
+    {
+        if (branchId is not long id)
+            return IsAbsentHeadCommit(expectedHeadCommit);
+        if (GetBranchSnapshotId(id) is not long current)
+            return true;
+        if (GetById(current) is not { Status: SnapshotStatus.Complete } target)
+            return true;
+        return GetCommitSha(target.CommitId) is string sha
+            && string.Equals(sha, expectedHeadCommit, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// The compare-and-swap branch-pointer advance for the SERVICE ensure path (SVC-6), shared by the
+    /// orchestrator's <c>AdvanceBranchToSnapshot</c> and the service's no-worker reuse paths so both converge
+    /// on the same decision. When <see cref="BranchHeadMatches"/> passes, points the branch at
+    /// <paramref name="snapshotId"/> and supersedes the previous target, but only when it is a different
+    /// snapshot that is still <see cref="SnapshotStatus.Complete"/> AND no other branch points at it (the
+    /// #128 guard; a shared target must not strand the other branch on a superseded head). When the CAS fails
+    /// the branch is left untouched. <c>head_sequence</c> is never written. Returns <c>true</c> when the CAS
+    /// passed, so the branch now points at <paramref name="snapshotId"/>. Runs on the caller's connection
+    /// inside the caller's write transaction.
+    /// </summary>
+    public bool AdvanceBranchPointerIfHeadMatches(long branchId, long snapshotId, string expectedHeadCommit, long now)
+    {
+        if (!BranchHeadMatches(branchId, expectedHeadCommit))
+            return false;
+
+        var previousSnapshot = GetBranchSnapshotId(branchId);
+        if (previousSnapshot == snapshotId)
+            return true;
+        SetBranchPointer(branchId, snapshotId, now);
+        if (previousSnapshot is long prev
+            && GetById(prev) is { Status: SnapshotStatus.Complete }
+            && !IsPointedByAnotherBranch(prev, branchId))
+            MarkStatus(prev, SnapshotStatus.Superseded);
+        return true;
+    }
+
+    /// <summary>
     /// Makes <paramref name="keepBranchId"/> the single default branch for its repository by clearing
     /// <c>is_default</c> on every sibling. A full index marks the checked-out branch it just published as
     /// default; without demoting siblings, indexing a second branch of one repo would leave two
@@ -810,6 +888,59 @@ public sealed class SnapshotStore(SqliteConnection connection)
         cmd.CommandText = "SELECT snapshot_id FROM branches WHERE id = @id;";
         cmd.Parameters.AddWithValue("@id", branchId);
         return cmd.ExecuteScalar() is long id ? id : null;
+    }
+
+    /// <summary>The branch row for a (repository, name) pair, or null when absent (read-only lookup).</summary>
+    public BranchRow? GetBranch(long repositoryId, string name)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT id, repository_id, name, snapshot_id, is_default, head_sequence
+            FROM branches WHERE repository_id = @repo AND name = @name LIMIT 1;
+            """;
+        cmd.Parameters.AddWithValue("@repo", repositoryId);
+        cmd.Parameters.AddWithValue("@name", name);
+        return ReadBranch(cmd);
+    }
+
+    /// <summary>The branch row for a <c>branches.id</c>, or null when absent (read-only lookup).</summary>
+    public BranchRow? GetBranchById(long branchId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT id, repository_id, name, snapshot_id, is_default, head_sequence
+            FROM branches WHERE id = @id;
+            """;
+        cmd.Parameters.AddWithValue("@id", branchId);
+        return ReadBranch(cmd);
+    }
+
+    private static BranchRow? ReadBranch(SqliteCommand cmd)
+    {
+        using var reader = cmd.ExecuteReader();
+        if (!reader.Read())
+            return null;
+        return new BranchRow
+        {
+            Id = reader.GetInt64(0),
+            RepositoryId = reader.GetInt64(1),
+            Name = reader.GetString(2),
+            SnapshotId = reader.IsDBNull(3) ? null : reader.GetInt64(3),
+            IsDefault = reader.GetInt64(4) != 0,
+            HeadSequence = reader.IsDBNull(5) ? null : reader.GetInt64(5)
+        };
+    }
+
+    /// <summary>
+    /// Deletes a branch row (SVC-6 retire). Only the pointer row goes: the snapshots it pointed at stay in the
+    /// catalog and are reclaimed by retention once nothing protects them. Returns true when a row was deleted.
+    /// </summary>
+    public bool DeleteBranch(long branchId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "DELETE FROM branches WHERE id = @id;";
+        cmd.Parameters.AddWithValue("@id", branchId);
+        return cmd.ExecuteNonQuery() > 0;
     }
 
     /// <summary>

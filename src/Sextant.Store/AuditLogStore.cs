@@ -20,6 +20,9 @@ public static class AuditAction
     public const string Backup = "backup";
     public const string Restore = "restore";
     public const string Reconcile = "reconcile";
+
+    /// <summary>A branch retirement (SVC-6, <c>POST /control/branches/retire</c>).</summary>
+    public const string Retire = "retire";
 }
 
 /// <summary>The outcome an <see cref="AuditEntry"/> records (migration 020 <c>audit_log.outcome</c>).</summary>
@@ -29,9 +32,12 @@ public static class AuditOutcome
     public const string Accepted = "accepted";
 
     /// <summary>
-    /// A request was refused. Emitted today ONLY for an AUTHENTICATED control-plane intake refusal: an ensure
+    /// A request was refused. Emitted today ONLY for an AUTHENTICATED control-plane refusal: an ensure
     /// whose repository URL the service's repository URL policy rejects (SVC-5, <c>ensure</c>/<c>denied</c>,
-    /// detail = the reason code; the refused URL is never stored). It is deliberately NOT emitted from the
+    /// detail = the reason code; the refused URL is never stored) or whose branch guards are malformed
+    /// (SVC-6/7), and a branch retirement refused by that policy, for a missing branch name, as the
+    /// repository's default branch, or on a head mismatch (SVC-6, <c>retire</c>/<c>denied</c>). It is
+    /// deliberately NOT emitted from the
     /// auth-middleware hot path: a durable write per unauthenticated request would drive the single writer
     /// into contention (a DoS amplifier), and the uniform-not-found denial already prevents an unauthorized
     /// caller from learning anything. A read-authorization refusal would be recorded here WITHOUT confirming
