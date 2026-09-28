@@ -24,6 +24,7 @@ inputs:
   failed: 99
   remaining: 99
   retried: true
+  limitReached: true
   complete: true
   outcome: seeded
   message: seeded

@@ -143,7 +143,7 @@ nodes:
          'imported', 'newlyImported', 'skipped', 'failed', 'remaining'].forEach(function (name) {
           context.setVariable(name, 0);
         });
-        ['hasLive', 'writeAttempts', 'accepted', 'retried', 'complete'].forEach(function (name) {
+        ['hasLive', 'writeAttempts', 'accepted', 'retried', 'limitReached', 'complete'].forEach(function (name) {
           context.setVariable(name, false);
         });
         ['facts', 'grantsJson', 'pending', 'putJson'].forEach(function (name) { context.setVariable(name, null); });
@@ -251,11 +251,12 @@ nodes:
         null;
     next: import-loop
 
-  # Processes have no for-each node: each pass takes the next planned entry.
+  # Processes have no for-each node: each pass takes the next planned entry. The watch limit ends the loop:
+  # every later entry would be refused too, so none of them costs a GitHub call.
   - id: import-loop
     type: decision
     next:
-      - when: "pending != null && index < pending.length"
+      - when: "pending != null && index < pending.length && !limitReached"
         next: next-entry
       - else: finish-attempts
 
@@ -375,6 +376,7 @@ nodes:
         } else if (putStatus == 409) {
           context.setVariable('failed', failed + 1);
           context.setVariable('resolution', 'final');
+          if (putJson != null && putJson.reason === 'grant_limit') context.setVariable('limitReached', true);
         } else {
           context.setVariable('failed', failed + 1);
           context.setVariable('resolution', 'retry');
@@ -395,7 +397,8 @@ nodes:
     next: import-loop
 
   # Nothing is left to retry when every planned entry was checked, the service refused or granted each
-  # one, and every remaining mark is unresolved.
+  # one, and every remaining mark is unresolved. After the watch limit, the entries not checked are marked
+  # unresolved and failed, as their own 409 would have left them.
   - id: finish-attempts
     type: activity:JavaScript
     inputs:
@@ -409,6 +412,13 @@ nodes:
             if ((marks[resolvedSlug] || 0) > 1) marks[resolvedSlug] = marks[resolvedSlug] - 1;
             else delete marks[resolvedSlug];
           }
+        }
+        if (limitReached && pending != null && index < pending.length) {
+          for (var i = index; i < pending.length; i++) {
+            var left = String(pending[i].slug);
+            marks[left] = Math.max(maxAttempts, marks[left] || 0);
+          }
+          context.setVariable('failed', failed + (pending.length - index));
         }
         var text = JSON.stringify(marks);
         var retryable = Object.keys(marks).some(function (slug) { return marks[slug] < maxAttempts; });
