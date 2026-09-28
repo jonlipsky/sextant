@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Text.RegularExpressions;
 
 namespace Sextant.Service.Tests;
 
@@ -35,40 +36,56 @@ public class ArchitectureBoundaryTests
                 "— service/hosting code depends on core, never the reverse (criterion 6).");
     }
 
-    // The app under apps/processstack/ builds against a private SDK feed, so nothing the public build
-    // restores may reference that SDK or the app's projects, and Sextant.slnx must not include the app.
+    // The ProcessStack app has moved to a separate private repository. It builds against a private SDK feed,
+    // so no project here may reference that SDK and the app must not come back: the public build never needs
+    // the private feed.
     private const string AppTree = "apps/processstack/";
-    private const string SdkPackagePrefix = "Include=\"ProcessStack.";
-    private static readonly string[] SkippedDirectories = ["bin", "obj", ".git", "TestResults", "node_modules"];
+    private const string AppManifest = "psapp.yaml";
+    private static readonly Regex SdkReference = new(
+        """\b(?:Include|Update)\s*=\s*["']\s*ProcessStack\.""",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    // Build output and other git-ignored directories.
+    private static readonly string[] SkippedDirectories =
+        ["bin", "obj", "artifacts", ".git", ".vs", ".idea", ".sextant", "TestResults", "node_modules"];
 
     [TestMethod]
-    public void PlatformSdk_AndAppProjects_AreReferencedOnlyFromTheAppTree()
+    public void NoProject_ReferencesTheProcessStackSdk()
+    {
+        var offenders = SdkReferences(RepositoryRoot());
+
+        Assert.IsEmpty(offenders,
+            $"no project may reference a ProcessStack.* SDK package: {string.Join(", ", offenders)}");
+    }
+
+    [TestMethod]
+    public void ProcessStackApp_DoesNotReappear()
     {
         var root = RepositoryRoot();
         var offenders = new List<string>();
-        foreach (var file in MsBuildFiles(root))
+        foreach (var file in RepositoryFiles(root))
         {
-            var relative = Path.GetRelativePath(root, file).Replace('\\', '/');
+            var relative = Relative(root, file);
             if (relative.StartsWith(AppTree, StringComparison.OrdinalIgnoreCase))
-                continue;
-            var text = File.ReadAllText(file).Replace('\\', '/');
-            if (text.Contains(SdkPackagePrefix, StringComparison.OrdinalIgnoreCase)
-                || text.Contains(AppTree, StringComparison.OrdinalIgnoreCase))
+                offenders.Add(relative);
+            else if (Path.GetFileName(file).Equals(AppManifest, StringComparison.OrdinalIgnoreCase))
+                offenders.Add(relative);
+            else if (IsMsBuildFile(file)
+                     && File.ReadAllText(file).Replace('\\', '/').Contains(AppTree, StringComparison.OrdinalIgnoreCase))
                 offenders.Add(relative);
         }
+        offenders.AddRange(SdkReferences(root));
 
         Assert.IsEmpty(offenders,
-            $"only {AppTree} may reference the platform SDK packages or the app projects: {string.Join(", ", offenders)}");
+            $"the ProcessStack app lives in a separate private repository; no {AppTree} tree, {AppManifest} or " +
+            $"ProcessStack.* package reference may come back (delete any leftover local build output under " +
+            $"{AppTree}): {string.Join(", ", offenders.Distinct())}");
     }
 
-    [TestMethod]
-    public void PublicSolution_DoesNotIncludeTheAppTree()
-    {
-        var solution = File.ReadAllText(Path.Combine(RepositoryRoot(), "Sextant.slnx")).Replace('\\', '/');
-
-        Assert.IsFalse(solution.Contains("apps/", StringComparison.OrdinalIgnoreCase),
-            "Sextant.slnx must build without the private SDK feed, so it must not include the app tree.");
-    }
+    private static List<string> SdkReferences(string root) =>
+        RepositoryFiles(root)
+            .Where(file => IsMsBuildFile(file) && SdkReference.IsMatch(File.ReadAllText(file)))
+            .Select(file => Relative(root, file))
+            .ToList();
 
     private static string RepositoryRoot()
     {
@@ -80,7 +97,19 @@ public class ArchitectureBoundaryTests
         throw new InvalidOperationException("Could not find Sextant.slnx above the test output directory.");
     }
 
-    private static IEnumerable<string> MsBuildFiles(string root)
+    private static string Relative(string root, string file) => Path.GetRelativePath(root, file).Replace('\\', '/');
+
+    private static bool IsMsBuildFile(string file)
+    {
+        var name = Path.GetFileName(file);
+        return name.EndsWith("proj", StringComparison.OrdinalIgnoreCase)
+               || name.EndsWith(".sln", StringComparison.OrdinalIgnoreCase)
+               || name.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase)
+               || name.EndsWith(".props", StringComparison.OrdinalIgnoreCase)
+               || name.EndsWith(".targets", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static IEnumerable<string> RepositoryFiles(string root)
     {
         var pending = new Stack<string>([root]);
         while (pending.Count > 0)
@@ -92,14 +121,7 @@ public class ArchitectureBoundaryTests
                     pending.Push(child);
             }
             foreach (var file in Directory.EnumerateFiles(dir))
-            {
-                var name = Path.GetFileName(file);
-                if (name.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase)
-                    || name.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase)
-                    || name.EndsWith(".props", StringComparison.OrdinalIgnoreCase)
-                    || name.EndsWith(".targets", StringComparison.OrdinalIgnoreCase))
-                    yield return file;
-            }
+                yield return file;
         }
     }
 
