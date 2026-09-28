@@ -19,7 +19,7 @@
 
 | # | Goal |
 |---|---|
-| G-1 | Sextant reaches ProcessStack users only as an app (`apps/processstack/sextant/`, manifest `name: sextant`, **v2.0.0**, the next version of the existing asset). It is shipped with `processstack app validate\|test\|publish\|activate`. |
+| G-1 | Sextant reaches ProcessStack users only as an app (`apps/processstack/sextant/`, manifest `name: sextant`, **v2.0.0**, the next version of the existing asset). It is shipped with `processstack app validate\|test\|publish` and a bound deployment (`app deployment upgrade`; `app activate` refuses for an app with a required connection binding). |
 | G-2 | The app uses only generic PS primitives: a `type: mcp` connection, a `type: http-api` connection, the `github` connection, App State, user memory, `connection-event`/`schedule`/`prompt` triggers, trigger run-now (for the one-shot G2c enrollment import), and the per-app MCP surface. |
 | G-3 | The service enforces per-user repository visibility from a verified caller assertion (option A). The app never sees or filters query results. |
 | G-4 | Domain rules move into the service: URL/host policy (SVC-5), branch-head CAS (SVC-6+7), grants (SVC-4), and federated symbol search (SVC-F). |

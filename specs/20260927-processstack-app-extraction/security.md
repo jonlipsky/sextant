@@ -8,7 +8,7 @@
 | Credential | Held by | Presented on | Grants |
 |---|---|---|---|
 | Control token (`SEXTANT_SERVICE_CONTROL_TOKEN`) | PS secret store (`sextant-control` connection); service env | `/control/*` | Full control plane. **Required:** the service refuses to start without it unless the explicit, loudly logged `SEXTANT_SERVICE_INSECURE_OPEN_CONTROL_PLANE=true` dev opt-out is set (SX-6d, #198). **Assertion-less calls stay full-power** until SVC-17 (N now; **R before a second app or tenant**) |
-| Legacy query token (`QUERY_TOKEN`) | Old PS gateway (until G3) | `/mcp`, `/query/*` | **Unscoped** read of every repository (today's behavior, kept until G3) |
+| Legacy query token (`QUERY_TOKEN`) | Old PS gateway (until G3) | `/mcp`, `/query/*` | **Unscoped** read of every repository (today's behavior, kept until G3). After G3 it is **replaced** with a value no client holds (or a `READ_POLICY` is set), never unset: with no query token and no read policy the query plane is open to anonymous reads (`docs/service.md`, "After the cutover (G3), not before") |
 | Delegate token (`DELEGATE_TOKENS`, new) | PS secret store (`sextant-query` connection) | `/mcp`, `/query/*` | **Nothing by itself.** Reads need a valid assertion, and data visibility = grants |
 | Caller key (`CALLER_KEYS`, new) | PS secret store (`callerIdentity.signingKey` on both connections); service env | Signs/verifies `X-ProcessStack-Caller` | Binds a caller to **one tenant** |
 | Checkout token (`CHECKOUT_TOKEN`) | Service env only | GitHub (clone) | Read on every repo the PAT reaches (#111) |
@@ -19,11 +19,11 @@
 
 | Control | Where | Evidence / status |
 |---|---|---|
-| Top-level URL: https only; host on allow-list (default `github.com`); no IP literal, localhost, single label, trailing dot, userinfo, port, query or fragment; `/owner/repo[.git]` only | `RepositoryUrlPolicy`, at ensure/grant/retire intake and the `repository` tool arg | **New.** Today there is no intake validation (`src/Sextant.Service.Host/ServiceApp.cs:224-251`), and git is allowed `https:http:file:ssh:git` (`src/Sextant.Service/CloningCheckoutProvider.cs:77`) |
+| Top-level URL: https only; host on allow-list (default `github.com`); no IP literal, localhost, single label, trailing dot, userinfo, port, query or fragment; `/owner/repo[.git]` only | `RepositoryUrlPolicy`, at ensure/grant/retire intake and the `repository` tool arg | Exists (SX-1, #186): intake refuses the URL before any job row exists. Git's own transport list is unchanged (`AllowedGitProtocols` in `CloningCheckoutProvider.cs`), so the intake policy is the gate |
 | Commit is a hex object id; URL has no embedded credentials | Clone provisioning | Exists: `CloningCheckoutProvider.cs:285-304` |
 | Submodules: `.gitmodules` `path`/`url` only; https / relative / same-host ssh→https; allow-listed extra hosts are anonymous | `SubmoduleUrlPolicy` | Exists: `src/Sextant.Service/SubmoduleUrlPolicy.cs`; `SEXTANT_SERVICE_SUBMODULE_HOSTS` |
 | The token never reaches argv/files; it is sent only to the repository's own host; redirects are not followed | Git env config | Exists (#125; `CLAUDE.md`, clone-mode rule) |
-| Optional owner allow-list `REPOSITORY_OWNERS` | `RepositoryUrlPolicy` | **N**; recommended before a second tenant |
+| Owner allow-list `REPOSITORY_OWNERS` (comma-separated `host/owner`) | `RepositoryUrlPolicy` | Exists (SX-1). **R in production whenever a tenant has members besides its owner** (SX-10 security review): without it any member can index any public repository on an allowed host, and indexing runs that repository's MSBuild on the worker. It does not stop a fork commit under an allowed base URL (#209); only #76 closes that |
 | Which Sextant service PS calls | Operator-set connection URL | Replaces PS `SextantServiceHostRouter` (deleted with PS-11). Nothing is caller-controlled |
 
 **Rationale.** The service is the only component that fetches, so policy lives there. The app does a *pre-check* (`GetRepository`) for UX and #111, but this is not a security boundary.
@@ -138,7 +138,7 @@ Assertion-less calls stay full-power until SVC-17 (see "Trust boundaries").
 |---|---|---|
 | The watch flow checks `GetRepository` through the tenant's `github` connection (installation scope) before `PUT /control/grants/self` | **R** | `app.md`, configure-watched-repos |
 | Only the app holds the control token; users cannot call `/control/grants/self` directly | **R** | Operator: restrict who can bind `sextant-control`. PS has no generic "restrict connection binding to app X" (a generic PS issue tracks it), so the service sets **`CALLER_APPS=sextant`** (SVC-3, R): another app bound to the same connections cannot use grant routes or delegate reads. Assertion-less control calls remain full-power until SVC-17 (**R before a second app or tenant**) |
-| `REPOSITORY_OWNERS` allow-list on the service | N (R before a 2nd tenant or org) | SVC-5 |
+| `REPOSITORY_OWNERS` allow-list on the service | **R** whenever a tenant has members besides its owner (see the SSRF table) | SVC-5; `docs/service.md`, "Production deployment checklist" |
 | Per-request installation token instead of the static PAT | N (R before a 2nd tenant) | #111 / SVC-11 |
 | Per-user GitHub permission check (the user's own OAuth) | N | Requires a PS user-GitHub identity; out of scope |
 
@@ -151,8 +151,16 @@ The app's pre-check is **UX plus defense in depth, not a boundary**. The durable
 | #145 | The query surface emits absolute worker checkout paths and keys `solution:` scope by absolute path | Fix before a second tenant (information disclosure) |
 | #134 | An unresolvable `project:`/`solution:` scope silently becomes an unfiltered query | Fix before a second tenant. The grant gate still bounds it to the pinned snapshot, but fail-open is the wrong default |
 | #77 | Provenance/overlay expose catalog-global integer ids | Makes `/control/status/{id}` enumerable (mitigated by the 404-unless-visible rule) |
-| #76 | No hard OS isolation for untrusted MSBuild evaluation | Required before indexing repos from mutually untrusted tenants |
+| #76 | No hard OS isolation for untrusted MSBuild evaluation | Required before indexing repos from mutually untrusted tenants. Also the only full fix for #209 |
 | #111 | Static org-wide checkout PAT | See above |
+| #209 | A user ensure with `branch_update: none` (the app's `start-indexing`) can index any commit reachable in a granted repository, fork-network commits included, so untrusted code runs through MSBuild evaluation under a trusted base URL | `REPOSITORY_OWNERS` narrows the base repositories but does not close it; #76 (or a commit-reachability check) does |
+| #210 | The app's visibility gate is workspace-level: the watch flow and the legacy import check the repository with the **workspace's** GitHub connection, so any workspace member can watch (and so read) every repository that connection sees | Treat every workspace member as trusted with what the connection reads (documented in the app README, "Tenant trust") |
+
+## Accepted residuals (as built, SX-10/SX-11)
+
+- **A missed push is repaired only by the nightly reconcile.** Each push ensure carries its own `before` as the head CAS, so after one lost push ensure every later push's CAS misses (it indexes but does not advance the branch). The app's nightly `reconcile` re-ensures the branch under the CAS of the service's current head and repairs it.
+- **A tenant grant deleted with `DELETE /control/grants/tenant` comes back.** Every repository event from the GitHub App installation creates or holds the repository's tenant grant (by design), and until the app's v2.1 cleanup the reconcile also imports the legacy `enrolled/*` App State rows as tenant grants. To stop indexing a repository for a tenant, remove it from the GitHub App installation; its enrolled row still restores the grant on each reconcile until v2.1 drops that import (`pr-plan.md`, post-G3 APP v2.1).
+- **`internal: true` flows are runnable directly** (elevenworks/ProcessStack#3287). The app treats any flow's inputs as caller-chosen; the service's grant gate, the SX-6d user-ensure bounds and the URL policy stay the authority.
 
 ## Audit
 

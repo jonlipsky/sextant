@@ -5,11 +5,7 @@
 > Every step uses **generic** PS activities and triggers only. The app contains no Sextant-specific platform code, stores no secrets in App State, and never proxies queries through processes.
 > PS features referenced: PS-5 (GitHub repository events), PS-6 (scenario stubs), PS-7 (F4 caller identity), PS-8 (F3 connection tools), and PS-13 (`DeleteMyMemory`).
 
-> **Open: app repo location (decision pending with the human; needed before SX-9).** `apps/processstack/sextant/` in this repo stays the working path. The options are:
-> - **A. Keep the app in this public repo.** CI restores the CLI with a classic `read:packages` PAT stored as the secret `PROCESSSTACK_PACKAGES_TOKEN`.
-> - **B. Move the app to a private elevenworks repo** (e.g. `elevenworks/processstack-sextant`). Its `GITHUB_TOKEN` is granted package access through the package's "Manage Actions access", so no PAT is needed, and this repo stays ProcessStack-agnostic.
->
-> The layout, flows and scenarios below are the same under either option; only the repo root and the CI auth differ.
+> **Resolved: the app lives in this public repo (option A).** It is at `apps/processstack/sextant/` (SX-9…SX-11 merged, #204, #207, #208). CI restores the CLI with a classic `read:packages` PAT stored as the secret `PROCESSSTACK_PACKAGES_TOKEN`; until a human adds it, the app job emits a notice and skips (it still does on `main`). The option considered instead was a private ProcessStack-org repo whose `GITHUB_TOKEN` gets package access through "Manage Actions access".
 
 ## Layout
 
@@ -25,7 +21,7 @@ apps/processstack/sextant/
 .github/workflows/processstack-app.yml
 ```
 
-## Connections (manifest dependencies, bound at `app activate`)
+## Connections (manifest dependencies, bound by the deployment)
 
 | id | type | Config set at registration (the runbook's G2b) | Used for |
 |---|---|---|---|
@@ -234,9 +230,9 @@ These assume the PS-6 scenario stubs: `principal`, `seed.userMemory`, `seed.appS
 |---|---|
 | Triggers | `pull_request` + `push` to `main`, path filter `apps/processstack/**` and the workflow file |
 | Steps | checkout → `actions/setup-dotnet` → `dotnet nuget add source https://nuget.pkg.github.com/elevenworks/index.json -n elevenworks -u x -p ${{ secrets.PROCESSSTACK_PACKAGES_TOKEN }} --store-password-in-clear-text` → `dotnet tool install -g ProcessStack.Cli --version <pinned>` → `processstack app validate -p apps/processstack/sextant` → `processstack app test -p apps/processstack/sextant --all` |
-| Secret | **`PROCESSSTACK_PACKAGES_TOKEN`: a classic PAT with `read:packages` on elevenworks. The human must add it** to `jonlipsky/sextant`. The package is private and org-owned, so a repo outside the elevenworks org cannot be granted Actions access to it; that is why the public-repo option needs this PAT. If it is absent, the job emits `::notice::` and skips, so it does not fail fork PRs. Under option B (private elevenworks repo; see "Open: app repo location") it is replaced by `GITHUB_TOKEN` with `packages: read` plus "Manage Actions access" on the package |
+| Secret | **`PROCESSSTACK_PACKAGES_TOKEN`: a classic PAT with `read:packages` on the package's org. The human must add it** to `jonlipsky/sextant`. The package is private and org-owned, so a repo outside that org cannot be granted Actions access to it; that is why the public-repo option (the one chosen; see the note at the top) needs this PAT. If it is absent, the job emits `::notice::` and skips, so it does not fail fork PRs |
 | Prerequisite | **Met: `ProcessStack.Cli` 1.1.0 and 1.1.1 are on the private elevenworks GitHub Packages feed** (tags `cli-v1.1.0` and `cli-v1.1.1`). It is never published to nuget.org. CI pins 1.1.1: 1.1.0 carried PS-6, PS-7, PS-8 and PS-15, and 1.1.1 adds PS-19's GitHub stubs |
-| Not in CI | `publish` / `activate`, which stay manual per the runbook |
+| Not in CI | `publish` and the deployment steps, which stay manual per the runbook |
 | Separation | Independent of the .NET `Build & Test` job (30-min timeout, `CLAUDE.md`), so it adds no Sextant build dependency |
 
 ## README (deploy steps; details in [`cutover-runbook.md`](cutover-runbook.md))
@@ -247,20 +243,24 @@ These assume the PS-6 scenario stubs: `principal`, `seed.userMemory`, `seed.appS
    - `SEXTANT_SERVICE_CALLER_AUDIENCE=sextant`;
    - `SEXTANT_SERVICE_CALLER_APPS=sextant`;
    - `SEXTANT_SERVICE_CALLER_IDPS=processstack` (the default; set explicitly);
-   - `SEXTANT_SERVICE_REPOSITORY_HOSTS=github.com`.
+   - `SEXTANT_SERVICE_REPOSITORY_HOSTS=github.com`;
+   - `SEXTANT_SERVICE_REPOSITORY_OWNERS=github.com/<org>,github.com/<owner>` (comma-separated), **required** whenever the tenant has members besides its owner (SX-10 security review; `docs/service.md`, "Production deployment checklist").
 
-   Check that `/control/metrics` reports schema 24.
+   Check that `/control/metrics` reports DB schema 25 (snapshot identity schema 24; the move to 24 re-indexes every repository once).
 2. **Register connections:**
    - `sextant-query` (mcp http, delegate bearer, callerIdentity);
    - `sextant-control` (http-api, control bearer, the same callerIdentity **and the same explicit `keyId`**);
    - `github` with webhook events `push`, `delete` and `pull_request`.
-3. **Publish:** `processstack app validate -p apps/processstack/sextant && processstack app test -p apps/processstack/sextant --all && processstack app publish apps/processstack/sextant`.
-4. **Deploy and activate:** bind `github`, `sextant-query` and `sextant-control` in the WebClient deploy dialog (the CLI sets no bindings), then `processstack app activate sextant` (it has no `--version`: it activates the published version).
+
+   Name the first two exactly `sextant-query` and `sextant-control`: an unbound optional dependency resolves by name (lazy binding).
+3. **Publish:** `processstack app validate -p apps/processstack/sextant && processstack app test -p apps/processstack/sextant --all && processstack app publish apps/processstack/sextant`, from a clean clone (elevenworks/ProcessStack#3284). Before an upgrade, pin a `latest`-mode deployment first (step 4): publish moves latest-mode deployments at once.
+4. **Deploy:** never `processstack app activate sextant`: the connection-event triggers make `github` a required binding, so it refuses, and it only manages the empty-binding `app:{appId}` deployment. Create a bound deployment in the WebClient deploy dialog (or `POST .../deployments`); to upgrade one, record it (`app deployment list|get`), pin it if it is `latest` (`app deployment set --mode pinned`), publish, then `processstack app deployment upgrade --id <app-id> --deployment <id>` and restore its mode. Surfaces that read the active version (the MCP surface, the chat) switch at publish; the schedule and connection-event registrations follow the deployment's version. Keep exactly one enabled deployment.
 5. **Import:**
    - each user runs `import-legacy-watches` (or it happens lazily on first internal-channel chat);
    - enrollments: fire `nightly-reconcile` once with trigger run-now, `POST /v1/{tenant}/triggers/run/{triggerId}` (needs `triggers:write`). It runs as `act=application`, and its legacy import step imports the `enrolled/*` rows.
 6. **Agents:** `processstack api-key create --name sextant-agents --app sextant`, then point clients at `POST /v1/{tenant}/mcp/sextant`.
-7. **Rollback:** `processstack app rollback sextant 1.0.1` (publishes 1.0.1's content as a new, auto-bumped version), then `processstack app activate sextant`. The dual-write keeps v1's stores current.
+7. **Rollback:** `processstack app rollback sextant 1.0.1` (publishes 1.0.1's content as a new, auto-bumped version and makes it active), then `processstack app deployment upgrade --id <app-id> --deployment <id>` (rollback moves no deployment). Never `app version rollback` (elevenworks/ProcessStack#3306: a manifest-only version). The dual-write keeps v1's stores current. A later re-cutover needs a higher version, e.g. `app publish --version 2.0.2`.
+8. **Tenant trust (jonlipsky/sextant#210):** the chat's and the import's visibility gate is workspace-level: they check a repository with the workspace's GitHub connection, so every member of a workspace can watch, and read, what that connection can read.
 
 ## Implementation notes (SX-9, as built)
 
@@ -459,7 +459,7 @@ SX-11 adds `mcp.connectionTools`, the `import-legacy-watches` process, the lazy 
 - **The note is prepended to the reply to the command** (`compose-reply`, then a blank line). It is the process's `message` when `outcome` is not `ok` or anything was newly imported, skipped, failed or left; nothing is said when there was nothing to import or every entry was already held. A failed import is the note "I couldn't finish importing your earlier Sextant watches yet; I'll try again next time." with `_lastErrorType` logged; the command is still answered.
 - **Scenarios:** `lazy-legacy-import` (#11: two `PUT`s, the tombstone skipped, the reply starts with the note), `lazy-import-flag-set-skips` (no call with the flag set) and `lazy-import-failed-note`. `unwatch` and `unwatch-two-repositories` seed the flag, because they seed v1 entries.
 
-**Deploy (the README section above is corrected)**
-- **`processstack app activate` takes no `--version`** (CLI 1.1.1): it activates the published version. Bindings are set in the WebClient deploy dialog; the CLI sets none. Rollback is `processstack app rollback sextant 1.0.1`, which publishes 1.0.1's content as a new auto-bumped version, then `processstack app activate sextant`. `cutover-runbook.md` is corrected the same way.
-- **After a rollback and a re-activation, run `import-legacy-watches` again.** The flag survives the rollback, so watches added under v1 meanwhile are not imported lazily.
+**Deploy (the README section above is corrected; SX-12 corrected it again against the PS deployment code)**
+- **Never `processstack app activate sextant`.** v2's connection-event triggers make `github` a required dependency (PS `ConnectionDependencyEnumerator`), so `app activate` refuses (`DeploymentBindingRequiredException`); it only ever manages the empty-binding tenant-global deployment `app:{appId}`. The app runs through a bound deployment (the WebClient deploy dialog or `POST .../deployments`). An existing deployment is moved with `processstack app deployment upgrade --id <app-id> --deployment <id>`; a `latest`-mode one is pinned first (`app deployment set … --mode pinned`), because publish upgrades latest-mode deployments with their existing bindings. The MCP surface and the chat read the asset's active version, so they switch at publish; the schedule and connection-event registrations follow the deployment's version. `sextant-query`/`sextant-control` resolve by name when unbound (lazy binding). Rollback is `processstack app rollback sextant 1.0.1` then `app deployment upgrade`, never `app version rollback` (elevenworks/ProcessStack#3306). A re-cutover after a rollback publishes a higher version (e.g. `--version 2.0.2`). `cutover-runbook.md` G2c step 2 and its Rollback section are the source of truth.
+- **After a rollback and a re-cutover, run `import-legacy-watches` again.** The flag survives the rollback, so watches added under v1 meanwhile are not imported lazily.
 - **v2.1 cleanup also deletes the import's `sextant.app` keys** (listed above).

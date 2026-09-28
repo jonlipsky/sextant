@@ -24,13 +24,37 @@
 | SX-11 | APP-3 | `configure-watched-repos` chat (internal channels; Slack gated off in v2.0), `grant-watch`, `import-legacy-watches`, lazy import, memory dual-write + tombstones, their scenarios | M | SX-9; SX-6 contract; **PS-6 scenario stubs** (`seed.userMemory`, `principal`); **PS-7** (`idp`) | G2c |
 | SX-12 | SVC-16 | Docs: `docs/service.md` (new env, grants, assertion, retire, selectors), onboarding rewrite (drop the `_sextant` Mode A), `CLAUDE.md` rules (grants, assertion, host policy; fix the Host→.Mcp dependency drift at `CLAUDE.md:36-37`) | S | SX-1…SX-11 | G2c |
 | post-G3 | APP v2.1 | Drop the dual-write and reconcile's legacy enrollment import; clean up legacy keys through the app: App State `enrolled/*`, `sextant-service-url`, `sextant-control-token`, and per-user `sextant.watched-repos` memory via `DeleteMyMemory` | S | G3 (PS-11 deployed); **PS-13 `DeleteMyMemory`** | after G3 |
-| post-G3 | ops | `REQUIRE_REPOSITORY_SELECTION=true`; remove the legacy `QUERY_TOKEN` | config | G3 | after G3 |
+| post-G3 | ops | `REQUIRE_REPOSITORY_SELECTION=true`; retire the legacy `QUERY_TOKEN` by **replacing** it with a fresh value (or configuring a `READ_POLICY`), never by unsetting it: with no query token and no read policy the query plane is open to anonymous reads (`docs/service.md`, "After the cutover (G3), not before") | config | G3 | after G3 |
 
-> **Open: app repo location (decision pending with the human; needed before SX-9).** SX-9…SX-11 use `apps/processstack/sextant/` in this repo as the working path. The options are:
-> - **A. Keep the app in this public repo**, with a classic `read:packages` PAT secret.
-> - **B. Move the app to a private elevenworks repo** (e.g. `elevenworks/processstack-sextant`). Its `GITHUB_TOKEN` gets package access through "Manage Actions access", so no PAT is needed, and this repo stays ProcessStack-agnostic.
->
-> Under B, SX-9…SX-11 open in that repo instead, and SX-12 only links to it. The SVC units (SX-1…SX-8) are unaffected.
+## As-built status (2026-09-28)
+
+Every SX unit is merged on `main` except SX-12 (this docs unit). Two units were added during the work: SX-U (the MCP C# SDK upgrade to 2.2.0, the version ProcessStack's MCP connection uses) and SX-13 (the app's own activities, `app-activities.md`), and four hardening follow-ups came out of reviews (SX-5b, SX-6c, SX-6d, SX-7b).
+
+| SX | PR | Merge | What landed |
+|---|---|---|---|
+| SX-0 | #183 | `935e4571` | This spec |
+| SX-1 | #186 | `0462d33f` | SVC-5 URL/host policy at ensure intake |
+| SX-2 | #184 | `e05b548c` | SVC-1 selector always wired; fail-closed selection hook |
+| SX-3 | #185 | `620903b4` | SVC-8 MCP-client compatibility test |
+| SX-U | #187 | `4d9753f1` | MCP C# SDK 2.2.0 |
+| SX-4 | #188 | `dbd046e5` | SVC-2 reserved `repository`/`branch` tool args |
+| SX-5 | #190 | `29650a6e` | SVC-3 caller assertions and delegate tokens |
+| SX-5b | #192 | `03eceb6a` | The assertion's `dep` claim made optional |
+| SX-6 | #191 | `17212f6d` | SVC-4 grants (migration 024), visibility, `list_repositories` |
+| SX-6c | #197 | `bc1751cf` | `act=user` refused on retire and the operational control routes (#193) |
+| SX-6d | #202 | `8aee3c03` | User ensure bodies bounded; no implicit default for a user; startup refused without a control token (#198, #199) |
+| SX-7 | #195 | `8ae27f3a` | SVC-F grant-scoped federated `search_symbols` |
+| SX-7b | #200 | `aec5d4ac` | Per-call cost bounds for `search_symbols`, migration 025 (identity-neutral) (#196) |
+| SX-8 | #189 | `a6945d0b` | SVC-6+7 head CAS, `branch_update: none`, retire, resolve `commit_sha` |
+| SX-9 | #204 | `4704d89c` | App skeleton, chat, MCP processes, scenarios, CI |
+| SX-10 | #207 | `c2e79a4f` | Repository events, enrollment, nightly reconcile |
+| SX-11 | #208 | `33896e64` | MCP connection tools, legacy watch import, README |
+| SX-13 | #194 | `91abf693` | `Sextant.ProcessStack.Activities`, the app's activity bundle |
+| SX-12 | this PR | — | Docs (this unit) |
+
+Open follow-ups filed from the reviews include #209 (a user ensure with `branch_update: none` can index any reachable commit, fork-network commits included) and #210 (the legacy import's follow-ups, including the workspace-level visibility gate). The post-G3 rows above are not started.
+
+> **Resolved: the app lives in this public repo (option A).** SX-9…SX-11 and SX-13 landed at `apps/processstack/sextant/`. CI restores the CLI with the `PROCESSSTACK_PACKAGES_TOKEN` PAT once a human adds it; until then the app job emits a notice and skips (it still skips on `main` as of this writing, so `app validate`/`app test` have run only locally). The option considered instead was a private ProcessStack-org repo whose `GITHUB_TOKEN` gets package access through "Manage Actions access".
 
 ## Stacking and parallelism
 
@@ -78,9 +102,9 @@ flowchart LR
 
 | Action | When |
 |---|---|
-| Decide the app repo location: this public repo (option A) or a private elevenworks repo such as `elevenworks/processstack-sextant` (option B); see "Open: app repo location" above | Before SX-9 |
+| Decided: the app lives in this public repo (option A; see "Resolved" above) | Before SX-9 ✓ |
 | **First `cli-v*` release to the private elevenworks GitHub Packages feed (approved; cut by the orchestrator after PS-6 merges).** `ProcessStack.Cli` has not been published yet (the "Publish CLI Tool" workflow has 0 runs and there are no `cli-v*` tags), and it is never published to nuget.org | Before SX-9 CI (prerequisite, in addition to the packages token) |
-| Add repo secret `PROCESSSTACK_PACKAGES_TOKEN` (a classic PAT with `read:packages` on elevenworks; a repo outside the org cannot get Actions access to the private package) to `jonlipsky/sextant`. Under option B, grant the private repo "Manage Actions access" on the package instead | Before SX-9 CI is meaningful. The workflow skips with a notice until then |
+| Add repo secret `PROCESSSTACK_PACKAGES_TOKEN` (a classic PAT with `read:packages` on the package's org; a repo outside the org cannot get Actions access to the private package) to `jonlipsky/sextant`. **Still pending:** the app job on `main` skips with a notice | Before the app CI is meaningful. The workflow skips with a notice until then |
 | Pin the `ProcessStack.Cli` version that contains PS-8 (F3) + the PS-6 scenario stubs + PS-5 trigger validation | SX-9 |
 | Enable GitHub App webhook events **`push`, `delete`, `pull_request`** (aligned with the runbook) | Before G2c |
 | Set `SEXTANT_SERVICE_CALLER_APPS=sextant` and keep `CALLER_IDPS` at `processstack` in the G2b service env | G2b |
@@ -94,6 +118,6 @@ flowchart LR
 | Unit | Must pass |
 |---|---|
 | SX-1…SX-8 | `dotnet build Sextant.slnx`; `dotnet test Sextant.slnx --no-build`; `ArchitectureBoundaryTests`; the new tests listed per unit in `service-changes.md`; `RemoteToolAllowlistTests` updated for `list_repositories`/`search_symbols` |
-| SX-6 | Migration test: 023 → 024 upgrade on a copy of a fixture catalog; `LatestSchemaVersion == 24` |
+| SX-6 | Migration test: 023 → 024 upgrade on a copy of a fixture catalog; `LatestSchemaVersion == 24` (as built: 25 after SX-7b's identity-neutral migration 025; `SnapshotSchemaVersion` stays 24) |
 | SX-9…SX-11 | `processstack app validate` + `app test` green in `processstack-app.yml`; all scenarios in `app.md` |
-| G2b (ops) | The runbook's G2b verify: schema 24, 8 repos, the old gateway query OK, a signed test assertion OK, a tampered one → 401, a wrong-`app` one → 403 |
+| G2b (ops) | The runbook's G2b verify: DB schema 25 (identity schema 24), 8 repos, the old gateway query OK, a signed test assertion OK, a tampered one → 401, a wrong-`app` one → 403 |
