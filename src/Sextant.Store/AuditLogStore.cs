@@ -29,11 +29,13 @@ public static class AuditOutcome
     public const string Accepted = "accepted";
 
     /// <summary>
-    /// RESERVED vocabulary for a future out-of-band (non-writer-path) audit sink. An authorization refusal
-    /// would be recorded here WITHOUT confirming the target exists (criterion 1). It is deliberately NOT
-    /// emitted from the auth-middleware hot path today: a durable write per unauthenticated request would
-    /// drive the single writer into contention (a DoS amplifier), and the uniform-not-found denial already
-    /// prevents an unauthorized caller from learning anything. See docs/runbooks.md.
+    /// A request was refused. Emitted today ONLY for an AUTHENTICATED control-plane intake refusal: an ensure
+    /// whose repository URL the service's repository URL policy rejects (SVC-5, <c>ensure</c>/<c>denied</c>,
+    /// detail = the reason code; the refused URL is never stored). It is deliberately NOT emitted from the
+    /// auth-middleware hot path: a durable write per unauthenticated request would drive the single writer
+    /// into contention (a DoS amplifier), and the uniform-not-found denial already prevents an unauthorized
+    /// caller from learning anything. A read-authorization refusal would be recorded here WITHOUT confirming
+    /// the target exists (criterion 1) once an out-of-band audit sink exists. See docs/runbooks.md.
     /// </summary>
     public const string Denied = "denied";
 

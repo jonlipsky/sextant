@@ -178,7 +178,10 @@ regression; both are explicitly carried here so operators size the risk before h
   operator control-plane actions (ensure/contribute/retention/backup) and their outcomes. A durable row
   per *unauthenticated* request is deliberately **not** emitted from the auth-middleware hot path — it would
   drive the single writer into contention (a DoS amplifier), and the uniform-not-found denial (slice 1)
-  already prevents an unauthorized caller from learning anything. The `query`/`denied` vocabulary in
+  already prevents an unauthorized caller from learning anything. The one `denied` row written today is an
+  **authenticated** control-plane intake refusal: an ensure whose repository URL the repository URL policy
+  (SVC-5, see [service.md](service.md#repository-url-policy-svc-5)) refuses is audited `ensure`/`denied` with
+  the reason code as `detail` (never the URL). The `query`/`denied` vocabulary for read-plane decisions in
   migration 020 is reserved for a future **out-of-band** (non-writer-path) audit sink; that sink is a
   tracked follow-up, not shipped here.
 - **Cache-reuse vs cost attribution edge (tracked follow-up).** Cache-reuse metrics and cost suppression

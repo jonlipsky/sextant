@@ -242,6 +242,63 @@ public sealed class SnapshotService : IDisposable
     }
 
     /// <summary>
+    /// Records the durable <c>ensure</c>/<c>denied</c> audit row for an ensure the host refused at intake,
+    /// before any job row exists (SVC-5: <see cref="RepositoryUrlPolicy"/>). <paramref name="reason"/> is the
+    /// refusal code only: the submitted URL is NEVER stored (it is untrusted and may carry credentials), so the
+    /// row has no repository scope. Like the ensure audit, the write is a service-owned operation: it survives
+    /// the caller disconnecting (its <paramref name="cancellationToken"/> only bounds this wait) and is drained by
+    /// <see cref="Dispose"/>. The caller waits at most <see cref="ServiceOptions.DeniedAuditWait"/> for it, so a
+    /// refusal is never held behind a running production (which holds the single writer for its whole run); a
+    /// write still queued past that bound lands once the writer frees. Its gate wait is deliberately NOT tied to
+    /// the service lifetime: the caller may already have its 400, so shutdown must not drop the row (it lands
+    /// during the <see cref="Dispose"/> drain, and fails closed if the lease was abandoned). A refusal admitted
+    /// after shutdown began throws <see cref="OperationCanceledException"/> on the service lifetime (503).
+    /// </summary>
+    public async Task RecordEnsureDeniedAsync(
+        string reason, string? principal = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(reason);
+        Task<bool> write;
+        lock (_inFlightLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            ThrowIfStopping();
+            write = Task.Run(
+                () => WithWriteAsync(
+                    () =>
+                    {
+                        new AuditLogStore(_conn).Append(
+                            AuditAction.Ensure, AuditOutcome.Denied,
+                            actor: AuditLogStore.HashActor(principal),
+                            detail: reason);
+                        return Task.FromResult(true);
+                    },
+                    CancellationToken.None),
+                CancellationToken.None);
+            _operations.Add(write);
+        }
+        _ = write.ContinueWith(
+            t =>
+            {
+                lock (_inFlightLock)
+                    _operations.Remove(t);
+                _ = t.Exception;
+            },
+            CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        try
+        {
+            await write.WaitAsync(_options.DeniedAuditWait, cancellationToken).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            // The writer is busy (a running production); the tracked write lands once it frees. If it finished
+            // after the timer fired, surface its real outcome instead of the timeout.
+            if (write.IsCompleted)
+                await write.ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
     /// Begins service shutdown (issue #148): cancels the service-owned production lifetime, so every in-flight
     /// worker run is cancelled and its job requeued (never recorded as a failure) and any later ensure fails
     /// fast. The host calls this on <c>ApplicationStopping</c>; <see cref="Dispose"/> calls it too. Idempotent.
