@@ -214,7 +214,7 @@ public class FederatedShadowingTests
         RepositoryRemoteUrl = RepoUrl,
         CommitSha = "commit_base",
         TreeSha = "tree_base",
-        SchemaVersion = IndexDatabase.LatestSchemaVersion,
+        SchemaVersion = IndexDatabase.SnapshotSchemaVersion,
         AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
         ConfigHash = "cfg",
         ToolchainFingerprint = "tc",

@@ -206,8 +206,29 @@ public sealed class IndexDatabase : IDisposable
             Recover();
     }
 
-    /// <summary>The highest migration version embedded in this build.</summary>
+    /// <summary>
+    /// The highest migration version embedded in this build: the DATABASE schema, which
+    /// <see cref="CheckReadiness"/> and catalog backups compare. It is not the version folded into a snapshot's
+    /// identity; that is <see cref="SnapshotSchemaVersion"/>.
+    /// </summary>
     public static int LatestSchemaVersion => LoadMigrations().Max(m => m.version);
+
+    /// <summary>
+    /// Migrations that only create or drop indexes (issue #196). They change no table or row and nothing the indexer
+    /// writes, so the snapshots a build produces are the same with or without them, and they do not advance
+    /// <see cref="SnapshotSchemaVersion"/>. Before 025 every migration advanced the snapshot schema (023 is an
+    /// index-only migration that did), and those identities are left as they are.
+    /// </summary>
+    public static IReadOnlySet<int> IdentityNeutralMigrations { get; } = new HashSet<int> { 25 };
+
+    /// <summary>
+    /// The schema version folded into a snapshot's identity (<c>SnapshotIdentity.SchemaVersion</c>) and compared by
+    /// snapshot reuse and read compatibility: the highest migration that is not in
+    /// <see cref="IdentityNeutralMigrations"/>. An index-only migration therefore advances
+    /// <see cref="LatestSchemaVersion"/> without changing any identity hash, so it never forces a re-index.
+    /// </summary>
+    public static int SnapshotSchemaVersion =>
+        LoadMigrations().Where(m => !IdentityNeutralMigrations.Contains(m.version)).Max(m => m.version);
 
     /// <summary>The schema version currently recorded in the database file (0 if none).</summary>
     public int CurrentSchemaVersion

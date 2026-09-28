@@ -119,7 +119,7 @@ public class ProviderGrowthImmutabilityTests
     {
         RepositoryRemoteUrl = $"repo-{repoId}",
         CommitSha = "pinned-provider-commit",
-        SchemaVersion = IndexDatabase.LatestSchemaVersion,
+        SchemaVersion = IndexDatabase.SnapshotSchemaVersion,
         AnalyzerVersion = "test-analyzer",
         ToolchainFingerprint = "test-toolchain"
     };

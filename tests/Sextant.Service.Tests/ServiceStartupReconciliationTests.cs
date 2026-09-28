@@ -173,7 +173,7 @@ public class ServiceStartupReconciliationTests
         {
             RepositoryRemoteUrl = repoUrl,
             CommitSha = commit,
-            SchemaVersion = IndexDatabase.LatestSchemaVersion,
+            SchemaVersion = IndexDatabase.SnapshotSchemaVersion,
             AnalyzerVersion = "test-analyzer",
             ToolchainFingerprint = "test-toolchain"
         };

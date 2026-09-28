@@ -486,6 +486,56 @@ public class SearchSymbolsHttpTests
     }
 
     [TestMethod]
+    public async Task AbortedRequest_InterruptsTheSearch_AndTheServiceKeepsServing()
+    {
+        // Issue #196: the request's cancellation reaches the search. A client that gives up while a snapshot page is
+        // being read interrupts that statement, so the call reads no further row and no further snapshot, and the
+        // service goes on serving searches from its pooled read connections.
+        await using var host = await Harness.StartAsync(seed: db =>
+        {
+            Publish(db, Gadgets, "commit-g1", 20);
+            Publish(db, Gizmos, "commit-z1", 20);
+        });
+        var assertion = host.UserAssertion();
+        await GrantSelfAsync(host, assertion, Gadgets);
+        await GrantSelfAsync(host, assertion, Gizmos);
+        var reads = RecordReads(host);
+        var rows = 0;
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sawCancellation = false;
+        var left = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        host.Service.SearchRowReadHook = (_, callToken) =>
+        {
+            if (Interlocked.Increment(ref rows) != 1)
+                return;
+            entered.TrySetResult();
+            // Holds the statement on its first row until the abort has reached the call's token. The hook only waits:
+            // what stops the statement once it moves on is the interrupt the cancellation raised.
+            sawCancellation = callToken.WaitHandle.WaitOne(TimeSpan.FromSeconds(30));
+            left.TrySetResult();
+        };
+        const string arguments = """{"name_prefix":"Type","limit":200}""";
+
+        using var abort = new CancellationTokenSource();
+        var call = host.SendAbortableRpcAsync(
+            "tools/call", $$"""{"name":"{{Tool}}","arguments":{{arguments}}}""", DelegateToken, assertion, abort.Token);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        await abort.CancelAsync();
+        await Assert.ThrowsAsync<OperationCanceledException>(() => call);
+        await left.Task.WaitAsync(TimeSpan.FromSeconds(60));
+
+        Assert.IsTrue(sawCancellation, "the aborted request cancelled the tool call's token");
+        // Were the search still running, it would read the other 39 rows within milliseconds.
+        Assert.IsFalse(SpinWait.SpinUntil(() => Volatile.Read(ref rows) > 1, TimeSpan.FromSeconds(1)),
+            $"the interrupted search went on reading ({Volatile.Read(ref rows)} rows)");
+        Assert.AreEqual(1, reads.Count, "no further snapshot was read");
+
+        host.Service.SearchRowReadHook = null;
+        var page = await SearchAsync(host, arguments, assertion);
+        Assert.AreEqual(40, page.GetProperty("symbols").GetArrayLength(), "the next search reads everything");
+    }
+
+    [TestMethod]
     public async Task SharedSnapshot_IsSearchedOnce()
     {
         await using var host = await Harness.StartAsync(seed: db =>

@@ -21,7 +21,10 @@ internal sealed record SymbolSearchQuery
     /// <summary>The symbol kind the search is narrowed to, or null for every kind.</summary>
     public SymbolKind? Kind { get; init; }
 
-    /// <summary>The most symbols read from each snapshot per call, 1..<see cref="MaxLimit"/>.</summary>
+    /// <summary>
+    /// The most symbols read from each snapshot per call, 1..<see cref="MaxLimit"/>. The call's total is also capped by
+    /// <see cref="ServiceOptions.SearchMaxHits"/>, which the snapshots a page reads share.
+    /// </summary>
     public int Limit { get; init; } = DefaultLimit;
 }
 

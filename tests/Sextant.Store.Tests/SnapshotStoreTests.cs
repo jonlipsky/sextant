@@ -645,7 +645,7 @@ public class SnapshotStoreTests
         RepositoryRemoteUrl = repo,
         CommitSha = commit,
         TreeSha = tree,
-        SchemaVersion = IndexDatabase.LatestSchemaVersion,
+        SchemaVersion = IndexDatabase.SnapshotSchemaVersion,
         AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
         ConfigHash = "cfg",
         ToolchainFingerprint = "tc"

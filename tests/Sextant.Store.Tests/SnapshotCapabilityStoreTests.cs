@@ -71,7 +71,7 @@ public class SnapshotCapabilityStoreTests
         RepositoryRemoteUrl = "https://github.com/org/repo",
         CommitSha = commit,
         TreeSha = $"tree_{commit}",
-        SchemaVersion = IndexDatabase.LatestSchemaVersion,
+        SchemaVersion = IndexDatabase.SnapshotSchemaVersion,
         AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
         ConfigHash = "cfg",
         ToolchainFingerprint = "tc"

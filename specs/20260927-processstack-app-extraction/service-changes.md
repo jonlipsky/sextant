@@ -504,7 +504,7 @@ Issue #198. A grant made a user caller's ensure body count in full, so a user co
 | `branch` | string? | Narrows to grants on that branch (ordinal; a `''` grant matches its resolved default branch name). **Absent = every granted branch** of each target, as in PS (`:406-414`) |
 | `name_prefix` | string? | **N, additive.** Case-insensitive prefix on `display_name` (PS had no text filter) |
 | `cursor` | string? | Opaque; a non-string is rejected |
-| `limit` | int? | Per snapshot; default 50, clamped to 1…200 |
+| `limit` | int? | Per snapshot; default 50, clamped to 1…200. Since SX-7b also within the per-call hit cap (`SEARCH_MAX_HITS`) |
 
 `additionalProperties: false`.
 
@@ -542,7 +542,7 @@ The contract above is implemented, with the differences below. The user docs are
 
 **Inputs (differs from the table).**
 - **`name_prefix` is required** (1-256 characters, trimmed). A required prefix keeps every call a filtered read, and a search without one is what `list_repositories` plus the per-repository tools already cover.
-- The prefix is a literal: `%`, `_` and `\` are escaped in the `LIKE` pattern. SQLite's `LIKE` folds ASCII letters only, so case-insensitivity is ASCII-only.
+- The prefix is a literal: `%`, `_` and `\` are escaped in the `LIKE` pattern. SQLite's `LIKE` folds ASCII letters only, so case-insensitivity is ASCII-only. Since SX-7b the page seeks the prefix's `NOCASE` key range, which folds exactly the same letters, and the `LIKE` stays as the exact residual.
 - **`kind` (N, additive):** an optional lowercase `SymbolKind` name, advertised as an `enum`.
 - The tool parses its raw arguments itself, so a wrong type, an unknown argument or an unknown `kind` is the tool error `invalid_arguments`. A `repository` the URL policy refuses is `invalid_selector`.
 - `limit` is clamped, never refused, and it is not bound to the cursor, so it may change between pages.
@@ -555,15 +555,15 @@ The contract above is implemented, with the differences below. The user docs are
 - Branches whose heads point at the same snapshot are searched once, and the rows are labeled with the first (repository key, branch) in order.
 
 **Algorithm (differs from step 4).**
-- The pages are read with one constant, parameterized SQL statement over `snapshot_projects` → `symbols` (`id > @after`, `display_name LIKE @pattern ESCAPE '\'`, an optional kind), not `LocalBaseSnapshotSource`, which has no name filter. No migration or index was added, so the prefix match is a scan of each snapshot's symbols.
-- Each snapshot reads `limit + 1` rows to decide whether it has more. A `SqliteException` for one snapshot makes it `unavailable`, and it keeps its position. The whole call is one read transaction.
+- The pages are read with one constant, parameterized SQL statement over `snapshot_projects` → `symbols`, not `LocalBaseSnapshotSource`, which has no name filter. As shipped in SX-7 it walked each snapshot in id order (`id > @after`, `display_name LIKE @pattern ESCAPE '\'`), a scan of the snapshot's symbols; SX-7b (below) replaced it with an index seek.
+- Each snapshot reads one row more than it may return to decide whether it has more. A `SqliteException` for one snapshot makes it `unavailable`, and it keeps its position. The whole call is one read transaction.
 - **`truncated` (N, additive):** the tracked targets not read on this call because of the width cap, plus the ones not tracked yet. A persistently unavailable snapshot keeps `next_cursor` non-null.
 - `SEARCH_MAX_WIDTH` (`SEXTANT_SERVICE_SEARCH_MAX_WIDTH`, default 50) is clamped to 100.
 - **Fairness (issue #176, point 2).** Up to 100 snapshots (`ServiceOptions.SearchMaxWidthCeiling`) are tracked at a time, in hash order. Each call reads at most `SEARCH_MAX_WIDTH` of them **round-robin in rounds**: a page reads, in hash order, only tracked snapshots after the cursor's rotation point `r` (the previous page's last read) and never wraps past the end, so the last page of a round can read fewer than the width. Once no tracked snapshot is after `r`, the next page starts a new round from the lowest hash. A not-yet-searched snapshot is admitted only while no tracked snapshot is waiting at or before `r` for the next round, so it joins at the tail of a round. It never jumps ahead of a long snapshot that is waiting. With V visible snapshots, each tracked one is read at least once every ⌈min(V, 100) / width⌉ pages (strictly, ⌈N / width⌉, where N is the tracked count on the last page before its read on which admission was allowed) (`DeferredSnapshot_IsSearchedWithinABoundedNumberOfPages`, and `LongSnapshot_IsNotStarvedByAdmissions_BeyondTheTrackedCapacity` with 151 visible snapshots). An `unavailable` snapshot keeps its position and is retried within the same bound, not necessarily on the next page. Beyond 100 visible snapshots, the rest wait for tracked ones to finish: a bounded cursor cannot carry a position for every one of an unbounded set. The cursor holds at most 100 positions, so it always fits in 16 KiB.
-- **Resolve fan-out (issue #176, point 1).** The gateway's concern was one HTTP resolve per target. In the service, resolution is in-process indexed lookups (the branch pointer and snapshot row per target, repository ids from a per-read dictionary) in the same read transaction, and the target count is bounded by `MAX_GRANTS_PER_PRINCIPAL` plus the tenant's `'*'` grants (at most `MAX_GRANTS_PER_TENANT`). Only the per-snapshot page scans are expensive, and those are bounded by the width. Resolution is not batched across pages, because the dedup by identity hash must see every target to guarantee no duplicates.
+- **Resolve fan-out (issue #176, point 1).** The gateway's concern was one HTTP resolve per target. In the service, resolution is in-process indexed lookups (the branch pointer and snapshot row per target, and since SX-7b the repository ids in one batched query over the caller's keys) in the same read transaction, and the target count is bounded by `MAX_GRANTS_PER_PRINCIPAL` plus the tenant's `'*'` grants (at most `MAX_GRANTS_PER_TENANT`). The per-snapshot pages are bounded by the width and, since SX-7b, by the call's hit budget. Resolution is not batched across pages, because the dedup by identity hash must see every target to guarantee no duplicates.
 
 **Cursor (differs from `{v, s, d}`).**
-- The cursor is `base64url(JSON {"v":1, "a":[[hash, afterId], ...], "w":watermark|null, "r":rotation|null, "b":digest})`.
+- The cursor is `base64url(JSON {"v":2, "a":[[hash, afterId], ...], "w":watermark|null, "r":rotation|null, "b":digest})` (`v` was 1 before SX-7b; see below).
   - `a` holds the snapshots still being paged.
   - `w` is the greatest identity hash admitted so far. Any visible hash after it has not been searched yet, which replaces the deferred list.
   - `r` is the last snapshot the page read, where the next page's round-robin starts. It is only a comparison point (at most `w`, and only with a `w`), so a forged value reads nothing.
@@ -577,6 +577,56 @@ The contract above is implemented, with the differences below. The user docs are
 - `next_cursor` is always present (null at the end). `project` is the project's canonical id.
 - `meta.index_freshness` is the newest `published_at` among the snapshots read on this call.
 - Every error, including `caller_required` and `no_visible_repositories`, is an `isError` tool result. `list_repositories`'s `caller_required` is not.
+
+### As implemented (SX-7b): bounded per-call cost (issue #196)
+
+A security review of SX-7 found no access-control issue, but it found four ways one authenticated call could do unbounded or O(total symbols) work. SX-7b bounds all four. The access rules above are unchanged: grants are re-read on every call, cursor positions are intersected with the fresh visible set before any SQL, an ungranted `repository` is byte-identical to an absent one, and a failed grants read is an `isError` failure.
+
+**Prefix index (migration `025_symbol_name_prefix_index`).**
+- The migration adds `ix_symbols_project_name_nocase ON symbols(project_id, display_name COLLATE NOCASE)`. The row id is the index's implicit last column, so the index orders by (project, folded name, id).
+- `NOCASE` folds ASCII letters only, exactly like `LIKE`. `NoCasePrefixRange` computes the prefix's key range in C#. `lo` is the prefix with its ASCII letters lower-cased, which is how `NOCASE` compares. `hi` is `lo` with its last code point replaced by the next one in `NOCASE` order, or null when no successor exists. The `LIKE` stays as the exact residual.
+- `SearchPageSql` forces its plan with `CROSS JOIN` and `INDEXED BY`: each of the snapshot's projects is one seek into `[lo, hi)`, stopping after the rows it may return. There is no scan of the snapshot and no sort. `SearchSymbolsCostTests` pins the plans with `EXPLAIN QUERY PLAN`, with and without `ANALYZE` statistics, asserting a `SEARCH` step and no `SCAN` or `TEMP B-TREE` for:
+  - the page query through `ix_symbols_project_name_nocase`, bounded and unbounded (`PageQuery_SeeksThePrefixRange_WithoutAScanOrASort`);
+  - the resume lookup by primary key (`ResumeQuery_IsAPointLookup`);
+  - the repository lookup (`RepositoryQuery_SeeksEachRange_WithoutReadingTheCatalog`).
+- **Traversal order.** A snapshot is now paged in index order, (project id, `NOCASE` name, id), instead of id order. The merge order of a page's output is unchanged: (name ordinal, identity hash, row id).
+- **Cursor v2.** A position's `afterId` is still the last row the snapshot returned (or, with a `kind`, examined). The page resumes after that row's (project, folded name, id), which `SearchResumeSql` looks up by primary key inside the snapshot. A forged `afterId` naming a row of another snapshot ends that snapshot's paging, and one naming a row outside the prefix's range restarts at the range's edge, so it still reads only rows of the visible snapshot. Because the traversal order changed, the cursor version is now `2` and a v1 cursor is `invalid_cursor`, so the client restarts the search.
+- **Identity.** An index changes no row, so migration `025` is **identity-neutral** and forces no re-index. `IndexDatabase.LatestSchemaVersion` (the readiness gate, which runs the migration) is 25. Every snapshot identity folds `IndexDatabase.SnapshotSchemaVersion` instead: the highest migration that is not in `IndexDatabase.IdentityNeutralMigrations` (= {25}), which is still 24. So the one full re-index at the schema-24 cutover stays the only one. `SymbolNamePrefixIndexMigrationTests` asserts:
+  - the indexes exist;
+  - an upgrade from 24 keeps `index_runs`;
+  - `SnapshotSchemaVersion` is 24;
+  - an identity-neutral migration only creates or drops indexes.
+  A service test asserts that the ensure identity folds 24.
+- **Upgrade cost.** `CREATE INDEX` over an existing `symbols` table runs once, at the first open after the upgrade.
+
+**Per-call hit cap.**
+- `SEARCH_MAX_HITS` (`SEXTANT_SERVICE_SEARCH_MAX_HITS`, `ServiceOptions.SearchMaxHits`) defaults to 500 and is clamped to 100…5000, like the width. `limit` stays per snapshot within that budget.
+- The snapshots of a page share the budget evenly, in turn order. Each gets `min(limit, remaining / snapshots left)`, and what one leaves unused carries to the next.
+- The floor (100) is at least the width ceiling (100), so every snapshot in a page's turn gets at least one row. The round-robin turns, the fairness bound and `truncated` are therefore exactly as above. A snapshot that returned fewer rows than it has keeps its position and resumes on its next turn, so paging to the end returns every hit once, with no gap (`SearchSymbolsCostTests`).
+- **`kind` examine bound.** A kind is filtered as rows are read, so a rare kind could otherwise walk every match of a broad prefix. With a `kind`, one call examines at most 8192 rows in all. The page's snapshots share them evenly, like the hit budget, so each examines at least ⌊8192 / width⌋ rows. A snapshot that runs out of its share resumes after the last row it examined, so a page can return fewer hits, or none, with a non-null `next_cursor` (`KindFilter_BoundsTheRowsExaminedPerCall_AcrossEverySnapshotItReads`).
+
+**Repository lookup.**
+- The caller's repository ids come from ONE query over the caller's own keys (`SearchRepositoriesSql`). It seeks each key's `NOCASE` range through `ix_repositories_remote_url_nocase` (also migration `025`), which also covers the key with the default `:443` port, and keeps a row only when its `RepositoryGrantKey` is exactly the key. So it no longer builds the whole-catalog map.
+- A spelling outside those ranges is not found, so its target reads as `pending` and never as another repository. Such a spelling has leading whitespace or a non-ASCII letter in another case, and the SVC-5 intake refuses both.
+- The branch pointer and snapshot row of each target are still point lookups. Their count is bounded by the grant limits, and they run in the same read transaction.
+- `list_repositories`, the grants list, `/control/status` and implicit selection still use the whole-catalog `GrantCatalogReader.RepositoryId` map. They are outside #196's scope.
+
+**Cancellation.**
+- `SearchSymbolsTool` passes the MCP request's `CancellationToken` to `SnapshotService.SearchSymbols`. The call checks it before resolving and before each snapshot, and the cancellable `ReadCatalog` overload registers `sqlite3_interrupt` on the read connection for the length of the call, so a statement that is running stops.
+- An interrupted statement surfaces as `OperationCanceledException`, never as an `unavailable` snapshot. The read transaction is committed only if it is still open (an interrupt can roll it back), and the connection is disposed as usual, so the next call reads normally (tests: a cancelled call reads no remaining snapshot; the next call returns every hit).
+- Over HTTP, the MCP SDK's stateless `/mcp` disposes the request's session when the client disconnects, which cancels the handler's token. `SearchSymbolsHttpTests` asserts that an aborted POST stops the running page.
+
+**Measured** (`SearchSymbolsPerformanceTests`, gated by `SEXTANT_RUN_PERF=1` and never run by CI; median ms per call, SX-7 → SX-7b):
+
+| Shape | SX-7 | SX-7b |
+|---|---|---|
+| 1 snapshot × 500k symbols, no match | 68 | 0.17 |
+| 1 × 500k, narrow prefix | 97 | 0.15 |
+| 1 × 500k, broad prefix, `limit` 50 | 75 | 0.20 |
+| 1 × 500k, broad prefix, `limit` 200 | 90 | 0.41 |
+| 1 × 500k, broad prefix, `kind` = delegate | 84 | 16 |
+| 20 snapshots × 25k, no match | 83 | 1.3 |
+| 20 × 25k, broad prefix, `limit` 200 | 87 | 4.1 (capped at 500 hits; was 4000) |
 
 ## SVC-6+7 (SX-8): branch-pointer semantics (R)
 

@@ -162,7 +162,7 @@ public class RetentionSnapshotGcTests
         {
             RepositoryRemoteUrl = $"repo-{repoId}",
             CommitSha = commit,
-            SchemaVersion = IndexDatabase.LatestSchemaVersion,
+            SchemaVersion = IndexDatabase.SnapshotSchemaVersion,
             AnalyzerVersion = "test-analyzer",
             ToolchainFingerprint = "test-toolchain"
         };

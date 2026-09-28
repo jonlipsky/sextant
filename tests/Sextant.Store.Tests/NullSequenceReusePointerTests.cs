@@ -189,7 +189,7 @@ public class NullSequenceReusePointerTests
         {
             RepositoryRemoteUrl = Repo,
             CommitSha = commit,
-            SchemaVersion = IndexDatabase.LatestSchemaVersion,
+            SchemaVersion = IndexDatabase.SnapshotSchemaVersion,
             AnalyzerVersion = analyzer,
             ToolchainFingerprint = "test-toolchain",
             WorkingTreeDelta = delta

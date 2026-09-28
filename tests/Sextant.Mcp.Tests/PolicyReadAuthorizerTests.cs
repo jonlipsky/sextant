@@ -34,7 +34,7 @@ public class PolicyReadAuthorizerTests
     private static SnapshotRow Row(long repoId) => new()
     {
         Id = 1, RepositoryId = repoId, IdentityHash = "h", Status = "complete", CreatedAt = 1,
-        SchemaVersion = IndexDatabase.LatestSchemaVersion, AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion
+        SchemaVersion = IndexDatabase.SnapshotSchemaVersion, AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion
     };
 
     // ==== decision logic (no database) =============================================================
@@ -314,7 +314,7 @@ public class PolicyReadAuthorizerTests
         var identity = new SnapshotIdentity
         {
             RepositoryRemoteUrl = url, CommitSha = "c1", TreeSha = "t1",
-            SchemaVersion = IndexDatabase.LatestSchemaVersion,
+            SchemaVersion = IndexDatabase.SnapshotSchemaVersion,
             AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
             ConfigHash = "cfg", ToolchainFingerprint = ToolchainFingerprint.Current
         };
@@ -372,7 +372,7 @@ public class PolicyReadAuthorizerTests
         RepositoryRemoteUrl = repoUrl,
         CommitSha = "c1",
         TreeSha = "t1",
-        SchemaVersion = IndexDatabase.LatestSchemaVersion,
+        SchemaVersion = IndexDatabase.SnapshotSchemaVersion,
         AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
         ConfigHash = "cfg",
         ToolchainFingerprint = ToolchainFingerprint.Current

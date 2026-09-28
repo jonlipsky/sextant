@@ -436,7 +436,7 @@ public sealed class CrossRepositoryUsageParityTests
         RepositoryRemoteUrl = url,
         CommitSha = commitSha,
         TreeSha = provider ? null : $"tree_{commitSha}",
-        SchemaVersion = IndexDatabase.LatestSchemaVersion,
+        SchemaVersion = IndexDatabase.SnapshotSchemaVersion,
         AnalyzerVersion = IndexConfigurationHash.AnalyzerVersion,
         ConfigHash = "cfg",
         ToolchainFingerprint = "tc",
