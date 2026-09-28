@@ -44,8 +44,8 @@ Ships SX-1…SX-8.
 
 ## G2c: the app
 1. **Register connections in tenant `<tenant>`.** Secrets are entered via the UI by the human, or piped from a host file by the operator's remote agent without printing.
-   - **`sextant-query`** (`type: mcp`, http): URL `http://<sextant-service-addr>/mcp`, a delegate token header, and `callerIdentity {mode: signed-header, audience: sextant, keyId: <kid>, signingKey: <same key>}`.
-   - **`sextant-control`** (`type: http-api`): baseUrl `http://<sextant-service-addr>`, bearer CONTROL token, plus the same `callerIdentity`, **with the same explicit `keyId`**. F4 defaults `keyId` to the connection instance id, so if you leave it unset the two connections end up with two different kids.
+   - **`sextant-query`** (`type: mcp`, http): URL `https://<sextant-service-addr>/mcp`, a delegate token header, and `callerIdentity {mode: signed-header, audience: sextant, keyId: <kid>, signingKey: <same key>}`.
+   - **`sextant-control`** (`type: http-api`): baseUrl `https://<sextant-service-addr>` (plain `http://` only on a private network: both connections carry a bearer token and a signed caller assertion), bearer CONTROL token, plus the same `callerIdentity`, **with the same explicit `keyId`**. F4 defaults `keyId` to the connection instance id, so if you leave it unset the two connections end up with two different kids.
    - **`github`:** the existing connection, unchanged. Its webhook must include **`push`, `delete` and `pull_request`**; `create` is not used by the app. Check this in the GitHub App settings; if any is missing, the human adds it.
 2. **Publish and activate v2.0.0 from the sextant repo:**
    - Commands: `processstack app validate|test|publish apps/processstack/sextant`, then bind the connections (github, sextant-query, sextant-control) in the WebClient deploy dialog (the CLI sets no bindings) and run `processstack app activate sextant`.

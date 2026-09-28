@@ -143,7 +143,7 @@ nodes:
          'imported', 'newlyImported', 'skipped', 'failed', 'remaining'].forEach(function (name) {
           context.setVariable(name, 0);
         });
-        ['hasLive', 'writeAttempts', 'accepted', 'complete'].forEach(function (name) {
+        ['hasLive', 'writeAttempts', 'accepted', 'retried', 'complete'].forEach(function (name) {
           context.setVariable(name, false);
         });
         ['facts', 'grantsJson', 'pending', 'putJson'].forEach(function (name) { context.setVariable(name, null); });
@@ -261,7 +261,9 @@ nodes:
 
   # The entry is marked before GitHub is asked: a failed check fails the whole run (a process has no error
   # route), and the mark lets the next run go past it. The previous entry's outcome is applied first: a
-  # grant clears its mark, and a refusal marks it unresolved.
+  # grant clears its mark, a refusal marks it unresolved, and a service failure takes this run's mark back
+  # (GitHub answered, so the attempt is not used up). The plan lists each entry once, so the mark went up
+  # by exactly 1 in this run.
   - id: next-entry
     type: activity:JavaScript
     inputs:
@@ -271,6 +273,10 @@ nodes:
         if (resolvedSlug !== '') {
           if (resolution === 'imported') delete marks[resolvedSlug];
           else if (resolution === 'final') marks[resolvedSlug] = Math.max(maxAttempts, marks[resolvedSlug] || 0);
+          else if (resolution === 'retry') {
+            if ((marks[resolvedSlug] || 0) > 1) marks[resolvedSlug] = marks[resolvedSlug] - 1;
+            else delete marks[resolvedSlug];
+          }
         }
         var entry = pending[index];
         var slug = String(entry.slug);
@@ -350,14 +356,18 @@ nodes:
     next: classify
 
   # 400 (the service refuses the repository or branch) and 409 (the watch limit) will not change by
-  # themselves, so the entry is marked unresolved; anything else (401/403, 5xx) is tried again next run.
+  # themselves, so the entry is marked unresolved; anything else (401/403, 5xx) uses no attempt and keeps
+  # the import incomplete, so the next run tries it again. A 200 for a grant that already existed says
+  # created: false, so it is imported but not new.
   - id: classify
     type: activity:JavaScript
     inputs:
       script: |
         if (putStatus == 200) {
           context.setVariable('imported', imported + 1);
-          context.setVariable('newlyImported', newlyImported + 1);
+          if (putJson != null && putJson.created === true) {
+            context.setVariable('newlyImported', newlyImported + 1);
+          }
           context.setVariable('resolution', 'imported');
         } else if (putStatus == 400) {
           context.setVariable('skipped', skipped + 1);
@@ -368,6 +378,7 @@ nodes:
         } else {
           context.setVariable('failed', failed + 1);
           context.setVariable('resolution', 'retry');
+          context.setVariable('retried', true);
         }
         context.setVariable('resolvedSlug', currentSlug);
         null;
@@ -383,7 +394,8 @@ nodes:
         null;
     next: import-loop
 
-  # Nothing is left to retry when every planned entry was checked and every remaining mark is unresolved.
+  # Nothing is left to retry when every planned entry was checked, the service refused or granted each
+  # one, and every remaining mark is unresolved.
   - id: finish-attempts
     type: activity:JavaScript
     inputs:
@@ -393,10 +405,14 @@ nodes:
         if (resolvedSlug !== '') {
           if (resolution === 'imported') delete marks[resolvedSlug];
           else if (resolution === 'final') marks[resolvedSlug] = Math.max(maxAttempts, marks[resolvedSlug] || 0);
+          else if (resolution === 'retry') {
+            if ((marks[resolvedSlug] || 0) > 1) marks[resolvedSlug] = marks[resolvedSlug] - 1;
+            else delete marks[resolvedSlug];
+          }
         }
         var text = JSON.stringify(marks);
         var retryable = Object.keys(marks).some(function (slug) { return marks[slug] < maxAttempts; });
-        context.setVariable('complete', remaining == 0 && !retryable);
+        context.setVariable('complete', remaining == 0 && !retryable && !retried);
         context.setVariable('writeAttempts', text !== lastWritten && !(text === '{}' && lastWritten === ''));
         context.setVariable('outcome', 'ok');
         text;
