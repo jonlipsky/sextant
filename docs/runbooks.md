@@ -127,7 +127,8 @@ highest migration file. A restored/older catalog is upgraded on next startup.
    back down (clears stale WAL/SHM sidecars first).
 3. **Re-provide credentials + authorization config.** The backup contains **no secrets**; re-export the
    environment variables the manifest's `credentials_boundary` lists (`SEXTANT_SERVICE_CONTROL_TOKEN`,
-   `…_QUERY_TOKEN`, `…_CONTRIBUTE_TOKEN`, `SEXTANT_SERVICE_READ_POLICY`, `SEXTANT_LLM_API_KEY`). The read
+   `…_QUERY_TOKEN`, `…_CONTRIBUTE_TOKEN`, `SEXTANT_SERVICE_READ_POLICY`, `SEXTANT_SERVICE_DELEGATE_TOKENS`,
+   `SEXTANT_SERVICE_CALLER_KEYS`, `SEXTANT_LLM_API_KEY`). The read
    policy is on the boundary deliberately: a restore that forgot it would start an **anonymously readable**
    service — restore must re-enforce slice-1 authz, so re-supply the policy alongside the tokens.
 4. Start the service. It runs migrations, recovers the WAL, reconciles orphaned jobs, and **re-enforces the
