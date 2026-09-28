@@ -44,15 +44,25 @@ internal static class ActivityValues
     public static bool IsAuthoredExpression(object? value) => Unwrap(value) switch
     {
         string text => text.StartsWith("= ", StringComparison.Ordinal)
-            || TemplatePattern.IsMatch(text)
+            || HasTemplate(text)
             || text.Contains("{{", StringComparison.Ordinal),
         IDictionary map => map.Values.Cast<object?>().Any(item => IsAuthoredExpression(Unwrap(item))),
         IEnumerable items => items.Cast<object?>().Any(item => IsAuthoredExpression(Unwrap(item))),
         _ => false,
     };
 
-    private static readonly System.Text.RegularExpressions.Regex TemplatePattern =
-        new(@"\$\{([^}]+)\}", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+    // A `${name}` template: "${", at least one character other than '}', then '}'.
+    private static bool HasTemplate(string text)
+    {
+        for (var start = text.IndexOf("${", StringComparison.Ordinal);
+             start >= 0;
+             start = text.IndexOf("${", start + 2, StringComparison.Ordinal))
+        {
+            if (text.IndexOf('}', start + 2) > start + 2)
+                return true;
+        }
+        return false;
+    }
 
     /// <summary>Unwraps a JSON wrapper into plain CLR values (string, long, double, bool, list, map, null).</summary>
     public static object? Unwrap(object? value) => value switch
