@@ -40,8 +40,11 @@ public sealed record CallerPrincipal
     /// <summary>The calling application (<c>app</c>).</summary>
     public required string App { get; init; }
 
-    /// <summary>The calling application's deployment (<c>dep</c>).</summary>
-    public required string Deployment { get; init; }
+    /// <summary>
+    /// The calling application's deployment (<c>dep</c>), recorded for audit only. Null when the assertion carries
+    /// none: the signer sends it only when the calling run is bound to a deployment.
+    /// </summary>
+    public string? Deployment { get; init; }
 
     /// <summary>The connection the request was sent through (<c>cid</c>).</summary>
     public required string Connection { get; init; }

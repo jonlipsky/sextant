@@ -1,5 +1,6 @@
 using System.Buffers.Text;
 using System.Security.Cryptography;
+using System.Text.Json;
 using Sextant.Service.CallerIdentity;
 using static Sextant.Service.Tests.CallerAssertionSigner;
 
@@ -586,7 +587,6 @@ public class CallerAssertionVerifierTests
     [DataRow("via", "web")]
     [DataRow("tslug", null)]
     [DataRow("app", null)]
-    [DataRow("dep", null)]
     [DataRow("cid", null)]
     [DataRow("cid", 5)]
     [DataRow("run", 5)]
@@ -597,6 +597,39 @@ public class CallerAssertionVerifierTests
             claims.Remove(claim);
         else
             claims[claim] = value;
+        AssertInvalid(Verify(Sign(KeyA, "kid-a", claims)), CallerAssertionReasons.BadClaims);
+    }
+
+    [TestMethod]
+    public void AbsentDeployment_Verifies_WithANullDeployment()
+    {
+        // The signer sends dep only when the calling run is bound to a deployment (amended 2026-09-28).
+        var user = UserClaims(Now);
+        user.Remove("dep");
+        var userResult = Verify(Sign(KeyA, "kid-a", user));
+        Assert.AreEqual(CallerAssertionOutcome.Verified, userResult.Outcome, userResult.Reason);
+        Assert.IsNull(userResult.Principal!.Deployment);
+        Assert.AreEqual("tenant-a/user-1", userResult.Principal.AuditPrincipal);
+
+        var application = ApplicationClaims(Now);
+        application.Remove("dep");
+        var applicationResult = Verify(Sign(KeyA, "kid-a", application));
+        Assert.AreEqual(CallerAssertionOutcome.Verified, applicationResult.Outcome, applicationResult.Reason);
+        Assert.IsNull(applicationResult.Principal!.Deployment);
+        Assert.AreEqual("tenant-a/app:sextant", applicationResult.Principal.AuditPrincipal);
+    }
+
+    [TestMethod]
+    [DataRow("null", DisplayName = "dep: null")]
+    [DataRow("1", DisplayName = "dep: 1")]
+    [DataRow("\"\"", DisplayName = "dep: empty string")]
+    [DataRow("true", DisplayName = "dep: true")]
+    [DataRow("[\"dep-1\"]", DisplayName = "dep: array")]
+    [DataRow("{\"id\":\"dep-1\"}", DisplayName = "dep: object")]
+    public void PresentDeployment_ThatIsNotANonEmptyString_IsRefused(string depJson)
+    {
+        var claims = UserClaims(Now);
+        claims["dep"] = JsonSerializer.Deserialize<JsonElement>(depJson);
         AssertInvalid(Verify(Sign(KeyA, "kid-a", claims)), CallerAssertionReasons.BadClaims);
     }
 
