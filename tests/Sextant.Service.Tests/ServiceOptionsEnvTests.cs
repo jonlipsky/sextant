@@ -377,4 +377,189 @@ public class ServiceOptionsEnvTests
             Environment.SetEnvironmentVariable(name, null);
         }
     }
+
+    // ==== SVC-3: delegate tokens and caller assertions ==============================================
+
+    private const string DelegateTokens = "SEXTANT_SERVICE_DELEGATE_TOKENS";
+    private const string CallerKeys = "SEXTANT_SERVICE_CALLER_KEYS";
+    private const string CallerAudience = "SEXTANT_SERVICE_CALLER_AUDIENCE";
+    private const string CallerIssuers = "SEXTANT_SERVICE_CALLER_ISSUERS";
+    private const string CallerHeader = "SEXTANT_SERVICE_CALLER_HEADER";
+    private const string CallerIdps = "SEXTANT_SERVICE_CALLER_IDPS";
+    private const string CallerApps = "SEXTANT_SERVICE_CALLER_APPS";
+    private const string QueryTokenVar = "SEXTANT_SERVICE_QUERY_TOKEN";
+    private const string ControlTokenVar = "SEXTANT_SERVICE_CONTROL_TOKEN";
+    private const string ContributeTokenVar = "SEXTANT_SERVICE_CONTRIBUTE_TOKEN";
+    private const string ReadPolicyVar = "SEXTANT_SERVICE_READ_POLICY";
+
+    private static readonly string[] CallerVariables =
+    [
+        DelegateTokens, CallerKeys, CallerAudience, CallerIssuers, CallerHeader, CallerIdps, CallerApps,
+        QueryTokenVar, ControlTokenVar, ContributeTokenVar, ReadPolicyVar
+    ];
+
+    private static T WithCallerEnv<T>(Dictionary<string, string?> values, Func<T> body)
+    {
+        foreach (var name in CallerVariables)
+            Environment.SetEnvironmentVariable(name, values.GetValueOrDefault(name));
+        try
+        {
+            return body();
+        }
+        finally
+        {
+            foreach (var name in CallerVariables)
+                Environment.SetEnvironmentVariable(name, null);
+        }
+    }
+
+    private static Dictionary<string, string?> ValidCallerEnv(byte[] key) => new()
+    {
+        [DelegateTokens] = "delegate-one; delegate-two",
+        [CallerKeys] = CallerAssertionSigner.KeySpec("kid-a", key, "tenant-a"),
+        [CallerAudience] = "sextant"
+    };
+
+    private static InvalidOperationException AssertStartupFails(Dictionary<string, string?> env) =>
+        WithCallerEnv(env, () => Assert.ThrowsExactly<InvalidOperationException>(() => ServiceOptions.FromEnvironment(Config())));
+
+    [TestMethod]
+    public void CallerIdentity_UnsetIsOff()
+    {
+        var options = WithCallerEnv([], () => ServiceOptions.FromEnvironment(Config()));
+        Assert.AreEqual(0, options.DelegateTokens.Count);
+        Assert.IsFalse(options.CallerAssertion.Enabled);
+        Assert.AreEqual("X-ProcessStack-Caller", options.CallerAssertion.Header);
+        CollectionAssert.AreEquivalent(new[] { "processstack" }, options.CallerAssertion.Idps.ToArray());
+        Assert.AreEqual(0, options.CallerAssertion.Apps.Count);
+        Assert.AreEqual(0, options.CallerAssertion.Issuers.Count);
+    }
+
+    [TestMethod]
+    public void CallerIdentity_BindsEveryVariable()
+    {
+        var key = CallerAssertionSigner.NewKey();
+        var env = ValidCallerEnv(key);
+        env[CallerKeys] += ";" + CallerAssertionSigner.KeySpec("kid-b", CallerAssertionSigner.NewKey(), "tenant-b");
+        env[CallerIssuers] = "https://platform.example.test, https://platform2.example.test";
+        env[CallerHeader] = "X-Caller-Assertion";
+        env[CallerIdps] = "processstack,slack";
+        env[CallerApps] = "sextant";
+        env[QueryTokenVar] = "query-secret";
+
+        var options = WithCallerEnv(env, () => ServiceOptions.FromEnvironment(Config()));
+
+        CollectionAssert.AreEqual(new[] { "delegate-one", "delegate-two" }, options.DelegateTokens.ToArray());
+        Assert.AreEqual(2, options.CallerAssertion.Keys.Count);
+        Assert.AreEqual("tenant-b", options.CallerAssertion.Keys.TenantOf("kid-b"));
+        Assert.AreEqual("sextant", options.CallerAssertion.Audience);
+        CollectionAssert.AreEquivalent(
+            new[] { "https://platform.example.test", "https://platform2.example.test" }, options.CallerAssertion.Issuers.ToArray());
+        Assert.AreEqual("X-Caller-Assertion", options.CallerAssertion.Header);
+        CollectionAssert.AreEquivalent(new[] { "processstack", "slack" }, options.CallerAssertion.Idps.ToArray());
+        CollectionAssert.AreEquivalent(new[] { "sextant" }, options.CallerAssertion.Apps.ToArray());
+    }
+
+    [TestMethod]
+    public void CallerIdentity_KeysWithoutDelegateTokens_AreAllowed()
+    {
+        // Keys alone let control calls carry an assertion (audit actor) with no delegate read path.
+        var env = ValidCallerEnv(CallerAssertionSigner.NewKey());
+        env.Remove(DelegateTokens);
+        var options = WithCallerEnv(env, () => ServiceOptions.FromEnvironment(Config()));
+        Assert.IsTrue(options.CallerAssertion.Enabled);
+        Assert.AreEqual(0, options.DelegateTokens.Count);
+    }
+
+    [TestMethod]
+    public void CallerIdentity_DelegateTokensWithoutKeys_FailStartup()
+    {
+        var env = ValidCallerEnv(CallerAssertionSigner.NewKey());
+        env.Remove(CallerKeys);
+        env.Remove(CallerAudience);
+        AssertStartupFails(env);
+    }
+
+    [TestMethod]
+    public void CallerIdentity_KeysWithoutAudience_FailStartup()
+    {
+        var env = ValidCallerEnv(CallerAssertionSigner.NewKey());
+        env.Remove(CallerAudience);
+        AssertStartupFails(env);
+        env[CallerAudience] = "  ";
+        AssertStartupFails(env);
+    }
+
+    [TestMethod]
+    public void CallerIdentity_ShortKey_FailsStartup_WithoutEchoingIt()
+    {
+        var shortKey = System.Buffers.Text.Base64Url.EncodeToString(CallerAssertionSigner.NewKey()[..31]);
+        var env = ValidCallerEnv(CallerAssertionSigner.NewKey());
+        env[CallerKeys] = $"kid-a={shortKey}@tenant-a";
+        var ex = AssertStartupFails(env);
+        Assert.IsFalse(ex.Message.Contains(shortKey, StringComparison.Ordinal), ex.Message);
+        StringAssert.Contains(ex.Message, "entry #1");
+    }
+
+    [TestMethod]
+    public void CallerIdentity_DuplicateKeyId_FailsStartup()
+    {
+        var env = ValidCallerEnv(CallerAssertionSigner.NewKey());
+        env[CallerKeys] += ";" + CallerAssertionSigner.KeySpec("kid-a", CallerAssertionSigner.NewKey(), "tenant-b");
+        AssertStartupFails(env);
+    }
+
+    [TestMethod]
+    [DataRow(CallerIdps, "processstack,Slack")]
+    [DataRow(CallerIdps, "processstack,sl ack")]
+    [DataRow(CallerIdps, " , ")]
+    [DataRow(CallerApps, "sextant,a b")]
+    [DataRow(CallerApps, ",")]
+    [DataRow(CallerIssuers, " , ")]
+    [DataRow(CallerHeader, "Authorization")]
+    [DataRow(CallerHeader, "X-Sextant-Repository")]
+    [DataRow(CallerHeader, "X Caller")]
+    [DataRow(DelegateTokens, " ; ")]
+    public void CallerIdentity_MalformedEntry_FailsStartup(string name, string value)
+    {
+        var env = ValidCallerEnv(CallerAssertionSigner.NewKey());
+        env[name] = value;
+        AssertStartupFails(env);
+    }
+
+    [TestMethod]
+    [DataRow(QueryTokenVar)]
+    [DataRow(ControlTokenVar)]
+    [DataRow(ContributeTokenVar)]
+    public void CallerIdentity_DelegateTokenEqualToAnotherToken_FailsStartup_WithoutEchoingIt(string other)
+    {
+        var env = ValidCallerEnv(CallerAssertionSigner.NewKey());
+        env[other] = "delegate-two";
+        var ex = AssertStartupFails(env);
+        Assert.IsFalse(ex.Message.Contains("delegate-two", StringComparison.Ordinal), ex.Message);
+        StringAssert.Contains(ex.Message, "entry #2");
+    }
+
+    [TestMethod]
+    public void CallerIdentity_DelegateTokenEqualToAReadPolicyPrincipal_FailsStartup()
+    {
+        var env = ValidCallerEnv(CallerAssertionSigner.NewKey());
+        env[ReadPolicyVar] = "delegate-one=https://github.com/acme/widgets";
+        AssertStartupFails(env);
+    }
+
+    [TestMethod]
+    public void CallerIdentity_ValidatedForDirectlyBuiltOptions()
+    {
+        var options = ServiceTestFixtures.NewOptions(ServiceTestFixtures.NewDbPath(), queryToken: "same") with
+        {
+            DelegateTokens = ["same"],
+            CallerAssertion = new Sextant.Service.CallerIdentity.CallerAssertionOptions
+            {
+                Keys = Sextant.Service.CallerIdentity.CallerKeyRing.Create([("kid-a", CallerAssertionSigner.NewKey(), "tenant-a")]),
+                Audience = "sextant"
+            }
+        };
+        Assert.ThrowsExactly<InvalidOperationException>(options.ValidateCallerIdentity);
+    }
 }

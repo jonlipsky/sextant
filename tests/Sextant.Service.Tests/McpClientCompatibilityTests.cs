@@ -25,6 +25,7 @@ public class McpClientCompatibilityTests
 {
     private const string ControlToken = "control-secret";
     private const string QueryToken = "query-secret";
+    private const string DelegateToken = "delegate-secret";
 
     /// <summary>Tools that must never be reachable remotely (they bypass or out-scope the read gate).</summary>
     private static readonly string[] LocalOnlyTools = ["get_source_context", "get_daemon_status", "get_base_snapshot_symbols"];
@@ -115,6 +116,44 @@ public class McpClientCompatibilityTests
             missText);
     }
 
+    /// <summary>
+    /// SVC-3: a pooled client holding a delegate token connects and lists tools with no caller assertion (one
+    /// connection serves many callers), and every <c>tools/call</c> then needs one. A client that sends a verified
+    /// assertion gets past the caller check, and its read is still denied until per-caller grants exist.
+    /// </summary>
+    [TestMethod]
+    [DataRow(null, DisplayName = "SDK default protocol (server/discover)")]
+    [DataRow("2025-06-18", DisplayName = "pinned older protocol (initialize)")]
+    public async Task SdkClient_DelegateToken_PoolConnectsWithoutCaller_AndCallsNeedOne(string? protocolVersion)
+    {
+        var key = CallerAssertionSigner.NewKey();
+        await using var host = await Harness.StartAsync(callerKey: key);
+
+        await using (var pooled = await McpClient.CreateAsync(
+            host.CreateTransport(DelegateToken), new McpClientOptions { ProtocolVersion = protocolVersion }))
+        {
+            Assert.IsNotNull(pooled.NegotiatedProtocolVersion, "a delegate client connects without a caller");
+            var listed = (await pooled.ListToolsAsync()).Select(t => t.Name).ToList();
+            CollectionAssert.Contains(listed, "find_symbol", "and lists tools without one");
+
+            var call = await pooled.CallToolAsync("find_symbol", new Dictionary<string, object?> { ["name"] = "global::App.Type0" });
+            var text = string.Concat(call.Content.OfType<TextContentBlock>().Select(c => c.Text));
+            Assert.IsTrue(call.IsError is true, text);
+            StringAssert.Contains(text, "\"caller_required\"");
+        }
+
+        var assertion = CallerAssertionSigner.Sign(key, "kid-a", CallerAssertionSigner.UserClaims(DateTimeOffset.UtcNow));
+        await using var caller = await McpClient.CreateAsync(
+            host.CreateTransport(DelegateToken, new Dictionary<string, string> { [Sextant.Service.CallerIdentity.CallerAssertionOptions.DefaultHeader] = assertion }),
+            new McpClientOptions { ProtocolVersion = protocolVersion });
+        var read = await caller.CallToolAsync(
+            "find_symbol", new Dictionary<string, object?> { ["name"] = "global::App.Type0", ["repository"] = "org/app" });
+        var readText = string.Concat(read.Content.OfType<TextContentBlock>().Select(c => c.Text));
+        Assert.IsFalse(readText.Contains("caller_required", StringComparison.Ordinal), readText);
+        Assert.AreEqual(0, System.Text.Json.JsonDocument.Parse(readText).RootElement.GetProperty("results").GetArrayLength(),
+            $"a delegate read is denied until grants exist: {readText}");
+    }
+
     /// <summary>The MCP tool names declared by the remote allowlist (<see cref="ServiceApp.RemoteQueryTools"/>).</summary>
     private static List<string> RemoteToolNames()
     {
@@ -139,7 +178,7 @@ public class McpClientCompatibilityTests
         /// <summary>The complete snapshot of the second repository, when one was published.</summary>
         public long? SecondRepositorySnapshot { get; private init; }
 
-        public static async Task<Harness> StartAsync(string? secondRepository = null)
+        public static async Task<Harness> StartAsync(string? secondRepository = null, byte[]? callerKey = null)
         {
             var dbPath = ServiceTestFixtures.NewDbPath();
             var db = new IndexDatabase(dbPath);
@@ -162,6 +201,18 @@ public class McpClientCompatibilityTests
             }
 
             var options = ServiceTestFixtures.NewOptions(dbPath, controlToken: ControlToken, queryToken: QueryToken);
+            if (callerKey is not null)
+            {
+                options = options with
+                {
+                    DelegateTokens = [DelegateToken],
+                    CallerAssertion = new Sextant.Service.CallerIdentity.CallerAssertionOptions
+                    {
+                        Keys = Sextant.Service.CallerIdentity.CallerKeyRing.Create([("kid-a", callerKey, "tenant-a")]),
+                        Audience = CallerAssertionSigner.Audience
+                    }
+                };
+            }
             var service = SnapshotService.Start(options, null, db);
 
             var builder = WebApplication.CreateBuilder();
@@ -183,11 +234,13 @@ public class McpClientCompatibilityTests
         /// A Streamable-HTTP client transport with a static bearer header, the shape a pooled MCP client uses.
         /// The mode is pinned so a 401 surfaces as-is instead of triggering an auto-detect fallback to SSE.
         /// </summary>
-        public HttpClientTransport CreateTransport(string? bearer)
+        public HttpClientTransport CreateTransport(string? bearer, IReadOnlyDictionary<string, string>? extraHeaders = null)
         {
             var headers = new Dictionary<string, string>();
             if (bearer is not null)
                 headers["Authorization"] = $"Bearer {bearer}";
+            foreach (var (name, value) in extraHeaders ?? new Dictionary<string, string>())
+                headers[name] = value;
 
             return new HttpClientTransport(new HttpClientTransportOptions
             {

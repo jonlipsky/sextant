@@ -1,6 +1,7 @@
 using Sextant.Core;
 using Sextant.Core.Platform;
 using Sextant.Indexer;
+using Sextant.Service.CallerIdentity;
 using Sextant.Service.Contributions;
 using Sextant.Service.Sandbox;
 
@@ -53,6 +54,58 @@ public sealed record ServiceOptions
     /// <see cref="ReadPolicy"/>: the selector is honored either way. <c>SEXTANT_SERVICE_REQUIRE_REPOSITORY_SELECTION</c>.
     /// </summary>
     public bool RequireRepositorySelection { get; init; }
+
+    /// <summary>
+    /// Delegate bearer tokens for the query plane (SVC-3): <c>SEXTANT_SERVICE_DELEGATE_TOKENS</c>, as <c>tok1;tok2</c>.
+    /// A delegate token grants nothing by itself. A <c>tools/call</c> or <c>/query/*</c> request made with one needs
+    /// a verified caller assertion, and what that caller may read is decided per caller (deny-all until grants
+    /// exist). Requires <see cref="CallerAssertion"/> keys, and must differ from every other configured token.
+    /// </summary>
+    public IReadOnlyList<string> DelegateTokens { get; init; } = [];
+
+    /// <summary>
+    /// How caller assertions are verified (SVC-3): the keys, audience, issuers, header, identity providers and
+    /// applications bound from <c>SEXTANT_SERVICE_CALLER_*</c>. Off (no keys) by default, in which case any request
+    /// that carries an assertion is refused.
+    /// </summary>
+    public CallerAssertionOptions CallerAssertion { get; init; } = CallerAssertionOptions.Disabled;
+
+    /// <summary>
+    /// Throws when the caller-identity settings are inconsistent (fail closed): invalid <see cref="CallerAssertion"/>
+    /// options, delegate tokens without caller keys, or a delegate token that is blank or equal to the control,
+    /// query or contribute token or to a read-policy principal's token. Messages never contain a token or key.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">The settings are invalid.</exception>
+    public void ValidateCallerIdentity()
+    {
+        CallerAssertion.Validate();
+        if (DelegateTokens.Count == 0)
+            return;
+        if (!CallerAssertion.Enabled)
+            throw new InvalidOperationException(
+                $"{EnvPrefix}DELEGATE_TOKENS requires {EnvPrefix}CALLER_KEYS: a delegate token is only usable with a " +
+                "verified caller assertion. Refusing to start with an unverifiable delegate token (fail closed).");
+
+        var others = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var token in new[] { ControlToken, QueryToken, ContributeToken })
+        {
+            if (!string.IsNullOrEmpty(token))
+                others.Add(token);
+        }
+        foreach (var principal in ReadPolicy.Principals)
+            others.Add(principal.Token);
+        for (var i = 0; i < DelegateTokens.Count; i++)
+        {
+            if (string.IsNullOrWhiteSpace(DelegateTokens[i]))
+                throw new InvalidOperationException(
+                    $"{EnvPrefix}DELEGATE_TOKENS entry #{i + 1} is blank. Refusing to start (fail closed).");
+            if (others.Contains(DelegateTokens[i]))
+                throw new InvalidOperationException(
+                    $"{EnvPrefix}DELEGATE_TOKENS entry #{i + 1} equals another configured token (the control, query or " +
+                    "contribute token, or a read-policy principal). A delegate token must be distinct so it can never " +
+                    "act as a legacy credential. Refusing to start (fail closed).");
+        }
+    }
 
     /// <summary>
     /// The network interface the HTTP surface binds to. Defaults to <c>localhost</c> (loopback only),
@@ -228,7 +281,7 @@ public sealed record ServiceOptions
         var dataRoot = Env("DATA_ROOT")
             ?? Path.Combine(Path.GetDirectoryName(Path.GetFullPath(dbPath)) is { Length: > 0 } dir ? dir : ".", "service");
 
-        return new ServiceOptions
+        var options = new ServiceOptions
         {
             CatalogDbPath = dbPath,
             Volumes = ServiceVolumes.Rooted(dataRoot,
@@ -241,6 +294,10 @@ public sealed record ServiceOptions
             ContributeToken = Env("CONTRIBUTE_TOKEN"),
             ReadPolicy = ReadAuthorizationPolicy.Parse(Env("READ_POLICY")),
             RequireRepositorySelection = EnvBool("REQUIRE_REPOSITORY_SELECTION") ?? false,
+            DelegateTokens = ParseDelegateTokens(Env("DELEGATE_TOKENS")),
+            CallerAssertion = ParseCallerAssertion(
+                Env("CALLER_KEYS"), Env("CALLER_AUDIENCE"), Env("CALLER_ISSUERS"), Env("CALLER_HEADER"),
+                Env("CALLER_IDPS"), Env("CALLER_APPS")),
             BindAddress = EnvHost("BIND_ADDRESS") ?? "localhost",
             ControlPort = EnvInt("CONTROL_PORT") ?? 3011,
             QueryPort = EnvInt("QUERY_PORT"),
@@ -291,6 +348,70 @@ public sealed record ServiceOptions
             },
             SdkPinOverride = EnvBool("SDK_PIN_OVERRIDE") ?? true
         };
+        options.ValidateCallerIdentity();
+        return options;
+    }
+
+    /// <summary>
+    /// Parses <c>SEXTANT_SERVICE_DELEGATE_TOKENS</c> (<c>tok1;tok2</c>; unset → none). A set variable that lists no
+    /// token THROWS (fail closed). The tokens are never echoed.
+    /// </summary>
+    internal static IReadOnlyList<string> ParseDelegateTokens(string? value)
+    {
+        if (value is null)
+            return [];
+        var tokens = value.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (tokens.Length == 0)
+            throw new InvalidOperationException(
+                $"Environment variable {EnvPrefix}DELEGATE_TOKENS is set but lists no tokens. Refusing to start (fail closed).");
+        return tokens.Distinct(StringComparer.Ordinal).ToList();
+    }
+
+    /// <summary>
+    /// Parses the <c>SEXTANT_SERVICE_CALLER_*</c> variables into <see cref="CallerAssertionOptions"/>. A malformed key
+    /// entry, identity provider or application THROWS, naming the entry by position only (fail closed); consistency
+    /// (for example the audience a key ring requires) is checked by <see cref="ValidateCallerIdentity"/>.
+    /// </summary>
+    internal static CallerAssertionOptions ParseCallerAssertion(
+        string? keys, string? audience, string? issuers, string? header, string? idps, string? apps)
+    {
+        CallerKeyRing ring;
+        try
+        {
+            ring = keys is null ? CallerKeyRing.Empty : CallerKeyRing.Parse(keys);
+        }
+        catch (FormatException ex)
+        {
+            throw new InvalidOperationException(
+                $"Environment variable {EnvPrefix}CALLER_KEYS is invalid: {ex.Message} Refusing to start (fail closed).", ex);
+        }
+
+        var defaults = CallerAssertionOptions.Disabled;
+        return new CallerAssertionOptions
+        {
+            Keys = ring,
+            Audience = audience?.Trim(),
+            Issuers = issuers is null ? defaults.Issuers : ParseCallerList(issuers, "CALLER_ISSUERS", _ => true, "a non-blank issuer"),
+            Header = header?.Trim() ?? CallerAssertionOptions.DefaultHeader,
+            Idps = idps is null ? defaults.Idps : ParseCallerList(idps, "CALLER_IDPS", CallerAssertionOptions.IsValidIdp, "[a-z0-9-]{1,32}"),
+            Apps = apps is null ? defaults.Apps : ParseCallerList(apps, "CALLER_APPS", CallerAssertionOptions.IsValidApp, "[A-Za-z0-9._-]{1,64}")
+        };
+    }
+
+    private static HashSet<string> ParseCallerList(string value, string name, Func<string, bool> isValid, string shape)
+    {
+        var entries = value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (entries.Length == 0)
+            throw new InvalidOperationException(
+                $"Environment variable {EnvPrefix}{name} is set but has no entries. Refusing to start (fail closed).");
+        for (var i = 0; i < entries.Length; i++)
+        {
+            if (!isValid(entries[i]))
+                throw new InvalidOperationException(
+                    $"Environment variable {EnvPrefix}{name} entry #{i + 1} is malformed (expected {shape}). " +
+                    "Refusing to start (fail closed).");
+        }
+        return entries.ToHashSet(StringComparer.Ordinal);
     }
 
     private static string? Env(string name) =>

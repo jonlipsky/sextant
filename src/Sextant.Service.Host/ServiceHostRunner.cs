@@ -37,6 +37,11 @@ public static class ServiceHostRunner
                 "WARNING: SEXTANT_SERVICE_REPOSITORY_HOSTS contains '*': /control/ensure accepts a repository on ANY " +
                 "public DNS host that passes the URL shape rules, including a name that resolves to an internal " +
                 "address. Prefer an explicit host allow-list.");
+        if (options.DelegateTokens.Count > 0 && string.IsNullOrEmpty(options.QueryToken) && !options.ReadPolicy.Enabled)
+            await Console.Error.WriteLineAsync(
+                "WARNING: SEXTANT_SERVICE_DELEGATE_TOKENS is set but the query plane is OPEN (no " +
+                "SEXTANT_SERVICE_QUERY_TOKEN and no SEXTANT_SERVICE_READ_POLICY): a request without a bearer still " +
+                "reads every repository. Set a query token or a read policy.");
 
         var paths = new ServicePaths(options.Volumes);
         var database = new IndexDatabase(options.CatalogDbPath, IndexWriteOptions.FromConfiguration(config));
