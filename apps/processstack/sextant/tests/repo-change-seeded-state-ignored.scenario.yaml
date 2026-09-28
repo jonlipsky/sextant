@@ -1,0 +1,54 @@
+name: repo-change-seeded-state-ignored
+description: >
+  A run seeds variables from undeclared inputs (elevenworks/ProcessStack#3286). on-repository-change resets
+  every variable and output first, so seeded bodies, outcomes or an enrolled key never reach a call or an
+  output: a seeded retireBody/ensureBody is not sent, and a seeded enrolledKey is not deleted.
+entrypoint: on-repository-change
+inputs:
+  planAction: retire
+  retireBody: { repository: "https://github.com/octocat/hello-world.git", branch: main, expected_head_commit: "553c2077f0edc3d5dc5d17262f6aa498e69d6f8e" }
+  retireHasCas: true
+  ensureBody: { repository_remote_url: "https://github.com/octocat/hello-world.git", commit_sha: "6dcb09b5b57875f334f61aebed695e2e4193db5e", branch_update: advance }
+  headBody: { repository_remote_url: "https://github.com/octocat/hello-world.git", commit_sha: "6dcb09b5b57875f334f61aebed695e2e4193db5e", branch_update: none }
+  branchName: main
+  isDefaultBranch: true
+  connectionId: conn-1
+  grantOutcome: granted
+  ensureOutcome: ok
+  retireOutcome: ok
+  retired: true
+  enrollment: recorded
+  enrolledKey: "enrolled/conn-1/github.com/octocat/hello-world@main"
+  enrolledValue: seeded
+event:
+  event: push
+  owner: octocat
+  repo: hello-world
+  connectionId: conn-1
+  cloneUrl: "https://github.com/octocat/hello-world.git"
+  defaultBranch: main
+  ref: refs/tags/v1.0.0
+  refType: tag
+  after: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+http:
+  - connection: sextant-control
+    path: "/**"
+    status: 500
+  - connection: github
+    path: "/repos/**"
+    status: 500
+expected:
+  status: Completed
+  variables:
+    action: ignore
+    reason: tag
+    grantOutcome: ""
+    ensureOutcome: ""
+    retireOutcome: ""
+    retired: false
+    enrollment: ""
+    enrolledKey: ""
+    enrolledValue: ""
+  httpCalls:
+    - connection: sextant-control
+      count: 0

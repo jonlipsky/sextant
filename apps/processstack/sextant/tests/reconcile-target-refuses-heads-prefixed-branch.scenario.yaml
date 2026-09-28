@@ -1,0 +1,26 @@
+name: reconcile-target-refuses-heads-prefixed-branch
+description: >
+  The service reports branch names without refs/heads/, so a target branch that still starts with it is
+  refused (invalid_branch) rather than stripped to another branch. Nothing is sent.
+entrypoint: reconcile-target
+inputs:
+  repository: "https://github.com/octocat/hello-world.git"
+  branch: refs/heads/main
+http:
+  - connection: sextant-control
+    path: "/**"
+    status: 500
+  - connection: github
+    path: "/repos/**"
+    status: 500
+expected:
+  status: Completed
+  variables:
+    result: skipped
+    reason: invalid_branch
+  httpCalls:
+    - connection: sextant-control
+      count: 0
+    - connection: github
+      path: "/repos/**"
+      count: 0

@@ -34,6 +34,7 @@ public sealed class SextantPlanRepositoryChangeActivity : AbstractActivity
     public const string ReasonHandledByPush = "handled_by_push";
     public const string ReasonPullRequestClosed = "pull_request_closed";
     public const string ReasonHeadRepositoryDeleted = "head_repository_deleted";
+    public const string ReasonForkHead = "fork_head";
     public const string ReasonInvalidSha = "invalid_sha";
 
     private const string KindPush = "push";
@@ -93,7 +94,7 @@ public sealed class SextantPlanRepositoryChangeActivity : AbstractActivity
     [ActivityInput("headRef", Description = "The pull request's head branch.")]
     public string? HeadRef { get; set; }
 
-    [ActivityInput("headCloneUrl", Description = "The pull request head repository's clone URL; empty when that repository was deleted.")]
+    [ActivityInput("headCloneUrl", Description = "The pull request head repository's clone URL; empty when that repository was deleted. A head in another repository (a fork) is not published (fork_head).")]
     public string? HeadCloneUrl { get; set; }
 
     [ActivityOutput("action", Description = "ensure | retire | ignore.")]
@@ -102,7 +103,7 @@ public sealed class SextantPlanRepositoryChangeActivity : AbstractActivity
     [ActivityOutput("ensureBody", Description = "The POST /control/ensure body when action is ensure (the first of ensureBodies); otherwise null.")]
     public Dictionary<string, object?>? EnsureBody { get; set; }
 
-    [ActivityOutput("ensureBodies", Description = "Every ensure body to send, in order (a pull request yields base then head).")]
+    [ActivityOutput("ensureBodies", Description = "Every ensure body to send, in order (a pull request yields base then head, the head only when it is in the base repository).")]
     public List<object?> EnsureBodies { get; set; } = [];
 
     [ActivityOutput("retireBody", Description = "The POST /control/branches/retire body when action is retire; otherwise null.")]
@@ -215,9 +216,14 @@ public sealed class SextantPlanRepositoryChangeActivity : AbstractActivity
 
         var bodies = new List<Dictionary<string, object?>>();
         var reason = AddPullRequestSide(bodies, Repository, change.BaseSha, change.BaseRef);
+        // A fork's head is code its author controls, and a trigger's ensure is the application's, which the
+        // service neither grant-checks nor bounds; indexing it would run that code on the index worker. So
+        // only a head in the base repository itself is published, under the base's spelling.
         var headReason = change.HeadCloneUrl.Length == 0
             ? ReasonHeadRepositoryDeleted
-            : AddPullRequestSide(bodies, change.HeadCloneUrl, change.HeadSha, change.HeadRef);
+            : HeadRepositoryProblem(change.HeadCloneUrl, Repository);
+        if (headReason.Length == 0)
+            headReason = AddPullRequestSide(bodies, Repository, change.HeadSha, change.HeadRef);
         if (headReason.Length > 0)
             reason = headReason;
 
@@ -230,6 +236,18 @@ public sealed class SextantPlanRepositoryChangeActivity : AbstractActivity
         EnsureBody = bodies[0];
         EnsureBodies = [.. bodies];
         Reason = reason;
+    }
+
+    // Why the head repository is not published, or "": its URL must pass the shape check and name the base
+    // repository (the same SVC-5 canonical key).
+    private static string HeadRepositoryProblem(string headCloneUrl, string repository)
+    {
+        var verdict = RepositoryUrlShape.Evaluate(headCloneUrl);
+        if (!verdict.Ok)
+            return verdict.Reason;
+        return string.Equals(verdict.Canonical, RepositoryReference.KeyFor(repository), StringComparison.Ordinal)
+            ? string.Empty
+            : ReasonForkHead;
     }
 
     // One side of a pull request, published with `branch_update: none` (no pointer moves); returns why the

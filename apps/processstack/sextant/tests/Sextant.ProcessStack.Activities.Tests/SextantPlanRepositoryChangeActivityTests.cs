@@ -33,7 +33,7 @@ public sealed class SextantPlanRepositoryChangeActivityTests
         BaseRef = "main",
         HeadSha = After,
         HeadRef = "feature/x",
-        HeadCloneUrl = Fork,
+        HeadCloneUrl = Repo,
     };
 
     private static EnsureSnapshotRequest AsEnsureRequest(object? body) =>
@@ -427,7 +427,7 @@ public sealed class SextantPlanRepositoryChangeActivityTests
         var baseSide = AsEnsureRequest(activity.EnsureBodies[0]);
         var headSide = AsEnsureRequest(activity.EnsureBodies[1]);
         Assert.AreEqual((Repo, Before, "main"), (baseSide.RepositoryRemoteUrl, baseSide.CommitSha, baseSide.BranchName));
-        Assert.AreEqual((Fork, After, "feature/x"), (headSide.RepositoryRemoteUrl, headSide.CommitSha, headSide.BranchName));
+        Assert.AreEqual((Repo, After, "feature/x"), (headSide.RepositoryRemoteUrl, headSide.CommitSha, headSide.BranchName));
         foreach (var request in new[] { baseSide, headSide })
         {
             Assert.AreEqual("none", request.BranchUpdate);
@@ -435,6 +435,49 @@ public sealed class SextantPlanRepositoryChangeActivityTests
             Assert.IsNull(request.IsDefaultBranch);
             Assert.IsNull(request.Forced);
         }
+    }
+
+    [TestMethod]
+    [DataRow("opened")]
+    [DataRow("synchronize")]
+    [DataRow("reopened")]
+    public async Task A_fork_pull_request_publishes_the_base_only(string action)
+    {
+        var activity = PullRequest(action);
+        activity.HeadCloneUrl = Fork;
+
+        await ActivityHarness.RunAsync(activity);
+
+        Assert.AreEqual("ensure", activity.Action);
+        Assert.AreEqual(SextantPlanRepositoryChangeActivity.ReasonForkHead, activity.Reason);
+        Assert.HasCount(1, activity.EnsureBodies);
+        var baseSide = AsEnsureRequest(activity.EnsureBody);
+        Assert.AreEqual((Repo, Before, "main"), (baseSide.RepositoryRemoteUrl, baseSide.CommitSha, baseSide.BranchName));
+    }
+
+    [TestMethod]
+    public async Task A_fork_on_another_host_is_not_published()
+    {
+        var activity = PullRequest();
+        activity.HeadCloneUrl = "https://gitlab.com/Octo/Repo.git";
+
+        await ActivityHarness.RunAsync(activity);
+
+        Assert.AreEqual(SextantPlanRepositoryChangeActivity.ReasonForkHead, activity.Reason);
+        Assert.HasCount(1, activity.EnsureBodies);
+    }
+
+    [TestMethod]
+    public async Task A_head_in_the_base_repository_spelled_differently_is_sent_under_the_base_spelling()
+    {
+        var activity = PullRequest();
+        activity.HeadCloneUrl = "https://github.com/Octo/Repo";
+
+        await ActivityHarness.RunAsync(activity);
+
+        Assert.AreEqual(string.Empty, activity.Reason);
+        Assert.HasCount(2, activity.EnsureBodies);
+        Assert.AreEqual(Repo, AsEnsureRequest(activity.EnsureBodies[1]).RepositoryRemoteUrl);
     }
 
     [TestMethod]
