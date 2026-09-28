@@ -23,8 +23,8 @@ It lives in two projects that depend on the core libraries — **never the rever
 > **ProcessStack is a client, through an app.** The ProcessStack integration is the `sextant` ProcessStack
 > app, which has moved to a separate private repository. Its chat and GitHub triggers drive the control
 > plane, and its MCP surface `/v1/{tenant}/mcp/sextant` forwards the service's query tools with each
-> caller's signed identity. The older ProcessStack-embedded `_sextant` gateway is being retired (deleted
-> from the platform at the cutover's G3 step).
+> caller's signed identity. The older ProcessStack-embedded `_sextant` gateway is being retired (removed
+> from the platform once the app has replaced it).
 > See [Production deployment checklist](#production-deployment-checklist-gateways)
 > before exposing the service to more than one user.
 
@@ -1502,10 +1502,9 @@ only #76 or a commit-reachability check closes.
   flow may run with inputs of the caller's choosing; the service's grant gate, the SX-6d user-ensure bounds and
   the URL policy stay the authority.
 
-### After the cutover (G3), not before
+### After the legacy `_sextant` gateway is retired, not before
 
-Once no client uses the legacy query token (the ProcessStack-embedded `_sextant` gateway, deleted at G3, was
-its only user):
+Once no client uses the legacy query token (the ProcessStack-embedded `_sextant` gateway was its only user):
 
 1. Set `REQUIRE_REPOSITORY_SELECTION=true`. A read without a verified caller must then name its repository.
    Delegate reads are unaffected: implicit selection still picks a caller's only visible repository.
