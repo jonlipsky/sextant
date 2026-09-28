@@ -1954,13 +1954,14 @@ public sealed partial class SnapshotService : IDisposable
         }
     }
 
-    // ReadCatalog that stops when `cancellationToken` is cancelled (issue #196). A cancellation interrupts the
+    // ReadCatalog that stops when `cancellationToken` is cancelled (issue #196). It is a separate name, not an overload,
+    // so the existing control-plane reads keep their deliberate no-cancellation contract. A cancellation interrupts the
     // statement in flight (sqlite3_interrupt; SqliteCommand.Cancel does nothing in Microsoft.Data.Sqlite), `read`
     // checks the token between its statements, and a statement failing while the token is cancelled surfaces as an
     // OperationCanceledException. The registration is disposed (which waits out a callback already running) before the
     // read transaction ends and the connection goes back to the pool, so a late cancellation can never interrupt the
     // COMMIT or a statement of the connection's next user.
-    private T ReadCatalog<T>(Func<SqliteConnection, T> read, CancellationToken cancellationToken)
+    private T ReadCatalogCancellable<T>(Func<SqliteConnection, T> read, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         using var conn = OpenReadConnection();
