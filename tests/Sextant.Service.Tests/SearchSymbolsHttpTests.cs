@@ -164,17 +164,26 @@ public class SearchSymbolsHttpTests
         var namingGadgets = SymbolSearchCursor.Encode(new SymbolSearchCursorState([new(GadgetsHash, 0)], GadgetsHash), binding);
         var namingNothing = SymbolSearchCursor.Encode(new SymbolSearchCursorState([new(absentHash, 0)], GadgetsHash), binding);
         var lowWatermark = SymbolSearchCursor.Encode(new SymbolSearchCursorState([], absentHash), binding);
+        // The rotation only orders the caller's own visible reads: naming Gadgets there is no different either, even with
+        // a visible position for it to be compared against.
+        var mark = string.CompareOrdinal(host.WidgetsHash, GadgetsHash) > 0 ? host.WidgetsHash : GadgetsHash;
+        var rotatedToGadgets = SymbolSearchCursor.Encode(new SymbolSearchCursorState([new(host.WidgetsHash, 0)], mark, GadgetsHash), binding);
+        var rotatedToNothing = SymbolSearchCursor.Encode(new SymbolSearchCursorState([new(host.WidgetsHash, 0)], mark, absentHash), binding);
 
         var forged = await SearchAsync(host, WithCursor(TypePrefix, namingGadgets), host.UserAssertion());
         var nothing = await SearchAsync(host, WithCursor(TypePrefix, namingNothing), host.UserAssertion());
         var low = await SearchAsync(host, WithCursor(TypePrefix, lowWatermark), host.UserAssertion());
+        var rotatedForged = await SearchAsync(host, WithCursor(TypePrefix, rotatedToGadgets), host.UserAssertion());
+        var rotatedNothing = await SearchAsync(host, WithCursor(TypePrefix, rotatedToNothing), host.UserAssertion());
 
-        foreach (var page in new[] { forged, nothing, low })
+        foreach (var page in new[] { forged, nothing, low, rotatedForged, rotatedNothing })
         {
             Assert.IsFalse(page.ToString().Contains("gadgets", StringComparison.Ordinal), page.ToString());
             Assert.IsFalse(page.ToString().Contains(GadgetsHash, StringComparison.Ordinal), page.ToString());
         }
         Assert.AreEqual(WithoutTimestamp(nothing), WithoutTimestamp(forged), "a forged hash is treated exactly like one that does not exist");
+        Assert.AreEqual(WithoutTimestamp(rotatedNothing), WithoutTimestamp(rotatedForged), "so is a forged rotation");
+        CollectionAssert.AreEqual(new[] { Widgets }, Repositories(rotatedForged), "the visible position is still searched");
         CollectionAssert.AreEqual(new[] { Widgets }, Repositories(low), "the visible snapshot is still searched");
         CollectionAssert.DoesNotContain(reads.ToList(), GadgetsHash, "the ungranted snapshot was never read");
     }
@@ -321,6 +330,96 @@ public class SearchSymbolsHttpTests
         Assert.AreEqual(3, hashes.Count(h => h == GadgetsHash));
         Assert.AreEqual(2, hashes.Count(h => h == GizmosHash));
         Assert.AreEqual(0, pages[^1].GetProperty("truncated").GetArrayLength());
+    }
+
+    [TestMethod]
+    public async Task DeferredSnapshot_IsSearchedWithinABoundedNumberOfPages()
+    {
+        // Issue #176 fairness: a long snapshot never keeps a deferred one waiting. With a width of one, three snapshots
+        // of three matches each take turns, one per page in hash order, instead of the first running to its end.
+        await using var host = await Harness.StartAsync(
+            configure: o => o with { SearchMaxWidth = 1 },
+            seed: db =>
+            {
+                AddSymbols(db, HashOf(Widgets, "commit-w1"), ("TypeW1", SymbolKind.Class), ("TypeW2", SymbolKind.Class));
+                Publish(db, Gadgets, "commit-g1", 3);
+                Publish(db, Gizmos, "commit-z1", 3);
+            });
+        var assertion = host.UserAssertion();
+        foreach (var repository in new[] { Widgets, Gadgets, Gizmos })
+            await GrantSelfAsync(host, assertion, repository);
+        var ordered = new[] { host.WidgetsHash, GadgetsHash, GizmosHash }.Order(StringComparer.Ordinal).ToList();
+        var reads = RecordReads(host);
+        const string arguments = """{"name_prefix":"Type","limit":1}""";
+
+        var turns = new List<string>();
+        var symbols = new List<string>();
+        // The two snapshots not read are deferred until the last round, when they finish one by one.
+        int[] waiting = [2, 2, 2, 2, 2, 2, 2, 1, 0];
+        string? cursor = null;
+        for (var page = 0; page < waiting.Length; page++)
+        {
+            reads.Clear();
+            var result = await SearchAsync(host, cursor is null ? arguments : WithCursor(arguments, cursor), assertion);
+            turns.Add(reads.Single());
+            symbols.AddRange(result.GetProperty("symbols").EnumerateArray().Select(s => s.GetProperty("identity_hash").GetString()!));
+            Assert.AreEqual(waiting[page], result.GetProperty("truncated").GetArrayLength(), $"page {page}");
+            cursor = result.GetProperty("next_cursor").GetString();
+        }
+
+        CollectionAssert.AreEqual(ordered.Concat(ordered).Concat(ordered).ToList(), turns, "each snapshot is read every third page");
+        Assert.IsNull(cursor, "nine single-symbol pages cover the three snapshots' nine matches");
+        CollectionAssert.AreEqual(turns, symbols, "every page returned the one symbol it read");
+    }
+
+    [TestMethod]
+    public async Task LongSnapshot_IsNotStarvedByAdmissions_BeyondTheTrackedCapacity()
+    {
+        // More visible snapshots than a cursor can track: snapshots admitted as tracked ones finish join at the tail of
+        // a round, so the long snapshot with the lowest hash is still read at least every ceil(100 / 50) pages.
+        const int others = 150;
+        const int extra = 20;
+        var repositories = Enumerable.Range(0, others).Select(i => $"https://github.com/acme/repo{i:D3}").ToList();
+        var hashes = repositories.Select((r, i) => HashOf(r, $"commit-{i}")).Append(HashOf(Widgets, "commit-w1")).ToList();
+        var longest = hashes.Min(StringComparer.Ordinal)!;
+        await using var host = await Harness.StartAsync(
+            configure: o => o with { SearchMaxWidth = 50 },
+            seed: db =>
+            {
+                for (var i = 0; i < others; i++)
+                    Publish(db, repositories[i], $"commit-{i}", 1);
+                AddSymbols(db, longest, Enumerable.Range(0, extra).Select(i => ($"TypeX{i:D2}", SymbolKind.Class)).ToArray());
+            });
+        var assertion = host.UserAssertion();
+        foreach (var repository in repositories.Append(Widgets))
+            await GrantSelfAsync(host, assertion, repository);
+        var reads = RecordReads(host);
+        const string arguments = """{"name_prefix":"Type","limit":1}""";
+
+        var longReads = new List<int>();
+        var symbols = new List<(string?, string?)>();
+        string? cursor = null;
+        for (var page = 0; page < 100; page++)
+        {
+            reads.Clear();
+            var result = await SearchAsync(host, cursor is null ? arguments : WithCursor(arguments, cursor), assertion);
+            Assert.IsTrue(reads.Count <= 50, $"page {page} read {reads.Count} snapshots");
+            if (reads.Contains(longest))
+                longReads.Add(page);
+            symbols.AddRange(result.GetProperty("symbols").EnumerateArray()
+                .Select(s => (s.GetProperty("identity_hash").GetString(), s.GetProperty("name").GetString())));
+            cursor = result.GetProperty("next_cursor").GetString();
+            if (cursor is null)
+                break;
+        }
+
+        Assert.IsNull(cursor, "the search terminated");
+        Assert.AreEqual(0, longReads[0], "the lowest hash is read on the first page");
+        Assert.AreEqual(extra + 1, longReads.Count, "the long snapshot is read once per match");
+        var widest = longReads.Zip(longReads.Skip(1), (a, b) => b - a).Max();
+        Assert.IsTrue(widest <= 2, $"the long snapshot waited {widest} pages between reads");
+        Assert.AreEqual(others + 1 + extra, symbols.Count, "every match is returned");
+        Assert.AreEqual(symbols.Count, symbols.Distinct().Count(), "no match is returned twice");
     }
 
     [TestMethod]

@@ -46,7 +46,7 @@ public class SymbolSearchCursorTests
         SymbolSearchCursor.Binding(caller ?? User(), prefix, kind, repository, branch);
 
     private static SymbolSearchCursorState State() =>
-        new([new SymbolSearchPosition(HashA, 12), new SymbolSearchPosition(HashB, 0)], HashC);
+        new([new SymbolSearchPosition(HashA, 12), new SymbolSearchPosition(HashB, 0)], HashC, HashA);
 
     [TestMethod]
     public void RoundTrip_UnderTheSameBinding()
@@ -55,6 +55,7 @@ public class SymbolSearchCursorTests
 
         Assert.IsTrue(SymbolSearchCursor.TryDecode(cursor, Binding(), 100, out var decoded));
         Assert.AreEqual(HashC, decoded!.Watermark);
+        Assert.AreEqual(HashA, decoded.Rotation);
         CollectionAssert.AreEqual(State().Active.ToList(), decoded.Active.ToList());
         Assert.IsTrue(cursor.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_'), "the cursor is unpadded base64url");
     }
@@ -66,6 +67,7 @@ public class SymbolSearchCursorTests
 
         Assert.IsTrue(SymbolSearchCursor.TryDecode(cursor, Binding(), 100, out var decoded));
         Assert.IsNull(decoded!.Watermark);
+        Assert.IsNull(decoded.Rotation);
         Assert.AreEqual(0, decoded.Active.Count);
     }
 
@@ -108,7 +110,8 @@ public class SymbolSearchCursorTests
                  {
                      json.Replace("12]", "13]", StringComparison.Ordinal),
                      json.Replace(HashB, new string('b', 63) + "0", StringComparison.Ordinal),
-                     json.Replace($"\"w\":\"{HashC}\"", $"\"w\":\"{new string('f', 64)}\"", StringComparison.Ordinal)
+                     json.Replace($"\"w\":\"{HashC}\"", $"\"w\":\"{new string('f', 64)}\"", StringComparison.Ordinal),
+                     json.Replace($"\"r\":\"{HashA}\"", $"\"r\":\"{HashB}\"", StringComparison.Ordinal)
                  })
         {
             Assert.AreNotEqual(json, tampered);
@@ -141,11 +144,11 @@ public class SymbolSearchCursorTests
     [TestMethod]
     public void MaximalCursor_FitsTheLengthBound()
     {
-        // The widest cursor the service can issue: one position per snapshot of the widest page, at the largest ids.
+        // The widest cursor the service can issue: every position it tracks, at the largest ids.
         var positions = Enumerable.Range(0, ServiceOptions.SearchMaxWidthCeiling)
             .Select(i => new SymbolSearchPosition(i.ToString("x64"), long.MaxValue))
             .ToList();
-        var cursor = SymbolSearchCursor.Encode(new SymbolSearchCursorState(positions, new string('f', 64)),
+        var cursor = SymbolSearchCursor.Encode(new SymbolSearchCursorState(positions, new string('f', 64), new string('e', 64)),
             Binding(prefix: new string('x', SearchSymbolsTool.MaxNamePrefixLength)));
 
         Assert.IsTrue(cursor.Length <= SymbolSearchCursor.MaxLength, $"{cursor.Length} characters");
@@ -157,31 +160,37 @@ public class SymbolSearchCursorTests
         // Each reshaped state carries a digest that is valid for it, so only the shape checks refuse it.
         foreach (var json in new[]
                  {
-                     Signed($$"""{"v":2,"a":[],"w":null}""", new SymbolSearchCursorState([], null)),
-                     Signed($$"""{"v":1,"a":[["{{HashA}}",1]],"w":null}""", new SymbolSearchCursorState([new(HashA, 1)], null)),
-                     Signed($$"""{"v":1,"a":[["{{HashB}}",1],["{{HashA}}",1]],"w":"{{HashC}}"}""",
+                     Signed($$"""{"v":2,"a":[],"w":null,"r":null}""", new SymbolSearchCursorState([], null)),
+                     Signed($$"""{"v":1,"a":[["{{HashA}}",1]],"w":null,"r":null}""", new SymbolSearchCursorState([new(HashA, 1)], null)),
+                     Signed($$"""{"v":1,"a":[["{{HashB}}",1],["{{HashA}}",1]],"w":"{{HashC}}","r":null}""",
                          new SymbolSearchCursorState([new(HashB, 1), new(HashA, 1)], HashC)),
-                     Signed($$"""{"v":1,"a":[["{{HashA}}",1],["{{HashA}}",2]],"w":"{{HashC}}"}""",
+                     Signed($$"""{"v":1,"a":[["{{HashA}}",1],["{{HashA}}",2]],"w":"{{HashC}}","r":null}""",
                          new SymbolSearchCursorState([new(HashA, 1), new(HashA, 2)], HashC)),
-                     Signed($$"""{"v":1,"a":[["{{HashC}}",1]],"w":"{{HashA}}"}""",
+                     Signed($$"""{"v":1,"a":[["{{HashC}}",1]],"w":"{{HashA}}","r":null}""",
                          new SymbolSearchCursorState([new(HashC, 1)], HashA)),
-                     Signed($$"""{"v":1,"a":[["{{HashA}}",-1]],"w":"{{HashC}}"}""",
+                     Signed($$"""{"v":1,"a":[["{{HashA}}",-1]],"w":"{{HashC}}","r":null}""",
                          new SymbolSearchCursorState([new(HashA, -1)], HashC)),
-                     Signed($$"""{"v":1,"a":[["{{HashA.ToUpperInvariant()}}",1]],"w":"{{HashC}}"}""",
+                     Signed($$"""{"v":1,"a":[["{{HashA.ToUpperInvariant()}}",1]],"w":"{{HashC}}","r":null}""",
                          new SymbolSearchCursorState([new(HashA.ToUpperInvariant(), 1)], HashC)),
-                     Signed($$"""{"v":1,"a":[],"w":null,"x":1}""", new SymbolSearchCursorState([], null)),
-                     Signed($$"""{"v":1,"a":[],"w":null,"w":null}""", new SymbolSearchCursorState([], null)),
-                     Signed($$"""{"v":1,"a":[["{{HashA}}"]],"w":"{{HashC}}"}""", new SymbolSearchCursorState([], HashC)),
-                     Signed($$"""{"v":1,"a":[["{{HashA}}","1"]],"w":"{{HashC}}"}""", new SymbolSearchCursorState([new(HashA, 1)], HashC)),
-                     Signed($$"""{"v":1,"a":{},"w":null}""", new SymbolSearchCursorState([], null)),
-                     Signed($$"""{"v":1,"a":[],"w":"short"}""", new SymbolSearchCursorState([], "short"))
+                     Signed($$"""{"v":1,"a":[],"w":null,"r":null,"x":1}""", new SymbolSearchCursorState([], null)),
+                     Signed($$"""{"v":1,"a":[],"w":null,"w":null,"r":null}""", new SymbolSearchCursorState([], null)),
+                     Signed($$"""{"v":1,"a":[["{{HashA}}"]],"w":"{{HashC}}","r":null}""", new SymbolSearchCursorState([], HashC)),
+                     Signed($$"""{"v":1,"a":[["{{HashA}}","1"]],"w":"{{HashC}}","r":null}""", new SymbolSearchCursorState([new(HashA, 1)], HashC)),
+                     Signed($$"""{"v":1,"a":{},"w":null,"r":null}""", new SymbolSearchCursorState([], null)),
+                     Signed($$"""{"v":1,"a":[],"w":"short","r":null}""", new SymbolSearchCursorState([], "short")),
+                     // The rotation: required, a hash, and never after the watermark.
+                     Signed($$"""{"v":1,"a":[],"w":"{{HashC}}"}""", new SymbolSearchCursorState([], HashC)),
+                     Signed($$"""{"v":1,"a":[],"w":"{{HashC}}","r":"short"}""", new SymbolSearchCursorState([], HashC, "short")),
+                     Signed($$"""{"v":1,"a":[],"w":"{{HashB}}","r":"{{HashC}}"}""", new SymbolSearchCursorState([], HashB, HashC)),
+                     Signed($$"""{"v":1,"a":[],"w":null,"r":"{{HashA}}"}""", new SymbolSearchCursorState([], null, HashA))
                  })
         {
             Assert.IsFalse(SymbolSearchCursor.TryDecode(Encode(json), Binding(), 100, out _), json);
         }
 
         // The well-formed control case is accepted, so the refusals above are about shape, not the digest.
-        var valid = Signed($$"""{"v":1,"a":[["{{HashA}}",1]],"w":"{{HashC}}"}""", new SymbolSearchCursorState([new(HashA, 1)], HashC));
+        var valid = Signed($$"""{"v":1,"a":[["{{HashA}}",1]],"w":"{{HashC}}","r":"{{HashC}}"}""",
+            new SymbolSearchCursorState([new(HashA, 1)], HashC, HashC));
         Assert.IsTrue(SymbolSearchCursor.TryDecode(Encode(valid), Binding(), 100, out _), valid);
     }
 

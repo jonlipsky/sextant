@@ -11,14 +11,17 @@ internal sealed record SymbolSearchPosition(string IdentityHash, long AfterId);
 
 /// <summary>
 /// The resume state a <c>search_symbols</c> cursor carries (SVC-F): the snapshots still being paged, each with its
-/// position, ordered by identity hash, and the watermark, the greatest identity hash ever admitted. A visible
-/// snapshot whose hash sorts after the watermark has not been searched yet.
+/// position, ordered by identity hash; the watermark, the greatest identity hash ever admitted (a visible snapshot
+/// whose hash sorts after it has not been searched yet); and the rotation, the last snapshot read by the previous
+/// page, which the next page's round-robin starts after.
 /// </summary>
-internal sealed record SymbolSearchCursorState(IReadOnlyList<SymbolSearchPosition> Active, string? Watermark);
+internal sealed record SymbolSearchCursorState(
+    IReadOnlyList<SymbolSearchPosition> Active, string? Watermark, string? Rotation = null);
 
 /// <summary>
 /// Encodes and validates the opaque <c>search_symbols</c> cursor (SVC-F): base64url of the JSON
-/// <c>{"v":1,"a":[[hash,afterId],...],"w":hash|null,"b":digest}</c>, at most <see cref="MaxLength"/> characters.
+/// <c>{"v":1,"a":[[hash,afterId],...],"w":hash|null,"r":hash|null,"b":digest}</c>, at most <see cref="MaxLength"/>
+/// characters.
 /// <para>
 /// <c>b</c> is an unkeyed SHA-256 digest over the cursor's contents and its binding (see <see cref="Binding"/>): the
 /// tenant, the caller and the query. It detects a tampered cursor and a cursor replayed by another caller, another
@@ -75,6 +78,10 @@ internal static class SymbolSearchCursor
                 writer.WriteNull("w");
             else
                 writer.WriteString("w", state.Watermark);
+            if (state.Rotation is null)
+                writer.WriteNull("r");
+            else
+                writer.WriteString("r", state.Rotation);
             writer.WriteString("b", Digest(state, binding));
             writer.WriteEndObject();
         }
@@ -84,8 +91,8 @@ internal static class SymbolSearchCursor
     /// <summary>
     /// Decodes a cursor issued for <paramref name="binding"/>. False (<c>invalid_cursor</c>) when it is empty or too
     /// long, is not base64url JSON of the expected shape, has another version, holds more than
-    /// <paramref name="maxEntries"/> positions, malformed or unordered hashes or negative positions, or was issued for
-    /// another binding or altered.
+    /// <paramref name="maxEntries"/> positions, malformed or unordered hashes, negative positions or a position or
+    /// rotation after the watermark, or was issued for another binding or altered.
     /// </summary>
     public static bool TryDecode(string cursor, string binding, int maxEntries, out SymbolSearchCursorState? state)
     {
@@ -132,6 +139,7 @@ internal static class SymbolSearchCursor
         JsonElement? version = null;
         JsonElement? active = null;
         JsonElement? watermark = null;
+        JsonElement? rotation = null;
         JsonElement? binding = null;
         foreach (var property in root.EnumerateObject())
         {
@@ -140,6 +148,7 @@ internal static class SymbolSearchCursor
                 case "v" when version is null: version = property.Value; break;
                 case "a" when active is null: active = property.Value; break;
                 case "w" when watermark is null: watermark = property.Value; break;
+                case "r" when rotation is null: rotation = property.Value; break;
                 case "b" when binding is null: binding = property.Value; break;
                 default: return false;
             }
@@ -148,7 +157,10 @@ internal static class SymbolSearchCursor
             return false;
         if (binding is not { ValueKind: JsonValueKind.String } b || b.GetString() is not { Length: > 0 } digestValue)
             return false;
-        if (!TryReadWatermark(watermark, out var mark))
+        if (!TryReadHashOrNull(watermark, out var mark) || !TryReadHashOrNull(rotation, out var turn))
+            return false;
+        // The rotation is a snapshot already admitted, so it is at or before the watermark.
+        if (turn is not null && (mark is null || string.CompareOrdinal(turn, mark) > 0))
             return false;
         if (active is not { ValueKind: JsonValueKind.Array } entries || entries.GetArrayLength() > maxEntries)
             return false;
@@ -166,19 +178,20 @@ internal static class SymbolSearchCursor
             positions.Add(position);
         }
 
-        state = new SymbolSearchCursorState(positions, mark);
+        state = new SymbolSearchCursorState(positions, mark, turn);
         digest = digestValue;
         return true;
     }
 
-    private static bool TryReadWatermark(JsonElement? watermark, out string? mark)
+    // A required member that is null or an identity hash.
+    private static bool TryReadHashOrNull(JsonElement? member, out string? hash)
     {
-        mark = null;
-        if (watermark is { ValueKind: JsonValueKind.Null })
+        hash = null;
+        if (member is { ValueKind: JsonValueKind.Null })
             return true;
-        if (watermark is not { ValueKind: JsonValueKind.String } w || !IsIdentityHash(w.GetString()))
+        if (member is not { ValueKind: JsonValueKind.String } value || !IsIdentityHash(value.GetString()))
             return false;
-        mark = w.GetString();
+        hash = value.GetString();
         return true;
     }
 
@@ -202,7 +215,8 @@ internal static class SymbolSearchCursor
     private static string Digest(SymbolSearchCursorState state, string binding)
     {
         var canonical = new StringBuilder();
-        canonical.Append(binding).Append("|v=").Append(Version).Append(";w=").Append(state.Watermark).Append(";a=");
+        canonical.Append(binding).Append("|v=").Append(Version).Append(";w=").Append(state.Watermark)
+            .Append(";r=").Append(state.Rotation).Append(";a=");
         foreach (var position in state.Active)
             canonical.Append(position.IdentityHash).Append(':').Append(position.AfterId).Append(',');
         return Base64Url.EncodeToString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical.ToString())));
