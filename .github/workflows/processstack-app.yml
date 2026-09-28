@@ -98,7 +98,7 @@ jobs:
         if: steps.feed.outputs.available == 'true'
         working-directory: apps/processstack
         run: |
-          dotnet tool install -g ProcessStack.Cli --version 1.1.0
+          dotnet tool install -g ProcessStack.Cli --version 1.1.1
           echo "${HOME}/.dotnet/tools" >> "${GITHUB_PATH}"
 
       # Both load the bundle published above (activities/sextant/, gitignored), so they run after it.

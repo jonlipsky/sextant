@@ -53,6 +53,9 @@ public sealed class SextantParseWatchCommandActivity : AbstractActivity
     [ActivityOutput("branch", Description = "The branch named with \"on\"/\"on branch\"; \"\" for the default branch.")]
     public string Branch { get; set; } = string.Empty;
 
+    [ActivityOutput("branchInvalid", Description = "True when the command named a branch (after \"on\") that is not a valid branch name. The flow must not act on the command: branch is then \"\", which would otherwise mean the default branch (watch) or every branch (unwatch).")]
+    public bool BranchInvalid { get; set; }
+
     [ActivityOutput("errors", Description = "Human-readable problems with the command; empty when it parsed cleanly.")]
     public List<string> Errors { get; set; } = [];
 
@@ -70,6 +73,7 @@ public sealed class SextantParseWatchCommandActivity : AbstractActivity
         Verb = VerbHelp;
         Repositories = [];
         Branch = string.Empty;
+        BranchInvalid = false;
         Errors = [];
 
         if (TryMatchPrefix(text, UnwatchPrefixes, out var rest))
@@ -92,9 +96,14 @@ public sealed class SextantParseWatchCommandActivity : AbstractActivity
         {
             var name = GitRefs.StripHeadsPrefix(StripDecoration(branch));
             if (GitRefs.IsValidBranchName(name))
+            {
                 Branch = name;
+            }
             else
+            {
+                BranchInvalid = true;
                 AddError(name.Length == 0 ? "Name the branch after \"on\"." : $"{Echo(name)} is not a valid branch name.");
+            }
         }
 
         var keys = new HashSet<string>(StringComparer.Ordinal);

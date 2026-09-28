@@ -1,0 +1,44 @@
+name: ensure-user-bounds-refused
+description: >
+  The service's SX-6d bounds on a user caller's ensure answer 400 with a reason code (here
+  branch_guard_required, which the app never provokes because every advance carries the compare-and-swap).
+  The ensure process reports it as the outcome "rejected" with that code, and never retries.
+entrypoint: ensure
+principal:
+  userId: u-alice
+inputs:
+  repositoryRemoteUrl: "https://github.com/octocat/hello-world.git"
+  commitSha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+  branchName: main
+  branchUpdate: advance
+  expectedHeadCommit: ""
+# Shape: 400 {"status":"rejected","reason":<code>} (EnsureSnapshotRequest.UserCallerBranchProblem, SX-6d #198:
+# default_branch_not_allowed | branch_head_sequence_not_allowed | branch_guard_required | branch_required).
+http:
+  - connection: sextant-control
+    method: POST
+    path: /control/ensure
+    status: 400
+    body: { status: rejected, reason: branch_guard_required }
+expected:
+  status: Completed
+  variables:
+    outcome: rejected
+    reason: branch_guard_required
+    statusCode: 400
+    jobId: ""
+  httpCalls:
+    - connection: sextant-control
+      method: POST
+      path: /control/ensure
+      caller: { act: user, idp: processstack, sub: u-alice }
+      bodyMatch:
+        repository_remote_url: "https://github.com/octocat/hello-world.git"
+        commit_sha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+        branch_name: main
+        branch_update: advance
+        expected_head_commit: ""
+        default_branch: null
+        branch_head_sequence: null
+        forced: null
+      count: 1

@@ -1,0 +1,32 @@
+name: watch-github-unavailable
+description: >
+  A GitHub failure that says nothing about visibility (here a 502, which Octokit raises as ApiException) is
+  reported as "try again later", not as the repository being invisible, and no grant is written.
+entrypoint: grant-watch
+principal:
+  userId: u-alice
+inputs:
+  host: github.com
+  owner: octocat
+  repo: hello-world
+http:
+  - connection: github
+    method: GET
+    path: /repos/octocat/hello-world
+    status: 502
+    body: { message: "Server Error" }
+  - connection: sextant-control
+    path: "/**"
+    status: 500
+expected:
+  status: Completed
+  variables:
+    granted: false
+    message: "I could not check octocat/hello-world with GitHub right now, so it is not watched yet. Try again later."
+  httpCalls:
+    - connection: github
+      method: GET
+      path: /repos/octocat/hello-world
+      count: 1
+    - connection: sextant-control
+      count: 0

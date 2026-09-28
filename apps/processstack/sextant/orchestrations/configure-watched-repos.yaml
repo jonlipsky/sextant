@@ -36,6 +36,9 @@ variables:
   - name: branch
     type: string
     default: ""
+  - name: branchInvalid
+    type: bool
+    default: false
   - name: errors
     type: json
   - name: perRepo
@@ -92,13 +95,16 @@ nodes:
       verb: verb
       repositories: repositories
       branch: branch
+      branchInvalid: branchInvalid
       errors: errors
     next: route
 
+  # A rejected branch leaves branch "", which would mean the default branch (watch) or every branch
+  # (unwatch), so the whole command is refused rather than run on another branch than the one named.
   - id: route
     type: decision
     next:
-      - when: "(verb == 'watch' || verb == 'unwatch') && (repositories == null || repositories.length == 0)"
+      - when: "(verb == 'watch' || verb == 'unwatch') && (branchInvalid || repositories == null || repositories.length == 0)"
         next: reply-errors
       - when: "verb == 'watch'"
         next: watch-each
@@ -167,6 +173,9 @@ nodes:
         var lines = (errors || []).map(function (e) { return String(e); });
         if (lines.length === 0) {
           lines.push('Name a repository, for example "watch owner/repo on main".');
+        }
+        if (branchInvalid) {
+          lines.push('Nothing was changed.');
         }
         lines.join('\n');
     outputs:

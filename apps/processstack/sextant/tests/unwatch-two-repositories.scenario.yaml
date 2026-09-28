@@ -17,6 +17,8 @@ seed:
   userMemory:
     - key: "sextant.watched-repos:github.com/octocat/spoon-knife@main"
       value: '{"owner":"octocat","repo":"spoon-knife","branch":"main","cloneUrl":"https://github.com/octocat/spoon-knife.git","addedAt":"2026-01-01T00:00:00+00:00"}'
+# Neither DELETE removes a grant. spoon-knife's watch exists only in the v1 memory (never imported): branch=*
+# answered 200, so the service holds nothing for it and its v1 entry is tombstoned, which ends the watch.
 http:
   - connection: sextant-control
     method: DELETE

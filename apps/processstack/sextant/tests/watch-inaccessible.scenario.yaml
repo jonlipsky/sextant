@@ -1,6 +1,8 @@
 name: watch-inaccessible
 description: >
-  (#3) A repository the workspace's GitHub connection cannot see (404) is refused before any grant.
+  (#3) A repository the workspace's GitHub connection cannot see is refused before any grant: GitHub's 404
+  raises Octokit's NotFoundException, which is the "not visible" refusal (any other GitHub failure is "try
+  again later", see watch-github-unavailable).
 entrypoint: configure-watched-repos
 principal:
   userId: u-alice
@@ -26,5 +28,9 @@ expected:
   variables:
     agentResponse: "octocat/hello-world isn't visible to this workspace's GitHub connection, so I can't watch it."
   httpCalls:
+    - connection: github
+      method: GET
+      path: /repos/octocat/hello-world
+      count: 1
     - connection: sextant-control
       count: 0

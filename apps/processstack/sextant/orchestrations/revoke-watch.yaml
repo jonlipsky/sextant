@@ -2,8 +2,13 @@ name: revoke-watch
 description: >
   Stops watching one repository for the calling user (one iteration of the chat's unwatch command).
   DELETE /control/grants/self removes the caller's own grants (branch "*" when no branch was named, so every
-  watched branch of the repository goes), then the v1 watched-repos memory entries are tombstoned
-  (legacy-dual-write). Snapshots are left in place; retention reclaims them once nothing points at them.
+  watched branch of the repository goes). A default-branch watch is held with branch "" and the service
+  resolves its name, so with a named branch the caller's grant listing is read too, and a default-branch
+  grant that resolves to that name is removed as well. The v1 watched-repos memory entries are tombstoned
+  (legacy-dual-write) once the service is known to hold no watch on what was named, including a v1 entry
+  the service never had. They are kept when that is not known (the listing failed, or a default-branch
+  grant's branch is not resolved yet), so the v1 copy never drops a watch the service still holds.
+  Snapshots are left in place; retention reclaims them once nothing points at them.
   An orchestration so that a network failure routes to a reply instead of failing the chat turn.
 
 inputs:
@@ -38,6 +43,17 @@ variables:
   - name: deleted
     type: int
     default: 0
+  - name: listStatus
+    type: int
+    default: 0
+  - name: listJson
+    type: json
+  - name: defaultState
+    type: string
+    default: ""
+  - name: serviceClear
+    type: bool
+    default: false
   - name: tombstoned
     type: int
     default: 0
@@ -112,7 +128,141 @@ nodes:
       value: "= deleteJson != null && typeof deleteJson.deleted === 'number' ? deleteJson.deleted : 0"
     outputs:
       result: deleted
-    next: remove-memory
+    next: route-named
+
+  # "stop watching X on main" must also end a default-branch watch whose default branch is main: that grant
+  # has branch "", which a DELETE with branch=main does not match. Without a branch, branch=* answered 200,
+  # so the caller holds no grant for the repository at all.
+  - id: route-named
+    type: decision
+    next:
+      - when: "branch != ''"
+        next: list-own
+      - else: mark-clear
+
+  - id: list-own
+    name: GET /control/grants/self
+    type: activity:HttpRequest
+    inputs:
+      connectionId: sextant-control
+      method: GET
+      url: /control/grants/self
+      failOnErrorStatus: false
+    outputs:
+      statusCode: listStatus
+      json: listJson
+    next: route-list
+    on-error: route-list-failed
+
+  - id: route-list
+    type: decision
+    next:
+      - when: "listStatus == 200"
+        next: find-default
+      - else: route-list-failed
+
+  # Without the listing, a default-branch watch may remain, so the v1 entries are kept: report the named
+  # grant's removal if there was one, else that the service is unavailable.
+  - id: route-list-failed
+    type: decision
+    next:
+      - when: "deleted > 0"
+        next: reply
+      - else: refuse-unavailable
+
+  # match: a default-branch grant resolves to the named branch; unknown: one exists whose branch the service
+  # has not resolved yet (it may be the named one); none: no default-branch grant for the repository.
+  - id: find-default
+    type: activity:SetVariable
+    inputs:
+      value: >
+        = (function () {
+            function key(url) {
+              return String(url || '').trim().replace(/\/+$/, '').replace(/\.git$/i, '').toLowerCase();
+            }
+            var wanted = key(remoteUrl);
+            var state = 'none';
+            ((listJson && listJson.grants) || []).forEach(function (g) {
+              if (!g || g.branch !== '' || key(g.repository) !== wanted) return;
+              var resolved = g.status && typeof g.status.resolved_branch === 'string' ? g.status.resolved_branch : '';
+              if (resolved === branch) state = 'match';
+              else if (resolved === '' && state === 'none') state = 'unknown';
+            });
+            return state;
+          })()
+    outputs:
+      result: defaultState
+    next: route-default
+
+  - id: route-default
+    type: decision
+    next:
+      - when: "defaultState == 'match'"
+        next: delete-default
+      - when: "defaultState == 'none'"
+        next: mark-clear
+      - when: "deleted > 0"
+        next: reply
+      - else: reply-unresolved-default
+
+  - id: reply-unresolved-default
+    type: activity:SetVariable
+    inputs:
+      value: >
+        = 'You are watching the default branch of ' + owner + '/' + repo + ', which may be ' + branch
+          + '. To stop watching it, say "stop watching ' + owner + '/' + repo + '".'
+    outputs:
+      result: message
+    next: end
+
+  # No branch parameter: the service reads that as the default branch ("").
+  - id: delete-default
+    name: DELETE /control/grants/self (default branch)
+    type: activity:HttpRequest
+    inputs:
+      connectionId: sextant-control
+      method: DELETE
+      url: /control/grants/self
+      query:
+        repository: "= remoteUrl"
+      failOnErrorStatus: false
+    outputs:
+      statusCode: deleteStatus
+      json: deleteJson
+    next: route-delete-default
+    on-error: route-list-failed
+
+  - id: route-delete-default
+    type: decision
+    next:
+      - when: "deleteStatus == 200"
+        next: read-deleted-default
+      - else: route-list-failed
+
+  - id: read-deleted-default
+    type: activity:SetVariable
+    inputs:
+      value: "= deleted + (deleteJson != null && typeof deleteJson.deleted === 'number' ? deleteJson.deleted : 0)"
+    outputs:
+      result: deleted
+    next: mark-clear
+
+  - id: mark-clear
+    type: activity:SetVariable
+    inputs:
+      value: true
+    outputs:
+      result: serviceClear
+    next: route-memory
+
+  # The v1 copy mirrors the service: its entries are tombstoned only once the service holds no watch on
+  # what was named.
+  - id: route-memory
+    type: decision
+    next:
+      - when: "serviceClear"
+        next: remove-memory
+      - else: reply
 
   - id: remove-memory
     type: process:legacy-dual-write
@@ -139,7 +289,7 @@ nodes:
     type: activity:SetVariable
     inputs:
       value: >
-        = (deleted > 0 || tombstoned > 0)
+        = deleted > 0 || tombstoned > 0
           ? ('Stopped watching ' + owner + '/' + repo + (branch != '' ? (' on ' + branch) : '')
               + '. Existing snapshots are left in place.')
           : ('You were not watching ' + owner + '/' + repo + (branch != '' ? (' on ' + branch) : '') + '.')

@@ -1,0 +1,38 @@
+name: start-indexing-resolve-unavailable
+description: >
+  With a branch, the service's head is read first. When /control/resolve fails (503), start-indexing
+  refuses with outcome unavailable before GitHub is read or any ensure is sent.
+entrypoint: start-indexing
+principal:
+  userId: u-alice
+inputs:
+  repositoryRemoteUrl: "https://github.com/octocat/hello-world.git"
+  commitSha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+  branchName: main
+http:
+  - connection: sextant-control
+    method: GET
+    path: /control/resolve
+    status: 503
+    body: { status: unavailable }
+expected:
+  status: Completed
+  variables:
+    outcome: unavailable
+    reason: http_503
+    jobId: ""
+    advanceRequested: false
+    message: "The Sextant service could not read the branch head right now; try again later."
+  httpCalls:
+    - connection: sextant-control
+      method: GET
+      path: /control/resolve
+      caller: { act: user, idp: processstack, sub: u-alice }
+      count: 1
+    - method: POST
+      count: 0
+    # A path is needed: a sextant-control request carries no bound connection id, so under CLI 1.1.1 a bare
+    # `connection: github` criterion (a connection with no baseUrl) would match it too.
+    - connection: github
+      path: "/repos/**"
+      count: 0

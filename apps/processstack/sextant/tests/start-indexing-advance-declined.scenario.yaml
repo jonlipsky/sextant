@@ -1,0 +1,44 @@
+name: start-indexing-advance-declined
+description: >
+  start-indexing of the branch's head whose compare-and-swap no longer matches (a newer push won after the
+  resolve): the ensure attaches with branch_advanced false, and the reply says the branch was not moved.
+entrypoint: start-indexing
+principal:
+  userId: u-alice
+inputs:
+  repositoryRemoteUrl: "https://github.com/octocat/hello-world.git"
+  commitSha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+  branchName: main
+http:
+  # Shape: GitHub REST GET /repos/{owner}/{repo}/branches (read by GitHubListBranches through Octokit).
+  - connection: github
+    method: GET
+    path: /repos/octocat/hello-world/branches
+    body:
+      - name: main
+        commit: { sha: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d", url: "https://api.github.com/repos/octocat/hello-world/commits/7fd1a60b01f91b314f59955a4e4d4e80d8edf11d" }
+        protected: false
+  - connection: sextant-control
+    method: GET
+    path: /control/resolve
+    body:
+      id: 6
+      identity_hash: "8a0c"
+      status: complete
+      commit_sha: "553c2077f0edc3d5dc5d17262f6aa498e69d6f8e"
+      branch: main
+      is_default: true
+  # Shape: EnsureSnapshotResult (src/Sextant.Service/ServiceContracts.cs); a CAS mismatch only attaches.
+  - connection: sextant-control
+    method: POST
+    path: /control/ensure
+    status: 200
+    body: { job_id: 41, identity_hash: "9b1d", status: complete, snapshot_id: 7, attached: true, branch_advanced: false }
+expected:
+  status: Completed
+  variables:
+    outcome: attached
+    jobId: "41"
+    branchAdvanced: false
+    advanceRequested: true
+    message: "Indexing job 41 is complete. The main branch was not moved to it: it already points there, or its head changed meanwhile."

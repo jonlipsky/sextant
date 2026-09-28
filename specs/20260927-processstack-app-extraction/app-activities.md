@@ -34,7 +34,7 @@ All of them are pure computation: deterministic, no network, no secrets. Authent
 | `SextantPlanRepositoryChange` | the event metadata (`kind`: push/delete/pr, plus PS-5 keys) → `action` (`ensure`\|`retire`\|`ignore`), `ensureBody` (`commit_sha`, `branch_name`, `default_branch`, `expected_head_commit` with all-zeros → `""`, `branch_update`, `forced`), `retireBody`, `reason` | the `ensure` steps 1–2 and the `on-repository-change` decision chain; enforces **CAS mode only** (SX-8 note) |
 | `SextantInterpretEnsureResult` | `statusCode`, `body` → `outcome` (`ok`\|`attached`\|`rejected`\|`unavailable`\|`head_mismatch`\|`not_granted`), `jobId`, `snapshotId`, `branchAdvanced`, `retryAdvised` | the `ensure` step 3 decision table, including the SX-8 out-of-order convergence (`branch_advanced:false` → `retryAdvised`) |
 | `SextantPlanReconcile` | `githubBranches[]`, `serviceTargets[]` (from `?scope=tenant` / resolve), limits → `ensures[]`, `retires[]`, `truncated` | the reconcile diff JS |
-| `SextantParseWatchCommand` | `prompt` → `verb` (`watch`\|`unwatch`\|`list`\|`help`), `repositories[]` (normalized), `errors[]` | the `configure-watched-repos` parser |
+| `SextantParseWatchCommand` | `prompt` → `verb` (`watch`\|`unwatch`\|`list`\|`help`), `repositories[]` (normalized), `branch`, `branchInvalid`, `errors[]` | the `configure-watched-repos` parser |
 
 Names are unique to this app and do not collide with built-ins; PS-15 rejects any collision at publish.
 
@@ -147,6 +147,7 @@ SX-13 follows the service code where it differs from the table above. Each activ
   - A Slack link gives its URL, unless the URL is only `http://` or `https://` plus the label. Slack auto-links a typed `github.com/owner/repo` as `<http://github.com/owner/repo|github.com/owner/repo>`, so the label is what was typed.
   - `&amp;` (Slack's escaped `&`) separates repositories, like `&`, `,` and `and`.
 - **Branch:** the extra `branch` output comes from `on <branch>` or `on branch <branch>` (the last spaced `on`). `""` means the default branch.
+  - **`branchInvalid`** (added by SX-9) is true when the command named a branch that is not a valid name (`on bad..name`, `on HEAD`, a bare `on`). `branch` is then `""`, which reads as the default branch (watch) or every branch (unwatch), so the flow refuses the whole command on it.
 - **Errors** are human-readable and capped at 10.
   - An echoed reference is truncated to 64 characters.
   - A reference containing `@` is never echoed, since it may carry a credential.

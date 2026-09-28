@@ -39,3 +39,6 @@ expected:
         branch_head_sequence: null
         forced: null
       count: 1
+    - connection: github
+      path: "/repos/**"
+      count: 0
