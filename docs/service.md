@@ -61,7 +61,7 @@ of the box.
 | `SEXTANT_SERVICE_QUERY_TOKEN` | Bearer token for `/mcp` + `/query/*` | none (anonymous read) |
 | `SEXTANT_SERVICE_CONTRIBUTE_TOKEN` | Least-privilege token for `/control/contribute` only (issue #71); the control token remains a superset that also authorizes it | none (falls back to control token) |
 | `SEXTANT_SERVICE_READ_POLICY` | Enforced query-plane read-authorization policy (Phase 17) | disabled (open read) |
-| `SEXTANT_SERVICE_REQUIRE_REPOSITORY_SELECTION` | Require every `/mcp` read to name its repository in the `X-Sextant-Repository` header; a read without one fails with `repository_required` (see [Repository selection](#repository-selection-on-mcp)). A malformed value fails startup | `false` (a read with no header reads the unselected default) |
+| `SEXTANT_SERVICE_REQUIRE_REPOSITORY_SELECTION` | Require every `/mcp` read to name its repository, in the `repository` tool argument or the `X-Sextant-Repository` header; a read without one fails with `repository_required` (see [Repository selection](#repository-selection-on-mcp)). A malformed value fails startup | `false` (a read that names no repository reads the unselected default) |
 | `SEXTANT_SERVICE_BIND_ADDRESS` | Network interface the HTTP surface binds to | `localhost` |
 | `SEXTANT_SERVICE_CONTROL_PORT` | HTTP port | `3011` |
 | `SEXTANT_SERVICE_QUERY_PORT` | Optional dedicated query port (shares the control port when unset) | none (shared) |
@@ -651,20 +651,57 @@ for the whole duration of a long index.
 
 ### Repository selection on `/mcp`
 
-A catalog can hold several repositories. An `/mcp` read names the one it wants in the
-`X-Sextant-Repository` request header (its remote URL). The host always honors the header, whether or not
-a read policy is configured, and the read then pins that repository's default-branch snapshot:
+A catalog can hold several repositories. An `/mcp` read names the one it wants either per call, in the
+reserved `repository` tool argument, or per connection, in the `X-Sextant-Repository` request header (its
+remote URL). The host always honors both, whether or not a read policy is configured. The read then pins
+that repository's default-branch snapshot, or a named branch's snapshot when the call also sends the
+reserved `branch` argument:
 
 | Request | `REQUIRE_REPOSITORY_SELECTION=false` (default) | `REQUIRE_REPOSITORY_SELECTION=true` |
 | --- | --- | --- |
-| Header names an indexed repository | That repository's default-branch snapshot (subject to the read policy, when one is set) | Same |
-| Header names a repository with no complete default-branch snapshot | Nothing: an empty result under an open read, the uniform not-found under an enforced read policy. Never widened to other repositories | Same |
-| No header (or a blank one) | The unselected default: the only repository of a single-repository catalog, or **every** repository of a multi-repository catalog | `meta.error.code = repository_required`, with no results |
+| Names an indexed repository | That repository's default-branch snapshot (subject to the read policy, when one is set) | Same |
+| Names a repository and a `branch` | The complete snapshot that branch's pointer targets (branch names match exactly) | Same |
+| Names a repository (or branch) with no complete snapshot | Nothing: an empty result with an actionable message under an open read, the uniform not-found under an enforced read policy. Never widened to other repositories or branches | Same |
+| Names a `branch` but no repository | `meta.error.code = repository_required`, with no results | Same |
+| Names nothing (or only blank values) | The unselected default: the only repository of a single-repository catalog, or **every** repository of a multi-repository catalog | `meta.error.code = repository_required`, with no results |
 
 The `repository_required` error names no repository and depends only on the request, so it reveals nothing
-about what the catalog holds. The default keeps a caller that sends no header (for example a legacy gateway
-using the plain query token) working unchanged; turn the requirement on once every caller sends the header.
-The local stdio MCP server has no header and never requires one.
+about what the catalog holds. The default keeps a caller that names no repository (for example a legacy
+gateway using the plain query token) working unchanged; turn the requirement on once every caller selects
+one. The local stdio MCP server has no header, advertises no reserved arguments, and never requires a
+selection.
+
+#### Reserved tool arguments (SVC-2)
+
+A client that forwards tool arguments verbatim over one pooled connection with only static headers selects
+per call through two reserved arguments. The service adds them in MCP request filters on its stateless
+`/mcp` (`ToolSelectionFilters`); the tools themselves are unchanged.
+
+- **`tools/list`** advertises two optional string arguments, `repository` and `branch`, on every
+  repository-scoped remote tool (today every tool on the remote allowlist). A tool that already declares an
+  argument of the same name keeps its own: `find_cross_repository_usages` and `find_submodule_consumers`
+  keep their consumer-filter `branch`, so they get only `repository`.
+- **`tools/call`** removes the reserved arguments before the tool binds its own, so a tool never sees them.
+  `repository` accepts `https://{host}/{owner}/{repo}[.git]`, `{host}/{owner}/{repo}`, or `{owner}/{repo}`
+  when `REPOSITORY_HOSTS` lists exactly one host besides `*`. It must pass the same URL policy as
+  `/control/ensure` (`REPOSITORY_HOSTS`/`REPOSITORY_OWNERS`) and is canonicalized with it before selecting.
+  A JSON `null` or blank value counts as absent.
+- **Precedence:** the `repository` argument wins over the header. When both are sent and name different
+  repositories (compared canonically, so `https://github.com/Acme/Widgets.git` and `acme/widgets` are the
+  same), the call fails with the tool error `selector_conflict`. A reserved argument that is not a string, or
+  a repository the URL policy refuses, fails with `invalid_selector` (the message carries only the policy's
+  reason code, never the value). A `branch` argument works with a header-selected repository.
+- **Cross-repository tools:** when a selection is required and the call names no repository, the two
+  cross-repository tools default the selection to their own `provider_repository_url`. The gate then pins
+  the provider's default-branch snapshot, so it serves a provider that has one (for example one also ensured
+  directly). A provider-only repository (indexed only as a submodule of its consumers) has no selectable
+  snapshot, so such a call gets the uniform not-found. Name a consumer repository you can read in
+  `repository` instead. With the requirement off the default does not apply, and these tools keep the
+  unselected read.
+
+The filter errors are MCP tool errors (`isError: true`) whose text is the usual JSON error envelope
+(`meta.error.code`). The selection of each call is kept in the request's `HttpContext.Items`
+(`ToolCallSelection`), where later per-call checks can reuse it.
 
 ## The `SnapshotService` data plane
 
@@ -1029,7 +1066,7 @@ catalog, and a `FakeSnapshotWorker`. The suite maps to the acceptance criteria:
 | 1 — idempotent ensure | `SnapshotServiceTests` (concurrent ensures attach to one job; worker runs once); `EnsureCallerDisconnectTests` / `EnsureCallerDisconnectHttpTests` (#148: caller disconnect never cancels production, re-ensure attaches to the in-flight run, `wait=false`, prompt status/resolve during a run, shutdown requeues) |
 | 2 — restart recovery | `SnapshotServiceTests` (catalog survives restart; orphaned `running` jobs reconciled) |
 | 3 — scratch cannot delete published | `ServicePathsTests` (scratch/persistent separation + `ReleaseScratch` refusal) |
-| 4 — query via HTTP MCP without ProcessStack | `ServiceHttpTests` (`/mcp` mapped + auth-gated; `/query` paging); `RepositorySelectionHttpTests` (the `X-Sextant-Repository` header without a read policy, the legacy no-header unscoped read, `repository_required`) |
+| 4 — query via HTTP MCP without ProcessStack | `ServiceHttpTests` (`/mcp` mapped + auth-gated; `/query` paging); `RepositorySelectionHttpTests` (the `X-Sextant-Repository` header without a read policy, the legacy no-header unscoped read, `repository_required`); `ToolArgumentSelectionHttpTests` + `ToolSelectionFiltersTests` (SVC-2: the reserved `repository`/`branch` arguments listed on repository-scoped tools and stripped on call, argument-over-header precedence, `selector_conflict`/`invalid_selector`, branch pinning, `branch` without a repository, the cross-repository provider default, the unknown-branch uniform not-found); `McpClientCompatibilityTests` (an SDK client selecting through the `repository` argument) |
 | 5 — structured per-project diagnostics | `SnapshotServiceTests` (partial/failed/unsupported diagnostics) |
 | 6 — local-only remains functional | `ArchitectureBoundaryTests` (core assemblies never reference the service; local query without a service) |
 

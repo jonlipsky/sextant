@@ -895,6 +895,44 @@ public sealed class SnapshotStore(SqliteConnection connection)
     }
 
     /// <summary>
+    /// The selected snapshot for a NAMED consumer repository's NAMED branch (SVC-2, per-call branch
+    /// selection): the complete snapshot that branch's pointer currently targets. The same contract as
+    /// <see cref="GetSelectedSnapshotIdForRepository"/> except that the branch is chosen by exact
+    /// (ordinal) name instead of <c>is_default = 1</c>. Providers are excluded (<c>is_provider = 0</c>).
+    /// Returns null when the URL or branch is unknown, the branch has no pointer, or its target is not
+    /// complete, so an unknown branch and one with no complete snapshot collapse to the same result.
+    /// </summary>
+    public long? GetSelectedSnapshotIdForRepositoryBranch(string remoteUrl, string branchName)
+    {
+        if (GetRepositoryId(remoteUrl) is not long repoId)
+            return null;
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT b.snapshot_id
+            FROM branches b
+            JOIN snapshots s ON s.id = b.snapshot_id
+            JOIN repositories r ON r.id = b.repository_id
+            WHERE b.name = @branch AND s.status = @complete
+              AND r.is_provider = 0 AND r.id = @repo_id
+            LIMIT 1;
+            """;
+        cmd.Parameters.AddWithValue("@complete", SnapshotStatus.Complete);
+        cmd.Parameters.AddWithValue("@repo_id", repoId);
+        cmd.Parameters.AddWithValue("@branch", branchName);
+        return cmd.ExecuteScalar() is long id ? id : null;
+    }
+
+    /// <summary>
+    /// The full <see cref="SnapshotRow"/> for a named repository branch's selected snapshot
+    /// (<see cref="GetSelectedSnapshotIdForRepositoryBranch"/>), or null when none resolves.
+    /// </summary>
+    public SnapshotRow? GetSelectedSnapshotRowForRepositoryBranch(string remoteUrl, string branchName)
+    {
+        var id = GetSelectedSnapshotIdForRepositoryBranch(remoteUrl, branchName);
+        return id.HasValue ? GetById(id.Value) : null;
+    }
+
+    /// <summary>
     /// True for a single-repository database that carries snapshot-tagged project rows
     /// (<c>projects.snapshot_id IS NOT NULL</c>) — i.e. a Phase-9 build has run or is in flight. When this
     /// holds but <see cref="GetSelectedSnapshotId"/> returns null (no complete snapshot selected yet),
