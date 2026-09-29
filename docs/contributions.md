@@ -25,14 +25,17 @@ macOS runner builds the `net8.0-macos` one) and then **assembled into ONE reposi
 ## `sextant contribute`
 
 ```bash
-# Capture committed source and upload to a service, finalizing the snapshot (the common case).
-sextant contribute path/to/Solution.slnx --service https://sextant.internal --token "$SEXTANT_CONTRIB_TOKEN"
+# Capture committed source and upload to a service, finalizing the snapshot (the common case). The token
+# comes from SEXTANT_CONTRIB_TOKEN, read from an owner-only file; never pass it as --token on the command line.
+SEXTANT_CONTRIB_TOKEN="$(cat <secrets-dir>/contribute-token)" \
+  sextant contribute path/to/Solution.slnx --service https://sextant.internal
 
 # Capture only, writing the artifact to a file (no service contacted).
 sextant contribute path/to/Solution.slnx --out contribution.sxc
 
 # CI: fail the job if the service is unreachable (the ONLY thing that makes upload blocking).
-sextant contribute path/to/Solution.slnx --service "$SEXTANT_SERVICE" --token "$TOK" --require
+# Map the CI secret to SEXTANT_CONTRIB_TOKEN in the step's environment.
+sextant contribute path/to/Solution.slnx --service "$SEXTANT_SERVICE" --require
 ```
 
 | Option | Purpose |
@@ -40,7 +43,7 @@ sextant contribute path/to/Solution.slnx --service "$SEXTANT_SERVICE" --token "$
 | `<solution-path>` | The `.sln`/`.slnx` to index (positional, required). |
 | `--service <url>` | Index service base URL to upload to. Omit to capture only. |
 | `--out, -o <file>` | Write the artifact to a file instead of uploading. |
-| `--token <token>` | Contributor bearer token (or `SEXTANT_CONTRIB_TOKEN`). |
+| `--token <token>` | Contributor bearer token. Prefer `SEXTANT_CONTRIB_TOKEN`: a `--token` value is visible in the process list. |
 | `--tenant <id>` | Tenant/owner the contribution is published under (default: repository URL). |
 | `--branch <name>` | Branch to advance to the published snapshot (default: current branch). |
 | `--default-branch` | Mark the branch as the repository default. |
@@ -108,11 +111,12 @@ repository snapshot. All contributions for the same committed state target the *
 assembly snapshot identity** (the manifest's `ToSnapshotIdentity()` deliberately omits the capability), so:
 
 ```bash
+# Each runner maps its CI secret to SEXTANT_CONTRIB_TOKEN in the step's environment (no --token).
 # On the Windows runner — import the Windows project version but don't finalize yet.
-sextant contribute Solution.slnx --service "$SVC" --token "$TOK" --no-finalize
+sextant contribute Solution.slnx --service "$SVC" --no-finalize
 
 # On the macOS runner — import the macOS project version and finalize the assembled snapshot.
-sextant contribute Solution.slnx --service "$SVC" --token "$TOK"
+sextant contribute Solution.slnx --service "$SVC"
 ```
 
 Each contribution carries its own capability fingerprint and assembles only with compatible inputs. While

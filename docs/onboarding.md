@@ -211,10 +211,12 @@ At the root of the repository you are working in, create a `sextant.json` descri
 - `remote_fetch_timeout_seconds` — per-request timeout (default `10`) before falling back to a cached base
   page or reporting the peer unavailable.
 
-If the peer's query plane requires a token, add `"peer_query_token": "<token>"`. A remote fetch never
-widens local authorization — the peer authorizes that token against its **own** read policy, so you read
-only what the peer already grants. The shared service behind Mode A does not accept ProcessStack API keys
-on its query plane, so federating to it needs a query token that its operator issues to a trusted peer.
+If the peer's query plane requires a token, keep it in an owner-only file and supply it through
+`SEXTANT_PEER_QUERY_TOKEN` (below) rather than as `"peer_query_token"` in `sextant.json`, which is usually
+committed. A remote fetch never widens local authorization — the peer authorizes that token against its
+**own** read policy, so you read only what the peer already grants. The shared service behind Mode A does
+not accept ProcessStack API keys on its query plane, so federating to it needs a query token that its
+operator issues to a trusted peer.
 
 Environment variables override `sextant.json` and are handy for keeping secrets and endpoints out of a
 committed file:
@@ -228,7 +230,7 @@ committed file:
 ```bash
 export SEXTANT_PEERS="https://<sextant-service-host>"
 export SEXTANT_REMOTE_FETCH_TIMEOUT=10
-# export SEXTANT_PEER_QUERY_TOKEN="<token>"   # only if the peer enforces a query token
+# export SEXTANT_PEER_QUERY_TOKEN="$(cat <secrets-dir>/peer-query-token)"   # only if the peer enforces a query token
 ```
 
 ### B3. Index locally and connect your agent

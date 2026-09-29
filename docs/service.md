@@ -35,16 +35,19 @@ It lives in two projects that depend on the core libraries — **never the rever
 
 ```bash
 # Single-node development on loopback. DB + volumes default under the repo's .sextant/service.
-# The service refuses to start without a control token (SX-6d), so set one...
-SEXTANT_SERVICE_CONTROL_TOKEN=... sextant service
+# The service refuses to start without a control token (SX-6d), so set one. Read it from an owner-only
+# file (see "Generating and installing secrets" below), never type it inline where shell history keeps it...
+SEXTANT_SERVICE_CONTROL_TOKEN="$(cat <secrets-dir>/control-token)" sextant service
 # ...or, for a loopback-only dev service, opt out explicitly. INSECURE: /control/* is open, and a loud warning is logged.
 SEXTANT_SERVICE_INSECURE_OPEN_CONTROL_PLANE=true sextant service
 
-# Scaled deployment: point volumes at durable storage and require tokens.
+# Scaled deployment: point volumes at durable storage and require tokens, again read from owner-only
+# files. A production service loads them from its owner-only env file instead (see the production
+# deployment checklist).
 SEXTANT_SERVICE_DB_PATH=/data/sextant/catalog.db \
 SEXTANT_SERVICE_DATA_ROOT=/data/sextant/volumes \
-SEXTANT_SERVICE_CONTROL_TOKEN=... \
-SEXTANT_SERVICE_QUERY_TOKEN=... \
+SEXTANT_SERVICE_CONTROL_TOKEN="$(cat <secrets-dir>/control-token)" \
+SEXTANT_SERVICE_QUERY_TOKEN="$(cat <secrets-dir>/query-token)" \
 sextant service
 ```
 
@@ -1455,11 +1458,21 @@ Use this list for any service that more than one person reaches, whether through
 (which has moved to a separate private repository) or through another gateway that pools many callers
 behind one delegate token.
 
+> **Secret handling.** Generate every secret straight into an owner-only file and never print it. Treat
+> terminal scrollback, CI logs and agent transcripts as logs: a value that reaches one has leaked, so the
+> commands below print only a length or `set`/`MISSING`, and never put a value on a command line or in shell
+> history. Once a secret file is consumed (its value is in the service's env file and the gateway's secret
+> store), remove it with `shred -u <file>`; on a copy-on-write or journaling filesystem `shred` cannot
+> overwrite the old blocks, so `rm` is the realistic option there. Rotating a secret means overwriting its
+> file with a new value, replacing its env entry from that file, and restarting the service (it reads its
+> secrets only at startup). The commands are in
+> [Generating and installing secrets](#generating-and-installing-secrets).
+
 | Setting | Production value | Why |
 | --- | --- | --- |
-| `CONTROL_TOKEN` | A long random secret, held only by the gateway's control connection and operators | Startup fails without it. Never set `INSECURE_OPEN_CONTROL_PLANE` |
-| `DELEGATE_TOKENS` | One random token per pooled gateway connection | A delegate token opens nothing on its own: every read is decided by the verified caller's grants |
-| `CALLER_KEYS` | `kid=base64url-key@tenantId` entries with keys of at least 32 random bytes (`openssl rand 48 \| base64 -w0 \| tr '+/' '-_' \| tr -d '='`). A kid belongs to exactly one tenant: never share a kid or a key across tenants | The verifier binds each kid to its tenant, so an assertion signed with one tenant's key can never name another tenant. The gateway must sign with the same key bytes under a kid the service knows (the ProcessStack app's two connections share one key, so both set the same explicit `keyId`) |
+| `CONTROL_TOKEN` | A long random secret, [generated into an owner-only file](#generating-and-installing-secrets) and held only by the gateway's control connection and operators | Startup fails without it. Never set `INSECURE_OPEN_CONTROL_PLANE` |
+| `DELEGATE_TOKENS` | One random token per pooled gateway connection, each [generated into its own owner-only file](#generating-and-installing-secrets) | A delegate token opens nothing on its own: every read is decided by the verified caller's grants |
+| `CALLER_KEYS` | `kid=base64url-key@tenantId` entries with keys of at least 32 random bytes, each [generated into an owner-only file](#generating-and-installing-secrets) and never printed. A kid belongs to exactly one tenant: never share a kid or a key across tenants | The verifier binds each kid to its tenant, so an assertion signed with one tenant's key can never name another tenant. The gateway must sign with the same key bytes under a kid the service knows (the ProcessStack app's two connections share one key, so both set the same explicit `keyId`) |
 | `CALLER_AUDIENCE` | The audience the gateway signs (the ProcessStack app uses `sextant`) | Required with `CALLER_KEYS` |
 | `CALLER_APPS` | The gateway app's name (`sextant`) | Only that app's assertions are accepted, so another app that is bound to the same connection is refused (`caller_not_allowed`) |
 | `CALLER_IDPS` | `processstack` (the default; set it explicitly) | Only these identity providers' users act as `act=user` callers |
@@ -1470,6 +1483,66 @@ behind one delegate token.
 
 Before deploying, check that every repository already in the catalog passes the new host and owner lists:
 a repository they refuse can no longer be ensured or granted (an old grant can still be revoked).
+
+### Generating and installing secrets
+
+Every random secret you generate for the service (`CONTROL_TOKEN`, `QUERY_TOKEN`, `CONTRIBUTE_TOKEN`, each
+`DELEGATE_TOKENS` entry and each `CALLER_KEYS` key) is 48 random bytes, base64url-encoded without padding,
+written straight into its own owner-only file:
+
+```bash
+install -d -m 700 <secrets-dir>
+(umask 077; openssl rand 48 | base64 -w0 | tr '+/' '-_' | tr -d '=' > <secrets-dir>/control-token)
+(umask 077; openssl rand 48 | base64 -w0 | tr '+/' '-_' | tr -d '=' > <secrets-dir>/delegate-token)
+(umask 077; openssl rand 48 | base64 -w0 | tr '+/' '-_' | tr -d '=' > <secrets-dir>/caller-key)
+wc -c < <secrets-dir>/caller-key   # prints only the length (64), never the key
+```
+
+The `umask 077` subshell creates each file with mode 600, and nothing reaches the terminal. Use one file per
+secret (for example `query-token`, `contribute-token`, and one `delegate-token-<n>` per pooled connection).
+A secret issued elsewhere, such as a `CHECKOUT_TOKEN` from your git host, goes into its file without being
+echoed: `(umask 077; IFS= read -rs v && printf '%s' "$v" > <secrets-dir>/checkout-token)`.
+
+Add the env entries from the files to the service's owner-only env file, which your service manager loads
+(for example systemd `EnvironmentFile=` or `docker run --env-file`):
+
+```bash
+(umask 077; touch <service-env-file>) && chmod 600 <service-env-file>
+printf 'SEXTANT_SERVICE_CONTROL_TOKEN=%s\n' "$(cat <secrets-dir>/control-token)" >> <service-env-file>
+printf 'SEXTANT_SERVICE_DELEGATE_TOKENS=%s\n' "$(cat <secrets-dir>/delegate-token)" >> <service-env-file>
+printf 'SEXTANT_SERVICE_CALLER_KEYS=<kid>=%s@<tenant-id>\n' "$(cat <secrets-dir>/caller-key)" >> <service-env-file>
+```
+
+`printf` is a bash builtin, so the value is in no process's argv (the only external command, `cat`, receives
+just the path) and goes straight into the file, never to stdout. For several delegate tokens or caller keys,
+join them with `;` in one format string, with one `"$(cat …)"` per file. Never type a value after `KEY=` or
+`export KEY=` at a prompt (shell history keeps it), and never pass one as a command-line argument (other
+local users can read argv in the process list). Check that an entry is set without printing it:
+
+```bash
+grep -Eq '^SEXTANT_SERVICE_CALLER_KEYS=[^[:space:]]' <service-env-file> && echo set || echo MISSING
+```
+
+To replace a value (a rotation, or the query token [below](#after-the-legacy-_sextant-gateway-is-retired-not-before)),
+regenerate its file with the same `umask 077` command, delete the old line by its key
+(`sed -i '/^SEXTANT_SERVICE_QUERY_TOKEN=/d' <service-env-file>`, which names only the key), append the new
+line with `printf`, and restart the service.
+
+The gateway needs the same control token, delegate token and caller key (under the same kid). Move them into
+its secret store file to file, or on stdin, never through a chat, a ticket or a terminal.
+
+For an HTTP call that needs a bearer (for example `/control/metrics`, `/control/resolve` or an ensure), keep
+the header in an owner-only file and let `curl` read it (`-H @file` needs curl 7.55 or later):
+
+```bash
+(umask 077; printf 'Authorization: Bearer %s\n' "$(cat <secrets-dir>/control-token)" > <secrets-dir>/control-token-auth-header)
+curl -sS -H @<secrets-dir>/control-token-auth-header <service-url>/control/metrics
+```
+
+Never use `curl -H "Authorization: Bearer $TOKEN"`: the shell expands the token into curl's argv. To compute
+an HMAC with a caller key (for example to mint a test caller assertion), read the key from its file inside a
+small script, such as Python's `hmac` module given the key file's path. Never use `openssl dgst -hmac <key>` or
+`-macopt hexkey:<key>`, which put the key in the process list.
 
 ### Why `REPOSITORY_OWNERS` is required for a tenant with other members
 
@@ -1511,8 +1584,19 @@ Once no client uses the legacy query token (the ProcessStack-embedded `_sextant`
 2. Retire the legacy `QUERY_TOKEN` by **replacing** it with a fresh random value that no client holds (or by
    configuring a `READ_POLICY`). **Do not simply unset it:** with no query token and no read policy the query
    plane is open, and a request with no bearer can read every repository (the service logs a startup warning
-   when delegate tokens are configured on an open query plane). Only a trusted federation peer that pages
-   snapshots from this service over `/query/*` should be given the new value.
+   when delegate tokens are configured on an open query plane). Generate the new value into an owner-only file
+   and swap the env entry without printing it (see
+   [Generating and installing secrets](#generating-and-installing-secrets)), then restart the service:
+
+   ```bash
+   (umask 077; openssl rand 48 | base64 -w0 | tr '+/' '-_' | tr -d '=' > <secrets-dir>/query-token)
+   sed -i '/^SEXTANT_SERVICE_QUERY_TOKEN=/d' <service-env-file>
+   printf 'SEXTANT_SERVICE_QUERY_TOKEN=%s\n' "$(cat <secrets-dir>/query-token)" >> <service-env-file>
+   grep -Eq '^SEXTANT_SERVICE_QUERY_TOKEN=[^[:space:]]' <service-env-file> && echo set || echo MISSING
+   ```
+
+   Only a trusted federation peer that pages snapshots from this service over `/query/*` should be given the
+   new value, file to file (the peer sets `SEXTANT_PEER_QUERY_TOKEN` from it), never pasted.
 
 ## Migration & schema
 
