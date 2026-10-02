@@ -86,7 +86,7 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_CALLER_ISSUERS` | Optional comma-separated `iss` allow-list | none (any issuer) |
 | `SEXTANT_SERVICE_CALLER_HEADER` | The request header that carries the caller assertion | `X-ProcessStack-Caller` |
 | `SEXTANT_SERVICE_CALLER_IDPS` | Comma-separated identity providers whose users may act as `act=user` callers (`[a-z0-9-]{1,32}` each) | `processstack` |
-| `SEXTANT_SERVICE_CALLER_APPS` | Optional comma-separated allow-list on the signed `app` claim | none (any app) |
+| `SEXTANT_SERVICE_CALLER_APPS` | Optional comma-separated allow-list on the signed `app` claim (exact, case-sensitive match). ProcessStack fills `app` with the calling application's **id** (a ULID such as `01M389V5MBGQKSF18HC2EGC3FY`, listed by `processstack app list` and returned as the application's `id` by the ProcessStack API), not its slug or name, so list ids here. A slug makes every assertion-bearing call fail with `caller_not_allowed`, while health, discovery and connection tests still succeed (see [Production deployment checklist](#production-deployment-checklist-gateways)) | none (any app) |
 | `SEXTANT_SERVICE_MAX_GRANTS_PER_PRINCIPAL` | Most repository grants one user caller may hold in a tenant (see [Repository grants](#repository-grants-and-visibility-svc-4)); creating one more is `409 grant_limit`. The tenant-wide `'*'` grants are not counted. A missing or non-positive value uses the default | `200` |
 | `SEXTANT_SERVICE_MAX_GRANTS_PER_TENANT` | Most repository grant rows a tenant may hold, tenant-wide grants included; creating one more is `409 grant_limit` | `5000` |
 | `SEXTANT_SERVICE_SEARCH_MAX_WIDTH` | Most snapshots one [`search_symbols`](#search_symbols-svc-f) call reads (round-robin over the tracked ones); the rest are listed in `truncated` and searched on later pages. Values above `100` are clamped to `100` (the most snapshots a search tracks at once, which keeps a cursor within 16 KiB); a missing or non-positive value uses the default | `50` |
@@ -757,13 +757,14 @@ The header parameters `jku`, `jwk`, `x5u`, `x5c` and `crit` are refused. The pay
 | `tslug` | Tenant slug (recorded) |
 | `act` | `user` or `application` |
 | `idp`, `sub` | For `act=user` only: the identity provider and the full subject. `idp=processstack` needs a `sub` with no `:`; any other `idp` needs `{idp}:{connectionInstanceId}:{peerId}` |
-| `app`, `cid`, `via` | Calling app, connection and surface (`via` is `mcp-surface` or `activity`) |
+| `app`, `cid`, `via` | Calling app, connection and surface (`via` is `mcp-surface` or `activity`). ProcessStack sets `app` to the application's id, not its slug |
 | `dep` | Optional deployment id, sent only when the calling run is bound to a deployment (recorded). When present it must be a non-empty string |
 | `run` | Optional run id |
 | `jti`, `iat`, `nbf`, `exp` | Assertion id and times: 60 s skew, at most 300 s from `iat` to `exp` |
 
 A verified `act=user` assertion also needs its `idp` in `CALLER_IDPS`, and, when `CALLER_APPS` is set,
-every assertion needs its `app` in it.
+every assertion needs its `app` in it. Because `app` carries the application's id, `CALLER_APPS` lists
+application ids, never slugs.
 
 **Where an assertion is accepted.**
 
@@ -1474,7 +1475,7 @@ behind one delegate token.
 | `DELEGATE_TOKENS` | One random token per pooled gateway connection, each [generated into its own owner-only file](#generating-and-installing-secrets) | A delegate token opens nothing on its own: every read is decided by the verified caller's grants |
 | `CALLER_KEYS` | `kid=base64url-key@tenantId` entries with keys of at least 32 random bytes, each [generated into an owner-only file](#generating-and-installing-secrets) and never printed. A kid belongs to exactly one tenant: never share a kid or a key across tenants | The verifier binds each kid to its tenant, so an assertion signed with one tenant's key can never name another tenant. The gateway must sign with the same key bytes under a kid the service knows (the ProcessStack app's two connections share one key, so both set the same explicit `keyId`) |
 | `CALLER_AUDIENCE` | The audience the gateway signs (the ProcessStack app uses `sextant`) | Required with `CALLER_KEYS` |
-| `CALLER_APPS` | The gateway app's name (`sextant`) | Only that app's assertions are accepted, so another app that is bound to the same connection is refused (`caller_not_allowed`) |
+| `CALLER_APPS` | The gateway app's **id**: the value ProcessStack signs into the `app` claim, which is the application's id (a ULID such as `01M389V5MBGQKSF18HC2EGC3FY`), not its slug or name (`sextant`). Find it with `processstack app list` or as the application's `id` in the ProcessStack API | Only that app's assertions are accepted, so another app that is bound to the same connection is refused (`caller_not_allowed`). A slug here refuses **every** assertion-bearing call (the grant routes, delegate `tools/call`, `/query/*`) with `caller_not_allowed` (`403` over HTTP, the tool error on `/mcp`), while `/health`, `tools/list` and the gateway's connection test still succeed |
 | `CALLER_IDPS` | `processstack` (the default; set it explicitly) | Only these identity providers' users act as `act=user` callers |
 | `REPOSITORY_HOSTS` | An explicit list, never `*` | The ensure/grant SSRF policy ([above](#repository-url-policy-svc-5)) |
 | `REPOSITORY_OWNERS` | The `host/owner` entries of the organisations you index, comma-separated (for example `github.com/<org>,github.com/<user>`) | **Required whenever a tenant has members besides its owner** (below) |
