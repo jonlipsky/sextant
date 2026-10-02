@@ -95,6 +95,7 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_CONTROL_PORT` | HTTP port | `3011` |
 | `SEXTANT_SERVICE_QUERY_PORT` | Optional dedicated query port (shares the control port when unset) | none (shared) |
 | `SEXTANT_SERVICE_LEASE_TTL_SECONDS` | Single-writer lease TTL | `30` |
+| `SEXTANT_SERVICE_CONTROL_WRITE_WAIT_SECONDS` | How long a `POST /control/ensure?wait=false` registration or a `POST /control/branches/retire` waits for the single writer before answering `202` with the write still queued (issue #158; see [Queued control writes](#queued-control-writes-issue-158)). Keep it well under the client's timeout. A value above `25` is clamped to `25`; a missing, non-numeric or non-positive value uses the default | `5` |
 | `SEXTANT_SERVICE_PEERS` | Comma-separated peer base URLs for federation | none |
 | `SEXTANT_SERVICE_REMOTE_TIMEOUT_SECONDS` | Per-request remote-fetch timeout | `10` |
 | `SEXTANT_SERVICE_CONTRIB_REQUIRE_AUTH` | Require contribution authorization (Phase 16) | `false` (dev-open) |
@@ -660,11 +661,11 @@ The host deliberately **separates control endpoints from query endpoints**, and 
 | --- | --- | --- | --- |
 | `GET /health` | — | open | Service **AVAILABILITY**: the process is up and the catalog is reachable. |
 | `GET /ready` | — | open | Worker **CAPACITY**: `503` when this node has no worker (query-only), so an operator can tell "up" from "can index". |
-| `POST /control/ensure` | control | control token | Idempotent ensure-snapshot (criterion 1). Accepts an optional monotonic `branch_head_sequence` for forward-only branch-head advance (Phase 14, issue #84), **or** an `expected_head_commit` head CAS, plus `forced` and `branch_update` (see [Branch-pointer guards](#branch-pointer-guards-head-cas-branch_update-none-retire-svc-67)); the result carries `branch_advanced`. Blocks until terminal (`200`; `202` when transient-requeued) unless `?wait=false`, which returns `202` at once with the job to poll (issue #148). A caller disconnect/timeout **never** cancels production. A repository URL the [repository URL policy](#repository-url-policy-svc-5) refuses, both branch guards together (`conflicting_branch_guards`) or an unknown `branch_update` (`invalid_branch_update`) is `400 {"status":"rejected","reason":"<code>"}` before any job exists (audited `ensure`/`denied`). A user caller (`act=user` assertion) may ensure only a repository it can read: otherwise `403 {"status":"rejected","reason":"not_granted"}` (SVC-4), whatever the body asks. A user caller's ensure is then bounded (SX-6d, see [User callers on the control plane](#user-callers-on-the-control-plane-issue-193)): `default_branch: true`, any `branch_head_sequence`, or an advance with no `expected_head_commit` or no `branch_name` is `400` (`default_branch_not_allowed`, `branch_head_sequence_not_allowed`, `branch_guard_required`, `branch_required`). |
+| `POST /control/ensure` | control | control token | Idempotent ensure-snapshot (criterion 1). Accepts an optional monotonic `branch_head_sequence` for forward-only branch-head advance (Phase 14, issue #84), **or** an `expected_head_commit` head CAS, plus `forced` and `branch_update` (see [Branch-pointer guards](#branch-pointer-guards-head-cas-branch_update-none-retire-svc-67)); the result carries `branch_advanced`. Blocks until terminal (`200`; `202` when transient-requeued) unless `?wait=false`, which returns `202` at once with the job to poll (issue #148). When that registration is still waiting for the writer after `CONTROL_WRITE_WAIT_SECONDS` (another identity is producing), it returns `202 {"job_id":<integer>,"identity_hash":…,"status":"queued","attached":…}` with the id the job is (or will be) registered under, which `/control/status/{job_id}` resolves at once (issue #158, see [Queued control writes](#queued-control-writes-issue-158)). A caller disconnect/timeout **never** cancels production. A repository URL the [repository URL policy](#repository-url-policy-svc-5) refuses, both branch guards together (`conflicting_branch_guards`) or an unknown `branch_update` (`invalid_branch_update`) is `400 {"status":"rejected","reason":"<code>"}` before any job exists (audited `ensure`/`denied`). A user caller (`act=user` assertion) may ensure only a repository it can read: otherwise `403 {"status":"rejected","reason":"not_granted"}` (SVC-4), whatever the body asks. A user caller's ensure is then bounded (SX-6d, see [User callers on the control plane](#user-callers-on-the-control-plane-issue-193)): `default_branch: true`, any `branch_head_sequence`, or an advance with no `expected_head_commit` or no `branch_name` is `400` (`default_branch_not_allowed`, `branch_head_sequence_not_allowed`, `branch_guard_required`, `branch_required`). |
 | `POST /control/contribute` | control | control **or** contribute token | Ingest a client/CI semantic contribution (Phase 16); the least-privilege contribute token authorizes this endpoint only. |
 | `GET /control/status/{jobId}` | control | control token | Job status + per-project diagnostics (criterion 5) + checkout `coverage` (#119). For a user caller, a job on a repository it cannot read is the same `404` as an unknown id (SVC-4). |
 | `GET /control/resolve` | control | control token | Resolve a repository branch (`?branch=`, else the default) to its current published snapshot (+ its `coverage`, #119), plus `commit_sha`, the resolved `branch` name, `is_default` and `head_sequence` (SVC-7; a null `commit_sha`/`head_sequence` is omitted). For a user caller, a repository it cannot read is the same bare `404` as an absent one (SVC-4). |
-| `POST /control/branches/retire` | control | control token | Delete a branch pointer (`{repository, branch, expected_head_commit?}`, SVC-6); its snapshots stay for retention. `200 {"retired":true}`, or `{"retired":false}` for a missing branch (idempotent). The default branch or a head-CAS mismatch is `409 {"status":"rejected","reason":"default_branch"\|"head_mismatch"}`; a refused URL or blank branch is `400`. Audited `retire`. A user caller is refused with `403 {"error":"caller_not_allowed"}` (issue #193, see [User callers on the control plane](#user-callers-on-the-control-plane-issue-193)). |
+| `POST /control/branches/retire` | control | control token | Delete a branch pointer (`{repository, branch, expected_head_commit?}`, SVC-6); its snapshots stay for retention. `200 {"retired":true}`, or `{"retired":false}` for a missing branch (idempotent). The default branch or a head-CAS mismatch is `409 {"status":"rejected","reason":"default_branch"\|"head_mismatch"}`; a refused URL or blank branch is `400`. When the retirement has not applied within `CONTROL_WRITE_WAIT_SECONDS` (a production holds the writer), the answer is `202 {"status":"accepted"}`: it applies once the writer frees, with both guards evaluated then (issue #158, see [Queued control writes](#queued-control-writes-issue-158)). `503 {"status":"unavailable"}` once shutdown began (nothing queued). Audited `retire`. A user caller is refused with `403 {"error":"caller_not_allowed"}` (issue #193, see [User callers on the control plane](#user-callers-on-the-control-plane-issue-193)). |
 | `POST /control/retention` | control | control token | Run the service-owned retention/GC pass (`?execute=true` to apply). A user caller is refused (`403 caller_not_allowed`). |
 | `PUT`/`DELETE`/`GET /control/grants/self` | control | control token + `act=user` assertion | The caller's own repository grants (see [Repository grants](#repository-grants-and-visibility-svc-4)). |
 | `PUT`/`DELETE /control/grants/tenant` | control | control token + `act=application` assertion | The tenant-wide repository grants. |
@@ -1077,10 +1078,10 @@ owned by the **service**, never by the request:
   fail-closed lease guard until it expires; the next owner's startup reconcile then requeues the
   `running` job.
 - **Single writer is unchanged.** Productions of *different* identities are still serialized by the one
-  writer. Registering a **new** identity's job needs that writer too, so even a `wait=false` ensure for a
-  new identity waits while another identity is producing. The ensure still survives its caller
-  disconnecting: it registers and produces once the writer frees up. Making this registration
-  gate-free is tracked in #158.
+  writer, and registering a **new** identity's job needs that writer too. A `wait=false` ensure no longer
+  waits for it past a short bound, though: see [Queued control writes](#queued-control-writes-issue-158).
+  The ensure survives its caller disconnecting either way: it registers and produces once the writer
+  frees up.
 - **Lease loss mid-run fails closed.** If the writer lease is stolen during a worker run, the service
   records **nothing**. The job stays `running` for the new owner's startup reconcile to requeue (#38).
 
@@ -1089,6 +1090,67 @@ polling budget sized for your largest repository (hours for a monorepo, not minu
 fine for small repositories or operator use. Either way, a client timeout is now harmless: re-issue the
 ensure to re-attach, or poll the job. Status and resolve reads never wait for a running index, so a short
 per-poll timeout (a few seconds) is appropriate.
+
+### Queued control writes (issue #158)
+
+A production holds the single writer for its whole run, which can take hours for a monorepo. Two event-driven
+control writes must not make their caller wait that long: registering a new identity's job
+(`POST /control/ensure?wait=false`) and retiring a branch (`POST /control/branches/retire`). Both are
+**service-owned** operations that take their turn on the writer when the service admits them. The caller waits
+at most `SEXTANT_SERVICE_CONTROL_WRITE_WAIT_SECONDS` (default `5`, at most `25`) for that turn; the write
+itself never gives up.
+
+- **Ensure with `wait=false`.** When the job is registered within the bound, the response is unchanged: a
+  `202` `queued`/`running` result, or the `200` terminal result. Otherwise the response is `202` with
+  `{"job_id": <integer>, "identity_hash": "…", "status": "queued", "attached": <bool>}`.
+  - `job_id` is always a JSON integer. It is the identity's durable job id when its row already exists;
+    otherwise it is an id **reserved** for the identity, and the row is inserted with exactly that id when the
+    ensure's turn comes.
+  - `GET /control/status/{job_id}` resolves a reserved id at once, as a `queued` job described by the
+    submitted repository, commit and branch, with no diagnostics. It keeps resolving the id once the row
+    exists. If the registration fails instead (for example the instance lost the writer lease before its turn),
+    the reserved id answers `404`: ensure the identity again.
+  - Another ensure of the same identity while the first is queued gets the same `job_id`. The identity is
+    registered once and produced once. `attached` is `false` only for the request that reserved the id.
+  - The `202` is given without reading the job's state under the writer, so an identity whose job is
+    already terminal may be answered `queued` too; polling then reports the terminal `job.status`. In every
+    case the ensure's branch decision (the advance, CAS or attach) is made when its turn comes, not at
+    submission.
+- **Blocking ensure** (no `wait`, or `wait=true`): unchanged. It waits for the result.
+- **Retire.** When the retirement applies within the bound, the response is unchanged
+  (`200 {"retired":…}` or `409`). Otherwise it is `202 {"status":"accepted"}`, with no `retired` field.
+  - The retirement stays queued and applies when the writer frees.
+  - The default-branch guard and the `expected_head_commit` CAS are evaluated **when it applies**, against the
+    branch as it is then.
+  - Its `retire` audit row (`retired`, `absent`, `default_branch` or `head_mismatch`) is written then. To learn
+    the outcome, read the audit log, or `GET /control/resolve` the branch.
+  - An identical retirement (same repository, branch, `expected_head_commit` and audit actor) submitted while
+    one is still queued, with no other write admitted in between, is **coalesced** into it: it shares that
+    retirement's result and its single audit row.
+- **A caller's disconnect or timeout never drops a queued write.** The request token only bounds that
+  caller's own wait.
+- **Submission order.** Ensures and retires take their writer turns in the order the service admits them,
+  and a production runs on the turn of the ensure that started it. So a push's ensure, the branch's retire
+  and its re-creation's ensure apply in that order even when all three are queued behind another
+  repository's production. Other control writes (contribution ingest, retention, backup, denied-audit
+  rows) queue on the same writer.
+- **Graceful shutdown drains.** Once shutdown begins, a new ensure or retire is refused with
+  `503 {"status":"unavailable"}` and nothing is queued. Writes queued before that **drain**: Dispose
+  cancels and requeues the running production, then waits (up to `ShutdownDrainTimeout`, 30 s) for each
+  queued write to take its turn before it releases the lease. A queued retirement applies, and a queued
+  registration inserts its job row under its reserved id. That job is not produced: it stays `queued`, and
+  the next ensure of the identity produces it.
+- **A crash loses queued writes.** Queued registrations and retirements are held in memory only, so a
+  crash, or a drain that times out, **loses** them:
+  - A reserved `job_id` then answers `404` from the next instance. Re-ensure the identity to register it.
+  - A reserved id is never given to another identity. Before it hands out an id with no row yet, the service
+    persists an id floor in `<catalog-db>.job-id-floor`, and ids start above it after a restart. If that
+    file cannot be written, the ensure keeps waiting for the writer rather than hand out an unrecorded id.
+    A malformed floor file **fails startup**.
+  - A lost retirement leaves its branch in place.
+
+  Treat a `202` as "accepted, not yet durable", and keep a reconcile as the backstop. The ProcessStack app's
+  nightly reconcile re-ensures watched branches and retires branches the host no longer has.
 
 **Forward-only branch-head advance (Phase 14, issue #84).** An ensure request may carry an optional
 monotonic `branch_head_sequence`. Because the service ensures *every* delivered commit (including
@@ -1233,9 +1295,16 @@ single writer:
 4. Otherwise the row is deleted: `200 {"retired":true}`.
 
 Every outcome writes a `retire` audit row in the same transaction. The detail is `retired`, `absent` or
-the refusal reason, scoped to the request's repository. Retire waits for the single writer as retention does,
-so it queues behind a running production, and the caller's timeout bounds only that wait. Because a failed
-CAS never creates a branch, a stale push that arrives after its branch was retired cannot re-create it. A
+the refusal reason, scoped to the request's repository. Retire is a service-owned write that takes its turn on
+the single writer in submission order (issue #158). When a running production holds the writer and the
+retirement has not applied within `SEXTANT_SERVICE_CONTROL_WRITE_WAIT_SECONDS`, the response is
+`202 {"status":"accepted"}`. The steps above then run when the writer frees, against the branch as it is at
+that point, and their outcome is recorded only in the audit row. The caller's disconnect or timeout never drops
+the retirement. See [Queued control writes](#queued-control-writes-issue-158) for ordering, coalescing and
+durability.
+
+Because a failed CAS never creates a branch, a stale push that arrives after its branch was retired cannot
+re-create it. A
 **sequence**-guarded ensure has no such protection: retire deletes the row together with its
 `head_sequence`, so a late sequence-bearing ensure re-creates the branch. Do not mix the two guards on one
 branch; the CAS path never writes `head_sequence`, so that value also goes stale.
@@ -1635,7 +1704,7 @@ catalog, and a `FakeSnapshotWorker`. The suite maps to the acceptance criteria:
 
 | Criterion | Test coverage |
 | --- | --- |
-| 1 — idempotent ensure | `SnapshotServiceTests` (concurrent ensures attach to one job; worker runs once); `EnsureCallerDisconnectTests` / `EnsureCallerDisconnectHttpTests` (#148: caller disconnect never cancels production, re-ensure attaches to the in-flight run, `wait=false`, prompt status/resolve during a run, shutdown requeues) |
+| 1 — idempotent ensure | `SnapshotServiceTests` (concurrent ensures attach to one job; worker runs once); `EnsureCallerDisconnectTests` / `EnsureCallerDisconnectHttpTests` (#148: caller disconnect never cancels production, re-ensure attaches to the in-flight run, `wait=false`, prompt status/resolve during a run, shutdown requeues); `QueuedControlWriteHttpTests` / `JobIdReservationsTests` (#158: `wait=false` and retire answer `202` within the bound while a production holds the writer, reserved job ids resolve and are never reused, apply-time retire guards, submission order, coalescing, shutdown drain) |
 | 2 — restart recovery | `SnapshotServiceTests` (catalog survives restart; orphaned `running` jobs reconciled) |
 | 3 — scratch cannot delete published | `ServicePathsTests` (scratch/persistent separation + `ReleaseScratch` refusal) |
 | 4 — query via HTTP MCP without ProcessStack | `ServiceHttpTests` (`/mcp` mapped + auth-gated; `/query` paging); `RepositorySelectionHttpTests` (the `X-Sextant-Repository` header without a read policy, the legacy no-header unscoped read, `repository_required`); `ToolArgumentSelectionHttpTests` + `ToolSelectionFiltersTests` (SVC-2: the reserved `repository`/`branch` arguments listed on repository-scoped tools and stripped on call, argument-over-header precedence, `selector_conflict`/`invalid_selector`, branch pinning, `branch` without a repository, the cross-repository provider default, the unknown-branch uniform not-found); `McpClientCompatibilityTests` (an SDK client selecting through the `repository` argument) |

@@ -22,6 +22,7 @@ public class ServiceOptionsEnvTests
     private const string MaxGrantsPerTenant = "SEXTANT_SERVICE_MAX_GRANTS_PER_TENANT";
     private const string SearchMaxWidth = "SEXTANT_SERVICE_SEARCH_MAX_WIDTH";
     private const string SearchMaxHits = "SEXTANT_SERVICE_SEARCH_MAX_HITS";
+    private const string ControlWriteWait = "SEXTANT_SERVICE_CONTROL_WRITE_WAIT_SECONDS";
     private const string RequireRepositorySelection = "SEXTANT_SERVICE_REQUIRE_REPOSITORY_SELECTION";
     private const string RepositoryHosts = "SEXTANT_SERVICE_REPOSITORY_HOSTS";
     private const string RepositoryOwners = "SEXTANT_SERVICE_REPOSITORY_OWNERS";
@@ -357,6 +358,31 @@ public class ServiceOptionsEnvTests
         finally
         {
             Environment.SetEnvironmentVariable(SearchMaxHits, null);
+        }
+    }
+
+    [TestMethod]
+    [DataRow(null, 5)]
+    [DataRow("2", 2)]
+    [DataRow(" 10 ", 10)]
+    [DataRow("25", 25)]
+    [DataRow("26", 25)]
+    [DataRow("600", 25)]
+    [DataRow("0", 5)]
+    [DataRow("-3", 5)]
+    [DataRow("abc", 5)]
+    public void ControlWriteWait_BindsClampsOrFallsBackToDefault(string? value, int expectedSeconds)
+    {
+        // Issue #158: how long a wait=false ensure or a retire waits for the writer before it answers 202. A missing,
+        // non-positive or unparseable value keeps the default; a larger one is clamped well under a 30 s client timeout.
+        Environment.SetEnvironmentVariable(ControlWriteWait, value);
+        try
+        {
+            Assert.AreEqual(TimeSpan.FromSeconds(expectedSeconds), ServiceOptions.FromEnvironment(Config()).ControlWriteWait);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(ControlWriteWait, null);
         }
     }
 

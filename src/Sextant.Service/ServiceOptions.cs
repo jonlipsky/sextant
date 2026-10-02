@@ -267,6 +267,21 @@ public sealed record ServiceOptions
     internal TimeSpan DeniedAuditWait { get; init; } = TimeSpan.FromSeconds(2);
 
     /// <summary>
+    /// How long a control write waits for the single writer before it answers without it (issue #158): a
+    /// <c>POST /control/ensure?wait=false</c> then returns <c>202</c> with a reserved <c>job_id</c>, and a
+    /// <c>POST /control/branches/retire</c> returns <c>202 {"status":"accepted"}</c>. Either write stays queued,
+    /// service-owned, and applies in submission order once the writer frees. Keep it well under the callers' HTTP
+    /// timeout. <c>SEXTANT_SERVICE_CONTROL_WRITE_WAIT_SECONDS</c> (default 5); a missing, non-positive or
+    /// unparseable value keeps the default, and a larger value is clamped to <see cref="MaxControlWriteWaitSeconds"/>.
+    /// </summary>
+    public TimeSpan ControlWriteWait { get; init; } = TimeSpan.FromSeconds(DefaultControlWriteWaitSeconds);
+
+    internal const int DefaultControlWriteWaitSeconds = 5;
+
+    /// <summary>The largest <see cref="ControlWriteWait"/> the environment can set, in seconds.</summary>
+    public const int MaxControlWriteWaitSeconds = 25;
+
+    /// <summary>
     /// Upper bound on how many times an identity's job may run before a persistently-RETRYABLE provisioning
     /// failure (a transient clone/fetch error in <see cref="ServiceCheckoutMode.Clone"/> mode — network,
     /// DNS, timeout, remote 5xx/429) is recorded as a terminal <see cref="SnapshotJobStatus.Failed"/> instead
@@ -416,6 +431,8 @@ public sealed record ServiceOptions
             // cannot defeat the safety bound.
             MaxProvisioningAttempts = EnvInt("MAX_PROVISIONING_ATTEMPTS") is int a and > 0 and <= 100 ? a : 5,
             LeaseTtl = EnvInt("LEASE_TTL_SECONDS") is int ttl and > 0 ? TimeSpan.FromSeconds(ttl) : TimeSpan.FromSeconds(30),
+            ControlWriteWait = TimeSpan.FromSeconds(EnvInt("CONTROL_WRITE_WAIT_SECONDS") is int writeWait and > 0
+                ? Math.Min(writeWait, MaxControlWriteWaitSeconds) : DefaultControlWriteWaitSeconds),
             Peers = Env("PEERS") is { Length: > 0 } peers
                 ? peers.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                 : [],

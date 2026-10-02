@@ -291,7 +291,9 @@ public static class ServiceApp
         // Issue #148: production runs on the SERVICE lifetime, so the request token `ct` only bounds how long
         // this HTTP caller waits — a client disconnect/timeout never cancels or requeues the index; the job
         // stays running and publishes normally, and a re-ensure attaches to it. `?wait=false` returns 202 as
-        // soon as the job is registered (status queued/running + job_id) so the caller polls /control/status.
+        // soon as the job is registered (status queued/running + job_id) so the caller polls /control/status;
+        // issue #158: when the registration itself waits for the writer past ServiceOptions.ControlWriteWait, it
+        // returns 202 queued with the job id the identity WILL be registered under (status resolves it at once).
         control.MapPost("/ensure", async (EnsureSnapshotRequest request, bool? wait, HttpRequest req, SnapshotService service, ServiceOptions options, CancellationToken ct) =>
         {
             EnsureSnapshotResult result;
@@ -407,23 +409,40 @@ public static class ServiceApp
         // SVC-6: retire a branch pointer (the branch was deleted upstream). The SVC-5 repository URL policy
         // applies as at ensure intake; the 400 body carries only the reason code (never the URL). A missing
         // branch is 200 {retired:false} (idempotent); the default branch and a head-CAS mismatch are 409.
+        // Issue #158: the retirement is service-owned and takes its turn on the writer in submission order. When it
+        // has not applied within ServiceOptions.ControlWriteWait (a production holds the writer), the answer is
+        // 202 {status:"accepted"}: it applies once the writer frees, with both guards evaluated and its retire audit
+        // row written then, even if this caller has gone.
         // Issue #193: retire is application/operator-only. A user caller is refused (403 caller_not_allowed,
         // audited retire/denied) before the body is read, even for a repository it can see: retiring a branch
         // of a repository other users watch is a destructive cross-user action.
         control.MapPost("/branches/retire", async (RetireBranchRequest request, HttpRequest req, SnapshotService service, ServiceOptions options, CancellationToken ct) =>
         {
-            var decision = options.RepositoryUrlPolicy.Evaluate(request.Repository);
-            var refusal = !decision.Ok
-                ? decision.Reason!
-                : string.IsNullOrWhiteSpace(request.Branch) ? BranchGuardReason.BranchRequired : null;
-            if (refusal is not null)
+            RetireBranchResult? result;
+            try
             {
-                await service.RecordRetireDeniedAsync(refusal, AuditActor(req), ct);
-                return Results.Json(new { status = "rejected", reason = refusal }, ServiceJson.Options,
-                    statusCode: StatusCodes.Status400BadRequest);
-            }
+                var decision = options.RepositoryUrlPolicy.Evaluate(request.Repository);
+                var refusal = !decision.Ok
+                    ? decision.Reason!
+                    : string.IsNullOrWhiteSpace(request.Branch) ? BranchGuardReason.BranchRequired : null;
+                if (refusal is not null)
+                {
+                    await service.RecordRetireDeniedAsync(refusal, AuditActor(req), ct);
+                    return Results.Json(new { status = "rejected", reason = refusal }, ServiceJson.Options,
+                        statusCode: StatusCodes.Status400BadRequest);
+                }
 
-            var result = await service.RetireBranchAsync(request, AuditActor(req), ct);
+                result = await service.BeginRetireBranchAsync(request, AuditActor(req), ct);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                // The service is shutting down and admitted nothing: the retirement was not queued.
+                return Results.Json(
+                    new { status = "unavailable", reason = "the index service is shutting down and did not accept this retirement; retry it" },
+                    ServiceJson.Options, statusCode: StatusCodes.Status503ServiceUnavailable);
+            }
+            if (result is null)
+                return Results.Json(new { status = "accepted" }, ServiceJson.Options, statusCode: StatusCodes.Status202Accepted);
             return result.Reason is null
                 ? Results.Json(new { retired = result.Retired }, ServiceJson.Options)
                 : Results.Json(new { status = "rejected", reason = result.Reason }, ServiceJson.Options,

@@ -52,14 +52,28 @@ public sealed partial class SnapshotService : IDisposable
     // Issue #148: the service-owned lifetime every ensure operation + worker run is bound to (cancelled only
     // by StopProduction/Dispose), the in-flight production registry keyed by identity hash, and the set of
     // live ensure operations Dispose drains. _inFlightLock guards both collections and _disposed's transition
-    // (admission and Dispose's drain snapshot are atomic under it); it is only ever taken AFTER the write gate
-    // (never the reverse), so it cannot deadlock against a production.
+    // (admission and Dispose's drain snapshot are atomic under it). It never waits for the write gate: under it a
+    // control write only QUEUES its turn (TakeWriteTurnLocked, which never blocks), so it cannot deadlock against a
+    // production.
     private readonly CancellationTokenSource _lifetime = new();
     private readonly Lock _inFlightLock = new();
     private readonly Dictionary<string, InFlightProduction> _inFlight = new(StringComparer.Ordinal);
     private readonly HashSet<Task> _operations = [];
     private volatile bool _leaseReleased;
     private volatile bool _disposed;
+
+    // Issue #158: ensures and retires take their turn on the writer at admission, in submission order (see
+    // TakeWriteTurnLocked). _writeAdmissions counts every write admitted to the gate (Interlocked) and _pendingRetire,
+    // guarded by _inFlightLock, is the latest retire still waiting for its turn (the only one an identical retire may
+    // coalesce into, and only while no other write was admitted after it). Job ids are handed out before their rows
+    // exist through _jobIds. _pendingEnsures (guarded by _inFlightLock) counts the ensure operations of each identity
+    // that have not finished: an identity's id reservation lives while one of them may still register it, and is
+    // dropped once none is left (EndPendingEnsureLocked), so a registration that failed or rolled back never leaves a
+    // reserved id reading as queued forever.
+    private long _writeAdmissions;
+    private PendingRetire? _pendingRetire;
+    private readonly JobIdReservations _jobIds;
+    private readonly Dictionary<string, int> _pendingEnsures = new(StringComparer.Ordinal);
 
     private SnapshotService(
         ServiceOptions options, ISnapshotWorker worker, ServicePaths paths,
@@ -78,6 +92,9 @@ public sealed partial class SnapshotService : IDisposable
         _gitContent = gitContent;
         _contributionPolicy = contributionPolicy;
         _remoteDefaults = remoteDefaults is null ? null : new RemoteDefaultBranchLookup(remoteDefaults);
+        _jobIds = new JobIdReservations(
+            JobIdReservations.FloorPathFor(options.CatalogDbPath),
+            () => ReadCatalog(conn => new SnapshotJobStore(conn).MaxJobId()));
     }
 
     public ServicePaths Paths => _paths;
@@ -161,6 +178,7 @@ public sealed partial class SnapshotService : IDisposable
                 var service = new SnapshotService(
                     options, worker ?? new UnavailableSnapshotWorker(), paths, db, lease, ownsDatabase,
                     effectiveAuthorizer, effectiveGitContent, effectivePolicy, remoteDefaults);
+                service._jobIds.Load();
                 service.ReconcileOnStartup();
                 return service;
             }
@@ -225,7 +243,7 @@ public sealed partial class SnapshotService : IDisposable
     public async Task<EnsureSnapshotResult> EnsureSnapshotAsync(
         EnsureSnapshotRequest request, CancellationToken cancellationToken = default, AuditCaller principal = default)
     {
-        var (_, completion) = StartEnsureOperation(request, principal);
+        var (_, completion, _) = StartEnsureOperation(request, principal);
         return await WaitForCallerAsync(completion, cancellationToken).ConfigureAwait(false);
     }
 
@@ -233,15 +251,62 @@ public sealed partial class SnapshotService : IDisposable
     /// The non-blocking ensure (issue #148, <c>POST /control/ensure?wait=false</c>): starts the same
     /// service-owned ensure as <see cref="EnsureSnapshotAsync"/> but returns as soon as the job is registered —
     /// a <c>queued</c>/<c>running</c> result carrying the <c>job_id</c> to poll, or the full result when the
-    /// identity was already terminal. Registering a NEW identity still needs the single writer, so while
-    /// ANOTHER identity is producing this waits for the writer (an identity that is itself already producing
-    /// is attached without waiting). <paramref name="cancellationToken"/> only bounds this caller's wait.
+    /// identity was already terminal. An identity that is already producing is attached at once.
+    /// <para>
+    /// Registering a NEW identity needs the single writer, which another identity's production holds for its whole
+    /// run. When the ensure has not registered within <see cref="ServiceOptions.ControlWriteWait"/> (issue #158), this
+    /// returns a <c>queued</c> result anyway, without the writer: its <c>job_id</c> is the identity's durable job id
+    /// when the row exists, else an id RESERVED for it, which <see cref="GetStatus"/> reports as <c>queued</c> at
+    /// once and which the row is inserted with when the ensure's turn on the writer comes. The ensure itself stays
+    /// queued and service-owned, so it registers and produces even after this caller has gone; a second ensure of the
+    /// same identity gets the same id. Ensures and retires take the writer in submission order. The only case that
+    /// keeps waiting past the bound is a reservation whose id floor cannot be persisted (see
+    /// <see cref="JobIdReservations"/>): then no unrecorded id is handed out. <paramref name="cancellationToken"/>
+    /// only bounds this caller's wait.
+    /// </para>
     /// </summary>
     public async Task<EnsureSnapshotResult> BeginEnsureSnapshotAsync(
         EnsureSnapshotRequest request, AuditCaller principal = default, CancellationToken cancellationToken = default)
     {
-        var (accepted, _) = StartEnsureOperation(request, principal);
+        var (accepted, _, hash) = StartEnsureOperation(request, principal);
+        if (!accepted.IsCompleted)
+        {
+            await ((Task)accepted).WaitAsync(_options.ControlWriteWait, cancellationToken)
+                .ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+            if (!accepted.IsCompleted)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                // The writer is busy: answer with the identity's job id without it. A registration that settled
+                // meanwhile reports its own result (it carries the same id).
+                if (QueuedResult(request, hash) is { } queued && !accepted.IsCompleted)
+                    return queued;
+            }
+        }
         return await WaitForCallerAsync(accepted, cancellationToken).ConfigureAwait(false);
+    }
+
+    // The wait=false answer for an ensure still waiting for the writer (issue #158): queued, with the job id the
+    // ensure will register (or has registered) its identity under. Null when no id can be handed out safely.
+    private EnsureSnapshotResult? QueuedResult(EnsureSnapshotRequest request, string hash)
+    {
+        if (FindInFlight(hash) is { } inFlight)
+            return PendingResult(inFlight.JobId, hash);
+        var handed = _jobIds.ForCaller(
+            hash, request.RepositoryRemoteUrl, request.CommitSha, request.BranchName,
+            identity => ReadCatalog(conn => new SnapshotJobStore(conn).GetJobByIdentity(identity)?.Id));
+        lock (_inFlightLock)
+        {
+            // The ensure finished meanwhile (its result is about to settle): nothing is left to register a reservation
+            // made just now, so drop it and let the caller take the ensure's own result.
+            if (!_pendingEnsures.ContainsKey(hash))
+            {
+                _jobIds.Release(hash);
+                return null;
+            }
+        }
+        return handed is { } job
+            ? new EnsureSnapshotResult { JobId = job.Id, IdentityHash = hash, Status = SnapshotJobStatus.Queued, Attached = job.Existed }
+            : null;
     }
 
     /// <summary>
@@ -344,13 +409,13 @@ public sealed partial class SnapshotService : IDisposable
         }
     }
 
-    // Starts one ensure as a service-owned background operation and returns (accepted, completion): the
+    // Starts one ensure as a service-owned background operation and returns (accepted, completion, identity hash): the
     // completion is the ensure's final result; accepted settles as soon as the job is registered (wait=false).
     // The operation is tracked so Dispose can drain it, and neither task can ever surface as an unobserved
     // exception when no caller is left waiting (the caller disconnected). Admission is atomic with Dispose's
     // drain snapshot (both under _inFlightLock): an operation either starts before shutdown closes admission
     // and is drained, or is refused, so none can run on against a released lease or a closed catalog.
-    private (Task<EnsureSnapshotResult> Accepted, Task<EnsureSnapshotResult> Completion) StartEnsureOperation(
+    private (Task<EnsureSnapshotResult> Accepted, Task<EnsureSnapshotResult> Completion, string Hash) StartEnsureOperation(
         EnsureSnapshotRequest request, AuditCaller principal)
     {
         // SVC-6/7: a malformed branch guard is refused before any job exists. The host validates first and
@@ -358,24 +423,97 @@ public sealed partial class SnapshotService : IDisposable
         if (request.BranchGuardProblem() is { } problem)
             throw new ArgumentException($"The ensure request's branch guards are invalid ({problem}).", nameof(request));
 
+        // Issue #113: the non-default SDK-pin policy is part of the identity, so flipping
+        // SEXTANT_SERVICE_SDK_PIN_OVERRIDE never reuses a snapshot (or failed job) built under the other policy. The
+        // remote-default lookup (issue #199) is not part of it, so the hash is known before that lookup runs.
+        var hash = request.ToIdentity(
+            _options.DefaultConfigHash, _options.DefaultCapabilityFingerprint, _options.SdkPinIdentityComponent).Hash;
         var accepted = new TaskCompletionSource<EnsureSnapshotResult>(TaskCreationOptions.RunContinuationsAsynchronously);
         Task<EnsureSnapshotResult> completion;
         lock (_inFlightLock)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             ThrowIfStopping();
-            completion = Task.Run(() => RunEnsureAsync(request, principal, accepted), CancellationToken.None);
+            // Issue #158: the ensure takes its turn on the writer now, in submission order. A user ensure that must
+            // first look up the remote's default branch (issue #199) takes its turn once that lookup has finished.
+            var turn = request.RestrictsImplicitDefault ? null : TakeWriteTurnLocked();
+            completion = Task.Run(() => RunEnsureAsync(request, hash, principal, accepted, turn), CancellationToken.None);
             _operations.Add(completion);
+            _pendingEnsures[hash] = _pendingEnsures.GetValueOrDefault(hash) + 1;
         }
         completion.ContinueWith(
             t =>
             {
                 lock (_inFlightLock)
+                {
                     _operations.Remove(t);
+                    EndPendingEnsureLocked(hash);
+                }
                 SettleAccepted(accepted, t);
             },
             CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-        return (accepted.Task, completion);
+        return (accepted.Task, completion, hash);
+    }
+
+    // One ensure of the identity has finished (the caller holds _inFlightLock). When it was the identity's last, no
+    // ensure is left to register a reserved id, so the reservation is dropped: after a successful registration it is
+    // already gone, and after a failure (the writer lease lost, a failed insert) its id then reads 404, the documented
+    // signal to ensure again, instead of queued forever. A reserved id is never reused (JobIdReservations).
+    private void EndPendingEnsureLocked(string hash)
+    {
+        if (_pendingEnsures.GetValueOrDefault(hash) > 1)
+        {
+            _pendingEnsures[hash]--;
+            return;
+        }
+        _pendingEnsures.Remove(hash);
+        _jobIds.Release(hash);
+    }
+
+    // Drops an identity's id reservation unless an ensure that may still register it is pending (issue #158).
+    private void ReleaseUnlessPending(string hash)
+    {
+        lock (_inFlightLock)
+        {
+            if (!_pendingEnsures.ContainsKey(hash))
+                _jobIds.Release(hash);
+        }
+    }
+
+    // Issue #158: queues a turn on the single writer for a control write (an ensure or a retire). The caller holds
+    // _inFlightLock, so turns are taken in admission order, and the write gate grants waiting turns first-in,
+    // first-out (SemaphoreSlim releases its asynchronous waiters in the order they queued), so writes apply in
+    // submission order: a branch delete's retire is never overtaken by the re-create push's ensure that followed it.
+    // The wait is not tied to the service lifetime, so a write admitted before shutdown still lands during the
+    // Dispose drain. The returned turn MUST be awaited and the gate released exactly once on every path, or the
+    // writer stalls for good (ReleaseTurn covers a turn abandoned before it was granted).
+    private Task TakeWriteTurnLocked() => TakeWriteTurnLocked(out _);
+
+    private Task TakeWriteTurnLocked(out long admission)
+    {
+        admission = Interlocked.Increment(ref _writeAdmissions);
+        return _writeGate.WaitAsync(CancellationToken.None);
+    }
+
+    private Task TakeWriteTurn()
+    {
+        lock (_inFlightLock)
+            return TakeWriteTurnLocked();
+    }
+
+    // Releases a turn whether or not it has been granted yet.
+    private void ReleaseTurn(Task turn, bool granted)
+    {
+        if (granted)
+            _writeGate.Release();
+        else
+            turn.ContinueWith(
+                t =>
+                {
+                    if (t.IsCompletedSuccessfully)
+                        _writeGate.Release();
+                },
+                CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
 
     // Service shutdown refuses new work with an OperationCanceledException on the SERVICE lifetime token, which
@@ -420,13 +558,14 @@ public sealed partial class SnapshotService : IDisposable
     }
 
     private async Task<EnsureSnapshotResult> RunEnsureAsync(
-        EnsureSnapshotRequest request, AuditCaller principal, TaskCompletionSource<EnsureSnapshotResult> accepted)
+        EnsureSnapshotRequest request, string hash, AuditCaller principal,
+        TaskCompletionSource<EnsureSnapshotResult> accepted, Task? turn)
     {
         using var activity = ServiceTelemetry.Source.StartActivity("ensure_snapshot");
         activity?.SetTag("sextant.repository", request.RepositoryRemoteUrl);
         activity?.SetTag("sextant.commit", request.CommitSha);
 
-        var result = await EnsureSnapshotCoreAsync(request, principal, accepted).ConfigureAwait(false);
+        var result = await EnsureSnapshotCoreAsync(request, hash, principal, accepted, turn).ConfigureAwait(false);
 
         _metrics.RecordEnsure(result.Attached);
         activity?.SetTag("sextant.status", result.Status);
@@ -440,7 +579,8 @@ public sealed partial class SnapshotService : IDisposable
     // time the safety net can apply) and the ensure may move a pointer (not `branch_update: none`). The lookup is shared,
     // remembered briefly and capped (RemoteDefaultBranchLookup). Any value a direct caller supplied is discarded. No
     // resolver (locate mode), a failed lookup or a full cap leaves it unset, so the branch is created without the
-    // default (fail closed).
+    // default (fail closed). So does shutdown, which stops waiting for the lookup: the ensure still registers its job
+    // (issue #158), because a wait=false caller may already hold its id.
     private async Task<EnsureSnapshotRequest> WithVerifiedRemoteDefaultAsync(EnsureSnapshotRequest request)
     {
         if (!request.RestrictsImplicitDefault)
@@ -453,7 +593,7 @@ public sealed partial class SnapshotService : IDisposable
             var branch = await lookup.ResolveAsync(request.RepositoryRemoteUrl).WaitAsync(_lifetime.Token).ConfigureAwait(false);
             return request with { VerifiedRemoteDefaultBranch = branch };
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException || _lifetime.IsCancellationRequested)
         {
             return unverified;
         }
@@ -465,76 +605,76 @@ public sealed partial class SnapshotService : IDisposable
         return snapshots.GetRepositoryId(repositoryRemoteUrl) is long repoId && snapshots.GetDefaultBranchId(repoId) is not null;
     });
 
-    // The idempotent-ensure core. Every durable step (and the request's audit row) runs under the single
-    // write gate; the only long step — the worker — is a shared, service-owned production per identity.
+    // The idempotent-ensure core. Every durable step (and the request's audit row) runs under the single write gate,
+    // on this ensure's turn (issue #158: turns are granted in submission order); the only long step — the worker — is
+    // a shared, service-owned production per identity, which runs on the turn of the ensure that started it.
     private async Task<EnsureSnapshotResult> EnsureSnapshotCoreAsync(
-        EnsureSnapshotRequest request, AuditCaller principal, TaskCompletionSource<EnsureSnapshotResult> accepted)
+        EnsureSnapshotRequest request, string hash, AuditCaller principal,
+        TaskCompletionSource<EnsureSnapshotResult> accepted, Task? turn)
     {
-        request = await WithVerifiedRemoteDefaultAsync(request).ConfigureAwait(false);
-        // Issue #113: the non-default SDK-pin policy is part of the identity, so flipping
-        // SEXTANT_SERVICE_SDK_PIN_OVERRIDE never reuses a snapshot (or failed job) built under the other policy.
-        var identity = request.ToIdentity(
-            _options.DefaultConfigHash, _options.DefaultCapabilityFingerprint, _options.SdkPinIdentityComponent);
-        var hash = identity.Hash;
-        var lifetime = _lifetime.Token;
-        var rejoined = false;
-
-        while (true)
+        var granted = false;
+        var handedOff = false;
+        try
         {
-            // Shutdown began: never attach to (or report as running) a production that is being cancelled.
+            if (turn is null)
+            {
+                request = await WithVerifiedRemoteDefaultAsync(request).ConfigureAwait(false);
+                turn = TakeWriteTurn();
+            }
+
+            // The identity is already producing: report its job at once, so a re-ensure — e.g. the retry of a
+            // caller that timed out — returns its job id immediately and never starts a second worker. Shutdown
+            // began: never attach to (or report as running) a production that is being cancelled.
+            var inFlight = FindInFlight(hash);
+            if (inFlight is not null)
+            {
+                ThrowIfStopping();
+                accepted.TrySetResult(PendingResult(inFlight.JobId, hash));
+            }
+
+            await turn.ConfigureAwait(false);
+            granted = true;
+            EnsureLeaseHeld();
+
+            if (inFlight is not null)
+            {
+                // A production holds the writer for its whole run and deregisters before releasing it, so it has
+                // finished by the time this turn is granted. A terminal outcome is re-attached through the terminal
+                // path below, so THIS request's own branch pointer is advanced/attached (the identity excludes the
+                // branch, so the producing request's branch may differ). A non-terminal (transient requeue) outcome is
+                // shared as-is rather than immediately re-running the worker.
+                var produced = await inFlight.Production.ConfigureAwait(false);
+                if (!SnapshotJobStatus.IsTerminal(produced.Status))
+                {
+                    // The branch decision in `produced` was the producing request's, not this one's.
+                    var shared = produced with { Attached = true, BranchAdvanced = null };
+                    RecordEnsureAuditLocked(request, shared, principal);
+                    return shared;
+                }
+            }
+
+            // Idempotent attach: create-or-return the ONE durable job for this identity (criterion 1), and in the
+            // SAME write check whether a terminal result is still backed by durable data (a complete job whose
+            // snapshot retention has since reclaimed must NOT be reported complete forever). A usable terminal result
+            // is attached — branch pointer advanced — in that SAME gate hold: releasing the gate between the check
+            // and the advance would let a concurrent ensure supersede the snapshot in between, leaving the branch
+            // head on a Superseded snapshot (issue #85).
+            var (job, existed, attached) = TryAttachTerminal(request, hash, principal);
+            if (attached is not null)
+                return attached;
+            accepted.TrySetResult(PendingResult(job, existed));
+
+            // Shutdown began: the job stays durably queued for the next instance to produce.
             ThrowIfStopping();
 
-            Task<EnsureSnapshotResult> production;
-            bool existed;
-            var owner = false;
-
-            if (FindInFlight(hash) is { } inFlight)
-            {
-                // The identity is already producing (it holds the write gate for the whole worker run):
-                // attach to that production WITHOUT waiting on the gate, so a re-ensure — e.g. the retry of a
-                // caller that timed out — returns its job id immediately and never starts a second worker.
-                existed = true;
-                accepted.TrySetResult(PendingResult(inFlight.JobId, hash));
-                production = inFlight.Production;
-            }
-            else
-            {
-                // Idempotent attach: create-or-return the ONE durable job for this identity (criterion 1), and
-                // in the SAME write check whether a terminal result is still backed by durable data (a complete
-                // job whose snapshot retention has since reclaimed must NOT be reported complete forever). A
-                // usable terminal result is attached — branch pointer advanced — in that SAME gate hold:
-                // releasing the gate between the check and the advance would let a concurrent ensure supersede
-                // the snapshot in between, leaving the branch head on a Superseded snapshot (issue #85).
-                var (job, wasExisting, attached) = await WithWriteAsync(
-                    () => Task.FromResult(TryAttachTerminal(request, hash, principal)), lifetime).ConfigureAwait(false);
-                if (attached is not null)
-                    return attached;
-
-                existed = wasExisting;
-                accepted.TrySetResult(PendingResult(job, wasExisting));
-                (production, owner) = GetOrStartProduction(request, hash, job.Id, wasExisting, principal);
-            }
-
-            var result = await production.ConfigureAwait(false);
-            if (owner)
-                return result;
-
-            // Attached to a production another request started. A terminal outcome is re-attached once through
-            // the terminal path above so THIS request's own branch pointer is advanced/attached (the identity
-            // excludes the branch, so the producing request's branch may differ). A non-terminal (transient
-            // requeue) outcome is shared as-is rather than immediately re-running the worker.
-            if (rejoined || !SnapshotJobStatus.IsTerminal(result.Status))
-            {
-                // The branch decision in `result` was the producing request's, not this one's.
-                var shared = result with { Attached = existed, BranchAdvanced = null };
-                await WithWriteAsync(() =>
-                {
-                    RecordEnsureAuditLocked(request, shared, principal);
-                    return Task.FromResult(0);
-                }, lifetime).ConfigureAwait(false);
-                return shared;
-            }
-            rejoined = true;
+            var production = StartProduction(request, hash, job.Id, existed, principal);
+            handedOff = true;
+            return await production.ConfigureAwait(false);
+        }
+        finally
+        {
+            if (!handedOff && turn is not null)
+                ReleaseTurn(turn, granted);
         }
     }
 
@@ -545,7 +685,9 @@ public sealed partial class SnapshotService : IDisposable
         EnsureSnapshotRequest request, string hash, AuditCaller principal)
     {
         var jobs = new SnapshotJobStore(_conn);
-        var (row, wasExisting) = jobs.EnsureJob(hash, request.RepositoryRemoteUrl, request.CommitSha, request.BranchName);
+        var (row, wasExisting) = RegisterJobLocked(jobs, hash, request.RepositoryRemoteUrl, request.CommitSha, request.BranchName);
+        // The row committed (this write is not inside a transaction), so a status read now finds it.
+        _jobIds.Release(hash);
         if (!SnapshotJobStatus.IsTerminal(row.Status) || !TerminalResultUsable(row, hash, new SnapshotStore(_conn)))
             return (row, wasExisting, null);
         var advanced = AdvanceOrAttachBranchPointer(request, row.SnapshotId);
@@ -554,28 +696,43 @@ public sealed partial class SnapshotService : IDisposable
         return (row, wasExisting, attached);
     }
 
+    // Creates or returns the ONE job row for an identity, under the write gate. A new row takes its id from _jobIds
+    // (issue #158), so it is the id a wait=false caller may already be polling, and no reserved id is ever taken by
+    // another identity's row. The caller releases the reservation once the row has committed.
+    private (SnapshotJobRow Row, bool Existed) RegisterJobLocked(
+        SnapshotJobStore jobs, string hash, string repositoryUrl, string commitSha, string? branchName)
+    {
+        long? id = jobs.GetJobByIdentity(hash) is null
+            ? _jobIds.ForRegistration(hash, repositoryUrl, commitSha, branchName)
+            : null;
+        return jobs.EnsureJob(hash, repositoryUrl, commitSha, branchName, id);
+    }
+
     private InFlightProduction? FindInFlight(string hash)
     {
         lock (_inFlightLock)
             return _inFlight.GetValueOrDefault(hash);
     }
 
-    // Returns the identity's in-flight production, starting (and registering) one when none is running. The
-    // starter is the OWNER: the production runs with its request (branch, sequence) and principal.
-    private (Task<EnsureSnapshotResult> Production, bool Owner) GetOrStartProduction(
+    // Starts (and registers) the identity's production on the write-gate turn the calling ensure holds, which the
+    // production takes over and releases. The starter is the OWNER: the production runs with its request (branch,
+    // sequence) and principal. Every production runs while holding the gate and deregisters before releasing it, so
+    // none can be in flight while the caller holds the gate.
+    private Task<EnsureSnapshotResult> StartProduction(
         EnsureSnapshotRequest request, string hash, long jobId, bool existed, AuditCaller principal)
     {
         lock (_inFlightLock)
         {
-            if (_inFlight.TryGetValue(hash, out var running))
-                return (running.Production, false);
+            if (_inFlight.ContainsKey(hash))
+                throw new InvalidOperationException(
+                    "An identity's production was in flight while another ensure held the write gate; productions must hold it for their whole run.");
 
             // Registered under the lock BEFORE the production can deregister itself (it takes the same lock).
             var entry = new InFlightProduction(jobId);
             entry.Production = Task.Run(
                 () => RunProductionAsync(request, hash, jobId, existed, principal, entry), CancellationToken.None);
             _inFlight[hash] = entry;
-            return (entry.Production, true);
+            return entry.Production;
         }
     }
 
@@ -598,18 +755,16 @@ public sealed partial class SnapshotService : IDisposable
             : new EnsureSnapshotResult { JobId = jobId, IdentityHash = hash, Status = SnapshotJobStatus.Queued, Attached = true };
     }
 
-    // One identity's shared production: waits for the single writer on the SERVICE lifetime (never a caller's
-    // token), runs the worker, records the result and the owner's audit row, then deregisters itself BEFORE
-    // releasing the gate — so any request that can observe the new durable state (which needs the gate) never
-    // attaches to this already-finished production.
+    // One identity's shared production: runs on the write-gate turn of the ensure that started it (never waiting for
+    // the writer again, so it applies at that ensure's place in submission order, issue #158) and on the SERVICE
+    // lifetime (never a caller's token). It runs the worker, records the result and the owner's audit row, then
+    // deregisters itself BEFORE releasing the gate — so any request that can observe the new durable state (which
+    // needs the gate) never attaches to this already-finished production.
     private async Task<EnsureSnapshotResult> RunProductionAsync(
         EnsureSnapshotRequest request, string hash, long jobId, bool existed, AuditCaller principal, InFlightProduction entry)
     {
-        var gateHeld = false;
         try
         {
-            await _writeGate.WaitAsync(_lifetime.Token).ConfigureAwait(false);
-            gateHeld = true;
             EnsureLeaseHeld();
             var result = await ProduceLockedAsync(request, hash, jobId, existed).ConfigureAwait(false);
             RecordEnsureAuditLocked(request, result, principal);
@@ -622,8 +777,7 @@ public sealed partial class SnapshotService : IDisposable
                 if (_inFlight.TryGetValue(hash, out var current) && ReferenceEquals(current, entry))
                     _inFlight.Remove(hash);
             }
-            if (gateHeld)
-                _writeGate.Release();
+            _writeGate.Release();
         }
     }
 
@@ -907,10 +1061,14 @@ public sealed partial class SnapshotService : IDisposable
         {
             var result = IngestBody(artifact, manifest, assemblyIdentity, identityHash, contentHash, payloadConn, request);
             ExecRaw("COMMIT;");
+            // The job row (if this ingest registered one) has committed: drop its id reservation (issue #158).
+            _jobIds.Release(identityHash);
             return result;
         }
         catch
         {
+            // No row commits: drop an id reservation this ingest made, unless a queued ensure will register it.
+            ReleaseUnlessPending(identityHash);
             ExecRaw("ROLLBACK;");
             throw;
         }
@@ -945,7 +1103,7 @@ public sealed partial class SnapshotService : IDisposable
 
         // Attach to the ONE durable job for this assembly identity (criterion 1), and take it running under
         // this instance's lease. A stale terminal job is requeued first so MarkRunning's guard advances it.
-        var (job, _) = jobs.EnsureJob(identityHash, manifest.RepositoryRemoteUrl, manifest.CommitSha, request.BranchName);
+        var (job, _) = RegisterJobLocked(jobs, identityHash, manifest.RepositoryRemoteUrl, manifest.CommitSha, request.BranchName);
         if (SnapshotJobStatus.IsTerminal(job.Status))
             jobs.Requeue(job.Id);
         jobs.MarkRunning(job.Id, _lease.OwnerToken);
@@ -1397,31 +1555,58 @@ public sealed partial class SnapshotService : IDisposable
 
     /// <summary>
     /// The full status of a job (with diagnostics) by durable job id — null when unknown. Served from an
-    /// independent read connection (issue #148), so it returns promptly while a worker holds the writer.
+    /// independent read connection (issue #148), so it returns promptly while a worker holds the writer. A job id
+    /// handed out by a <c>wait=false</c> ensure whose registration is still waiting for the writer (issue #158)
+    /// resolves as <c>queued</c>, with no diagnostics or coverage, until its row is written.
     /// </summary>
     public JobStatusResult? GetStatus(long jobId)
     {
+        // Read the reservation BEFORE the catalog: it is released only after its row has committed, so one of the
+        // two reads always sees the job.
+        var reserved = _jobIds.Find(jobId);
         return ReadCatalog(conn =>
         {
             var jobs = new SnapshotJobStore(conn);
             var job = jobs.GetJob(jobId);
-            return job is null ? null : StatusOf(conn, jobs, job);
+            return job is not null ? StatusOf(conn, jobs, job) : ReservedStatus(reserved);
         });
     }
 
     /// <summary>
     /// The full status of a job (with diagnostics) by snapshot identity hash — null when unknown. Served from
-    /// an independent read connection (issue #148).
+    /// an independent read connection (issue #148). Like <see cref="GetStatus"/>, a reserved job id resolves as
+    /// <c>queued</c> (issue #158).
     /// </summary>
     public JobStatusResult? GetStatusByIdentity(string identityHash)
     {
+        var reserved = _jobIds.Find(identityHash);
         return ReadCatalog(conn =>
         {
             var jobs = new SnapshotJobStore(conn);
             var job = jobs.GetJobByIdentity(identityHash);
-            return job is null ? null : StatusOf(conn, jobs, job);
+            return job is not null ? StatusOf(conn, jobs, job) : ReservedStatus(reserved);
         });
     }
+
+    // A job id handed out before its row exists (issue #158): queued, described by what the ensure submitted.
+    private static JobStatusResult? ReservedStatus(JobIdReservations.Reservation? reserved) => reserved is null
+        ? null
+        : new JobStatusResult
+        {
+            Job = new SnapshotJobRow
+            {
+                Id = reserved.Id,
+                IdentityHash = reserved.IdentityHash,
+                RepositoryUrl = reserved.RepositoryUrl,
+                CommitSha = reserved.CommitSha,
+                BranchName = reserved.BranchName,
+                Status = SnapshotJobStatus.Queued,
+                CreatedAt = reserved.CreatedAt,
+                UpdatedAt = reserved.CreatedAt
+            },
+            Diagnostics = [],
+            Coverage = null
+        };
 
     // Like Attach, the reported verdict never contradicts the durable coverage.
     private static JobStatusResult StatusOf(SqliteConnection conn, SnapshotJobStore jobs, SnapshotJobRow job)
@@ -1490,20 +1675,100 @@ public sealed partial class SnapshotService : IDisposable
     /// <see cref="RetireBranchRequest.ExpectedHeadCommit"/> is present the branch is retired only while
     /// <see cref="SnapshotStore.BranchHeadMatches"/> passes, so a newer push that re-created the branch is
     /// never retired (<see cref="BranchGuardReason.HeadMismatch"/>). The decision, the delete and the
-    /// <c>retire</c> audit row commit in ONE write transaction under the single writer. The caller's
-    /// <paramref name="cancellationToken"/> bounds only the wait for the writer (a running production holds
-    /// it), like <see cref="RunRetentionAsync"/>; a retirement that never acquired it changed nothing.
-    /// The host applies the repository URL policy before calling this.
+    /// <c>retire</c> audit row commit in ONE write transaction under the single writer, so both guards are evaluated
+    /// when the retirement APPLIES, never when it was submitted.
+    /// <para>
+    /// Issue #158: the retirement is a service-owned operation. It takes its turn on the writer when submitted
+    /// (ensures and retires apply in submission order) and applies once the writer frees, even after this caller has
+    /// gone: <paramref name="cancellationToken"/> only bounds this caller's wait. An identical retirement (same
+    /// repository, branch, guard and caller) submitted while one is still waiting, with no other write admitted in
+    /// between, is coalesced into it and shares its result and its single audit row. A retirement submitted after
+    /// shutdown began throws <see cref="OperationCanceledException"/> on the service lifetime. The host applies the
+    /// repository URL policy before calling this; it uses <see cref="BeginRetireBranchAsync"/> to bound its wait.
+    /// </para>
     /// </summary>
-    public async Task<RetireBranchResult> RetireBranchAsync(
+    public Task<RetireBranchResult> RetireBranchAsync(
+        RetireBranchRequest request, AuditCaller principal = default, CancellationToken cancellationToken = default) =>
+        WaitForCallerAsync(StartRetire(request, principal), cancellationToken);
+
+    /// <summary>
+    /// <see cref="RetireBranchAsync"/> with a bounded wait (issue #158, <c>POST /control/branches/retire</c>): the
+    /// retirement's result when it applies within <see cref="ServiceOptions.ControlWriteWait"/>, else null — the
+    /// retirement stays queued and applies once the writer frees (a running production holds it for its whole run),
+    /// with its guards evaluated and its audit row written then. <paramref name="cancellationToken"/> only bounds
+    /// this caller's wait; it never cancels the retirement.
+    /// </summary>
+    public async Task<RetireBranchResult?> BeginRetireBranchAsync(
         RetireBranchRequest request, AuditCaller principal = default, CancellationToken cancellationToken = default)
+    {
+        var retire = StartRetire(request, principal);
+        if (!retire.IsCompleted)
+        {
+            await ((Task)retire).WaitAsync(_options.ControlWriteWait, cancellationToken)
+                .ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+            if (!retire.IsCompleted)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                return null;
+            }
+        }
+        return await retire.ConfigureAwait(false);
+    }
+
+    // Admits one retirement as a service-owned operation on its own write-gate turn (issue #158), or coalesces it into
+    // the identical retirement still waiting when no other write was admitted after it (applying both would change
+    // nothing more, so it shares that one's result and audit row). Admission is atomic with Dispose's drain snapshot.
+    private Task<RetireBranchResult> StartRetire(RetireBranchRequest request, AuditCaller principal)
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentException.ThrowIfNullOrEmpty(request.Repository);
         ArgumentException.ThrowIfNullOrEmpty(request.Branch);
-        using var activity = ServiceTelemetry.Source.StartActivity("retire_branch");
-        return await WithWriteAsync(
-            () => Task.FromResult(RetireBranchLocked(request, principal)), cancellationToken).ConfigureAwait(false);
+        var key = new RetireKey(request.Repository, request.Branch, request.ExpectedHeadCommit, principal.Principal);
+        PendingRetire entry;
+        lock (_inFlightLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            ThrowIfStopping();
+            if (_pendingRetire is { } pending && pending.Key == key && pending.Admission == Interlocked.Read(ref _writeAdmissions))
+                return pending.Retire;
+
+            var turn = TakeWriteTurnLocked(out var admission);
+            entry = new PendingRetire(key, admission);
+            // Published under the lock BEFORE the retirement can clear it (it takes the same lock).
+            entry.Retire = Task.Run(() => ApplyRetireAsync(request, principal, entry, turn), CancellationToken.None);
+            _pendingRetire = entry;
+            _operations.Add(entry.Retire);
+        }
+        _ = entry.Retire.ContinueWith(
+            t =>
+            {
+                lock (_inFlightLock)
+                    _operations.Remove(t);
+                _ = t.Exception;
+            },
+            CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        return entry.Retire;
+    }
+
+    private async Task<RetireBranchResult> ApplyRetireAsync(
+        RetireBranchRequest request, AuditCaller principal, PendingRetire entry, Task turn)
+    {
+        await turn.ConfigureAwait(false);
+        try
+        {
+            lock (_inFlightLock)
+            {
+                if (ReferenceEquals(_pendingRetire, entry))
+                    _pendingRetire = null;
+            }
+            using var activity = ServiceTelemetry.Source.StartActivity("retire_branch");
+            EnsureLeaseHeld();
+            return RetireBranchLocked(request, principal);
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
     }
 
     private RetireBranchResult RetireBranchLocked(RetireBranchRequest request, AuditCaller principal)
@@ -1995,6 +2260,7 @@ public sealed partial class SnapshotService : IDisposable
     {
         // Synchronous callers only (startup reconcile, the sync retention/backup/PR-root APIs): request threads
         // use WithWriteAsync with their own token (issue #148), so this explicitly opts out of cancellation.
+        Interlocked.Increment(ref _writeAdmissions);
         _writeGate.Wait(CancellationToken.None);
         try
         {
@@ -2009,6 +2275,8 @@ public sealed partial class SnapshotService : IDisposable
 
     private async Task<T> WithWriteAsync<T>(Func<Task<T>> work, CancellationToken cancellationToken = default)
     {
+        // Counted like a control write's turn, so a retirement is never coalesced across another write (issue #158).
+        Interlocked.Increment(ref _writeAdmissions);
         await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -2023,6 +2291,10 @@ public sealed partial class SnapshotService : IDisposable
 
     // True once this instance may no longer write: the lease was stolen (issue #38) or released by Dispose.
     internal bool LeaseLost => _lease.IsLost || _leaseReleased;
+
+    // How many writes have been admitted to the write gate so far (issue #158); lets a test tell that a control write
+    // has been submitted before its caller goes away.
+    internal long WriteAdmissions => Interlocked.Read(ref _writeAdmissions);
 
     // Fail closed if this instance lost the single-writer lease (it expired and another writer stole it):
     // writing anyway would race the new owner on one SQLite database (issue #38).
@@ -2095,6 +2367,19 @@ public sealed partial class SnapshotService : IDisposable
     {
         public long JobId { get; } = jobId;
         public Task<EnsureSnapshotResult> Production { get; set; } = null!;
+    }
+
+    // What makes two retirements identical (issue #158): same repository and branch spelling, same CAS guard, same
+    // audit actor. Spellings are compared exactly, so two spellings of one repository simply are not coalesced.
+    private readonly record struct RetireKey(string Repository, string Branch, string? ExpectedHeadCommit, string? Actor);
+
+    // A retirement waiting for (or holding) its write-gate turn (issue #158). Admission is the write-admission count
+    // its own turn produced; Retire is assigned under _inFlightLock before the entry is published.
+    private sealed class PendingRetire(RetireKey key, long admission)
+    {
+        public RetireKey Key { get; } = key;
+        public long Admission { get; } = admission;
+        public Task<RetireBranchResult> Retire { get; set; } = null!;
     }
 }
 
