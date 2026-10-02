@@ -401,6 +401,24 @@ public sealed class ContributionIngestTests
     }
 
     [TestMethod]
+    public async Task An_ingest_that_rolls_back_after_registering_its_job_leaves_no_job_behind()
+    {
+        // The job row is registered inside the ingest transaction, before validation. When validation then throws,
+        // the transaction rolls back, and the id reserved for the row must go with it (issue #158): the identity
+        // reads as unknown, never as a queued job that nothing will ever run.
+        var service = Start(
+            policy: new ContributionPolicy { RequireAuthorization = true },
+            authorizer: new ThrowingAuthorizer());
+        var artifact = ContributionTestFixtures.BuildArtifact(Repo, Commit, CapLinux, [new PayloadProjectSpec("src/App/App.csproj", "net8.0")]);
+
+        var result = await service.IngestContributionAsync(new IngestContributionRequest { Artifact = artifact.ToArray(), Token = "bearer-xyz" });
+
+        Assert.AreEqual(ContributionRejectionCode.MalformedArtifact, result.RejectionCode);
+        Assert.IsNotNull(result.IdentityHash);
+        Assert.IsNull(service.GetStatusByIdentity(result.IdentityHash));
+    }
+
+    [TestMethod]
     public async Task Missing_token_is_rejected_when_authorization_required()
     {
         // A REAL authorizer is wired (satisfying the fail-closed Start guard); the token-presence gate must
@@ -576,6 +594,12 @@ public sealed class ContributionIngestTests
     private sealed class AllowingAuthorizer : IContributionAuthorizer
     {
         public ContributionAuthorization Authorize(ContributionAuthContext context) => ContributionAuthorization.Allow();
+    }
+
+    private sealed class ThrowingAuthorizer : IContributionAuthorizer
+    {
+        public ContributionAuthorization Authorize(ContributionAuthContext context) =>
+            throw new InvalidOperationException("the authorizer failed");
     }
 
     private sealed class FixedGitContentProvider(GitContentCheck answer) : IGitContentProvider
