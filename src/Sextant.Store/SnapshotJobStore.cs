@@ -86,10 +86,12 @@ public sealed class SnapshotJobStore(SqliteConnection connection)
     /// Idempotently attaches to (or creates) the job for <paramref name="identityHash"/>. A repeated call
     /// with the same identity returns the SAME job row (criterion 1) without disturbing its status or
     /// resetting an in-flight/terminal run — only <c>updated_at</c> is bumped so "last requested" is
-    /// observable. Returns the current row and whether it already existed.
+    /// observable. Returns the current row and whether it already existed. A new row takes
+    /// <paramref name="id"/> when one is given (the service hands out a job id before the row can be written,
+    /// issue #158); otherwise SQLite assigns the next rowid.
     /// </summary>
     public (SnapshotJobRow job, bool existed) EnsureJob(
-        string identityHash, string repositoryUrl, string commitSha, string? branchName)
+        string identityHash, string repositoryUrl, string commitSha, string? branchName, long? id = null)
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         long existingId;
@@ -114,18 +116,27 @@ public sealed class SnapshotJobStore(SqliteConnection connection)
         using var insert = connection.CreateCommand();
         insert.CommandText = """
             INSERT INTO snapshot_jobs
-                (identity_hash, repository_url, commit_sha, branch_name, status, attempts, created_at, updated_at)
-            VALUES (@h, @repo, @commit, @branch, @status, 0, @now, @now)
+                (id, identity_hash, repository_url, commit_sha, branch_name, status, attempts, created_at, updated_at)
+            VALUES (@id, @h, @repo, @commit, @branch, @status, 0, @now, @now)
             RETURNING id;
             """;
+        insert.Parameters.AddWithValue("@id", (object?)id ?? DBNull.Value);
         insert.Parameters.AddWithValue("@h", identityHash);
         insert.Parameters.AddWithValue("@repo", repositoryUrl);
         insert.Parameters.AddWithValue("@commit", commitSha);
         insert.Parameters.AddWithValue("@branch", (object?)branchName ?? DBNull.Value);
         insert.Parameters.AddWithValue("@status", SnapshotJobStatus.Queued);
         insert.Parameters.AddWithValue("@now", now);
-        var id = Convert.ToInt64(insert.ExecuteScalar()!);
-        return (GetJob(id)!, false);
+        var newId = Convert.ToInt64(insert.ExecuteScalar()!);
+        return (GetJob(newId)!, false);
+    }
+
+    /// <summary>The highest job id in the ledger, or 0 when it is empty.</summary>
+    public long MaxJobId()
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT COALESCE(MAX(id), 0) FROM snapshot_jobs;";
+        return Convert.ToInt64(cmd.ExecuteScalar()!);
     }
 
     public SnapshotJobRow? GetJob(long id)
