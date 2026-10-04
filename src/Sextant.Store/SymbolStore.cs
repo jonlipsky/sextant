@@ -289,7 +289,7 @@ public sealed class SymbolStore(SqliteConnection connection)
     public List<long> GetScopedProjectIds()
     {
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = "SELECT id FROM projects" + Scope.Where("id") + " ORDER BY id;";
+        cmd.CommandText = Scope.ProjectIdsQuery;
         Scope.Bind(cmd);
         var ids = new List<long>();
         using var reader = cmd.ExecuteReader();
@@ -317,20 +317,23 @@ public sealed class SymbolStore(SqliteConnection connection)
         if (pids is null)
             return [];
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = $"""
-            {SelectColumns}
-            FROM json_each(@pids) __pid
-            CROSS JOIN symbols s INDEXED BY ix_symbols_project_name_nocase{SymbolJoins}
-            WHERE s.project_id = __pid.value
-              AND s.display_name COLLATE NOCASE = @name{KindClause(kinds)}
-            ORDER BY s.project_id, s.id
-            LIMIT @limit;
-            """;
+        cmd.CommandText = ByDisplayNameSql;
         cmd.Parameters.AddWithValue("@pids", pids);
         cmd.Parameters.AddWithValue("@name", name);
+        BindKinds(cmd, kinds);
         cmd.Parameters.AddWithValue("@limit", limit);
         return ReadAll(cmd);
     }
+
+    private const string ByDisplayNameSql = $"""
+        {SelectColumns}
+        FROM json_each(@pids) __pid
+        CROSS JOIN symbols s INDEXED BY ix_symbols_project_name_nocase{SymbolJoins}
+        WHERE s.project_id = __pid.value
+          AND s.display_name COLLATE NOCASE = @name{KindFilter}
+        ORDER BY s.project_id, s.id
+        LIMIT @limit;
+        """;
 
     /// <summary>
     /// The symbols whose <c>display_name</c> starts with <paramref name="prefix"/> ignoring ASCII case (the
@@ -347,27 +350,42 @@ public sealed class SymbolStore(SqliteConnection connection)
             return [];
         var range = NoCasePrefixRange.Of(prefix);
         using var cmd = connection.CreateCommand();
-        var hi = range.Hi is null ? string.Empty : "\n  AND s.display_name COLLATE NOCASE < @hi";
-        cmd.CommandText = $"""
-            {SelectColumns}
-            FROM json_each(@pids) __pid
-            CROSS JOIN symbols s INDEXED BY ix_symbols_project_name_nocase{SymbolJoins}
-            WHERE s.project_id = __pid.value
-              AND s.display_name COLLATE NOCASE >= @lo{hi}{KindClause(kinds)}
-            ORDER BY s.project_id, s.id
-            LIMIT @limit;
-            """;
+        cmd.CommandText = range.Hi is null ? ByDisplayNameFromSql : ByDisplayNameRangeSql;
         cmd.Parameters.AddWithValue("@pids", pids);
         cmd.Parameters.AddWithValue("@lo", range.Lo);
         if (range.Hi is not null)
             cmd.Parameters.AddWithValue("@hi", range.Hi);
+        BindKinds(cmd, kinds);
         cmd.Parameters.AddWithValue("@limit", limit);
         return ReadAll(cmd);
     }
 
+    // The prefix's NOCASE range [@lo, @hi); a prefix with no upper bound (NoCasePrefixRange.Hi null) reads from @lo on.
+    private const string ByDisplayNameRangeSql = $"""
+        {SelectColumns}
+        FROM json_each(@pids) __pid
+        CROSS JOIN symbols s INDEXED BY ix_symbols_project_name_nocase{SymbolJoins}
+        WHERE s.project_id = __pid.value
+          AND s.display_name COLLATE NOCASE >= @lo
+          AND s.display_name COLLATE NOCASE < @hi{KindFilter}
+        ORDER BY s.project_id, s.id
+        LIMIT @limit;
+        """;
+
+    private const string ByDisplayNameFromSql = $"""
+        {SelectColumns}
+        FROM json_each(@pids) __pid
+        CROSS JOIN symbols s INDEXED BY ix_symbols_project_name_nocase{SymbolJoins}
+        WHERE s.project_id = __pid.value
+          AND s.display_name COLLATE NOCASE >= @lo{KindFilter}
+        ORDER BY s.project_id, s.id
+        LIMIT @limit;
+        """;
+
     /// <summary>
     /// The symbols of <paramref name="projectId"/> whose <c>symbol_key</c> starts with <paramref name="keyPrefix"/>
-    /// (binary, case-sensitive), ordered by key; at most <paramref name="limit"/> rows. One range seek of the unique
+    /// (binary, case-sensitive), ordered by key; at most <paramref name="limit"/> rows, and none when the project is
+    /// outside the scoped project versions (<see cref="GetScopedProjectIds"/>). One range seek of the unique
     /// <c>(project_id, symbol_key)</c> index. With documentation-ID keys, <c>M:Ns.Type.</c> covers every method of the
     /// type across all its partial declarations; the caller filters nested members out.
     /// </summary>
@@ -377,22 +395,28 @@ public sealed class SymbolStore(SqliteConnection connection)
         var last = keyPrefix[^1];
         if (char.IsSurrogate(last) || last == char.MaxValue)
             return [];
+        var pids = ProjectIdsJson([projectId]);
+        if (pids is null)
+            return [];
         var hi = keyPrefix[..^1] + (char)(last + 1);
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = $"""
-            {SelectColumns}
-            FROM symbols s INDEXED BY ix_symbols_key{SymbolJoins}{Scope.Join("s.project_id")}
-            WHERE s.project_id = @project_id
-              AND s.symbol_key >= @lo AND s.symbol_key < @hi
-            ORDER BY s.symbol_key
-            LIMIT @limit;
-            """;
-        cmd.Parameters.AddWithValue("@project_id", projectId);
+        cmd.CommandText = ByKeyPrefixSql;
+        cmd.Parameters.AddWithValue("@pids", pids);
         cmd.Parameters.AddWithValue("@lo", keyPrefix);
         cmd.Parameters.AddWithValue("@hi", hi);
         cmd.Parameters.AddWithValue("@limit", limit);
         return ReadAll(cmd);
     }
+
+    private const string ByKeyPrefixSql = $"""
+        {SelectColumns}
+        FROM json_each(@pids) __pid
+        CROSS JOIN symbols s INDEXED BY ix_symbols_key{SymbolJoins}
+        WHERE s.project_id = __pid.value
+          AND s.symbol_key >= @lo AND s.symbol_key < @hi
+        ORDER BY s.symbol_key
+        LIMIT @limit;
+        """;
 
     /// <summary>
     /// The symbols whose <c>symbol_key</c> is exactly <paramref name="symbolKey"/> in the scoped project versions
@@ -433,10 +457,14 @@ public sealed class SymbolStore(SqliteConnection connection)
         return list.Count == 0 ? null : "[" + string.Join(",", list) + "]";
     }
 
-    private static string KindClause(IReadOnlyCollection<SymbolKind>? kinds) =>
-        kinds is null || kinds.Count == 0
-            ? string.Empty
-            : $"\n  AND s.kind IN ({string.Join(",", kinds.Select(k => (int)k).Distinct().Order())})";
+    // A kind filter bound as a JSON array of SymbolKind ordinals (@kinds NULL = every kind), so the lookups stay one
+    // constant statement whatever the filter.
+    private const string KindFilter = "\n      AND (@kinds IS NULL OR s.kind IN (SELECT value FROM json_each(@kinds)))";
+
+    private static void BindKinds(SqliteCommand cmd, IReadOnlyCollection<SymbolKind>? kinds) =>
+        cmd.Parameters.AddWithValue("@kinds", kinds is null || kinds.Count == 0
+            ? (object)DBNull.Value
+            : "[" + string.Join(",", kinds.Select(k => (int)k).Distinct().Order()) + "]");
 
     private static readonly int[] TypeKindOrdinals =
     {

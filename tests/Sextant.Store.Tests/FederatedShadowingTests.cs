@@ -143,6 +143,56 @@ public class FederatedShadowingTests
 
     // ==== helpers =================================================================================
 
+    // ==== Scoped project listing ===================================================================
+
+    [TestMethod]
+    public void ProjectIdsQuery_ReadsExactlyTheProjectsTheScopesWhereClauseReads_InEveryMode()
+    {
+        // The name/key lookups list the scoped project versions through ProjectIdsQuery, one constant statement per
+        // scope mode; it must select exactly what the scope's Where fragment selects.
+        var s = SeedBaseAndOverlay();
+        var legacy = new ProjectStore(_conn).Insert(new ProjectIdentity
+        {
+            CanonicalId = "legacy_C",
+            GitRemoteUrl = RepoUrl,
+            RepoRelativePath = "src/C/C.csproj",
+            TargetFramework = "net10.0"
+        }, lastIndexedAt: 1);
+
+        var scopes = new (string Name, SnapshotReadScope Scope)[]
+        {
+            ("unscoped", SnapshotReadScope.Unscoped),
+            ("legacy-pinned", SnapshotReadScope.LegacyPinned),
+            ("deny-all", SnapshotReadScope.DenyAll),
+            ("overlay", new SnapshotReadScope(s.OverlayId)),
+            ("base", SnapshotReadScope.ForBaseOf(s.BaseId)),
+            ("overlay-local", SnapshotReadScope.ForOverlayLocalOnly(s.OverlayId)),
+        };
+        foreach (var (name, scope) in scopes)
+        {
+            var expected = ProjectIds("SELECT id FROM projects" + scope.Where("id") + " ORDER BY id;", scope);
+            CollectionAssert.AreEqual(expected, ProjectIds(scope.ProjectIdsQuery, scope), name);
+        }
+
+        CollectionAssert.AreEqual(new[] { legacy }, ProjectIds(SnapshotReadScope.LegacyPinned.ProjectIdsQuery, SnapshotReadScope.LegacyPinned));
+        CollectionAssert.AreEqual(new[] { s.OverlayProjectA },
+            ProjectIds(SnapshotReadScope.ForOverlayLocalOnly(s.OverlayId).ProjectIdsQuery, SnapshotReadScope.ForOverlayLocalOnly(s.OverlayId)));
+        Assert.AreEqual(0, ProjectIds(SnapshotReadScope.DenyAll.ProjectIdsQuery, SnapshotReadScope.DenyAll).Count);
+    }
+
+    // ==== helpers =================================================================================
+
+    private List<long> ProjectIds(string sql, SnapshotReadScope scope)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = sql;
+        scope.Bind(cmd);
+        var ids = new List<long>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read()) ids.Add(reader.GetInt64(0));
+        return ids;
+    }
+
     private const string RepoUrl = "https://github.com/org/fed-repo";
 
     private sealed record Scenario(
