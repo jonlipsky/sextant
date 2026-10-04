@@ -143,6 +143,37 @@ public class ConfigurationTests
     }
 
     [TestMethod]
+    public void Load_WithLegacyLlmAssistSection_IgnoresItAndAppliesTheRest()
+    {
+        // research_codebase and its LLM assist config were removed. A config that still carries the section the old
+        // `sextant config llm` wrote (and the old docs told users to add) must load as before, the section ignored.
+        var json = """
+        {
+            "db_path": "legacy.db",
+            "fts_max_results": 40,
+            "solutions": ["src/App.sln"],
+            "llm_assist": {
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-20250514",
+                "base_url": "https://api.anthropic.com",
+                "api_key_env": "ANTHROPIC_API_KEY",
+                "max_tool_calls": 15,
+                "enabled": true
+            }
+        }
+        """;
+        File.WriteAllText(Path.Combine(_tempDir, "sextant.json"), json);
+
+        var config = SextantConfiguration.Load(_tempDir);
+        Assert.AreEqual("legacy.db", config.DbPath, "the file parsed: a parse failure would fall back to defaults");
+        Assert.AreEqual(40, config.FtsMaxResults);
+        CollectionAssert.AreEqual(new[] { "src/App.sln" }, config.Solutions.ToArray());
+
+        Assert.IsTrue(SextantConfiguration.TryReadCheckoutSolutions(_tempDir, out var solutions, out var error), error);
+        CollectionAssert.AreEqual(new[] { "src/App.sln" }, solutions.ToList());
+    }
+
+    [TestMethod]
     public void Load_WithCommentsAndTrailingCommas_ParsesSuccessfully()
     {
         var json = """

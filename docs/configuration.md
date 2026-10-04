@@ -48,7 +48,9 @@ All fields are optional — Sextant uses sensible defaults.
 | `remote_fetch_timeout_seconds` | int | `10` | Per-request timeout for a remote federation fetch before falling back to the cached base or reporting the peer unavailable (issue #60). |
 | `peer_query_token` | string | (none) | Shared Bearer query token presented to every configured peer's query plane (issue #60). Null presents no token. |
 | `retention` | object | — | Retention limits for superseded generations, API history, and source blobs (see [Retention](#retention)). |
-| `llm_assist` | object | — | LLM assist config (see [LLM Assist Configuration](#llm-assist-configuration)). |
+
+Unknown fields are ignored. A leftover `llm_assist` section from the removed `research_codebase` tool is
+ignored too, as is `~/.sextant/sextant.json`, which only held that section; delete either at your leisure.
 
 > The standalone index service (`sextant service`) is configured separately via `SEXTANT_SERVICE_*`
 > environment variables — see [service.md](service.md). It is additive and never required for local
@@ -193,62 +195,6 @@ warmed page is cached by immutable snapshot identity, so once fetched a base kee
 (`meta.snapshot.origin` = `local`/`remote`, `base_identity_hash`) records where the rows came from. A single
 shared token is used for all peers today; per-peer tokens are a tracked follow-up.
 
-## LLM Assist Configuration
-
-The `research_codebase` tool requires an LLM to synthesize answers. Run the interactive setup wizard:
-
-```bash
-sextant config llm
-```
-
-This prompts for provider, model, API key, and other settings, then saves to `sextant.json`.
-
-### Non-Interactive Setup
-
-```bash
-# Set provider and model
-sextant config llm set --provider anthropic --model claude-sonnet-4-20250514
-
-# Set which env var holds your API key
-sextant config llm set --api-key-env ANTHROPIC_API_KEY
-
-# Or use an OpenAI-compatible provider
-sextant config llm set --provider openai-compatible --model gpt-4o --base-url https://api.openai.com/v1
-
-# Enable/disable
-sextant config llm set --enabled true
-
-# Show current configuration
-sextant config llm --show
-```
-
-### Direct JSON Configuration
-
-Add the `llm_assist` section to `sextant.json`:
-
-```json
-{
-  "llm_assist": {
-    "provider": "anthropic",
-    "model": "claude-sonnet-4-20250514",
-    "api_key_env": "ANTHROPIC_API_KEY",
-    "max_tool_calls": 15,
-    "enabled": true
-  }
-}
-```
-
-### LLM Environment Variables
-
-| Variable | Description |
-|---|---|
-| `SEXTANT_LLM_API_KEY` | API key (highest priority, overrides all other key sources) |
-| `SEXTANT_LLM_API_KEY_ENV` | Name of env var containing the API key |
-| `SEXTANT_LLM_PROVIDER` | Provider override (`anthropic` or `openai-compatible`) |
-| `SEXTANT_LLM_MODEL` | Model override |
-| `SEXTANT_LLM_BASE_URL` | Base URL override |
-| `SEXTANT_LLM_MAX_CALLS` | Max tool calls override |
-
 ## CLI Reference
 
 ```
@@ -267,9 +213,6 @@ sextant daemon status                            Check if daemon is running
 sextant daemon stop                              Stop the running daemon
 sextant profiles                                 List index slots + the active indexing profile/features/hash
 sextant retention [--execute]                    Report (dry-run) or apply local retention (see runbooks.md)
-sextant config llm                               Interactive LLM configuration setup
-sextant config llm --show                        Show current LLM configuration
-sextant config llm set [options]                 Set LLM config non-interactively
 ```
 
 `sextant contribute` (Phase 16) produces a deterministic semantic contribution for the committed source and

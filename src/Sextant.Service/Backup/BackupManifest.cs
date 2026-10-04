@@ -5,7 +5,7 @@ namespace Sextant.Service.Backup;
 /// when it was taken, the catalog SCHEMA version it was taken at (so a restore can refuse to load a
 /// backup produced by a NEWER build than the restoring code), the relative locations of the backed-up
 /// catalog and immutable-artifact volume, a configuration fingerprint, and — importantly — a
-/// CREDENTIALS BOUNDARY note. Secrets (control/query/contribute tokens, LLM API keys) are NEVER written
+/// CREDENTIALS BOUNDARY note. Secrets (control/query/contribute tokens, caller keys) are NEVER written
 /// into a backup; the manifest instead lists the environment variables an operator must re-provide on
 /// restore, so the backup is safe at rest and the restore is reproducible.
 /// </summary>
@@ -35,7 +35,6 @@ public sealed record BackupManifest
         "SEXTANT_SERVICE_CONTRIBUTE_TOKEN",
         "SEXTANT_SERVICE_READ_POLICY",
         "SEXTANT_SERVICE_DELEGATE_TOKENS",
-        "SEXTANT_SERVICE_CALLER_KEYS",
-        "SEXTANT_LLM_API_KEY"
+        "SEXTANT_SERVICE_CALLER_KEYS"
     ];
 }
