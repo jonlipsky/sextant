@@ -187,7 +187,8 @@ public class McpClientCompatibilityTests
         Assert.AreEqual(1, Results(granted.Text), $"the granted caller reads the repository: {granted.Text}");
 
         var other = await FindAs("user-2");
-        Assert.IsFalse(other.IsError, other.Text);
+        Assert.IsTrue(other.IsError, other.Text);
+        StringAssert.Contains(other.Text, "\"repository_not_found\"", "another caller gets the uniform not-found");
         Assert.AreEqual(0, Results(other.Text), $"another caller on the same client reads nothing: {other.Text}");
 
         var again = await FindAs("user-1");
@@ -202,7 +203,7 @@ public class McpClientCompatibilityTests
         var concurrent = await Task.WhenAll(subjects.Select(sub => Task.Run(() => FindAs(sub))));
         for (var i = 0; i < subjects.Length; i++)
         {
-            Assert.IsFalse(concurrent[i].IsError, concurrent[i].Text);
+            Assert.AreEqual(subjects[i] != "user-1", concurrent[i].IsError, concurrent[i].Text);
             Assert.AreEqual(subjects[i] == "user-1" ? 1 : 0, Results(concurrent[i].Text),
                 $"concurrent call {i} as {subjects[i]}: {concurrent[i].Text}");
         }

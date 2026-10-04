@@ -236,13 +236,33 @@ public class ToolArgumentSelectionHttpTests
         var call = await host.CallAsync("find_symbol",
             new() { ["name"] = "global::App.Type0", ["repository"] = Widgets, ["branch"] = "no-such-branch" });
 
-        Assert.IsFalse(call.IsError);
+        Assert.IsTrue(call.IsError, call.Body.ToString());
+        Assert.AreEqual(ResponseBuilder.RepositoryNotFoundCode, ErrorCode(call.Body));
         Assert.AreEqual(0, call.Body.GetProperty("meta").GetProperty("result_count").GetInt32());
         Assert.AreEqual(
             JsonDocument.Parse(ResponseBuilder.BuildBranchSelectionUnresolved()).RootElement.GetProperty("message").GetString(),
             call.Body.GetProperty("message").GetString());
         var text = call.Body.ToString();
         Assert.IsFalse(text.Contains("no-such-branch") || text.Contains("widgets"), "nothing requested is echoed");
+    }
+
+    [TestMethod]
+    public async Task Call_UnindexedRepository_WithoutReadPolicy_IsActionableAndNotEchoed()
+    {
+        // #163: naming a repository with no complete snapshot is a tool error, never an empty success that a
+        // client reads as "no matches".
+        await using var host = await Harness.StartAsync(requireSelection: true);
+
+        var call = await host.CallAsync("find_symbol",
+            new() { ["name"] = "global::App.Type0", ["repository"] = "https://github.com/acme/not-indexed" });
+
+        Assert.IsTrue(call.IsError, call.Body.ToString());
+        Assert.AreEqual(ResponseBuilder.RepositoryNotFoundCode, ErrorCode(call.Body));
+        Assert.AreEqual(0, call.Body.GetProperty("meta").GetProperty("result_count").GetInt32());
+        Assert.AreEqual(
+            JsonDocument.Parse(ResponseBuilder.BuildSelectionUnresolved()).RootElement.GetProperty("message").GetString(),
+            call.Body.GetProperty("message").GetString());
+        Assert.IsFalse(call.Body.ToString().Contains("not-indexed"), "the requested repository is not echoed");
     }
 
     [TestMethod]

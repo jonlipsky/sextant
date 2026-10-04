@@ -267,13 +267,17 @@ public class FederatedReadContextTests
         Assert.IsFalse(denied, "an unauthorized read does not resolve");
 
         // Phase 17, criterion 1 (revised from the Phase-11 `authorization_denied` structured error): a
-        // denial now returns the SINGLE uniform not-found — no error block, no code — so it is
-        // byte-indistinguishable from a nonexistent/unprovisioned index. The old distinct
-        // `authorization_denied` code was itself an existence/authorization oracle (it told an
-        // unauthorized caller "this exists but you may not see it"); the uniform not-found reveals nothing.
+        // denial returns the SINGLE uniform not-found — the one `repository_not_found` code every case
+        // shares, never a distinct denial code — so it is byte-indistinguishable from a nonexistent/unprovisioned
+        // index. The old distinct `authorization_denied` code was itself an existence/authorization oracle (it
+        // told an unauthorized caller "this exists but you may not see it"); a shared code reveals nothing.
         var meta = JsonDocument.Parse(errorResponse).RootElement.GetProperty("meta");
-        Assert.IsFalse(meta.TryGetProperty("error", out _),
-            "the denial must NOT carry a distinct error code — that would be an authz/existence oracle");
+        Assert.AreEqual(ResponseBuilder.RepositoryNotFoundCode, meta.GetProperty("error").GetProperty("code").GetString(),
+            "the denial carries only the uniform not-found code, never a distinct (oracle) denial code");
+        Assert.AreEqual(
+            JsonDocument.Parse(ResponseBuilder.BuildNotFound()).RootElement.GetProperty("message").GetString(),
+            JsonDocument.Parse(errorResponse).RootElement.GetProperty("message").GetString(),
+            "the denial is the uniform not-found");
         Assert.AreEqual(0, meta.GetProperty("result_count").GetInt32());
         Assert.IsFalse(meta.TryGetProperty("snapshot", out _),
             "a denied read stamps no provenance (no existence/freshness signal leaks)");

@@ -110,6 +110,31 @@ public class QueryToolInputResolutionHttpTests
         StringAssert.Contains(description, "repository_required");
     }
 
+    [TestMethod]
+    public async Task NamedRepositoryTheCallerCannotRead_IsAToolError_IndistinguishableFromAnAbsentOne()
+    {
+        // Solo can read only the library: acme/widgets is indexed but not granted to it, acme/absent does not exist,
+        // and the library has no 'no-such-branch'. Each is the ONE uniform repository_not_found error, so a wrong
+        // repository is never read as "no matches", and nothing tells an indexed repository from an absent one.
+        var ungranted = await CallAsync("find_symbol", """{"name":"Circle","repository":"acme/widgets"}""", Solo);
+        var absent = await CallAsync("find_symbol", """{"name":"Circle","repository":"acme/absent"}""", Solo);
+        var branch = await CallAsync("find_symbol",
+            """{"name":"Circle","repository":"acme/library","branch":"no-such-branch"}""", Solo);
+
+        foreach (var call in new[] { ungranted, absent, branch })
+        {
+            Assert.IsTrue(call.IsError, call.Body.ToString());
+            Assert.AreEqual("repository_not_found", ErrorCode(call.Body));
+            StringAssert.Contains(Message(call.Body), "list_repositories");
+            Assert.AreEqual(0, call.Body.GetProperty("results").GetArrayLength());
+        }
+        Assert.AreEqual(WithoutTimestamp(absent.Body), WithoutTimestamp(ungranted.Body),
+            "an ungranted repository reads exactly like an absent one");
+        Assert.AreEqual(WithoutTimestamp(absent.Body), WithoutTimestamp(branch.Body));
+        Assert.IsFalse(ungranted.Body.ToString().Contains("widgets", StringComparison.OrdinalIgnoreCase),
+            "nothing requested is echoed");
+    }
+
     // ==== #149: an FQN without global:: ===============================================================
 
     [TestMethod]
