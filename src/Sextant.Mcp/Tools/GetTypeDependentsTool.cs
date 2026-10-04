@@ -25,18 +25,23 @@ public static class GetTypeDependentsTool
         var relationshipStore = new RelationshipStore(conn);
         var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
 
-        var resolution = SymbolResolver.Resolve(symbolStore, projectStore, symbol_fqn);
-        if (resolution.Symbol == null)
-            return ResponseBuilder.BuildEmpty("Symbol not found.", readContext.Provenance);
-        var targetSymbol = resolution.Symbol;
-
         RelationshipKind? kindFilter = null;
-        if (dependency_kind != "all")
+        var dependencyText = dependency_kind?.Trim().Replace("_", string.Empty).Replace("-", string.Empty);
+        if (!string.IsNullOrEmpty(dependencyText) && !dependencyText.Equals("all", StringComparison.OrdinalIgnoreCase))
         {
-            if (!Enum.TryParse<RelationshipKind>(dependency_kind, ignoreCase: true, out var parsed))
-                return ResponseBuilder.BuildEmpty($"Invalid dependency_kind: {dependency_kind}", readContext.Provenance);
+            if (!dependencyText.All(char.IsLetter)
+                || !Enum.TryParse<RelationshipKind>(dependencyText, ignoreCase: true, out var parsed))
+                return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode,
+                    $"Unknown dependency_kind '{dependency_kind}'. Use 'inherits', 'implements', 'overrides', " +
+                    "'returns', 'parameter_of', 'instantiates', or 'all'.", readContext.Provenance);
             kindFilter = parsed;
         }
+
+        var lookup = SymbolResolver.Lookup(symbolStore, projectStore, symbol_fqn, SymbolLookupOptions.Types);
+        if (lookup.Status != SymbolLookupStatus.Resolved)
+            return SymbolResolver.ErrorResponse(symbolStore, projectStore, lookup, readContext.Provenance);
+        var targetSymbol = lookup.Symbol!;
+        var namer = new SymbolNamer(symbolStore);
 
         var rels = relationshipStore.GetByToSymbol(targetSymbol.Id, kindFilter);
 
@@ -48,22 +53,17 @@ public static class GetTypeDependentsTool
             var fromSymbol = symbolStore.GetById(rel.FromSymbolId);
             if (fromSymbol == null) continue;
 
-            var containingTypeFqn = GetContainingTypeFqn(fromSymbol);
-            var containingType = containingTypeFqn != fromSymbol.FullyQualifiedName
-                ? symbolStore.GetByFqn(containingTypeFqn, fromSymbol.ProjectId)
-                : fromSymbol;
-
-            var groupSymbol = containingType ?? fromSymbol;
-            // Key by project + FQN so same-named types in different projects are not merged into one
-            // dependent. The containing-type lookup is scoped to the dependent's own project above.
-            var key = $"{groupSymbol.ProjectId}:{groupSymbol.FullyQualifiedName}";
+            var groupSymbol = ContainingType(symbolStore, namer, fromSymbol) ?? fromSymbol;
+            // Key by project + symbol key so same-named types in different projects are not merged into one
+            // dependent. The containing type is looked up in the dependent's own project.
+            var key = $"{groupSymbol.ProjectId}:{groupSymbol.SymbolKey}";
 
             if (!dependentMap.TryGetValue(key, out var info))
             {
                 var s = groupSymbol;
                 info = new DependentInfo
                 {
-                    DependentType = s.FullyQualifiedName,
+                    DependentType = namer.QualifiedName(s),
                     DisplayName = s.DisplayName,
                     Kind = s.Kind.ToString().ToLowerInvariant(),
                     FilePath = s.FilePath,
@@ -76,7 +76,7 @@ public static class GetTypeDependentsTool
             info.Relationships.Add(new
             {
                 kind = rel.Kind.ToString().ToLowerInvariant(),
-                via_member = fromSymbol.FullyQualifiedName != groupSymbol.FullyQualifiedName ? fromSymbol.DisplayName : null,
+                via_member = fromSymbol.Id != groupSymbol.Id ? fromSymbol.DisplayName : null,
                 file_path = fromSymbol.FilePath,
                 line_start = fromSymbol.LineStart
             });
@@ -92,7 +92,27 @@ public static class GetTypeDependentsTool
             relationships = d.Relationships
         }).ToList();
 
-        return ResponseBuilder.Build(results, targetSymbol.LastIndexedAt, resolution.Ambiguity, readContext.Provenance);
+        var empty = results.Count == 0
+            ? $"No indexed type depends on {SymbolResolver.Describe(namer, targetSymbol)}" +
+              (kindFilter is null ? "." : $" through '{dependency_kind!.Trim()}'.")
+            : null;
+        return ResponseBuilder.Build(results, targetSymbol.LastIndexedAt, lookup.Ambiguity, readContext.Provenance,
+            message: ResponseBuilder.JoinMessages(SymbolResolver.ResolutionNote(symbolStore, lookup), empty));
+    }
+
+    // The type declaring a member (from its documentation-ID key; for an index from before those keys, from its fully
+    // qualified name), or null for a type.
+    private static SymbolInfo? ContainingType(SymbolStore store, SymbolNamer namer, SymbolInfo symbol)
+    {
+        if (symbol.Kind is not (SymbolKind.Method or SymbolKind.Constructor or SymbolKind.Property
+            or SymbolKind.Field or SymbolKind.Event or SymbolKind.Indexer))
+            return null;
+        if (namer.ContainingType(symbol) is { } type)
+            return type;
+        var containingTypeFqn = GetContainingTypeFqn(symbol);
+        return containingTypeFqn != symbol.FullyQualifiedName
+            ? store.GetByFqn(containingTypeFqn, symbol.ProjectId)
+            : null;
     }
 
     private static string GetContainingTypeFqn(SymbolInfo symbol)

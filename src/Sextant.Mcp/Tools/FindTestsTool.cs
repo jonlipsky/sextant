@@ -32,7 +32,12 @@ public static class FindTestsTool
         var referenceStore = new ReferenceStore(conn) { Scope = snapshotScope };
         var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
 
-        var testAttributes = GetTestAttributes(framework);
+        var frameworkName = string.IsNullOrWhiteSpace(framework) ? "all" : framework.Trim().ToLowerInvariant();
+        if (frameworkName is not ("all" or "xunit" or "nunit" or "mstest"))
+            return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode,
+                $"Unknown framework '{framework}'. Use 'xunit', 'nunit', 'mstest' or 'all'.", readContext.Provenance);
+
+        var testAttributes = GetTestAttributes(frameworkName);
 
         var allTestMethods = new List<SymbolInfo>();
         foreach (var attr in testAttributes)
@@ -46,14 +51,17 @@ public static class FindTestsTool
 
         var testMethods = allTestMethods;
         SymbolAmbiguity? ambiguity = null;
+        string? message = null;
+        var namer = new SymbolNamer(symbolStore);
+        var referencing = false;
 
         if (for_symbol != null)
         {
-            var resolution = SymbolResolver.Resolve(symbolStore, projectStore, for_symbol);
-            if (resolution.Symbol == null)
-                return ResponseBuilder.BuildEmpty("Symbol not found.", readContext.Provenance);
-            var targetSymbol = resolution.Symbol;
-            ambiguity = resolution.Ambiguity;
+            var lookup = SymbolResolver.Lookup(symbolStore, projectStore, for_symbol);
+            if (lookup.Status != SymbolLookupStatus.Resolved)
+                return SymbolResolver.ErrorResponse(symbolStore, projectStore, lookup, readContext.Provenance);
+            var targetSymbol = lookup.Symbol!;
+            ambiguity = lookup.Ambiguity;
 
             var refs = referenceStore.GetBySymbolId(targetSymbol.Id);
             var testFiles = testMethods.Select(t => t.FilePath).ToHashSet();
@@ -66,37 +74,56 @@ public static class FindTestsTool
                     r.Line >= tm.LineStart &&
                     r.Line <= tm.LineEnd))
                 .ToList();
+            referencing = matchedTests.Count > 0;
 
+            var target = SymbolResolver.Describe(namer, targetSymbol);
             // Fallback: naming convention matching
             if (matchedTests.Count == 0)
             {
-                var targetName = ExtractSimpleName(for_symbol);
+                var targetName = targetSymbol.Kind == SymbolKind.Constructor
+                    ? namer.ContainingType(targetSymbol)?.DisplayName ?? targetSymbol.DisplayName
+                    : targetSymbol.DisplayName;
                 matchedTests = allTestMethods.Where(t =>
                     t.DisplayName.Contains(targetName, StringComparison.OrdinalIgnoreCase) ||
-                    GetContainingTypeName(t.FullyQualifiedName).Contains(targetName, StringComparison.OrdinalIgnoreCase))
+                    TestClassName(namer, t).Contains(targetName, StringComparison.OrdinalIgnoreCase))
                     .ToList();
+                message = matchedTests.Count > 0
+                    ? $"No test method references {target}; these tests are matched by name only."
+                    : $"No test method references {target}, and none is named after it.";
             }
 
+            message = ResponseBuilder.JoinMessages(SymbolResolver.ResolutionNote(symbolStore, lookup), message);
             testMethods = matchedTests;
+        }
+        else if (testMethods.Count == 0)
+        {
+            message = frameworkName == "all"
+                ? "No test methods were found (xUnit [Fact]/[Theory], NUnit [Test]/[TestCase], MSTest [TestMethod])."
+                : $"No {frameworkName} test methods were found.";
         }
 
         testMethods = testMethods.Take(max_results).ToList();
 
         var results = testMethods.Select(t => (object)new
         {
-            fully_qualified_name = t.FullyQualifiedName,
+            fully_qualified_name = namer.QualifiedName(t),
             display_name = t.DisplayName,
             test_framework = DetectFramework(t.Attributes),
-            test_class = GetContainingTypeName(t.FullyQualifiedName),
+            test_class = TestClassName(namer, t),
             file_path = t.FilePath,
             line_start = t.LineStart,
             line_end = t.LineEnd,
-            references_target = for_symbol != null
+            references_target = referencing
         }).ToList();
 
         var freshness = testMethods.Count > 0 ? testMethods.Min(t => t.LastIndexedAt) : 0;
-        return ResponseBuilder.Build(results, freshness, ambiguity, readContext.Provenance);
+        return ResponseBuilder.Build(results, freshness, ambiguity, readContext.Provenance, message: message);
     }
+
+    // The simple name of the class declaring a test method: from its documentation-ID key, else (an index from before
+    // documentation-ID keys) its fully qualified name.
+    private static string TestClassName(SymbolNamer namer, SymbolInfo test) =>
+        namer.ContainingType(test)?.DisplayName ?? GetContainingTypeName(test.FullyQualifiedName);
 
     private static List<string> GetTestAttributes(string framework)
     {
@@ -121,14 +148,6 @@ public static class FindTestsTool
                 "global::Microsoft.VisualStudio.TestTools.UnitTesting.TestMethodAttribute"
             ]
         };
-    }
-
-    private static string ExtractSimpleName(string fqn)
-    {
-        var parenIdx = fqn.IndexOf('(');
-        var nameOnly = parenIdx >= 0 ? fqn[..parenIdx] : fqn;
-        var lastDot = nameOnly.LastIndexOf('.');
-        return lastDot >= 0 ? nameOnly[(lastDot + 1)..] : nameOnly;
     }
 
     private static string GetContainingTypeName(string fqn)

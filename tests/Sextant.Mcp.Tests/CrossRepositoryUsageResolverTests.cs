@@ -21,7 +21,9 @@ public class CrossRepositoryUsageResolverTests
     private SqliteConnection _conn = null!;
 
     private const string ProviderUrl = "https://github.com/org/mixandmatch";
-    private const string ProviderFqn = "global::Mix.Combiner";
+    // The name agents type for the provider method (no `global::`, no parameter list); stored member rows carry a
+    // documentation-ID key and a bare display name, as the extractor writes them.
+    private const string ProviderFqn = "Mix.Combiner.Combine";
     private const string ProviderKey = "M:Mix.Combiner.Combine";
     private const string ProviderCommit = "prov_commit_aaaa";
     private const string AppAUrl = "https://github.com/org/appA";
@@ -129,14 +131,14 @@ public class CrossRepositoryUsageResolverTests
     }
 
     [TestMethod]
-    public void Resolve_FqnMatchingMultipleProviderKeys_UnionsUsages_AndReportsAllDistinctKeys()
+    public void Resolve_NameMatchingMultipleProviderSymbols_IsAmbiguous_AndReadsNoUsages()
     {
-        // A display FQN is NOT a unique identity: two DISTINCT provider stable keys (e.g. overloads) can
-        // share one FQN. The query unions both keys' usages, but must REPORT both keys so the caller can
-        // tell the FQN was ambiguous and narrow by stable key (the tool surfaces this in meta.ambiguous).
+        // A name is NOT a unique identity: two DISTINCT provider stable keys (overloads) share it. Unioning their usages
+        // would answer for a symbol the caller did not name (#163), so the resolver reports the ambiguity with both
+        // symbols and reads no usages; the tool turns that into an ambiguous_symbol error listing them.
         var (providerSnap, providerProj, providerRepo, symbolId1) = SeedProvider();
         const string ProviderKey2 = ProviderKey + "(System.Int32)";
-        var symbolId2 = InsertSymbol(providerProj, ProviderKey2, ProviderFqn);
+        var symbolId2 = InsertSymbol(providerProj, ProviderKey2, "Mix.Combiner.Combine(int)");
 
         SeedConsumer(AppAUrl, "appA_head", "logical_appA", "src/A/UseA.cs", 10,
             providerSnap, providerProj, providerRepo, symbolId1);
@@ -146,13 +148,38 @@ public class CrossRepositoryUsageResolverTests
         var result = CrossRepositoryUsageResolver.Resolve(
             _conn, ProviderUrl, ProviderFqn, CrossRepoUsageScope.DefaultHeads, AllowAllReadAuthorizer.Instance);
 
-        Assert.IsTrue(result.StableIdentityResolved);
-        Assert.AreEqual(2, result.ResolvedSymbolKeyCount, "the ambiguous FQN resolves to BOTH distinct stable keys");
+        Assert.IsTrue(result.Ambiguous);
+        Assert.IsFalse(result.StableIdentityResolved);
+        Assert.AreEqual(2, result.AmbiguousMatchCount);
         CollectionAssert.AreEquivalent(
-            new[] { ProviderKey, ProviderKey2 }, result.ResolvedSymbolKeys.ToArray(),
-            "both distinct provider keys are reported so the caller can disambiguate, not silently merged away");
-        Assert.AreEqual(ProviderKey, result.ResolvedSymbolKeys[0], "keys are returned in a deterministic (symbol_key) order");
-        Assert.AreEqual(2, result.Usages.Count, "usages of both keys are unioned (one per consumer)");
+            new[] { ProviderKey, ProviderKey2 }, result.AmbiguousMatches.Select(s => s.SymbolKey).ToArray(),
+            "both distinct provider symbols are reported so the caller can pick one");
+        Assert.AreEqual(0, result.Usages.Count, "no usages are read for an ambiguous name");
+
+        // Naming one overload (with its parameter list) resolves it, and only its usages are returned.
+        var overload = CrossRepositoryUsageResolver.Resolve(
+            _conn, ProviderUrl, "global::Mix.Combiner.Combine(int)", CrossRepoUsageScope.DefaultHeads,
+            AllowAllReadAuthorizer.Instance);
+        Assert.IsTrue(overload.StableIdentityResolved);
+        CollectionAssert.AreEqual(new[] { ProviderKey2 }, overload.ResolvedSymbolKeys.ToArray());
+        Assert.AreEqual(1, overload.Usages.Count);
+        Assert.AreEqual(AppBUrl, overload.Usages[0].ConsumerRepositoryUrl);
+    }
+
+    [TestMethod]
+    public void Resolve_SymbolOutsideTheProviderRepository_IsNotResolved()
+    {
+        // The name is resolved only among the provider's pinned projects: the same name in a consumer repository is
+        // never taken for the provider's symbol (no FQN-only cross-repo match, #32).
+        SeedProviderAndTwoConsumers();
+        var appProject = new ProjectStore(_conn).GetByCanonicalId("logical_appA")!.Value.id;
+        InsertSymbol(appProject, "M:App.Local.Combine", "App.Local.Combine()");
+
+        var result = CrossRepositoryUsageResolver.Resolve(
+            _conn, ProviderUrl, "App.Local.Combine", CrossRepoUsageScope.DefaultHeads, AllowAllReadAuthorizer.Instance);
+
+        Assert.IsFalse(result.StableIdentityResolved);
+        Assert.IsFalse(result.Ambiguous);
     }
 
     [TestMethod]
@@ -232,7 +259,7 @@ public class CrossRepositoryUsageResolverTests
             new ProjectIdentity { CanonicalId = "logical_mix", GitRemoteUrl = ProviderUrl, RepoRelativePath = "lib/Mix.csproj", TargetFramework = "net10.0" },
             snapId, logicalId, lastIndexedAt: 1);
         store.MapProject(snapId, projectId);
-        var symbolId = InsertSymbol(projectId, ProviderKey, ProviderFqn);
+        var symbolId = InsertSymbol(projectId, ProviderKey, "Mix.Combiner.Combine()");
         store.MarkComplete(snapId, publishedAt: 1);
         return (snapId, projectId, repoId, symbolId);
     }
@@ -279,20 +306,20 @@ public class CrossRepositoryUsageResolverTests
         });
     }
 
-    private long InsertSymbol(long projectId, string symbolKey, string fqn)
+    private long InsertSymbol(long projectId, string symbolKey, string signature)
     {
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = """
             INSERT INTO symbols
-                (project_id, symbol_key, fully_qualified_name, display_name, kind, accessibility,
+                (project_id, symbol_key, fully_qualified_name, display_name, kind, accessibility, signature,
                  line_start, line_end, last_indexed_at)
-            VALUES (@p, @k, @fqn, @dn, 0, 0, 1, 1, 1)
+            VALUES (@p, @k, 'Combine', 'Combine', @kind, 0, @sig, 1, 1, 1)
             RETURNING id;
             """;
         cmd.Parameters.AddWithValue("@p", projectId);
         cmd.Parameters.AddWithValue("@k", symbolKey);
-        cmd.Parameters.AddWithValue("@fqn", fqn);
-        cmd.Parameters.AddWithValue("@dn", fqn.Split('.').Last());
+        cmd.Parameters.AddWithValue("@kind", (int)SymbolKind.Method);
+        cmd.Parameters.AddWithValue("@sig", signature);
         return (long)cmd.ExecuteScalar()!;
     }
 

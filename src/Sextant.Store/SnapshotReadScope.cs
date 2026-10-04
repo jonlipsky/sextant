@@ -168,6 +168,21 @@ public sealed class SnapshotReadScope
         return string.Empty;
     }
 
+    /// <summary>
+    /// One constant statement listing the ids of the project versions this scope reads, ascending: every project when
+    /// unscoped, none when deny-all. It selects exactly the rows <c>"SELECT id FROM projects" + Where("id")</c> would.
+    /// Pair with <see cref="Bind"/>.
+    /// </summary>
+    public string ProjectIdsQuery =>
+        _denyAll ? "SELECT id FROM projects WHERE 1 = 0;"
+        : SnapshotId.HasValue
+            ? _overlayLocalOnly
+                ? "SELECT id FROM projects WHERE snapshot_id = @__snap ORDER BY id;"
+                : "SELECT id FROM projects WHERE id IN (SELECT project_id FROM snapshot_projects WHERE snapshot_id = @__snap) ORDER BY id;"
+            : _legacyPinned
+                ? "SELECT id FROM projects WHERE snapshot_id IS NULL ORDER BY id;"
+                : "SELECT id FROM projects ORDER BY id;";
+
     /// <summary>Binds the scope parameter when scoped to a snapshot; a no-op otherwise. Safe to call on every query.</summary>
     public void Bind(SqliteCommand cmd)
     {

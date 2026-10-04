@@ -88,6 +88,27 @@ public sealed class SnapshotDependencyStore(SqliteConnection connection)
     }
 
     /// <summary>
+    /// The provider project versions of a shared submodule (provider) repository that at least one consumer edge
+    /// pins: the projects a cross-repository symbol argument is resolved in.
+    /// </summary>
+    public HashSet<long> GetPinnedProviderProjectIds(string providerRepositoryUrl)
+    {
+        if (new SnapshotStore(connection).GetRepositoryId(providerRepositoryUrl) is not long providerRepoId)
+            return [];
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT DISTINCT provider_project_id FROM snapshot_dependencies
+            WHERE provider_repository_id = @provider_repo_id;
+            """;
+        cmd.Parameters.AddWithValue("@provider_repo_id", providerRepoId);
+        var ids = new HashSet<long>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            ids.Add(reader.GetInt64(0));
+        return ids;
+    }
+
+    /// <summary>
     /// Distinct provider project versions in a repository that expose a symbol with the given stable
     /// <c>symbol_key</c> AND are actually pinned by at least one consumer edge. Used to reject
     /// FQN-only cross-repo queries: an input FQN must first resolve to exactly one stable key here (via

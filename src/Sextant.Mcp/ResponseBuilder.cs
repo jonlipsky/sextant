@@ -14,7 +14,7 @@ public static class ResponseBuilder
 
     public static string Build<T>(
         List<T> results, long? indexFreshness = null, SymbolAmbiguity? ambiguity = null,
-        SnapshotProvenance? provenance = null, string? nextCursor = null)
+        SnapshotProvenance? provenance = null, string? nextCursor = null, string? message = null)
     {
         var response = new
         {
@@ -31,7 +31,10 @@ public static class ResponseBuilder
                 Snapshot = SnapshotMeta.From(provenance),
                 NextCursor = nextCursor
             },
-            Results = results
+            Results = results,
+            // An explicit statement about a valid answer (e.g. "the type has no implementors"); omitted when null so
+            // every other response is byte-identical.
+            Message = message
         };
 
         return JsonSerializer.Serialize(response, JsonOptions);
@@ -62,21 +65,41 @@ public static class ResponseBuilder
     /// <summary>
     /// The single uniform "nothing to serve" response returned for EVERY fail-closed read denial under an
     /// enforced policy (Phase 17, criterion 1). An unauthorized principal, a cross-tenant repository, an
-    /// unidentifiable/nonexistent repository, and an unprovisioned service ALL collapse to these exact
-    /// bytes: no error code, no message, no provenance, and <c>result_count</c> 0. An unauthorized caller
-    /// therefore cannot distinguish "exists but forbidden" from "does not exist" or "service not
-    /// provisioned" — no data, counts, names, existence, or artifact-access signal leaks (only the
-    /// always-varying <c>queried_at</c> differs). This deliberately replaces the Phase-11
-    /// <c>authorization_denied</c> structured error on the ACL path: a distinct denial code is itself an
-    /// existence/authorization oracle, which criterion 1 forbids. The Phase-11 "never present a denial as
-    /// no matches" guarantee is preserved where it still applies — a denial only ever happens under an
-    /// ENABLED multi-tenant policy, never on the zero-friction local path where a mistyped token would be
-    /// the single-tenant usability concern that guarantee was written for.
+    /// unidentifiable/nonexistent repository, a branch with no complete snapshot, and an unprovisioned service
+    /// ALL collapse to these exact bytes: the one <see cref="RepositoryNotFoundCode"/> error with one fixed
+    /// message, no provenance, and <c>result_count</c> 0. An unauthorized caller therefore cannot distinguish
+    /// "exists but forbidden" from "does not exist" or "service not provisioned" — no data, counts, names,
+    /// existence, or artifact-access signal leaks (only the always-varying <c>queried_at</c> differs). What
+    /// criterion 1 forbids is a DISTINCT denial code (the Phase-11 <c>authorization_denied</c>), which told an
+    /// unauthorized caller "this exists but you may not see it"; a code every case shares reveals nothing. It is
+    /// an error rather than an empty result (issue #163) so a client never reads "you cannot read this" as "no
+    /// matches". A denial only ever happens under an ENABLED policy, which only the index service configures, so
+    /// the message may point at its <c>list_repositories</c> tool.
     /// </summary>
-    public static string BuildNotFound() => BuildEmpty(message: null, provenance: null);
+    public static string BuildNotFound() => BuildError(RepositoryNotFoundCode, RepositoryNotFoundMessage);
+
+    /// <summary>
+    /// The <c>meta.error.code</c> of <see cref="BuildNotFound"/>, <see cref="BuildSelectionUnresolved"/> and
+    /// <see cref="BuildBranchSelectionUnresolved"/>: the request names a repository or branch that serves nothing.
+    /// </summary>
+    public const string RepositoryNotFoundCode = "repository_not_found";
+
+    private const string RepositoryNotFoundMessage =
+        "Nothing you can read matches the requested repository or branch: it is not indexed, has no complete " +
+        "snapshot on that branch, or you cannot read it. Pass a repository you can read (list_repositories lists " +
+        "them), and omit 'branch' to read its default branch.";
 
     /// <summary>The <c>meta.error.code</c> of <see cref="BuildRepositoryRequired"/>.</summary>
     public const string RepositoryRequiredCode = "repository_required";
+
+    /// <summary>The <c>meta.error.code</c> when a symbol argument matches no indexed symbol.</summary>
+    public const string SymbolNotFoundCode = "symbol_not_found";
+
+    /// <summary>The <c>meta.error.code</c> when a symbol argument matches several symbols and the tool needs one.</summary>
+    public const string AmbiguousSymbolCode = "ambiguous_symbol";
+
+    /// <summary>The <c>meta.error.code</c> when an argument is malformed or names nothing the tool accepts.</summary>
+    public const string InvalidArgumentCode = "invalid_argument";
 
     private const string RepositoryRequiredMessage =
         "This request must select a repository to read. Name the repository and retry.";
@@ -90,20 +113,34 @@ public static class ResponseBuilder
     public static string BuildRepositoryRequired() => BuildError(RepositoryRequiredCode, RepositoryRequiredMessage);
 
     /// <summary>
-    /// The actionable response for a NAMED repository selection that resolves to no complete default-branch
-    /// snapshot on a NON-enforcing read path. It never echoes the requested repository. Under an enforced
-    /// policy the same case is the uniform <see cref="BuildNotFound"/> instead.
+    /// <see cref="BuildRepositoryRequired()"/> followed by host <paramref name="guidance"/> (how to name a repository,
+    /// and which ones the verified caller may read). The guidance is the host's to keep request-shaped: it must only
+    /// describe what the CALLER can already see (its own grants), never other catalog content.
     /// </summary>
-    public static string BuildSelectionUnresolved() =>
-        BuildEmpty("No complete default-branch snapshot is available for the requested repository.");
+    public static string BuildRepositoryRequired(string? guidance) =>
+        string.IsNullOrWhiteSpace(guidance)
+            ? BuildRepositoryRequired()
+            : BuildError(RepositoryRequiredCode, RepositoryRequiredMessage + " " + guidance.Trim());
 
     /// <summary>
-    /// The actionable response for a NAMED repository branch selection (SVC-2) that resolves to no complete
-    /// snapshot on a NON-enforcing read path. It never echoes the requested repository or branch. Under an
-    /// enforced policy the same case is the uniform <see cref="BuildNotFound"/> instead.
+    /// The actionable <see cref="RepositoryNotFoundCode"/> error for a NAMED repository selection that resolves to
+    /// no complete default-branch snapshot on a NON-enforcing read path. It never echoes the requested repository.
+    /// Under an enforced policy the same case is the uniform <see cref="BuildNotFound"/> instead.
+    /// </summary>
+    public static string BuildSelectionUnresolved() =>
+        BuildError(RepositoryNotFoundCode,
+            "No complete default-branch snapshot is available for the requested repository. " +
+            "Name an indexed repository, or index this one first.");
+
+    /// <summary>
+    /// The actionable <see cref="RepositoryNotFoundCode"/> error for a NAMED repository branch selection (SVC-2)
+    /// that resolves to no complete snapshot on a NON-enforcing read path. It never echoes the requested repository
+    /// or branch. Under an enforced policy the same case is the uniform <see cref="BuildNotFound"/> instead.
     /// </summary>
     public static string BuildBranchSelectionUnresolved() =>
-        BuildEmpty("No complete snapshot is available for the requested repository branch.");
+        BuildError(RepositoryNotFoundCode,
+            "No complete snapshot is available for the requested repository branch. " +
+            "Omit 'branch' to read the default branch, or name an indexed branch.");
 
     public static string BuildEmpty(string? message = null, SnapshotProvenance? provenance = null)
     {
@@ -123,13 +160,20 @@ public static class ResponseBuilder
         return JsonSerializer.Serialize(response, JsonOptions);
     }
 
+    /// <summary>Joins the non-empty message parts with a space, or null when there are none.</summary>
+    public static string? JoinMessages(params string?[] parts)
+    {
+        var present = parts.Where(p => !string.IsNullOrWhiteSpace(p)).Select(p => p!.Trim()).ToList();
+        return present.Count == 0 ? null : string.Join(" ", present);
+    }
+
     /// <summary>
     /// Builds a structured ERROR response (Phase 11, criterion 6). Distinct from <see cref="BuildEmpty"/>:
     /// the <c>meta.error</c> block names a failure the caller must NOT read as "no matches" — most
     /// importantly a fail-closed authorization denial, which must never be presented as an empty
     /// successful result.
     /// </summary>
-    public static string BuildError(string code, string message)
+    public static string BuildError(string code, string message, SnapshotProvenance? provenance = null)
     {
         var response = new
         {
@@ -138,6 +182,37 @@ public static class ResponseBuilder
                 QueriedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 IndexFreshness = 0L,
                 ResultCount = 0,
+                Snapshot = SnapshotMeta.From(provenance),
+                Error = new ErrorInfo { Code = code, Message = message }
+            },
+            Results = Array.Empty<object>(),
+            Message = message
+        };
+
+        return JsonSerializer.Serialize(response, JsonOptions);
+    }
+
+    /// <summary>
+    /// A structured error for a symbol argument the tool could not bind to exactly one symbol: <paramref name="code"/>
+    /// is <see cref="SymbolNotFoundCode"/> (with the closest <paramref name="candidates"/>) or
+    /// <see cref="AmbiguousSymbolCode"/> (with the matching ones and the total <paramref name="matchCount"/>). Each
+    /// candidate's <c>fully_qualified_name</c> is in a form the tool accepts back, so the caller can retry with it.
+    /// </summary>
+    public static string BuildSymbolError(
+        string code, string message, IReadOnlyList<SymbolCandidate> candidates, int? matchCount,
+        SnapshotProvenance? provenance)
+    {
+        var response = new
+        {
+            Meta = new MetaObject
+            {
+                QueriedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                IndexFreshness = 0L,
+                ResultCount = 0,
+                Ambiguous = code == AmbiguousSymbolCode ? true : null,
+                AmbiguousMatchCount = code == AmbiguousSymbolCode ? matchCount : null,
+                Candidates = candidates.Count > 0 ? candidates : null,
+                Snapshot = SnapshotMeta.From(provenance),
                 Error = new ErrorInfo { Code = code, Message = message }
             },
             Results = Array.Empty<object>(),
@@ -272,6 +347,14 @@ public sealed class SnapshotMeta
     [JsonPropertyName("coverage")]
     public Sextant.Core.SnapshotCoverage? Coverage { get; set; }
 
+    /// <summary>The repository the host selected for a request that named none (omitted otherwise).</summary>
+    [JsonPropertyName("repository")]
+    public string? Repository { get; set; }
+
+    /// <summary>"implicit" when <see cref="Repository"/> was selected by the host (omitted otherwise).</summary>
+    [JsonPropertyName("repository_selection")]
+    public string? RepositorySelection { get; set; }
+
     /// <summary>Projects planner provenance into the serializable meta block, or null to omit it.</summary>
     public static SnapshotMeta? From(SnapshotProvenance? p)
     {
@@ -293,7 +376,9 @@ public sealed class SnapshotMeta
             Freshness = p.Freshness,
             Origin = p.Origin,
             BaseIdentityHash = p.BaseIdentityHash,
-            Coverage = p.Coverage
+            Coverage = p.Coverage,
+            Repository = p.Repository,
+            RepositorySelection = p.RepositorySelection
         };
     }
 }
