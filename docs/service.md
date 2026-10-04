@@ -264,7 +264,9 @@ says why, and every surface carries the `coverage` block:
   cached by `RemoteHttpBaseSnapshotSource` (that state is mutable), so a base published after a probe
   is seen on the next fetch. Multi-peer source affinity (binding a resumed cursor, or an overlay's
   recorded base coverage, to the peer that produced it) is tracked in #122.
-- MCP `meta.snapshot.completeness` is `partial` and `meta.snapshot.coverage` is set; `get_index_status`
+- MCP `meta.snapshot.completeness` is `partial` and `meta.snapshot.coverage` is set (on the service's
+  `/mcp` the lean `meta.snapshot.coverage` is the string `partial`, plus a `warning`; the full block is in
+  `get_index_status` `index.snapshot`); `get_index_status`
   reports `index.coverage` (an overlay reports its committed base's coverage; a baseless remote-base
   overlay records the peer's probed base coverage on its own row at publish, so a local hit that never
   contacts the peer still reports a partial remote base as partial).
@@ -527,8 +529,8 @@ An overridden snapshot is **complete**, because the override restored full cover
 silent:
 
 - `GET /control/status/{jobId}` lists the `sdk_pin_overridden` diagnostic.
-- The snapshot's durable `coverage` block (in ensure/status/resolve, query pages, and MCP
-  `meta.snapshot.coverage`) carries
+- The snapshot's durable `coverage` block (in ensure/status/resolve, query pages, local MCP
+  `meta.snapshot.coverage`, and `get_index_status` `index.snapshot.coverage` on the service's `/mcp`) carries
   `sdk_pin_overrides: [{ global_json_path, requested_version, roll_forward, resolved_sdk_version, installed_sdks }]`.
 - The ensure audit row's `detail` gains a suffix, e.g. `job_42;sdk_pin_overridden`. The suffixes are
   `;sdk_resolution_failed` and `;sdk_pin_restore_failed` for the other two outcomes.
@@ -752,6 +754,39 @@ per call through two reserved arguments. The service adds them in MCP request fi
 The filter errors are MCP tool errors (`isError: true`) whose text is the usual JSON error envelope
 (`meta.error.code`). The selection of each call is kept in the request's `HttpContext.Items`
 (`ToolCallSelection`), where later per-call checks can reuse it.
+
+### Agent-sized output on `/mcp`
+
+The remote tools answer an agent, so every response is shaped to fit its context:
+
+- **Paging.** Every tool that can return an unbounded list takes `limit` (default 50, max 200) and `cursor`,
+  and reports `meta.total` and `meta.next_cursor` (see [Paged results](mcp-tools.md#paged-results)). A
+  truncated first page leads with a `summary` (counts per project, file or kind) before `results`. A cursor
+  is bound to the tool, its query arguments and the served snapshot (so its repository and branch): reused
+  anywhere else, or after the branch has moved, it fails with `meta.error.code = invalid_cursor`.
+- **Paths.** Every path in a response is repository-relative (`src/App/Foo.cs`); the worker's checkout
+  directory never appears (#145). A path outside every checkout (a package's source file) is reduced to its file
+  name, including where it keys a summary count. Path inputs (`file_path`,
+  `file:` and `solution:` scopes) take the same relative form, and an absolute path is refused with
+  `invalid_argument` (the message does not echo the path). `RemoteOutputFilter` (the innermost `tools/call`
+  filter) applies this as a post-pass, so the
+  local stdio server keeps its absolute paths.
+- **Lean `meta.snapshot`.** Each response carries only `{repository, branch, commit, coverage, warning?}`
+  (the 12-character commit; `warning` only when the answer may be incomplete: partial coverage, an incompatible
+  indexer, or a dirty working tree), plus `repository_selection: "implicit"` when the caller named no repository
+  and the service read its one visible repository. A tool error carries the same lean block. `get_index_status`
+  reports the full provenance in `index.snapshot`.
+- **Server `instructions`.** `initialize` returns a short instruction string telling the agent to pass
+  `repository` and to page with `next_cursor`. A gateway that does not forward server instructions, or a client
+  that drops them (Copilot CLI keeps them only for an allowlisted server), loses only this hint: the tool
+  descriptions stand alone, and the `repository` argument reads `Required: owner/repo` (or
+  `Required: host/owner/repo` with several allow-listed hosts) when `REQUIRE_REPOSITORY_SELECTION` is on, and
+  `Required unless exactly one is granted: owner/repo` when delegate tokens are configured (a verified caller that
+  can read exactly one repository may omit it; see implicit selection below).
+- **Compact `tools/list`.** Descriptions are one or two short sentences, the reserved `repository` argument is
+  one short line and `branch` carries no description (omitted, it reads the default branch), and an optional
+  argument is advertised as its plain type (no
+  `["T","null"]` union, no `default: null`; an explicit JSON `null` still means "omitted").
 
 ### Caller assertions (SVC-3)
 
@@ -1721,7 +1756,7 @@ catalog, and a `FakeSnapshotWorker`. The suite maps to the acceptance criteria:
 | 1 — idempotent ensure | `SnapshotServiceTests` (concurrent ensures attach to one job; worker runs once); `EnsureCallerDisconnectTests` / `EnsureCallerDisconnectHttpTests` (#148: caller disconnect never cancels production, re-ensure attaches to the in-flight run, `wait=false`, prompt status/resolve during a run, shutdown requeues); `QueuedControlWriteHttpTests` / `JobIdReservationsTests` (#158: `wait=false` and retire answer `202` within the bound while a production holds the writer, reserved job ids resolve and are never reused, apply-time retire guards, submission order, coalescing, shutdown drain) |
 | 2 — restart recovery | `SnapshotServiceTests` (catalog survives restart; orphaned `running` jobs reconciled) |
 | 3 — scratch cannot delete published | `ServicePathsTests` (scratch/persistent separation + `ReleaseScratch` refusal) |
-| 4 — query via HTTP MCP without ProcessStack | `ServiceHttpTests` (`/mcp` mapped + auth-gated; `/query` paging); `RepositorySelectionHttpTests` (the `X-Sextant-Repository` header without a read policy, the legacy no-header unscoped read, `repository_required`); `ToolArgumentSelectionHttpTests` + `ToolSelectionFiltersTests` (SVC-2: the reserved `repository`/`branch` arguments listed on repository-scoped tools and stripped on call, argument-over-header precedence, `selector_conflict`/`invalid_selector`, branch pinning, `branch` without a repository, the cross-repository provider default, the unknown-branch uniform not-found); `McpClientCompatibilityTests` (an SDK client selecting through the `repository` argument); `QueryToolInputResolutionHttpTests` (issues #149/#163: symbol arguments without `global::`, `Type.Member`, parameter lists and documentation IDs; exact type lookup and `kind`; ambiguity and not-found as tool errors with candidates; `get_type_members`; implicit selection naming its repository and `repository_required` listing the caller's repositories) |
+| 4 — query via HTTP MCP without ProcessStack | `ServiceHttpTests` (`/mcp` mapped + auth-gated; `/query` paging); `RepositorySelectionHttpTests` (the `X-Sextant-Repository` header without a read policy, the legacy no-header unscoped read, `repository_required`); `ToolArgumentSelectionHttpTests` + `ToolSelectionFiltersTests` (SVC-2: the reserved `repository`/`branch` arguments listed on repository-scoped tools and stripped on call, argument-over-header precedence, `selector_conflict`/`invalid_selector`, branch pinning, `branch` without a repository, the cross-repository provider default, the unknown-branch uniform not-found); `McpClientCompatibilityTests` (an SDK client selecting through the `repository` argument); `QueryToolInputResolutionHttpTests` (issues #149/#163: symbol arguments without `global::`, `Type.Member`, parameter lists and documentation IDs; exact type lookup and `kind`; ambiguity and not-found as tool errors with candidates; `get_type_members`; implicit selection naming its repository and `repository_required` listing the caller's repositories); `AgentSizedOutputHttpTests` (#145: paging, truncation summary, cursor binding, lean `meta.snapshot`, repo-relative paths in and out, server `instructions`, the `tools/list` size pin); `SubmoduleCheckoutIntegrationTests.RemoteMcp_RepositoryRelativePaths_*` (#145 on a real worker index: repo-relative inputs over `/mcp`, a submodule file included) |
 | 5 — structured per-project diagnostics | `SnapshotServiceTests` (partial/failed/unsupported diagnostics) |
 | 6 — local-only remains functional | `ArchitectureBoundaryTests` (core assemblies never reference the service; local query without a service) |
 

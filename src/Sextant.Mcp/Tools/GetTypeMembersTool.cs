@@ -10,11 +10,11 @@ public static class GetTypeMembersTool
 {
     private const int MaxInheritanceDepth = 10;
 
-    [McpServerTool(Name = "get_type_members"), Description("List all members of a type (methods, properties, fields, events) with signatures. Faster than reading the source file — includes inherited members.")]
+    [McpServerTool(Name = "get_type_members"), Description("Members of a type with signatures. Use instead of reading its file.")]
     public static string GetTypeMembers(
         DatabaseProvider dbProvider,
-        [Description("The fully qualified name of the type")] string symbol_fqn,
-        [Description("Include inherited members")] bool include_inherited = false)
+        [Description("Type, fully qualified.")] string symbol_fqn,
+        bool include_inherited = false)
     {
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;

@@ -8,7 +8,7 @@ namespace Sextant.Mcp.Tools;
 [McpServerToolType]
 public static class GetIndexStatusTool
 {
-    [McpServerTool(Name = "get_index_status"), Description("Check what projects are indexed, symbol/reference counts, index freshness, the active indexing profile, its enabled feature capabilities, and retained storage. Call this first to see what data is available.")]
+    [McpServerTool(Name = "get_index_status"), Description("What is indexed, with full snapshot provenance and coverage. Call when meta.snapshot has a warning.")]
     public static string GetIndexStatus(DatabaseProvider dbProvider)
     {
         // Fail closed (criterion 1): status reveals project names, git remotes, symbol/reference counts and
@@ -64,12 +64,13 @@ public static class GetIndexStatusTool
             }
         }
 
-        var index = BuildIndexInfo(conn, selected, dbProvider.Authorizer.IsEnforcing);
+        var index = BuildIndexInfo(conn, selected, dbProvider.Authorizer.IsEnforcing, readContext.Provenance);
         return ResponseBuilder.BuildStatus(results, freshness, index);
     }
 
     private static object BuildIndexInfo(
-        Microsoft.Data.Sqlite.SqliteConnection conn, long? selectedSnapshotId, bool policyEnforced)
+        Microsoft.Data.Sqlite.SqliteConnection conn, long? selectedSnapshotId, bool policyEnforced,
+        SnapshotProvenance? provenance)
     {
         // Under an enforced multi-tenant policy, scope run metadata (profile / config_hash / features) to
         // the caller's SELECTED snapshot's own index run instead of the DB-wide latest complete run, which
@@ -98,6 +99,10 @@ public static class GetIndexStatusTool
             features = IndexProfiles.FeatureNames(features),
             overlay = BuildOverlayInfo(conn, selectedSnapshotId),
             coverage = BuildCoverageInfo(conn, selectedSnapshotId),
+            // The full provenance of the served snapshot (base/overlay, completeness, compatibility, origin): the
+            // detail the remote surface's lean per-response meta.snapshot points here for. Null (omitted) for a
+            // legacy/pre-snapshot database, like meta.snapshot.
+            snapshot = SnapshotMeta.From(provenance),
             // Storage is a DB-WIDE (all-tenant) aggregate; omit it under an enforced multi-tenant policy so
             // a per-repository authorized caller cannot read another tenant's storage/existence counts
             // (Phase 17, criterion 1). The zero-policy local path keeps reporting it (byte-identical).

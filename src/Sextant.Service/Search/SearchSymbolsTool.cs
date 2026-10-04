@@ -63,11 +63,7 @@ public static class SearchSymbolsTool
     internal static JsonElement InputSchema { get; } = BuildInputSchema();
 
     [McpServerTool(Name = ToolName), Description(
-        "Search the symbols of every repository you can query by the start of their name (case-insensitive). By " +
-        "default every indexed branch you were granted is searched; `repository`, `branch` and `kind` narrow it. Each " +
-        "result names its repository, branch and snapshot. Pass `next_cursor` back as `cursor`, with the same other " +
-        "arguments, for the next page; it is null when the search is complete. `pending` lists branches that are not " +
-        "indexed yet, `unavailable` those that could not be read this time, and `truncated` those left for later pages.")]
+        "Symbols by name prefix in every repository you can query. Use when you do not know which repository has a type.")]
     public static CallToolResult SearchSymbols(
         RequestContext<CallToolRequestParams> context, SnapshotService service, CallerContext caller, ServiceOptions options,
         CancellationToken cancellationToken)
@@ -153,29 +149,26 @@ public static class SearchSymbolsTool
                     ["type"] = "string",
                     ["minLength"] = 1,
                     ["maxLength"] = MaxNamePrefixLength,
-                    ["description"] = "The start of the symbol names to find (case-insensitive for ASCII letters)."
+                    ["description"] = "Start of the symbol name."
                 },
                 [RepositoryArgument] = Property("string",
-                    "Optional: search only this repository, as 'https://{host}/{owner}/{repo}', '{host}/{owner}/{repo}' " +
-                    "or, on a single-host service, '{owner}/{repo}'."),
+                    "Only this repository."),
                 [BranchArgument] = Property("string",
-                    "Optional: search only this branch. Omit it to search every granted branch."),
+                    "Only this branch."),
                 [KindArgument] = new JsonObject
                 {
                     ["type"] = "string",
                     ["enum"] = kinds,
-                    ["description"] = "Optional: return only symbols of this kind."
+                    ["description"] = "Only this kind."
                 },
                 [CursorArgument] = new JsonObject
                 {
                     ["type"] = "string",
                     ["maxLength"] = SymbolSearchCursor.MaxLength,
-                    ["description"] = "Optional: the next_cursor of the previous page."
+                    ["description"] = "next_cursor"
                 },
                 [LimitArgument] = Property("integer",
-                    $"Optional: the most symbols read from each snapshot per page (default {SymbolSearchQuery.DefaultLimit}; " +
-                    $"clamped to 1..{SymbolSearchQuery.MaxLimit}). A page also returns at most the service's per-call " +
-                    "total, which the snapshots it reads share; the rest follow on later pages.")
+                    $"Max {SymbolSearchQuery.MaxLimit} per snapshot.")
             },
             ["required"] = new JsonArray(NamePrefixArgument),
             ["additionalProperties"] = false

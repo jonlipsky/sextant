@@ -8,14 +8,13 @@ namespace Sextant.Mcp.Tools;
 public static class GetNamespaceTreeTool
 {
     [McpServerTool(Name = "get_namespace_tree"),
-     Description("Get the namespace hierarchy for the indexed codebase, or list symbols within a specific namespace.")]
+     Description("Namespaces, or the symbols in one. Use to orient instead of listing directories.")]
     public static string GetNamespaceTree(
         DatabaseProvider dbProvider,
-        [Description("Namespace to explore. Omit to get top-level namespaces. Use 'global::Company.Core' to drill into a namespace.")]
+        [Description("e.g. global::Company.Core")]
         string? namespace_prefix = null,
-        [Description("Optional project canonical ID to scope to a single project")]
+        [Description(ToolText.ProjectId)]
         string? project_id = null,
-        [Description("Depth of namespace levels to return (default 1 = immediate children only)")]
         int depth = 1)
     {
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))

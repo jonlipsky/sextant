@@ -8,15 +8,15 @@ namespace Sextant.Mcp.Tools;
 [McpServerToolType]
 public static class FindSymbolTool
 {
-    [McpServerTool(Name = "find_symbol"), Description("Instant indexed lookup of a symbol by name. Faster than grep/file reading for .NET codebases. Use fuzzy=true for FTS5 search.")]
+    [McpServerTool(Name = "find_symbol"), Description("A declaration by name or fully qualified name (fuzzy=true: full-text). Use instead of grepping for it.")]
     public static async Task<string> FindSymbol(
         DatabaseProvider dbProvider,
-        [Description("The symbol name or fully qualified name to search for")] string name,
-        [Description("Optional symbol kind filter (class, method, property, etc.)")] string? kind = null,
-        [Description("Optional project canonical ID filter")] string? project_id = null,
-        [Description("Use FTS5 fuzzy search instead of exact match")] bool fuzzy = false,
-        [Description("Include the symbol's source declaration")] bool include_source = false,
-        [Description("Scope filter: 'file:/path', 'project:canonical_id', 'solution:/path', or 'all'")] string? scope = null)
+        [Description("Name or fully qualified name.")] string name,
+        [Description(ToolText.Kind)] string? kind = null,
+        [Description(ToolText.ProjectId)] string? project_id = null,
+        bool fuzzy = false,
+        bool include_source = false,
+        [Description(ToolText.Scope)] string? scope = null)
     {
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
@@ -39,7 +39,7 @@ public static class FindSymbolTool
 
         // Resolve scope to project filter. An unknown project/solution or an unrecognized scope is an error, never
         // a silently unfiltered query.
-        var scopeFilter = ScopeResolver.Resolve(scope, conn, readContext.Scope);
+        var scopeFilter = ScopeResolver.Resolve(scope, conn, readContext.Scope, readContext.Paths);
         if (scopeFilter.Error != null)
             return scopeFilter.ErrorResponse(readContext.Provenance);
 
@@ -87,7 +87,7 @@ public static class FindSymbolTool
             if (!scopeFilter.IsEmpty)
             {
                 if (scopeFilter.FilePath != null)
-                    results = results.Where(s => s.FilePath == scopeFilter.FilePath).ToList();
+                    results = results.Where(s => scopeFilter.MatchesFile(s.FilePath)).ToList();
                 else if (scopeFilter.ProjectIds != null)
                     results = results.Where(s => scopeFilter.ProjectIds.Contains(s.ProjectId)).ToList();
             }
@@ -144,6 +144,7 @@ public static class FindSymbolTool
                 KindDescription = kindDescription,
                 ProjectIds = restriction,
                 FilePath = scopeFilter.FilePath,
+                FileMatches = scopeFilter.FilePath != null ? scopeFilter.MatchesFile : null,
                 ScopeDescription = scopeDescription
             };
             var lookup = SymbolResolver.Lookup(symbolStore, projectStore, name, options);

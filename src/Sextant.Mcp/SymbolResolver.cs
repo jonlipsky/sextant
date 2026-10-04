@@ -65,6 +65,12 @@ public sealed record SymbolLookupOptions
     /// <summary>Restricts matches to symbols declared in this file (a <c>file:</c> scope), or null.</summary>
     public string? FilePath { get; init; }
 
+    /// <summary>
+    /// How a stored path is compared with <see cref="FilePath"/> (a remote read matches repository-relative input);
+    /// a plain separator-insensitive comparison when null.
+    /// </summary>
+    public Func<string, bool>? FileMatches { get; init; }
+
     /// <summary>How the restriction reads in a message ("in project 'x'"), or null.</summary>
     public string? ScopeDescription { get; init; }
 
@@ -272,7 +278,8 @@ public static class SymbolResolver
 
     private static bool InRestriction(SymbolInfo row, SymbolLookupOptions options) =>
         (options.ProjectIds is null || options.ProjectIds.Contains(row.ProjectId))
-        && (options.FilePath is null || SameFile(row.FilePath, options.FilePath));
+        && (options.FilePath is null
+            || (options.FileMatches is { } matches ? matches(row.FilePath) : SameFile(row.FilePath, options.FilePath)));
 
     private static bool SameFile(string a, string b) =>
         string.Equals(a.Replace('\\', '/'), b.Replace('\\', '/'),

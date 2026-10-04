@@ -20,6 +20,7 @@
     <PackageReference Include="MSTest.TestFramework" Version="4.1.0" />
     <PackageReference Include="MSTest.TestAdapter" Version="4.1.0" />
     <PackageReference Include="Microsoft.Build.Locator" Version="1.11.2" />
+    <PackageReference Include="Microsoft.AspNetCore.TestHost" Version="10.0.3" />
   </ItemGroup>
 
   <ItemGroup>
@@ -33,6 +34,7 @@
     <ProjectReference Include="..\..\src\Sextant.Mcp\Sextant.Mcp.csproj" />
     <ProjectReference Include="..\..\src\Sextant.Daemon\Sextant.Daemon.csproj" />
     <ProjectReference Include="..\..\src\Sextant.Service\Sextant.Service.csproj" />
+    <ProjectReference Include="..\..\src\Sextant.Service.Host\Sextant.Service.Host.csproj" />
   </ItemGroup>
 
   <ItemGroup>
