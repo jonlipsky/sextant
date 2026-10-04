@@ -65,18 +65,29 @@ public static class ResponseBuilder
     /// <summary>
     /// The single uniform "nothing to serve" response returned for EVERY fail-closed read denial under an
     /// enforced policy (Phase 17, criterion 1). An unauthorized principal, a cross-tenant repository, an
-    /// unidentifiable/nonexistent repository, and an unprovisioned service ALL collapse to these exact
-    /// bytes: no error code, no message, no provenance, and <c>result_count</c> 0. An unauthorized caller
-    /// therefore cannot distinguish "exists but forbidden" from "does not exist" or "service not
-    /// provisioned" — no data, counts, names, existence, or artifact-access signal leaks (only the
-    /// always-varying <c>queried_at</c> differs). This deliberately replaces the Phase-11
-    /// <c>authorization_denied</c> structured error on the ACL path: a distinct denial code is itself an
-    /// existence/authorization oracle, which criterion 1 forbids. The Phase-11 "never present a denial as
-    /// no matches" guarantee is preserved where it still applies — a denial only ever happens under an
-    /// ENABLED multi-tenant policy, never on the zero-friction local path where a mistyped token would be
-    /// the single-tenant usability concern that guarantee was written for.
+    /// unidentifiable/nonexistent repository, a branch with no complete snapshot, and an unprovisioned service
+    /// ALL collapse to these exact bytes: the one <see cref="RepositoryNotFoundCode"/> error with one fixed
+    /// message, no provenance, and <c>result_count</c> 0. An unauthorized caller therefore cannot distinguish
+    /// "exists but forbidden" from "does not exist" or "service not provisioned" — no data, counts, names,
+    /// existence, or artifact-access signal leaks (only the always-varying <c>queried_at</c> differs). What
+    /// criterion 1 forbids is a DISTINCT denial code (the Phase-11 <c>authorization_denied</c>), which told an
+    /// unauthorized caller "this exists but you may not see it"; a code every case shares reveals nothing. It is
+    /// an error rather than an empty result (issue #163) so a client never reads "you cannot read this" as "no
+    /// matches". A denial only ever happens under an ENABLED policy, which only the index service configures, so
+    /// the message may point at its <c>list_repositories</c> tool.
     /// </summary>
-    public static string BuildNotFound() => BuildEmpty(message: null, provenance: null);
+    public static string BuildNotFound() => BuildError(RepositoryNotFoundCode, RepositoryNotFoundMessage);
+
+    /// <summary>
+    /// The <c>meta.error.code</c> of <see cref="BuildNotFound"/>, <see cref="BuildSelectionUnresolved"/> and
+    /// <see cref="BuildBranchSelectionUnresolved"/>: the request names a repository or branch that serves nothing.
+    /// </summary>
+    public const string RepositoryNotFoundCode = "repository_not_found";
+
+    private const string RepositoryNotFoundMessage =
+        "Nothing you can read matches the requested repository or branch: it is not indexed, has no complete " +
+        "snapshot on that branch, or you cannot read it. Pass a repository you can read (list_repositories lists " +
+        "them), and omit 'branch' to read its default branch.";
 
     /// <summary>The <c>meta.error.code</c> of <see cref="BuildRepositoryRequired"/>.</summary>
     public const string RepositoryRequiredCode = "repository_required";
@@ -112,20 +123,24 @@ public static class ResponseBuilder
             : BuildError(RepositoryRequiredCode, RepositoryRequiredMessage + " " + guidance.Trim());
 
     /// <summary>
-    /// The actionable response for a NAMED repository selection that resolves to no complete default-branch
-    /// snapshot on a NON-enforcing read path. It never echoes the requested repository. Under an enforced
-    /// policy the same case is the uniform <see cref="BuildNotFound"/> instead.
+    /// The actionable <see cref="RepositoryNotFoundCode"/> error for a NAMED repository selection that resolves to
+    /// no complete default-branch snapshot on a NON-enforcing read path. It never echoes the requested repository.
+    /// Under an enforced policy the same case is the uniform <see cref="BuildNotFound"/> instead.
     /// </summary>
     public static string BuildSelectionUnresolved() =>
-        BuildEmpty("No complete default-branch snapshot is available for the requested repository.");
+        BuildError(RepositoryNotFoundCode,
+            "No complete default-branch snapshot is available for the requested repository. " +
+            "Name an indexed repository, or index this one first.");
 
     /// <summary>
-    /// The actionable response for a NAMED repository branch selection (SVC-2) that resolves to no complete
-    /// snapshot on a NON-enforcing read path. It never echoes the requested repository or branch. Under an
-    /// enforced policy the same case is the uniform <see cref="BuildNotFound"/> instead.
+    /// The actionable <see cref="RepositoryNotFoundCode"/> error for a NAMED repository branch selection (SVC-2)
+    /// that resolves to no complete snapshot on a NON-enforcing read path. It never echoes the requested repository
+    /// or branch. Under an enforced policy the same case is the uniform <see cref="BuildNotFound"/> instead.
     /// </summary>
     public static string BuildBranchSelectionUnresolved() =>
-        BuildEmpty("No complete snapshot is available for the requested repository branch.");
+        BuildError(RepositoryNotFoundCode,
+            "No complete snapshot is available for the requested repository branch. " +
+            "Omit 'branch' to read the default branch, or name an indexed branch.");
 
     public static string BuildEmpty(string? message = null, SnapshotProvenance? provenance = null)
     {

@@ -136,11 +136,11 @@ public class PolicyReadAuthorizerTests
 
             var meta = JsonDocument.Parse(deniedJson).RootElement.GetProperty("meta");
             // Phase 17, criterion 1 (revised from the Phase-11 `authorization_denied` code): an
-            // unauthorized status read now returns the UNIFORM not-found — no error block — so it is
-            // byte-indistinguishable from an unprovisioned/nonexistent index. A distinct code would itself
-            // be an existence/authz oracle.
-            Assert.IsFalse(meta.TryGetProperty("error", out _),
-                "an unauthorized status read must NOT carry a distinct error code (authz/existence oracle)");
+            // unauthorized status read returns the UNIFORM not-found — only the `repository_not_found` code every
+            // denial shares — so it is byte-indistinguishable from an unprovisioned/nonexistent index. A distinct
+            // code would itself be an existence/authz oracle.
+            Assert.AreEqual(ResponseBuilder.RepositoryNotFoundCode, meta.GetProperty("error").GetProperty("code").GetString(),
+                "an unauthorized status read carries only the uniform not-found code (no authz/existence oracle)");
             Assert.AreEqual(0, meta.GetProperty("result_count").GetInt32(), "it reveals zero results");
             Assert.IsFalse(deniedJson.Contains(RepoA), "the repository remote URL does not leak");
             Assert.IsFalse(deniedJson.Contains("logical_A"), "the project canonical id does not leak");
@@ -216,7 +216,8 @@ public class PolicyReadAuthorizerTests
             Assert.AreEqual(StripQueriedAt(forbiddenJson), StripQueriedAt(nonexistentJson),
                 "a forbidden existing repo must be byte-indistinguishable from a nonexistent one");
             var meta = JsonDocument.Parse(forbiddenJson).RootElement.GetProperty("meta");
-            Assert.IsFalse(meta.TryGetProperty("error", out _), "neither carries an authz/existence oracle");
+            Assert.AreEqual(ResponseBuilder.RepositoryNotFoundCode, meta.GetProperty("error").GetProperty("code").GetString(),
+                "both carry only the uniform not-found code, never an authz/existence oracle");
             Assert.IsFalse(forbiddenJson.Contains(RepoA), "the forbidden repository name does not leak");
         }
         finally

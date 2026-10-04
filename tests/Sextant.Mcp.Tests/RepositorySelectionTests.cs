@@ -276,7 +276,9 @@ public class RepositorySelectionTests
 
         var root = JsonDocument.Parse(failure).RootElement;
         Assert.AreEqual(0, root.GetProperty("meta").GetProperty("result_count").GetInt32());
-        Assert.IsFalse(root.GetProperty("meta").TryGetProperty("error", out _));
+        Assert.AreEqual(ResponseBuilder.RepositoryNotFoundCode,
+            root.GetProperty("meta").GetProperty("error").GetProperty("code").GetString(),
+            "an unresolved named repository is a tool error, never an empty success");
         StringAssert.Contains(root.GetProperty("message").GetString(), "requested repository",
             "the permissive path says why it read nothing");
         Assert.IsFalse(failure.Contains("not-indexed"), "the requested repository is not echoed");

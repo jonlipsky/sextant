@@ -7,11 +7,11 @@ namespace Sextant.Mcp;
 /// it resolves the once-per-request <see cref="FederatedReadContext"/> and, when the read is authorized,
 /// hands back a context whose <see cref="FederatedReadContext.Scope"/> every store reuses and whose
 /// <see cref="FederatedReadContext.Provenance"/> every response stamps. When authorization is DENIED it
-/// emits the single UNIFORM not-found response (<see cref="ResponseBuilder.BuildNotFound"/>) — never a
-/// distinct <c>authorization_denied</c> code — so a fail-closed denial is byte-indistinguishable from a
-/// nonexistent/unprovisioned index (Phase 17, criterion 1): no data, counts, names, existence, or timing
-/// signal leaks. A denial only ever occurs under an ENABLED policy; on the zero-policy local path the
-/// permissive authorizer always allows, so this path is unchanged.
+/// emits the single UNIFORM not-found response (<see cref="ResponseBuilder.BuildNotFound"/>: one shared
+/// <c>repository_not_found</c> error, never a distinct <c>authorization_denied</c> code) — so a fail-closed denial
+/// is byte-indistinguishable from a nonexistent/unprovisioned index (Phase 17, criterion 1): no data, counts,
+/// names, existence, or timing signal leaks. A denial only ever occurs under an ENABLED policy; on the zero-policy
+/// local path the permissive authorizer always allows, so this path is unchanged.
 /// </summary>
 public static class ReadContextGate
 {
@@ -33,7 +33,7 @@ public static class ReadContextGate
             return true;
         }
 
-        // A named repository with no complete snapshot, on a NON-enforcing path, gets an actionable message
+        // A named repository with no complete snapshot, on a NON-enforcing path, gets an actionable error
         // rather than an empty "no matches" (there is no authorization to protect, so no oracle to avoid).
         if (context.SelectionUnresolved && authorizer is not { IsEnforcing: true })
         {

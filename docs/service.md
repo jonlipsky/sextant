@@ -697,7 +697,7 @@ reserved `branch` argument:
 | --- | --- | --- |
 | Names an indexed repository | That repository's default-branch snapshot (subject to the read policy, when one is set) | Same |
 | Names a repository and a `branch` | The complete snapshot that branch's pointer targets (branch names match exactly) | Same |
-| Names a repository (or branch) with no complete snapshot | Nothing: an empty result with an actionable message under an open read, the uniform not-found under an enforced read policy. Never widened to other repositories or branches | Same |
+| Names a repository (or branch) with no complete snapshot | Nothing, as a `repository_not_found` tool error (`isError: true`): an actionable message under an open read, the uniform not-found (below) under an enforced read policy. Never widened to other repositories or branches | Same |
 | Names a `branch` but no repository | `meta.error.code = repository_required`, with no results | Same |
 | Names nothing (or only blank values) | The unselected default: the only repository of a single-repository catalog, or **every** repository of a multi-repository catalog | `meta.error.code = repository_required`, with no results |
 
@@ -708,6 +708,14 @@ holds. For a verified caller its message also lists the repositories that caller
 gateway using the plain query token) working unchanged; turn the requirement on once every caller selects
 one. The local stdio MCP server has no header, advertises no reserved arguments, and never requires a
 selection.
+
+The **uniform not-found** is the one answer an enforced read policy gives to every read it cannot serve: a
+repository the caller may not read, one that does not exist, a branch with no complete snapshot, or an
+unprovisioned service. It is a `repository_not_found` tool error (`isError: true`) with one fixed message that
+says what to pass instead (a repository you can read, as listed by `list_repositories`, and no `branch` for the
+default branch). Every case gets the same code and the same bytes (only `queried_at` differs), and it echoes
+nothing the request named, so it is not an existence oracle; what Phase 17 forbids is a distinct denial code. It
+is an error, not an empty result, so an agent never reads "you cannot read this" as "no matches" (issue #163).
 
 #### Reserved tool arguments (SVC-2)
 

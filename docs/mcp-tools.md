@@ -57,6 +57,7 @@ the JSON envelope with `meta.error.code` and a top-level `message` saying what t
 | `ambiguous_symbol` | A tool that needs one symbol was given a name that several different symbols match equally well (e.g. a bare method name, or an overloaded method without its parameter list). The tool never picks one | `meta.ambiguous`, `meta.ambiguous_match_count`, and `meta.candidates` (the first ten) |
 | `invalid_argument` | An argument is malformed or names nothing the tool accepts (an unknown `project_id`, `scope`, `kind`, `accessibility`, namespace or commit) | |
 | `repository_required` (service) | The call must name a repository; for a verified caller the message lists the repositories it can read | |
+| `repository_not_found` (service) | The named repository or branch serves nothing to this caller: not indexed, no complete snapshot on that branch, or not readable by it. Under a read policy every such case gets the same bytes, so it never tells an existing repository from an absent one | |
 
 `find_symbol` is a search, so several equally good matches are an answer there: it lists them (best first) and its
 `message` says how to narrow. A valid query whose answer is empty (a type with no implementors, a method with no
