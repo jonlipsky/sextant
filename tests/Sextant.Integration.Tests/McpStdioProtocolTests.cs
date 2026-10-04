@@ -60,7 +60,7 @@ public class McpStdioProtocolTests
             "get_call_hierarchy", "get_type_members", "get_type_hierarchy", "get_type_dependents",
             "get_implementors", "get_api_surface", "get_impact", "get_file_symbols", "get_source_context",
             "get_namespace_tree", "get_project_dependencies", "get_index_status", "get_daemon_status",
-            "trace_value", "research_codebase"
+            "trace_value"
         };
 
         var missing = expectedTools.Where(t => !toolNames.Contains(t)).ToList();

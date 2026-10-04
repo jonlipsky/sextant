@@ -128,7 +128,7 @@ highest migration file. A restored/older catalog is upgraded on next startup.
 3. **Re-provide credentials + authorization config.** The backup contains **no secrets**; re-provide the
    environment variables the manifest's `credentials_boundary` lists (`SEXTANT_SERVICE_CONTROL_TOKEN`,
    `…_QUERY_TOKEN`, `…_CONTRIBUTE_TOKEN`, `SEXTANT_SERVICE_READ_POLICY`, `SEXTANT_SERVICE_DELEGATE_TOKENS`,
-   `SEXTANT_SERVICE_CALLER_KEYS`, `SEXTANT_LLM_API_KEY`) from the service's owner-only env file, never by
+   `SEXTANT_SERVICE_CALLER_KEYS`) from the service's owner-only env file, never by
    typing a value at a prompt (see
    [Generating and installing secrets](service.md#generating-and-installing-secrets)). The read
    policy is on the boundary deliberately: a restore that forgot it would start an **anonymously readable**

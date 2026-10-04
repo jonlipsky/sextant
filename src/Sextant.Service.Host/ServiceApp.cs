@@ -167,7 +167,7 @@ public static class ServiceApp
         typeof(GetImpactTool), typeof(GetImplementorsTool), typeof(GetIndexStatusTool),
         typeof(GetNamespaceTreeTool), typeof(GetProjectDependenciesTool), typeof(GetTypeDependentsTool),
         typeof(GetTypeHierarchyTool), typeof(GetTypeMembersTool), typeof(SemanticSearchTool),
-        typeof(TraceValueTool), typeof(ResearchCodebaseTool),
+        typeof(TraceValueTool),
         // SVC-4: a service-only tool over the caller's grants (no index read, so no TryBeginRead gate); it answers
         // only a verified caller and lists only the repositories that caller may read.
         typeof(ListRepositoriesTool),

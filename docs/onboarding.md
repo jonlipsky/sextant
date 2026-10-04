@@ -106,7 +106,7 @@ Other tools use the same URL and header, only the config file and root key diffe
 
 - the service's query tools under their own names: `list_repositories`, `search_symbols`, `find_symbol`,
   `find_references`, `get_type_hierarchy`, `get_call_hierarchy`, `get_impact`, `get_index_status`, and the
-  rest of the remote query set (`research_codebase` and the local-only tools are not offered);
+  rest of the remote query set (the local-only tools are not offered);
 - the app's own tools: `start-indexing` (index an exact commit of a repository you watch),
   `get-indexing-status` (poll the job it returns) and `import-legacy-watches` (below).
 
