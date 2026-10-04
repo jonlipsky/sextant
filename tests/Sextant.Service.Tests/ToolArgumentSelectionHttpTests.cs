@@ -270,17 +270,22 @@ public class ToolArgumentSelectionHttpTests
     // ==== cross-repository tools ====================================================================
 
     [TestMethod]
-    [DataRow("find_cross_repository_usages", """{"provider_repository_url":"https://github.com/acme/widgets","symbol_fqn":"global::App.Type0","branch":"main"}""")]
-    [DataRow("find_submodule_consumers", """{"provider_repository_url":"https://github.com/acme/widgets","branch":"main"}""")]
-    public async Task Call_CrossRepositoryTool_DefaultsSelectorToProvider_WhenSelectionIsRequired(string toolName, string arguments)
+    // The fixture pins no consumer to the provider, so the usages tool reaches its own (loud) not-found: what matters
+    // here is that the selection requirement is met, never `repository_required`.
+    [DataRow("find_cross_repository_usages", """{"provider_repository_url":"https://github.com/acme/widgets","symbol_fqn":"global::App.Type0","branch":"main"}""", "symbol_not_found")]
+    [DataRow("find_submodule_consumers", """{"provider_repository_url":"https://github.com/acme/widgets","branch":"main"}""", null)]
+    public async Task Call_CrossRepositoryTool_DefaultsSelectorToProvider_WhenSelectionIsRequired(
+        string toolName, string arguments, string? toolError)
     {
         await using var host = await Harness.StartAsync(requireSelection: true);
 
         var call = await host.CallRawAsync(toolName, arguments);
 
-        Assert.IsFalse(call.IsError, call.Body.ToString());
-        Assert.IsFalse(call.Body.GetProperty("meta").TryGetProperty("error", out _),
-            $"the provider repository satisfies the requirement: {call.Body}");
+        var code = call.Body.GetProperty("meta").TryGetProperty("error", out var error)
+            ? error.GetProperty("code").GetString()
+            : null;
+        Assert.AreEqual(toolError, code, $"the provider repository satisfies the requirement: {call.Body}");
+        Assert.AreEqual(toolError is not null, call.IsError, call.Body.ToString());
         Assert.AreEqual(new ToolCallSelection(Widgets, null, ToolSelectionSource.ProviderDefault), host.Probe.Selection);
         CollectionAssert.Contains(host.Probe.ArgumentNames, "branch",
             "the tool's own branch argument is passed through, not taken as the selector");

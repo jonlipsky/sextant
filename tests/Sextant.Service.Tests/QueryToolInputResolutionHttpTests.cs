@@ -240,6 +240,99 @@ public class QueryToolInputResolutionHttpTests
         }
     }
 
+    // ==== generic types and members ==================================================================
+
+    [TestMethod]
+    [DataRow("IStore.PublishAsync")]
+    [DataRow("IStore<T>.PublishAsync")]
+    [DataRow("IStore`1.PublishAsync")]
+    [DataRow("Library.Storage.IStore<T>.PublishAsync(T, System.Threading.CancellationToken)")]
+    [DataRow("global::Library.Storage.IStore<T>.PublishAsync(T, CancellationToken)")]
+    [DataRow("Library.Storage.IStore<string>.PublishAsync(string, CancellationToken)")]
+    [DataRow("M:Library.Storage.IStore`1.PublishAsync(`0,System.Threading.CancellationToken)")]
+    public async Task GenericInterfaceMethod_ResolvesInEverySpelling_ToItsCallsThroughTheInterface(string name)
+    {
+        var call = await CallAsync("find_references",
+            WithRepository($$"""{"symbol_fqn":{{JsonSerializer.Serialize(name)}}}"""), Solo);
+
+        Assert.IsFalse(call.IsError, call.Body.ToString());
+        var files = call.Body.GetProperty("results").EnumerateArray()
+            .Select(r => Path.GetFileName(r.GetProperty("file_path").GetString()!))
+            .Distinct()
+            .ToArray();
+        CollectionAssert.AreEqual(new[] { "Publisher.cs" }, files, $"the call through IStore<string>: {call.Body}");
+    }
+
+    [TestMethod]
+    public async Task GenericInterfaceMethod_ThePrintedName_ResolvesBackToIt()
+    {
+        var members = await CallAsync("get_type_members", WithRepository("""{"symbol_fqn":"Library.Storage.IStore"}"""), Solo);
+        Assert.IsFalse(members.IsError, members.Body.ToString());
+        var printed = Names(members.Body).Single(n => n.Contains("PublishAsync", StringComparison.Ordinal));
+
+        var call = await CallAsync("find_references",
+            WithRepository($$"""{"symbol_fqn":{{JsonSerializer.Serialize(printed)}}}"""), Solo);
+
+        Assert.IsFalse(call.IsError, $"{printed}: {call.Body}");
+        Assert.IsTrue(call.Body.GetProperty("meta").GetProperty("result_count").GetInt32() > 0, call.Body.ToString());
+    }
+
+    [TestMethod]
+    [DataRow("Library.Storage.Result", "global::Library.Storage.Result")]
+    [DataRow("global::Library.Storage.Result", "global::Library.Storage.Result")]
+    [DataRow("Result", "global::Library.Storage.Result")]
+    [DataRow("Library.Storage.Result<T>", "global::Library.Storage.Result<T>")]
+    [DataRow("Result`1", "global::Library.Storage.Result<T>")]
+    [DataRow("T:Library.Storage.Result`1", "global::Library.Storage.Result<T>")]
+    public async Task NameWithoutTypeArguments_IsTheNonGenericType_WhenOneExists(string name, string expected)
+    {
+        var call = await CallAsync("find_symbol", WithRepository($$"""{"name":{{JsonSerializer.Serialize(name)}}}"""), Solo);
+
+        Assert.IsFalse(call.IsError, call.Body.ToString());
+        Assert.AreEqual(expected, Names(call.Body).Single(), call.Body.ToString());
+    }
+
+    [TestMethod]
+    public async Task GetTypeMembers_OfANonGenericTypeWithAGenericNamesake_ListsItsOwnMembers()
+    {
+        var call = await CallAsync("get_type_members", WithRepository("""{"symbol_fqn":"Library.Storage.Result"}"""), Solo);
+
+        Assert.IsFalse(call.IsError, call.Body.ToString());
+        CollectionAssert.AreEqual(new[] { "global::Library.Storage.Result.Ok" }, Names(call.Body), call.Body.ToString());
+    }
+
+    [TestMethod]
+    public async Task BareTypeName_IsTheType_NotATypeParameterOfTheSameName()
+    {
+        var symbol = await CallAsync("find_symbol", WithRepository("""{"name":"Item"}"""), Solo);
+        var references = await CallAsync("find_references", WithRepository("""{"symbol_fqn":"Item"}"""), Solo);
+
+        Assert.IsFalse(symbol.IsError, symbol.Body.ToString());
+        Assert.AreEqual("global::Library.Storage.Item", Names(symbol.Body).Single(), symbol.Body.ToString());
+        Assert.AreEqual("class", symbol.Body.GetProperty("results")[0].GetProperty("kind").GetString());
+        Assert.IsFalse(references.IsError, references.Body.ToString());
+        var files = references.Body.GetProperty("results").EnumerateArray()
+            .Select(r => Path.GetFileName(r.GetProperty("file_path").GetString()!))
+            .Distinct()
+            .ToArray();
+        CollectionAssert.AreEqual(new[] { "Publisher.cs" }, files, references.Body.ToString());
+    }
+
+    [TestMethod]
+    [DataRow(3000, 1)]
+    [DataRow(0, 40)]
+    public async Task OversizedOrTooDeeplyNestedInput_IsAnInvalidArgumentError(int length, int depth)
+    {
+        var name = length > 0
+            ? "Library." + new string('a', length)
+            : "Circle.Scale(" + string.Concat(Enumerable.Repeat("A<", depth)) + "B" + new string('>', depth) + ")";
+
+        var call = await CallAsync("find_references", WithRepository($$"""{"symbol_fqn":{{JsonSerializer.Serialize(name)}}}"""), Solo);
+
+        Assert.IsTrue(call.IsError, call.Body.ToString());
+        Assert.AreEqual("invalid_argument", ErrorCode(call.Body));
+    }
+
     // ==== loud failures, and honest empty answers =====================================================
 
     [TestMethod]
@@ -395,6 +488,43 @@ public class QueryToolInputResolutionHttpTests
                     public void Old() { }
 
                     public void Unused() { }
+                }
+            }
+            """),
+        ("src/Library/Storage/Store.cs", """
+            namespace Library.Storage
+            {
+                public interface IStore<T>
+                {
+                    System.Threading.Tasks.Task PublishAsync(T item, System.Threading.CancellationToken ct);
+                }
+
+                public sealed class MemoryStore<T> : IStore<T>
+                {
+                    public System.Threading.Tasks.Task PublishAsync(T item, System.Threading.CancellationToken ct) =>
+                        System.Threading.Tasks.Task.CompletedTask;
+                }
+
+                public class Result { public bool Ok; }
+
+                public class Result<T> : Result { public T Value; }
+
+                public class Item { }
+
+                public class Holder<Item> { public Item Held; }
+            }
+            """),
+        ("src/Library/Storage/Publisher.cs", """
+            namespace Library.Storage
+            {
+                public class Publisher
+                {
+                    public Item Stored = new Item();
+
+                    public System.Threading.Tasks.Task Send(IStore<string> store) =>
+                        store.PublishAsync("a", System.Threading.CancellationToken.None);
+
+                    public Result Check(Result<int> typed) => typed;
                 }
             }
             """)
