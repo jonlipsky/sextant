@@ -167,7 +167,6 @@ public static class McpInstaller
         **Start here:**
         - `get_index_status` — See what's indexed and how fresh the data is
         - `find_symbol` / `semantic_search` — Find symbols by name or text query
-        - `research_codebase` — Ask natural language questions about the codebase
 
         **Explore structure:**
         - `get_file_symbols` — Understand a file before reading it
@@ -242,7 +241,6 @@ public static class McpInstaller
           - mcp__sextant__get_api_surface
           - mcp__sextant__get_impact
           - mcp__sextant__get_index_status
-          - mcp__sextant__research_codebase
           - Read
           - Glob
           - Grep
@@ -263,17 +261,15 @@ public static class McpInstaller
         Return concise, structured answers. Include file paths and line numbers for all referenced symbols.
         """;
 
+    // Kept (not deleted) so a reinstall overwrites the SKILL.md older installers wrote, which routed to the removed
+    // research_codebase tool: the installer never deletes files.
     private const string SkillTemplate = """
         ---
-        description: "Research the .NET codebase using the Sextant semantic index. Use for architecture questions, finding symbols, tracing dependencies, and understanding code structure."
+        description: "Explore the .NET codebase using the Sextant semantic index. Use for architecture questions, finding symbols, tracing dependencies, and understanding code structure."
         ---
-        # Sextant Research
+        # Sextant
 
-        The user wants to explore or ask a question about the codebase using Sextant.
-
-        Use the `mcp__sextant__research_codebase` tool with the user's question. If the user provided a specific scope (file, project, or solution), pass it via the `scope` parameter.
-
-        If the question is simple and direct (e.g., "find usages of X", "what implements Y"), use the specific sextant tool directly instead of research_codebase:
+        Answer the user's question with the Sextant tool that fits it. For a broad question, chain them: find the symbol, then trace it. If the user gave a scope (file, project, or solution), pass it as `scope` where the tool takes one.
         - Symbol lookup → `mcp__sextant__find_symbol` or `mcp__sextant__semantic_search`
         - References → `mcp__sextant__find_references`
         - Call chains → `mcp__sextant__get_call_hierarchy`

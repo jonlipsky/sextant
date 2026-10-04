@@ -310,23 +310,9 @@ Public and protected API surface of a project, with optional breaking change det
 
 When `compare_to_commit` is provided, classifies each symbol as added, removed, or changed (breaking vs non-breaking).
 
-### research_codebase
-
-Ask a natural language question about the indexed codebase. An LLM agent researches the answer using the semantic index tools and returns a synthesized response. Requires LLM assist to be configured (`sextant config llm`).
-
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `question` | string | yes | The natural language question about the codebase |
-| `project_id` | string | no | Project canonical ID to scope the research |
-| `scope` | string | no | Scope filter: `file:/path`, `project:canonical_id`, `solution:/path`, or `all` |
-| `max_tool_calls` | int | no | Maximum tool calls the research agent can make (default: 15) |
-| `detail_level` | string | no | Response detail level: `brief` (default) or `detailed` |
-
-The response includes the synthesized `answer`, a `sources` array with FQNs and file locations, and `meta` with `tool_calls_used`, `model`, and standard freshness fields.
-
 ## Additional Tools
 
-The following tools are also exposed as MCP tools (registered via `WithToolsFromAssembly`) and are additionally available to the inner LLM agent behind `research_codebase`, which uses them alongside the tools above to answer natural language questions about the codebase.
+The following tools are also exposed as MCP tools (registered via `WithToolsFromAssembly`).
 
 ### get_namespace_tree
 
