@@ -23,6 +23,12 @@ public sealed class SymbolStore(SqliteConnection connection)
     /// </summary>
     public SnapshotReadScope Scope { get; set; } = SnapshotReadScope.Unscoped;
 
+    /// <summary>
+    /// Optional further restriction of the name and key lookups (<see cref="GetScopedProjectIds"/>) to these project
+    /// versions, e.g. a shared submodule's provider projects; null = every project in <see cref="Scope"/>.
+    /// </summary>
+    public IReadOnlySet<long>? ProjectRestriction { get; init; }
+
     // Reads reconstruct the absolute FilePath from the file version's repo-relative path and the
     // owning project's disk path, so no absolute path is ever stored (acceptance criterion 1).
     private const string SelectBase = """
@@ -256,6 +262,182 @@ public sealed class SymbolStore(SqliteConnection connection)
         return ReadAll(cmd);
     }
 
+    // ==== symbol lookup by name / key (the MCP symbol resolver) ========================================
+
+    // The SelectBase columns and joins after `FROM symbols s`, for queries that must drive the symbols table through a
+    // chosen index (`INDEXED BY` must follow the table name, before the joins).
+    private const string SelectColumns = """
+        SELECT s.id, s.project_id, s.symbol_key, s.fully_qualified_name, s.display_name, s.kind,
+               s.accessibility, s.is_static, s.is_abstract, s.is_virtual, s.is_override, s.signature,
+               s.signature_hash, s.doc_comment, s.line_start, s.line_end, s.attributes, s.last_indexed_at,
+               f.repo_relative_path AS repo_relative_path, p.disk_path AS disk_path,
+               p.repo_relative_path AS project_repo_relative
+        """;
+
+    private const string SymbolJoins = """
+
+        LEFT JOIN file_versions fv ON fv.id = s.file_version_id
+        LEFT JOIN files f ON f.id = fv.file_id
+        LEFT JOIN projects p ON p.id = s.project_id
+        """;
+
+    /// <summary>
+    /// The ids of the project versions this store's <see cref="Scope"/> reads (narrowed to
+    /// <see cref="ProjectRestriction"/> when set), ascending (every project when unscoped). The name lookups below seek
+    /// each one through <c>ix_symbols_project_name_nocase</c>.
+    /// </summary>
+    public List<long> GetScopedProjectIds()
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT id FROM projects" + Scope.Where("id") + " ORDER BY id;";
+        Scope.Bind(cmd);
+        var ids = new List<long>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            var id = reader.GetInt64(0);
+            if (ProjectRestriction is null || ProjectRestriction.Contains(id))
+                ids.Add(id);
+        }
+        return ids;
+    }
+
+    /// <summary>
+    /// The symbols whose <c>display_name</c> equals <paramref name="name"/> ignoring ASCII case, in the scoped project
+    /// versions (narrowed to <paramref name="projectIds"/> when given) and, when <paramref name="kinds"/> is given, of
+    /// those kinds; at most <paramref name="limit"/> rows ordered by (project, id). Each project is one seek of
+    /// <c>ix_symbols_project_name_nocase</c>, so the cost follows the matches, not the table.
+    /// </summary>
+    public List<SymbolInfo> GetByDisplayName(
+        string name, IReadOnlyCollection<SymbolKind>? kinds = null, IReadOnlyCollection<long>? projectIds = null,
+        int limit = 1000)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        var pids = ProjectIdsJson(projectIds);
+        if (pids is null)
+            return [];
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = $"""
+            {SelectColumns}
+            FROM json_each(@pids) __pid
+            CROSS JOIN symbols s INDEXED BY ix_symbols_project_name_nocase{SymbolJoins}
+            WHERE s.project_id = __pid.value
+              AND s.display_name COLLATE NOCASE = @name{KindClause(kinds)}
+            ORDER BY s.project_id, s.id
+            LIMIT @limit;
+            """;
+        cmd.Parameters.AddWithValue("@pids", pids);
+        cmd.Parameters.AddWithValue("@name", name);
+        cmd.Parameters.AddWithValue("@limit", limit);
+        return ReadAll(cmd);
+    }
+
+    /// <summary>
+    /// The symbols whose <c>display_name</c> starts with <paramref name="prefix"/> ignoring ASCII case (the
+    /// <see cref="NoCasePrefixRange"/> of the prefix, one index range per project), narrowed like
+    /// <see cref="GetByDisplayName"/>; at most <paramref name="limit"/> rows.
+    /// </summary>
+    public List<SymbolInfo> GetByDisplayNamePrefix(
+        string prefix, IReadOnlyCollection<SymbolKind>? kinds = null, IReadOnlyCollection<long>? projectIds = null,
+        int limit = 50)
+    {
+        ArgumentNullException.ThrowIfNull(prefix);
+        var pids = ProjectIdsJson(projectIds);
+        if (pids is null || prefix.Length == 0)
+            return [];
+        var range = NoCasePrefixRange.Of(prefix);
+        using var cmd = connection.CreateCommand();
+        var hi = range.Hi is null ? string.Empty : "\n  AND s.display_name COLLATE NOCASE < @hi";
+        cmd.CommandText = $"""
+            {SelectColumns}
+            FROM json_each(@pids) __pid
+            CROSS JOIN symbols s INDEXED BY ix_symbols_project_name_nocase{SymbolJoins}
+            WHERE s.project_id = __pid.value
+              AND s.display_name COLLATE NOCASE >= @lo{hi}{KindClause(kinds)}
+            ORDER BY s.project_id, s.id
+            LIMIT @limit;
+            """;
+        cmd.Parameters.AddWithValue("@pids", pids);
+        cmd.Parameters.AddWithValue("@lo", range.Lo);
+        if (range.Hi is not null)
+            cmd.Parameters.AddWithValue("@hi", range.Hi);
+        cmd.Parameters.AddWithValue("@limit", limit);
+        return ReadAll(cmd);
+    }
+
+    /// <summary>
+    /// The symbols of <paramref name="projectId"/> whose <c>symbol_key</c> starts with <paramref name="keyPrefix"/>
+    /// (binary, case-sensitive), ordered by key; at most <paramref name="limit"/> rows. One range seek of the unique
+    /// <c>(project_id, symbol_key)</c> index. With documentation-ID keys, <c>M:Ns.Type.</c> covers every method of the
+    /// type across all its partial declarations; the caller filters nested members out.
+    /// </summary>
+    public List<SymbolInfo> GetByKeyPrefix(long projectId, string keyPrefix, int limit = 5000)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(keyPrefix);
+        var last = keyPrefix[^1];
+        if (char.IsSurrogate(last) || last == char.MaxValue)
+            return [];
+        var hi = keyPrefix[..^1] + (char)(last + 1);
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = $"""
+            {SelectColumns}
+            FROM symbols s INDEXED BY ix_symbols_key{SymbolJoins}{Scope.Join("s.project_id")}
+            WHERE s.project_id = @project_id
+              AND s.symbol_key >= @lo AND s.symbol_key < @hi
+            ORDER BY s.symbol_key
+            LIMIT @limit;
+            """;
+        cmd.Parameters.AddWithValue("@project_id", projectId);
+        cmd.Parameters.AddWithValue("@lo", keyPrefix);
+        cmd.Parameters.AddWithValue("@hi", hi);
+        cmd.Parameters.AddWithValue("@limit", limit);
+        return ReadAll(cmd);
+    }
+
+    /// <summary>
+    /// The symbols whose <c>symbol_key</c> is exactly <paramref name="symbolKey"/> in the scoped project versions
+    /// (narrowed to <paramref name="projectIds"/> when given), ordered by project: one row per project version that
+    /// declares it.
+    /// </summary>
+    public List<SymbolInfo> GetBySymbolKeyInScope(string symbolKey, IReadOnlyCollection<long>? projectIds = null)
+    {
+        ArgumentNullException.ThrowIfNull(symbolKey);
+        var pids = ProjectIdsJson(projectIds);
+        if (pids is null)
+            return [];
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = $"""
+            {SelectColumns}
+            FROM json_each(@pids) __pid
+            CROSS JOIN symbols s INDEXED BY ix_symbols_key{SymbolJoins}
+            WHERE s.project_id = __pid.value AND s.symbol_key = @symbol_key
+            ORDER BY s.project_id, s.id;
+            """;
+        cmd.Parameters.AddWithValue("@pids", pids);
+        cmd.Parameters.AddWithValue("@symbol_key", symbolKey);
+        return ReadAll(cmd);
+    }
+
+    // The JSON array of project ids a name/key lookup seeks: the scoped project versions, intersected with
+    // `restriction` when given; null when that leaves none (the lookup then reads nothing). Scoping by the explicit id
+    // list keeps the lookups on their index whatever the scope's own join would make the planner do.
+    private string? ProjectIdsJson(IReadOnlyCollection<long>? restriction)
+    {
+        IEnumerable<long> ids = GetScopedProjectIds();
+        if (restriction is not null)
+        {
+            var allowed = restriction as IReadOnlySet<long> ?? restriction.ToHashSet();
+            ids = ids.Where(allowed.Contains);
+        }
+        var list = ids.ToList();
+        return list.Count == 0 ? null : "[" + string.Join(",", list) + "]";
+    }
+
+    private static string KindClause(IReadOnlyCollection<SymbolKind>? kinds) =>
+        kinds is null || kinds.Count == 0
+            ? string.Empty
+            : $"\n  AND s.kind IN ({string.Join(",", kinds.Select(k => (int)k).Distinct().Order())})";
+
     private static readonly int[] TypeKindOrdinals =
     {
         (int)SymbolKind.Class, (int)SymbolKind.Interface, (int)SymbolKind.Struct,
@@ -292,10 +474,7 @@ public sealed class SymbolStore(SqliteConnection connection)
 
     public List<SymbolInfo> GetByAttribute(string attributeFqn)
     {
-        using var cmd = connection.CreateCommand();
-        cmd.CommandText = SelectPrefix + " WHERE s.attributes LIKE '%' || @attr || '%' ORDER BY s.fully_qualified_name, s.id;";
-        cmd.Parameters.AddWithValue("@attr", attributeFqn);
-        var results = ReadAll(cmd);
+        var results = GetByAttributeFragment(attributeFqn);
         // Verify exact match in JSON array
         return results.Where(s =>
         {
@@ -307,6 +486,18 @@ public sealed class SymbolStore(SqliteConnection connection)
             }
             catch { return false; }
         }).ToList();
+    }
+
+    /// <summary>
+    /// The symbols whose attribute list contains <paramref name="fragment"/> anywhere (case-insensitive for ASCII), a
+    /// pre-filter the caller narrows by parsing <see cref="SymbolInfo.Attributes"/>.
+    /// </summary>
+    public List<SymbolInfo> GetByAttributeFragment(string fragment)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = SelectPrefix + " WHERE s.attributes LIKE '%' || @attr || '%' ORDER BY s.fully_qualified_name, s.id;";
+        cmd.Parameters.AddWithValue("@attr", fragment);
+        return ReadAll(cmd);
     }
 
     /// <summary>

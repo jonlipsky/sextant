@@ -51,9 +51,13 @@ public class RepositorySelectionHttpTests
 
         var meta = tool.GetProperty("meta");
         Assert.IsFalse(meta.TryGetProperty("error", out _), tool.ToString());
-        Assert.IsTrue(meta.GetProperty("ambiguous").GetBoolean());
-        Assert.AreEqual(2, meta.GetProperty("ambiguous_match_count").GetInt32(),
-            "with no header the read spans both repositories");
+        // Each repository's snapshot declares its own App.Type0 (the fixture keys differ per snapshot), so the
+        // search lists both definitions instead of picking one.
+        var projects = tool.GetProperty("results").EnumerateArray()
+            .Select(r => r.GetProperty("project_id").GetString())
+            .Distinct()
+            .Count();
+        Assert.AreEqual(2, projects, $"with no header the read spans both repositories: {tool}");
     }
 
     [TestMethod]

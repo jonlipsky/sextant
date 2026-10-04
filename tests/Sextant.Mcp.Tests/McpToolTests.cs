@@ -660,7 +660,7 @@ public class McpToolTests
     }
 
     [TestMethod]
-    public void AmbiguousFqn_ReturnsBestMatchPlusCandidateMetadata()
+    public void AmbiguousFqn_ListsEveryMatchInAnAcceptedForm()
     {
         var conn = _db.GetConnection();
         var symbolStore = new SymbolStore(conn);
@@ -695,13 +695,15 @@ public class McpToolTests
         var doc = JsonDocument.Parse(result);
         var meta = doc.RootElement.GetProperty("meta");
 
-        // A deterministic best match is still returned...
-        Assert.AreEqual(1, meta.GetProperty("result_count").GetInt32());
-        // ...but the ambiguity is disclosed rather than hidden.
-        Assert.IsTrue(meta.GetProperty("ambiguous").GetBoolean());
-        Assert.AreEqual(2, meta.GetProperty("ambiguous_match_count").GetInt32());
-        Assert.AreEqual(2, meta.GetProperty("candidates").GetArrayLength());
-        Assert.IsTrue(meta.TryGetProperty("selected_symbol_key", out var selected));
-        StringAssert.StartsWith(selected.GetString(), "M:TestNamespace.TestClass.Run");
+        // find_symbol is a search: both overloads are listed (never one silently picked), not an error...
+        Assert.IsFalse(meta.TryGetProperty("error", out _));
+        Assert.AreEqual(2, meta.GetProperty("result_count").GetInt32());
+        // ...each named in a form the single-symbol tools accept back (here its documentation ID: no signature)...
+        CollectionAssert.AreEquivalent(
+            new[] { "M:TestNamespace.TestClass.Run(System.Int32)", "M:TestNamespace.TestClass.Run(System.String)" },
+            doc.RootElement.GetProperty("results").EnumerateArray()
+                .Select(r => r.GetProperty("fully_qualified_name").GetString()).ToArray());
+        // ...and the response says the name is ambiguous and how to narrow it.
+        StringAssert.Contains(doc.RootElement.GetProperty("message").GetString(), "matches 2 different symbols");
     }
 }

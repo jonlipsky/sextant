@@ -701,8 +701,10 @@ reserved `branch` argument:
 | Names a `branch` but no repository | `meta.error.code = repository_required`, with no results | Same |
 | Names nothing (or only blank values) | The unselected default: the only repository of a single-repository catalog, or **every** repository of a multi-repository catalog | `meta.error.code = repository_required`, with no results |
 
-The `repository_required` error names no repository and depends only on the request, so it reveals nothing
-about what the catalog holds. The default keeps a caller that names no repository (for example a legacy
+The `repository_required` error is an MCP tool error (`isError: true`) and names no catalog repository: for a
+request without a verified caller it depends only on the request, so it reveals nothing about what the catalog
+holds. For a verified caller its message also lists the repositories that caller's own grants make visible (the
+`list_repositories` set, as `owner/repo`), so an agent can retry at once. The default keeps a caller that names no repository (for example a legacy
 gateway using the plain query token) working unchanged; turn the requirement on once every caller selects
 one. The local stdio MCP server has no header, advertises no reserved arguments, and never requires a
 selection.
@@ -713,9 +715,12 @@ A client that forwards tool arguments verbatim over one pooled connection with o
 per call through two reserved arguments. The service adds them in MCP request filters on its stateless
 `/mcp` (`ToolSelectionFilters`); the tools themselves are unchanged.
 
-- **`tools/list`** advertises two optional string arguments, `repository` and `branch`, on every
+- **`tools/list`** advertises two string arguments, `repository` and `branch`, on every
   repository-scoped remote tool (every tool on the remote allowlist except `list_repositories`, which reads no
-  index, and `search_symbols`, which declares its own `repository`/`branch` narrowing arguments). A tool that already declares an
+  index, and `search_symbols`, which declares its own `repository`/`branch` narrowing arguments). The
+  `repository` description says "Optional" only when omitting it can read something: with
+  `REQUIRE_REPOSITORY_SELECTION` on it says "Required", and with delegate tokens configured it states the one case
+  in which a verified caller may omit it (implicit selection, below). A tool that already declares an
   argument of the same name keeps its own: `find_cross_repository_usages` and `find_submodule_consumers`
   keep their consumer-filter `branch`, so they get only `repository`.
 - **`tools/call`** removes the reserved arguments before the tool binds its own, so a tool never sees them.
@@ -820,8 +825,9 @@ across requests, so a revocation takes effect on the next call. Once a request h
   does not exist.
 - **Cross-repository tools** list only consumer repositories the caller can see.
 - **Implicit selection:** a delegate read that names neither a repository nor a branch reads the caller's
-  **one** visible repository with a complete default-branch snapshot. With none or several, it fails with
-  `repository_required`.
+  **one** visible repository with a complete default-branch snapshot, and says so: `meta.snapshot.repository`
+  names it and `meta.snapshot.repository_selection` is `implicit`. With none or several, it fails with
+  `repository_required` (`isError: true`), whose message lists the caller's visible repositories.
 - **`/control/ensure`** by a user caller needs the repository to be visible, otherwise `403 not_granted`
   (audited `ensure`/`denied`), and its body is then bounded (SX-6d, see
   [User callers on the control plane](#user-callers-on-the-control-plane-issue-193)). An application caller
@@ -1707,7 +1713,7 @@ catalog, and a `FakeSnapshotWorker`. The suite maps to the acceptance criteria:
 | 1 — idempotent ensure | `SnapshotServiceTests` (concurrent ensures attach to one job; worker runs once); `EnsureCallerDisconnectTests` / `EnsureCallerDisconnectHttpTests` (#148: caller disconnect never cancels production, re-ensure attaches to the in-flight run, `wait=false`, prompt status/resolve during a run, shutdown requeues); `QueuedControlWriteHttpTests` / `JobIdReservationsTests` (#158: `wait=false` and retire answer `202` within the bound while a production holds the writer, reserved job ids resolve and are never reused, apply-time retire guards, submission order, coalescing, shutdown drain) |
 | 2 — restart recovery | `SnapshotServiceTests` (catalog survives restart; orphaned `running` jobs reconciled) |
 | 3 — scratch cannot delete published | `ServicePathsTests` (scratch/persistent separation + `ReleaseScratch` refusal) |
-| 4 — query via HTTP MCP without ProcessStack | `ServiceHttpTests` (`/mcp` mapped + auth-gated; `/query` paging); `RepositorySelectionHttpTests` (the `X-Sextant-Repository` header without a read policy, the legacy no-header unscoped read, `repository_required`); `ToolArgumentSelectionHttpTests` + `ToolSelectionFiltersTests` (SVC-2: the reserved `repository`/`branch` arguments listed on repository-scoped tools and stripped on call, argument-over-header precedence, `selector_conflict`/`invalid_selector`, branch pinning, `branch` without a repository, the cross-repository provider default, the unknown-branch uniform not-found); `McpClientCompatibilityTests` (an SDK client selecting through the `repository` argument) |
+| 4 — query via HTTP MCP without ProcessStack | `ServiceHttpTests` (`/mcp` mapped + auth-gated; `/query` paging); `RepositorySelectionHttpTests` (the `X-Sextant-Repository` header without a read policy, the legacy no-header unscoped read, `repository_required`); `ToolArgumentSelectionHttpTests` + `ToolSelectionFiltersTests` (SVC-2: the reserved `repository`/`branch` arguments listed on repository-scoped tools and stripped on call, argument-over-header precedence, `selector_conflict`/`invalid_selector`, branch pinning, `branch` without a repository, the cross-repository provider default, the unknown-branch uniform not-found); `McpClientCompatibilityTests` (an SDK client selecting through the `repository` argument); `QueryToolInputResolutionHttpTests` (issues #149/#163: symbol arguments without `global::`, `Type.Member`, parameter lists and documentation IDs; exact type lookup and `kind`; ambiguity and not-found as tool errors with candidates; `get_type_members`; implicit selection naming its repository and `repository_required` listing the caller's repositories) |
 | 5 — structured per-project diagnostics | `SnapshotServiceTests` (partial/failed/unsupported diagnostics) |
 | 6 — local-only remains functional | `ArchitectureBoundaryTests` (core assemblies never reference the service; local query without a service) |
 

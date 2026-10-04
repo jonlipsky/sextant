@@ -64,13 +64,32 @@ public class GetNamespaceTreeTests
     [TestMethod]
     public void GetNamespaceTree_LeafNamespace_HasEmptyChildNamespaces()
     {
-        // Alpha.Tests is a leaf namespace
+        // Beta is a leaf namespace (it declares Consumer and has no sub-namespace)
         var result = GetNamespaceTreeTool.GetNamespaceTree(_fixture.DbProvider,
-            namespace_prefix: "global::Alpha.Tests");
+            namespace_prefix: "global::Beta");
         var doc = JsonDocument.Parse(result);
         var first = doc.RootElement.GetProperty("results")[0];
         var childNamespaces = first.GetProperty("child_namespaces");
         Assert.AreEqual(0, childNamespaces.GetArrayLength());
+    }
+
+    [TestMethod]
+    public void GetNamespaceTree_PrefixWithoutGlobalAlias_DrillsIntoNamespace()
+    {
+        var result = GetNamespaceTreeTool.GetNamespaceTree(_fixture.DbProvider, namespace_prefix: "Alpha");
+        var first = JsonDocument.Parse(result).RootElement.GetProperty("results")[0];
+        Assert.AreEqual("global::Alpha", first.GetProperty("namespace").GetString());
+        Assert.IsTrue(first.GetProperty("symbols").GetArrayLength() >= 2);
+    }
+
+    [TestMethod]
+    public void GetNamespaceTree_UnknownNamespace_IsAnErrorNamingTheClosest()
+    {
+        // A namespace that declares no indexed type is an error, never an empty tree an agent reads as "no types".
+        var result = GetNamespaceTreeTool.GetNamespaceTree(_fixture.DbProvider, namespace_prefix: "Alfa.Beta");
+        var meta = JsonDocument.Parse(result).RootElement.GetProperty("meta");
+        Assert.AreEqual("invalid_argument", meta.GetProperty("error").GetProperty("code").GetString());
+        StringAssert.Contains(meta.GetProperty("error").GetProperty("message").GetString()!, "global::Beta");
     }
 
     [TestMethod]

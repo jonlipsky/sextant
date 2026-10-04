@@ -44,7 +44,9 @@ public static class McpServerSetup
                 });
                 services.AddMcpServer()
                     .WithStdioServerTransport()
-                    .WithToolsFromAssembly();
+                    .WithToolsFromAssembly()
+                    // A result with a structured meta.error is an MCP tool error (isError: true), issue #163.
+                    .WithRequestFilters(filters => filters.AddCallToolFilter(ToolErrorResults.CallToolFilter()));
             });
     }
 
@@ -78,7 +80,8 @@ public static class McpServerSetup
         // (Sextant.Service.Host ServiceApp) is the stateless one.
         builder.Services.AddMcpServer()
             .WithHttpTransport(transport => transport.Stateless = false)
-            .WithToolsFromAssembly();
+            .WithToolsFromAssembly()
+            .WithRequestFilters(filters => filters.AddCallToolFilter(ToolErrorResults.CallToolFilter()));
 
         builder.WebHost.UseUrls($"http://localhost:{port}");
 

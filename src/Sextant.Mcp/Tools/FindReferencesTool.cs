@@ -30,28 +30,48 @@ public static class FindReferencesTool
         var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
         var contextRetriever = new SourceContextRetriever(new FileStore(conn));
 
-        var resolution = SymbolResolver.Resolve(symbolStore, projectStore, symbol_fqn);
-        if (resolution.Symbol == null)
-            return ResponseBuilder.BuildEmpty("Symbol not found.", readContext.Provenance);
-        var symbol = resolution.Symbol;
+        var lookup = SymbolResolver.Lookup(symbolStore, projectStore, symbol_fqn);
+        if (lookup.Status != SymbolLookupStatus.Resolved)
+            return SymbolResolver.ErrorResponse(symbolStore, projectStore, lookup, readContext.Provenance);
+        var symbol = lookup.Symbol!;
+        var namer = new SymbolNamer(symbolStore);
 
-        var refs = referenceStore.GetBySymbolId(symbol.Id);
+        AccessKind? accessFilter = null;
+        if (!string.IsNullOrEmpty(access_kind))
+        {
+            var accessText = access_kind.Trim().Replace("_", string.Empty).Replace("-", string.Empty);
+            if (!accessText.All(char.IsLetter) || !Enum.TryParse<AccessKind>(accessText, ignoreCase: true, out var ak))
+                return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode,
+                    $"Unknown access_kind '{access_kind}'. Use 'read', 'write' or 'readwrite', or omit it for all.",
+                    readContext.Provenance);
+            accessFilter = ak;
+        }
 
-        // Filter by project if include_projects is specified
+        HashSet<long>? includedProjectIds = null;
         if (!string.IsNullOrEmpty(include_projects))
         {
-            var projectIds = new HashSet<long>();
+            includedProjectIds = [];
             foreach (var canonicalId in include_projects.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
             {
                 var proj = projectStore.GetByCanonicalId(canonicalId);
-                if (proj != null)
-                    projectIds.Add(proj.Value.id);
+                if (proj == null)
+                    return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode,
+                        $"Unknown project '{canonicalId}' in include_projects. Use project canonical IDs as listed by get_index_status.",
+                        readContext.Provenance);
+                includedProjectIds.Add(proj.Value.id);
             }
-            refs = refs.Where(r => projectIds.Contains(r.InProjectId)).ToList();
         }
 
-        // Apply scope filter
+        // An unknown project/solution or an unrecognized scope is an error, never a silently unfiltered query.
         var scopeFilter = ScopeResolver.Resolve(scope, conn, readContext.Scope);
+        if (scopeFilter.Error != null)
+            return scopeFilter.ErrorResponse(readContext.Provenance);
+
+        var refs = referenceStore.GetBySymbolId(symbol.Id);
+
+        if (includedProjectIds != null)
+            refs = refs.Where(r => includedProjectIds.Contains(r.InProjectId)).ToList();
+
         if (!scopeFilter.IsEmpty)
         {
             if (scopeFilter.FilePath != null)
@@ -60,12 +80,15 @@ public static class FindReferencesTool
                 refs = refs.Where(r => scopeFilter.ProjectIds.Contains(r.InProjectId)).ToList();
         }
 
-        // Filter by access kind
-        if (!string.IsNullOrEmpty(access_kind))
-        {
-            if (Enum.TryParse<AccessKind>(access_kind, ignoreCase: true, out var ak))
-                refs = refs.Where(r => r.AccessKind == ak).ToList();
-        }
+        if (accessFilter != null)
+            refs = refs.Where(r => r.AccessKind == accessFilter).ToList();
+
+        var filtered = includedProjectIds != null || !scopeFilter.IsEmpty || accessFilter != null;
+        var message = ResponseBuilder.JoinMessages(
+            SymbolResolver.ResolutionNote(symbolStore, lookup),
+            refs.Count == 0
+                ? $"No references to {SymbolResolver.Describe(namer, symbol)} were found{(filtered ? " with the given filters" : string.Empty)}."
+                : null);
 
         var canonicalIdCache = FindSymbolTool.BuildCanonicalIdCache(projectStore);
         var mapped = refs.Select(r =>
@@ -90,10 +113,10 @@ public static class FindReferencesTool
         {
             var groups = group_by.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
             var grouped = GroupReferences(mapped, groups);
-            return ResponseBuilder.Build(grouped, symbol.LastIndexedAt, resolution.Ambiguity, readContext.Provenance);
+            return ResponseBuilder.Build(grouped, symbol.LastIndexedAt, lookup.Ambiguity, readContext.Provenance, message: message);
         }
 
-        return ResponseBuilder.Build(mapped, symbol.LastIndexedAt, resolution.Ambiguity, readContext.Provenance);
+        return ResponseBuilder.Build(mapped, symbol.LastIndexedAt, lookup.Ambiguity, readContext.Provenance, message: message);
     }
 
     private static List<object> GroupReferences(List<object> refs, string[] groupKeys)
