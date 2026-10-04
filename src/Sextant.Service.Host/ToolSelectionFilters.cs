@@ -107,10 +107,6 @@ internal static class ToolSelectionFilters
 
     private static readonly string[] ReservedArguments = [RepositoryArgument, BranchArgument];
 
-    private const string BranchDescription =
-        "Optional: read this branch's latest complete snapshot instead of the repository's default branch. " +
-        "Requires the repository to be selected too.";
-
     /// <summary>
     /// The names of every repository-scoped tool among <paramref name="toolTypes"/>: each
     /// <see cref="McpServerToolAttribute"/> method's tool name, minus <see cref="SelectionExemptTools"/>.
@@ -135,6 +131,9 @@ internal static class ToolSelectionFilters
     /// <summary>
     /// Adds the reserved arguments to every repository-scoped tool's <c>inputSchema</c> in a <c>tools/list</c>
     /// result. The SDK's tool definitions are shared across requests, so each one is cloned, never mutated.
+    /// <paramref name="selectionRequired"/> (the operator switch) makes the description say it is required, and
+    /// <paramref name="implicitSelection"/> (delegate callers) names the one exception: a caller that can read
+    /// exactly one repository may omit it.
     /// </summary>
     public static McpRequestFilter<ListToolsRequestParams, ListToolsResult> ListToolsFilter(
         RepositoryUrlPolicy policy, IReadOnlySet<string> scopedTools, bool selectionRequired = false,
@@ -309,8 +308,10 @@ internal static class ToolSelectionFilters
         }
         if (!declared.Contains(RepositoryArgument))
             properties[RepositoryArgument] = StringProperty(repositoryDescription);
+        // No description: an optional `branch` explains itself (omitted = the default branch), and this saves a
+        // line on each of the scoped tools (issue #145). The repository description already says it is required.
         if (!declared.Contains(BranchArgument))
-            properties[BranchArgument] = StringProperty(BranchDescription);
+            properties[BranchArgument] = new JsonObject { ["type"] = "string" };
 
         var clone = JsonSerializer.Deserialize(
             JsonSerializer.Serialize(tool, McpJsonUtilities.DefaultOptions), typeof(Tool), McpJsonUtilities.DefaultOptions) as Tool
@@ -323,29 +324,20 @@ internal static class ToolSelectionFilters
         new() { ["type"] = "string", ["description"] = description };
 
     /// <summary>
-    /// The advertised description of the reserved <c>repository</c> argument. It says "Optional" only when omitting it
-    /// really reads something: never when the operator requires a selection (<paramref name="selectionRequired"/>),
-    /// and, when callers are verified (<paramref name="implicitSelection"/>), it states the one case in which a
-    /// verified caller may omit it.
+    /// The advertised description of the reserved <c>repository</c> argument. It never says "Optional": it states
+    /// the requirement when the operator requires a selection (<paramref name="selectionRequired"/>), and, when
+    /// callers are verified (<paramref name="implicitSelection"/>), the one case in which a verified caller may omit it.
     /// </summary>
     internal static string RepositoryDescription(RepositoryUrlPolicy policy, bool selectionRequired, bool implicitSelection)
     {
-        var forms = "'https://{host}/{owner}/{repo}' (optionally ending in '.git') or '{host}/{owner}/{repo}'";
-        if (policy.Hosts.Count == 1)
-            forms += $", or '{{owner}}/{{repo}}' on {policy.Hosts[0]}";
-        var header = $"The request's {ServiceApp.RepositoryHeader} header can name it instead; when both are sent they " +
-                     "must name the same repository.";
-        const string implicitRule =
-            " A verified caller that can read exactly one indexed repository may omit both: that repository is read " +
-            "and named in meta.snapshot.repository. Otherwise omitting it fails with repository_required, which " +
-            "lists the repositories the caller can read.";
-        if (selectionRequired || implicitSelection)
-        {
-            var lead = selectionRequired ? "Required" : "Required for a verified caller";
-            return $"{lead}: the repository to read, as {forms}. {header}" + (implicitSelection ? implicitRule : string.Empty);
-        }
-        return $"Optional: the repository to read, as {forms}. Omit it to use the request's " +
-               $"{ServiceApp.RepositoryHeader} header; when both are sent they must name the same repository.";
+        // Kept to one short line: it is repeated on every repository-scoped tool (issue #145). The forms and the
+        // header default are spelled out once, in the server instructions and docs/service.md. A client may drop
+        // those instructions, so the requirement itself is stated here. Implicit selection (delegate callers) lets
+        // a verified caller that can read exactly one repository omit it, whether or not the operator switch is on.
+        var form = policy.Hosts.Count == 1 ? "owner/repo" : "host/owner/repo";
+        if (implicitSelection)
+            return "Required unless exactly one is granted: " + form;
+        return selectionRequired ? "Required: " + form : form;
     }
 
     private static SelectionOutcome Fail(string code, string message) =>

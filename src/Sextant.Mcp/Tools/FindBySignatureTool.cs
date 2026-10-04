@@ -8,26 +8,28 @@ namespace Sextant.Mcp.Tools;
 public static class FindBySignatureTool
 {
     [McpServerTool(Name = "find_by_signature"),
-     Description("Find methods/properties by their signature characteristics: return type, parameter types, parameter count.")]
+     Description("Methods by return type, parameter type or count. Use instead of regex over signatures.")]
     public static string FindBySignature(
         DatabaseProvider dbProvider,
-        [Description("Return type to match (e.g., 'Task', 'IEnumerable<Order>', 'void'). Partial match supported.")]
+        [Description("Partial match, e.g. Task.")]
         string? return_type = null,
-        [Description("Parameter type to match — finds methods with at least one parameter of this type (e.g., 'CancellationToken', 'HttpClient'). Partial match supported.")]
+        [Description("Partial match, e.g. CancellationToken.")]
         string? parameter_type = null,
-        [Description("Exact number of parameters to match")]
         int? parameter_count = null,
-        [Description("Symbol kind filter (default: method). Use 'property' for property type matching.")]
+        [Description("method or property.")]
         string? kind = null,
-        [Description("Optional project canonical ID filter")]
+        [Description(ToolText.ProjectId)]
         string? project_id = null,
-        [Description("Maximum results (default 50)")]
-        int max_results = 50)
+        [Description(ToolText.Limit)] int? limit = null,
+        [Description(ToolText.Cursor)] string? cursor = null)
     {
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
         if (!SymbolKindNames.TryParse(kind, out var kinds, out _, out var kindError))
             return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode, kindError!, readContext.Provenance);
+        if (!Paging.TryBegin("find_by_signature", limit, cursor, readContext, out var page, out var cursorError,
+                return_type, parameter_type, parameter_count, kind, project_id))
+            return cursorError;
 
         using var conn = db.OpenReadConnection();
         var symbolStore = new SymbolStore(conn) { Scope = readContext.Scope };
@@ -44,10 +46,11 @@ public static class FindBySignatureTool
             projectDbId = proj.Value.id;
         }
 
+        // Every match is read (no SQL cap), so meta.total is exact; only this page is mapped.
         var results = kinds == null
-            ? symbolStore.SearchBySignature(return_type, parameter_type, null, projectDbId, max_results * 2)
+            ? symbolStore.SearchBySignature(return_type, parameter_type, null, projectDbId, int.MaxValue)
             : kinds.Order()
-                .SelectMany(k => symbolStore.SearchBySignature(return_type, parameter_type, k.ToString(), projectDbId, max_results * 2))
+                .SelectMany(k => symbolStore.SearchBySignature(return_type, parameter_type, k.ToString(), projectDbId, int.MaxValue))
                 .ToList();
 
         // Post-filter by parameter count if specified
@@ -65,15 +68,22 @@ public static class FindBySignatureTool
             }).ToList();
         }
 
-        results = results.Take(max_results).ToList();
+        results = results
+            .OrderBy(s => s.FilePath, StringComparer.Ordinal).ThenBy(s => s.LineStart).ThenBy(s => s.Id)
+            .ToList();
 
         var canonicalIdCache = FindSymbolTool.BuildCanonicalIdCache(projectStore);
         var namer = new SymbolNamer(symbolStore);
-        var mapped = results.Select(s => FindSymbolTool.MapSymbol(
-            s, FindSymbolTool.ResolveCanonicalId(s.ProjectId, canonicalIdCache), qualifiedName: namer.QualifiedName(s))).ToList<object>();
+        object? summary = page.IsTruncatedFirstPage(results.Count)
+            ? new { ByProject = Paging.CountBy(results, s => FindSymbolTool.ResolveCanonicalId(s.ProjectId, canonicalIdCache)) }
+            : null;
+        var mapped = page.Slice(results)
+            .Select(s => FindSymbolTool.MapSymbol(
+                s, FindSymbolTool.ResolveCanonicalId(s.ProjectId, canonicalIdCache), qualifiedName: namer.QualifiedName(s)))
+            .ToList();
         var freshness = results.Count > 0 ? results.Min(s => s.LastIndexedAt) : 0;
-        return ResponseBuilder.Build(mapped, freshness, provenance: readContext.Provenance,
-            message: mapped.Count == 0 ? "No symbol matches the given signature filters." : null);
+        return ResponseBuilder.BuildPage(mapped, results.Count, page, freshness, provenance: readContext.Provenance,
+            summary: summary, message: results.Count == 0 ? "No symbol matches the given signature filters." : null);
     }
 
     internal static int CountParameters(string paramSection)

@@ -90,6 +90,22 @@ public sealed class DatabaseProvider : IDisposable
     /// </summary>
     public Func<bool> RepositorySelectedImplicitly { get; set; } = () => false;
 
+    /// <summary>
+    /// True on the service's remote MCP surface (issue #145): every read's <see cref="FederatedReadContext.Paths"/>
+    /// refuses absolute path inputs (callers pass repository-relative paths), and the context resolves the
+    /// selected repository and branch names that the remote response post-pass
+    /// (<see cref="RemoteResponsePresenter"/>) shows in the lean <c>meta.snapshot</c>. False (the default) keeps
+    /// the local stdio/CLI path unchanged: absolute paths are still accepted and shown.
+    /// </summary>
+    public bool RemoteSurface { get; init; }
+
+    /// <summary>
+    /// Called with the context of every read that <see cref="TryBeginRead"/> admits, so a host can present the
+    /// tool's response against the same pinned selection (the remote surface records it for
+    /// <see cref="RemoteResponsePresenter"/>). Null (the default) does nothing.
+    /// </summary>
+    public Action<FederatedReadContext>? ReadAdmitted { get; init; }
+
     public bool DatabaseExists => File.Exists(_dbPath);
 
     public IndexDatabase? GetDatabase()
@@ -182,12 +198,13 @@ public sealed class DatabaseProvider : IDisposable
 
             if (!ReadContextGate.TryResolve(
                     ready, out context, out failureResponse, mode, Authorizer, compatibility, RequestedRepository,
-                    RequestedBranch))
+                    RequestedBranch, RemoteSurface))
                 return false; // the gate already produced the uniform not-found
 
             database = ready;
             context = StampImplicitSelection(context);
             failureResponse = string.Empty;
+            ReadAdmitted?.Invoke(context);
             return true;
         }
 
@@ -202,11 +219,12 @@ public sealed class DatabaseProvider : IDisposable
 
         if (!ReadContextGate.TryResolve(
                 database, out context, out failureResponse, mode, Authorizer, compatibility, RequestedRepository,
-                RequestedBranch))
+                RequestedBranch, RemoteSurface))
             return false;
 
         context = StampImplicitSelection(context);
         failureResponse = string.Empty;
+        ReadAdmitted?.Invoke(context);
         return true;
     }
 

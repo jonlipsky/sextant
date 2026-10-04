@@ -7,13 +7,17 @@ namespace Sextant.Mcp.Tools;
 [McpServerToolType]
 public static class GetImpactTool
 {
-    [McpServerTool(Name = "get_impact"), Description("Assess the impact of changing a symbol — find all cross-project consumers and classify breaking changes. Use before refactoring.")]
+    [McpServerTool(Name = "get_impact"), Description("Projects that break if a symbol changes. Use before refactoring.")]
     public static string GetImpact(
         DatabaseProvider dbProvider,
-        [Description("Fully qualified name of the symbol")] string symbol_fqn)
+        [Description(ToolText.SymbolFqn)] string symbol_fqn,
+        [Description(ToolText.Limit)] int? limit = null,
+        [Description(ToolText.Cursor)] string? cursor = null)
     {
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
+        if (!Paging.TryBegin("get_impact", limit, cursor, readContext, out var page, out var cursorError, symbol_fqn))
+            return cursorError;
 
         using var conn = db.OpenReadConnection();
         var snapshotScope = readContext.Scope;
@@ -30,27 +34,31 @@ public static class GetImpactTool
         var namer = new SymbolNamer(symbolStore);
 
         // Find all projects that depend on this symbol's project
-        var consumers = dependencyStore.GetByDependency(symbol.ProjectId);
+        var consumers = dependencyStore.GetByDependency(symbol.ProjectId)
+            .Select(dep => (Dependency: dep, Project: projectStore.GetById(dep.ConsumerProjectId)))
+            .Where(c => c.Project != null)
+            .OrderBy(c => c.Project!.Value.project.CanonicalId, StringComparer.Ordinal)
+            .ThenBy(c => c.Dependency.ConsumerProjectId)
+            .ToList();
+
+        // Read the target's references once, not once per consumer.
+        var refCountByProject = referenceStore.GetBySymbolId(symbol.Id)
+            .GroupBy(r => r.InProjectId)
+            .ToDictionary(g => g.Key, g => g.Count());
 
         var consumerResults = new List<object>();
-        foreach (var dep in consumers)
+        foreach (var (dep, consumer) in page.Slice(consumers))
         {
-            var consumerProject = projectStore.GetById(dep.ConsumerProjectId);
-            if (consumerProject == null) continue;
-
-            // Count references from this consumer to the target symbol
-            var refs = referenceStore.GetBySymbolId(symbol.Id);
-            var refCount = refs.Count(r => r.InProjectId == dep.ConsumerProjectId);
-
+            var consumerProject = consumer!.Value;
             consumerResults.Add(new
             {
                 project = new
                 {
-                    canonical_id = consumerProject.Value.project.CanonicalId,
-                    git_remote_url = consumerProject.Value.project.GitRemoteUrl,
-                    repo_relative_path = consumerProject.Value.project.RepoRelativePath
+                    canonical_id = consumerProject.project.CanonicalId,
+                    git_remote_url = consumerProject.project.GitRemoteUrl,
+                    repo_relative_path = consumerProject.project.RepoRelativePath
                 },
-                reference_count = refCount,
+                reference_count = refCountByProject.GetValueOrDefault(dep.ConsumerProjectId),
                 reference_kind = dep.ReferenceKind,
                 submodule_pinned_commit = dep.SubmodulePinnedCommit,
                 pin_includes_current = dep.SubmodulePinnedCommit != null
@@ -99,7 +107,8 @@ public static class GetImpactTool
             }
         };
 
-        return ResponseBuilder.Build(result, symbol.LastIndexedAt, lookup.Ambiguity, readContext.Provenance,
+        return ResponseBuilder.BuildPage(result, consumers.Count, page, symbol.LastIndexedAt, lookup.Ambiguity,
+            readContext.Provenance, resultCount: consumerResults.Count,
             message: SymbolResolver.ResolutionNote(symbolStore, lookup));
     }
 

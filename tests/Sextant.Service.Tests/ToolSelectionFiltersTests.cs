@@ -241,6 +241,45 @@ public sealed class ToolSelectionFiltersTests
     }
 
     [TestMethod]
+    [DataRow(false, false, "owner/repo")]
+    [DataRow(true, false, "Required: owner/repo")]
+    [DataRow(false, true, "Required unless exactly one is granted: owner/repo")]
+    [DataRow(true, true, "Required unless exactly one is granted: owner/repo")]
+    public async Task ListTools_RepositoryDescription_StatesTheRequirement_InOneShortLine(
+        bool selectionRequired, bool implicitSelection, string expected)
+    {
+        var filter = ToolSelectionFilters.ListToolsFilter(RepositoryUrlPolicy.Default, new HashSet<string> { "find_symbol" },
+            selectionRequired, implicitSelection);
+        var shared = new ListToolsResult { Tools = [Tool("find_symbol", """{"type":"object","properties":{}}""")] };
+
+        var result = await filter((_, _) => ValueTask.FromResult(shared))(null!, CancellationToken.None);
+
+        Assert.AreEqual(expected,
+            result.Tools[0].InputSchema.GetProperty("properties").GetProperty("repository").GetProperty("description").GetString());
+    }
+
+    [TestMethod]
+    public async Task SchemaCompaction_DropsOnlyNullUnionsAndNullDefaults_WithoutMutatingTheShared()
+    {
+        var nullable = Tool("find_references",
+            """{"type":"object","properties":{"limit":{"type":["integer","null"],"default":null},"flag":{"type":"boolean","default":false},"either":{"type":["string","integer"]}}}""");
+        var plain = Tool("get_index_status", """{"type":"object","properties":{"name":{"type":"string"}}}""");
+        var originalSchema = nullable.InputSchema.GetRawText();
+        var shared = new ListToolsResult { Tools = [nullable, plain] };
+
+        var result = await ToolSchemaCompaction.ListToolsFilter()((_, _) => ValueTask.FromResult(shared))(null!, CancellationToken.None);
+
+        Assert.AreEqual(originalSchema, nullable.InputSchema.GetRawText(), "the shared definition is not mutated");
+        Assert.AreNotSame(nullable, result.Tools[0], "a compacted tool is a copy");
+        Assert.AreSame(plain, result.Tools[1], "a tool with nothing to compact is passed through");
+        var properties = result.Tools[0].InputSchema.GetProperty("properties");
+        Assert.AreEqual("""{"type":"integer"}""", properties.GetProperty("limit").GetRawText());
+        Assert.AreEqual("""{"type":"boolean","default":false}""", properties.GetProperty("flag").GetRawText(), "a real default is kept");
+        Assert.AreEqual("""{"type":["string","integer"]}""", properties.GetProperty("either").GetRawText(), "a non-null union is kept");
+        Assert.AreEqual(nullable.Description, result.Tools[0].Description);
+    }
+
+    [TestMethod]
     public void RepositoryScopedTools_CoverEveryRemoteTool()
     {
         var names = ToolSelectionFilters.RepositoryScopedToolNames(ServiceApp.RemoteQueryTools);

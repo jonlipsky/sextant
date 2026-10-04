@@ -239,6 +239,9 @@ sextant query find-symbol UserService --fuzzy
 # Find all references to a method
 sextant query find-references "global::App.Services.UserService.GetById(int)"
 
+# Large results are paged (default 50 rows, max 200): pass meta.next_cursor back to continue
+sextant query find-references "global::App.Services.UserService.GetById(int)" --limit 100 --cursor <meta.next_cursor>
+
 # Get call hierarchy
 sextant query get-call-hierarchy "global::App.Handlers.OrderHandler.Process()" --direction callees --depth 3
 

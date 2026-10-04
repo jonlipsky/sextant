@@ -28,9 +28,7 @@ public static class ListRepositoriesTool
     };
 
     [McpServerTool(Name = "list_repositories"), Description(
-        "List the repositories you can query, with each repository's branches and the status of their index " +
-        "(complete, partial, pending or missing). Pass one of these repositories as the `repository` argument of " +
-        "the other tools.")]
+        "Repositories you can query, with branches and index status. Call first to pick repository.")]
     public static string ListRepositories(SnapshotService service, CallerContext caller)
     {
         if (caller.Current is not { } principal)

@@ -9,21 +9,18 @@ namespace Sextant.Mcp.Tools;
 public static class FindCrossRepositoryUsagesTool
 {
     [McpServerTool(Name = "find_cross_repository_usages"),
-     Description("Find where a symbol from a shared submodule (provider) repository is used across OTHER repositories, " +
-                 "without opening them. Answers \"which apps use this method\" for code shared via a git submodule that " +
-                 "Sextant indexed once. Results come from each authorized consumer repository's default-branch head " +
-                 "(or an explicit branch/commit), and are bound to the provider's stable symbol identity, never an FQN " +
-                 "string match.")]
+     Description("Uses of a shared submodule symbol in OTHER repositories. Use instead of searching each consumer.")]
     public static string FindCrossRepositoryUsages(
         DatabaseProvider dbProvider,
-        [Description("Git remote URL of the shared submodule (provider) repository, e.g. 'https://github.com/org/MixAndMatch.git'")]
+        [Description("Submodule repository URL.")]
         string provider_repository_url,
-        [Description("Fully qualified name of the provider symbol to find usages of")]
+        [Description(ToolText.SymbolFqn)]
         string symbol_fqn,
-        [Description("Optional: restrict consumers to this branch head (by name). Omit for each repository's default branch.")]
+        [Description("Branch of the consumers.")]
         string? branch = null,
-        [Description("Optional: restrict to consumers at this exact commit (historical scope). Omit for branch-head scope.")]
-        string? consumer_commit = null)
+        string? consumer_commit = null,
+        [Description(ToolText.Limit)] int? limit = null,
+        [Description(ToolText.Cursor)] string? cursor = null)
     {
         // Honour the Phase-17 fail-closed top-level read gate before touching any cross-repo data: a
         // denied read surfaces the uniform not-found, never an empty successful result.
@@ -61,7 +58,17 @@ public static class FindCrossRepositoryUsagesTool
                 "an FQN-only match is not performed.",
                 readContext.Provenance);
 
-        var results = outcome.Usages.Select(u => (object)new
+        // The rows come from each consumer's own branch head, not the selected snapshot, so the cursor is also bound
+        // to the consumer commits it paged: a consumer that moved between pages makes it invalid_cursor.
+        if (!Paging.TryBegin("find_cross_repository_usages", limit, cursor, readContext, out var page, out var cursorError,
+                provider_repository_url, symbol_fqn, branch, consumer_commit, ConsumerHeads(outcome.Usages)))
+            return cursorError;
+
+        object? summary = page.IsTruncatedFirstPage(outcome.Usages.Count)
+            ? new { ByRepository = Paging.CountBy(outcome.Usages, u => u.ConsumerRepositoryUrl) }
+            : null;
+
+        var results = page.Slice(outcome.Usages).Select(u => (object)new
         {
             consumer_repository = u.ConsumerRepositoryUrl,
             branch = u.ConsumerBranch,
@@ -76,12 +83,19 @@ public static class FindCrossRepositoryUsagesTool
         }).ToList();
 
         var resolved = Describe(conn, outcome.Symbol!);
-        var message = results.Count == 0
+        var message = outcome.Usages.Count == 0
             ? $"No authorized consumer repository uses {resolved} in the selected scope."
             : $"Usages of {resolved}.";
-        return ResponseBuilder.Build(results, readContext.Provenance?.Freshness, provenance: readContext.Provenance, message: message);
+        return ResponseBuilder.BuildPage(results, outcome.Usages.Count, page, readContext.Provenance?.Freshness,
+            provenance: readContext.Provenance, summary: summary, message: message);
     }
 
     private static string Describe(Microsoft.Data.Sqlite.SqliteConnection conn, SymbolInfo symbol) =>
         SymbolResolver.Describe(new SymbolNamer(new SymbolStore(conn)), symbol);
+
+    private static string ConsumerHeads(IEnumerable<CrossRepositoryUsage> usages) =>
+        string.Join("\n", usages
+            .Select(u => $"{u.ConsumerRepositoryUrl}\t{u.ConsumerBranch}\t{u.ConsumerCommitSha}")
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal));
 }

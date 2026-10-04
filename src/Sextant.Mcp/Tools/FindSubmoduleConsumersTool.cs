@@ -8,19 +8,15 @@ namespace Sextant.Mcp.Tools;
 public static class FindSubmoduleConsumersTool
 {
     [McpServerTool(Name = "find_submodule_consumers"),
-     Description("Reverse-dependency query for a shared submodule: list the repositories/projects that pin a given " +
-                 "provider (submodule) repository, and at what commit. Answers \"who consumes this submodule\" from the " +
-                 "dependency catalog without opening the consumer repositories. Results are limited to each authorized " +
-                 "consumer's default-branch head (or an explicit branch/commit).")]
+     Description("Repositories pinning a shared submodule, and at which commit. Use instead of reading .gitmodules.")]
     public static string FindSubmoduleConsumers(
         DatabaseProvider dbProvider,
-        [Description("Git remote URL of the shared submodule (provider) repository")]
+        [Description("Submodule repository URL.")]
         string provider_repository_url,
-        [Description("Optional: restrict to consumers pinning this exact provider commit. Omit for all pins.")]
+        [Description("Pinned commit.")]
         string? provider_commit = null,
-        [Description("Optional: restrict consumers to this branch head (by name). Omit for each repository's default branch.")]
+        [Description("Branch of the consumers.")]
         string? branch = null,
-        [Description("Optional: restrict to consumers at this exact commit (historical scope). Omit for branch-head scope.")]
         string? consumer_commit = null)
     {
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))

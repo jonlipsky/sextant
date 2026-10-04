@@ -21,6 +21,58 @@ Every tool response includes a `meta` object:
 - `index_freshness` — oldest `last_indexed_at` among all results (worst-case staleness)
 - `result_count` — number of results returned
 
+### Paged results
+
+The tools that can return hundreds of rows — `find_references`, `find_by_attribute`, `find_by_signature`,
+`find_comments`, `find_tests`, `find_unreferenced`, `find_cross_repository_usages`, `get_api_surface` (list
+mode), `get_call_hierarchy`, `get_file_symbols`, `get_impact` (its `consumers`), `get_implementors`,
+`get_type_dependents` and `trace_value` — return one page at a time:
+
+| Parameter | Type | Description |
+|---|---|---|
+| `limit` | int | Rows per page (default 50, at most 200) |
+| `cursor` | string | `meta.next_cursor` from the previous page |
+
+```json
+{
+  "meta": { "result_count": 50, "total": 259, "next_cursor": "eyJ2Ijox…" },
+  "summary": { "by_project": { "App.Web": 140, "App.Core": 70 }, "by_file": { "src/App.Web/Orders.cs": 7 } },
+  "results": [...]
+}
+```
+
+- `meta.total` is the size of the whole result; `meta.result_count` the rows on this page.
+- `meta.next_cursor` is present only when rows remain. A cursor is bound to the tool, its arguments and the
+  snapshot it was issued for; reusing it with other arguments, another tool, or after the index moved to a new
+  snapshot is `meta.error.code = "invalid_cursor"` (re-run without a cursor).
+- A **truncated first page** leads with a `summary` (counts per project, file, kind, … — the top 10 of each,
+  then a `(N more)` entry) before the rows, so an agent can narrow the query (`scope`, `project_id`, …)
+  instead of paging. A result that fits its page has no summary.
+- `group_by` (`find_references`) groups the rows of the page; `meta.result_count` counts those rows.
+- `find_tests`, `find_comments` and `find_by_signature` replaced their former `max_results` with `limit`.
+
+### Paths
+
+Every `file_path` (and every path in `scope`) is repository-relative on the service's remote `/mcp`
+(issue #145): a file in a submodule reads under its path in the parent checkout (`external/lib/src/…`), and no
+response names a worker checkout directory. Path inputs — `get_file_symbols`'s `file_path` and the `file:`/
+`solution:` scopes — take the repository-relative form there; an absolute path is refused with
+`meta.error.code = "invalid_argument"` (the message does not echo the path). The local stdio/CLI surface keeps
+reporting paths as indexed and accepts both forms.
+
+### Remote meta
+
+On the remote `/mcp`, `meta.snapshot` is lean — what an agent needs to trust the answer:
+
+```json
+"snapshot": { "repository": "github.com/org/app", "branch": "main", "commit": "0123456789ab", "coverage": "complete" }
+```
+
+`coverage` is `complete` or `partial`; a `warning` is added only when the answer may be incomplete (a partial
+index, an incompatible indexer, or a dirty working tree). The full provenance described below stays available
+from `get_index_status` as `index.snapshot`. The server's `initialize` result carries short `instructions`
+(when to use the tools, the `repository` argument, paging) for clients that surface them.
+
 ### Symbol arguments
 
 Every tool that takes a symbol (`symbol_fqn`, `method_fqn`, `for_symbol`, `in_symbol`, `find_symbol`'s `name`, and
@@ -55,7 +107,8 @@ the JSON envelope with `meta.error.code` and a top-level `message` saying what t
 | --- | --- | --- |
 | `symbol_not_found` | The symbol argument matches nothing (in scope, of the kinds the tool accepts) | `meta.candidates`: up to five closest symbols, each named in an accepted form |
 | `ambiguous_symbol` | A tool that needs one symbol was given a name that several different symbols match equally well (e.g. a bare method name, or an overloaded method without its parameter list). The tool never picks one | `meta.ambiguous`, `meta.ambiguous_match_count`, and `meta.candidates` (the first ten) |
-| `invalid_argument` | An argument is malformed or names nothing the tool accepts (an unknown `project_id`, `scope`, `kind`, `accessibility`, namespace or commit) | |
+| `invalid_argument` | An argument is malformed or names nothing the tool accepts (an unknown `project_id`, `scope`, `kind`, `accessibility`, namespace or commit; on the remote `/mcp`, an absolute path) | |
+| `invalid_cursor` | A `cursor` that was issued for another tool, other arguments or an older snapshot, or is malformed. Re-run without it | |
 | `repository_required` (service) | The call must name a repository; for a verified caller the message lists the repositories it can read | |
 | `repository_not_found` (service) | The named repository or branch serves nothing to this caller: not indexed, no complete snapshot on that branch, or not readable by it. Under a read policy every such case gets the same bytes, so it never tells an existing repository from an absent one | |
 
@@ -221,6 +274,8 @@ All usages of a symbol across the codebase.
 | `include_projects` | string[] | no | Limit to specific projects |
 | `group_by` | string | no | Group results by `project`, `file`, or `kind` |
 | `include_source` | bool | no | Include source code lines in results |
+| `scope` | string | no | `file:<relative path>`, `project:<canonical_id>`, `solution:<relative path>` or `all` |
+| `limit` / `cursor` | int / string | no | Paging (see [Paged results](#paged-results)) |
 
 Returns reference locations with `reference_kind` (invocation, type_ref, attribute, inheritance, override, object_creation) and `context_snippet`.
 
@@ -239,7 +294,8 @@ All symbols defined in a source file.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `file_path` | string | yes | Path to the source file |
+| `file_path` | string | yes | Repository-relative path (an absolute path also works locally) |
+| `limit` / `cursor` | int / string | no | Paging (see [Paged results](#paged-results)) |
 
 ### get_call_hierarchy
 
@@ -250,6 +306,7 @@ Callers or callees of a method with configurable depth.
 | `symbol_fqn` | string | yes | Fully qualified name of the method |
 | `direction` | string | yes | `callers` or `callees` |
 | `depth` | int | no | Recursion depth (default: configured max, typically 5) |
+| `limit` / `cursor` | int / string | no | Paging (see [Paged results](#paged-results)) |
 
 Uses a recursive CTE on the `call_graph` table. Results are returned as a flat list with a `depth` field rather than a nested tree.
 
@@ -260,6 +317,7 @@ Types implementing an interface or overriding a virtual member.
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `symbol_fqn` | string | yes | Fully qualified name of the interface or member |
+| `limit` / `cursor` | int / string | no | Paging (see [Paged results](#paged-results)) |
 
 ### get_type_hierarchy
 
@@ -289,7 +347,9 @@ No parameters.
 The response also includes an `index` block describing the served generation: the active `profile`
 (indexing profile), its `config_hash`, the enabled `features` (the capability names built under that
 profile), an `overlay` block when the served generation is a Phase-10 working-tree overlay or a full local
-fallback (`is_overlay`, `base_snapshot_id`, `has_working_tree_delta`, `fallback_reason`), and a `storage`
+fallback (`is_overlay`, `base_snapshot_id`, `has_working_tree_delta`, `fallback_reason`), a `snapshot` block
+with the served snapshot's full provenance (the `meta.snapshot` fields described under
+[Snapshot provenance](#snapshot-provenance-phases-1112); omitted for a legacy, pre-snapshot index), and a `storage`
 block (`database_bytes`, `api_snapshot_count`, `file_version_count`, `complete_generation_count`,
 `total_run_count`). Under an enforced multi-tenant read policy the run metadata is scoped to the caller's
 selected snapshot and the DB-wide `storage` block is omitted (Phase 17). If the database needs a rebuild or
@@ -329,6 +389,7 @@ Cross-project blast radius analysis for a symbol.
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `symbol_fqn` | string | yes | Fully qualified name of the symbol |
+| `limit` / `cursor` | int / string | no | Pages `consumers` (see [Paged results](#paged-results)) |
 
 Returns all projects that consume the symbol, reference counts, whether changes are breaking, and submodule pin status for cross-repo references.
 
@@ -349,6 +410,7 @@ Public and protected API surface of a project, with optional breaking change det
 |---|---|---|---|
 | `project_id` | string | yes | Project canonical ID |
 | `compare_to_commit` | string | no | Git commit SHA to diff against |
+| `limit` / `cursor` | int / string | no | Paging in list mode (see [Paged results](#paged-results)) |
 
 When `compare_to_commit` is provided, classifies each symbol as added, removed, or changed (breaking vs non-breaking).
 
@@ -385,6 +447,7 @@ Symbols decorated with a given attribute.
 | `attribute_fqn` | string | yes | Fully qualified name of the attribute |
 | `kind` | string | no | Filter by symbol kind |
 | `scope` | string | no | Scope filter |
+| `limit` / `cursor` | int / string | no | Paging (see [Paged results](#paged-results)) |
 
 ### find_unreferenced
 
@@ -395,6 +458,7 @@ Finds symbols with no inbound references (potential dead code).
 | `kind` | string | no | Filter by symbol kind |
 | `project_id` | string | no | Filter by project canonical ID |
 | `accessibility` | string | no | Filter by accessibility (public, internal, etc.) |
+| `limit` / `cursor` | int / string | no | Paging (see [Paged results](#paged-results)) |
 
 ### get_type_dependents
 
@@ -404,6 +468,7 @@ Types that depend on a given type, through fields, parameters, return types, or 
 |---|---|---|---|
 | `symbol_fqn` | string | yes | Fully qualified name of the type |
 | `dependency_kind` | string | no | Filter: `inherits`, `implements`, `returns`, `parameter_of`, `instantiates`, or `all` (default: all) |
+| `limit` / `cursor` | int / string | no | Paging (see [Paged results](#paged-results)) |
 
 ### find_tests
 
@@ -413,7 +478,7 @@ Finds test methods, optionally filtered to tests that reference a specific produ
 |---|---|---|---|
 | `for_symbol` | string | no | FQN of a production symbol to find tests for |
 | `framework` | string | no | Test framework filter: `xunit`, `nunit`, `mstest`, or `all` |
-| `max_results` | int | no | Limit results (default: 50) |
+| `limit` / `cursor` | int / string | no | Paging (see [Paged results](#paged-results)) |
 
 ### find_comments
 
@@ -425,7 +490,7 @@ Finds TODO, HACK, FIXME, BUG, and NOTE comments in the codebase.
 | `search` | string | no | Search within comment text |
 | `project_id` | string | no | Filter by project canonical ID |
 | `in_symbol` | string | no | FQN of enclosing symbol |
-| `max_results` | int | no | Limit results (default: 50) |
+| `limit` / `cursor` | int / string | no | Paging (see [Paged results](#paged-results)) |
 
 ### trace_value
 
@@ -437,6 +502,7 @@ Traces data flow through method calls — what values flow into parameters, or w
 | `direction` | string | yes | `origins` (what flows IN) or `destinations` (where output goes) |
 | `parameter` | string | no | Parameter name or index to trace (for origins) |
 | `depth` | int | no | Maximum depth of transitive tracing (default: 2) |
+| `limit` / `cursor` | int / string | no | Paging (see [Paged results](#paged-results)) |
 
 ### find_by_signature
 
@@ -449,7 +515,7 @@ Finds methods/properties by signature characteristics.
 | `parameter_count` | int | no | Exact number of parameters |
 | `kind` | string | no | Symbol kind filter (default: method) |
 | `project_id` | string | no | Filter by project canonical ID |
-| `max_results` | int | no | Limit results (default: 50) |
+| `limit` / `cursor` | int / string | no | Paging (see [Paged results](#paged-results)) |
 
 ### get_daemon_status
 

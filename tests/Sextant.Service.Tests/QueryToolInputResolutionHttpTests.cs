@@ -61,7 +61,9 @@ public class QueryToolInputResolutionHttpTests
         Assert.IsFalse(call.IsError, call.Body.ToString());
         Assert.AreEqual("global::Library.Shapes.Circle", Names(call.Body).Single());
         var snapshot = call.Body.GetProperty("meta").GetProperty("snapshot");
-        Assert.AreEqual(Library, snapshot.GetProperty("repository").GetString(), "the answer says which repository it read");
+        // The lean remote meta names it in the host/owner/repo form the repository argument accepts.
+        Assert.AreEqual("github.com/acme/library", snapshot.GetProperty("repository").GetString(),
+            "the answer says which repository it read");
         Assert.AreEqual("implicit", snapshot.GetProperty("repository_selection").GetString());
     }
 
@@ -107,7 +109,9 @@ public class QueryToolInputResolutionHttpTests
             .GetProperty("description").GetString()!;
         Assert.IsTrue(description.StartsWith("Required", StringComparison.Ordinal), description);
         Assert.IsFalse(description.Contains("Optional", StringComparison.Ordinal), description);
-        StringAssert.Contains(description, "repository_required");
+        // The description stays one short line (it is repeated on every scoped tool); omitting the argument
+        // when the caller can read several repositories is the repository_required tool error.
+        StringAssert.Contains(description, "unless exactly one is granted");
     }
 
     [TestMethod]
@@ -152,7 +156,8 @@ public class QueryToolInputResolutionHttpTests
         var call = await CallAsync(tool, WithRepository(arguments), Solo);
 
         Assert.IsFalse(call.IsError, call.Body.ToString());
-        Assert.IsTrue(call.Body.GetProperty("meta").GetProperty("result_count").GetInt32() > 0, call.Body.ToString());
+        // The results, not meta.result_count: get_impact's result_count counts its paged consumers (none here).
+        Assert.IsTrue(call.Body.GetProperty("results").GetArrayLength() > 0, call.Body.ToString());
     }
 
     // ==== #163: exact type lookup, kind, member identity ==============================================

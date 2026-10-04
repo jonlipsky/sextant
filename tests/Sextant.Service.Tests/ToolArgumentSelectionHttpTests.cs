@@ -72,11 +72,32 @@ public class ToolArgumentSelectionHttpTests
         }
 
         var findSymbol = tools.Single(t => t.GetProperty("name").GetString() == "find_symbol");
-        StringAssert.Contains(
+        Assert.AreEqual(
+            "owner/repo",
             findSymbol.GetProperty("inputSchema").GetProperty("properties").GetProperty("repository")
                 .GetProperty("description").GetString(),
-            "'{owner}/{repo}' on github.com",
             "the single allow-listed host enables the owner/repo short form");
+    }
+
+    [TestMethod]
+    public async Task ToolsList_RepositoryDescription_SaysRequired_WhenTheServiceRequiresASelection()
+    {
+        // A client may drop the server instructions, so the tool schema alone must tell the agent to name the
+        // repository; still one short line, since it repeats on every repository-scoped tool.
+        await using var host = await Harness.StartAsync(requireSelection: true);
+
+        var tools = (await host.RpcAsync("tools/list", "{}")).GetProperty("tools").EnumerateArray()
+            .Where(t => ServiceApp.RepositoryScopedTools.Contains(t.GetProperty("name").GetString()!))
+            .ToList();
+
+        Assert.AreEqual(ServiceApp.RepositoryScopedTools.Count, tools.Count);
+        foreach (var tool in tools)
+        {
+            Assert.AreEqual("Required: owner/repo",
+                tool.GetProperty("inputSchema").GetProperty("properties").GetProperty("repository")
+                    .GetProperty("description").GetString(),
+                tool.GetProperty("name").GetString());
+        }
     }
 
     [TestMethod]

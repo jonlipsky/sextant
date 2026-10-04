@@ -9,15 +9,15 @@ namespace Sextant.Mcp.Tools;
 public static class FindTestsTool
 {
     [McpServerTool(Name = "find_tests"),
-     Description("Find test methods, optionally filtered to tests that reference a specific production symbol.")]
+     Description("Test methods, optionally only those exercising a symbol. Use instead of grepping test folders.")]
     public static string FindTests(
         DatabaseProvider dbProvider,
-        [Description("FQN of a production symbol to find tests for. Omit to list all test methods.")]
+        [Description("Symbol the tests exercise.")]
         string? for_symbol = null,
-        [Description("Test framework filter: 'xunit', 'nunit', 'mstest', or 'all' (default)")]
+        [Description("xunit, nunit, mstest or all.")]
         string framework = "all",
-        [Description("Maximum results (default 50)")]
-        int max_results = 50)
+        [Description(ToolText.Limit)] int? limit = null,
+        [Description(ToolText.Cursor)] string? cursor = null)
     {
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
@@ -25,6 +25,9 @@ public static class FindTestsTool
         if (!CapabilityGate.Ensure(db, IndexFeature.TestIndexing, "test_indexing", out var unavailable,
                 readContext.SelectedSnapshotId, dbProvider.Authorizer.IsEnforcing))
             return unavailable;
+        if (!Paging.TryBegin("find_tests", limit, cursor, readContext, out var page, out var cursorError,
+                for_symbol, framework))
+            return cursorError;
 
         using var conn = db.OpenReadConnection();
         var snapshotScope = readContext.Scope;
@@ -102,9 +105,18 @@ public static class FindTestsTool
                 : $"No {frameworkName} test methods were found.";
         }
 
-        testMethods = testMethods.Take(max_results).ToList();
+        testMethods = testMethods
+            .OrderBy(t => t.FilePath, StringComparer.Ordinal).ThenBy(t => t.LineStart).ThenBy(t => t.Id)
+            .ToList();
+        object? summary = page.IsTruncatedFirstPage(testMethods.Count)
+            ? new
+            {
+                ByClass = Paging.CountBy(testMethods, t => TestClassName(namer, t)),
+                ByFile = Paging.CountBy(testMethods, t => t.FilePath)
+            }
+            : null;
 
-        var results = testMethods.Select(t => (object)new
+        var results = page.Slice(testMethods).Select(t => (object)new
         {
             fully_qualified_name = namer.QualifiedName(t),
             display_name = t.DisplayName,
@@ -117,7 +129,8 @@ public static class FindTestsTool
         }).ToList();
 
         var freshness = testMethods.Count > 0 ? testMethods.Min(t => t.LastIndexedAt) : 0;
-        return ResponseBuilder.Build(results, freshness, ambiguity, readContext.Provenance, message: message);
+        return ResponseBuilder.BuildPage(results, testMethods.Count, page, freshness, ambiguity, readContext.Provenance, summary,
+            message: message);
     }
 
     // The simple name of the class declaring a test method: from its documentation-ID key, else (an index from before

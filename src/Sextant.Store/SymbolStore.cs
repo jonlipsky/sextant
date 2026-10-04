@@ -192,6 +192,33 @@ public sealed class SymbolStore(SqliteConnection connection)
         return ReadAll(cmd).Where(s => PathEquals(s.FilePath, filePath)).ToList();
     }
 
+    /// <summary>
+    /// The symbols of every file whose stored <c>files.repo_relative_path</c> is one of
+    /// <paramref name="storedPaths"/> (issue #145), in the scoped project versions (<see cref="GetScopedProjectIds"/>).
+    /// A caller's repository-relative path is passed with its whole-segment suffixes, because a submodule's files are
+    /// stored relative to the submodule's own root; the caller confirms each hit against the full path it asked for.
+    /// </summary>
+    public List<SymbolInfo> GetByStoredRelativePaths(IReadOnlyList<string> storedPaths)
+    {
+        if (storedPaths.Count == 0)
+            return [];
+        var pids = ProjectIdsJson(null);
+        if (pids is null)
+            return [];
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = ByStoredRelativePathsSql;
+        cmd.Parameters.AddWithValue("@pids", pids);
+        cmd.Parameters.AddWithValue("@paths", System.Text.Json.JsonSerializer.Serialize(storedPaths));
+        return ReadAll(cmd);
+    }
+
+    // One constant statement whatever the number of candidate paths: both lists are bound as JSON arrays.
+    private const string ByStoredRelativePathsSql = $"""
+        {SelectBase}
+        WHERE f.repo_relative_path IN (SELECT value FROM json_each(@paths))
+          AND s.project_id IN (SELECT value FROM json_each(@pids));
+        """;
+
     // Project-scoped variant: a source file that is shared across the evaluated target frameworks of a
     // multi-targeted project appears once per logical (per-TFM) project, so callers that re-index or
     // resolve within one framework must restrict to that project rather than matching every variant.

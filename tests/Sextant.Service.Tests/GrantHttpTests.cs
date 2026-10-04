@@ -783,6 +783,32 @@ public class GrantHttpTests
     }
 
     [TestMethod]
+    public async Task FindCrossRepositoryUsages_Cursor_IsInvalidOnceAConsumerHeadMoves()
+    {
+        // The rows come from each consumer's own branch head, not the selected snapshot: a cursor taken before a
+        // consumer moved must fail instead of skipping or repeating that consumer's rows.
+        await using var host = await Harness.StartAsync(seed: SeedUsages);
+        foreach (var repository in new[] { Widgets, Gadgets, Gizmos })
+            await PutSelfAsync(host, host.UserAssertion(), repository);
+        var args = $$"""{"provider_repository_url":"{{Widgets}}","symbol_fqn":"App.Type0","limit":1}""";
+
+        var first = await host.CallAsync("find_cross_repository_usages", args, DelegateToken, host.UserAssertion());
+        Assert.IsFalse(first.IsError, first.Body.ToString());
+        Assert.AreEqual(2, first.Body.GetProperty("meta").GetProperty("total").GetInt32(), first.Body.ToString());
+        var cursor = first.Body.GetProperty("meta").GetProperty("next_cursor").GetString();
+        var next = $$"""{"provider_repository_url":"{{Widgets}}","symbol_fqn":"App.Type0","limit":1,"cursor":"{{cursor}}"}""";
+
+        var unmoved = await host.CallAsync("find_cross_repository_usages", next, DelegateToken, host.UserAssertion());
+        host.ExecuteOnCatalog("UPDATE commits SET commit_sha = 'commit-g2' WHERE commit_sha = 'commit-g1';");
+        var moved = await host.CallAsync("find_cross_repository_usages", next, DelegateToken, host.UserAssertion());
+
+        Assert.IsFalse(unmoved.IsError, unmoved.Body.ToString());
+        Assert.AreEqual(1, unmoved.Body.GetProperty("results").GetArrayLength(), unmoved.Body.ToString());
+        Assert.IsTrue(moved.IsError, moved.Body.ToString());
+        Assert.AreEqual(Paging.InvalidCursorCode, ErrorCode(moved.Body), moved.Body.ToString());
+    }
+
+    [TestMethod]
     public async Task FindCrossRepositoryUsages_UngrantedProvider_IsTheUniformNotFound_LikeAnAbsentOne()
     {
         await using var host = await Harness.StartAsync(seed: SeedUsages);

@@ -7,14 +7,19 @@ namespace Sextant.Mcp.Tools;
 [McpServerToolType]
 public static class GetApiSurfaceTool
 {
-    [McpServerTool(Name = "get_api_surface"), Description("Get the complete public API surface of a project. Use to understand what a project exposes before making changes. Supports diff against previous commits.")]
+    [McpServerTool(Name = "get_api_surface"), Description("Public API of a project, or its breaking changes since compare_to_commit. Use before changing a library.")]
     public static string GetApiSurface(
         DatabaseProvider dbProvider,
-        [Description("Canonical ID of the project")] string project_id,
-        [Description("Git commit to compare against (optional, for diff mode)")] string? compare_to_commit = null)
+        [Description("canonical_id from get_index_status.")] string project_id,
+        string? compare_to_commit = null,
+        [Description(ToolText.Limit)] int? limit = null,
+        [Description(ToolText.Cursor)] string? cursor = null)
     {
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
+        if (!Paging.TryBegin("get_api_surface", limit, cursor, readContext, out var page, out var cursorError,
+                project_id, compare_to_commit))
+            return cursorError;
 
         using var conn = db.OpenReadConnection();
         var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
@@ -36,8 +41,18 @@ public static class GetApiSurfaceTool
 
         if (compare_to_commit == null)
         {
-            // No diff — just return current API surface
-            var results = publicSymbols.Select(s => new
+            // No diff — return the current API surface, one page at a time.
+            var ordered = publicSymbols
+                .OrderBy(s => s.FilePath, StringComparer.Ordinal).ThenBy(s => s.LineStart).ThenBy(s => s.Id)
+                .ToList();
+            object? summary = page.IsTruncatedFirstPage(ordered.Count)
+                ? new
+                {
+                    ByKind = Paging.CountBy(ordered, s => s.Kind.ToString().ToLowerInvariant()),
+                    ByFile = Paging.CountBy(ordered, s => s.FilePath)
+                }
+                : null;
+            var results = page.Slice(ordered).Select(s => new
             {
                 fully_qualified_name = namer.QualifiedName(s),
                 display_name = s.DisplayName,
@@ -49,7 +64,8 @@ public static class GetApiSurfaceTool
                 line_start = s.LineStart
             }).ToList<object>();
 
-            return ResponseBuilder.Build(results, project.Value.lastIndexedAt, provenance: readContext.Provenance);
+            return ResponseBuilder.BuildPage(results, ordered.Count, page, project.Value.lastIndexedAt,
+                provenance: readContext.Provenance, summary: summary);
         }
 
         // Diff mode: compare current symbols against a previous snapshot
