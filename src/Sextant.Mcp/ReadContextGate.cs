@@ -23,10 +23,11 @@ public static class ReadContextGate
         IReadAuthorizer? authorizer = null,
         CompatibilityInputs? compatibility = null,
         Func<string?>? requestedRepository = null,
-        Func<string?>? requestedBranch = null)
+        Func<string?>? requestedBranch = null,
+        bool remoteSurface = false)
     {
         context = FederatedReadContext.Resolve(
-            db, mode, authorizer, compatibility, requestedRepository, requestedBranch);
+            db, mode, authorizer, compatibility, requestedRepository, requestedBranch, remoteSurface);
         if (context.Authorization.Allowed && !context.SelectionUnresolved)
         {
             errorResponse = string.Empty;

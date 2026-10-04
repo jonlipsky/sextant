@@ -8,13 +8,13 @@ namespace Sextant.Mcp.Tools;
 [McpServerToolType]
 public static class SemanticSearchTool
 {
-    [McpServerTool(Name = "semantic_search"), Description("Full-text search over symbol names and documentation. Use instead of grep for .NET symbol discovery — searches the pre-built semantic index.")]
+    [McpServerTool(Name = "semantic_search"), Description("Symbols matching words in names or XML docs. Use instead of grep to find code by topic.")]
     public static string SemanticSearch(
         DatabaseProvider dbProvider,
-        [Description("The search query")] string query,
-        [Description("Optional symbol kind filter")] string? kind = null,
-        [Description("Maximum number of results")] int max_results = 20,
-        [Description("Scope filter: 'file:/path', 'project:canonical_id', 'solution:/path', or 'all'")] string? scope = null)
+        string query,
+        [Description(ToolText.Kind)] string? kind = null,
+        int max_results = 20,
+        [Description(ToolText.Scope)] string? scope = null)
     {
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
@@ -32,8 +32,9 @@ public static class SemanticSearchTool
         if (!SymbolKindNames.TryParse(kind, out var kinds, out _, out var kindError))
             return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode, kindError!, readContext.Provenance);
 
-        // An unknown project/solution or an unrecognized scope is an error, never a silently unfiltered query.
-        var scopeFilter = ScopeResolver.Resolve(scope, conn, readContext.Scope);
+        // An unknown project/solution, an unrecognized scope or (remote) an absolute path is an error, never a
+        // silently unfiltered query.
+        var scopeFilter = ScopeResolver.Resolve(scope, conn, readContext.Scope, readContext.Paths);
         if (scopeFilter.Error != null)
             return scopeFilter.ErrorResponse(readContext.Provenance);
 
@@ -46,7 +47,7 @@ public static class SemanticSearchTool
         if (!scopeFilter.IsEmpty)
         {
             if (scopeFilter.FilePath != null)
-                results = results.Where(s => s.FilePath == scopeFilter.FilePath).ToList();
+                results = results.Where(s => scopeFilter.MatchesFile(s.FilePath)).ToList();
             else if (scopeFilter.ProjectIds != null)
                 results = results.Where(s => scopeFilter.ProjectIds.Contains(s.ProjectId)).ToList();
         }

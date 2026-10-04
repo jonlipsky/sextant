@@ -7,24 +7,31 @@ namespace Sextant.Mcp.Tools;
 [McpServerToolType]
 public static class FindByAttributeTool
 {
-    [McpServerTool(Name = "find_by_attribute"), Description("Find symbols decorated with a given attribute.")]
+    [McpServerTool(Name = "find_by_attribute"), Description("Symbols with an attribute, e.g. [Obsolete]. Use instead of grepping for it.")]
     public static string FindByAttribute(
         DatabaseProvider dbProvider,
-        [Description("The fully qualified name of the attribute")] string attribute_fqn,
-        [Description("Optional symbol kind filter")] string? kind = null,
-        [Description("Scope filter: 'file:/path', 'project:canonical_id', 'solution:/path', or 'all'")] string? scope = null)
+        [Description("e.g. Obsolete or System.ObsoleteAttribute")] string attribute_fqn,
+        [Description(ToolText.Kind)] string? kind = null,
+        [Description(ToolText.Scope)] string? scope = null,
+        [Description(ToolText.Limit)] int? limit = null,
+        [Description(ToolText.Cursor)] string? cursor = null)
     {
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
+        if (!Paging.TryBegin("find_by_attribute", limit, cursor, readContext, out var page, out var cursorError,
+                attribute_fqn, kind, scope))
+            return cursorError;
 
         using var conn = db.OpenReadConnection();
         var symbolStore = new SymbolStore(conn) { Scope = readContext.Scope };
+        var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
 
         if (!SymbolKindNames.TryParse(kind, out var kinds, out _, out var kindError))
             return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode, kindError!, readContext.Provenance);
 
-        // An unknown project/solution or an unrecognized scope is an error, never a silently unfiltered query.
-        var scopeFilter = ScopeResolver.Resolve(scope, conn, readContext.Scope);
+        // An unknown project/solution, an unrecognized scope or (remote) an absolute path is an error, never a
+        // silently unfiltered query.
+        var scopeFilter = ScopeResolver.Resolve(scope, conn, readContext.Scope, readContext.Paths);
         if (scopeFilter.Error != null)
             return scopeFilter.ErrorResponse(readContext.Provenance);
 
@@ -48,47 +55,47 @@ public static class FindByAttributeTool
                 "Pass one of these names exactly.", readContext.Provenance);
         var matches = matchedNames.Count == 0
             ? []
-            : candidates.Where(s => AttributeName.ListOf(s.Attributes).Contains(matchedNames[0], StringComparer.Ordinal)).ToList();
+            : candidates
+                .Where(s => AttributeName.ListOf(s.Attributes).Contains(matchedNames[0], StringComparer.Ordinal))
+                .Where(s => kinds == null || kinds.Contains(s.Kind))
+                .Where(s => scopeFilter.FilePath == null || scopeFilter.MatchesFile(s.FilePath))
+                .Where(s => scopeFilter.ProjectIds == null || scopeFilter.ProjectIds.Contains(s.ProjectId))
+                .OrderBy(s => s.FilePath, StringComparer.Ordinal).ThenBy(s => s.LineStart).ThenBy(s => s.Id)
+                .ToList();
         var namer = new SymbolNamer(symbolStore);
 
-        var results = new List<object>();
-        long freshness = 0;
-        foreach (var s in matches)
+        var freshness = matches.Count > 0 ? matches.Min(s => s.LastIndexedAt) : 0L;
+        object? summary = null;
+        if (page.IsTruncatedFirstPage(matches.Count))
         {
-            if (kinds != null && !kinds.Contains(s.Kind))
-                continue;
-
-            if (!scopeFilter.IsEmpty)
+            var canonicalIds = FindSymbolTool.BuildCanonicalIdCache(projectStore);
+            summary = new
             {
-                if (scopeFilter.FilePath != null && s.FilePath != scopeFilter.FilePath)
-                    continue;
-                if (scopeFilter.ProjectIds != null && !scopeFilter.ProjectIds.Contains(s.ProjectId))
-                    continue;
-            }
-
-            if (freshness == 0 || s.LastIndexedAt < freshness)
-                freshness = s.LastIndexedAt;
-
-            results.Add(new
-            {
-                fully_qualified_name = namer.QualifiedName(s),
-                display_name = s.DisplayName,
-                kind = s.Kind.ToString().ToLowerInvariant(),
-                file_path = s.FilePath,
-                line_start = s.LineStart,
-                accessibility = SymbolStore.FormatAccessibility(s.Accessibility),
-                attributes = s.Attributes
-            });
+                ByProject = Paging.CountBy(matches, s => FindSymbolTool.ResolveCanonicalId(s.ProjectId, canonicalIds)),
+                ByFile = Paging.CountBy(matches, s => s.FilePath)
+            };
         }
+
+        var results = page.Slice(matches).Select(s => (object)new
+        {
+            fully_qualified_name = namer.QualifiedName(s),
+            display_name = s.DisplayName,
+            kind = s.Kind.ToString().ToLowerInvariant(),
+            file_path = s.FilePath,
+            line_start = s.LineStart,
+            accessibility = SymbolStore.FormatAccessibility(s.Accessibility),
+            attributes = s.Attributes
+        }).ToList();
 
         string? message = null;
         if (matchedNames.Count == 0)
             message = $"No indexed symbol carries an attribute named '{attribute_fqn.Trim()}'.";
-        else if (results.Count == 0)
+        else if (matches.Count == 0)
             message = $"No symbol carries {matchedNames[0]} with the given kind and scope filters.";
         else if (!string.Equals(matchedNames[0], attribute_fqn.Trim(), StringComparison.Ordinal))
             message = $"Matched attribute {matchedNames[0]}.";
-        return ResponseBuilder.Build(results, freshness, provenance: readContext.Provenance, message: message);
+        return ResponseBuilder.BuildPage(results, matches.Count, page, freshness, provenance: readContext.Provenance,
+            summary: summary, message: message);
     }
 
     /// <summary>An attribute argument, matched against stored attribute names (<c>global::Ns.FooAttribute</c>).</summary>

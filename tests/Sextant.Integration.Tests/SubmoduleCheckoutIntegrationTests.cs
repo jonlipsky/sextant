@@ -23,7 +23,7 @@ namespace Sextant.Integration.Tests;
 /// </summary>
 [TestClass]
 [TestCategory("Integration")]
-public class SubmoduleCheckoutIntegrationTests : IDisposable
+public partial class SubmoduleCheckoutIntegrationTests : IDisposable
 {
     private readonly string _tempDir;
     private readonly List<string> _log = [];
