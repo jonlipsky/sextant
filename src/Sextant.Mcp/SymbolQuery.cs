@@ -56,9 +56,19 @@ public sealed record SymbolTypeTerm(string Name, IReadOnlyList<SymbolTypeTerm> A
         "ref", "out", "in", "params", "this", "scoped", "readonly"
     };
 
+    /// <summary>
+    /// The deepest generic-argument/tuple nesting <see cref="Parse"/> reads. A deeper type does not parse (null), so a
+    /// crafted argument can never exhaust the stack: the recursion is the only unbounded part of the parser.
+    /// </summary>
+    public const int MaxNestingDepth = 32;
+
     /// <summary>Parses one parameter (C# or documentation-ID spelling), or returns null when it is not a type.</summary>
-    public static SymbolTypeTerm? Parse(string text)
+    public static SymbolTypeTerm? Parse(string text) => Parse(text, 0);
+
+    private static SymbolTypeTerm? Parse(string text, int depth)
     {
+        if (depth > MaxNestingDepth)
+            return null;
         var s = text.Trim();
         // Leading attribute sections: [NotNull] string value.
         while (s.StartsWith('['))
@@ -76,11 +86,13 @@ public sealed record SymbolTypeTerm(string Name, IReadOnlyList<SymbolTypeTerm> A
             return null;
         // `Type name` (and `Type name` after modifiers): the last token is the parameter's name.
         s = tokens.Count >= 2 ? string.Join(' ', tokens.Take(tokens.Count - 1)) : tokens[0];
-        return ParseType(s);
+        return ParseType(s, depth);
     }
 
-    private static SymbolTypeTerm? ParseType(string text)
+    private static SymbolTypeTerm? ParseType(string text, int depth)
     {
+        if (depth > MaxNestingDepth)
+            return null;
         var s = text.Trim();
         if (s.Length == 0)
             return null;
@@ -117,7 +129,7 @@ public sealed record SymbolTypeTerm(string Name, IReadOnlyList<SymbolTypeTerm> A
             var close = MatchingClose(s, 0);
             if (close != s.Length - 1)
                 return null;
-            var elements = SplitTopLevel(s[1..^1], ',').Select(Parse).ToList();
+            var elements = SplitTopLevel(s[1..^1], ',').Select(e => Parse(e, depth + 1)).ToList();
             if (elements.Count < 2 || elements.Any(e => e is null))
                 return null;
             return new SymbolTypeTerm("ValueTuple", elements!, suffix.ToString(), false);
@@ -142,7 +154,7 @@ public sealed record SymbolTypeTerm(string Name, IReadOnlyList<SymbolTypeTerm> A
                     args.Clear();
                     break;
                 }
-                var parsed = ParseType(arg);
+                var parsed = ParseType(arg, depth + 1);
                 if (parsed is null)
                     return null;
                 args.Add(parsed);
@@ -353,6 +365,9 @@ public sealed class SymbolQuery
         "'Type.Member', 'Ns.Type.Method(int, string)', 'Type.Type(int)' for a constructor, 'Type.this[int]' for an " +
         "indexer (a leading 'global::' is optional), or a documentation ID such as 'M:Ns.Type.Method(System.Int32)'.";
 
+    /// <summary>The longest symbol argument parsed; a longer one is an <c>invalid_argument</c> error.</summary>
+    public const int MaxLength = 2048;
+
     /// <summary>
     /// Parses <paramref name="raw"/>. When <paramref name="constructorsOnly"/> is set (the caller asks only for
     /// constructors), a plain path also reads as the constructors of the type it names.
@@ -362,6 +377,8 @@ public sealed class SymbolQuery
         var text = (raw ?? string.Empty).Trim();
         if (text.Length == 0)
             return Invalid(raw ?? string.Empty, "The symbol argument is empty.");
+        if (text.Length > MaxLength)
+            return Invalid(raw!, $"The symbol argument is longer than {MaxLength} characters.");
         if (text.StartsWith("global::", StringComparison.Ordinal))
             text = text["global::".Length..].TrimStart();
 

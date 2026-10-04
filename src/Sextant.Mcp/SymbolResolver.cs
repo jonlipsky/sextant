@@ -113,10 +113,11 @@ public sealed class SymbolLookup
 /// </para>
 /// <para>
 /// Ranking, best first: an exact symbol-key match; an earlier reading of the argument
-/// (<see cref="SymbolQuery.Forms"/>); a full path over a path suffix over a bare name; case-sensitive over
-/// case-insensitive; fewer parameters matched only through a generic type parameter; and, when no kind was asked for,
-/// a type over a member over a type parameter (so a class is not shadowed by its constructors or by a property of the
-/// same name). When several different symbols tie for best, the result is <see cref="SymbolLookupStatus.Ambiguous"/>.
+/// (<see cref="SymbolQuery.Forms"/>); a full path over a path suffix over a bare name; fewer generic segments named
+/// without their arity (<c>Result</c> is the non-generic <c>Result</c>, not <c>Result&lt;T&gt;</c>); case-sensitive
+/// over case-insensitive; fewer parameters matched only through a generic type parameter; and, when no kind was asked
+/// for, a type over a member over a type parameter (so a class is not shadowed by its constructors or by a property of
+/// the same name). When several different symbols tie for best, the result is <see cref="SymbolLookupStatus.Ambiguous"/>.
 /// </para>
 /// </summary>
 public static class SymbolResolver
@@ -241,6 +242,8 @@ public static class SymbolResolver
         if (query.ExactKey is { } key)
             keys.Add(key);
         var raw = query.Raw.Trim();
+        if (raw.Length > SymbolQuery.MaxLength)
+            return keys;
         var bare = raw.StartsWith("global::", StringComparison.Ordinal) ? raw["global::".Length..] : raw;
         if (bare.Length > 0 && !RowShape.IsDocumentationKey(bare))
         {
@@ -284,10 +287,14 @@ public static class SymbolResolver
             case SymbolNameKind.Plain:
             {
                 var byName = store.GetByDisplayName(form.Name.Name, limit: NameLookupLimit);
-                if (byName.Count < NameLookupLimit || form.Qualifier.Count == 0)
+                if (byName.Count < NameLookupLimit)
                     return byName;
-                // A very common name: the qualifier's types bound the search too.
-                return byName.Concat(FindContainers(store, form.Qualifier).SelectMany(t => Members(store, t)));
+                // A very common name: the types of that name, and the qualifier's types' members, are looked up on
+                // their own too, so the cap never hides a type or a qualified member.
+                var bounded = byName.Concat(store.GetByDisplayName(form.Name.Name, SymbolQuery.TypeKinds, limit: NameLookupLimit));
+                return form.Qualifier.Count == 0
+                    ? bounded
+                    : bounded.Concat(FindContainers(store, form.Qualifier).SelectMany(t => Members(store, t)));
             }
             case SymbolNameKind.Indexer:
                 return FindContainers(store, form.Qualifier)
@@ -319,7 +326,8 @@ public static class SymbolResolver
             .Where(t => t.SymbolKey.StartsWith("T:", StringComparison.Ordinal))
             .Select(t => (Type: t, Tier: PathTier(qualifier, RowShape.Of(t).FullPath)))
             .Where(x => x.Tier is not null)
-            .OrderBy(x => x.Tier!.Value.Tier).ThenBy(x => x.Tier!.Value.CaseInsensitive)
+            .OrderBy(x => x.Tier!.Value.Tier).ThenBy(x => x.Tier!.Value.AritySkipped)
+            .ThenBy(x => x.Tier!.Value.CaseInsensitive)
             .ThenBy(x => x.Type.ProjectId).ThenBy(x => x.Type.Id)
             .Select(x => x.Type)
             .Take(ContainerLimit)
@@ -370,16 +378,18 @@ public static class SymbolResolver
 
     /// <summary>How well a row matches; lower is better (compared field by field).</summary>
     internal readonly record struct MatchScore(
-        int Exact, int Form, int Tier, int CaseInsensitive, int Wildcards, int KindPenalty, int StaticConstructor)
+        int Exact, int Form, int Tier, int AritySkipped, int CaseInsensitive, int Wildcards, int KindPenalty,
+        int StaticConstructor)
         : IComparable<MatchScore>
     {
-        public static MatchScore ExactKey => new(0, 0, 0, 0, 0, 0, 0);
+        public static MatchScore ExactKey => new(0, 0, 0, 0, 0, 0, 0, 0);
 
         public int CompareTo(MatchScore other)
         {
             var c = Exact.CompareTo(other.Exact);
             if (c == 0) c = Form.CompareTo(other.Form);
             if (c == 0) c = Tier.CompareTo(other.Tier);
+            if (c == 0) c = AritySkipped.CompareTo(other.AritySkipped);
             if (c == 0) c = CaseInsensitive.CompareTo(other.CaseInsensitive);
             if (c == 0) c = Wildcards.CompareTo(other.Wildcards);
             if (c == 0) c = KindPenalty.CompareTo(other.KindPenalty);
@@ -398,6 +408,7 @@ public static class SymbolResolver
     {
         parameterMiss = false;
         var caseInsensitive = 0;
+        var aritySkipped = 0;
         var staticConstructor = 0;
         switch (form.NameKind)
         {
@@ -410,8 +421,15 @@ public static class SymbolResolver
                         return null;
                     caseInsensitive = 1;
                 }
-                if (form.Name.Arity is { } arity && arity != (shape.Name.Arity ?? 0))
-                    return null;
+                if (form.Name.Arity is { } arity)
+                {
+                    if (arity != (shape.Name.Arity ?? 0))
+                        return null;
+                }
+                else if (shape.Name.Arity is > 0)
+                {
+                    aritySkipped = 1;
+                }
                 break;
             case SymbolNameKind.InstanceConstructor:
                 if (row.Kind != SymbolKind.Constructor || shape.Name.Name != ".ctor")
@@ -435,6 +453,7 @@ public static class SymbolResolver
         if (PathTier(form.Qualifier, shape.Container) is not { } tier)
             return null;
         caseInsensitive |= tier.CaseInsensitive;
+        aritySkipped += tier.AritySkipped;
 
         var wildcards = 0;
         if (parameters is not null)
@@ -459,19 +478,23 @@ public static class SymbolResolver
         var kindPenalty = form.NameKind != SymbolNameKind.Plain || options.KindsExplicit
             ? 0
             : SymbolQuery.TypeKinds.Contains(row.Kind) ? 0 : row.Kind == SymbolKind.TypeParameter ? 2 : 1;
-        return new MatchScore(1, formIndex, tier.Tier, caseInsensitive, wildcards, kindPenalty, staticConstructor);
+        return new MatchScore(1, formIndex, tier.Tier, aritySkipped, caseInsensitive, wildcards, kindPenalty, staticConstructor);
     }
 
     /// <summary>
     /// Whether <paramref name="query"/> is a suffix of <paramref name="path"/> (segment names, and arities the query
-    /// spelled): tier 1 = the whole path, 2 = a proper suffix, 3 = the query names no path at all.
+    /// spelled): tier 1 = the whole path, 2 = a proper suffix, 3 = the query names no path at all (so a bare name
+    /// never favours a row that happens to have no container, such as a type parameter or a global-namespace type).
+    /// <c>AritySkipped</c> counts the generic segments the query named without an arity (<c>Outer</c> for
+    /// <c>Outer&lt;T&gt;</c>), so a name without type arguments prefers its non-generic namesake.
     /// </summary>
-    internal static (int Tier, int CaseInsensitive)? PathTier(
+    internal static (int Tier, int CaseInsensitive, int AritySkipped)? PathTier(
         IReadOnlyList<SymbolPathSegment> query, IReadOnlyList<SymbolPathSegment> path)
     {
         if (query.Count > path.Count)
             return null;
         var caseInsensitive = 0;
+        var aritySkipped = 0;
         var offset = path.Count - query.Count;
         for (var i = 0; i < query.Count; i++)
         {
@@ -483,11 +506,18 @@ public static class SymbolResolver
                     return null;
                 caseInsensitive = 1;
             }
-            if (q.Arity is { } arity && arity != (p.Arity ?? 0))
-                return null;
+            if (q.Arity is { } arity)
+            {
+                if (arity != (p.Arity ?? 0))
+                    return null;
+            }
+            else if (p.Arity is > 0)
+            {
+                aritySkipped++;
+            }
         }
-        var tier = query.Count == path.Count ? 1 : query.Count > 0 ? 2 : 3;
-        return (tier, caseInsensitive);
+        var tier = query.Count == 0 ? 3 : query.Count == path.Count ? 1 : 2;
+        return (tier, caseInsensitive, aritySkipped);
     }
 
     // ==== suggestions =================================================================================

@@ -34,10 +34,13 @@ developer types, with or without Roslyn's `global::` alias:
 | A member with its parameter list (C# keywords or framework names) | `UserService.GetById(int)`, `global::MyApp.Services.UserService.GetById(System.Int32)` |
 | A Roslyn documentation ID (the stored `symbol_key`) | `M:MyApp.Services.UserService.GetById(System.Int32)`, `T:MyApp.Services.UserService` |
 
-Ranking prefers an exact symbol key, then a full path over a path suffix over a bare name, and, when the caller
-asked for no `kind`, a type over a member of the same name, so a class is never shadowed by its constructors or by
-a field elsewhere that shares its name. `find_symbol` honours `kind` on its exact path too. It is a query-time
-resolution over the stored keys and signatures: no re-index is needed.
+Ranking prefers an exact symbol key, then a full path over a path suffix over a bare name, then a name spelled
+without type arguments for a non-generic symbol over a generic namesake (`Result` is `Result`, not `Result<T>`;
+write `Result<T>` or ``Result`1`` for the generic one), and, when the caller asked for no `kind`, a type over a
+member or type parameter of the same name, so a class is never shadowed by its constructors or by a field elsewhere
+that shares its name. `find_symbol` honours `kind` on its exact path too. It is a query-time resolution over the
+stored keys and signatures: no re-index is needed. An argument longer than 2048 characters, or with generic
+arguments or tuples nested more than 32 deep, is an `invalid_argument` error.
 
 The `fully_qualified_name` a tool prints for a symbol is in one of those accepted forms (a type's
 `global::Ns.Type`, a method's `global::Ns.Type.Method(int)`, a field's `global::Ns.Type.Field`, else its
