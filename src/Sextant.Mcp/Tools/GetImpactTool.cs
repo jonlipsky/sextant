@@ -23,10 +23,11 @@ public static class GetImpactTool
         var apiSurfaceStore = new ApiSurfaceStore(conn);
         var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
 
-        var resolution = SymbolResolver.Resolve(symbolStore, projectStore, symbol_fqn);
-        if (resolution.Symbol == null)
-            return ResponseBuilder.BuildEmpty($"Symbol not found: {symbol_fqn}", readContext.Provenance);
-        var symbol = resolution.Symbol;
+        var lookup = SymbolResolver.Lookup(symbolStore, projectStore, symbol_fqn);
+        if (lookup.Status != SymbolLookupStatus.Resolved)
+            return SymbolResolver.ErrorResponse(symbolStore, projectStore, lookup, readContext.Provenance);
+        var symbol = lookup.Symbol!;
+        var namer = new SymbolNamer(symbolStore);
 
         // Find all projects that depend on this symbol's project
         var consumers = dependencyStore.GetByDependency(symbol.ProjectId);
@@ -86,7 +87,7 @@ public static class GetImpactTool
             {
                 symbol = new
                 {
-                    fully_qualified_name = symbol.FullyQualifiedName,
+                    fully_qualified_name = namer.QualifiedName(symbol),
                     display_name = symbol.DisplayName,
                     kind = symbol.Kind.ToString().ToLowerInvariant(),
                     file_path = symbol.FilePath,
@@ -98,7 +99,8 @@ public static class GetImpactTool
             }
         };
 
-        return ResponseBuilder.Build(result, symbol.LastIndexedAt, resolution.Ambiguity, readContext.Provenance);
+        return ResponseBuilder.Build(result, symbol.LastIndexedAt, lookup.Ambiguity, readContext.Provenance,
+            message: SymbolResolver.ResolutionNote(symbolStore, lookup));
     }
 
     private static List<(string symbolKey, string fqn, string signatureHash, string accessibility)> BuildSurface(

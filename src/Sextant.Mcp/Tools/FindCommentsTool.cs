@@ -40,28 +40,41 @@ public static class FindCommentsTool
         {
             var proj = projectStore.GetByCanonicalId(project_id);
             if (proj == null)
-                return ResponseBuilder.BuildEmpty("Project not found.", readContext.Provenance);
+                return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode,
+                    $"Unknown project_id '{project_id}'. Use a project canonical ID as listed by get_index_status.",
+                    readContext.Provenance);
             projectDbId = proj.Value.id;
         }
 
+        var allTags = string.IsNullOrWhiteSpace(tag) || tag.Trim().Equals("all", StringComparison.OrdinalIgnoreCase);
+        var tagName = allTags ? null : tag.Trim().ToUpperInvariant();
+        if (tagName != null && !KnownTags.Contains(tagName))
+            return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode,
+                $"Unknown tag '{tag}'. Use one of: {string.Join(", ", KnownTags)}, or 'all'.", readContext.Provenance);
+
         List<Core.CommentInfo> comments;
         SymbolAmbiguity? ambiguity = null;
+        string? note = null;
+        var namer = new SymbolNamer(symbolStore);
 
         if (in_symbol != null)
         {
-            var resolution = SymbolResolver.Resolve(symbolStore, projectStore, in_symbol);
-            if (resolution.Symbol == null)
-                return ResponseBuilder.BuildEmpty("Symbol not found.", readContext.Provenance);
-            ambiguity = resolution.Ambiguity;
-            comments = commentStore.GetBySymbol(resolution.Symbol.Id);
+            var lookup = SymbolResolver.Lookup(symbolStore, projectStore, in_symbol);
+            if (lookup.Status != SymbolLookupStatus.Resolved)
+                return SymbolResolver.ErrorResponse(symbolStore, projectStore, lookup, readContext.Provenance);
+            ambiguity = lookup.Ambiguity;
+            note = SymbolResolver.ResolutionNote(symbolStore, lookup);
+            comments = commentStore.GetBySymbol(lookup.Symbol!.Id);
+            if (projectDbId != null)
+                comments = comments.Where(c => c.ProjectId == projectDbId.Value).ToList();
         }
         else if (!string.IsNullOrEmpty(search))
         {
             comments = commentStore.Search(search, projectDbId);
         }
-        else if (tag != "all")
+        else if (tagName != null)
         {
-            comments = commentStore.GetByTag(tag.ToUpperInvariant(), projectDbId);
+            comments = commentStore.GetByTag(tagName, projectDbId);
         }
         else
         {
@@ -69,8 +82,8 @@ public static class FindCommentsTool
         }
 
         // Apply tag filter if search or in_symbol was primary filter
-        if (tag != "all" && (search != null || in_symbol != null))
-            comments = comments.Where(c => c.Tag.Equals(tag, StringComparison.OrdinalIgnoreCase)).ToList();
+        if (tagName != null && (search != null || in_symbol != null))
+            comments = comments.Where(c => c.Tag.Equals(tagName, StringComparison.OrdinalIgnoreCase)).ToList();
 
         comments = comments.Take(max_results).ToList();
 
@@ -81,7 +94,7 @@ public static class FindCommentsTool
             if (c.EnclosingSymbolId.HasValue)
             {
                 var s = symbolStore.GetById(c.EnclosingSymbolId.Value);
-                enclosingSymbolFqn = s?.FullyQualifiedName;
+                enclosingSymbolFqn = s is null ? null : namer.QualifiedName(s);
             }
 
             return (object)new
@@ -96,6 +109,8 @@ public static class FindCommentsTool
         }).ToList();
 
         var freshness = comments.Count > 0 ? comments.Min(c => c.LastIndexedAt) : 0;
-        return ResponseBuilder.Build(results, freshness, ambiguity, readContext.Provenance);
+        return ResponseBuilder.Build(results, freshness, ambiguity, readContext.Provenance, message: note);
     }
+
+    private static readonly string[] KnownTags = ["TODO", "HACK", "FIXME", "BUG", "NOTE", "UNDONE"];
 }

@@ -22,29 +22,45 @@ public static class GetTypeHierarchyTool
         var relationshipStore = new RelationshipStore(conn);
         var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
 
-        var resolution = SymbolResolver.Resolve(symbolStore, projectStore, symbol_fqn);
-        if (resolution.Symbol == null)
-            return ResponseBuilder.BuildEmpty("Symbol not found.", readContext.Provenance);
-        var rootSymbol = resolution.Symbol;
+        var directionName = string.IsNullOrWhiteSpace(direction) ? "both" : direction.Trim().ToLowerInvariant();
+        if (directionName is not ("up" or "down" or "both"))
+            return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode,
+                $"Unknown direction '{direction}'. Use 'up' (base types), 'down' (derived types) or 'both'.",
+                readContext.Provenance);
+
+        var lookup = SymbolResolver.Lookup(symbolStore, projectStore, symbol_fqn, SymbolLookupOptions.Types);
+        if (lookup.Status != SymbolLookupStatus.Resolved)
+            return SymbolResolver.ErrorResponse(symbolStore, projectStore, lookup, readContext.Provenance);
+        var rootSymbol = lookup.Symbol!;
+        var namer = new SymbolNamer(symbolStore);
 
         var results = new List<object>();
 
-        if (direction is "up" or "both")
+        if (directionName is "up" or "both")
         {
-            CollectHierarchy(symbolStore, relationshipStore, rootSymbol.Id, "up", results, new HashSet<long>());
+            CollectHierarchy(symbolStore, relationshipStore, namer, rootSymbol.Id, "up", results, new HashSet<long>());
         }
 
-        if (direction is "down" or "both")
+        if (directionName is "down" or "both")
         {
-            CollectHierarchy(symbolStore, relationshipStore, rootSymbol.Id, "down", results, new HashSet<long>());
+            CollectHierarchy(symbolStore, relationshipStore, namer, rootSymbol.Id, "down", results, new HashSet<long>());
         }
 
+        var empty = results.Count == 0
+            ? $"{SymbolResolver.Describe(namer, rootSymbol)} has no indexed " + directionName switch
+            {
+                "up" => "base types.",
+                "down" => "derived types.",
+                _ => "base or derived types."
+            }
+            : null;
         var freshness = rootSymbol.LastIndexedAt;
-        return ResponseBuilder.Build(results, freshness, resolution.Ambiguity, readContext.Provenance);
+        return ResponseBuilder.Build(results, freshness, lookup.Ambiguity, readContext.Provenance,
+            message: ResponseBuilder.JoinMessages(SymbolResolver.ResolutionNote(symbolStore, lookup), empty));
     }
 
     private static void CollectHierarchy(
-        SymbolStore symbolStore, RelationshipStore relationshipStore,
+        SymbolStore symbolStore, RelationshipStore relationshipStore, SymbolNamer namer,
         long symbolId, string dir, List<object> results, HashSet<long> visited, int depth = 0)
     {
         if (!visited.Add(symbolId) || depth > 20) return;
@@ -63,7 +79,7 @@ public static class GetTypeHierarchyTool
 
             results.Add(new
             {
-                fully_qualified_name = target.FullyQualifiedName,
+                fully_qualified_name = namer.QualifiedName(target),
                 display_name = target.DisplayName,
                 kind = target.Kind.ToString().ToLowerInvariant(),
                 file_path = target.FilePath,
@@ -72,7 +88,7 @@ public static class GetTypeHierarchyTool
                 depth = depth + 1
             });
 
-            CollectHierarchy(symbolStore, relationshipStore, targetId, dir, results, visited, depth + 1);
+            CollectHierarchy(symbolStore, relationshipStore, namer, targetId, dir, results, visited, depth + 1);
         }
     }
 }

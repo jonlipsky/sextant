@@ -23,9 +23,13 @@ public static class GetApiSurfaceTool
 
         var project = projectStore.GetByCanonicalId(project_id);
         if (project == null)
-            return ResponseBuilder.BuildEmpty($"Project not found: {project_id}", readContext.Provenance);
+            return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode,
+                $"Unknown project_id '{project_id}'. Use a project canonical ID as listed by get_index_status.",
+                readContext.Provenance);
 
         var projectId = project.Value.id;
+
+        var namer = new SymbolNamer(symbolStore);
 
         // Get current public/protected symbols
         var publicSymbols = symbolStore.GetByProjectAndAccessibility(projectId, ["public", "protected"]);
@@ -35,7 +39,7 @@ public static class GetApiSurfaceTool
             // No diff — just return current API surface
             var results = publicSymbols.Select(s => new
             {
-                fully_qualified_name = s.FullyQualifiedName,
+                fully_qualified_name = namer.QualifiedName(s),
                 display_name = s.DisplayName,
                 kind = s.Kind.ToString().ToLowerInvariant(),
                 accessibility = SymbolStore.FormatAccessibility(s.Accessibility),
@@ -51,7 +55,9 @@ public static class GetApiSurfaceTool
         // Diff mode: compare current symbols against a previous snapshot
         var oldSnapshots = apiSurfaceStore.GetByProjectAndCommit(projectId, compare_to_commit);
         if (oldSnapshots.Count == 0)
-            return ResponseBuilder.BuildEmpty($"No snapshot found for commit: {compare_to_commit}", readContext.Provenance);
+            return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode,
+                $"No API surface snapshot was recorded for commit '{compare_to_commit}' in this project. Omit compare_to_commit for the current surface.",
+                readContext.Provenance);
 
         var oldSurface = new List<(string symbolKey, string fqn, string signatureHash, string accessibility)>();
         foreach (var snapshot in oldSnapshots)

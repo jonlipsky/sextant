@@ -1,20 +1,20 @@
 using System.Text;
 
-namespace Sextant.Service.Search;
+namespace Sextant.Store;
 
 /// <summary>
 /// The key range of a literal, ASCII-case-insensitive prefix under SQLite's <c>NOCASE</c> collation (issue #196).
 /// NOCASE, like <c>LIKE</c>, folds only the ASCII letters and otherwise compares UTF-8 bytes, which order like Unicode
 /// scalar values. So a text starts with the prefix (ignoring ASCII case) exactly when, under NOCASE, it is at least
 /// <see cref="Lo"/> and, unless <see cref="Hi"/> is null, below <see cref="Hi"/>. That turns a prefix match into an
-/// index range.
+/// index range. Shared by the service's <c>search_symbols</c> page seek and the MCP symbol resolver's suggestions.
 /// </summary>
 /// <param name="Lo">The prefix with its ASCII letters folded to lowercase.</param>
 /// <param name="Hi">
 /// The least text above every text that starts with the prefix, or null when there is none (a prefix made only of
 /// U+10FFFF).
 /// </param>
-internal readonly record struct NoCasePrefixRange(string Lo, string? Hi)
+public readonly record struct NoCasePrefixRange(string Lo, string? Hi)
 {
     public static NoCasePrefixRange Of(string prefix)
     {

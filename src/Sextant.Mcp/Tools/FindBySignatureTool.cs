@@ -26,6 +26,8 @@ public static class FindBySignatureTool
     {
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
+        if (!SymbolKindNames.TryParse(kind, out var kinds, out _, out var kindError))
+            return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode, kindError!, readContext.Provenance);
 
         using var conn = db.OpenReadConnection();
         var symbolStore = new SymbolStore(conn) { Scope = readContext.Scope };
@@ -36,11 +38,17 @@ public static class FindBySignatureTool
         {
             var proj = projectStore.GetByCanonicalId(project_id);
             if (proj == null)
-                return ResponseBuilder.BuildEmpty("Project not found.", readContext.Provenance);
+                return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode,
+                    $"Unknown project_id '{project_id}'. Use a project canonical ID as listed by get_index_status.",
+                    readContext.Provenance);
             projectDbId = proj.Value.id;
         }
 
-        var results = symbolStore.SearchBySignature(return_type, parameter_type, kind, projectDbId, max_results * 2);
+        var results = kinds == null
+            ? symbolStore.SearchBySignature(return_type, parameter_type, null, projectDbId, max_results * 2)
+            : kinds.Order()
+                .SelectMany(k => symbolStore.SearchBySignature(return_type, parameter_type, k.ToString(), projectDbId, max_results * 2))
+                .ToList();
 
         // Post-filter by parameter count if specified
         if (parameter_count != null)
@@ -60,9 +68,12 @@ public static class FindBySignatureTool
         results = results.Take(max_results).ToList();
 
         var canonicalIdCache = FindSymbolTool.BuildCanonicalIdCache(projectStore);
-        var mapped = results.Select(s => FindSymbolTool.MapSymbol(s, FindSymbolTool.ResolveCanonicalId(s.ProjectId, canonicalIdCache))).ToList<object>();
+        var namer = new SymbolNamer(symbolStore);
+        var mapped = results.Select(s => FindSymbolTool.MapSymbol(
+            s, FindSymbolTool.ResolveCanonicalId(s.ProjectId, canonicalIdCache), qualifiedName: namer.QualifiedName(s))).ToList<object>();
         var freshness = results.Count > 0 ? results.Min(s => s.LastIndexedAt) : 0;
-        return ResponseBuilder.Build(mapped, freshness, provenance: readContext.Provenance);
+        return ResponseBuilder.Build(mapped, freshness, provenance: readContext.Provenance,
+            message: mapped.Count == 0 ? "No symbol matches the given signature filters." : null);
     }
 
     internal static int CountParameters(string paramSection)

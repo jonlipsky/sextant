@@ -197,4 +197,14 @@ public sealed record SnapshotProvenance
     /// overlay, or pre-022 snapshot), so a response without recorded coverage is byte-identical.
     /// </summary>
     public SnapshotCoverage? Coverage { get; init; }
+
+    /// <summary>
+    /// The repository the read was served from, stamped ONLY when the request named none and the host selected one
+    /// for it (<see cref="RepositorySelection"/> = "implicit"); null otherwise, so an explicitly selected or local
+    /// read is byte-identical.
+    /// </summary>
+    public string? Repository { get; init; }
+
+    /// <summary>How <see cref="Repository"/> was chosen: "implicit" when the host selected it; null otherwise.</summary>
+    public string? RepositorySelection { get; init; }
 }

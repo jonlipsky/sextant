@@ -29,10 +29,20 @@ public static class SemanticSearchTool
         var config = SextantConfiguration.FromEnvironment();
         var canonicalIdCache = FindSymbolTool.BuildCanonicalIdCache(projectStore);
 
-        max_results = Math.Min(max_results, config.FtsMaxResults);
-        var results = symbolStore.SearchFts(query, max_results, kind);
+        if (!SymbolKindNames.TryParse(kind, out var kinds, out _, out var kindError))
+            return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode, kindError!, readContext.Provenance);
 
+        // An unknown project/solution or an unrecognized scope is an error, never a silently unfiltered query.
         var scopeFilter = ScopeResolver.Resolve(scope, conn, readContext.Scope);
+        if (scopeFilter.Error != null)
+            return scopeFilter.ErrorResponse(readContext.Provenance);
+
+        max_results = Math.Min(max_results, config.FtsMaxResults);
+        // One kind narrows the FTS query itself; a kind family ("type") filters its results.
+        var results = symbolStore.SearchFts(query, max_results, kinds is { Count: 1 } ? kinds.First().ToString() : null);
+        if (kinds is { Count: > 1 })
+            results = results.Where(s => kinds.Contains(s.Kind)).ToList();
+
         if (!scopeFilter.IsEmpty)
         {
             if (scopeFilter.FilePath != null)
@@ -41,7 +51,9 @@ public static class SemanticSearchTool
                 results = results.Where(s => scopeFilter.ProjectIds.Contains(s.ProjectId)).ToList();
         }
 
-        var mapped = results.Select(s => FindSymbolTool.MapSymbol(s, FindSymbolTool.ResolveCanonicalId(s.ProjectId, canonicalIdCache))).ToList<object>();
+        var namer = new SymbolNamer(symbolStore);
+        var mapped = results.Select(s => FindSymbolTool.MapSymbol(
+            s, FindSymbolTool.ResolveCanonicalId(s.ProjectId, canonicalIdCache), qualifiedName: namer.QualifiedName(s))).ToList<object>();
         var freshness = results.Count > 0 ? results.Min(s => s.LastIndexedAt) : 0;
         return ResponseBuilder.Build(mapped, freshness, provenance: readContext.Provenance);
     }

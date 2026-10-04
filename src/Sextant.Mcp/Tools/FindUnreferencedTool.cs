@@ -17,6 +17,17 @@ public static class FindUnreferencedTool
     {
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
+        if (!SymbolKindNames.TryParse(kind, out var kinds, out _, out var kindError))
+            return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode, kindError!, readContext.Provenance);
+        string? accessibilityName = null;
+        if (!string.IsNullOrWhiteSpace(accessibility))
+        {
+            accessibilityName = accessibility.Trim().ToLowerInvariant().Replace(' ', '_').Replace('-', '_');
+            if (!AccessibilityNames.Contains(accessibilityName))
+                return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode,
+                    $"Unknown accessibility '{accessibility.Trim()}'. Use one of: {string.Join(", ", AccessibilityNames)}.",
+                    readContext.Provenance);
+        }
 
         using var conn = db.OpenReadConnection();
         var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
@@ -28,23 +39,34 @@ public static class FindUnreferencedTool
         {
             var proj = projectStore.GetByCanonicalId(project_id);
             if (proj == null)
-                return ResponseBuilder.BuildEmpty("Project not found.", readContext.Provenance);
+                return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode,
+                    $"Unknown project_id '{project_id}'. Use a project canonical ID as listed by get_index_status.",
+                    readContext.Provenance);
             projectDbId = proj.Value.id;
         }
 
         var canonicalIdCache = FindSymbolTool.BuildCanonicalIdCache(projectStore);
+        var namer = new SymbolNamer(symbolStore);
 
-        var symbols = symbolStore.GetUnreferenced(projectDbId, kind, exclude_test_projects, accessibility);
+        var symbols = symbolStore.GetUnreferenced(
+            projectDbId, kinds is { Count: 1 } ? kinds.Single().ToString() : null, exclude_test_projects, accessibilityName);
 
         var results = new List<object>();
         long freshness = 0;
         foreach (var s in symbols)
         {
+            if (kinds != null && !kinds.Contains(s.Kind))
+                continue;
             if (freshness == 0 || s.LastIndexedAt < freshness)
                 freshness = s.LastIndexedAt;
-            results.Add(FindSymbolTool.MapSymbol(s, FindSymbolTool.ResolveCanonicalId(s.ProjectId, canonicalIdCache)));
+            results.Add(FindSymbolTool.MapSymbol(
+                s, FindSymbolTool.ResolveCanonicalId(s.ProjectId, canonicalIdCache), qualifiedName: namer.QualifiedName(s)));
         }
 
-        return ResponseBuilder.Build(results, freshness, provenance: readContext.Provenance);
+        return ResponseBuilder.Build(results, freshness, provenance: readContext.Provenance,
+            message: results.Count == 0 ? "No unreferenced symbol matches the given filters." : null);
     }
+
+    private static readonly string[] AccessibilityNames =
+        ["public", "internal", "protected", "private", "protected_internal", "private_protected"];
 }

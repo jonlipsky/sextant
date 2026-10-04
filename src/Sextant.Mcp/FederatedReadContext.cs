@@ -31,6 +31,14 @@ public sealed class FederatedReadContext
     public SnapshotReadScope Scope { get; }
 
     /// <summary>
+    /// This context with <paramref name="provenance"/> in place of <see cref="Provenance"/>, every other decision
+    /// (scope, authorization, pinned snapshot, remote base) unchanged. Used to stamp how the request's repository
+    /// was selected without re-resolving the read.
+    /// </summary>
+    internal FederatedReadContext WithProvenance(SnapshotProvenance? provenance) =>
+        new(Scope, provenance, Authorization, SelectedSnapshotId, RemoteBase, SelectionUnresolved, BranchRequested);
+
+    /// <summary>
     /// True when the request NAMED a repository that has no complete default-branch snapshot (or, with a
     /// named branch, no complete snapshot on that branch), or named a branch without a repository. Such a
     /// read never widens to the unselected fallback (which spans every repository of a multi-repository
