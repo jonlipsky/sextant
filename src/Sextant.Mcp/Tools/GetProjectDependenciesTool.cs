@@ -22,14 +22,17 @@ public static class GetProjectDependenciesTool
 
         var project = projectStore.GetByCanonicalId(project_id);
         if (project == null)
-            return ResponseBuilder.BuildEmpty($"Project not found: {project_id}", readContext.Provenance);
+            return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode,
+                $"Unknown project_id '{project_id}'. Use a project canonical ID as listed by get_index_status.",
+                readContext.Provenance);
 
         var visited = new HashSet<long>();
         var results = new List<object>();
 
         CollectDependencies(project.Value.id, 0, transitive, visited, results, projectStore, dependencyStore);
 
-        return ResponseBuilder.Build(results, project.Value.lastIndexedAt, provenance: readContext.Provenance);
+        return ResponseBuilder.Build(results, project.Value.lastIndexedAt, provenance: readContext.Provenance,
+            message: results.Count == 0 ? $"Project '{project_id}' has no indexed project dependencies." : null);
     }
 
     private static void CollectDependencies(

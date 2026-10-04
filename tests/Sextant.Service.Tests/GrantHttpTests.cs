@@ -762,6 +762,27 @@ public class GrantHttpTests
     }
 
     [TestMethod]
+    public async Task FindCrossRepositoryUsages_FqnWithoutTheGlobalAlias_Resolves()
+    {
+        // #149: the provider symbol is named as an agent types it, without Roslyn's global:: alias.
+        await using var host = await Harness.StartAsync(seed: SeedUsages);
+        foreach (var repository in new[] { Widgets, Gadgets, Gizmos })
+            await PutSelfAsync(host, host.UserAssertion(), repository);
+
+        var call = await host.CallAsync("find_cross_repository_usages",
+            $$"""{"provider_repository_url":"{{Widgets}}","symbol_fqn":"App.Type0"}""", DelegateToken, host.UserAssertion());
+        var unknown = await host.CallAsync("find_cross_repository_usages",
+            $$"""{"provider_repository_url":"{{Widgets}}","symbol_fqn":"App.Type9"}""", DelegateToken, host.UserAssertion());
+
+        Assert.IsFalse(call.IsError, call.Body.ToString());
+        CollectionAssert.AreEquivalent(new[] { Gadgets, Gizmos },
+            call.Body.GetProperty("results").EnumerateArray().Select(r => r.GetProperty("consumer_repository").GetString()).ToList(),
+            call.Body.ToString());
+        Assert.IsTrue(unknown.IsError, $"a provider symbol that does not exist is a tool error, not an empty answer: {unknown.Body}");
+        Assert.AreEqual("symbol_not_found", ErrorCode(unknown.Body));
+    }
+
+    [TestMethod]
     public async Task FindCrossRepositoryUsages_UngrantedProvider_IsTheUniformNotFound_LikeAnAbsentOne()
     {
         await using var host = await Harness.StartAsync(seed: SeedUsages);

@@ -16,13 +16,22 @@ public sealed record CrossRepositoryUsageResult(
     IReadOnlyList<string> ResolvedSymbolKeys,
     IReadOnlyList<CrossRepositoryUsage> Usages)
 {
-    /// <summary>
-    /// The number of DISTINCT provider stable keys the input display FQN resolved to. A display FQN is not
-    /// a unique identity (overloads and same-named members collapse to one string), so this is >1 when the
-    /// FQN is ambiguous within the provider; the usage query then unions every resolved key's occurrences
-    /// and the tool surfaces the ambiguity in <c>meta</c> so the caller can narrow by stable key.
-    /// </summary>
+    /// <summary>The number of DISTINCT provider stable keys the input resolved to (one once resolved).</summary>
     public int ResolvedSymbolKeyCount => ResolvedSymbolKeys.Count;
+
+    /// <summary>The provider symbol the input resolved to, when <see cref="StableIdentityResolved"/>.</summary>
+    public SymbolInfo? Symbol { get; init; }
+
+    /// <summary>
+    /// When the input names several DIFFERENT provider symbols equally well (overloads, or same-named members of
+    /// different types): those symbols, best first. No usages are read; the caller must name one (issue #163).
+    /// </summary>
+    public IReadOnlyList<SymbolInfo> AmbiguousMatches { get; init; } = [];
+
+    /// <summary>How many of <see cref="AmbiguousMatches"/> tie for best.</summary>
+    public int AmbiguousMatchCount { get; init; }
+
+    public bool Ambiguous => AmbiguousMatches.Count > 0;
 }
 
 /// <summary>
@@ -63,13 +72,27 @@ public static class CrossRepositoryUsageResolver
                 return new CrossRepositoryUsageResult(StableIdentityResolved: false, ResolvedSymbolKeys: [], Usages: []);
         }
 
-        // Bind the input FQN to the provider's STABLE symbol key(s). No key ⇒ no stable identity /
-        // assembly lineage for this name in the provider repo, so a cross-repo match is prohibited: report
-        // that explicitly rather than silently searching by FQN string (which could conflate two repos'
-        // same-named-but-distinct symbols — #32).
-        var providerKeys = store.ResolveProviderSymbolKeysByFqn(providerRepositoryUrl, symbolFqn);
-        if (providerKeys.Count == 0)
+        // Bind the input to ONE provider symbol's STABLE key, through the same resolver as every other tool (so
+        // `Ns.Type.Method`, `global::`-less names and documentation IDs work), restricted to the provider projects
+        // consumers pin. Nothing ⇒ no stable identity / assembly lineage for this name in the provider repo, so a
+        // cross-repo match is prohibited: report that explicitly rather than silently searching by FQN string (which
+        // could conflate two repos' same-named-but-distinct symbols — #32). Several different symbols ⇒ ambiguous:
+        // never union homonyms' usages as if they were one symbol (#163).
+        var providerProjects = store.GetPinnedProviderProjectIds(providerRepositoryUrl);
+        if (providerProjects.Count == 0)
             return new CrossRepositoryUsageResult(StableIdentityResolved: false, ResolvedSymbolKeys: [], Usages: []);
+        var lookup = SymbolResolver.Lookup(
+            new SymbolStore(conn) { ProjectRestriction = providerProjects }, new ProjectStore(conn), symbolFqn);
+        if (lookup.Status == SymbolLookupStatus.Ambiguous)
+        {
+            return new CrossRepositoryUsageResult(StableIdentityResolved: false, ResolvedSymbolKeys: [], Usages: [])
+            {
+                AmbiguousMatches = lookup.Matches, AmbiguousMatchCount = lookup.TopMatchCount
+            };
+        }
+        if (lookup.Status != SymbolLookupStatus.Resolved)
+            return new CrossRepositoryUsageResult(StableIdentityResolved: false, ResolvedSymbolKeys: [], Usages: []);
+        string[] providerKeys = [lookup.Symbol!.SymbolKey];
 
         // Authorize each candidate consumer repository ONCE (decision is per-repo, independent of which
         // provider key it uses) and fail closed: only authorized ids flow into the usage query.
@@ -96,7 +119,7 @@ public static class CrossRepositoryUsageResolver
         }
 
         return new CrossRepositoryUsageResult(
-            StableIdentityResolved: true, ResolvedSymbolKeys: providerKeys, Usages: usages);
+            StableIdentityResolved: true, ResolvedSymbolKeys: providerKeys, Usages: usages) { Symbol = lookup.Symbol };
     }
 
     /// <summary>

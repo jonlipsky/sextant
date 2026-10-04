@@ -21,10 +21,11 @@ public static class GetImplementorsTool
         var relationshipStore = new RelationshipStore(conn);
         var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
 
-        var resolution = SymbolResolver.Resolve(symbolStore, projectStore, symbol_fqn);
-        if (resolution.Symbol == null)
-            return ResponseBuilder.BuildEmpty("Symbol not found.", readContext.Provenance);
-        var targetSymbol = resolution.Symbol;
+        var lookup = SymbolResolver.Lookup(symbolStore, projectStore, symbol_fqn);
+        if (lookup.Status != SymbolLookupStatus.Resolved)
+            return SymbolResolver.ErrorResponse(symbolStore, projectStore, lookup, readContext.Provenance);
+        var targetSymbol = lookup.Symbol!;
+        var namer = new SymbolNamer(symbolStore);
 
         // Find types that implement this interface or override this member
         var implementsRels = relationshipStore.GetByToSymbol(targetSymbol.Id, RelationshipKind.Implements);
@@ -40,7 +41,7 @@ public static class GetImplementorsTool
 
             results.Add(new
             {
-                fully_qualified_name = implementor.FullyQualifiedName,
+                fully_qualified_name = namer.QualifiedName(implementor),
                 display_name = implementor.DisplayName,
                 kind = implementor.Kind.ToString().ToLowerInvariant(),
                 file_path = implementor.FilePath,
@@ -49,7 +50,15 @@ public static class GetImplementorsTool
             });
         }
 
+        string? empty = null;
+        if (results.Count == 0)
+        {
+            empty = $"{SymbolResolver.Describe(namer, targetSymbol)} has no indexed implementors or overrides.";
+            if (targetSymbol.Kind is SymbolKind.Class or SymbolKind.Record)
+                empty += " For classes deriving from it, use get_type_hierarchy with direction 'down'.";
+        }
         var freshness = results.Count > 0 ? targetSymbol.LastIndexedAt : 0;
-        return ResponseBuilder.Build(results, freshness, resolution.Ambiguity, readContext.Provenance);
+        return ResponseBuilder.Build(results, freshness, lookup.Ambiguity, readContext.Provenance,
+            message: ResponseBuilder.JoinMessages(SymbolResolver.ResolutionNote(symbolStore, lookup), empty));
     }
 }

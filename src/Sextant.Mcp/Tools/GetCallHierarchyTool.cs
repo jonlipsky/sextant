@@ -28,10 +28,17 @@ public static class GetCallHierarchyTool
         var config = SextantConfiguration.FromEnvironment();
         depth = Math.Min(depth, config.MaxCallHierarchyDepth);
 
-        var resolution = SymbolResolver.Resolve(symbolStore, projectStore, symbol_fqn);
-        if (resolution.Symbol == null)
-            return ResponseBuilder.BuildEmpty("Symbol not found.", readContext.Provenance);
-        var rootSymbol = resolution.Symbol;
+        var directionName = direction?.Trim().ToLowerInvariant();
+        if (directionName is not ("callers" or "callees"))
+            return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode,
+                $"Unknown direction '{direction}'. Use 'callers' or 'callees'.", readContext.Provenance);
+        var callees = directionName == "callees";
+
+        var lookup = SymbolResolver.Lookup(symbolStore, projectStore, symbol_fqn, CallableOptions);
+        if (lookup.Status != SymbolLookupStatus.Resolved)
+            return SymbolResolver.ErrorResponse(symbolStore, projectStore, lookup, readContext.Provenance);
+        var rootSymbol = lookup.Symbol!;
+        var namer = new SymbolNamer(symbolStore);
 
         var results = new List<object>();
         var visited = new HashSet<long>();
@@ -44,20 +51,20 @@ public static class GetCallHierarchyTool
             var (currentId, currentDepth) = queue.Dequeue();
 
             List<CallGraphEdge> edges;
-            if (direction == "callees")
+            if (callees)
                 edges = callGraphStore.GetByCaller(currentId);
             else
                 edges = callGraphStore.GetByCallee(currentId);
 
             foreach (var edge in edges)
             {
-                var targetId = direction == "callees" ? edge.CalleeSymbolId : edge.CallerSymbolId;
+                var targetId = callees ? edge.CalleeSymbolId : edge.CallerSymbolId;
                 var targetSymbol = symbolStore.GetById(targetId);
                 if (targetSymbol == null) continue;
 
                 var entry = new Dictionary<string, object?>
                 {
-                    ["fully_qualified_name"] = targetSymbol.FullyQualifiedName,
+                    ["fully_qualified_name"] = namer.QualifiedName(targetSymbol),
                     ["display_name"] = targetSymbol.DisplayName,
                     ["kind"] = targetSymbol.Kind.ToString().ToLowerInvariant(),
                     ["file_path"] = targetSymbol.FilePath,
@@ -84,6 +91,21 @@ public static class GetCallHierarchyTool
         }
 
         var freshness = rootSymbol.LastIndexedAt;
-        return ResponseBuilder.Build(results, freshness, resolution.Ambiguity, readContext.Provenance);
+        var message = ResponseBuilder.JoinMessages(
+            SymbolResolver.ResolutionNote(symbolStore, lookup),
+            results.Count == 0
+                ? $"{SymbolResolver.Describe(namer, rootSymbol)} has no indexed {(callees ? "callees" : "callers")}."
+                : null);
+        return ResponseBuilder.Build(results, freshness, lookup.Ambiguity, readContext.Provenance, message: message);
     }
+
+    // The call graph links members with bodies: methods, constructors, and property/indexer/event accessors.
+    private static readonly SymbolLookupOptions CallableOptions = new()
+    {
+        Kinds = new HashSet<SymbolKind>
+        {
+            SymbolKind.Method, SymbolKind.Constructor, SymbolKind.Property, SymbolKind.Indexer, SymbolKind.Event
+        },
+        KindDescription = "method, constructor, property, indexer or event"
+    };
 }

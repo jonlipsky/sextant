@@ -34,17 +34,34 @@ public static class FindSymbolTool
 
         var canonicalIdCache = BuildCanonicalIdCache(projectStore);
 
-        // Resolve scope to project filter
+        if (!SymbolKindNames.TryParse(kind, out var kinds, out var kindDescription, out var kindError))
+            return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode, kindError!, readContext.Provenance);
+
+        // Resolve scope to project filter. An unknown project/solution or an unrecognized scope is an error, never
+        // a silently unfiltered query.
         var scopeFilter = ScopeResolver.Resolve(scope, conn, readContext.Scope);
+        if (scopeFilter.Error != null)
+            return scopeFilter.ErrorResponse(readContext.Provenance);
+
+        long? projectDbId = null;
+        if (project_id != null)
+        {
+            var proj = projectStore.GetByCanonicalId(project_id);
+            if (proj == null)
+                return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode,
+                    $"Unknown project_id '{project_id}'. Use a project canonical ID as listed by get_index_status.",
+                    readContext.Provenance);
+            projectDbId = proj.Value.id;
+        }
 
         // Issue #108: this pinned generation is a REMOTE-base overlay when readContext.RemoteBase is set —
         // the committed base lives only on a configured peer (a thin machine indexed just its diff). We
         // federate the base ONLY for a genuinely whole-repo lookup ("all" or no scope) with no project
         // filter: a file:/project:/solution: scope is inherently local (remote base rows carry no local
         // file/project id, so they can never satisfy such a filter). Gate on the RAW scope request, not
-        // ScopeFilter.IsEmpty — a project:/solution: scope that does not resolve locally collapses to an
-        // EMPTY filter, indistinguishable from "no scope", so keying off IsEmpty would silently promote a
-        // scoped miss into an UNSCOPED remote federation, returning base symbols the caller scoped out.
+        // ScopeFilter.IsEmpty — a known solution with no mapped project yields an EMPTY project set, and
+        // keying off IsEmpty could silently promote a scoped miss into an UNSCOPED remote federation,
+        // returning base symbols the caller scoped out.
         var remoteBase = readContext.RemoteBase;
         var remoteSource = dbProvider.RemoteBaseSource;
         var isRemoteBaseOverlay = remoteBase != null;
@@ -55,11 +72,17 @@ public static class FindSymbolTool
         // what a base row must be shadowed against so a symbol changed/deleted in a touched project never
         // resurfaces from the remote base.
         var touchedCanonicalIds = new HashSet<string>(canonicalIdCache.Values, StringComparer.Ordinal);
+        var namer = new SymbolNamer(symbolStore);
 
         if (fuzzy)
         {
             var config = SextantConfiguration.FromEnvironment();
-            var results = symbolStore.SearchFts(name, config.FtsMaxResults, kind);
+            // One kind narrows the FTS query itself; a kind family ("type") filters its results.
+            var results = symbolStore.SearchFts(name, config.FtsMaxResults, kinds is { Count: 1 } ? kinds.First().ToString() : null);
+            if (kinds is { Count: > 1 })
+                results = results.Where(s => kinds.Contains(s.Kind)).ToList();
+            if (projectDbId != null)
+                results = results.Where(s => s.ProjectId == projectDbId.Value).ToList();
 
             if (!scopeFilter.IsEmpty)
             {
@@ -69,7 +92,9 @@ public static class FindSymbolTool
                     results = results.Where(s => scopeFilter.ProjectIds.Contains(s.ProjectId)).ToList();
             }
 
-            var mapped = results.Select(s => MapSymbol(s, ResolveCanonicalId(s.ProjectId, canonicalIdCache), serveSource)).ToList();
+            var mapped = results
+                .Select(s => MapSymbol(s, ResolveCanonicalId(s.ProjectId, canonicalIdCache), serveSource, namer.QualifiedName(s)))
+                .ToList();
             var freshness = results.Count > 0 ? results.Min(s => s.LastIndexedAt) : 0L;
 
             if (!isRemoteBaseOverlay)
@@ -79,13 +104,11 @@ public static class FindSymbolTool
             if (federateRemote && mapped.Count < config.FtsMaxResults)
             {
                 var term = name.Trim();
-                // Apply the SAME kind filter the local FTS query used (SearchFts(..., kind)) to the remote
-                // base rows, so a kind-filtered fuzzy search does not surface unfiltered base symbols
-                // (an unknown kind maps to -1 and matches nothing, exactly as locally).
-                var kindOrdinal = kind != null ? SymbolStore.KindNameToInt(kind) : (int?)null;
+                // Apply the SAME kind filter the local FTS query used to the remote base rows, so a kind-filtered
+                // fuzzy search does not surface unfiltered base symbols.
                 outcome = await RemoteBaseSymbolFederation.FetchAsync(
                     remoteSource!, remoteBase!.BaseIdentityHash, touchedCanonicalIds,
-                    row => (kindOrdinal is null || row.Kind == kindOrdinal.Value)
+                    row => (kinds is null || kinds.Contains((SymbolKind)row.Kind))
                         && (Contains(row.DisplayName, term) || Contains(row.FullyQualifiedName, term)),
                     maxMatches: config.FtsMaxResults - mapped.Count,
                     CancellationToken.None).ConfigureAwait(false);
@@ -102,45 +125,73 @@ public static class FindSymbolTool
         }
         else
         {
-            long? projectDbId = null;
-            if (project_id != null)
+            var restriction = projectDbId != null
+                ? scopeFilter.ProjectIds is { } scoped
+                    ? scoped.Where(id => id == projectDbId.Value).ToHashSet()
+                    : new HashSet<long> { projectDbId.Value }
+                : scopeFilter.ProjectIds;
+            var scopeDescription = (project_id, wholeRepoScope) switch
             {
-                var proj = projectStore.GetByCanonicalId(project_id);
-                if (proj == null)
-                    return ResponseBuilder.BuildEmpty("Project not found.", readContext.Provenance);
-                projectDbId = proj.Value.id;
+                (not null, false) => $"in project '{project_id}' and scope '{scope}'",
+                (not null, true) => $"in project '{project_id}'",
+                (null, false) => $"in scope '{scope}'",
+                _ => null
+            };
+            var options = new SymbolLookupOptions
+            {
+                Kinds = kinds,
+                KindsExplicit = kinds != null,
+                KindDescription = kindDescription,
+                ProjectIds = restriction,
+                FilePath = scopeFilter.FilePath,
+                ScopeDescription = scopeDescription
+            };
+            var lookup = SymbolResolver.Lookup(symbolStore, projectStore, name, options);
+            // Served from the local overlay; for a remote-base overlay stamp origin=local (the base is
+            // addressable remotely but this answer never needed it) while keeping the base identity hash.
+            var localProv = isRemoteBaseOverlay
+                ? FinalizeRemoteBaseProvenance(readContext.Provenance!, remoteSource != null, outcome: null)
+                : readContext.Provenance;
+
+            if (lookup.Status == SymbolLookupStatus.Resolved)
+            {
+                var symbol = lookup.Symbol!;
+                var localHit = new List<object>
+                {
+                    MapSymbol(symbol, ResolveCanonicalId(symbol.ProjectId, canonicalIdCache), serveSource, namer.QualifiedName(symbol))
+                };
+                return ResponseBuilder.Build(localHit, symbol.LastIndexedAt, lookup.Ambiguity, localProv,
+                    message: SymbolResolver.ResolutionNote(symbolStore, lookup));
             }
 
-            var resolution = SymbolResolver.Resolve(symbolStore, projectStore, name, projectDbId);
-            if (resolution.Symbol != null)
+            if (lookup.Status == SymbolLookupStatus.Ambiguous)
             {
-                var symbol = resolution.Symbol;
-
-                if (!scopeFilter.IsEmpty)
-                {
-                    if (scopeFilter.FilePath != null && symbol.FilePath != scopeFilter.FilePath)
-                        return ResponseBuilder.BuildEmpty("Symbol not in scope.", readContext.Provenance);
-                    if (scopeFilter.ProjectIds != null && !scopeFilter.ProjectIds.Contains(symbol.ProjectId))
-                        return ResponseBuilder.BuildEmpty("Symbol not in scope.", readContext.Provenance);
-                }
-
-                var localHit = new List<object> { MapSymbol(symbol, ResolveCanonicalId(symbol.ProjectId, canonicalIdCache), serveSource) };
-                // Served from the local overlay; for a remote-base overlay stamp origin=local (the base is
-                // addressable remotely but this answer never needed it) while keeping the base identity hash.
-                var localProv = isRemoteBaseOverlay
-                    ? FinalizeRemoteBaseProvenance(readContext.Provenance!, remoteSource != null, outcome: null)
-                    : readContext.Provenance;
-                return ResponseBuilder.Build(localHit, symbol.LastIndexedAt, resolution.Ambiguity, localProv);
+                // find_symbol is a search, so several equally good matches are an answer, not an error: list them
+                // (best first) and say how to narrow to one for the tools that need exactly one symbol.
+                var top = lookup.Matches.Take(Math.Min(lookup.TopMatchCount, MaxAmbiguousResults)).ToList();
+                var listed = top
+                    .Select(s => MapSymbol(s, ResolveCanonicalId(s.ProjectId, canonicalIdCache), serveSource, namer.QualifiedName(s)))
+                    .ToList();
+                var shown = top.Count < lookup.TopMatchCount ? $" (the first {top.Count} are listed)" : string.Empty;
+                var message =
+                    $"'{name.Trim()}' matches {lookup.TopMatchCount} different symbols{shown}. Tools that need one " +
+                    "symbol accept any fully_qualified_name listed here (or qualify the name with its containing type " +
+                    "and parameter list, e.g. 'Type.Method(int)').";
+                return ResponseBuilder.Build(listed, top.Min(s => s.LastIndexedAt), provenance: localProv, message: message);
             }
 
             // Not resolvable locally. For a remote-base overlay, the definition may live in an UNCHANGED
             // (untouched) project that exists only in the committed base on the peer — federate it.
-            if (federateRemote)
+            if (federateRemote && lookup.Status == SymbolLookupStatus.NotFound)
             {
+                var term = name.Trim();
+                var bare = term.StartsWith("global::", StringComparison.Ordinal) ? term["global::".Length..] : term;
                 var outcome = await RemoteBaseSymbolFederation.FetchAsync(
                     remoteSource!, remoteBase!.BaseIdentityHash, touchedCanonicalIds,
-                    row => string.Equals(row.FullyQualifiedName, name, StringComparison.Ordinal)
-                        || string.Equals(row.DisplayName, name, StringComparison.Ordinal),
+                    row => (kinds is null || kinds.Contains((SymbolKind)row.Kind))
+                        && (string.Equals(row.FullyQualifiedName, term, StringComparison.Ordinal)
+                            || string.Equals(row.FullyQualifiedName, "global::" + bare, StringComparison.Ordinal)
+                            || string.Equals(row.DisplayName, term, StringComparison.Ordinal)),
                     maxMatches: 1,
                     CancellationToken.None).ConfigureAwait(false);
 
@@ -150,16 +201,14 @@ public static class FindSymbolTool
                     var remoteHit = new List<object> { RemoteBaseSymbolFederation.MapRemoteSymbol(outcome.Rows[0]) };
                     return ResponseBuilder.Build(remoteHit, provenance.Freshness, provenance: provenance);
                 }
-                return ResponseBuilder.BuildEmpty("Symbol not found.", provenance);
+                return SymbolResolver.ErrorResponse(symbolStore, projectStore, lookup, provenance);
             }
 
-            var notFoundProv = isRemoteBaseOverlay
-                ? FinalizeRemoteBaseProvenance(readContext.Provenance!, remoteSource != null, outcome: null)
-                : readContext.Provenance;
-            return ResponseBuilder.BuildEmpty("Symbol not found.", notFoundProv);
+            return SymbolResolver.ErrorResponse(symbolStore, projectStore, lookup, localProv);
         }
     }
 
+    private const int MaxAmbiguousResults = 25;
     private static bool Contains(string? haystack, string needle)
         => haystack != null && haystack.Contains(needle, StringComparison.OrdinalIgnoreCase);
 
@@ -213,11 +262,16 @@ public static class FindSymbolTool
     internal static string ResolveCanonicalId(long projectId, Dictionary<long, string> cache)
         => cache.TryGetValue(projectId, out var cid) ? cid : projectId.ToString();
 
-    internal static object MapSymbol(SymbolInfo s, string? canonicalId = null, bool includeSource = false)
+    /// <param name="qualifiedName">
+    /// The name to print as <c>fully_qualified_name</c>, in a form the tools accept back (<see cref="SymbolNamer"/>);
+    /// the stored name when null.
+    /// </param>
+    internal static object MapSymbol(
+        SymbolInfo s, string? canonicalId = null, bool includeSource = false, string? qualifiedName = null)
     {
         var result = new Dictionary<string, object?>
         {
-            ["fully_qualified_name"] = s.FullyQualifiedName,
+            ["fully_qualified_name"] = qualifiedName ?? s.FullyQualifiedName,
             ["display_name"] = s.DisplayName,
             ["kind"] = s.Kind.ToString().ToLowerInvariant(),
             ["project_id"] = canonicalId ?? s.ProjectId.ToString(),

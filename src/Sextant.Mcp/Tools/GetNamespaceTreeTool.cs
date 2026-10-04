@@ -30,8 +30,20 @@ public static class GetNamespaceTreeTool
         {
             var proj = projectStore.GetByCanonicalId(project_id);
             if (proj == null)
-                return ResponseBuilder.BuildEmpty("Project not found.", readContext.Provenance);
+                return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode,
+                    $"Unknown project_id '{project_id}'. Use a project canonical ID as listed by get_index_status.",
+                    readContext.Provenance);
             projectDbId = proj.Value.id;
+        }
+
+        // Stored type names carry the 'global::' alias; accept a prefix with or without it.
+        if (namespace_prefix != null)
+        {
+            namespace_prefix = namespace_prefix.Trim().TrimEnd('.');
+            if (namespace_prefix.Length == 0 || namespace_prefix == "global::")
+                namespace_prefix = null;
+            else if (!namespace_prefix.StartsWith("global::", StringComparison.Ordinal))
+                namespace_prefix = "global::" + namespace_prefix;
         }
 
         var allTypeFqns = symbolStore.GetAllTypeFqns(projectDbId);
@@ -47,9 +59,12 @@ public static class GetNamespaceTreeTool
         // Filter to prefix
         if (namespace_prefix != null)
         {
+            var all = namespaces;
             namespaces = namespaces
                 .Where(ns => ns.StartsWith(namespace_prefix + ".") || ns == namespace_prefix)
                 .ToList();
+            if (namespaces.Count == 0)
+                return UnknownNamespace(namespace_prefix, all, project_id, readContext.Provenance);
         }
 
         // Build namespace tree at requested depth
@@ -109,6 +124,23 @@ public static class GetNamespaceTreeTool
         };
 
         return ResponseBuilder.Build(result, null, provenance: readContext.Provenance);
+    }
+
+    private static string UnknownNamespace(
+        string prefix, List<string> namespaces, string? projectId, SnapshotProvenance? provenance)
+    {
+        var lastSegment = prefix[(prefix.LastIndexOf('.') + 1)..].Replace("global::", string.Empty);
+        var close = namespaces
+            .Where(ns => ns.Contains(lastSegment, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(ns => ns.Length)
+            .ThenBy(ns => ns, StringComparer.Ordinal)
+            .Take(5)
+            .ToList();
+        var message = $"No namespace '{prefix}' contains an indexed type{(projectId != null ? " in that project" : string.Empty)}.";
+        message += close.Count > 0
+            ? $" Closest: {string.Join(", ", close)}."
+            : " Omit namespace_prefix to list the top-level namespaces.";
+        return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode, message, provenance);
     }
 
     internal static string? ExtractNamespace(string fullyQualifiedName)

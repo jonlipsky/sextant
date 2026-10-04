@@ -74,6 +74,22 @@ public sealed class DatabaseProvider : IDisposable
     /// </summary>
     public Func<string?> RequestedBranch { get; set; } = () => null;
 
+    /// <summary>
+    /// Extra guidance appended to the <see cref="ResponseBuilder.RepositoryRequiredCode"/> error (how to name a
+    /// repository, and which ones the caller may read), or null for none. The host evaluates it only when that error
+    /// is returned, so it may read the caller's own grants; it must never describe catalog content the caller cannot
+    /// read. The default (<c>() =&gt; null</c>) keeps the error's bytes unchanged.
+    /// </summary>
+    public Func<string?> RepositoryRequiredGuidance { get; set; } = () => null;
+
+    /// <summary>
+    /// Whether the repository <see cref="RequestedRepository"/> yields for the current request was selected by the host
+    /// because the request named none (e.g. the caller can read exactly one repository). When true, a successful read
+    /// stamps the repository and <c>repository_selection: "implicit"</c> into <c>meta.snapshot</c>, so the answer
+    /// says which repository it came from. The default (<c>() =&gt; false</c>) leaves provenance unchanged.
+    /// </summary>
+    public Func<bool> RepositorySelectedImplicitly { get; set; } = () => false;
+
     public bool DatabaseExists => File.Exists(_dbPath);
 
     public IndexDatabase? GetDatabase()
@@ -147,7 +163,7 @@ public sealed class DatabaseProvider : IDisposable
         if ((RequireRepositorySelection() || !string.IsNullOrWhiteSpace(RequestedBranch()))
             && string.IsNullOrWhiteSpace(RequestedRepository()))
         {
-            failureResponse = ResponseBuilder.BuildRepositoryRequired();
+            failureResponse = ResponseBuilder.BuildRepositoryRequired(RepositoryRequiredGuidance());
             return false;
         }
 
@@ -170,6 +186,7 @@ public sealed class DatabaseProvider : IDisposable
                 return false; // the gate already produced the uniform not-found
 
             database = ready;
+            context = StampImplicitSelection(context);
             failureResponse = string.Empty;
             return true;
         }
@@ -188,8 +205,19 @@ public sealed class DatabaseProvider : IDisposable
                 RequestedBranch))
             return false;
 
+        context = StampImplicitSelection(context);
         failureResponse = string.Empty;
         return true;
+    }
+
+    // Says which repository answered a read the host selected for the caller. Only a READ THAT SUCCEEDED is stamped,
+    // and only with the repository the request already resolved to, so nothing is revealed that the read did not serve.
+    private FederatedReadContext StampImplicitSelection(FederatedReadContext context)
+    {
+        if (context.Provenance is not { } provenance || !RepositorySelectedImplicitly()
+            || RequestedRepository() is not { Length: > 0 } repository)
+            return context;
+        return context.WithProvenance(provenance with { Repository = repository, RepositorySelection = "implicit" });
     }
 
     public void Dispose()

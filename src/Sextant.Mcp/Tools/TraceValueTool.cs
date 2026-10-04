@@ -35,23 +35,33 @@ public static class TraceValueTool
         var returnFlowStore = new ReturnFlowStore(conn);
         var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
 
-        var resolution = SymbolResolver.Resolve(symbolStore, projectStore, method_fqn);
-        if (resolution.Symbol == null)
-            return ResponseBuilder.BuildEmpty("Method not found.", readContext.Provenance);
-        var methodSymbol = resolution.Symbol;
+        var directionName = direction?.Trim().ToLowerInvariant();
+        if (directionName is not ("origins" or "destinations"))
+            return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode,
+                $"Unknown direction '{direction}'. Use 'origins' or 'destinations'.", readContext.Provenance);
 
-        if (direction == "origins")
-            return TraceOrigins(methodSymbol, parameter, depth, symbolStore, callGraphStore, argumentFlowStore, resolution.Ambiguity, readContext.Provenance);
-        else if (direction == "destinations")
-            return TraceDestinations(methodSymbol, depth, symbolStore, callGraphStore, returnFlowStore, resolution.Ambiguity, readContext.Provenance);
-        else
-            return ResponseBuilder.BuildEmpty("Invalid direction. Use 'origins' or 'destinations'.", readContext.Provenance);
+        var lookup = SymbolResolver.Lookup(symbolStore, projectStore, method_fqn, MethodOptions);
+        if (lookup.Status != SymbolLookupStatus.Resolved)
+            return SymbolResolver.ErrorResponse(symbolStore, projectStore, lookup, readContext.Provenance);
+        var methodSymbol = lookup.Symbol!;
+        var namer = new SymbolNamer(symbolStore);
+        var note = SymbolResolver.ResolutionNote(symbolStore, lookup);
+
+        if (directionName == "origins")
+            return TraceOrigins(methodSymbol, parameter, depth, symbolStore, namer, callGraphStore, argumentFlowStore, lookup.Ambiguity, readContext.Provenance, note);
+        return TraceDestinations(methodSymbol, depth, symbolStore, namer, callGraphStore, returnFlowStore, lookup.Ambiguity, readContext.Provenance, note);
     }
+
+    private static readonly SymbolLookupOptions MethodOptions = new()
+    {
+        Kinds = new HashSet<Core.SymbolKind> { Core.SymbolKind.Method, Core.SymbolKind.Constructor },
+        KindDescription = "method or constructor"
+    };
 
     private static string TraceOrigins(
         Core.SymbolInfo method, string? parameter, int depth,
-        SymbolStore symbolStore, CallGraphStore callGraphStore, ArgumentFlowStore argumentFlowStore,
-        SymbolAmbiguity? ambiguity, SnapshotProvenance? provenance)
+        SymbolStore symbolStore, SymbolNamer namer, CallGraphStore callGraphStore, ArgumentFlowStore argumentFlowStore,
+        SymbolAmbiguity? ambiguity, SnapshotProvenance? provenance, string? note)
     {
         // Find all call graph edges where this method is the callee
         var callerEdges = callGraphStore.GetByCallee(method.Id);
@@ -59,8 +69,8 @@ public static class TraceValueTool
         var allArgFlows = argumentFlowStore.GetByCallGraphIds(edgeIds);
 
         // Group argument flows by parameter
-        var paramGroups = allArgFlows
-            .GroupBy(a => a.ParameterName)
+        var allGroups = allArgFlows.GroupBy(a => a.ParameterName).ToList();
+        var paramGroups = allGroups
             .Where(g =>
             {
                 if (parameter == null) return true;
@@ -78,7 +88,7 @@ public static class TraceValueTool
 
                 return (object)new
                 {
-                    caller_fqn = callerSymbol?.FullyQualifiedName ?? "unknown",
+                    caller_fqn = callerSymbol is null ? "unknown" : namer.QualifiedName(callerSymbol),
                     argument_expression = af.ArgumentExpression,
                     argument_kind = af.ArgumentKind,
                     source_symbol_fqn = af.SourceSymbolFqn,
@@ -95,13 +105,23 @@ public static class TraceValueTool
             };
         }).ToList();
 
-        return ResponseBuilder.Build(results, method.LastIndexedAt, ambiguity, provenance);
+        string? empty = null;
+        if (results.Count == 0)
+        {
+            var target = SymbolResolver.Describe(namer, method);
+            empty = allGroups.Count == 0
+                ? $"No argument flows into {target} were found (it has no indexed callers passing arguments)."
+                : $"{target} has no traced parameter '{parameter}'. Traced parameters: " +
+                  $"{string.Join(", ", allGroups.Select(g => $"{g.Key} ({g.First().ParameterOrdinal})"))}.";
+        }
+        return ResponseBuilder.Build(results, method.LastIndexedAt, ambiguity, provenance,
+            message: ResponseBuilder.JoinMessages(note, empty));
     }
 
     private static string TraceDestinations(
         Core.SymbolInfo method, int depth,
-        SymbolStore symbolStore, CallGraphStore callGraphStore, ReturnFlowStore returnFlowStore,
-        SymbolAmbiguity? ambiguity, SnapshotProvenance? provenance)
+        SymbolStore symbolStore, SymbolNamer namer, CallGraphStore callGraphStore, ReturnFlowStore returnFlowStore,
+        SymbolAmbiguity? ambiguity, SnapshotProvenance? provenance, string? note)
     {
         // Find all call graph edges where this method is the callee
         var callerEdges = callGraphStore.GetByCallee(method.Id);
@@ -115,7 +135,7 @@ public static class TraceValueTool
 
             return (object)new
             {
-                caller_fqn = callerSymbol?.FullyQualifiedName ?? "unknown",
+                caller_fqn = callerSymbol is null ? "unknown" : namer.QualifiedName(callerSymbol),
                 destination_kind = returnFlow?.DestinationKind ?? "unknown",
                 destination_variable = returnFlow?.DestinationVariable,
                 destination_symbol_fqn = returnFlow?.DestinationSymbolFqn,
@@ -124,6 +144,10 @@ public static class TraceValueTool
             };
         }).ToList();
 
-        return ResponseBuilder.Build(results, method.LastIndexedAt, ambiguity, provenance);
+        var empty = results.Count == 0
+            ? $"{SymbolResolver.Describe(namer, method)} has no indexed callers, so its return value flows nowhere in the index."
+            : null;
+        return ResponseBuilder.Build(results, method.LastIndexedAt, ambiguity, provenance,
+            message: ResponseBuilder.JoinMessages(note, empty));
     }
 }

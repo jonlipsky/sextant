@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using Sextant.Core;
 using Sextant.Store;
 using ModelContextProtocol.Server;
 
@@ -35,12 +36,28 @@ public static class FindCrossRepositoryUsagesTool
         var outcome = CrossRepositoryUsageResolver.Resolve(
             conn, provider_repository_url, symbol_fqn, scope, dbProvider.Authorizer);
 
-        // FQN did not resolve to a stable provider symbol identity: an FQN-only cross-repo match is
-        // prohibited, so say so explicitly instead of implying the symbol has zero usages.
+        // The name matches several different provider symbols: never union their usages as if they were one.
+        if (outcome.Ambiguous)
+        {
+            var namer = new SymbolNamer(new SymbolStore(conn));
+            var candidates = outcome.AmbiguousMatches
+                .Take(Math.Min(outcome.AmbiguousMatchCount, SymbolResolver.MaxAmbiguousCandidates))
+                .Select(s => namer.Candidate(s, new ProjectStore(conn).GetById(s.ProjectId)?.project.CanonicalId ?? ""))
+                .ToList();
+            return SymbolResolver.AmbiguousResponse(
+                symbol_fqn.Trim(), candidates, outcome.AmbiguousMatchCount,
+                $"in provider repository '{provider_repository_url}'", readContext.Provenance);
+        }
+
+        // The name did not resolve to a stable provider symbol identity: an FQN-only cross-repo match is prohibited,
+        // so say so explicitly (as an error) instead of implying the symbol has zero usages. The message is the same
+        // for a provider the caller may not read, so it reveals nothing about one.
         if (!outcome.StableIdentityResolved)
-            return ResponseBuilder.BuildEmpty(
-                $"No stable symbol identity for '{symbol_fqn}' in provider repository '{provider_repository_url}'. " +
-                "A cross-repository usage query requires the provider symbol to be indexed (stable identity); " +
+            return ResponseBuilder.BuildError(
+                ResponseBuilder.SymbolNotFoundCode,
+                $"No symbol '{symbol_fqn.Trim()}' is indexed in provider repository '{provider_repository_url}' with a " +
+                "stable identity. Pass the symbol as a qualified name (Ns.Type, Ns.Type.Member or " +
+                "Ns.Type.Method(int, string)) or a documentation ID, and the provider's repository URL; " +
                 "an FQN-only match is not performed.",
                 readContext.Provenance);
 
@@ -58,32 +75,13 @@ public static class FindCrossRepositoryUsagesTool
             submodule_dirty = u.SubmoduleDirty
         }).ToList();
 
-        // A display FQN is not a unique identity: overloads and same-named members of the provider collapse
-        // to one string, so it can resolve to SEVERAL distinct stable keys. The query deliberately unions
-        // every resolved key's usages (the caller asked for "this method" by name), but that must not be
-        // silent — surface the ambiguity through the standard meta channel (ambiguous + candidate keys) so
-        // the caller can tell the FQN was ambiguous and narrow by stable key, instead of reading a merged,
-        // symbol-agnostic result set as if the FQN were unique.
-        SymbolAmbiguity? ambiguity = null;
-        if (outcome.ResolvedSymbolKeys.Count > 1)
-        {
-            var candidates = outcome.ResolvedSymbolKeys
-                .Select(key => new SymbolCandidate(
-                    ProjectId: provider_repository_url,
-                    SymbolKey: key,
-                    FullyQualifiedName: symbol_fqn,
-                    Kind: "",
-                    FilePath: "",
-                    LineStart: 0))
-                .ToList();
-            ambiguity = new SymbolAmbiguity
-            {
-                Candidates = candidates,
-                SelectedProjectId = provider_repository_url,
-                SelectedSymbolKey = outcome.ResolvedSymbolKeys[0]
-            };
-        }
-
-        return ResponseBuilder.Build(results, readContext.Provenance?.Freshness, ambiguity, readContext.Provenance);
+        var resolved = Describe(conn, outcome.Symbol!);
+        var message = results.Count == 0
+            ? $"No authorized consumer repository uses {resolved} in the selected scope."
+            : $"Usages of {resolved}.";
+        return ResponseBuilder.Build(results, readContext.Provenance?.Freshness, provenance: readContext.Provenance, message: message);
     }
+
+    private static string Describe(Microsoft.Data.Sqlite.SqliteConnection conn, SymbolInfo symbol) =>
+        SymbolResolver.Describe(new SymbolNamer(new SymbolStore(conn)), symbol);
 }

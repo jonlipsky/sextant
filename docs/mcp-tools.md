@@ -21,9 +21,50 @@ Every tool response includes a `meta` object:
 - `index_freshness` — oldest `last_indexed_at` among all results (worst-case staleness)
 - `result_count` — number of results returned
 
-### Ambiguous FQN lookups
+### Symbol arguments
 
-Because the display FQN is no longer unique, tools that accept an FQN resolve it through a shared resolver. When the FQN matches exactly one definition the response is unchanged. When it matches **several** definitions (overloads, or the same FQN in multiple projects) the resolver still returns a deterministic best match, but adds ambiguity fields to `meta` so callers can see the collision instead of silently getting one row:
+Every tool that takes a symbol (`symbol_fqn`, `method_fqn`, `for_symbol`, `in_symbol`, `find_symbol`'s `name`, and
+`find_cross_repository_usages`' provider symbol) resolves it through one resolver that accepts the spellings a C#
+developer types, with or without Roslyn's `global::` alias:
+
+| Form | Example |
+| --- | --- |
+| A type, with or without its namespace | `MyApp.Services.UserService`, `global::MyApp.Services.UserService`, `UserService` |
+| A member qualified by its type (and optionally its namespace) | `UserService.GetById`, `MyApp.Services.UserService.GetById` |
+| A member with its parameter list (C# keywords or framework names) | `UserService.GetById(int)`, `global::MyApp.Services.UserService.GetById(System.Int32)` |
+| A Roslyn documentation ID (the stored `symbol_key`) | `M:MyApp.Services.UserService.GetById(System.Int32)`, `T:MyApp.Services.UserService` |
+
+Ranking prefers an exact symbol key, then a full path over a path suffix over a bare name, then a name spelled
+without type arguments for a non-generic symbol over a generic namesake (`Result` is `Result`, not `Result<T>`;
+write `Result<T>` or ``Result`1`` for the generic one), and, when the caller asked for no `kind`, a type over a
+member or type parameter of the same name, so a class is never shadowed by its constructors or by a field elsewhere
+that shares its name. `find_symbol` honours `kind` on its exact path too. It is a query-time resolution over the
+stored keys and signatures: no re-index is needed. An argument longer than 2048 characters, or with generic
+arguments or tuples nested more than 32 deep, is an `invalid_argument` error.
+
+The `fully_qualified_name` a tool prints for a symbol is in one of those accepted forms (a type's
+`global::Ns.Type`, a method's `global::Ns.Type.Method(int)`, a field's `global::Ns.Type.Field`, else its
+documentation ID), so any name a tool returns can be passed back to another tool as is.
+
+### Tool errors
+
+A call that cannot be answered as asked is an MCP tool error (`isError: true`), never an empty success. Its text is
+the JSON envelope with `meta.error.code` and a top-level `message` saying what to pass instead:
+
+| `meta.error.code` | When | Extra metadata |
+| --- | --- | --- |
+| `symbol_not_found` | The symbol argument matches nothing (in scope, of the kinds the tool accepts) | `meta.candidates`: up to five closest symbols, each named in an accepted form |
+| `ambiguous_symbol` | A tool that needs one symbol was given a name that several different symbols match equally well (e.g. a bare method name, or an overloaded method without its parameter list). The tool never picks one | `meta.ambiguous`, `meta.ambiguous_match_count`, and `meta.candidates` (the first ten) |
+| `invalid_argument` | An argument is malformed or names nothing the tool accepts (an unknown `project_id`, `scope`, `kind`, `accessibility`, namespace or commit) | |
+| `repository_required` (service) | The call must name a repository; for a verified caller the message lists the repositories it can read | |
+| `repository_not_found` (service) | The named repository or branch serves nothing to this caller: not indexed, no complete snapshot on that branch, or not readable by it. Under a read policy every such case gets the same bytes, so it never tells an existing repository from an absent one | |
+
+`find_symbol` is a search, so several equally good matches are an answer there: it lists them (best first) and its
+`message` says how to narrow. A valid query whose answer is empty (a type with no implementors, a method with no
+references) is not an error: the result says so in `message`.
+
+When one symbol is declared in several project versions (the same `symbol_key` in several projects or target
+frameworks), the tool answers for one of them and discloses the others in `meta`:
 
 ```json
 {
@@ -44,7 +85,8 @@ Because the display FQN is no longer unique, tools that accept an FQN resolve it
 }
 ```
 
-These fields are omitted entirely for unambiguous lookups, so existing callers see byte-identical responses. To pin a specific definition, re-issue the lookup with a narrowing `project_id`; `selected_project_id` and each candidate's `project_id` identify which projects collided. The `symbol_key` on each candidate is the stable semantic identity you can record and compare across runs (tools resolve by FQN scoped with `project_id`; there is no query-by-key tool in this phase).
+These fields are omitted when the symbol is declared once. To pin a specific project version, re-issue the call with
+a narrowing `project_id`.
 
 ### Feature availability (Phase 8)
 

@@ -97,6 +97,8 @@ public static class ServiceApp
             return new DatabaseProvider(options.CatalogDbPath, authorizer)
             {
                 RequestedRepository = RequestedRepositoryAccessor(http, service),
+                RepositorySelectedImplicitly = RepositorySelectedImplicitlyAccessor(http, service),
+                RepositoryRequiredGuidance = RepositoryRequiredGuidanceAccessor(http, service, options.RepositoryUrlPolicy),
                 RequestedBranch = RequestedBranchAccessor(http),
                 RequireRepositorySelection = RepositorySelectionRequirement(options, CallerAssertionGate.CallerPrincipalAccessor(http))
             };
@@ -139,9 +141,15 @@ public static class ServiceApp
             // verified caller is answered before its arguments are even read.
             .WithRequestFilters(filters => filters
                 .AddCallToolFilter(CallerAssertionGate.CallToolFilter())
-                .AddListToolsFilter(ToolSelectionFilters.ListToolsFilter(options.RepositoryUrlPolicy, RepositoryScopedTools))
+                .AddListToolsFilter(ToolSelectionFilters.ListToolsFilter(
+                    options.RepositoryUrlPolicy, RepositoryScopedTools,
+                    selectionRequired: options.RequireRepositorySelection,
+                    implicitSelection: options.DelegateTokens.Count > 0))
                 .AddListToolsFilter(SearchSymbolsTool.ListToolsFilter())
-                .AddCallToolFilter(ToolSelectionFilters.CallToolFilter(options.RepositoryUrlPolicy, RepositoryScopedTools)));
+                .AddCallToolFilter(ToolSelectionFilters.CallToolFilter(options.RepositoryUrlPolicy, RepositoryScopedTools))
+                // Innermost: a tool result carrying a structured meta.error is an MCP tool error (isError: true),
+                // so a client never mistakes a failed call for an empty answer (issue #163).
+                .AddCallToolFilter(ToolErrorResults.CallToolFilter()));
     }
 
     /// <summary>
@@ -718,16 +726,70 @@ public static class ServiceApp
     /// fails with <c>repository_required</c>.
     /// </summary>
     private static Func<string?> RequestedRepositoryAccessor(IHttpContextAccessor accessor, SnapshotService service) =>
+        () => accessor.HttpContext is { } ctx ? RequestedRepositorySelection(ctx, service).Repository : null;
+
+    /// <summary>
+    /// Whether <see cref="RequestedRepositoryAccessor"/>'s repository for the current request is the SVC-4 implicit
+    /// selection (the request named none), so the response says which repository answered.
+    /// </summary>
+    private static Func<bool> RepositorySelectedImplicitlyAccessor(IHttpContextAccessor accessor, SnapshotService service) =>
+        () => accessor.HttpContext is { } ctx && RequestedRepositorySelection(ctx, service).Implicit;
+
+    private static (string? Repository, bool Implicit) RequestedRepositorySelection(HttpContext ctx, SnapshotService service)
+    {
+        var selection = ToolCallSelection.Get(ctx);
+        var named = selection is not null ? selection.Repository : RepositoryHeaderValue(ctx);
+        if (named is not null || selection?.Branch is not null)
+            return (named, false);
+        var selected = CallerVisibility.ImplicitRepository(ctx, service);
+        return (selected, selected is not null);
+    }
+
+    /// <summary>The most repositories a <c>repository_required</c> error lists before pointing at <c>list_repositories</c>.</summary>
+    internal const int RepositoryRequiredListLimit = 20;
+
+    /// <summary>
+    /// The guidance appended to a <c>repository_required</c> error: how to name a repository and, for a verified
+    /// caller, the repositories ITS grants make visible (the same set <c>list_repositories</c> returns to it), so an
+    /// agent can retry at once. A request without a verified caller gets only the syntax hint, so the error never
+    /// describes catalog content to an unidentified caller.
+    /// </summary>
+    private static Func<string?> RepositoryRequiredGuidanceAccessor(
+        IHttpContextAccessor accessor, SnapshotService service, RepositoryUrlPolicy policy) =>
         () =>
         {
-            if (accessor.HttpContext is not { } ctx)
-                return null;
-            var selection = ToolCallSelection.Get(ctx);
-            var named = selection is not null ? selection.Repository : RepositoryHeaderValue(ctx);
-            if (named is not null || selection?.Branch is not null)
-                return named;
-            return CallerVisibility.ImplicitRepository(ctx, service);
+            var example = policy.Hosts.Count == 1 ? "owner/repo" : "host/owner/repo";
+            var how = $"Pass the 'repository' argument (e.g. '{example}') or the {RepositoryHeader} header.";
+            if (accessor.HttpContext is not { } ctx || CallerRequest.Get(ctx)?.Principal is not { } caller)
+                return how;
+            var visible = service.ListVisibleRepositories(caller)
+                .Select(r => ShortRepositoryName(r.Repository, policy))
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+            if (visible.Count == 0)
+                return how + " The caller has no repository grants yet, so there is nothing to read until one is added.";
+            var shown = string.Join(", ", visible.Take(RepositoryRequiredListLimit).Select(name => $"'{name}'"));
+            var more = visible.Count > RepositoryRequiredListLimit
+                ? $" and {visible.Count - RepositoryRequiredListLimit} more (call list_repositories for all)"
+                : string.Empty;
+            return $"{how} Repositories this caller can read: {shown}{more}.";
         };
+
+    /// <summary>
+    /// A repository URL in the shortest spelling the <c>repository</c> argument accepts: <c>owner/repo</c> when the
+    /// policy has one host and the URL is on it, else <c>host/owner/repo</c>; any other shape is returned as stored.
+    /// </summary>
+    internal static string ShortRepositoryName(string url, RepositoryUrlPolicy policy)
+    {
+        var decision = policy.Evaluate(url);
+        if (!decision.Ok || decision.Host is not { } host || decision.Owner is not { } owner || decision.Repo is not { } repo)
+            return url;
+        if (repo.EndsWith(".git", StringComparison.OrdinalIgnoreCase))
+            repo = repo[..^4];
+        return policy.Hosts.Count == 1 && string.Equals(host, policy.Hosts[0], StringComparison.OrdinalIgnoreCase)
+            ? $"{owner}/{repo}"
+            : $"{host}/{owner}/{repo}";
+    }
 
     /// <summary>
     /// Resolves the branch the current call selected through the reserved <c>branch</c> tool argument

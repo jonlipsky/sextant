@@ -276,7 +276,9 @@ public class RepositorySelectionTests
 
         var root = JsonDocument.Parse(failure).RootElement;
         Assert.AreEqual(0, root.GetProperty("meta").GetProperty("result_count").GetInt32());
-        Assert.IsFalse(root.GetProperty("meta").TryGetProperty("error", out _));
+        Assert.AreEqual(ResponseBuilder.RepositoryNotFoundCode,
+            root.GetProperty("meta").GetProperty("error").GetProperty("code").GetString(),
+            "an unresolved named repository is a tool error, never an empty success");
         StringAssert.Contains(root.GetProperty("message").GetString(), "requested repository",
             "the permissive path says why it read nothing");
         Assert.IsFalse(failure.Contains("not-indexed"), "the requested repository is not echoed");
@@ -315,17 +317,18 @@ public class RepositorySelectionTests
     }
 
     [TestMethod]
-    public void LocalStdioHost_RegistersNoRequestFilters()
+    public void LocalStdioHost_RegistersOnlyTheToolErrorFilter()
     {
         // The per-call selection filters (SVC-2) belong to the service's /mcp only: the local stdio server's
-        // tools/list and tools/call stay byte-identical, with no reserved selector arguments.
+        // tools/list stays byte-identical, with no reserved selector arguments. Its one call-tool filter is the
+        // tool-error marker (isError on a meta.error result), which every host registers.
         using var host = McpServerSetup.CreateMcpHost([], _dbPath).Build();
         var filters = host.Services
             .GetRequiredService<Microsoft.Extensions.Options.IOptions<ModelContextProtocol.Server.McpServerOptions>>()
             .Value.Filters.Request;
 
         Assert.AreEqual(0, filters.ListToolsFilters.Count);
-        Assert.AreEqual(0, filters.CallToolFilters.Count);
+        Assert.AreEqual(1, filters.CallToolFilters.Count);
     }
 
     [TestMethod]
