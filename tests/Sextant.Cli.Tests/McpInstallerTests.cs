@@ -161,7 +161,7 @@ public class McpInstallerTests
         StringAssert.Contains(content, "<!-- sextant:end -->");
         StringAssert.Contains(content, "Sextant Semantic Index");
         StringAssert.Contains(content, "find_symbol");
-        StringAssert.Contains(content, "research_codebase");
+        Assert.IsFalse(content.Contains("research_codebase"), "the removed research_codebase tool is not advertised");
     }
 
     [TestMethod]
@@ -195,6 +195,33 @@ public class McpInstallerTests
     }
 
     [TestMethod]
+    public void Install_ClaudeCode_ReplacesFilesWrittenByOlderInstallers()
+    {
+        // The upgrade path for repos set up before research_codebase was removed: a reinstall rewrites the marked
+        // CLAUDE.md section, the agent and the skill, so nothing keeps pointing agents at the removed tool.
+        var claudeMdPath = Path.Combine(_tempDir, "CLAUDE.md");
+        File.WriteAllText(claudeMdPath,
+            "# My Project\n\n<!-- sextant:begin -->\n## Sextant Semantic Index\n" +
+            "- `research_codebase` — Ask natural language questions about the codebase\n" +
+            "<!-- sextant:end -->\n\n# Other Section\n");
+        var agentPath = Path.Combine(_tempDir, ".claude", "agents", "sextant-researcher.md");
+        var skillPath = Path.Combine(_tempDir, ".claude", "skills", "sextant", "SKILL.md");
+        Directory.CreateDirectory(Path.GetDirectoryName(agentPath)!);
+        Directory.CreateDirectory(Path.GetDirectoryName(skillPath)!);
+        File.WriteAllText(agentPath, "tools:\n  - mcp__sextant__research_codebase\n");
+        File.WriteAllText(skillPath, "Use the `mcp__sextant__research_codebase` tool with the user's question.\n");
+
+        McpInstaller.Install("claude-code", _tempDir, cliProjectPath: _fakeCliPath);
+
+        var claudeMd = File.ReadAllText(claudeMdPath);
+        StringAssert.StartsWith(claudeMd, "# My Project");
+        StringAssert.Contains(claudeMd, "# Other Section");
+        StringAssert.Contains(claudeMd, "find_symbol");
+        foreach (var path in new[] { claudeMdPath, agentPath, skillPath })
+            Assert.IsFalse(File.ReadAllText(path).Contains("research_codebase"), $"{path} still names research_codebase");
+    }
+
+    [TestMethod]
     public void Install_ClaudeCode_CreatesAgentFile()
     {
         McpInstaller.Install("claude-code", _tempDir, cliProjectPath: _fakeCliPath);
@@ -205,7 +232,7 @@ public class McpInstallerTests
         var content = File.ReadAllText(agentPath);
         StringAssert.Contains(content, "description:");
         StringAssert.Contains(content, "mcp__sextant__find_symbol");
-        StringAssert.Contains(content, "mcp__sextant__research_codebase");
+        Assert.IsFalse(content.Contains("research_codebase"), "the agent does not list the removed research_codebase tool");
         StringAssert.Contains(content, "Sextant semantic index");
     }
 
@@ -219,7 +246,8 @@ public class McpInstallerTests
 
         var content = File.ReadAllText(skillPath);
         StringAssert.Contains(content, "description:");
-        StringAssert.Contains(content, "mcp__sextant__research_codebase");
+        StringAssert.Contains(content, "mcp__sextant__find_references");
+        Assert.IsFalse(content.Contains("research_codebase"), "the skill routes to the typed tools, not the removed research_codebase");
     }
 
     [TestMethod]

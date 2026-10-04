@@ -7,7 +7,7 @@ This document describes potential enhancements to Sextant, prioritized by their 
 
 ## Current Capabilities
 
-Sextant provides 25 MCP tools covering the semantic navigation features found in IDEs like Visual Studio and Rider, plus cross-repository analysis and index inspection:
+Sextant provides 24 MCP tools covering the semantic navigation features found in IDEs like Visual Studio and Rider, plus cross-repository analysis and index inspection:
 
 - **Symbol lookup & discovery** — exact and fuzzy search (`find_symbol`), full-text search over names and doc comments (`semantic_search`), file symbols (`get_file_symbols`), type members (`get_type_members`), namespace browsing (`get_namespace_tree`), signature/type-constraint search (`find_by_signature`), attribute search (`find_by_attribute`), and unreferenced/dead-code detection (`find_unreferenced`)
 - **References & usages** — find all usages with grouping (by project/file/kind), read/write access classification, and inline source (`find_references`); cross-project blast radius (`get_impact`); dependent types (`get_type_dependents`)
@@ -19,7 +19,6 @@ Sextant provides 25 MCP tools covering the semantic navigation features found in
 - **Source context** — code preview around a location (`get_source_context`)
 - **Test discovery** — find tests, optionally for a specific production symbol (`find_tests`)
 - **Comment discovery** — TODO/HACK/FIXME/BUG/NOTE search (`find_comments`)
-- **Research** — natural-language Q&A over the index via LLM assist (`research_codebase`)
 - **Index inspection** — index status and enabled capabilities (`get_index_status`) and live daemon progress (`get_daemon_status`)
 
 Many search tools also accept a `scope` filter (file, project, solution, or all) for efficient monorepo workflows. See the [MCP Tools Reference](mcp-tools.md) for the full per-tool documentation.
