@@ -9,16 +9,21 @@ namespace Sextant.Mcp.Tools;
 public static class GetTypeDependentsTool
 {
     [McpServerTool(Name = "get_type_dependents"),
-     Description("Find all types that depend on a given type — through fields, properties, method parameters, return types, or inheritance.")]
+     Description("Types that depend on a type, by kind. Use instead of grepping its name.")]
     public static string GetTypeDependents(
         DatabaseProvider dbProvider,
-        [Description("Fully qualified name of the type to find dependents of")]
+        [Description("Type, fully qualified.")]
         string symbol_fqn,
-        [Description("Filter by dependency kind: 'inherits', 'implements', 'returns', 'parameter_of', 'instantiates', or 'all' (default)")]
-        string dependency_kind = "all")
+        [Description("inherits, implements, returns, parameter_of, instantiates or all.")]
+        string dependency_kind = "all",
+        [Description(ToolText.Limit)] int? limit = null,
+        [Description(ToolText.Cursor)] string? cursor = null)
     {
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
+        if (!Paging.TryBegin("get_type_dependents", limit, cursor, readContext, out var page, out var cursorError,
+                symbol_fqn, dependency_kind))
+            return cursorError;
 
         using var conn = db.OpenReadConnection();
         var symbolStore = new SymbolStore(conn) { Scope = readContext.Scope };
@@ -47,11 +52,14 @@ public static class GetTypeDependentsTool
 
         // Group relationships by containing type
         var dependentMap = new Dictionary<string, DependentInfo>();
+        // The kinds of the relationships whose source this read can see (the summary counts only these).
+        var readableKinds = new List<string>();
 
         foreach (var rel in rels)
         {
             var fromSymbol = symbolStore.GetById(rel.FromSymbolId);
             if (fromSymbol == null) continue;
+            readableKinds.Add(rel.Kind.ToString().ToLowerInvariant());
 
             var groupSymbol = ContainingType(symbolStore, namer, fromSymbol) ?? fromSymbol;
             // Key by project + symbol key so same-named types in different projects are not merged into one
@@ -82,7 +90,22 @@ public static class GetTypeDependentsTool
             });
         }
 
-        var results = dependentMap.Values.Select(d => (object)new
+        // A stable order, so a cursor resumes exactly where the previous page ended (the project-qualified key
+        // breaks a tie between one type's per-TFM rows).
+        var dependents = dependentMap
+            .OrderBy(d => d.Value.DependentType, StringComparer.Ordinal).ThenBy(d => d.Value.FilePath, StringComparer.Ordinal)
+            .ThenBy(d => d.Value.LineStart).ThenBy(d => d.Key, StringComparer.Ordinal)
+            .Select(d => d.Value)
+            .ToList();
+        object? summary = page.IsTruncatedFirstPage(dependents.Count)
+            ? new
+            {
+                ByRelationship = Paging.CountBy(readableKinds, k => k),
+                ByFile = Paging.CountBy(dependents, d => d.FilePath)
+            }
+            : null;
+
+        var results = page.Slice(dependents).Select(d => (object)new
         {
             dependent_type = d.DependentType,
             display_name = d.DisplayName,
@@ -92,11 +115,12 @@ public static class GetTypeDependentsTool
             relationships = d.Relationships
         }).ToList();
 
-        var empty = results.Count == 0
+        var empty = dependents.Count == 0
             ? $"No indexed type depends on {SymbolResolver.Describe(namer, targetSymbol)}" +
               (kindFilter is null ? "." : $" through '{dependency_kind!.Trim()}'.")
             : null;
-        return ResponseBuilder.Build(results, targetSymbol.LastIndexedAt, lookup.Ambiguity, readContext.Provenance,
+        return ResponseBuilder.BuildPage(results, dependents.Count, page, targetSymbol.LastIndexedAt, lookup.Ambiguity,
+            readContext.Provenance, summary,
             message: ResponseBuilder.JoinMessages(SymbolResolver.ResolutionNote(symbolStore, lookup), empty));
     }
 

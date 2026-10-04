@@ -8,19 +8,19 @@ namespace Sextant.Mcp.Tools;
 public static class FindCommentsTool
 {
     [McpServerTool(Name = "find_comments"),
-     Description("Find TODO, HACK, FIXME, BUG, and NOTE comments in the codebase.")]
+     Description("TODO, HACK, FIXME, BUG and NOTE comments with their symbol. Use instead of grepping tags.")]
     public static string FindComments(
         DatabaseProvider dbProvider,
-        [Description("Filter by tag: 'TODO', 'HACK', 'FIXME', 'BUG', 'NOTE', or 'all' (default)")]
+        [Description("TODO, HACK, FIXME, BUG, NOTE or all.")]
         string tag = "all",
-        [Description("Search within comment text")]
+        [Description("Text to match.")]
         string? search = null,
-        [Description("Optional project canonical ID filter")]
+        [Description(ToolText.ProjectId)]
         string? project_id = null,
-        [Description("FQN of enclosing symbol — find comments within a specific method/class")]
+        [Description("Enclosing method or type.")]
         string? in_symbol = null,
-        [Description("Maximum results (default 50)")]
-        int max_results = 50)
+        [Description(ToolText.Limit)] int? limit = null,
+        [Description(ToolText.Cursor)] string? cursor = null)
     {
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
@@ -28,6 +28,9 @@ public static class FindCommentsTool
         if (!CapabilityGate.Ensure(db, Core.IndexFeature.Comments, "comments", out var unavailable,
                 readContext.SelectedSnapshotId, dbProvider.Authorizer.IsEnforcing))
             return unavailable;
+        if (!Paging.TryBegin("find_comments", limit, cursor, readContext, out var page, out var cursorError,
+                tag, search, project_id, in_symbol))
+            return cursorError;
 
         using var conn = db.OpenReadConnection();
         var snapshotScope = readContext.Scope;
@@ -85,10 +88,20 @@ public static class FindCommentsTool
         if (tagName != null && (search != null || in_symbol != null))
             comments = comments.Where(c => c.Tag.Equals(tagName, StringComparison.OrdinalIgnoreCase)).ToList();
 
-        comments = comments.Take(max_results).ToList();
+        comments = comments
+            .OrderBy(c => c.FilePath, StringComparer.Ordinal).ThenBy(c => c.Line).ThenBy(c => c.Id)
+            .ToList();
 
         var canonicalIdCache = FindSymbolTool.BuildCanonicalIdCache(projectStore);
-        var results = comments.Select(c =>
+        object? summary = page.IsTruncatedFirstPage(comments.Count)
+            ? new
+            {
+                ByTag = Paging.CountBy(comments, c => c.Tag),
+                ByFile = Paging.CountBy(comments, c => c.FilePath)
+            }
+            : null;
+
+        var results = page.Slice(comments).Select(c =>
         {
             string? enclosingSymbolFqn = null;
             if (c.EnclosingSymbolId.HasValue)
@@ -109,7 +122,8 @@ public static class FindCommentsTool
         }).ToList();
 
         var freshness = comments.Count > 0 ? comments.Min(c => c.LastIndexedAt) : 0;
-        return ResponseBuilder.Build(results, freshness, ambiguity, readContext.Provenance, message: note);
+        return ResponseBuilder.BuildPage(results, comments.Count, page, freshness, ambiguity, readContext.Provenance, summary,
+            message: note);
     }
 
     private static readonly string[] KnownTags = ["TODO", "HACK", "FIXME", "BUG", "NOTE", "UNDONE"];

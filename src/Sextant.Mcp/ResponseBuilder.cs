@@ -41,6 +41,42 @@ public static class ResponseBuilder
     }
 
     /// <summary>
+    /// Builds one page of a bounded result (<see cref="Paging"/>): <paramref name="results"/> are this page's
+    /// rows (already sliced and mapped), <paramref name="total"/> the size of the whole result. <c>meta.total</c>
+    /// is always present, <c>meta.next_cursor</c> only when rows remain, and <paramref name="summary"/> (counts
+    /// per file/project/…, set by the tool on a truncated first page) comes BEFORE the rows so an agent can
+    /// narrow the query instead of paging. <c>meta.result_count</c> is the number of rows on this page.
+    /// <paramref name="message"/> is an explicit statement about a valid answer, as in <see cref="Build{T}"/>.
+    /// </summary>
+    public static string BuildPage<T>(
+        List<T> results, int total, PageRequest page, long? indexFreshness = null, SymbolAmbiguity? ambiguity = null,
+        SnapshotProvenance? provenance = null, object? summary = null, int? resultCount = null, string? message = null)
+    {
+        var response = new
+        {
+            Meta = new MetaObject
+            {
+                QueriedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                IndexFreshness = indexFreshness ?? 0,
+                ResultCount = resultCount ?? results.Count,
+                Total = total,
+                Ambiguous = ambiguity != null ? true : null,
+                AmbiguousMatchCount = ambiguity?.Candidates.Count,
+                SelectedProjectId = ambiguity?.SelectedProjectId,
+                SelectedSymbolKey = ambiguity?.SelectedSymbolKey,
+                Candidates = ambiguity?.Candidates,
+                Snapshot = SnapshotMeta.From(provenance),
+                NextCursor = page.NextCursor(total)
+            },
+            Summary = summary,
+            Results = results,
+            Message = message
+        };
+
+        return JsonSerializer.Serialize(response, JsonOptions);
+    }
+
+    /// <summary>
     /// Builds an index-status response (Phase 8) — the standard results/meta envelope plus a top-level
     /// <c>index</c> object describing the active profile, its enabled feature capabilities, and retained
     /// storage. Serialized with the same snake_case policy as every other response.
@@ -393,6 +429,10 @@ public sealed class MetaObject
 
     [JsonPropertyName("result_count")]
     public int ResultCount { get; set; }
+
+    /// <summary>The size of the whole result of a paged tool (<see cref="Paging"/>); omitted by unpaged tools.</summary>
+    [JsonPropertyName("total")]
+    public int? Total { get; set; }
 
     [JsonPropertyName("ambiguous")]
     public bool? Ambiguous { get; set; }

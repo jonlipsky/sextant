@@ -7,11 +7,11 @@ namespace Sextant.Mcp.Tools;
 [McpServerToolType]
 public static class GetProjectDependenciesTool
 {
-    [McpServerTool(Name = "get_project_dependencies"), Description("Get the project dependency graph (direct and transitive). Use to understand solution architecture and project relationships.")]
+    [McpServerTool(Name = "get_project_dependencies"), Description("Project references, direct or transitive. Use instead of reading .csproj files.")]
     public static string GetProjectDependencies(
         DatabaseProvider dbProvider,
-        [Description("Canonical ID of the project")] string project_id,
-        [Description("Include transitive dependencies (default: false)")] bool transitive = false)
+        [Description("canonical_id from get_index_status.")] string project_id,
+        bool transitive = false)
     {
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;

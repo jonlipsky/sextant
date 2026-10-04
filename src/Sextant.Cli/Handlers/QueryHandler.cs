@@ -75,6 +75,13 @@ internal static class QueryHandler
 
     private static bool HasFlag(string[] args, string flag) => args.Contains(flag);
 
+    // --limit N / --cursor C page the large-result tools (meta.next_cursor continues; meta.total is the full count).
+    internal static int? GetLimit(string[] args) =>
+        GetOption(args, "--limit") is not { } value ? null
+        : int.TryParse(value, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var limit) && limit > 0
+            ? limit
+            : throw new ArgumentException("--limit must be a positive integer.");
+
     // Returns an actionable rebuild message when the resolved database exists but cannot be served as a
     // complete index (older/incompatible schema, or a compact schema not yet re-populated by a full
     // run). Returns null when the index is servable, or when the file is simply absent — in that case
@@ -97,13 +104,13 @@ internal static class QueryHandler
     }
 
     private static string RunFindReferences(Mcp.DatabaseProvider db, string[] args)
-        => Mcp.Tools.FindReferencesTool.FindReferences(db, GetArg(args, 0, "<symbol-fqn>"));
+        => Mcp.Tools.FindReferencesTool.FindReferences(db, GetArg(args, 0, "<symbol-fqn>"), limit: GetLimit(args), cursor: GetOption(args, "--cursor"));
 
     private static string RunGetTypeMembers(Mcp.DatabaseProvider db, string[] args)
         => Mcp.Tools.GetTypeMembersTool.GetTypeMembers(db, GetArg(args, 0, "<symbol-fqn>"));
 
     private static string RunGetFileSymbols(Mcp.DatabaseProvider db, string[] args)
-        => Mcp.Tools.GetFileSymbolsTool.GetFileSymbols(db, GetArg(args, 0, "<file-path>"));
+        => Mcp.Tools.GetFileSymbolsTool.GetFileSymbols(db, GetArg(args, 0, "<file-path>"), limit: GetLimit(args), cursor: GetOption(args, "--cursor"));
 
     private static string RunGetCallHierarchy(Mcp.DatabaseProvider db, string[] args, Core.SextantConfiguration config)
     {
@@ -111,11 +118,11 @@ internal static class QueryHandler
         var direction = GetOption(args, "--direction") ?? "callees";
         var depthStr = GetOption(args, "--depth");
         var depth = depthStr != null ? int.Parse(depthStr) : config.MaxCallHierarchyDepth;
-        return Mcp.Tools.GetCallHierarchyTool.GetCallHierarchy(db, fqn, direction, depth);
+        return Mcp.Tools.GetCallHierarchyTool.GetCallHierarchy(db, fqn, direction, depth, limit: GetLimit(args), cursor: GetOption(args, "--cursor"));
     }
 
     private static string RunGetImplementors(Mcp.DatabaseProvider db, string[] args)
-        => Mcp.Tools.GetImplementorsTool.GetImplementors(db, GetArg(args, 0, "<symbol-fqn>"));
+        => Mcp.Tools.GetImplementorsTool.GetImplementors(db, GetArg(args, 0, "<symbol-fqn>"), limit: GetLimit(args), cursor: GetOption(args, "--cursor"));
 
     private static string RunGetTypeHierarchy(Mcp.DatabaseProvider db, string[] args)
     {
@@ -141,13 +148,13 @@ internal static class QueryHandler
     }
 
     private static string RunGetImpact(Mcp.DatabaseProvider db, string[] args)
-        => Mcp.Tools.GetImpactTool.GetImpact(db, GetArg(args, 0, "<symbol-fqn>"));
+        => Mcp.Tools.GetImpactTool.GetImpact(db, GetArg(args, 0, "<symbol-fqn>"), limit: GetLimit(args), cursor: GetOption(args, "--cursor"));
 
     private static string RunGetApiSurface(Mcp.DatabaseProvider db, string[] args)
     {
         var projectId = GetArg(args, 0, "<project-id>");
         var diff = GetOption(args, "--diff");
-        return Mcp.Tools.GetApiSurfaceTool.GetApiSurface(db, projectId, diff);
+        return Mcp.Tools.GetApiSurfaceTool.GetApiSurface(db, projectId, diff, limit: GetLimit(args), cursor: GetOption(args, "--cursor"));
     }
 
     private static string RunGetIndexStatus(Mcp.DatabaseProvider db)
@@ -159,6 +166,7 @@ internal static class QueryHandler
         var projectId = GetOption(args, "--project");
         var includeTests = HasFlag(args, "--include-tests");
         var accessibility = GetOption(args, "--accessibility");
-        return Mcp.Tools.FindUnreferencedTool.FindUnreferenced(db, kind, projectId, !includeTests, accessibility);
+        return Mcp.Tools.FindUnreferencedTool.FindUnreferenced(db, kind, projectId, !includeTests, accessibility,
+            limit: GetLimit(args), cursor: GetOption(args, "--cursor"));
     }
 }

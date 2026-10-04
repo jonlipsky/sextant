@@ -8,20 +8,26 @@ namespace Sextant.Mcp.Tools;
 [McpServerToolType]
 public static class FindReferencesTool
 {
-    [McpServerTool(Name = "find_references"), Description("Find all usages of a symbol across the entire solution instantly. More accurate than text search — uses Roslyn semantic analysis.")]
+
+    [McpServerTool(Name = "find_references"), Description("Every use of a symbol. Use instead of grep: no false matches from comments, strings or namesakes.")]
     public static string FindReferences(
         DatabaseProvider dbProvider,
-        [Description("The fully qualified name of the symbol")] string symbol_fqn,
-        [Description("Comma-separated canonical IDs to filter results to specific projects")] string? include_projects = null,
-        [Description("Group results by: 'project', 'file', 'kind', or comma-separated combination (e.g. 'project,file'). Default: flat list.")] string? group_by = null,
-        [Description("Include source code lines around each reference")] bool include_source = false,
-        [Description("Scope filter: 'file:/path', 'project:canonical_id', 'solution:/path', or 'all'")] string? scope = null,
-        [Description("Filter by access kind: 'read', 'write', 'readwrite', or null for all")] string? access_kind = null,
-        [Description("Federation partition (Phase 11 diagnostic): 'federated' (default, overlay over base), 'base_only', or 'overlay_only'")] string? federation = null)
+        [Description(ToolText.SymbolFqn)] string symbol_fqn,
+        [Description("Comma-separated canonical_ids")] string? include_projects = null,
+        [Description("project, file and/or kind, e.g. project,file.")] string? group_by = null,
+        bool include_source = false,
+        [Description(ToolText.Scope)] string? scope = null,
+        [Description("read, write or readwrite.")] string? access_kind = null,
+        [Description(ToolText.Federation)] string? federation = null,
+        [Description(ToolText.Limit)] int? limit = null,
+        [Description(ToolText.Cursor)] string? cursor = null)
     {
         var mode = FederationModes.Parse(federation);
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError, mode))
             return authError;
+        if (!Paging.TryBegin("find_references", limit, cursor, readContext, out var page, out var cursorError,
+                symbol_fqn, include_projects, group_by, include_source, scope, access_kind, federation))
+            return cursorError;
 
         using var conn = db.OpenReadConnection();
         var snapshotScope = readContext.Scope;
@@ -63,7 +69,7 @@ public static class FindReferencesTool
         }
 
         // An unknown project/solution or an unrecognized scope is an error, never a silently unfiltered query.
-        var scopeFilter = ScopeResolver.Resolve(scope, conn, readContext.Scope);
+        var scopeFilter = ScopeResolver.Resolve(scope, conn, readContext.Scope, readContext.Paths);
         if (scopeFilter.Error != null)
             return scopeFilter.ErrorResponse(readContext.Provenance);
 
@@ -75,7 +81,7 @@ public static class FindReferencesTool
         if (!scopeFilter.IsEmpty)
         {
             if (scopeFilter.FilePath != null)
-                refs = refs.Where(r => r.FilePath == scopeFilter.FilePath).ToList();
+                refs = refs.Where(r => scopeFilter.MatchesFile(r.FilePath)).ToList();
             else if (scopeFilter.ProjectIds != null)
                 refs = refs.Where(r => scopeFilter.ProjectIds.Contains(r.InProjectId)).ToList();
         }
@@ -90,8 +96,22 @@ public static class FindReferencesTool
                 ? $"No references to {SymbolResolver.Describe(namer, symbol)} were found{(filtered ? " with the given filters" : string.Empty)}."
                 : null);
 
+        // A stable order, so a cursor resumes exactly where the previous page ended.
+        refs = refs.OrderBy(r => r.FilePath, StringComparer.Ordinal).ThenBy(r => r.Line)
+            .ThenBy(r => r.InProjectId).ThenBy(r => r.Id).ToList();
+
         var canonicalIdCache = FindSymbolTool.BuildCanonicalIdCache(projectStore);
-        var mapped = refs.Select(r =>
+        object? summary = page.IsTruncatedFirstPage(refs.Count)
+            ? new
+            {
+                ByProject = Paging.CountBy(refs, r => FindSymbolTool.ResolveCanonicalId(r.InProjectId, canonicalIdCache)),
+                ByFile = Paging.CountBy(refs, r => r.FilePath)
+            }
+            : null;
+
+        // Only this page's rows are mapped, so snippets are read for at most `limit` references.
+        var pageRefs = page.Slice(refs);
+        var mapped = pageRefs.Select(r =>
         {
             var result = new Dictionary<string, object?>
             {
@@ -112,11 +132,11 @@ public static class FindReferencesTool
         if (!string.IsNullOrEmpty(group_by))
         {
             var groups = group_by.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
-            var grouped = GroupReferences(mapped, groups);
-            return ResponseBuilder.Build(grouped, symbol.LastIndexedAt, lookup.Ambiguity, readContext.Provenance, message: message);
+            mapped = GroupReferences(mapped, groups);
         }
 
-        return ResponseBuilder.Build(mapped, symbol.LastIndexedAt, lookup.Ambiguity, readContext.Provenance, message: message);
+        return ResponseBuilder.BuildPage(mapped, refs.Count, page, symbol.LastIndexedAt, lookup.Ambiguity,
+            readContext.Provenance, summary, resultCount: pageRefs.Count, message: message);
     }
 
     private static List<object> GroupReferences(List<object> refs, string[] groupKeys)

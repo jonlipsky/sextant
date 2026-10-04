@@ -100,7 +100,11 @@ public static class ServiceApp
                 RepositorySelectedImplicitly = RepositorySelectedImplicitlyAccessor(http, service),
                 RepositoryRequiredGuidance = RepositoryRequiredGuidanceAccessor(http, service, options.RepositoryUrlPolicy),
                 RequestedBranch = RequestedBranchAccessor(http),
-                RequireRepositorySelection = RepositorySelectionRequirement(options, CallerAssertionGate.CallerPrincipalAccessor(http))
+                RequireRepositorySelection = RepositorySelectionRequirement(options, CallerAssertionGate.CallerPrincipalAccessor(http)),
+                // Issue #145: refuse absolute path inputs and record each admitted read for the output pass
+                // (RemoteOutputFilter), which makes paths repository-relative and the snapshot meta lean.
+                RemoteSurface = true,
+                ReadAdmitted = context => RemoteOutputFilter.Record(http.HttpContext, context)
             };
         });
         // Explicit ALLOWLIST for the remote HTTP MCP surface (hardening review, criterion 1): register ONLY
@@ -123,7 +127,7 @@ public static class ServiceApp
         // proxy-client tests in ServiceHttpTests pin both client shapes. The auth/scope middleware runs
         // per-POST on the /mcp path BEFORE MapMcp, so it is unaffected; the local stdio server
         // (McpServerSetup) is a separate path and stays stateful/unchanged.
-        builder.Services.AddMcpServer()
+        builder.Services.AddMcpServer(server => server.ServerInstructions = ServerInstructions)
             .WithHttpTransport(transport => transport.Stateless = true)
             // Cast to IEnumerable<Type> is REQUIRED: RemoteQueryTools is typed IReadOnlyList<Type>, and a
             // bare `.WithTools(RemoteQueryTools)` binds to the generic overload
@@ -141,16 +145,34 @@ public static class ServiceApp
             // verified caller is answered before its arguments are even read.
             .WithRequestFilters(filters => filters
                 .AddCallToolFilter(CallerAssertionGate.CallToolFilter())
+                // Issue #145: the first list filter, so it runs outermost and compacts every other filter's output.
+                .AddListToolsFilter(ToolSchemaCompaction.ListToolsFilter())
                 .AddListToolsFilter(ToolSelectionFilters.ListToolsFilter(
                     options.RepositoryUrlPolicy, RepositoryScopedTools,
                     selectionRequired: options.RequireRepositorySelection,
                     implicitSelection: options.DelegateTokens.Count > 0))
                 .AddListToolsFilter(SearchSymbolsTool.ListToolsFilter())
                 .AddCallToolFilter(ToolSelectionFilters.CallToolFilter(options.RepositoryUrlPolicy, RepositoryScopedTools))
-                // Innermost: a tool result carrying a structured meta.error is an MCP tool error (isError: true),
-                // so a client never mistakes a failed call for an empty answer (issue #163).
-                .AddCallToolFilter(ToolErrorResults.CallToolFilter()));
+                // A tool result carrying a structured meta.error is an MCP tool error (isError: true), so a client
+                // never mistakes a failed call for an empty answer (issue #163). It reads the presented text below,
+                // which keeps meta.error.
+                .AddCallToolFilter(ToolErrorResults.CallToolFilter())
+                // Issue #145: added LAST, so it wraps the tool itself and presents its result (repository-relative
+                // paths, lean snapshot meta) after the selection filter has recorded the call's repository.
+                .AddCallToolFilter(RemoteOutputFilter.CallToolFilter()));
     }
+
+    /// <summary>
+    /// The server's <c>instructions</c> (returned by <c>initialize</c>): when to reach for these tools and how to
+    /// call them. Kept short (pinned by a test), because a client may put it in every prompt.
+    /// </summary>
+    internal const string ServerInstructions =
+        "Sextant answers .NET code questions from a Roslyn index. Use it instead of grep or reading files " +
+        "to find symbols, references, callers, implementations, tests and attributes. Pass `repository` " +
+        "(owner/repo or host/owner/repo) on each call; list_repositories shows what you can read, and search_symbols searches all of " +
+        "them by name. Paths are repository-relative (src/App/Foo.cs). Large results are paged: read meta.total " +
+        "and the summary, narrow with scope (file:, project:, solution:) or pass meta.next_cursor " +
+        "(search_symbols: next_cursor). A meta.snapshot.warning means results may be incomplete.";
 
     /// <summary>
     /// The vetted tool types exposed over the remote HTTP MCP surface. Every index-query tool takes a

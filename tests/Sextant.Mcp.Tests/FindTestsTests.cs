@@ -69,9 +69,9 @@ public class FindTestsTests
     }
 
     [TestMethod]
-    public void FindTests_MaxResults_IsRespected()
+    public void FindTests_Limit_IsRespected()
     {
-        var result = FindTestsTool.FindTests(_fixture.DbProvider, max_results: 1);
+        var result = FindTestsTool.FindTests(_fixture.DbProvider, limit: 1);
         var doc = JsonDocument.Parse(result);
         var results = doc.RootElement.GetProperty("results");
         Assert.IsTrue(results.GetArrayLength() <= 1);

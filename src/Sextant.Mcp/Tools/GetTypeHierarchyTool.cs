@@ -8,11 +8,11 @@ namespace Sextant.Mcp.Tools;
 [McpServerToolType]
 public static class GetTypeHierarchyTool
 {
-    [McpServerTool(Name = "get_type_hierarchy"), Description("Get the full inheritance chain (base types and/or derived types) for a type. Resolves across projects instantly.")]
+    [McpServerTool(Name = "get_type_hierarchy"), Description("Base and/or derived types. Use instead of grepping for : Base.")]
     public static string GetTypeHierarchy(
         DatabaseProvider dbProvider,
-        [Description("The fully qualified name of the type")] string symbol_fqn,
-        [Description("Direction: 'up' (base types), 'down' (derived types), or 'both'")] string direction = "both")
+        [Description("Type, fully qualified.")] string symbol_fqn,
+        [Description("up, down or both.")] string direction = "both")
     {
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
