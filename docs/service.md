@@ -754,7 +754,7 @@ The host deliberately **separates control endpoints from query endpoints**, and 
 | `POST /control/ensure` | control | control token | Idempotent ensure-snapshot (criterion 1). Accepts an optional monotonic `branch_head_sequence` for forward-only branch-head advance (Phase 14, issue #84), **or** an `expected_head_commit` head CAS, plus `forced` and `branch_update` (see [Branch-pointer guards](#branch-pointer-guards-head-cas-branch_update-none-retire-svc-67)); the result carries `branch_advanced`. Blocks until terminal (`200`; `202` when transient-requeued) unless `?wait=false`, which returns `202` at once with the job to poll (issue #148). When that registration is still waiting for the writer after `CONTROL_WRITE_WAIT_SECONDS` (another identity is producing), it returns `202 {"job_id":<integer>,"identity_hash":…,"status":"queued","attached":…}` with the id the job is (or will be) registered under, which `/control/status/{job_id}` resolves at once (issue #158, see [Queued control writes](#queued-control-writes-issue-158)). A caller disconnect/timeout **never** cancels production. A repository URL the [repository URL policy](#repository-url-policy-svc-5) refuses, both branch guards together (`conflicting_branch_guards`) or an unknown `branch_update` (`invalid_branch_update`) is `400 {"status":"rejected","reason":"<code>"}` before any job exists (audited `ensure`/`denied`). A user caller (`act=user` assertion) may ensure only a repository it can read: otherwise `403 {"status":"rejected","reason":"not_granted"}` (SVC-4), whatever the body asks. A user caller's ensure is then bounded (SX-6d, see [User callers on the control plane](#user-callers-on-the-control-plane-issue-193)): `default_branch: true`, any `branch_head_sequence`, or an advance with no `expected_head_commit` or no `branch_name` is `400` (`default_branch_not_allowed`, `branch_head_sequence_not_allowed`, `branch_guard_required`, `branch_required`). |
 | `POST /control/contribute` | control | control **or** contribute token | Ingest a client/CI semantic contribution (Phase 16); the least-privilege contribute token authorizes this endpoint only. |
 | `GET /control/status/{jobId}` | control | control token | Job status + per-project diagnostics (criterion 5) + checkout `coverage` (#119). For a user caller, a job on a repository it cannot read is the same `404` as an unknown id (SVC-4). |
-| `GET /control/resolve` | control | control token | Resolve a repository branch (`?branch=`, else the default) to its current published snapshot (+ its `coverage`, #119), plus `commit_sha`, the resolved `branch` name, `is_default` and `head_sequence` (SVC-7; a null `commit_sha`/`head_sequence` is omitted), and `current_identity_hash` + `identity_current`: whether the snapshot is what an ensure of its commit would build on this node now (both omitted when there is no `commit_sha`; see [Identity currency](#branch-pointer-guards-head-cas-branch_update-none-retire-svc-67)). For a user caller, a repository it cannot read is the same bare `404` as an absent one (SVC-4). |
+| `GET /control/resolve` | control | control token | Resolve a repository branch (`?branch=`, else the default) to its current published snapshot (+ its `coverage`, #119), plus `commit_sha`, the resolved `branch` name, `is_default` and `head_sequence` (SVC-7; a null `commit_sha`/`head_sequence` is omitted), and `current_identity_hash` + `identity_current`: whether the snapshot is what an ensure of its commit would build on this node now (both omitted when there is no `commit_sha` or the head is a contribution; see [Identity currency](#branch-pointer-guards-head-cas-branch_update-none-retire-svc-67)). For a user caller, a repository it cannot read is the same bare `404` as an absent one (SVC-4). |
 | `POST /control/branches/retire` | control | control token | Delete a branch pointer (`{repository, branch, expected_head_commit?}`, SVC-6); its snapshots stay for retention. `200 {"retired":true}`, or `{"retired":false}` for a missing branch (idempotent). The default branch or a head-CAS mismatch is `409 {"status":"rejected","reason":"default_branch"\|"head_mismatch"}`; a refused URL or blank branch is `400`. When the retirement has not applied within `CONTROL_WRITE_WAIT_SECONDS` (a production holds the writer), the answer is `202 {"status":"accepted"}`: it applies once the writer frees, with both guards evaluated then (issue #158, see [Queued control writes](#queued-control-writes-issue-158)). `503 {"status":"unavailable"}` once shutdown began (nothing queued). Audited `retire`. A user caller is refused with `403 {"error":"caller_not_allowed"}` (issue #193, see [User callers on the control plane](#user-callers-on-the-control-plane-issue-193)). |
 | `POST /control/retention` | control | control token | Run the service-owned retention/GC pass (`?execute=true` to apply). A user caller is refused (`403 caller_not_allowed`). |
 | `PUT`/`DELETE`/`GET /control/grants/self` | control | control token + `act=user` assertion | The caller's own repository grants (see [Repository grants](#repository-grants-and-visibility-svc-4)). |
@@ -1477,7 +1477,7 @@ also returns, next to the row's own `identity_hash`:
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `current_identity_hash` | string | The identity hash an ensure of the head's commit would compute on this node **now**: no `config_hash` (the node's default profile), no tree sha, no capability override, and the node's present schema, analyzer, toolchain, capability, SDK-pin and restore components. |
-| `identity_current` | bool | `identity_hash == current_identity_hash`. `false` means an ensure of the same commit builds a new snapshot. |
+| `identity_current` | bool | `identity_hash == current_identity_hash`. `false` means the head is not the identity an ensure of its commit builds now. |
 
 The identity also folds the raw repository URL spelling, and one repository is ensured under several (a push
 sends GitHub's `clone_url`, `…/repo.git`; a reconcile sends the grant's stored spelling). A spelling variant
@@ -1485,18 +1485,26 @@ alone is never stale: `current_identity_hash` is computed under the spelling of 
 (its job row), of the resolve request's `repository`, and of the catalog's repository row, and the first that
 reproduces the snapshot's `identity_hash` is returned (`identity_current: true`). When none does, it is the hash
 under the request's spelling, which is exactly the `identity_hash` the caller's own ensure of `commit_sha` will
-produce. A snapshot whose identity no service ensure reproduces (an overlay, a contribution built under
-another configuration) reads as not current.
+produce. A head built by an ensure that sent a `config_hash` or `tree_sha` reads as not current, since the
+default ensure builds another snapshot.
 
-Both fields are **omitted together, never `null`**, when the head records no commit (`commit_sha` is absent), so
-a client treats an absent `identity_current` as current, which is also what an older service implies. The
-fields are additive: old clients ignore them. A stale head after an upgrade (hashes shortened):
+Both fields are **omitted together, never `null`**, when currency is not reported, so a client treats an absent
+`identity_current` as current, which is also what an older service implies:
+
+- the head records no commit (`commit_sha` is absent);
+- the head was assembled from client contributions (`POST /control/contribute`). A contribution carries its
+  contributor's identity (its own tree sha, no toolchain), which no service ensure reproduces, and rebuilding
+  it on the server could replace client-built projects (say, Windows-only ones) with a narrower snapshot. Its
+  contributor refreshes it.
+
+The fields are additive: old clients ignore them. A head left behind by an upgrade from analyzer `"4"` and schema
+24 (hashes shortened):
 
 ```json
 {
   "id": 41, "repository_id": 3, "commit_id": 17, "run_id": 41,
   "identity_hash": "e722df68…",
-  "schema_version": 26, "analyzer_version": "5", "config_hash": "f421bf15…", "toolchain_fingerprint": "5c794fa4…",
+  "schema_version": 24, "analyzer_version": "4", "config_hash": "f421bf15…", "toolchain_fingerprint": "5c794fa4…",
   "status": "complete", "created_at": 1791178954837, "published_at": 1791178954849,
   "is_overlay": false, "is_provider": false,
   "commit_sha": "0123456789abcdef0123456789abcdef01234567",
@@ -1511,8 +1519,11 @@ To refresh a stale branch, ensure the same head with a CAS on it: `commit_sha` a
 expected value), the worker builds the new identity, and on publish the branch moves to the new snapshot (the
 previous one is superseded unless another branch still points at it, #128); resolve then reports
 `identity_current: true` with the new `id`, and queries serve the new snapshot. A repeat of that ensure is a
-reuse (`branch_advanced: false`), never a re-index. If the new identity's job fails, the field stays `false`, so
-a reconciler retries it on its next pass like any failed ensure.
+reuse (`branch_advanced: false`), never a re-index. Like any ensure, it attaches to a recorded terminal job of
+the same identity: if the current identity's job already ended `failed` or `unsupported`, the ensure returns that
+result without rebuilding, and `identity_current` stays `false` until the commit or the node's identity changes.
+A reconciler should treat that result as settled for the pass rather than retry it in a loop (a `failed` job
+needs a fix, a new commit, or an identity change).
 
 The local CLI/daemon path never sets these guards (`SnapshotContext.ExpectedHeadCommit` and
 `SuppressBranchUpdate` stay null), so its branch state is byte-identical.
@@ -1937,7 +1948,7 @@ reuse and provider coverage (#162): `NullSequenceReusePointerTests`, `EnsureNull
 `ServiceHttpTests` direct-ensure-reusing-a-provider test. Identity currency on `/control/resolve`:
 `ResolveIdentityCurrencyHttpTests` (a policy flip and a simulated analyzer/schema upgrade each read as stale, a
 same-commit CAS ensure re-points the branch through the real orchestrator and `/mcp` serves the new snapshot, a
-URL spelling variant is never stale, and both fields are omitted for a head with no commit). Submodule
+URL spelling variant is never stale, and both fields are omitted for a head with no commit or a contributed head). Submodule
 provisioning (#125): `CloningCheckoutProviderSubmoduleTests` (local `file://` fixtures, no network:
 absolute/relative/nested pins, unfetchable → partial with reasons, sentinel-token non-persistence across every
 git dir, pre-change cache upgrade, transient failure retried then degraded on the final attempt),

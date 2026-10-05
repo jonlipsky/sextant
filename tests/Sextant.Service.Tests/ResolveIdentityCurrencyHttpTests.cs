@@ -242,6 +242,28 @@ public class ResolveIdentityCurrencyHttpTests
             head.GetProperty("identity_hash").GetString()!), "the snapshot has no job row");
     }
 
+    [TestMethod]
+    public async Task AContributedHead_OmitsBothFields()
+    {
+        // A head assembled from client contributions carries the contributor's identity (its own tree sha, no
+        // toolchain), which no service ensure reproduces, so the strict comparison would read it as stale forever and
+        // a reconciler would replace it with a server build. Its currency is left to its contributor: not reported.
+        await using var host = await Host.StartAsync(_db, Options(packageRestore: true), _root);
+        var artifact = ContributionTestFixtures.BuildArtifact(
+            Repo, Commit, "win-x64|net8.0-windows|sdk-8.0.400", [new PayloadProjectSpec("src/Win/Win.csproj", "net8.0-windows")]);
+        var contributed = await host.Service.IngestContributionAsync(new IngestContributionRequest
+        {
+            Artifact = artifact.ToArray(), Finalize = true, BranchName = "main", IsDefaultBranch = true
+        });
+        Assert.AreEqual(ContributionIngestStatus.Complete, contributed.Status, contributed.Message);
+
+        var head = await host.ResolveAsync(Repo);
+        Assert.AreEqual(contributed.SnapshotId, head.GetProperty("id").GetInt64());
+        Assert.AreEqual(Commit, head.GetProperty("commit_sha").GetString(), "the head records its commit");
+        Assert.IsFalse(head.TryGetProperty("identity_current", out _), head.ToString());
+        Assert.IsFalse(head.TryGetProperty("current_identity_hash", out _), head.ToString());
+    }
+
     private const string SymbolNotFound = ResponseBuilder.SymbolNotFoundCode;
 
     // The service's default profile (the worker's orchestrator stamps its configuration hash), with or without
@@ -268,8 +290,8 @@ public class ResolveIdentityCurrencyHttpTests
     {
         public HttpClient Client { get; private init; } = null!;
         public FakeSnapshotWorker Worker { get; private init; } = null!;
+        public SnapshotService Service { get; private init; } = null!;
         private WebApplication App { get; init; } = null!;
-        private SnapshotService Service { get; init; } = null!;
 
         // A service + HTTP host over the shared catalog; its worker runs the real orchestrator under the node's
         // restore policy (the published identity must equal the requested one). Disposing it releases the writer

@@ -103,6 +103,18 @@ public sealed class ContributionStore(SqliteConnection connection)
         return cmd.ExecuteScalar() is not null;
     }
 
+    /// <summary>
+    /// True when any accepted contribution fed <paramref name="snapshotId"/>: the snapshot was assembled from
+    /// client/CI contributions under the contributors' own identity, never built by a service ensure.
+    /// </summary>
+    public bool HasContributions(long snapshotId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT 1 FROM snapshot_contributions WHERE snapshot_id = @s LIMIT 1;";
+        cmd.Parameters.AddWithValue("@s", snapshotId);
+        return cmd.ExecuteScalar() is not null;
+    }
+
     private const string Select = """
         SELECT id, snapshot_id, content_hash, tenant, repository_url, commit_sha, capability_fingerprint,
                producer, toolchain_fingerprint, manifest_hash, created_at
