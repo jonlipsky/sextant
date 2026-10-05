@@ -51,7 +51,8 @@ public class SearchSymbolsCostTests
         var identity = ServiceTestFixtures.Request().ToIdentity();
 
         Assert.AreEqual(IndexDatabase.SnapshotSchemaVersion, identity.SchemaVersion);
-        Assert.IsTrue(identity.SchemaVersion < IndexDatabase.LatestSchemaVersion, "025 is identity-neutral");
+        Assert.IsTrue(IndexDatabase.IdentityNeutralMigrations.Contains(25), "025 is identity-neutral");
+        Assert.AreNotEqual(25, identity.SchemaVersion, "so the identity never folds 25");
     }
 
     // ==== query plans ===============================================================================

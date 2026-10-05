@@ -53,48 +53,31 @@ public static class FindBySignatureTool
                 .SelectMany(k => symbolStore.SearchBySignature(return_type, parameter_type, k.ToString(), projectDbId, int.MaxValue))
                 .ToList();
 
-        // Post-filter by parameter count if specified
-        if (parameter_count != null)
-        {
-            results = results.Where(s =>
-            {
-                var sig = s.Signature ?? "";
-                var parenStart = sig.IndexOf('(');
-                var parenEnd = sig.LastIndexOf(')');
-                if (parenStart < 0 || parenEnd < 0) return parameter_count == 0;
-                var paramSection = sig[(parenStart + 1)..parenEnd].Trim();
-                if (string.IsNullOrEmpty(paramSection)) return parameter_count == 0;
-                return CountParameters(paramSection) == parameter_count;
-            }).ToList();
-        }
-
+        // The store's text match is only a prefilter: the parsed signature decides, so a return type is matched
+        // against the return type alone and a parameter type never against a parameter name or default value.
         results = results
+            .Where(s => Matches(
+                SignatureText.Parse(s.Declaration ?? s.Signature), return_type, parameter_type, parameter_count))
             .OrderBy(s => s.FilePath, StringComparer.Ordinal).ThenBy(s => s.LineStart).ThenBy(s => s.Id)
             .ToList();
 
         var canonicalIdCache = FindSymbolTool.BuildCanonicalIdCache(projectStore);
         var namer = new SymbolNamer(symbolStore);
-        object? summary = page.IsTruncatedFirstPage(results.Count)
-            ? new { ByProject = Paging.CountBy(results, s => FindSymbolTool.ResolveCanonicalId(s.ProjectId, canonicalIdCache)) }
-            : null;
+        object? Summary() => new { ByProject = Paging.CountBy(results, s => FindSymbolTool.ResolveCanonicalId(s.ProjectId, canonicalIdCache)) };
         var mapped = page.Slice(results)
             .Select(s => FindSymbolTool.MapSymbol(
                 s, FindSymbolTool.ResolveCanonicalId(s.ProjectId, canonicalIdCache), qualifiedName: namer.QualifiedName(s)))
             .ToList();
         var freshness = results.Count > 0 ? results.Min(s => s.LastIndexedAt) : 0;
         return ResponseBuilder.BuildPage(mapped, results.Count, page, freshness, provenance: readContext.Provenance,
-            summary: summary, message: results.Count == 0 ? "No symbol matches the given signature filters." : null);
+            summary: Summary, message: results.Count == 0 ? "No symbol matches the given signature filters." : null);
     }
 
-    internal static int CountParameters(string paramSection)
-    {
-        int count = 1, angleDepth = 0;
-        foreach (var ch in paramSection)
-        {
-            if (ch == '<') angleDepth++;
-            else if (ch == '>') angleDepth--;
-            else if (ch == ',' && angleDepth == 0) count++;
-        }
-        return count;
-    }
+    // Each filter is a case-insensitive partial match on its part; a legacy signature (no return type) never
+    // matches a return type.
+    private static bool Matches(SignatureText.Parts parts, string? returnType, string? parameterType, int? parameterCount) =>
+        (returnType is null || (parts.ReturnType?.Contains(returnType, StringComparison.OrdinalIgnoreCase) ?? false))
+        && (parameterType is null
+            || parts.ParameterTypes.Any(t => t.Contains(parameterType, StringComparison.OrdinalIgnoreCase)))
+        && (parameterCount is null || parts.ParameterTypes.Count == parameterCount);
 }

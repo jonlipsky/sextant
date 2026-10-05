@@ -91,6 +91,7 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_MAX_GRANTS_PER_TENANT` | Most repository grant rows a tenant may hold, tenant-wide grants included; creating one more is `409 grant_limit` | `5000` |
 | `SEXTANT_SERVICE_SEARCH_MAX_WIDTH` | Most snapshots one [`search_symbols`](#search_symbols-svc-f) call reads (round-robin over the tracked ones); the rest are listed in `truncated` and searched on later pages. Values above `100` are clamped to `100` (the most snapshots a search tracks at once, which keeps a cursor within 16 KiB); a missing or non-positive value uses the default | `50` |
 | `SEXTANT_SERVICE_SEARCH_MAX_HITS` | Most symbols one [`search_symbols`](#search_symbols-svc-f) call returns in all; the snapshots it reads share it evenly (each still gets at least one row, so the round-robin is unchanged), and what a snapshot did not return is searched on its next turn. Clamped to `100`–`5000`; a missing or non-positive value uses the default | `500` |
+| `SEXTANT_SERVICE_MAX_RESPONSE_CHARS` | Character budget of one `/mcp` tool result, measured on the text the caller receives. A paged tool cuts its page at the last row that fits and returns `meta.next_cursor` with `meta.page_truncated_by: "size"`; an unpaged one keeps the leading rows and says to narrow the query (see [mcp-tools.md](mcp-tools.md#response-size-budget)). At least `1000`; a missing or non-positive value uses the default. `search_symbols` keeps its own `SEARCH_MAX_HITS` cap | `20000` |
 | `SEXTANT_SERVICE_BIND_ADDRESS` | Network interface the HTTP surface binds to | `localhost` |
 | `SEXTANT_SERVICE_CONTROL_PORT` | HTTP port | `3011` |
 | `SEXTANT_SERVICE_QUERY_PORT` | Optional dedicated query port (shares the control port when unset) | none (shared) |
@@ -1820,10 +1821,11 @@ branch-head advance on the ensure path (Phase 14, issue #84); `022_snapshot_cove
 per-snapshot `snapshot_coverage` record (issue #119); `023_partial_occurrence_source_index.sql` rebuilds
 `ix_occ_source` as a partial index over call edges only (issue #160); `024_repository_grants.sql` adds the
 `repository_grants` table behind per-caller visibility (SVC-4); `025_symbol_name_prefix_index.sql` adds the
-`NOCASE` name and repository-URL indexes that bound `search_symbols` (issue #196). All are additive/forward-only. See
+`NOCASE` name and repository-URL indexes that bound `search_symbols` (issue #196); `026_symbol_declaration.sql`
+adds `symbols.declaration`, the member declaration the MCP `signature` shows. All are additive/forward-only. See
 [`schema.md`](schema.md) for the table definitions. `LatestSchemaVersion` auto-derives from the highest
-migration and is **25**. Snapshot identities fold `SnapshotSchemaVersion` instead, which skips identity-neutral
-(index-only) migrations such as `025` and is **24**.
+migration and is **26**. Snapshot identities fold `SnapshotSchemaVersion` instead, which skips identity-neutral
+(index-only) migrations such as `025` and is **26**.
 
 > **One-time full re-index when upgrading from schema 23.** Migration `024` moves `SnapshotSchemaVersion`
 > from 23 to 24, which changes every snapshot's identity hash. Each repository is therefore re-indexed once,
@@ -1837,6 +1839,15 @@ migration and is **25**. Snapshot identities fold `SnapshotSchemaVersion` instea
 > keep answering meanwhile. Migration `025` is identity-neutral, so upgrading from 24 to 25 re-indexes
 > nothing. (A `search_symbols` cursor issued by a build before SX-7b answers `invalid_cursor`, because the
 > cursor is now v2; the client re-queries.)
+
+> **One-time full re-index when upgrading to schema 26.** Migration `026` stores a new column, and
+> `AnalyzerVersion` is `5`, so `SnapshotSchemaVersion` moves from 24 to 26 and every snapshot identity changes
+> once, exactly as for `024` above: each repository is re-indexed on its next ensure, and until its new snapshot
+> publishes it keeps serving the old one, whose member `signature` is the earlier display
+> (`Ns.Type.Member(string, System.DateTime)`, no return type or parameter names). The column is added without a
+> default or backfill, so the migration itself only rewrites the schema text. A build older than `026` serves no
+> reads from an upgraded catalog (`CheckReadiness`: newer schema); see
+> [runbooks.md](runbooks.md#runbook-schema-upgrades-with-rehearsal) for rolling back.
 
 ## Testing
 

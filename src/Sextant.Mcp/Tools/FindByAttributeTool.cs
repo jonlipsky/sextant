@@ -65,11 +65,10 @@ public static class FindByAttributeTool
         var namer = new SymbolNamer(symbolStore);
 
         var freshness = matches.Count > 0 ? matches.Min(s => s.LastIndexedAt) : 0L;
-        object? summary = null;
-        if (page.IsTruncatedFirstPage(matches.Count))
+        object? Summary()
         {
             var canonicalIds = FindSymbolTool.BuildCanonicalIdCache(projectStore);
-            summary = new
+            return new
             {
                 ByProject = Paging.CountBy(matches, s => FindSymbolTool.ResolveCanonicalId(s.ProjectId, canonicalIds)),
                 ByFile = Paging.CountBy(matches, s => s.FilePath)
@@ -95,7 +94,7 @@ public static class FindByAttributeTool
         else if (!string.Equals(matchedNames[0], attribute_fqn.Trim(), StringComparison.Ordinal))
             message = $"Matched attribute {matchedNames[0]}.";
         return ResponseBuilder.BuildPage(results, matches.Count, page, freshness, provenance: readContext.Provenance,
-            summary: summary, message: message);
+            summary: Summary, message: message);
     }
 
     /// <summary>An attribute argument, matched against stored attribute names (<c>global::Ns.FooAttribute</c>).</summary>

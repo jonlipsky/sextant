@@ -18,8 +18,22 @@ public sealed class SymbolInfo
     public bool IsAbstract { get; init; }
     public bool IsVirtual { get; init; }
     public bool IsOverride { get; init; }
+    /// <summary>
+    /// Roslyn's default display of a method, constructor, property or indexer (<c>Ns.Type.Method(int, string)</c>):
+    /// the basis of every printed member name (<c>SymbolNamer</c>) and of <see cref="SignatureHash"/>. Not shown to
+    /// agents as is when <see cref="Declaration"/> is set.
+    /// </summary>
     public string? Signature { get; init; }
     public string? SignatureHash { get; init; }
+
+    /// <summary>
+    /// The member as C# declares it, with return type, parameter names, modifiers and default values
+    /// (<c>Task&lt;Record&gt; CreateAsync(string id, CancellationToken cancellationToken = default)</c>), for methods,
+    /// constructors, properties, indexers, fields, events and delegates; null for other kinds and for rows indexed
+    /// before migration 026.
+    /// </summary>
+    public string? Declaration { get; init; }
+
     public string? DocComment { get; init; }
     public required string FilePath { get; init; }
     public int LineStart { get; init; }

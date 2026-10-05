@@ -8,7 +8,7 @@ internal static class QueryHandler
         var dbPath = DbResolver.Resolve(db, profile, config);
         if (dbPath == null) return 1;
 
-        using var dbProvider = new Mcp.DatabaseProvider(dbPath);
+        using var dbProvider = new Mcp.DatabaseProvider(dbPath) { MaxResponseChars = config.MaxResponseChars };
 
         var readinessProblem = CheckIndexReadiness(dbProvider);
         if (readinessProblem != null)
@@ -33,7 +33,7 @@ internal static class QueryHandler
                 "get-dependencies" => RunGetDependencies(dbProvider, toolArgs),
                 "get-impact" => RunGetImpact(dbProvider, toolArgs),
                 "get-api-surface" => RunGetApiSurface(dbProvider, toolArgs),
-                "get-index-status" => RunGetIndexStatus(dbProvider),
+                "get-index-status" => RunGetIndexStatus(dbProvider, toolArgs),
                 "find-unreferenced" => RunFindUnreferenced(dbProvider, toolArgs),
                 _ => throw new ArgumentException($"Unknown tool: {tool}")
             };
@@ -107,7 +107,8 @@ internal static class QueryHandler
         => Mcp.Tools.FindReferencesTool.FindReferences(db, GetArg(args, 0, "<symbol-fqn>"), limit: GetLimit(args), cursor: GetOption(args, "--cursor"));
 
     private static string RunGetTypeMembers(Mcp.DatabaseProvider db, string[] args)
-        => Mcp.Tools.GetTypeMembersTool.GetTypeMembers(db, GetArg(args, 0, "<symbol-fqn>"));
+        => Mcp.Tools.GetTypeMembersTool.GetTypeMembers(db, GetArg(args, 0, "<symbol-fqn>"),
+            limit: GetLimit(args), cursor: GetOption(args, "--cursor"));
 
     private static string RunGetFileSymbols(Mcp.DatabaseProvider db, string[] args)
         => Mcp.Tools.GetFileSymbolsTool.GetFileSymbols(db, GetArg(args, 0, "<file-path>"), limit: GetLimit(args), cursor: GetOption(args, "--cursor"));
@@ -157,8 +158,8 @@ internal static class QueryHandler
         return Mcp.Tools.GetApiSurfaceTool.GetApiSurface(db, projectId, diff, limit: GetLimit(args), cursor: GetOption(args, "--cursor"));
     }
 
-    private static string RunGetIndexStatus(Mcp.DatabaseProvider db)
-        => Mcp.Tools.GetIndexStatusTool.GetIndexStatus(db);
+    private static string RunGetIndexStatus(Mcp.DatabaseProvider db, string[] args)
+        => Mcp.Tools.GetIndexStatusTool.GetIndexStatus(db, limit: GetLimit(args), cursor: GetOption(args, "--cursor"));
 
     private static string RunFindUnreferenced(Mcp.DatabaseProvider db, string[] args)
     {

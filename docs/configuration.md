@@ -32,6 +32,7 @@ All fields are optional — Sextant uses sensible defaults.
 | `solutions` | string[] | `[]` | Solutions (`.sln`/`.slnx`, repo-relative) to index. When set, it is authoritative everywhere. When empty, the **index service** indexes the deterministic union of **every** solution discovered under the checkout into one snapshot (issue #124; see [service.md — Solution selection](service.md#solution-selection--which-solutions-get-indexed)), while the local **daemon** falls back to the `*.sln` files at the repo root (the CLI `index` command always takes an explicit solution path). |
 | `max_call_hierarchy_depth` | int | `5` | Max call-hierarchy traversal depth. |
 | `fts_max_results` | int | `20` | Max FTS search results. |
+| `max_response_chars` | int | `20000` | Character budget of one MCP tool result; a longer page is cut and continues at `meta.next_cursor` (see [mcp-tools.md](mcp-tools.md#response-size-budget)). At least `1000`; `0` or less uses the default. |
 | `auto_spawn_daemon` | bool | `true` | Auto-spawn the daemon from the MCP server. |
 | `daemon_socket` | string | (auto) | Override the daemon IPC socket/pipe path. |
 | `document_extractor` | bool | `true` | Phase 5 document-oriented extractor (see above). |
@@ -66,6 +67,7 @@ Environment variables take precedence over `sextant.json`:
 | `SEXTANT_PROFILE` | Index slot name (selects `.sextant/profiles/<name>/sextant.db`) | `default` |
 | `SEXTANT_MAX_DEPTH` | Max call hierarchy depth | `5` |
 | `SEXTANT_FTS_MAX` | Max FTS search results | `20` |
+| `SEXTANT_MAX_RESPONSE_CHARS` | Character budget of one MCP tool result | `20000` (at least `1000`) |
 | `SEXTANT_DAEMON_SOCKET` | Daemon IPC socket/pipe path | (auto) |
 | `SEXTANT_AUTO_SPAWN_DAEMON` | Auto-spawn daemon from MCP server | `true` (set `false` or `0` to disable) |
 | `SEXTANT_DOCUMENT_EXTRACTOR` | Use the Phase 5 document-oriented extractor | `true` (set `false`/`0` for the legacy fallback) |
@@ -241,6 +243,7 @@ sextant query find-references "global::App.Services.UserService.GetById(int)"
 
 # Large results are paged (default 50 rows, max 200): pass meta.next_cursor back to continue
 sextant query find-references "global::App.Services.UserService.GetById(int)" --limit 100 --cursor <meta.next_cursor>
+# (get-type-members and get-index-status page the same way; a page also ends early at max_response_chars)
 
 # Get call hierarchy
 sextant query get-call-hierarchy "global::App.Handlers.OrderHandler.Process()" --direction callees --depth 3
