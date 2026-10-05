@@ -255,11 +255,7 @@ public sealed class ToolSelectionFiltersTests
 
         CollectionAssert.AreEquivalent(names.ToList(), ServiceApp.RepositoryScopedTools.ToList());
         CollectionAssert.AreEquivalent(
-            new[]
-            {
-                "find_symbol", "find_references", "get_call_hierarchy", "get_implementors",
-                "get_type_hierarchy", "get_type_members", "get_file_symbols"
-            },
+            RemoteToolSurfaceGuardTests.AgentTools.Where(n => n is not ("list_repositories" or "search_symbols")).ToList(),
             names.ToList(), "every remote tool but list_repositories and search_symbols reads one selected repository");
     }
 

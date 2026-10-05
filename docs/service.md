@@ -819,8 +819,8 @@ per call through two reserved arguments. The service adds them in MCP request fi
   `repository` description says "Optional" only when omitting it can read something: with
   `REQUIRE_REPOSITORY_SELECTION` on it says "Required", and with delegate tokens configured it states the one case
   in which a verified caller may omit it (implicit selection, below). A tool that already declares an
-  argument of the same name keeps its own and is advertised only the other one (none of the eight remote
-  tools does today).
+  argument of the same name keeps its own and is advertised only the other one (no remote tool does
+  today).
 - **`tools/call`** removes the reserved arguments before the tool binds its own, so a tool never sees them.
   `repository` accepts `https://{host}/{owner}/{repo}[.git]`, `{host}/{owner}/{repo}`, or `{owner}/{repo}`
   when `REPOSITORY_HOSTS` lists exactly one host besides `*`. It must pass the same URL policy as
@@ -849,7 +849,11 @@ The remote tools answer an agent, so every response is shaped to fit its context
   `project_id`, `include_projects` and `project:` scopes take the `project_id` that `find_symbol`,
   `get_file_symbols` and `get_type_members` print (`in_project_id` on a `find_references` row).
   `RemoteToolSurfaceGuardTests` pins the list and the texts through the real host, and scans every string
-  constant and literal on the remote path. A tool added later is never exposed by default.
+  constant and literal on the remote path. A tool added later is never exposed by default. `RemoteQueryTools`
+  is the one list: the selection filter and every test of the surface read it, so adding or dropping a remote
+  tool is a one-line change there (plus this list and [MCP tools](mcp-tools.md)). The guard already holds calls
+  for the measured candidates (`get_type_dependents`, `semantic_search`, `find_by_attribute`,
+  `find_unreferenced`), which run only while the tool is listed.
 - **Paging.** Every tool that can return an unbounded list takes `limit` (default 50, max 200) and `cursor`,
   and reports `meta.total` and `meta.next_cursor` (see [Paged results](mcp-tools.md#paged-results)). A
   truncated first page leads with a `summary` (counts per project, file or kind) before `results`. A cursor
@@ -1941,7 +1945,7 @@ catalog, and a `FakeSnapshotWorker`. The suite maps to the acceptance criteria:
 | 1 — idempotent ensure | `SnapshotServiceTests` (concurrent ensures attach to one job; worker runs once); `EnsureCallerDisconnectTests` / `EnsureCallerDisconnectHttpTests` (#148: caller disconnect never cancels production, re-ensure attaches to the in-flight run, `wait=false`, prompt status/resolve during a run, shutdown requeues); `QueuedControlWriteHttpTests` / `JobIdReservationsTests` (#158: `wait=false` and retire answer `202` within the bound while a production holds the writer, reserved job ids resolve and are never reused, apply-time retire guards, submission order, coalescing, shutdown drain) |
 | 2 — restart recovery | `SnapshotServiceTests` (catalog survives restart; orphaned `running` jobs reconciled) |
 | 3 — scratch cannot delete published | `ServicePathsTests` (scratch/persistent separation + `ReleaseScratch` refusal) |
-| 4 — query via HTTP MCP without ProcessStack | `ServiceHttpTests` (`/mcp` mapped + auth-gated; `/query` paging); `RepositorySelectionHttpTests` (the `X-Sextant-Repository` header without a read policy, the legacy no-header unscoped read, `repository_required`); `ToolArgumentSelectionHttpTests` + `ToolSelectionFiltersTests` (SVC-2: the reserved `repository`/`branch` arguments listed on repository-scoped tools and stripped on call, argument-over-header precedence, `selector_conflict`/`invalid_selector`, branch pinning, `branch` without a repository, the unknown-branch uniform not-found); `McpClientCompatibilityTests` (an SDK client selecting through the `repository` argument); `QueryToolInputResolutionHttpTests` (issues #149/#163: symbol arguments without `global::`, `Type.Member`, parameter lists and documentation IDs; exact type lookup and `kind`; ambiguity and not-found as tool errors with candidates; `get_type_members`; implicit selection naming its repository and `repository_required` listing the caller's repositories); `AgentSizedOutputHttpTests` (#145: paging, truncation summary, cursor binding, lean `meta.snapshot`, repo-relative paths in and out, server `instructions`, the `tools/list` size pin); `RemoteToolSurfaceGuardTests` (S12: exactly the eight agent tools, and no remote text naming another tool); `SubmoduleCheckoutIntegrationTests.RemoteMcp_RepositoryRelativePaths_*` (#145 on a real worker index: repo-relative inputs over `/mcp`, a submodule file included) |
+| 4 — query via HTTP MCP without ProcessStack | `ServiceHttpTests` (`/mcp` mapped + auth-gated; `/query` paging); `RepositorySelectionHttpTests` (the `X-Sextant-Repository` header without a read policy, the legacy no-header unscoped read, `repository_required`); `ToolArgumentSelectionHttpTests` + `ToolSelectionFiltersTests` (SVC-2: the reserved `repository`/`branch` arguments listed on repository-scoped tools and stripped on call, argument-over-header precedence, `selector_conflict`/`invalid_selector`, branch pinning, `branch` without a repository, the unknown-branch uniform not-found); `McpClientCompatibilityTests` (an SDK client selecting through the `repository` argument); `QueryToolInputResolutionHttpTests` (issues #149/#163: symbol arguments without `global::`, `Type.Member`, parameter lists and documentation IDs; exact type lookup and `kind`; ambiguity and not-found as tool errors with candidates; `get_type_members`; implicit selection naming its repository and `repository_required` listing the caller's repositories); `AgentSizedOutputHttpTests` (#145: paging, truncation summary, cursor binding, lean `meta.snapshot`, repo-relative paths in and out, server `instructions`, the `tools/list` size pin); `RemoteToolSurfaceGuardTests` (S12: exactly the agent tools of `RemoteQueryTools`, and no remote text naming another tool); `SubmoduleCheckoutIntegrationTests.RemoteMcp_RepositoryRelativePaths_*` (#145 on a real worker index: repo-relative inputs over `/mcp`, a submodule file included) |
 | 5 — structured per-project diagnostics | `SnapshotServiceTests` (partial/failed/unsupported diagnostics) |
 | 6 — local-only remains functional | `ArchitectureBoundaryTests` (core assemblies never reference the service; local query without a service) |
 

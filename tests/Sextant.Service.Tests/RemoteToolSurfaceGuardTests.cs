@@ -15,10 +15,10 @@ using Sextant.Store;
 namespace Sextant.Service.Tests;
 
 /// <summary>
-/// S12: the service's remote MCP surface lists exactly the eight tools agents call plus the service-only
-/// <c>search_symbols</c>, and nothing it sends names a tool
-/// an agent cannot call there. An agent told "call get_index_status" by a warning, or "a project_id from
-/// get_index_status" by a parameter description, wastes a turn on a tool that does not exist on its server.
+/// S12: the service's remote MCP surface lists exactly the tools agents call (<see cref="ServiceApp.RemoteQueryTools"/>),
+/// and nothing it sends names a tool an agent cannot call there. An agent told "call get_index_status" by a warning,
+/// or "a project_id from get_index_status" by a parameter description, wastes a turn on a tool that does not exist on
+/// its server.
 /// <list type="bullet">
 /// <item>Through the real host over <c>/mcp</c>: <c>tools/list</c> (both deployments) is exactly that list; no tool
 /// description, parameter description or the <c>initialize</c> instructions names another tool; and the texts the
@@ -27,21 +27,26 @@ namespace Sextant.Service.Tests;
 /// the source of the remote path (Sextant.Mcp, Sextant.Service, Sextant.Service.Host, Sextant.Store), except the
 /// local-only tool classes and the local stdio composition root.</item>
 /// </list>
-/// The forbidden names are every <c>[McpServerTool]</c> name in the tool assemblies outside that list, plus the
-/// retired remote-only names, so a tool added later is covered without editing this test.
+/// Everything here reads the set from <see cref="ServiceApp.RemoteQueryTools"/>: the forbidden names are every
+/// <c>[McpServerTool]</c> name in the tool assemblies outside it, plus the retired remote-only names, so adding or
+/// dropping a remote tool needs no edit here unless the tool has no <c>EmittedTexts</c> call yet.
 /// </summary>
 [TestClass]
 public sealed partial class RemoteToolSurfaceGuardTests
 {
     /// <summary>
-    /// The remote surface (S12): the tools the agent-behaviour harness saw agents call, plus the service-only
-    /// search_symbols.
+    /// The remote surface, read from <see cref="ServiceApp.RemoteQueryTools"/>: that list is the one place the set is
+    /// decided, so every test of the surface reads it from here and changing the set is a one-line change.
     /// </summary>
-    internal static readonly string[] AgentTools =
-    [
-        "find_references", "find_symbol", "get_call_hierarchy", "get_file_symbols", "get_implementors",
-        "get_type_hierarchy", "get_type_members", "list_repositories", "search_symbols"
-    ];
+    internal static readonly string[] AgentTools = ToolNames(ServiceApp.RemoteQueryTools);
+
+    /// <summary>The <c>[McpServerTool]</c> names <paramref name="toolTypes"/> declare, in ordinal order.</summary>
+    internal static string[] ToolNames(IEnumerable<Type> toolTypes) => toolTypes
+        .SelectMany(t => t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance))
+        .Select(m => m.GetCustomAttribute<McpServerToolAttribute>()?.Name)
+        .OfType<string>()
+        .Order(StringComparer.Ordinal)
+        .ToArray();
 
     // Tools that were once on the remote surface and no longer exist in any assembly; no text may bring them back.
     private static readonly string[] RetiredToolNames = ["research_codebase"];
@@ -81,9 +86,11 @@ public sealed partial class RemoteToolSurfaceGuardTests
     {
         var forbidden = Forbidden.Value;
 
-        foreach (var name in new[] { "get_index_status", "get_api_surface", "semantic_search", "find_cross_repository_usages" })
+        // Tools that never go remote (they read outside the grant gate, or report on the whole local index).
+        foreach (var name in new[] { "get_index_status", "get_source_context", "get_base_snapshot_symbols", "find_cross_repository_usages" })
             CollectionAssert.Contains(forbidden.ToList(), name);
         Assert.AreEqual(0, forbidden.Intersect(AgentTools).Count());
+        Assert.IsTrue(AgentTools.Length > 0);
     }
 
     [TestMethod]
@@ -184,11 +191,30 @@ public sealed partial class RemoteToolSurfaceGuardTests
             ("implementors", SizeCut, "get_implementors", new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetInterface, ["repository"] = repoA }),
             ("ambiguous member", "ambiguous_symbol", "get_call_hierarchy", new JsonObject { ["symbol_fqn"] = "Get", ["direction"] = "callers", ["repository"] = repoA }),
             ("list_repositories without a caller", "caller_required", "list_repositories", new JsonObject()),
-            ("search_symbols without a caller", "caller_required", "search_symbols", new JsonObject { ["name_prefix"] = "IStore" })
+            ("search_symbols without a caller", "caller_required", "search_symbols", new JsonObject { ["name_prefix"] = "IStore" }),
+            // Candidates for the surface: their rows run only while the tool is on it, so adding one to
+            // RemoteQueryTools needs no edit here.
+            ("dependents", SizeCut, "get_type_dependents", new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetInterface, ["repository"] = repoA }),
+            ("bad dependency kind", InvalidArgument, "get_type_dependents", new JsonObject
+            {
+                ["symbol_fqn"] = AgentOutputFixture.TargetInterface, ["dependency_kind"] = "sideways", ["repository"] = repoA
+            }),
+            ("topic search", SizeCut, "semantic_search", new JsonObject { ["query"] = "Handler*", ["max_results"] = 200, ["repository"] = repoA }),
+            ("attribute", Answered, "find_by_attribute", new JsonObject { ["attribute_fqn"] = "Obsolete", ["repository"] = repoA }),
+            ("unreferenced", SizeCut, "find_unreferenced", new JsonObject { ["repository"] = repoA }),
+            ("unknown project_id (unreferenced)", InvalidArgument, "find_unreferenced", new JsonObject
+            {
+                ["project_id"] = "0000000000000000", ["repository"] = repoA
+            })
         };
 
+        var unknown = calls.Select(c => c.Tool).Except(AgentTools).Except(Forbidden.Value).ToList();
+        Assert.AreEqual(0, unknown.Count, "no such tool: " + string.Join(", ", unknown));
+        var unexercised = AgentTools.Except(calls.Select(c => c.Tool)).ToList();
+        Assert.AreEqual(0, unexercised.Count, "every tool on the remote surface needs a call here: " + string.Join(", ", unexercised));
+
         var missed = new List<string>();
-        foreach (var (label, expected, tool, arguments) in calls)
+        foreach (var (label, expected, tool, arguments) in calls.Where(c => AgentTools.Contains(c.Tool)))
         {
             var text = await host.CallTextAsync(tool, arguments);
             var outcome = Outcome(text);
