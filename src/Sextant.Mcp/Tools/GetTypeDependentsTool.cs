@@ -119,7 +119,8 @@ public static class GetTypeDependentsTool
             : null;
         return ResponseBuilder.BuildPage(results, dependents.Count, page, targetSymbol.LastIndexedAt, lookup.Ambiguity,
             readContext.Provenance, Summary,
-            message: ResponseBuilder.JoinMessages(SymbolResolver.ResolutionNote(symbolStore, lookup), empty));
+            message: ResponseBuilder.JoinMessages(SymbolResolver.ResolutionNote(symbolStore, lookup), empty),
+            warning: lookup.Warning);
     }
 
     // The type declaring a member (from its documentation-ID key; for an index from before those keys, from its fully

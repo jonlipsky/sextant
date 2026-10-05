@@ -100,7 +100,7 @@ public static class GetImpactTool
         };
 
         return ResponseBuilder.BuildPage(consumerResults, consumers.Count, page, symbol.LastIndexedAt, lookup.Ambiguity,
-            readContext.Provenance, message: SymbolResolver.ResolutionNote(symbolStore, lookup),
+            readContext.Provenance, message: SymbolResolver.ResolutionNote(symbolStore, lookup), warning: lookup.Warning,
             shape: kept => new List<object>
             {
                 new
