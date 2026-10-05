@@ -376,14 +376,16 @@ public class SearchSymbolsHttpTests
     public async Task LongSnapshot_IsNotStarvedByAdmissions_BeyondTheTrackedCapacity()
     {
         // More visible snapshots than a cursor can track: snapshots admitted as tracked ones finish join at the tail of
-        // a round, so the long snapshot with the lowest hash is still read at least every ceil(100 / 50) pages.
+        // a round, so the long snapshot with the lowest hash is still read at least every ceil(100 / 50) pages. That is
+        // the width's bound: the response size budget, which can end a turn early, is lifted out of the way here (its
+        // own walk is pinned by the SizeBudget_ tests).
         const int others = 150;
         const int extra = 20;
         var repositories = Enumerable.Range(0, others).Select(i => $"https://github.com/acme/repo{i:D3}").ToList();
         var hashes = repositories.Select((r, i) => HashOf(r, $"commit-{i}")).Append(HashOf(Widgets, "commit-w1")).ToList();
         var longest = hashes.Min(StringComparer.Ordinal)!;
         await using var host = await Harness.StartAsync(
-            configure: o => o with { SearchMaxWidth = 50 },
+            configure: o => o with { SearchMaxWidth = 50, MaxResponseChars = 1_000_000 },
             seed: db =>
             {
                 for (var i = 0; i < others; i++)
@@ -429,7 +431,10 @@ public class SearchSymbolsHttpTests
     [DataRow(1000, 200)]
     public async Task Limit_IsClampedToOneThroughTwoHundred(int limit, int expected)
     {
-        await using var host = await Harness.StartAsync(seed: db => Publish(db, Gadgets, "commit-g1", 250));
+        // 200 symbols are more than the default response size budget holds, so it is lifted to see the limit alone.
+        await using var host = await Harness.StartAsync(
+            configure: o => o with { MaxResponseChars = 1_000_000 },
+            seed: db => Publish(db, Gadgets, "commit-g1", 250));
         await GrantSelfAsync(host, host.UserAssertion(), Gadgets);
 
         var page = await SearchAsync(host, $$"""{"name_prefix":"Type","limit":{{limit}}}""", host.UserAssertion());
@@ -557,6 +562,191 @@ public class SearchSymbolsHttpTests
         var symbol = page.GetProperty("symbols").EnumerateArray().Single();
         Assert.AreEqual(host.WidgetsHash, symbol.GetProperty("identity_hash").GetString());
         Assert.AreEqual("develop", symbol.GetProperty("branch").GetString(), "the first target in (repository, branch) order labels it");
+    }
+
+    // ==== response size budget ======================================================================
+
+    [TestMethod]
+    [DataRow(1_000)]
+    [DataRow(1_500)]
+    [DataRow(2_500)]
+    public async Task SizeBudget_EveryPageFits_AndTheWalkReturnsEverySymbolOnce(int budget)
+    {
+        // A page over the budget keeps a prefix of each snapshot's own page (and, when one symbol from each is still too
+        // much, of the turn), so its cursor resumes exactly at the first symbol it left out: the size-cut walk returns
+        // the same symbols as the unbudgeted one, each once, and every page's text fits.
+        void Seed(IndexDatabase db)
+        {
+            Publish(db, Gadgets, "commit-g1", 12);
+            Publish(db, Gizmos, "commit-z1", 8);
+        }
+
+        var expected = await WalkAllAsync(configure: null, Seed);
+        Assert.AreEqual(21, expected.Symbols.Count, "Type0 in Widgets, 12 in Gadgets, 8 in Gizmos");
+        Assert.IsTrue(expected.Pages.All(p => !IsSizeCut(p)), "the default budget holds the whole search");
+
+        var cut = await WalkAllAsync(configure: o => o with { MaxResponseChars = budget }, Seed);
+
+        foreach (var page in cut.Pages)
+        {
+            var symbols = page.GetProperty("symbols").GetArrayLength();
+            Assert.IsTrue(page.GetRawText().Length <= budget || symbols == 1,
+                $"a page of {symbols} symbols is {page.GetRawText().Length} characters");
+            Assert.AreEqual(symbols, page.GetProperty("meta").GetProperty("result_count").GetInt32());
+            if (IsSizeCut(page))
+            {
+                Assert.IsNotNull(page.GetProperty("next_cursor").GetString(), "a cut page always has the rest to follow");
+                StringAssert.Contains(page.GetProperty("message").GetString(), "next_cursor");
+            }
+            else
+            {
+                Assert.IsFalse(page.TryGetProperty("message", out _), "an uncut page is unchanged");
+            }
+        }
+        Assert.IsTrue(cut.Pages.Any(IsSizeCut), "the budget cut some page");
+        CollectionAssert.AreEquivalent(expected.Symbols, cut.Symbols, "every symbol once, none lost or repeated");
+        Assert.AreEqual(cut.Symbols.Count, cut.Symbols.Distinct().Count());
+    }
+
+    [TestMethod]
+    public async Task SizeBudget_TooSmallForOneSymbolPerSnapshot_EndsTheTurnEarly_AndTheNextPageStartsWithTheRest()
+    {
+        // With one symbol from each snapshot over the budget, the page reads all three but returns only the first ones;
+        // the others are listed in `truncated` and are the first ones the next page returns.
+        await using var host = await Harness.StartAsync(
+            configure: o => o with { MaxResponseChars = 1_000 },
+            seed: db =>
+            {
+                Publish(db, Gadgets, "commit-g1", 2);
+                Publish(db, Gizmos, "commit-z1", 2);
+            });
+        var assertion = host.UserAssertion();
+        foreach (var repository in new[] { Widgets, Gadgets, Gizmos })
+            await GrantSelfAsync(host, assertion, repository);
+        var byRepository = new Dictionary<string, string>
+        {
+            [Widgets] = host.WidgetsHash, [Gadgets] = GadgetsHash, [Gizmos] = GizmosHash
+        };
+        var ordered = byRepository.Values.Order(StringComparer.Ordinal).ToList();
+
+        var first = await SearchAsync(host, TypePrefix, assertion);
+
+        Assert.IsTrue(IsSizeCut(first), first.ToString());
+        var returned = first.GetProperty("symbols").EnumerateArray().Select(s => s.GetProperty("identity_hash").GetString()!).ToList();
+        var truncated = first.GetProperty("truncated").EnumerateArray()
+            .Select(t => byRepository[t.GetProperty("repository").GetString()!]).ToList();
+        Assert.IsTrue(truncated.Count > 0, "the turn ended before the last snapshot: " + first);
+        CollectionAssert.AreEqual(ordered.Take(ordered.Count - truncated.Count).ToList(), returned.Distinct().ToList(),
+            "the turn keeps a prefix of its snapshots, in hash order");
+        CollectionAssert.AreEqual(ordered.Skip(ordered.Count - truncated.Count).ToList(), truncated);
+
+        var second = await SearchAsync(host, WithCursor(TypePrefix, first.GetProperty("next_cursor").GetString()), assertion);
+        Assert.AreEqual(truncated[0], second.GetProperty("symbols")[0].GetProperty("identity_hash").GetString(),
+            "the snapshot left out is read first on the next page, not after another round");
+    }
+
+    [TestMethod]
+    public async Task SizeBudget_SnapshotsWithoutMatches_AreNotDeferred_AndTheMatchesArePagedBySize()
+    {
+        // Only the first snapshot in hash order matches. Leaving the others out of a page would only lengthen it (their
+        // targets in `truncated`, their positions in the cursor), so a page over the budget keeps fewer of the first
+        // snapshot's matches instead, and none of them is listed in `truncated`.
+        const int others = 10;
+        const int matches = 20;
+        const int budget = 2_500;
+        var repositories = Enumerable.Range(0, others).Select(i => $"https://github.com/acme/repo{i:D3}").ToList();
+        var hashes = repositories.Select((r, i) => HashOf(r, $"commit-{i}")).Append(HashOf(Widgets, "commit-w1")).ToList();
+        var lowest = hashes.Min(StringComparer.Ordinal)!;
+        await using var host = await Harness.StartAsync(
+            configure: o => o with { MaxResponseChars = budget },
+            seed: db =>
+            {
+                for (var i = 0; i < others; i++)
+                    Publish(db, repositories[i], $"commit-{i}", 1);
+                AddSymbols(db, lowest, Enumerable.Range(0, matches).Select(i => ($"ZedMatch{i:D2}", SymbolKind.Class)).ToArray());
+            });
+        var assertion = host.UserAssertion();
+        foreach (var repository in repositories.Append(Widgets))
+            await GrantSelfAsync(host, assertion, repository);
+
+        var pages = await WalkAsync(host, """{"name_prefix":"Zed"}""", assertion);
+
+        Assert.IsTrue(pages.Count > 1 && IsSizeCut(pages[0]), "the matches do not fit one page: " + pages[0]);
+        Assert.IsTrue(pages.Where(IsSizeCut).All(p => p.GetProperty("symbols").GetArrayLength() > 1),
+            "a cut page keeps as many matches as fit, not one");
+        foreach (var page in pages)
+        {
+            Assert.IsTrue(page.GetRawText().Length <= budget, $"a page is {page.GetRawText().Length} characters");
+            Assert.AreEqual(0, page.GetProperty("truncated").GetArrayLength(), "no snapshot is left out: " + page);
+        }
+        var names = pages.SelectMany(p => p.GetProperty("symbols").EnumerateArray())
+            .Select(s => s.GetProperty("name").GetString()!)
+            .ToList();
+        CollectionAssert.AreEqual(Enumerable.Range(0, matches).Select(i => $"ZedMatch{i:D2}").ToList(), names,
+            "every match once, in order");
+    }
+
+    [TestMethod]
+    public async Task SizeBudget_EndsTheTurnAfterTheMostSnapshotsThatFit_AndNeverDefersOnesWithoutMatches()
+    {
+        // Half of sixteen snapshots match, twice each; one match from each of them is already over the budget, so a page
+        // ends its turn early. It keeps as many matching snapshots as fit, and a snapshot without matches is reported as
+        // read, never listed in `truncated`.
+        const int count = 16;
+        const int budget = 3_000;
+        var repositories = Enumerable.Range(0, count).Select(i => $"https://github.com/acme/repo{i:D3}").ToList();
+        var matching = repositories.Where((_, i) => i % 2 == 0).ToHashSet(StringComparer.Ordinal);
+        await using var host = await Harness.StartAsync(
+            configure: o => o with { MaxResponseChars = budget },
+            seed: db =>
+            {
+                for (var i = 0; i < count; i++)
+                {
+                    Publish(db, repositories[i], $"commit-{i}", 1);
+                    if (i % 2 == 0)
+                        AddSymbols(db, HashOf(repositories[i], $"commit-{i}"), ("ZedA", SymbolKind.Class), ("ZedB", SymbolKind.Class));
+                }
+            });
+        var assertion = host.UserAssertion();
+        foreach (var repository in repositories.Append(Widgets))
+            await GrantSelfAsync(host, assertion, repository);
+
+        var pages = await WalkAsync(host, """{"name_prefix":"Zed"}""", assertion);
+
+        Assert.IsTrue(IsSizeCut(pages[0]) && pages[0].GetProperty("truncated").GetArrayLength() > 0,
+            "one match from each matching snapshot is over the budget: " + pages[0]);
+        Assert.IsTrue(Repositories(pages[0]).Count > 1, "the first page keeps as many snapshots as fit: " + pages[0]);
+        foreach (var page in pages)
+        {
+            Assert.IsTrue(page.GetRawText().Length <= budget, $"a page is {page.GetRawText().Length} characters");
+            foreach (var target in page.GetProperty("truncated").EnumerateArray())
+                Assert.IsTrue(matching.Contains(target.GetProperty("repository").GetString()!), "only snapshots with matches wait: " + page);
+        }
+        var symbols = pages.SelectMany(p => p.GetProperty("symbols").EnumerateArray())
+            .Select(s => s.GetProperty("repository").GetString() + "|" + s.GetProperty("name").GetString())
+            .ToList();
+        CollectionAssert.AreEquivalent(matching.SelectMany(r => new[] { r + "|ZedA", r + "|ZedB" }).ToList(), symbols,
+            "every match once");
+    }
+
+    private static bool IsSizeCut(JsonElement page) =>
+        page.GetProperty("meta").TryGetProperty("page_truncated_by", out var by) && by.GetString() == "size";
+
+    // Walks the search for "Type" from its start, granted Widgets, Gadgets and Gizmos, and returns its pages and every
+    // symbol returned, as (identity hash, symbol key).
+    private static async Task<(List<JsonElement> Pages, List<string> Symbols)> WalkAllAsync(
+        Func<ServiceOptions, ServiceOptions>? configure, Action<IndexDatabase> seed)
+    {
+        await using var host = await Harness.StartAsync(configure: configure, seed: seed);
+        var assertion = host.UserAssertion();
+        foreach (var repository in new[] { Widgets, Gadgets, Gizmos })
+            await GrantSelfAsync(host, assertion, repository);
+        var pages = await WalkAsync(host, TypePrefix, assertion);
+        var symbols = pages
+            .SelectMany(p => p.GetProperty("symbols").EnumerateArray())
+            .Select(s => s.GetProperty("identity_hash").GetString() + "|" + s.GetProperty("symbol_key").GetString())
+            .ToList();
+        return (pages, symbols);
     }
 
     // ==== filters and output ========================================================================

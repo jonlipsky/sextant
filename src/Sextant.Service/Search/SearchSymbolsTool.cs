@@ -1,4 +1,6 @@
 using System.ComponentModel;
+using System.Globalization;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
@@ -17,7 +19,10 @@ namespace Sextant.Service.Search;
 /// call, so a revoked grant stops being searched on the next page, and it declares its own <c>repository</c> and
 /// <c>branch</c> narrowing arguments, so it is exempt from the reserved SVC-2 selector arguments. It parses its raw
 /// arguments itself (see <see cref="InputSchema"/>): a wrong type or an unknown argument is <c>invalid_arguments</c>.
-/// The result is a text block and the same JSON as <c>structuredContent</c>.
+/// The result is a text block and the same JSON as <c>structuredContent</c>. The text fits
+/// <see cref="ServiceOptions.MaxResponseChars"/> (see <see cref="ResponseBudget"/>): a page that would not keeps fewer
+/// symbols, says so in <c>meta.page_truncated_by</c> and <c>message</c>, and its <c>next_cursor</c> resumes at the first
+/// symbol left out.
 /// </summary>
 [McpServerToolType]
 public static class SearchSymbolsTool
@@ -56,7 +61,9 @@ public static class SearchSymbolsTool
     {
         PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-        WriteIndented = false
+        WriteIndented = false,
+        // As the remote output pass writes it, so the size budget measures the text the client receives.
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
     };
 
     /// <summary>The advertised <c>inputSchema</c>, applied to <c>tools/list</c> by <see cref="ListToolsFilter"/>.</summary>
@@ -88,30 +95,42 @@ public static class SearchSymbolsTool
 
         // The request's cancellation (a closed connection or notifications/cancelled) stops the search: it is checked
         // between statements and interrupts the one running (issue #196).
-        var outcome = service.SearchSymbols(principal, query, resume, cancellationToken);
+        var maxChars = ResponseBudget.Clamp(options.MaxResponseChars);
+        var queriedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var outcome = service.SearchSymbols(principal, query, resume,
+            fits: candidate => Render(candidate, binding, queriedAt, maxChars).GetRawText().Length <= maxChars,
+            cancellationToken: cancellationToken);
         if (outcome.NoTargets)
             return Error(NoVisibleRepositoriesCode, NoVisibleRepositoriesMessage);
 
-        var body = JsonSerializer.SerializeToElement(new SearchSymbolsResponse
-        {
-            Symbols = outcome.Symbols,
-            NextCursor = outcome.Next is { } next ? SymbolSearchCursor.Encode(next, binding) : null,
-            Pending = outcome.Pending,
-            Unavailable = outcome.Unavailable,
-            Truncated = outcome.Truncated,
-            Meta = new MetaObject
-            {
-                QueriedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                IndexFreshness = outcome.IndexFreshness,
-                ResultCount = outcome.Symbols.Count
-            }
-        }, JsonOptions);
+        var body = Render(outcome, binding, queriedAt, maxChars);
         return new CallToolResult
         {
             Content = [new TextContentBlock { Text = body.GetRawText() }],
             StructuredContent = body
         };
     }
+
+    private static JsonElement Render(SymbolSearchOutcome outcome, string binding, long queriedAt, int maxChars) =>
+        JsonSerializer.SerializeToElement(new SearchSymbolsResponse
+        {
+            Symbols = outcome.Symbols,
+            NextCursor = outcome.Next is { } next ? SymbolSearchCursor.Encode(next, binding) : null,
+            Pending = outcome.Pending,
+            Unavailable = outcome.Unavailable,
+            Truncated = outcome.Truncated,
+            Message = outcome.CutBySize ? SizeCutMessage(outcome.Symbols.Count, maxChars) : null,
+            Meta = new MetaObject
+            {
+                QueriedAt = queriedAt,
+                IndexFreshness = outcome.IndexFreshness,
+                ResultCount = outcome.Symbols.Count,
+                PageTruncatedBy = outcome.CutBySize ? ResponseBudget.SizeTruncation : null
+            }
+        }, JsonOptions);
+
+    private static string SizeCutMessage(int symbols, int maxChars) => string.Create(CultureInfo.InvariantCulture,
+        $"Page cut to {symbols} symbols to stay under {maxChars:N0} characters. Pass next_cursor for the rest, or narrow with repository, branch or kind.");
 
     /// <summary>
     /// Replaces <c>search_symbols</c>'s generated <c>inputSchema</c> in a <c>tools/list</c> result with
@@ -279,6 +298,7 @@ public static class SearchSymbolsTool
         public required IReadOnlyList<SymbolSearchTarget> Pending { get; init; }
         public required IReadOnlyList<SymbolSearchTarget> Unavailable { get; init; }
         public required IReadOnlyList<SymbolSearchTarget> Truncated { get; init; }
+        public string? Message { get; init; }
         public required MetaObject Meta { get; init; }
     }
 }

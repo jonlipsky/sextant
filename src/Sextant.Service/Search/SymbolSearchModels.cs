@@ -84,4 +84,7 @@ internal sealed record SymbolSearchOutcome
 
     /// <summary>The newest <c>published_at</c> among the snapshots read this call, or 0.</summary>
     public long IndexFreshness { get; init; }
+
+    /// <summary>True when the page holds fewer symbols than were read, to fit the response size budget.</summary>
+    public bool CutBySize { get; init; }
 }

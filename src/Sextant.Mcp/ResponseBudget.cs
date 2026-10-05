@@ -5,8 +5,7 @@ namespace Sextant.Mcp;
 /// <summary>
 /// The most characters one tool result may hold. An MCP client caps what it accepts from a tool (Claude Code
 /// rejects a result over <c>MAX_MCP_OUTPUT_TOKENS</c>, 25,000 by default, which it estimates from the character
-/// count), and a rejected result leaves the agent guessing. So every list-returning tool (except the service's
-/// <c>search_symbols</c>, which has its own hit cap) fits its rows to this
+/// count), and a rejected result leaves the agent guessing. So every list-returning tool fits its rows to this
 /// budget: a paged tool stops at the last row that fits and returns <c>meta.next_cursor</c> exactly as it does at
 /// <c>limit</c>, and an unpaged one stops there and says how to narrow the query. At least one row is always
 /// returned, and <c>meta.total</c> stays exact.
