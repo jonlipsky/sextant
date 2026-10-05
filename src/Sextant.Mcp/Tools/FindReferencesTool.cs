@@ -35,7 +35,7 @@ public static class FindReferencesTool
         var symbolStore = new SymbolStore(conn) { Scope = snapshotScope };
         var referenceStore = new ReferenceStore(conn) { Scope = snapshotScope };
         var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
-        var contextRetriever = new SourceContextRetriever(new FileStore(conn));
+        var contextRetriever = new SourceContextRetriever(new FileStore(conn), dbProvider.SourceTexts);
 
         var lookup = SymbolResolver.Lookup(symbolStore, projectStore, symbol_fqn);
         if (lookup.Status != SymbolLookupStatus.Resolved)

@@ -23,6 +23,12 @@ public sealed class ServicePaths
     public string CacheRoot => _cacheRoot;
     public string ScratchRoot => _scratchRoot;
 
+    /// <summary>
+    /// The content-addressed source-text store on the artifact volume (issue #244): the indexed bytes every
+    /// published snapshot serves its source text from, so it is backed up with the catalog.
+    /// </summary>
+    public string SourceTextRoot => Path.Combine(_artifactRoot, Sextant.Store.SourceTextStore.DirectoryName);
+
     public ServicePaths(ServiceVolumes volumes)
     {
         _checkoutRoot = NormalizeFull(volumes.CheckoutRoot);

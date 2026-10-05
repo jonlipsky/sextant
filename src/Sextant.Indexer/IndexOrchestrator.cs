@@ -46,6 +46,13 @@ public sealed class IndexOrchestrator
     /// </summary>
     internal Func<string, Task<List<SubmoduleInfo>>> SubmoduleDiscoverer { get; init; } = SubmoduleDiscovery.DiscoverAsync;
 
+    /// <summary>
+    /// Where the run keeps the bytes of every source file it hashes (issue #244), so each published snapshot serves
+    /// its own source text even after the checkout moves to another commit. Null (the default, the local
+    /// CLI/daemon) keeps nothing; the index service's worker sets it.
+    /// </summary>
+    public SourceTextStore? SourceTexts { get; init; }
+
     /// <summary>One non-generated document paired with its project's compilation, the unit of parallel
     /// per-document extraction. The semantic model is built inside the worker so each model is used on
     /// a single thread; the compilation is immutable and safely shared.</summary>
@@ -133,7 +140,7 @@ public sealed class IndexOrchestrator
         // file_version_id (symbols, occurrences, comments) route through it so path→id resolution is
         // single-sourced, cached, and — because it is only touched by the sequential symbol phase and
         // the single occurrence-persistence consumer — deterministic (Phase 6).
-        var fileStore = new FileStore(conn);
+        var fileStore = new FileStore(conn) { SourceTexts = SourceTexts };
         symbolStore.Files = fileStore;
         referenceStore.Files = fileStore;
         callGraphStore.Files = fileStore;

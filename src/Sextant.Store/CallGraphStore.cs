@@ -40,7 +40,7 @@ public sealed class CallGraphStore(SqliteConnection connection)
     // column so two distinct calls on one line (e.g. `F(a); F(b);`) stay distinguishable occurrences —
     // the discriminator the unified schema reserves for same-line disambiguation.
     private const string SelectBase = """
-        SELECT o.id AS id, o.source_symbol_id, o.target_symbol_id, o.line, o.col, o.flags, o.last_indexed_at,
+        SELECT o.id AS id, o.in_project_id, o.source_symbol_id, o.target_symbol_id, o.line, o.col, o.flags, o.last_indexed_at,
                f.repo_relative_path AS repo_relative_path, p.disk_path AS disk_path,
                p.repo_relative_path AS project_repo_relative
         FROM occurrences o
@@ -181,6 +181,7 @@ public sealed class CallGraphStore(SqliteConnection connection)
             results.Add(new CallGraphEdge
             {
                 Id = reader.GetInt64(reader.GetOrdinal("id")),
+                InProjectId = reader.GetInt64(reader.GetOrdinal("in_project_id")),
                 CallerSymbolId = reader.GetInt64(reader.GetOrdinal("source_symbol_id")),
                 CalleeSymbolId = reader.GetInt64(reader.GetOrdinal("target_symbol_id")),
                 CallSiteFile = callSiteFile,

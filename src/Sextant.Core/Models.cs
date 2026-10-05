@@ -75,6 +75,10 @@ public sealed class RelationshipInfo
 public sealed class CallGraphEdge
 {
     public long Id { get; set; }
+
+    /// <summary>The project version the call occurs in (the caller's), which owns <see cref="CallSiteFile"/>.</summary>
+    public long InProjectId { get; init; }
+
     public long CallerSymbolId { get; set; }
     public long CalleeSymbolId { get; set; }
     public required string CallSiteFile { get; init; }
