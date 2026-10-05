@@ -51,9 +51,7 @@ public static class GetImplementorsTool
             .ThenBy(i => i.Symbol.Id).ThenBy(i => i.Kind)
             .ToList();
 
-        object? summary = page.IsTruncatedFirstPage(implementors.Count)
-            ? new { ByFile = Paging.CountBy(implementors, i => i.Symbol.FilePath) }
-            : null;
+        object? Summary() => new { ByFile = Paging.CountBy(implementors, i => i.Symbol.FilePath) };
 
         var results = page.Slice(implementors).Select(i => (object)new
         {
@@ -74,6 +72,6 @@ public static class GetImplementorsTool
         }
         var freshness = implementors.Count > 0 ? targetSymbol.LastIndexedAt : 0;
         return ResponseBuilder.BuildPage(results, implementors.Count, page, freshness, lookup.Ambiguity, readContext.Provenance,
-            summary, message: ResponseBuilder.JoinMessages(SymbolResolver.ResolutionNote(symbolStore, lookup), empty));
+            Summary, message: ResponseBuilder.JoinMessages(SymbolResolver.ResolutionNote(symbolStore, lookup), empty));
     }
 }

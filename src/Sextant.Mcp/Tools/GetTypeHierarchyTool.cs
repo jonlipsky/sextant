@@ -55,7 +55,7 @@ public static class GetTypeHierarchyTool
             }
             : null;
         var freshness = rootSymbol.LastIndexedAt;
-        return ResponseBuilder.Build(results, freshness, lookup.Ambiguity, readContext.Provenance,
+        return ResponseBuilder.BuildBounded(results, readContext, freshness, lookup.Ambiguity, readContext.Provenance,
             message: ResponseBuilder.JoinMessages(SymbolResolver.ResolutionNote(symbolStore, lookup), empty));
     }
 

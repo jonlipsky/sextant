@@ -108,13 +108,11 @@ public static class FindTestsTool
         testMethods = testMethods
             .OrderBy(t => t.FilePath, StringComparer.Ordinal).ThenBy(t => t.LineStart).ThenBy(t => t.Id)
             .ToList();
-        object? summary = page.IsTruncatedFirstPage(testMethods.Count)
-            ? new
-            {
-                ByClass = Paging.CountBy(testMethods, t => TestClassName(namer, t)),
-                ByFile = Paging.CountBy(testMethods, t => t.FilePath)
-            }
-            : null;
+        object? Summary() => new
+        {
+            ByClass = Paging.CountBy(testMethods, t => TestClassName(namer, t)),
+            ByFile = Paging.CountBy(testMethods, t => t.FilePath)
+        };
 
         var results = page.Slice(testMethods).Select(t => (object)new
         {
@@ -129,7 +127,7 @@ public static class FindTestsTool
         }).ToList();
 
         var freshness = testMethods.Count > 0 ? testMethods.Min(t => t.LastIndexedAt) : 0;
-        return ResponseBuilder.BuildPage(results, testMethods.Count, page, freshness, ambiguity, readContext.Provenance, summary,
+        return ResponseBuilder.BuildPage(results, testMethods.Count, page, freshness, ambiguity, readContext.Provenance, Summary,
             message: message);
     }
 

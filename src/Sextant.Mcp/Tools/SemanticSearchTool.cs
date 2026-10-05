@@ -56,6 +56,6 @@ public static class SemanticSearchTool
         var mapped = results.Select(s => FindSymbolTool.MapSymbol(
             s, FindSymbolTool.ResolveCanonicalId(s.ProjectId, canonicalIdCache), qualifiedName: namer.QualifiedName(s))).ToList<object>();
         var freshness = results.Count > 0 ? results.Min(s => s.LastIndexedAt) : 0;
-        return ResponseBuilder.Build(mapped, freshness, provenance: readContext.Provenance);
+        return ResponseBuilder.BuildBounded(mapped, readContext, freshness, provenance: readContext.Provenance);
     }
 }

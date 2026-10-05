@@ -93,13 +93,11 @@ public static class FindCommentsTool
             .ToList();
 
         var canonicalIdCache = FindSymbolTool.BuildCanonicalIdCache(projectStore);
-        object? summary = page.IsTruncatedFirstPage(comments.Count)
-            ? new
-            {
-                ByTag = Paging.CountBy(comments, c => c.Tag),
-                ByFile = Paging.CountBy(comments, c => c.FilePath)
-            }
-            : null;
+        object? Summary() => new
+        {
+            ByTag = Paging.CountBy(comments, c => c.Tag),
+            ByFile = Paging.CountBy(comments, c => c.FilePath)
+        };
 
         var results = page.Slice(comments).Select(c =>
         {
@@ -122,7 +120,7 @@ public static class FindCommentsTool
         }).ToList();
 
         var freshness = comments.Count > 0 ? comments.Min(c => c.LastIndexedAt) : 0;
-        return ResponseBuilder.BuildPage(results, comments.Count, page, freshness, ambiguity, readContext.Provenance, summary,
+        return ResponseBuilder.BuildPage(results, comments.Count, page, freshness, ambiguity, readContext.Provenance, Summary,
             message: note);
     }
 

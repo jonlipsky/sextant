@@ -27,6 +27,9 @@ public class LiveMcpFederationTests
 {
     private const string QueryToken = "query-secret";
 
+    // Small enough that a page of the seeded snapshots does not fit, large enough for the envelope and a row.
+    private const int BaseBudget = 2_000;
+
     // ---- acceptance: end-to-end federation over a real HTTP peer ------------------------------------
 
     [TestMethod]
@@ -274,6 +277,64 @@ public class LiveMcpFederationTests
         Assert.AreEqual("partial", snapshot.GetProperty("coverage").GetProperty("verdict").GetString());
     }
 
+    // ---- size budget: a page over the response budget is cut and resumes at the first row it left out ----
+
+    [TestMethod]
+    public async Task LocalBase_PageOverTheSizeBudget_IsCutAndTheCursorResumesAtTheNextRow()
+    {
+        using var node = LocalNode.PureLocal(
+            ServiceTestFixtures.Request(repo: "https://github.com/org/appA", commit: "commit-aaaa"), symbolCount: 40,
+            maxResponseChars: BaseBudget);
+
+        var seen = await WalkBaseAsync(node.Provider, node.LocalIdentityHash, BaseBudget);
+
+        Assert.AreEqual(40, seen.Count, "the size-cut pages concatenate to every symbol of the snapshot");
+        Assert.AreEqual(40, seen.Distinct().Count(), "no row is repeated or skipped across a size cut");
+    }
+
+    [TestMethod]
+    public async Task RemoteBase_PageOverTheSizeBudget_IsCutAndTheCursorResumesAtTheNextRow()
+    {
+        await using var peer = await RemotePeer.StartAsync(
+            ServiceTestFixtures.Request(repo: "https://github.com/org/appB", commit: "commit-bbbb"),
+            symbolCount: 30);
+        using var node = LocalNode.Federated(
+            peerUrl: "http://peer.local", peerClient: peer.Client, token: QueryToken, maxResponseChars: BaseBudget);
+
+        var seen = await WalkBaseAsync(node.Provider, peer.IdentityHash, BaseBudget);
+
+        Assert.AreEqual(30, seen.Count, "the size-cut pages of a federated base concatenate to every symbol");
+        Assert.AreEqual(30, seen.Distinct().Count(), "a size-cut cursor stays in the peer's id space");
+    }
+
+    private static async Task<List<string>> WalkBaseAsync(DatabaseProvider provider, string identityHash, int budget)
+    {
+        var seen = new List<string>();
+        var cut = 0;
+        string? cursor = null;
+        for (var pages = 0; pages < 100; pages++)
+        {
+            var json = await GetBaseSnapshotSymbolsTool.GetBaseSnapshotSymbols(provider, identityHash, cursor);
+            Assert.IsTrue(json.Length <= budget, $"page {pages} is {json.Length} chars, over the {budget}-char budget");
+            using var doc = JsonDocument.Parse(json);
+            var meta = doc.RootElement.GetProperty("meta");
+            foreach (var r in doc.RootElement.GetProperty("results").EnumerateArray())
+                seen.Add(r.GetProperty("symbol_key").GetString()!);
+            if (meta.TryGetProperty("page_truncated_by", out var by))
+            {
+                Assert.AreEqual("size", by.GetString());
+                cut++;
+            }
+            cursor = meta.TryGetProperty("next_cursor", out var nc) ? nc.GetString() : null;
+            if (cursor is null)
+                break;
+        }
+
+        Assert.IsNull(cursor, "the walk ended");
+        Assert.IsTrue(cut > 0, "at least one page was cut by the size budget, so the walk crossed a size cut");
+        return seen;
+    }
+
     [TestMethod]
     public void Federation_Create_WithNoPeers_ProducesNoSource()
     {
@@ -301,7 +362,7 @@ public class LiveMcpFederationTests
             Provider = provider;
         }
 
-        public static LocalNode Federated(string peerUrl, HttpClient peerClient, string? token)
+        public static LocalNode Federated(string peerUrl, HttpClient peerClient, string? token, int? maxResponseChars = null)
         {
             var localDb = new SeededDb(
                 ServiceTestFixtures.Request(repo: "https://github.com/org/appA", commit: "commit-aaaa"), symbolCount: 2);
@@ -311,16 +372,16 @@ public class LiveMcpFederationTests
                 PeerQueryToken = token,
                 RemoteFetchTimeoutSeconds = 5
             };
-            var provider = new DatabaseProvider(localDb.Path);
+            var provider = new DatabaseProvider(localDb.Path) { MaxResponseChars = maxResponseChars ?? 0 };
             provider.AttachRemoteFederation(RemoteBaseSnapshotFederation.Create(config, peerClient));
             return new LocalNode(localDb, provider);
         }
 
         public static LocalNode PureLocal(
-            EnsureSnapshotRequest request, int symbolCount, SnapshotCoverage? coverage = null)
+            EnsureSnapshotRequest request, int symbolCount, SnapshotCoverage? coverage = null, int? maxResponseChars = null)
         {
             var localDb = new SeededDb(request, symbolCount, coverage);
-            return new LocalNode(localDb, new DatabaseProvider(localDb.Path));
+            return new LocalNode(localDb, new DatabaseProvider(localDb.Path) { MaxResponseChars = maxResponseChars ?? 0 });
         }
 
         public void Dispose()

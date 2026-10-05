@@ -68,7 +68,7 @@ public static class RemoteResponsePresenter
             && context?.Provenance is { } provenance)
             meta["snapshot"] = LeanSnapshot(context, provenance);
 
-        return paths.Redact(node)?.ToJsonString() ?? text;
+        return paths.Redact(node)?.ToJsonString(ResponseBuilder.NodeWriteOptions) ?? text;
     }
 
     /// <summary>

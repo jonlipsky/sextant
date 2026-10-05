@@ -130,7 +130,7 @@ public class UnboundCallSitesHttpTests
 
     // ==== fixture ======================================================================================
 
-    private static void IndexStore(IndexDatabase db, string root)
+    internal static void IndexStore(IndexDatabase db, string root)
     {
         var request = new EnsureSnapshotRequest
         {

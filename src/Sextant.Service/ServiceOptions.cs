@@ -137,6 +137,15 @@ public sealed record ServiceOptions
     public const int SearchMaxHitsCeiling = 5000;
 
     /// <summary>
+    /// The most characters one <c>/mcp</c> tool result may hold, measured on the text the client receives
+    /// (<see cref="Sextant.Mcp.ResponseBudget"/>): a list that does not fit ends at the last row that does, with
+    /// <c>meta.next_cursor</c> or a hint to narrow the query. <c>SEXTANT_SERVICE_MAX_RESPONSE_CHARS</c> (default
+    /// 20,000); a missing, non-positive or unparseable value keeps the default, and a smaller value than
+    /// <see cref="Sextant.Mcp.ResponseBudget.MinMaxChars"/> is raised to it.
+    /// </summary>
+    public int MaxResponseChars { get; init; } = Sextant.Mcp.ResponseBudget.DefaultMaxChars;
+
+    /// <summary>
     /// Throws when the caller-identity settings are inconsistent (fail closed): invalid <see cref="CallerAssertion"/>
     /// options, delegate tokens without caller keys, or a delegate token that is blank or equal to the control,
     /// query or contribute token or to a read-policy principal's token. Messages never contain a token or key.
@@ -443,6 +452,7 @@ public sealed record ServiceOptions
                 ? Math.Min(width, SearchMaxWidthCeiling) : DefaultSearchMaxWidth,
             SearchMaxHits = EnvInt("SEARCH_MAX_HITS") is int hits and > 0
                 ? Math.Clamp(hits, SearchMaxHitsFloor, SearchMaxHitsCeiling) : DefaultSearchMaxHits,
+            MaxResponseChars = Sextant.Mcp.ResponseBudget.Clamp(EnvInt("MAX_RESPONSE_CHARS")),
             BindAddress = EnvHost("BIND_ADDRESS") ?? "localhost",
             ControlPort = EnvInt("CONTROL_PORT") ?? 3011,
             QueryPort = EnvInt("QUERY_PORT"),

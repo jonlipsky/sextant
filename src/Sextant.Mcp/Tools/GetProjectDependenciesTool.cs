@@ -31,7 +31,7 @@ public static class GetProjectDependenciesTool
 
         CollectDependencies(project.Value.id, 0, transitive, visited, results, projectStore, dependencyStore);
 
-        return ResponseBuilder.Build(results, project.Value.lastIndexedAt, provenance: readContext.Provenance,
+        return ResponseBuilder.BuildBounded(results, readContext, project.Value.lastIndexedAt, provenance: readContext.Provenance,
             message: results.Count == 0 ? $"Project '{project_id}' has no indexed project dependencies." : null);
     }
 

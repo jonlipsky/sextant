@@ -10,6 +10,14 @@ public sealed class SextantConfiguration
     public string Profile { get; set; } = "default";
     public int MaxCallHierarchyDepth { get; set; } = 5;
     public int FtsMaxResults { get; set; } = 20;
+
+    /// <summary>
+    /// The most characters one MCP tool result may hold (the MCP server's response size budget): a list that does not
+    /// fit ends at the last row that does, with a cursor or a hint to narrow the query. 0 (the default) means the
+    /// server's default (20,000). Overridable via <c>max_response_chars</c> in <c>sextant.json</c> or the
+    /// <c>SEXTANT_MAX_RESPONSE_CHARS</c> env var.
+    /// </summary>
+    public int MaxResponseChars { get; set; }
     public List<string> Solutions { get; set; } = [];
     public string? DaemonSocket { get; set; }
     public bool AutoSpawnDaemon { get; set; } = true;
@@ -266,6 +274,8 @@ public sealed class SextantConfiguration
                             config.MaxCallHierarchyDepth = fileConfig.MaxCallHierarchyDepth.Value;
                         if (fileConfig.FtsMaxResults.HasValue)
                             config.FtsMaxResults = fileConfig.FtsMaxResults.Value;
+                        if (fileConfig.MaxResponseChars.HasValue)
+                            config.MaxResponseChars = fileConfig.MaxResponseChars.Value;
                         if (fileConfig.Solutions != null)
                             config.Solutions = fileConfig.Solutions;
                         if (fileConfig.Profile != null)
@@ -351,6 +361,10 @@ public sealed class SextantConfiguration
         var ftsMax = Environment.GetEnvironmentVariable("SEXTANT_FTS_MAX");
         if (int.TryParse(ftsMax, out var max))
             config.FtsMaxResults = max;
+
+        var maxResponseChars = Environment.GetEnvironmentVariable("SEXTANT_MAX_RESPONSE_CHARS");
+        if (int.TryParse(maxResponseChars, out var responseChars))
+            config.MaxResponseChars = responseChars;
 
         var daemonSocket = Environment.GetEnvironmentVariable("SEXTANT_DAEMON_SOCKET");
         if (!string.IsNullOrEmpty(daemonSocket))
@@ -460,6 +474,9 @@ public sealed class SextantConfiguration
 
         [JsonPropertyName("fts_max_results")]
         public int? FtsMaxResults { get; set; }
+
+        [JsonPropertyName("max_response_chars")]
+        public int? MaxResponseChars { get; set; }
 
         [JsonPropertyName("solutions")]
         public List<string>? Solutions { get; set; }

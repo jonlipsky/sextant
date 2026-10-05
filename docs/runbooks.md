@@ -115,6 +115,16 @@ highest migration file. A restored/older catalog is upgraded on next startup.
 > A backup taken at a **newer** schema than the restoring build is **refused** (forward-only guard) so a bad
 > restore never half-lands. This is exercised by `SchemaUpgradeRehearsalTests`.
 
+**Rolling back a binary across a migration.** An older build opening a catalog that a newer one migrated
+applies nothing and starts, but `CheckReadiness` reports the catalog as built by a newer schema, so it serves
+no MCP read until the catalog matches it. The supported rollback is to restore the pre-upgrade backup. For a
+purely additive migration such as `026` (one nullable `symbols.declaration` column), a faster route keeps
+the data: delete that version's row (`DELETE FROM schema_version WHERE version = 26;`) with the service
+stopped. The older build never reads the column (it names its columns, never `SELECT *` on `symbols`) and
+indexes with its own snapshot identities. To roll forward again, re-insert the row
+(`INSERT INTO schema_version (version, applied_at) VALUES (26, datetime('now'));`) instead of letting startup
+re-run `026`, which would fail on the existing column.
+
 ---
 
 ## Runbook: snapshot corruption / disaster recovery

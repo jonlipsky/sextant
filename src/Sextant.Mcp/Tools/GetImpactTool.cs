@@ -50,7 +50,7 @@ public static class GetImpactTool
         foreach (var (dep, consumer) in page.Slice(consumers))
         {
             var consumerProject = consumer!.Value;
-            consumerResults.Add(new
+            consumerResults.Add((object)new
             {
                 project = new
                 {
@@ -89,27 +89,28 @@ public static class GetImpactTool
             }
         }
 
-        var result = new List<object>
+        // The page's rows are the consumers; the response wraps the ones it keeps in the one symbol row.
+        var target = new
         {
-            new
-            {
-                symbol = new
-                {
-                    fully_qualified_name = namer.QualifiedName(symbol),
-                    display_name = symbol.DisplayName,
-                    kind = symbol.Kind.ToString().ToLowerInvariant(),
-                    file_path = symbol.FilePath,
-                    line_start = symbol.LineStart
-                },
-                is_api_surface = isApiSurface,
-                change_classification = changeClassification,
-                consumers = consumerResults
-            }
+            fully_qualified_name = namer.QualifiedName(symbol),
+            display_name = symbol.DisplayName,
+            kind = symbol.Kind.ToString().ToLowerInvariant(),
+            file_path = symbol.FilePath,
+            line_start = symbol.LineStart
         };
 
-        return ResponseBuilder.BuildPage(result, consumers.Count, page, symbol.LastIndexedAt, lookup.Ambiguity,
-            readContext.Provenance, resultCount: consumerResults.Count,
-            message: SymbolResolver.ResolutionNote(symbolStore, lookup));
+        return ResponseBuilder.BuildPage(consumerResults, consumers.Count, page, symbol.LastIndexedAt, lookup.Ambiguity,
+            readContext.Provenance, message: SymbolResolver.ResolutionNote(symbolStore, lookup),
+            shape: kept => new List<object>
+            {
+                new
+                {
+                    symbol = target,
+                    is_api_surface = isApiSurface,
+                    change_classification = changeClassification,
+                    consumers = kept
+                }
+            });
     }
 
     private static List<(string symbolKey, string fqn, string signatureHash, string accessibility)> BuildSurface(

@@ -38,6 +38,7 @@ public static class FindSubmoduleConsumersTool
             submodule_dirty = c.SubmoduleDirty
         }).ToList();
 
-        return ResponseBuilder.Build(results, readContext.Provenance?.Freshness, ambiguity: null, readContext.Provenance);
+        return ResponseBuilder.BuildBounded(results, readContext, readContext.Provenance?.Freshness, ambiguity: null,
+            readContext.Provenance);
     }
 }

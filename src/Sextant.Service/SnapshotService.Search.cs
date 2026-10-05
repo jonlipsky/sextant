@@ -94,11 +94,13 @@ public sealed partial class SnapshotService
     /// tracked in hash order, and at most <see cref="ServiceOptions.SearchMaxWidth"/> of those are read per call,
     /// round-robin, sharing <see cref="ServiceOptions.SearchMaxHits"/>. <paramref name="resume"/> is honored only for
     /// snapshots still visible. A failure to read the grants propagates: it never becomes an empty or unscoped result.
+    /// When <paramref name="fits"/> refuses the page (the response size budget), the page keeps fewer symbols and its
+    /// cursor resumes at the first one left out (see <c>SizeCut</c>).
     /// </summary>
     /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
     internal SymbolSearchOutcome SearchSymbols(
         CallerPrincipal caller, SymbolSearchQuery query, SymbolSearchCursorState? resume,
-        CancellationToken cancellationToken = default)
+        Func<SymbolSearchOutcome, bool>? fits = null, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(caller);
         ArgumentNullException.ThrowIfNull(query);
@@ -106,12 +108,12 @@ public sealed partial class SnapshotService
             Math.Clamp(_options.SearchMaxWidth, 1, ServiceOptions.SearchMaxWidthCeiling),
             Math.Clamp(_options.SearchMaxHits, ServiceOptions.SearchMaxHitsFloor, ServiceOptions.SearchMaxHitsCeiling));
         var bounded = query with { Limit = Math.Clamp(query.Limit, 1, SymbolSearchQuery.MaxLimit) };
-        return ReadCatalogCancellable(conn => SearchOn(conn, caller, bounded, resume, bounds, cancellationToken), cancellationToken);
+        return ReadCatalogCancellable(conn => SearchOn(conn, caller, bounded, resume, bounds, fits, cancellationToken), cancellationToken);
     }
 
     private SymbolSearchOutcome SearchOn(
         SqliteConnection conn, CallerPrincipal caller, SymbolSearchQuery query, SymbolSearchCursorState? resume,
-        SearchBounds bounds, CancellationToken cancellationToken)
+        SearchBounds bounds, Func<SymbolSearchOutcome, bool>? fits, CancellationToken cancellationToken)
     {
         var grants = new RepositoryGrantStore(conn).ListVisible(caller.TenantId, VisibilitySubject(caller));
         var targets = ResolveSearchTargets(conn, grants, query, cancellationToken);
@@ -134,16 +136,14 @@ public sealed partial class SnapshotService
         }
 
         var (tracked, watermark, start) = Admit(snapshots, resume, ServiceOptions.SearchMaxWidthCeiling);
-        var next = new List<SymbolSearchPosition>();
-        var deferred = new List<string>();
+        var waiting = new List<SymbolSearchPosition>();
         var turn = new List<SymbolSearchPosition>();
         foreach (var position in tracked)
         {
             if (turn.Count >= bounds.Width || (start is not null && string.CompareOrdinal(position.IdentityHash, start) <= 0))
             {
                 // Not this page's turn: kept unread, for a later page of this round or for the next round.
-                next.Add(position);
-                deferred.Add(position.IdentityHash);
+                waiting.Add(position);
             }
             else
             {
@@ -152,16 +152,13 @@ public sealed partial class SnapshotService
         }
 
         var page = new SearchPageInput(query, NoCasePrefixRange.Of(query.NamePrefix), LikePrefix(query.NamePrefix), cancellationToken);
-        var hits = new List<(SymbolSearchHit Hit, long Id)>();
+        var reads = new List<TurnRead>(turn.Count);
         var budget = bounds.MaxHits;
         var examineBudget = SearchKindExamineRowsPerCall;
-        string? rotation = null;
-        long freshness = 0;
         for (var i = 0; i < turn.Count; i++)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var position = turn[i];
-            rotation = position.IdentityHash;
             var snapshot = snapshots[position.IdentityHash];
             // The snapshots still to read share what is left of the call's budget evenly. MaxHits is at least the width,
             // so every one of them gets at least one row and the round-robin turns are unchanged.
@@ -179,21 +176,110 @@ public sealed partial class SnapshotService
             catch (SqliteException) when (!cancellationToken.IsCancellationRequested)
             {
                 examineBudget -= take;
-                unavailable.AddRange(snapshot.Targets);
-                next.Add(position);
+                reads.Add(new TurnRead(position, null));
                 continue;
             }
 
             budget -= rows.Hits.Count;
             examineBudget -= rows.Examined;
-            freshness = Math.Max(freshness, snapshot.Row.PublishedAt ?? 0L);
-            if (rows.ResumeAfter is long after)
-                next.Add(position with { AfterId = after });
-            hits.AddRange(rows.Hits);
+            reads.Add(new TurnRead(position, rows));
         }
 
         var unadmitted = snapshots.Keys.Where(h => watermark is null || string.CompareOrdinal(h, watermark) > 0).ToList();
-        deferred.AddRange(unadmitted);
+        var parts = new SearchPageParts(snapshots, waiting, reads, unadmitted, pending, unavailable, watermark);
+        var full = Compose(parts, reads.Count, int.MaxValue);
+        return fits is null || full.Symbols.Count <= 1 || fits(full) ? full : SizeCut(parts, fits);
+    }
+
+    // The largest page that `fits` accepts, cut from the full one (the response size budget). Every cut keeps a prefix
+    // of each snapshot's own page order, so its cursor resumes exactly at the first row it left out. First every
+    // snapshot of the turn keeps at most `cap` of its rows: more rows only make the page longer, so the largest cap
+    // that fits is bisected. When one row from each is still too long, the turn ends early, after the most snapshots
+    // that fit (those left out with rows wait for the next page, which starts with them, and are listed in
+    // `truncated`). Leaving a snapshot out can make a page longer (its targets and position stay in the envelope), so
+    // that count is searched from the top, one by one (a turn is at most SearchMaxWidthCeiling reads). The turn never
+    // ends before its first snapshot with a row, so a cut page always returns at least one.
+    private static SymbolSearchOutcome SizeCut(SearchPageParts parts, Func<SymbolSearchOutcome, bool> fits)
+    {
+        var reads = parts.Reads.Count;
+        var whole = Compose(parts, reads, 1);
+        if (fits(whole))
+        {
+            var best = whole;
+            int low = 1, high = parts.Reads.Max(r => r.Rows?.Hits.Count ?? 0) - 1;
+            while (low < high)
+            {
+                var mid = low + (high - low + 1) / 2;
+                var candidate = Compose(parts, reads, mid);
+                if (fits(candidate))
+                {
+                    low = mid;
+                    best = candidate;
+                }
+                else
+                {
+                    high = mid - 1;
+                }
+            }
+            return best;
+        }
+
+        var first = parts.Reads.FindIndex(r => r.Rows?.Hits.Count > 0) + 1;
+        for (var read = reads - 1; read > first; read--)
+        {
+            var candidate = Compose(parts, read, 1);
+            if (fits(candidate))
+                return candidate;
+        }
+        return Compose(parts, first, 1);
+    }
+
+    // One page from the turn's reads: the snapshots after the first `read` are left out when they have rows (a read
+    // that failed or found nothing is reported as read, since leaving it out would only lengthen the page), and each
+    // snapshot keeps at most `cap` of its rows. With every snapshot and no cap, this is the page as read.
+    private static SymbolSearchOutcome Compose(SearchPageParts parts, int read, int cap)
+    {
+        var next = new List<SymbolSearchPosition>(parts.Waiting);
+        var deferred = parts.Waiting.Select(p => p.IdentityHash).ToList();
+        var unavailable = new List<SymbolSearchTarget>(parts.Unavailable);
+        var hits = new List<(SymbolSearchHit Hit, long Id)>();
+        var cut = false;
+        long freshness = 0;
+        for (var i = 0; i < parts.Reads.Count; i++)
+        {
+            var (position, rows) = parts.Reads[i];
+            var snapshot = parts.Snapshots[position.IdentityHash];
+            if (i >= read && rows is { Hits.Count: > 0 })
+            {
+                next.Add(position);
+                deferred.Add(position.IdentityHash);
+                cut = true;
+            }
+            else if (rows is not { } page)
+            {
+                unavailable.AddRange(snapshot.Targets);
+                next.Add(position);
+            }
+            else
+            {
+                freshness = Math.Max(freshness, snapshot.Row.PublishedAt ?? 0L);
+                if (page.Hits.Count > cap)
+                {
+                    hits.AddRange(page.Hits.Take(cap));
+                    next.Add(position with { AfterId = page.Hits[cap - 1].Id });
+                    cut = true;
+                }
+                else
+                {
+                    hits.AddRange(page.Hits);
+                    if (page.ResumeAfter is long after)
+                        next.Add(position with { AfterId = after });
+                }
+            }
+        }
+
+        deferred.AddRange(parts.Unadmitted);
+        var rotation = read > 0 ? parts.Reads[read - 1].Position.IdentityHash : null;
         return new SymbolSearchOutcome
         {
             Symbols = hits
@@ -202,14 +288,15 @@ public sealed partial class SnapshotService
                 .ThenBy(h => h.Id)
                 .Select(h => h.Hit)
                 .ToList(),
-            Next = next.Count == 0 && unadmitted.Count == 0
+            Next = next.Count == 0 && parts.Unadmitted.Count == 0
                 ? null
                 : new SymbolSearchCursorState(
-                    next.OrderBy(p => p.IdentityHash, StringComparer.Ordinal).ToList(), watermark, rotation),
-            Pending = Ordered(pending),
+                    next.OrderBy(p => p.IdentityHash, StringComparer.Ordinal).ToList(), parts.Watermark, rotation),
+            Pending = Ordered(parts.Pending),
             Unavailable = Ordered(unavailable),
-            Truncated = Ordered(deferred.SelectMany(h => snapshots[h].Targets)),
-            IndexFreshness = freshness
+            Truncated = Ordered(deferred.SelectMany(h => parts.Snapshots[h].Targets)),
+            IndexFreshness = freshness,
+            CutBySize = cut
         };
     }
 
@@ -458,6 +545,16 @@ public sealed partial class SnapshotService
     // What every snapshot page of one call shares.
     private sealed record SearchPageInput(
         SymbolSearchQuery Query, NoCasePrefixRange Range, string Pattern, CancellationToken CancellationToken);
+
+    // One snapshot of a page's turn and what was read from it (null when it could not be read).
+    private readonly record struct TurnRead(SymbolSearchPosition Position, SnapshotPage? Rows);
+
+    // What every candidate rendering of one page shares: the visible snapshots, the tracked positions not in this
+    // page's turn, the turn's reads, the visible hashes not admitted yet, the targets with no snapshot or an unreadable
+    // one, and the cursor's watermark.
+    private sealed record SearchPageParts(
+        SortedDictionary<string, SearchSnapshot> Snapshots, List<SymbolSearchPosition> Waiting, List<TurnRead> Reads,
+        List<string> Unadmitted, List<SymbolSearchTarget> Pending, List<SymbolSearchTarget> Unavailable, string? Watermark);
 
     // One snapshot's page: its hits (with their row ids), the row it resumes after (null when it is exhausted), and how
     // many rows it examined.

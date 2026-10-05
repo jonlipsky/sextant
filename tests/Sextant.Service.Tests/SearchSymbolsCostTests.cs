@@ -51,7 +51,8 @@ public class SearchSymbolsCostTests
         var identity = ServiceTestFixtures.Request().ToIdentity();
 
         Assert.AreEqual(IndexDatabase.SnapshotSchemaVersion, identity.SchemaVersion);
-        Assert.IsTrue(identity.SchemaVersion < IndexDatabase.LatestSchemaVersion, "025 is identity-neutral");
+        Assert.IsTrue(IndexDatabase.IdentityNeutralMigrations.Contains(25), "025 is identity-neutral");
+        Assert.AreNotEqual(25, identity.SchemaVersion, "so the identity never folds 25");
     }
 
     // ==== query plans ===============================================================================
@@ -465,7 +466,7 @@ public class SearchSymbolsCostTests
     private static SymbolSearchOutcome Search(
         SnapshotService service, string prefix, int limit = SymbolSearchQuery.DefaultLimit, SymbolKind? kind = null,
         SymbolSearchCursorState? resume = null, CancellationToken cancellationToken = default) =>
-        service.SearchSymbols(Caller, new SymbolSearchQuery { NamePrefix = prefix, Limit = limit, Kind = kind }, resume, cancellationToken);
+        service.SearchSymbols(Caller, new SymbolSearchQuery { NamePrefix = prefix, Limit = limit, Kind = kind }, resume, cancellationToken: cancellationToken);
 
     private static List<SymbolSearchOutcome> Walk(SnapshotService service, string prefix, int limit, SymbolKind? kind = null) =>
         Pages(service, prefix, limit, kind).ToList();

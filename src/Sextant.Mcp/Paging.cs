@@ -12,16 +12,18 @@ namespace Sextant.Mcp;
 /// </summary>
 public sealed record PageRequest(int Offset, int Limit, string Binding)
 {
+    /// <summary>
+    /// The most characters this page's response may hold (<see cref="ResponseBudget"/>):
+    /// <see cref="ResponseBuilder.BuildPage{T}"/> ends the page at the last row that fits, before <see cref="Limit"/>.
+    /// </summary>
+    public int MaxChars { get; init; } = ResponseBudget.DefaultMaxChars;
+
+    /// <summary>How long a response is as the client receives it (see <see cref="ResponseBudget"/>).</summary>
+    internal Func<string, int> Measure { get; init; } = static text => text.Length;
+
     /// <summary>The rows of <paramref name="all"/> on this page.</summary>
     public List<T> Slice<T>(IReadOnlyList<T> all) =>
         Offset >= all.Count ? [] : all.Skip(Offset).Take(Limit).ToList();
-
-    /// <summary>The cursor for the page after this one, or null when <paramref name="total"/> ends on this page.</summary>
-    public string? NextCursor(int total) =>
-        Offset + Limit < total ? Paging.EncodeCursor(Offset + Limit, Binding) : null;
-
-    /// <summary>True on the first page of a result that does not fit it: the case that leads with a summary.</summary>
-    public bool IsTruncatedFirstPage(int total) => Offset == 0 && total > Limit;
 }
 
 /// <summary>
@@ -70,7 +72,11 @@ public static class Paging
     {
         var binding = Binding(tool, context.SelectedSnapshotId, queryArguments);
         var size = ClampLimit(limit);
-        page = new PageRequest(0, size, binding);
+        page = new PageRequest(0, size, binding)
+        {
+            MaxChars = context.MaxResponseChars,
+            Measure = text => ResponseBudget.Measure(text, context)
+        };
         error = string.Empty;
         if (string.IsNullOrEmpty(cursor))
             return true;
