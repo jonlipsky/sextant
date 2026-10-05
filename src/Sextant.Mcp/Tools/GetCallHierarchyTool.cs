@@ -8,7 +8,7 @@ namespace Sextant.Mcp.Tools;
 [McpServerToolType]
 public static class GetCallHierarchyTool
 {
-    [McpServerTool(Name = "get_call_hierarchy"), Description("Callers or callees of a method, transitively. Use instead of repeated grep and read.")]
+    [McpServerTool(Name = "get_call_hierarchy"), Description("Callers or callees of a method, transitively, including calls grep misses (aliases, using static, calls through interfaces). Use instead of repeated grep and read.")]
     public static string GetCallHierarchy(
         DatabaseProvider dbProvider,
         [Description("Method, fully qualified.")] string symbol_fqn,
