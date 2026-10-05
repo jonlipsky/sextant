@@ -20,7 +20,9 @@ public class IntegrationFixture
         var solution = await SolutionLoader.LoadSolutionAsync(solutionPath);
         var db = new IndexDatabase(fixture.DbPath);
         db.RunMigrations();
-        var orchestrator = new IndexOrchestrator(db, msg => { });
+        // The production default. The legacy fallback (one FindReferencesAsync per symbol) over the whole
+        // solution outgrew CI's 10-minute hang window; ExtractorParityTests still cover it.
+        var orchestrator = new IndexOrchestrator(db, msg => { }, useDocumentExtractor: true);
         await orchestrator.IndexSolutionAsync(solution);
 
         fixture.DbProvider = new DatabaseProvider(fixture.DbPath);
