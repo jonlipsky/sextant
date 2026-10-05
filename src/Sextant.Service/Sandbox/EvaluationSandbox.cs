@@ -35,6 +35,10 @@ public sealed class EvaluationSandbox(SandboxPolicy policy, ServicePaths paths, 
 {
     public SandboxPolicy Policy => policy;
 
+    public TimeSpan? TimeBudget => policy.Enabled && policy.TimeBudget > TimeSpan.Zero ? policy.TimeBudget : null;
+
+    public string? BudgetPolicyToken => EvaluationBudgetPolicy.Token(policy);
+
     public async Task<T> RunAsync<T>(
         string checkoutDir, string scratchDir, Func<CancellationToken, Task<T>> evaluate, CancellationToken cancellationToken)
     {
@@ -65,12 +69,16 @@ public sealed class EvaluationSandbox(SandboxPolicy policy, ServicePaths paths, 
         catch (OperationCanceledException) when (linked.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
         {
             // The sandbox — not the caller — cancelled: a budget was exceeded. Distinguish memory (watchdog
-            // tripped) from time (deadline elapsed) for the diagnostic; either way the job fails, never
-            // publishes, and is retryable.
+            // tripped) from time (deadline elapsed) for the diagnostic; either way the job fails and never
+            // publishes. The policy token lets the service retry it once the policy changes (issue #245).
             var kind = breach == SandboxBreach.Memory ? "memory" : "time";
             log?.Invoke($"sandbox aborted untrusted evaluation of '{checkoutDir}': {kind} budget exceeded.");
             throw new SandboxLimitExceededException(
-                $"untrusted repository evaluation exceeded its {kind} budget and was aborted.");
+                $"untrusted repository evaluation exceeded its {kind} budget and was aborted.")
+            {
+                Kind = kind,
+                PolicyToken = EvaluationBudgetPolicy.Token(policy),
+            };
         }
     }
 

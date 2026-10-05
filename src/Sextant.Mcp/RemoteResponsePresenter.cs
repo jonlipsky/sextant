@@ -108,8 +108,9 @@ public static class RemoteResponsePresenter
     }
 
     /// <summary>
-    /// The partial warning for <paramref name="coverage"/>: it counts what is missing (projects that did not load
-    /// or compile, submodules not checked out, solutions or parts of the checkout that could not be read) from the
+    /// The partial warning for <paramref name="coverage"/>: it counts what is missing (projects the time budget left
+    /// out, projects that did not load or compile, submodules not checked out, solutions or parts of the checkout
+    /// that could not be read) from the
     /// recorded coverage, so an agent can judge whether its question is affected, without naming a project or a
     /// tool. It holds at most <see cref="MaxPartialWarningChars"/> characters; a gap that does not fit is folded
     /// into "and other gaps". The generic <see cref="PartialWarning"/> is used when the record counts no gap.
@@ -139,6 +140,16 @@ public static class RemoteResponsePresenter
     private static List<string> CountedGaps(SnapshotCoverage coverage)
     {
         var parts = new List<string>();
+        // What the indexing time budget left out (#245) goes first: on a repository too large for the budget it is
+        // the largest gap. It is disjoint from the counts below: such a project was neither skipped nor extracted.
+        if (coverage.TimeBudget is { Exhausted: true } budget)
+        {
+            var leftOut = (long)Math.Max(budget.ProjectsNotLoaded, 0) + Math.Max(budget.ProjectsNotIndexed, 0)
+                          + Math.Max(budget.ProjectsNotFullyExtracted, 0);
+            parts.Add(coverage.ProjectsDeclared >= leftOut
+                ? $"the time budget left {leftOut} of {coverage.ProjectsDeclared} projects not fully indexed"
+                : $"the time budget left {leftOut} {Plural(leftOut, "project", "projects")} not fully indexed");
+        }
         var skipped = Math.Max(coverage.ProjectsSkipped, 0);
         var degraded = Math.Max(coverage.Binding?.ProjectsDegraded ?? 0, 0);
         if (skipped > 0 || degraded > 0)

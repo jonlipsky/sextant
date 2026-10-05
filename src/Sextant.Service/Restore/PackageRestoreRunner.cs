@@ -57,17 +57,19 @@ public sealed class PackageRestoreRunner(bool enabled = true, TimeSpan? timeout 
     internal string DotnetPath { get; init; } = ResolveDotnet();
 
     /// <summary>
-    /// Restores every solution in <paramref name="solutions"/> in order, under one deadline. Returns what was
-    /// achieved; throws only <see cref="OperationCanceledException"/> when <paramref name="cancellationToken"/>
-    /// is cancelled (after killing the running restore).
+    /// Restores every solution in <paramref name="solutions"/> in order, under one deadline: <see cref="Timeout"/>,
+    /// or <paramref name="limit"/> when it is shorter (the worker's share of a time-budgeted evaluation). Returns
+    /// what was achieved; throws only <see cref="OperationCanceledException"/> when
+    /// <paramref name="cancellationToken"/> is cancelled (after killing the running restore).
     /// </summary>
     public async Task<PackageRestoreOutcome> RunAsync(
-        string checkoutDir, IReadOnlyList<string> solutions, CancellationToken cancellationToken)
+        string checkoutDir, IReadOnlyList<string> solutions, TimeSpan? limit, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(solutions);
         if (!enabled)
             return PackageRestoreOutcome.Disabled;
 
+        var deadline = limit is { } l && l < Timeout ? (l > TimeSpan.Zero ? l : TimeSpan.Zero) : Timeout;
         var parser = new RestoreOutputParser(checkoutDir);
         var stopwatch = Stopwatch.StartNew();
         int attempted = 0, succeeded = 0, notStarted = 0;
@@ -75,7 +77,7 @@ public sealed class PackageRestoreRunner(bool enabled = true, TimeSpan? timeout 
 
         foreach (var solution in solutions)
         {
-            var remaining = Timeout - stopwatch.Elapsed;
+            var remaining = deadline - stopwatch.Elapsed;
             if (remaining <= TimeSpan.Zero)
             {
                 timedOut = true;
@@ -106,7 +108,7 @@ public sealed class PackageRestoreRunner(bool enabled = true, TimeSpan? timeout 
             SolutionsSucceeded = succeeded,
             SolutionsNotStarted = notStarted,
             TimedOut = timedOut,
-            Timeout = Timeout,
+            Timeout = deadline,
             Elapsed = stopwatch.Elapsed,
             Projects = parser.Projects(),
             ProjectsDropped = parser.ProjectsDropped,

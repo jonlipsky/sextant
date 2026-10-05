@@ -155,6 +155,30 @@ public class TransitiveProjectReferencesTests
     }
 
     [TestMethod]
+    public async Task ProjectWithADanglingReference_IsStillClosed_AndKeepsTheDanglingReference()
+    {
+        // The prod shape (TouchDraw2ProForiOS, Valuosity.Reports): App keeps a reference to a project the workspace
+        // does not contain. Roslyn's AddProjectReferences resolves every existing reference and threw
+        // "Unexpected null - file SolutionState.cs line 363", so App was left without its closure.
+        var chain = BuildChain();
+        var ghost = ProjectId.CreateNewId("Ghost");
+        var solution = Add(chain.Solution, ghost, "Ghost", "Ghost", "namespace Ghost { public class G { } }")
+            .AddProjectReference(chain.App, new ProjectReference(ghost))
+            .RemoveProject(ghost);
+        Assert.IsTrue(solution.GetProject(chain.App)!.AllProjectReferences.Any(r => r.ProjectId == ghost),
+            "the fixture really has a dangling reference");
+        var messages = new List<string>();
+
+        var closed = TransitiveProjectReferences.Close(solution, _ => true, messages.Add);
+
+        var app = closed.GetProject(chain.App)!;
+        CollectionAssert.AreEquivalent(new[] { chain.Core, chain.Abs }, app.ProjectReferences.Select(r => r.ProjectId).ToArray());
+        Assert.IsTrue(app.AllProjectReferences.Any(r => r.ProjectId == ghost), "the dangling reference is kept as loaded");
+        Assert.AreEqual(0, (await Errors(closed, chain.App)).Count);
+        Assert.IsFalse(messages.Any(m => m.StartsWith("Could not add", StringComparison.Ordinal)), string.Join(" | ", messages));
+    }
+
+    [TestMethod]
     public void DeepChain_ClosesEveryLevel_InBreadthFirstOrder()
     {
         var workspace = new AdhocWorkspace();

@@ -56,7 +56,12 @@ public static class TransitiveProjectReferences
 
             try
             {
-                solution = solution.AddProjectReferences(projectId, missing);
+                // Not AddProjectReferences: Roslyn's submission check there resolves every EXISTING reference with
+                // GetRequiredProjectState, so a project that keeps a reference to a project the workspace never
+                // loaded fails with "Unexpected null" (Roslyn 5.0.0, Solution.CheckSubmissionProjectReferences).
+                // WithProjectReferences skips existing references; AllProjectReferences keeps the dangling ones.
+                var current = solution.GetProject(projectId)!;
+                solution = solution.WithProjectReferences(projectId, current.AllProjectReferences.Concat(missing));
                 added += missing.Count;
                 projectsChanged++;
             }

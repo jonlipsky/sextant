@@ -628,11 +628,63 @@ public sealed class IndexOrchestrator
         // rows; publishing that as a complete branch head would serve an incomplete API surface. A full
         // index that hits any such failure is marked partial (diagnosable) and NOT selected below.
         var compilationFailures = 0;
+
+        // The service worker's time budget (issue #245): when set, projects the budget cannot cover are left
+        // out — registered but not indexed — and the gap is folded into the coverage at publish, so the
+        // snapshot is published PARTIAL instead of the whole evaluation being aborted with nothing. Provider
+        // (submodule) projects are never left out: a provider snapshot is shared and reused, so a mapped but
+        // empty provider project would be reused empty. Null (local CLI/daemon) keeps indexing unbounded.
+        var timeBudget = isFullIndex ? effectiveCtx?.TimeBudget : null;
+        var budgetNotIndexed = new HashSet<ProjectId>();
+        var budgetNotExtracted = new HashSet<long>();
+        var budgetLock = new object();
+        var symbolDeadline = timeBudget?.SymbolDeadline(timeBudget.Clock.GetUtcNow());
+        var symbolProjectsAdmitted = 0;
+
+        // True (and the project recorded as not fully extracted) when the extraction deadline has passed and
+        // the project may be left without relationships, references, calls and comments.
+        bool PastExtractionDeadline(long projectId)
+        {
+            if (timeBudget == null || providerProjectInfo.ContainsKey(projectId)
+                || timeBudget.Clock.GetUtcNow() < timeBudget.ExtractionDeadline)
+                return false;
+            lock (budgetLock)
+            {
+                if (budgetNotExtracted.Add(projectId) && budgetNotExtracted.Count == 1)
+                    _log?.Invoke("  Time budget: the extraction deadline passed; the remaining projects get no " +
+                                 "relationships, references, calls or comments.");
+            }
+            return true;
+        }
+
+        // Whether a phase after the symbol phase skips the project because of the time budget.
+        bool SkipForTimeBudget(Project project) =>
+            budgetNotIndexed.Contains(project.Id)
+            || (projectRoslynToId.TryGetValue(project.Id, out var budgetProjectId) && PastExtractionDeadline(budgetProjectId));
+
         foreach (var project in solution.Projects)
         {
             if (project.FilePath == null || !projectRoslynToId.TryGetValue(project.Id, out var projectId)
                 || !processSet.Contains(project.Id))
                 continue;
+
+            if (timeBudget != null && !providerProjectInfo.ContainsKey(projectId))
+            {
+                if (symbolProjectsAdmitted > 0 && timeBudget.Clock.GetUtcNow() >= symbolDeadline)
+                {
+                    if (budgetNotIndexed.Count == 0)
+                        _log?.Invoke($"  Time budget: the symbol phase deadline passed after {symbolProjectsAdmitted} " +
+                                     "project(s); the remaining projects are registered but not indexed.");
+                    budgetNotIndexed.Add(project.Id);
+                    // Clear whatever an earlier generation of this identity left in the row, so the project
+                    // is published empty rather than with stale content.
+                    symbolStore.DeleteByProject(projectId);
+                    fileStore.DeleteByProject(projectId);
+                    session.CommitBatch();
+                    continue;
+                }
+                symbolProjectsAdmitted++;
+            }
 
             EnterProject();
             projectIndex++;
@@ -766,6 +818,7 @@ public sealed class IndexOrchestrator
             foreach (var project in solution.Projects)
             {
                 if (!processSet.Contains(project.Id)) continue;
+                if (budgetNotIndexed.Contains(project.Id)) continue;
                 if (!projectRoslynToId.TryGetValue(project.Id, out var ownerProjectId)) continue;
 
                 var captured = project;
@@ -778,6 +831,10 @@ public sealed class IndexOrchestrator
                     // started), and the consumer never calls ResolveTargetProject (targets are already
                     // stamped into the contribution records), so clearing here races nothing.
                     assemblyProjectCache.Clear();
+                    // Checked as each project is produced, not when the list is built, so the deadline
+                    // stops the phase where it actually passes.
+                    if (PastExtractionDeadline(owner))
+                        return new ProjectExtraction<OccurrenceDoc>(owner, captured.Name, new List<OccurrenceDoc>());
                     var compilation = await captured.GetCompilationAsync(ct);
                     var docs = new List<OccurrenceDoc>();
                     if (compilation != null)
@@ -949,7 +1006,7 @@ public sealed class IndexOrchestrator
         });
         foreach (var project in solution.Projects)
         {
-            if (!processSet.Contains(project.Id)) continue;
+            if (!processSet.Contains(project.Id) || SkipForTimeBudget(project)) continue;
             EnterProject();
             projectIndex++;
             progress?.Report(new IndexingProgress
@@ -1008,7 +1065,7 @@ public sealed class IndexOrchestrator
         projectIndex = 0;
         foreach (var project in solution.Projects)
         {
-            if (!processSet.Contains(project.Id)) continue;
+            if (!processSet.Contains(project.Id) || SkipForTimeBudget(project)) continue;
             EnterProject();
             projectIndex++;
             progress?.Report(new IndexingProgress
@@ -1083,7 +1140,7 @@ public sealed class IndexOrchestrator
         using var commentInsert = commentStore.CreateInsertCommand();
         foreach (var project in solution.Projects)
         {
-            if (!processSet.Contains(project.Id)) continue;
+            if (!processSet.Contains(project.Id) || SkipForTimeBudget(project)) continue;
             EnterProject();
             projectIndex++;
             progress?.Report(new IndexingProgress
@@ -1136,7 +1193,7 @@ public sealed class IndexOrchestrator
         projectIndex = 0;
         foreach (var project in solution.Projects)
         {
-            if (!processSet.Contains(project.Id)) continue;
+            if (!processSet.Contains(project.Id) || SkipForTimeBudget(project)) continue;
             EnterProject();
             projectIndex++;
             progress?.Report(new IndexingProgress
@@ -1449,8 +1506,14 @@ public sealed class IndexOrchestrator
             // Record the worker-computed coverage in the SAME transaction as the publish (issue #119), so
             // no reader or crash can observe this service snapshot published without its coverage. The binding
             // health measured while persisting this run's occurrences is folded in: a project whose code did not
-            // bind makes the verdict partial, because references and calls inside it may be missing.
-            RecordCoverage(conn, publishId, WithBindingHealth(effectiveCtx, bindingProjectPaths, bindingCounts), completedAt);
+            // bind makes the verdict partial, because references and calls inside it may be missing. So is what the
+            // time budget left out (issue #245), whose reason goes first.
+            var publishCtx = WithTimeBudget(
+                WithBindingHealth(effectiveCtx, bindingProjectPaths, bindingCounts),
+                solution, solutionMembership, projectRoslynToId, budgetNotIndexed, budgetNotExtracted);
+            if (publishCtx.Coverage is { TimeBudget: not null } budgeted)
+                _log?.Invoke($"  {budgeted.Reasons[0]}");
+            RecordCoverage(conn, publishId, publishCtx, completedAt);
 
             AdvanceBranchToSnapshot(snapshotStore, publishRepoId, effectiveCtx, publishId, completedAt);
 
@@ -1827,6 +1890,54 @@ public sealed class IndexOrchestrator
             });
         var health = BindingHealthBuilder.Build(projects, ctx.ProjectLoadIssues);
         return ctx with { Coverage = BindingHealthBuilder.Apply(coverage, health) };
+    }
+
+    /// <summary>
+    /// Folds what the time budget left out into the caller-computed coverage (issue #245): the declared projects
+    /// the loader did not open (<see cref="IndexTimeBudget.NotLoaded"/>), the project versions registered but not
+    /// indexed (<paramref name="notIndexed"/>), and those indexed without relationships, references, calls or
+    /// comments (<paramref name="notExtracted"/>). A selected solution is unfinished when it declares a project
+    /// that was not loaded, or covers (declares or reaches through a project reference) a project version left
+    /// out. A single-solution workspace has one solution covering every project. Unchanged when no budget was
+    /// set, the caller computed no coverage, or nothing was left out.
+    /// </summary>
+    internal static SnapshotContext WithTimeBudget(
+        SnapshotContext ctx, Solution solution, IReadOnlyList<SolutionMembership>? membership,
+        IReadOnlyDictionary<ProjectId, long> projectRoslynToId, IReadOnlySet<ProjectId> notIndexed,
+        IReadOnlySet<long> notExtracted)
+    {
+        if (ctx.TimeBudget is not { } budget || ctx.Coverage is not { } coverage)
+            return ctx;
+        var notLoaded = new HashSet<string>(budget.NotLoaded.Select(Path.GetFullPath), MultiSolutionLoader.ProjectPathComparer);
+        if (notLoaded.Count == 0 && notIndexed.Count == 0 && notExtracted.Count == 0)
+            return ctx;
+
+        var leftOut = new HashSet<long>(notExtracted);
+        foreach (var id in notIndexed)
+            if (projectRoslynToId.TryGetValue(id, out var pid))
+                leftOut.Add(pid);
+
+        string Display(string path) => budget.CheckoutRoot is { } root
+            ? Path.GetRelativePath(root, path).Replace('\\', '/')
+            : Path.GetFileName(path);
+
+        var unfinished = new List<string>();
+        if (solution.FilePath != null)
+            unfinished.Add(Display(solution.FilePath));
+        else if (membership is { Count: > 0 })
+        {
+            var covered = ComputeSolutionMembership(solution, membership, projectRoslynToId);
+            for (var i = 0; i < membership.Count; i++)
+            {
+                if (membership[i].DeclaredProjects.Any(p => notLoaded.Contains(Path.GetFullPath(p)))
+                    || covered[i].ProjectIds.Any(leftOut.Contains))
+                    unfinished.Add(Display(membership[i].SolutionPath));
+            }
+        }
+
+        var gap = TimeBudgetCoverageBuilder.Build(
+            budget.Budget, notLoaded.Count, notIndexed.Count, notExtracted.Count, unfinished);
+        return ctx with { Coverage = TimeBudgetCoverageBuilder.Apply(coverage, gap) };
     }
 
     /// <summary>The binding counts persisted for one project version during a run.</summary>

@@ -15,7 +15,11 @@ public sealed record SandboxPolicy
     /// </summary>
     public bool Enabled { get; init; } = true;
 
-    /// <summary>Wall-clock budget for one evaluation; exceeding it aborts the job (retryable), never publishes.</summary>
+    /// <summary>
+    /// Wall-clock budget for one evaluation. The worker plans its phases inside it and publishes a PARTIAL
+    /// snapshot when it runs short; reaching it aborts the job as failed and never publishes. An aborted job is
+    /// retried only after the budget policy changes (<see cref="EvaluationBudgetPolicy"/>).
+    /// </summary>
     public TimeSpan TimeBudget { get; init; } = TimeSpan.FromMinutes(30);
 
     /// <summary>
