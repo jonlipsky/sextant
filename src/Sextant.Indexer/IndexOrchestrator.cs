@@ -147,6 +147,10 @@ public sealed class IndexOrchestrator
         // evaluated-TFM instances of one multi-targeted csproj map to distinct logical projects
         // instead of collapsing onto a single id (which would make DeleteByProject cross-TFM).
         var projectRoslynToId = new Dictionary<ProjectId, long>();
+        // The repository-relative path and target framework of every NON-provider project version this run
+        // indexes, and the binding counts persisted for each, folded into the recorded coverage at publish.
+        var bindingProjectPaths = new Dictionary<long, (string Path, string? TargetFramework)>();
+        var bindingCounts = new Dictionary<long, BindingCounter>();
         // Logical-project rows this run is responsible for (re)building. For a full index it is every
         // registered project; for an incremental rebuild the orchestrator is handed a canonical-id
         // filter naming the invalidated project closure, and only those projects are reset and
@@ -283,6 +287,7 @@ public sealed class IndexOrchestrator
                     CapabilityFingerprint = effectiveCtx.CapabilityFingerprint,
                     // Issue #113: the service's non-default SDK-pin policy (null locally / by default).
                     SdkPinPolicy = effectiveCtx.SdkPinPolicy,
+                    RestorePolicy = effectiveCtx.RestorePolicy,
                     // A full index is never an overlay; for a dirty fallback this keeps its identity
                     // distinct from an overlay of the same dirty tree (issue #47). Ignored when the tree
                     // is clean (delta null → discriminator not folded).
@@ -345,7 +350,8 @@ public sealed class IndexOrchestrator
                         // Phase-15 worker-capability fingerprint (null in local/single-node runs).
                         CapabilityFingerprint = effectiveCtx.CapabilityFingerprint,
                         // Issue #113 SDK-pin policy (null on every local run).
-                        SdkPinPolicy = effectiveCtx.SdkPinPolicy
+                        SdkPinPolicy = effectiveCtx.SdkPinPolicy,
+                        RestorePolicy = effectiveCtx.RestorePolicy
                     };
                     var (overlayId, overlayExisted, overlayStatus) = snapshotStore.BeginPending(
                         overlayIdentity, repositoryId.Value, commitId, runScope.RunId, now,
@@ -454,7 +460,8 @@ public sealed class IndexOrchestrator
                 CapabilityFingerprint = effectiveCtx.CapabilityFingerprint,
                 // Issue #113: a submodule's projects load in the SAME MSBuild load, under the same SDK-pin
                 // policy, so a provider built with the override disabled is never reused once it is enabled.
-                SdkPinPolicy = effectiveCtx.SdkPinPolicy
+                SdkPinPolicy = effectiveCtx.SdkPinPolicy,
+                RestorePolicy = effectiveCtx.RestorePolicy
             };
             var (provId, provExisted, provStatus) = snapshotStore.BeginPending(
                 providerIdentity, providerRepoId, providerCommitId, runScope.RunId, now, isProvider: true);
@@ -595,6 +602,7 @@ public sealed class IndexOrchestrator
                 projectId = projectStore.Insert(identity, now);
             }
             projectRoslynToId[project.Id] = projectId;
+            bindingProjectPaths[projectId] = (identity.RepoRelativePath, identity.TargetFramework);
             if (extractThisProject)
                 processSet.Add(project.Id);
             _log?.Invoke($"  Project: {project.Name} (id={projectId}, tfm={identity.TargetFramework}, test={identity.IsTestProject})");
@@ -806,6 +814,7 @@ public sealed class IndexOrchestrator
 
                 long ownerProjectId = project.OwnerProjectId;
                 var contributions = project.Contributions;
+                long candidateOccurrences = 0;
 
                 foreach (var rel in contributions.Relationships)
                 {
@@ -847,9 +856,12 @@ public sealed class IndexOrchestrator
                         Line = reference.Line,
                         ContextSnippet = reference.Snippet,
                         ReferenceKind = reference.Kind,
-                        AccessKind = reference.Access
+                        AccessKind = reference.Access,
+                        IsCandidate = reference.IsCandidate
                     });
                     session.RowsWritten();
+                    if (reference.IsCandidate)
+                        candidateOccurrences++;
                 }
 
                 foreach (var call in contributions.Calls)
@@ -868,9 +880,12 @@ public sealed class IndexOrchestrator
                         CallSiteFile = call.CallSiteFile,
                         CallSiteLine = call.CallSiteLine,
                         CallSiteColumn = call.CallSiteColumn,
-                        LastIndexedAt = now
+                        LastIndexedAt = now,
+                        IsCandidate = call.IsCandidate
                     }, ownerProjectId);
                     session.RowsWritten();
+                    if (call.IsCandidate)
+                        candidateOccurrences++;
 
                     var dfResult = call.Dataflow;
                     if (persistDataflow)
@@ -892,9 +907,19 @@ public sealed class IndexOrchestrator
                     }
                 }
 
-                if (contributions.CompletenessDiagnostics > 0)
-                    _log?.Invoke($"  {project.Name}: {contributions.CompletenessDiagnostics} unresolved " +
-                                 "region(s) (extraction completeness diagnostic)");
+                if (contributions.UnboundNames > 0 || contributions.UnboundInvocations > 0)
+                    _log?.Invoke($"  {project.Name}: {contributions.UnboundNames} of {contributions.NamesExamined} " +
+                                 $"name(s) and {contributions.UnboundInvocations} invocation(s) did not bind; " +
+                                 $"{candidateOccurrences} candidate occurrence(s) recorded");
+                if (bindingProjectPaths.ContainsKey(ownerProjectId))
+                {
+                    if (!bindingCounts.TryGetValue(ownerProjectId, out var counter))
+                        bindingCounts[ownerProjectId] = counter = new BindingCounter();
+                    counter.NamesExamined += contributions.NamesExamined;
+                    counter.UnboundNames += contributions.UnboundNames;
+                    counter.UnboundInvocations += contributions.UnboundInvocations;
+                    counter.CandidateOccurrences += candidateOccurrences;
+                }
 
                 _log?.Invoke($"  {project.Name}: occurrences extracted");
                 // Honour cancellation before publishing this project's batch so a mid-run cancel drops
@@ -1422,8 +1447,10 @@ public sealed class IndexOrchestrator
                     $"Snapshot {publishId} was not pending at publish; aborting to avoid a false completion.");
 
             // Record the worker-computed coverage in the SAME transaction as the publish (issue #119), so
-            // no reader or crash can observe this service snapshot published without its coverage.
-            RecordCoverage(conn, publishId, effectiveCtx, completedAt);
+            // no reader or crash can observe this service snapshot published without its coverage. The binding
+            // health measured while persisting this run's occurrences is folded in: a project whose code did not
+            // bind makes the verdict partial, because references and calls inside it may be missing.
+            RecordCoverage(conn, publishId, WithBindingHealth(effectiveCtx, bindingProjectPaths, bindingCounts), completedAt);
 
             AdvanceBranchToSnapshot(snapshotStore, publishRepoId, effectiveCtx, publishId, completedAt);
 
@@ -1776,6 +1803,39 @@ public sealed class IndexOrchestrator
         if (ctx.Coverage is { } coverage && !new SnapshotCoverageStore(conn).Record(snapshotId, coverage, recordedAt))
             throw new InvalidOperationException(
                 $"Snapshot {snapshotId} already has a recorded coverage row at first publish (issue #119 invariant).");
+    }
+
+    /// <summary>
+    /// Folds the binding health this run measured into the caller-computed coverage. Covers only the
+    /// repository's own project versions (a Phase-12 provider's projects are not part of the parent's
+    /// coverage). Unchanged when the caller computed no coverage (local CLI/daemon) or the run extracted nothing.
+    /// </summary>
+    internal static SnapshotContext WithBindingHealth(
+        SnapshotContext ctx, IReadOnlyDictionary<long, (string Path, string? TargetFramework)> projectPaths,
+        IReadOnlyDictionary<long, BindingCounter> counts)
+    {
+        if (ctx.Coverage is not { } coverage || (counts.Count == 0 && ctx.ProjectLoadIssues is not { Count: > 0 }))
+            return ctx;
+        var projects = counts
+            .Where(c => projectPaths.ContainsKey(c.Key))
+            .Select(c =>
+            {
+                var (path, tfm) = projectPaths[c.Key];
+                return new ProjectBindingCounts(
+                    path, tfm, c.Value.NamesExamined, c.Value.UnboundNames, c.Value.UnboundInvocations,
+                    c.Value.CandidateOccurrences);
+            });
+        var health = BindingHealthBuilder.Build(projects, ctx.ProjectLoadIssues);
+        return ctx with { Coverage = BindingHealthBuilder.Apply(coverage, health) };
+    }
+
+    /// <summary>The binding counts persisted for one project version during a run.</summary>
+    internal sealed class BindingCounter
+    {
+        public long NamesExamined { get; set; }
+        public long UnboundNames { get; set; }
+        public long UnboundInvocations { get; set; }
+        public long CandidateOccurrences { get; set; }
     }
 
     /// <summary>

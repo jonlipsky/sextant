@@ -94,9 +94,91 @@ public sealed record SnapshotCoverage
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public IReadOnlyList<SdkPinOverride>? SdkPinOverrides { get; init; }
 
+    /// <summary>
+    /// How well the indexed code BOUND: how many names and invocations the compiler could not resolve, per
+    /// project, and which projects are degraded enough that references or calls inside them may be missing. A
+    /// degraded project makes the verdict partial and the reason names it. Null when the producer recorded no
+    /// binding health (rows written by an older service, and the local CLI/daemon); omitted from the JSON.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public BindingHealth? Binding { get; init; }
+
+    /// <summary>
+    /// Facts about the checkout that do NOT make the verdict partial but an operator or agent may want to
+    /// know, for example project files that no selected solution declares, or packages the restore could not
+    /// resolve. Null when there are none; omitted from the JSON.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IReadOnlyList<string>? Notes { get; init; }
+
     /// <summary>True when <see cref="Verdict"/> is <see cref="SnapshotCoverageVerdict.Partial"/>.</summary>
     [JsonIgnore]
     public bool IsPartial => string.Equals(Verdict, SnapshotCoverageVerdict.Partial, StringComparison.Ordinal);
+}
+
+/// <summary>
+/// How well a snapshot's source BOUND. A name the compiler could not resolve, or an invocation whose overload
+/// resolution failed, has no exact target, so an exact reference or call edge for it cannot be stored; the
+/// extractor records the compiler's candidate symbols instead (marked <c>candidate</c> on the query surface).
+/// A project is degraded when enough of its code failed to bind that references or calls inside it may be
+/// missing; any degraded project makes the coverage verdict partial. Serialized snake_case inside
+/// <see cref="SnapshotCoverage.Binding"/>.
+/// </summary>
+public sealed record BindingHealth
+{
+    /// <summary>Identifier names the extractor examined across the indexed projects.</summary>
+    public long NamesExamined { get; init; }
+
+    /// <summary>Names that did not bind to any symbol (an unresolved type or member, or a failed overload resolution).</summary>
+    public long UnboundNames { get; init; }
+
+    /// <summary>Invocations the compiler could not bind to one method (an invalid invocation operation).</summary>
+    public long UnboundInvocations { get; init; }
+
+    /// <summary>References and call edges stored against the compiler's candidate symbols rather than an exact target.</summary>
+    public long CandidateOccurrences { get; init; }
+
+    /// <summary>Projects whose binding failures exceed the degraded threshold.</summary>
+    public int ProjectsDegraded { get; init; }
+
+    /// <summary>
+    /// The projects with binding failures, worst first, capped at <see cref="MaxProjects"/>; a project that
+    /// bound cleanly is not listed.
+    /// </summary>
+    public IReadOnlyList<ProjectBindingHealth> Projects { get; init; } = [];
+
+    /// <summary>The cap on <see cref="Projects"/>.</summary>
+    public const int MaxProjects = 25;
+}
+
+/// <summary>One project's binding health inside <see cref="BindingHealth.Projects"/>.</summary>
+public sealed record ProjectBindingHealth
+{
+    /// <summary>The project file, relative to its repository root (forward slashes).</summary>
+    public required string Project { get; init; }
+
+    /// <summary>The evaluated target framework, when known.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? TargetFramework { get; init; }
+
+    /// <summary>Identifier names examined in the project.</summary>
+    public long NamesExamined { get; init; }
+
+    /// <summary>Names in the project that did not bind.</summary>
+    public long UnboundNames { get; init; }
+
+    /// <summary>Invocations in the project that did not bind to one method.</summary>
+    public long UnboundInvocations { get; init; }
+
+    /// <summary>Candidate references and call edges stored for the project.</summary>
+    public long CandidateOccurrences { get; init; }
+
+    /// <summary>True when the project's binding failures exceed the degraded threshold.</summary>
+    public bool Degraded { get; init; }
+
+    /// <summary>The design-time build or restore failure the loader reported for the project, when any.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? LoadIssue { get; init; }
 }
 
 /// <summary>
