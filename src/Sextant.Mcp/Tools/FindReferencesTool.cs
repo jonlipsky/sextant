@@ -9,7 +9,7 @@ namespace Sextant.Mcp.Tools;
 public static class FindReferencesTool
 {
 
-    [McpServerTool(Name = "find_references"), Description("Every use of a symbol. Use instead of grep: no false matches from comments, strings or namesakes.")]
+    [McpServerTool(Name = "find_references"), Description("Every use of a symbol, including the uses grep misses (qualified new Ns.Type(...), target-typed new(...), calls through interfaces) and none of its false matches (comments, strings, namesakes). Use instead of grep.")]
     public static string FindReferences(
         DatabaseProvider dbProvider,
         [Description(ToolText.SymbolFqn)] string symbol_fqn,

@@ -18,9 +18,9 @@ namespace Sextant.Service.Tests;
 public sealed partial class AgentSizedOutputHttpTests
 {
     // Before #145 tools/list was 29159 characters for 24 tools (the #145 budget was half of that, 14579). S12 lists
-    // the eight agent tools plus the service-only search_symbols: 5350 characters with a required selection, 5560
+    // the eight agent tools plus the service-only search_symbols: 5546 characters with a required selection, 5756
     // with delegate callers.
-    private const int ToolsListBudget = 5700;
+    private const int ToolsListBudget = 5900;
     private const int InstructionsBudget = 600;
     private const int UnboundedChars = 10_000_000;
 

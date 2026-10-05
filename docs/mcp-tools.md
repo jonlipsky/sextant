@@ -327,7 +327,11 @@ When `fuzzy` is false, matches exactly on `fully_qualified_name`. When true, use
 
 ### find_references
 
-All usages of a symbol across the codebase.
+All usages of a symbol across the codebase, from the compiler's binding: it includes the uses a text search
+misses (a qualified `new Ns.Type(...)`, a target-typed `new()`, a type named through a `using` alias, a call made
+through an interface) and none of its false matches (comments, strings, a namesake in another namespace). A
+call through an interface binds to the interface member, so it is listed under that member, not under the
+implementation.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
@@ -361,7 +365,9 @@ All symbols defined in a source file.
 
 ### get_call_hierarchy
 
-Callers or callees of a method with configurable depth.
+Callers or callees of a method with configurable depth. It includes calls a text search misses (a call
+through a `using` alias or `using static`, a call made through an interface); as with `find_references`, a call
+through an interface is an edge to the interface member, not to the implementation.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
