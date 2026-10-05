@@ -316,7 +316,9 @@ public sealed partial class AgentSizedOutputHttpTests
 
         var snapshot = body.GetProperty("meta").GetProperty("snapshot");
         Assert.AreEqual("partial", snapshot.GetProperty("coverage").GetString());
-        StringAssert.Contains(snapshot.GetProperty("warning").GetString(), "get_index_status");
+        Assert.AreEqual(
+            "Partial index: submodule_unpopulated: external/tools. Call get_index_status for details.",
+            snapshot.GetProperty("warning").GetString(), "the warning names what is missing");
         Assert.IsFalse(snapshot.TryGetProperty("reasons", out _), "the partial reasons stay in get_index_status");
     }
 

@@ -210,28 +210,30 @@ public static class SnapshotCoverageBuilder
             }, "submodule_unpopulated", "declared submodule(s) are not populated");
         }
 
-        // An operator's explicit `solutions` list is a deliberate scope: project files outside it are
-        // reported (info) but do not make the snapshot partial. Under the no-config default nobody chose to
-        // exclude them, so they are a coverage gap.
-        var orphansArePartial = resolution.Source != SolutionSelectionSource.Configured;
+        // Project files on disk that no selected solution declares and no loaded project references are
+        // reported as a NOTE, never a partial verdict. Under the no-config default every discovered solution is
+        // indexed (#124) and every project a solution reaches is loaded, so such a file is outside every build
+        // of the repository (a sample, a template, a scratch project): what is missing is only the code INSIDE
+        // it, which the note names. An explicit `solutions` list is a deliberate scope, reported the same way.
+        var notes = new List<string>();
         if (unreferenced.Count > 0)
         {
-            if (orphansArePartial)
-                reasons.Add(
-                    $"{unreferenced.Count} of {inventory.ProjectFilesOnDisk.Count} project file(s) on disk are " +
-                    "not declared by any selected solution and were not indexed.");
-            var severity = orphansArePartial ? JobDiagnosticSeverity.Warning : JobDiagnosticSeverity.Info;
+            var paths = unreferenced.Select(p => RepoRelative(checkoutDir, p)).Order(StringComparer.Ordinal).ToList();
+            notes.Add(
+                $"{unreferenced.Count} project file(s) outside every selected solution were not indexed: " +
+                $"{NameSample(paths)}.");
             AddCapped(diagnostics, unreferenced, p => new ProjectOutcome
             {
-                Severity = severity,
+                Severity = JobDiagnosticSeverity.Info,
                 Code = "project_file_unreferenced",
                 ProjectPath = RepoRelative(checkoutDir, p),
                 Message =
                     $"Project file '{RepoRelative(checkoutDir, p)}' is not declared by any selected solution and " +
-                    (orphansArePartial
-                        ? "was not indexed."
-                        : "was not indexed (outside the configured `solutions` scope).")
-            }, "project_file_unreferenced", "project file(s) are not declared by any selected solution", severity);
+                    (resolution.Source == SolutionSelectionSource.Configured
+                        ? "was not indexed (outside the configured `solutions` scope)."
+                        : "was not indexed.")
+            }, "project_file_unreferenced", "project file(s) are not declared by any selected solution",
+            JobDiagnosticSeverity.Info);
         }
 
         if (scanErrors.Count > 0)
@@ -266,10 +268,22 @@ public static class SnapshotCoverageBuilder
             SubmodulesDeclared = inventory.Submodules.Count,
             SubmodulesUnpopulated = unpopulated.Count,
             ScanErrors = scanErrors.Count,
-            SdkPinOverrides = sdkPinOverrides is { Count: > 0 } ? sdkPinOverrides : null
+            SdkPinOverrides = sdkPinOverrides is { Count: > 0 } ? sdkPinOverrides : null,
+            Notes = notes.Count > 0 ? notes : null
         };
 
         return new Result(coverage, diagnostics);
+    }
+
+    /// <summary>
+    /// Appends <paramref name="notes"/> to <paramref name="coverage"/>'s notes. Notes never change the verdict.
+    /// </summary>
+    public static SnapshotCoverage WithNotes(SnapshotCoverage coverage, IReadOnlyList<string> notes)
+    {
+        ArgumentNullException.ThrowIfNull(coverage);
+        if (notes is not { Count: > 0 })
+            return coverage;
+        return coverage with { Notes = [.. coverage.Notes ?? [], .. notes] };
     }
 
     /// <summary>

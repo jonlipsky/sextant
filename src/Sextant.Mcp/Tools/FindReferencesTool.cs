@@ -123,6 +123,11 @@ public static class FindReferencesTool
                 ["access_kind"] = r.AccessKind?.ToString().ToLowerInvariant()
             };
 
+            // The site did not bind exactly (for example a call whose argument type is unresolved on the
+            // indexer); this symbol is one of the compiler's candidates for it.
+            if (r.IsCandidate)
+                result["candidate"] = true;
+
             if (include_source)
                 result["source_context"] = contextRetriever.GetContext(r.InProjectId, r.FilePath, r.Line, 2);
 

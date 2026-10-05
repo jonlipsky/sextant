@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Text.RegularExpressions;
 using Sextant.Core;
 using Microsoft.CodeAnalysis;
@@ -15,6 +16,8 @@ namespace Sextant.Indexer;
 /// target's exact owning project (from the bound symbol's containing assembly) when it maps to an
 /// indexed project, so the orchestrator resolves the exact per-TFM row rather than a deterministic
 /// pick among same-key rows; it is null for targets outside the indexed set (key-only fallback).
+/// <see cref="IsCandidate"/> marks a reference whose name did not bind to one symbol, recorded against one of
+/// the compiler's candidate symbols instead.
 /// </summary>
 public sealed record ReferenceContribution(
     string TargetKey,
@@ -23,7 +26,8 @@ public sealed record ReferenceContribution(
     ReferenceKind Kind,
     AccessKind? Access,
     string? Snippet,
-    long? TargetProjectId = null);
+    long? TargetProjectId = null,
+    bool IsCandidate = false);
 
 /// <summary>
 /// A call-graph edge contributed at a usage site: an invocation inside <see cref="CallerKey"/>'s body
@@ -32,6 +36,8 @@ public sealed record ReferenceContribution(
 /// or semantic model, so a project's per-document models are not pinned in memory until persistence.
 /// <see cref="CalleeProjectId"/> carries the callee's exact owning project (from its containing
 /// assembly) for compilation-scoped resolution, or null for a callee outside the indexed set.
+/// <see cref="IsCandidate"/> marks an invocation the compiler could not bind to one method, recorded against
+/// one of its candidate methods (with no dataflow).
 /// </summary>
 public sealed record CallContribution(
     string CallerKey,
@@ -40,7 +46,8 @@ public sealed record CallContribution(
     int CallSiteLine,
     int CallSiteColumn,
     DataflowResult Dataflow,
-    long? CalleeProjectId = null);
+    long? CalleeProjectId = null,
+    bool IsCandidate = false);
 
 /// <summary>
 /// A type relationship contributed from a document (inherits/implements/overrides/returns/parameterOf
@@ -79,9 +86,12 @@ public sealed class DocumentContributionSet
     // stored), so coalescing them discards no information — an intentional, information-preserving
     // difference from the legacy per-occurrence path. Calls also carry per-occurrence dataflow, so
     // their key includes the call-site column: two distinct same-line calls to the same callee (e.g.
-    // `F(a); F(b);`) are separate occurrences whose arguments differ and must not collapse.
-    private readonly HashSet<(string, string, int, ReferenceKind, AccessKind?, long?)> _refKeys = [];
-    private readonly HashSet<(string, string, string, int, int)> _callKeys = [];
+    // `F(a); F(b);`) are separate occurrences whose arguments differ and must not collapse. The keys
+    // exclude IsCandidate: an exact and a candidate occurrence of the same target at the same place are
+    // one occurrence, and the exact one wins (it replaces the candidate entry in place, so the order
+    // stays the order of first emission). Each key maps to its entry's index for that replacement.
+    private readonly Dictionary<(string, string, int, ReferenceKind, AccessKind?, long?), int> _refKeys = [];
+    private readonly Dictionary<(string, string, string, int, int), int> _callKeys = [];
     private readonly HashSet<(string, string, RelationshipKind, long?, long?)> _relKeys = [];
 
     public IReadOnlyList<ReferenceContribution> References => _references;
@@ -89,23 +99,47 @@ public sealed class DocumentContributionSet
     public IReadOnlyList<RelationshipContribution> Relationships => _relationships;
 
     /// <summary>
-    /// Count of malformed regions where the semantic model could not bind a name/invocation to a
-    /// symbol (e.g. a compile-error region). Surfaced as an extraction completeness diagnostic.
+    /// Identifier names examined (every simple name except the <c>var</c> keyword): the denominator of
+    /// the binding-health counters.
     /// </summary>
-    public int CompletenessDiagnostics { get; internal set; }
+    public long NamesExamined { get; internal set; }
+
+    /// <summary>
+    /// Names that did not bind to any symbol: an unresolved type or member, an inaccessible or ambiguous
+    /// one, or a failed overload resolution. A method group in <c>nameof</c> and a late-bound
+    /// (<c>dynamic</c>) member are not failures and are not counted.
+    /// </summary>
+    public long UnboundNames { get; internal set; }
+
+    /// <summary>Invocations the compiler could not bind to one method (an invalid invocation operation).</summary>
+    public long UnboundInvocations { get; internal set; }
 
     public bool AddReference(ReferenceContribution r)
     {
-        if (!_refKeys.Add((r.TargetKey, r.FilePath, r.Line, r.Kind, r.Access, r.TargetProjectId)))
-            return false;
+        var key = (r.TargetKey, r.FilePath, r.Line, r.Kind, r.Access, r.TargetProjectId);
+        if (_refKeys.TryGetValue(key, out var index))
+        {
+            if (!_references[index].IsCandidate || r.IsCandidate)
+                return false;
+            _references[index] = r;
+            return true;
+        }
+        _refKeys.Add(key, _references.Count);
         _references.Add(r);
         return true;
     }
 
     public bool AddCall(CallContribution c)
     {
-        if (!_callKeys.Add((c.CallerKey, c.CalleeKey, c.CallSiteFile, c.CallSiteLine, c.CallSiteColumn)))
-            return false;
+        var key = (c.CallerKey, c.CalleeKey, c.CallSiteFile, c.CallSiteLine, c.CallSiteColumn);
+        if (_callKeys.TryGetValue(key, out var index))
+        {
+            if (!_calls[index].IsCandidate || c.IsCandidate)
+                return false;
+            _calls[index] = c;
+            return true;
+        }
+        _callKeys.Add(key, _calls.Count);
         _calls.Add(c);
         return true;
     }
@@ -135,7 +169,9 @@ public sealed class DocumentContributionSet
             AddReference(reference);
         foreach (var call in other._calls)
             AddCall(call);
-        CompletenessDiagnostics += other.CompletenessDiagnostics;
+        NamesExamined += other.NamesExamined;
+        UnboundNames += other.UnboundNames;
+        UnboundInvocations += other.UnboundInvocations;
     }
 }
 
@@ -250,40 +286,57 @@ public static class DocumentSemanticExtractor
         DocumentContributionSet sink,
         Func<IAssemblySymbol, long?>? resolveTargetProject)
     {
-        // Only a symbol Roslyn resolved unambiguously (info.Symbol) becomes a stored occurrence.
-        // Candidate symbols arise from ambiguous/overload-error binds in temporarily-uncompilable
-        // code (common during daemon editing); persisting an arbitrary candidate would emit a false,
-        // possibly nondeterministic edge, so instead count it as a completeness diagnostic and skip.
         var info = model.GetSymbolInfo(name);
         var symbol = info.Symbol;
-        if (symbol == null)
-        {
-            if (info.CandidateReason != CandidateReason.None)
-                sink.CompletenessDiagnostics++;
-            return;
-        }
 
         // The contextual `var` keyword is an IdentifierNameSyntax that binds to the *inferred* type,
         // which would record a phantom type occurrence at a position where the type name never
         // textually appears (e.g. `var x = new Foo();`, `foreach (var m in list)`). The legacy
         // FindReferencesAsync path does not report implicit-var occurrences, so skip it to preserve
         // parity and avoid inflating type occurrence counts. The check is semantic, not lexical: a
-        // type (or member) literally named `var` binds to a symbol whose Name is "var" and is kept.
-        if (name is IdentifierNameSyntax { IsVar: true } && symbol is ITypeSymbol { Name: not "var" })
+        // type (or member) literally named `var` binds to a symbol whose Name is "var" and is kept. An
+        // unbound `var` is not counted either: its initializer already counted the failure.
+        if (name is IdentifierNameSyntax { IsVar: true } && symbol is null or ITypeSymbol { Name: not "var" })
             return;
+
+        sink.NamesExamined++;
+        if (symbol == null)
+        {
+            // The name did not bind to one symbol: an unresolved type in a signature makes overload
+            // resolution fail, an ambiguous or inaccessible name, a method group in `nameof`, or a
+            // late-bound member. Dropping the occurrence would erase the call site from the index (one
+            // unresolved type would hide every caller of a method whose signature mentions it), so it is
+            // recorded against the compiler's candidate symbols and marked candidate, as Roslyn's own
+            // FindReferences reports candidate locations.
+            if (IsBindingFailure(name, model, info.CandidateReason))
+                sink.UnboundNames++;
+            foreach (var candidate in StoredCandidates(info.CandidateSymbols))
+                EmitReferenceTo(candidate, isCandidate: true, name, model, filePath, text, sink, resolveTargetProject);
+            return;
+        }
 
         // An attribute name (and any bare constructor reference) binds to the constructor, not the
         // type. Retarget to the constructed type so type-usage/impact queries see the type as
         // referenced. The specific constructor overload is intentionally not a stored reference
         // target here — a documented difference from the legacy declaration-driven extractor, which
         // recorded both the type-level and constructor-level occurrence.
-        if (symbol is IMethodSymbol { MethodKind: MethodKind.Constructor } constructor)
-            symbol = constructor.ContainingType;
-
-        var target = Canonicalize(symbol);
+        var target = Canonicalize(ConstructedTypeOrSelf(symbol));
         if (!IsStoredTarget(target))
             return;
 
+        EmitReferenceTo(target, isCandidate: false, name, model, filePath, text, sink, resolveTargetProject);
+    }
+
+    private static void EmitReferenceTo(
+        ISymbol target,
+        bool isCandidate,
+        SimpleNameSyntax name,
+        SemanticModel model,
+        string filePath,
+        SourceText text,
+        DocumentContributionSet sink,
+        Func<IAssemblySymbol, long?>? resolveTargetProject)
+    {
         var kind = ClassifyReferenceKind(name, target);
         AccessKind? access = target is IFieldSymbol or IPropertySymbol
             ? ClassifyAccess(name, model)
@@ -297,8 +350,56 @@ public static class DocumentSemanticExtractor
             kind,
             access,
             Snippet(text, name.Span),
-            ExactTargetProject(target, resolveTargetProject)));
+            ExactTargetProject(target, resolveTargetProject),
+            isCandidate));
     }
+
+    /// <summary>
+    /// True when a name's failure to bind is a compile error rather than a name that legitimately has no
+    /// single symbol: a method group (<c>nameof</c> of an overloaded method) or a late-bound
+    /// (<c>dynamic</c>) member is not a failure, and a name with no candidate reason counts only when its
+    /// type is an error type (an unresolved type or member).
+    /// </summary>
+    private static bool IsBindingFailure(SimpleNameSyntax name, SemanticModel model, CandidateReason reason)
+        => reason switch
+        {
+            CandidateReason.MemberGroup or CandidateReason.LateBound => false,
+            CandidateReason.None => model.GetTypeInfo(name).Type is IErrorTypeSymbol,
+            _ => true
+        };
+
+    /// <summary>
+    /// The stored declarations among a failed bind's candidate symbols, canonicalized like an exact target
+    /// (a constructor becomes its type), de-duplicated, ordered by declaration key so the result does not
+    /// depend on the compiler's candidate order, and capped at <see cref="MaxCandidates"/>.
+    /// </summary>
+    private static List<ISymbol> StoredCandidates(ImmutableArray<ISymbol> candidates)
+    {
+        if (candidates.IsDefaultOrEmpty)
+            return [];
+
+        var seen = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
+        var keyed = new List<(string Key, ISymbol Symbol)>();
+        foreach (var candidate in candidates)
+        {
+            var target = Canonicalize(ConstructedTypeOrSelf(candidate));
+            if (IsStoredTarget(target) && seen.Add(target))
+                keyed.Add((SemanticSymbolKeyFactory.DeclarationKey(target), target));
+        }
+        return keyed
+            .OrderBy(k => k.Key, StringComparer.Ordinal)
+            .Take(MaxCandidates)
+            .Select(k => k.Symbol)
+            .ToList();
+    }
+
+    /// <summary>The most candidates one failed bind records (an overload set rarely comes close).</summary>
+    private const int MaxCandidates = 32;
+
+    private static ISymbol ConstructedTypeOrSelf(ISymbol symbol)
+        => symbol is IMethodSymbol { MethodKind: MethodKind.Constructor } constructor
+            ? constructor.ContainingType
+            : symbol;
 
     private static void EmitCall(
         InvocationExpressionSyntax invocation,
@@ -308,10 +409,14 @@ public static class DocumentSemanticExtractor
         Func<IAssemblySymbol, long?>? resolveTargetProject,
         bool includeDataflow)
     {
-        var callee = (model.GetOperation(invocation) as IInvocationOperation)?.TargetMethod
+        var operation = model.GetOperation(invocation);
+        var callee = (operation as IInvocationOperation)?.TargetMethod
                      ?? model.GetSymbolInfo(invocation).Symbol as IMethodSymbol;
         if (callee == null)
+        {
+            EmitCandidateCalls(invocation, operation, model, filePath, sink, resolveTargetProject);
             return;
+        }
 
         var canonicalCallee = Canonicalize(callee);
         // Only source methods have a stored declaration to anchor the edge; metadata callees (e.g.
@@ -344,12 +449,78 @@ public static class DocumentSemanticExtractor
             ExactTargetProject(canonicalCallee, resolveTargetProject)));
     }
 
+    /// <summary>
+    /// Records the call edges of an invocation the compiler could not bind to one method (overload
+    /// resolution failed, typically because a parameter or argument type is unresolved) against its stored
+    /// candidate methods, marked candidate and without dataflow (there is no bound argument-to-parameter
+    /// mapping). An invalid invocation counts toward <see cref="DocumentContributionSet.UnboundInvocations"/>.
+    /// </summary>
+    private static void EmitCandidateCalls(
+        InvocationExpressionSyntax invocation,
+        IOperation? operation,
+        SemanticModel model,
+        string filePath,
+        DocumentContributionSet sink,
+        Func<IAssemblySymbol, long?>? resolveTargetProject)
+    {
+        if (operation is IInvalidOperation)
+            sink.UnboundInvocations++;
+
+        var candidates = StoredCandidates(model.GetSymbolInfo(invocation).CandidateSymbols);
+        if (!candidates.Any(c => c is IMethodSymbol))
+            return;
+
+        var callerKey = EnclosingMemberKey(invocation, model);
+        if (callerKey == null)
+            return;
+
+        var startPos = invocation.GetLocation().GetLineSpan().StartLinePosition;
+        foreach (var candidate in candidates.OfType<IMethodSymbol>())
+        {
+            sink.AddCall(new CallContribution(
+                callerKey,
+                SemanticSymbolKeyFactory.DeclarationKey(candidate),
+                filePath,
+                startPos.Line + 1,
+                startPos.Character,
+                new DataflowResult(),
+                ExactTargetProject(candidate, resolveTargetProject),
+                IsCandidate: true));
+        }
+    }
+
+    /// <summary>
+    /// The type an object creation constructs: the bound constructor's type, or, when overload resolution
+    /// failed, the type every candidate constructor belongs to (the created type is certain even though the
+    /// constructor is not). Null when nothing bound or the candidates span several types.
+    /// </summary>
+    private static INamedTypeSymbol? CreatedType(SyntaxNode creationNode, SemanticModel model)
+    {
+        if ((model.GetOperation(creationNode) as IObjectCreationOperation)?.Constructor?.ContainingType is { } bound)
+            return bound;
+
+        var info = model.GetSymbolInfo(creationNode);
+        if (info.Symbol is IMethodSymbol constructor)
+            return constructor.ContainingType;
+
+        INamedTypeSymbol? only = null;
+        foreach (var candidate in info.CandidateSymbols)
+        {
+            if (candidate is not IMethodSymbol { MethodKind: MethodKind.Constructor, ContainingType: { } type })
+                return null;
+            if (only == null)
+                only = type;
+            else if (!SymbolEqualityComparer.Default.Equals(only, type))
+                return null;
+        }
+        return only;
+    }
+
     private static void EmitInstantiation(
         SyntaxNode creationNode, SemanticModel model, DocumentContributionSet sink,
         Func<IAssemblySymbol, long?>? resolveTargetProject)
     {
-        var createdType = (model.GetOperation(creationNode) as IObjectCreationOperation)?.Constructor?.ContainingType
-                          ?? (model.GetSymbolInfo(creationNode).Symbol as IMethodSymbol)?.ContainingType;
+        var createdType = CreatedType(creationNode, model);
         if (createdType == null)
             return;
 
@@ -379,8 +550,7 @@ public static class DocumentSemanticExtractor
         DocumentContributionSet sink,
         Func<IAssemblySymbol, long?>? resolveTargetProject)
     {
-        var createdType = (model.GetOperation(creation) as IObjectCreationOperation)?.Constructor?.ContainingType
-                          ?? (model.GetSymbolInfo(creation).Symbol as IMethodSymbol)?.ContainingType;
+        var createdType = CreatedType(creation, model);
         if (createdType == null)
             return;
 

@@ -104,9 +104,11 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_SANDBOX_ENABLED` | Enforce the evaluation sandbox (Phase 17) | `true` |
 | `SEXTANT_SERVICE_SANDBOX_TIME_BUDGET_SECONDS` | Wall-clock evaluation time budget | policy default |
 | `SEXTANT_SERVICE_SANDBOX_MEMORY_BUDGET_BYTES` | Watchdog memory ceiling | policy default |
-| `SEXTANT_SERVICE_SANDBOX_ALLOW_NETWORK` | Allow network during evaluation | `false` |
+| `SEXTANT_SERVICE_SANDBOX_ALLOW_NETWORK` | Allow network during evaluation (a best-effort posture, not a network block; it does not gate package restore, see [Package restore](#package-restore-before-the-load)) | `false` |
 | `SEXTANT_SERVICE_SANDBOX_SCRUB_SECRETS` | Scrub secrets from the evaluation environment | `true` |
 | `SEXTANT_SERVICE_SDK_PIN_OVERRIDE` | Temporarily neutralize a checkout `global.json` SDK pin that no installed SDK satisfies, so the checkout still indexes with an installed SDK (issue #113; see [SDK pins](#repository-globaljson-sdk-pins-issue-113)). `false` leaves such pins alone and the job fails / goes partial with a typed `sdk_resolution_failed` diagnostic. `false` is part of the snapshot identity, so flipping the toggle re-indexes a commit instead of reusing a result built under the other policy. An unparseable value **fails startup** | `true` |
+| `SEXTANT_SERVICE_PACKAGE_RESTORE` | Run `dotnet restore` over the selected solutions before the load (see [Package restore](#package-restore-before-the-load)). `false` loads unrestored projects, which compile against their direct project references only, so calls into transitively referenced projects may not bind. `false` is part of the snapshot identity (`restore=off`). An unparseable value **fails startup** | `true` |
+| `SEXTANT_SERVICE_PACKAGE_RESTORE_TIMEOUT_SECONDS` | Bound on one job's whole restore step (all solutions), clamped to 3600. On expiry the restore process tree is killed and the load goes ahead with whatever was restored | `300` |
 
 Boolean toggles accept `1/0`, `true/false`, `yes/no`, `on/off` (case-insensitive); any other non-empty
 value **fails startup** rather than silently disabling a security-relevant control (fail-closed). The
@@ -235,11 +237,20 @@ file-system inventory (project files on disk, excluding `obj`/`bin`/`.git`; subm
 | a declared project could not load on this worker (e.g. an iOS/Android/Mac/WPF head on Linux, #90) | `project_skipped` (`sdk_resolution_failed` when its `global.json` pins an SDK this worker lacks and the pin was not overridden, #113) |
 | a selected solution declared no readable project, or nothing loaded at all | `solution_no_projects` / `no_projects_loaded` |
 | a declared submodule is not populated (no `.git` at its path) | `submodule_unpopulated` |
-| a project file on disk is in no selected solution and was not pulled in by a `ProjectReference` | `project_file_unreferenced` |
+| code in a loaded project did not bind (see [Binding health](#binding-health)) | (coverage `binding`) |
 | part of the tree could not be inspected (unreadable dir, `.gitmodules` entry escaping the checkout) | `coverage_scan_incomplete` |
 
-Under an explicit `solutions` list, project files outside that scope are reported as `info` and do **not**
-make the snapshot partial (the operator chose the scope). Per-item diagnostics are capped at 200 per code
+A project file on disk that no selected solution declares and no loaded project references
+(`project_file_unreferenced`, `info`) does **not** make the snapshot partial; it is listed in
+`coverage.notes` instead ("N project file(s) outside every selected solution were not indexed: …", naming up
+to 10). Under the no-config default every discovered solution is indexed (#124) and every project a solution
+reaches through a `ProjectReference` is loaded, so such a file is outside every build of the repository (a
+sample, a template, a scratch project): only the code inside it is missing, and the note says exactly which
+files. Before this change ten stray samples made every answer for a 188-project repository carry the generic
+"some projects or submodules were not indexed" warning, which agents read as "do not trust these results"
+and fell back to grep. Under an explicit `solutions` list the same files were already `info`. A **provider**
+(submodule) snapshot still goes partial for a stray project in its subtree (#162): the parent's selection
+does not scope another repository. Per-item diagnostics are capped at 200 per code
 with a summary row; the coverage counts are never capped. Diagnostic paths are checkout-relative.
 
 The coverage record is persisted in `snapshot_coverage` (migration `022`) **in the same transaction that
@@ -313,6 +324,82 @@ unchanged.
 
 Routing platform heads to a native Windows/macOS worker is a separate concern (issue #89); here they are
 recorded skipped-with-reason.
+
+#### Package restore before the load
+
+The worker runs `dotnet restore <solution> -p:DesignTimeBuild=true --ignore-failed-sources
+--disable-build-servers -nodeReuse:false` over every selected solution, in order and under one deadline
+(`SEXTANT_SERVICE_PACKAGE_RESTORE_TIMEOUT_SECONDS`, default 300 s), inside the evaluation sandbox and while
+an unsatisfiable `global.json` SDK pin is still neutralized, then loads the solutions. **Why:** without a
+restore there is no `obj/project.assets.json`, so the design-time build gets no package compile assets and the
+SDK never adds the **transitive** project references the assets file lists. Each project then compiles against
+its direct `ProjectReference`s only, every type it reaches through another project is unresolved, and every
+call whose signature mentions one fails to bind. Before this change the worker never restored: on a
+188-project repository a project with 3 direct references compiled with 2,219 errors (8 references and 0
+errors once restored), and `find_references` silently missed most call sites of methods with an optional
+parameter of such a type.
+
+A restore never fails the job. `--ignore-failed-sources` lets an unreachable or credential-gated feed (for
+example a private feed authenticated by an environment variable the worker does not have) leave the other
+packages restored; NuGet then reports the source as the per-project **warning** `NU1801` (not the error
+`NU1301`), and the parser records that warning as "a package source was unreachable", even when its message
+contains the word "error". `-p:DesignTimeBuild=true` keeps a missing optional workload from failing the restore,
+like the load. What it could not do is recorded: per-project `package_restore_incomplete` warnings (codes and
+package ids only, never a raw message, which can name a source URL), `coverage.notes` lines such as "Package
+restore could not find 2 package(s) (Acme.Auth, Acme.Auth.UI) for 1 project(s); code that uses them may not
+bind.", and each affected project's `coverage.binding.projects[].load_issue`. A restore that exits non-zero
+without a recognizable error line still leaves a note ("Package restore failed for N solution(s) without a
+recognized error code; ..."). A restore problem alone does not make the snapshot partial; the code that then
+fails to bind does (below). The process tree is killed on expiry or cancellation, stdin is closed, and
+stdout/stderr are drained concurrently with a bounded wait, so a leaked MSBuild node cannot hang the job.
+
+A restore problem is **not retried**: the job publishes with the notes above, and a later ensure of the same
+commit attaches to that snapshot. Retrying would rarely help, because each job restores into its own cold
+`NUGET_PACKAGES` (a timed-out restore would time out again), and a credential-gated feed never becomes
+reachable. The binding-health verdict below is what tells an agent that results may be missing; the next commit
+re-indexes.
+
+**Network and credentials.** Restore contacts nuget.org and every package source the repository's
+`nuget.config` names, from the worker host. `SEXTANT_SERVICE_SANDBOX_ALLOW_NETWORK` does **not** gate it: that
+setting is a best-effort offline posture for evaluation (telemetry and first-run variables) and never blocked
+the network, and the repository's design-time targets can already reach it during the load (only
+out-of-process worker isolation, #76, contains them). Set `SEXTANT_SERVICE_PACKAGE_RESTORE=false` on a host that
+must not make outbound requests on behalf of indexed repositories. The restore inherits the sandbox's scrubbed
+environment, and never any `SEXTANT_*` variable, so a `%VAR%` in a repository's `nuget.config` cannot send the
+service's own tokens to a source it names. Do not give the service account a user-level `NuGet.Config` with
+`packageSourceCredentials`: a repository's `nuget.config` can declare a source with the same key and another
+URL, and NuGet would send those credentials to it.
+
+Cost: 15-60 s per job for a large repository with a warm NuGet cache. The sandbox gives each job its own
+`NUGET_PACKAGES`, so a cold job downloads every package (about 2.6 GB for a 188-project repository) into job
+scratch, which is released with the job. The restore writes `obj/` files (`project.assets.json`,
+`*.nuget.g.props`) into the checkout, which `EvaluationFingerprint` hashes; a different commit is a fresh clone,
+so they never carry over to another commit. The toggle is part of the snapshot identity: `restore=off` is folded
+only when `SEXTANT_SERVICE_PACKAGE_RESTORE=false`, so the default leaves identities unchanged and flipping it
+re-indexes. The worker also closes each loaded project's transitive project-reference graph in the workspace
+(`TransitiveProjectReferences`), which covers a project restore could not restore at all.
+
+#### Binding health
+
+The extractor counts, per indexed project version, the identifier names it examined, the names that bound to
+no symbol, and the invocations that did not bind to one method. A compile-clean project leaves no name
+unbound, so these are symptoms of a missing reference or package. A project is **degraded** when at least 25
+names, and at least 0.5% of the names it uses, did not bind (`BindingHealthBuilder`); a few stray errors
+(generated code, a test fixture that deliberately does not compile) are tolerated. Every degraded project makes
+the snapshot **partial**, with a reason naming up to 5 of them ("Code in N project(s) did not fully compile on
+the indexer, so references and calls inside them may be missing (src/App/App.csproj: 412 unbound name(s); …).
+Calls that failed to bind are kept as candidate matches."). The counts are recorded in `coverage.binding`
+(totals, `projects_degraded`, and up to 25 projects with problems, each with `names_examined`,
+`unbound_names`, `unbound_invocations`, `candidate_occurrences`, `degraded` and the restore `load_issue`) in
+the publish transaction, so `get_index_status` `index.coverage` shows them. Binding health is recorded for
+the repository's own snapshot; provider snapshots and local CLI/daemon indexes record none.
+
+**Candidate matches.** When a name or call does not bind but the compiler offers candidates (overload
+resolution failed because an argument or optional parameter type is unresolved, or the call is ambiguous), the
+reference and the call edge are still stored, against every candidate, with the occurrence flag bit 2
+(`0b100`, `ReferenceStore.CandidateFlag`). Roslyn's own Find References reports these as candidate locations.
+An exact edge to the same target at the same site wins over a candidate. `find_references` and
+`get_call_hierarchy` mark such results `"candidate": true`; an exact result carries no `candidate` field.
 
 #### Submodules — recursive, pinned, credential-scoped (#125)
 
@@ -775,7 +862,12 @@ The remote tools answer an agent, so every response is shaped to fit its context
   (the 12-character commit; `warning` only when the answer may be incomplete: partial coverage, an incompatible
   indexer, or a dirty working tree), plus `repository_selection: "implicit"` when the caller named no repository
   and the service read its one visible repository. A tool error carries the same lean block. `get_index_status`
-  reports the full provenance in `index.snapshot`.
+  reports the full provenance in `index.snapshot`. A partial-coverage warning names what is missing: it is
+  `Partial index: ` + the recorded coverage reasons (for example `Code in 1 project(s) did not fully compile on
+  the indexer, … (src/App/App.csproj: 412 unbound name(s)). …`), cut
+  at a word boundary past 600 characters, + ` Call get_index_status for details.` A partial record with no
+  reasons keeps the generic caution. `coverage.notes` (stray project files, restore problems) never produce a
+  warning.
 - **Server `instructions`.** `initialize` returns a short instruction string telling the agent to pass
   `repository` and to page with `next_cursor`. A gateway that does not forward server instructions, or a client
   that drops them (Copilot CLI keeps them only for an allowlisted server), loses only this hint: the tool

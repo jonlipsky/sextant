@@ -69,8 +69,12 @@ On the remote `/mcp`, `meta.snapshot` is lean — what an agent needs to trust t
 ```
 
 `coverage` is `complete` or `partial`; a `warning` is added only when the answer may be incomplete (a partial
-index, an incompatible indexer, or a dirty working tree). The full provenance described below stays available
-from `get_index_status` as `index.snapshot`. The server's `initialize` result carries short `instructions`
+index, an incompatible indexer, or a dirty working tree). A partial warning names what is missing, for example
+`Partial index: Code in 1 project(s) did not fully compile on the indexer, so references and calls inside them
+may be missing (src/App/App.csproj: 412 unbound name(s)). Calls that failed to bind are kept as candidate
+matches. Call get_index_status for details.` The full provenance described below stays available
+from `get_index_status` as `index.snapshot`, and the coverage record (its `binding` health per project and its
+informational `notes`) as `index.coverage`. The server's `initialize` result carries short `instructions`
 (when to use the tools, the `repository` argument, paging) for clients that surface them.
 
 ### Symbol arguments
@@ -277,7 +281,7 @@ All usages of a symbol across the codebase.
 | `scope` | string | no | `file:<relative path>`, `project:<canonical_id>`, `solution:<relative path>` or `all` |
 | `limit` / `cursor` | int / string | no | Paging (see [Paged results](#paged-results)) |
 
-Returns reference locations with `reference_kind` (invocation, type_ref, attribute, inheritance, override, object_creation) and `context_snippet`.
+Returns reference locations with `reference_kind` (invocation, type_ref, attribute, inheritance, override, object_creation) and `context_snippet`. A location whose code did not bind exactly (overload resolution failed, typically because an argument or parameter type is unresolved on the indexer, or the call is ambiguous) is still returned, against each compiler candidate, with `"candidate": true`, like a candidate location in Roslyn's Find References. Exact locations carry no `candidate` field.
 
 ### get_type_members
 
@@ -308,7 +312,7 @@ Callers or callees of a method with configurable depth.
 | `depth` | int | no | Recursion depth (default: configured max, typically 5) |
 | `limit` / `cursor` | int / string | no | Paging (see [Paged results](#paged-results)) |
 
-Uses a recursive CTE on the `call_graph` table. Results are returned as a flat list with a `depth` field rather than a nested tree.
+Uses a recursive CTE on the `call_graph` table. Results are returned as a flat list with a `depth` field rather than a nested tree. An edge recorded from a call that did not bind exactly is marked `"candidate": true` (see `find_references`).
 
 ### get_implementors
 

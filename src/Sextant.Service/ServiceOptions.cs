@@ -3,6 +3,7 @@ using Sextant.Core.Platform;
 using Sextant.Indexer;
 using Sextant.Service.CallerIdentity;
 using Sextant.Service.Contributions;
+using Sextant.Service.Restore;
 using Sextant.Service.Sandbox;
 
 namespace Sextant.Service;
@@ -379,6 +380,29 @@ public sealed record ServiceOptions
     /// </summary>
     public string? SdkPinIdentityComponent => SdkPin.SdkPinOptions.IdentityComponentFor(SdkPinOverride);
 
+    /// <summary>
+    /// When true (the default) the worker runs <c>dotnet restore</c> on each selected solution before loading it,
+    /// so package compile assets and the SDK's transitive project references are present and code that uses
+    /// them binds. A failed or partial restore never fails the job: the load proceeds and the recorded coverage
+    /// names what the restore could not resolve. <c>SEXTANT_SERVICE_PACKAGE_RESTORE</c>.
+    /// </summary>
+    public bool PackageRestore { get; init; } = true;
+
+    /// <summary>
+    /// The wall-clock bound on the restore step of one job, across every selected solution
+    /// (<c>SEXTANT_SERVICE_PACKAGE_RESTORE_TIMEOUT_SECONDS</c>, default 300). On expiry the restore process tree
+    /// is killed and the load proceeds with whatever was restored.
+    /// </summary>
+    public TimeSpan PackageRestoreTimeout { get; init; } = PackageRestoreRunner.DefaultTimeout;
+
+    /// <summary>
+    /// The <see cref="SnapshotIdentity.RestorePolicy"/> component folded into every ensure request's identity:
+    /// null for the default restore-on policy and <c>off</c> when <see cref="PackageRestore"/> is disabled, so
+    /// flipping the toggle rebuilds a commit instead of reusing a snapshot produced under the other policy.
+    /// The worker publishes under the same value (<see cref="PackageRestoreRunner.IdentityComponentFor"/>).
+    /// </summary>
+    public string? RestoreIdentityComponent => PackageRestoreRunner.IdentityComponentFor(PackageRestore);
+
     private const string EnvPrefix = "SEXTANT_SERVICE_";
 
     /// <summary>
@@ -469,7 +493,10 @@ public sealed record ServiceOptions
                 AllowNetwork = EnvBool("SANDBOX_ALLOW_NETWORK") ?? false,
                 ScrubSecrets = EnvBool("SANDBOX_SCRUB_SECRETS") ?? true
             },
-            SdkPinOverride = EnvBool("SDK_PIN_OVERRIDE") ?? true
+            SdkPinOverride = EnvBool("SDK_PIN_OVERRIDE") ?? true,
+            PackageRestore = EnvBool("PACKAGE_RESTORE") ?? true,
+            PackageRestoreTimeout = EnvInt("PACKAGE_RESTORE_TIMEOUT_SECONDS") is int restoreSeconds and > 0
+                ? TimeSpan.FromSeconds(restoreSeconds) : PackageRestoreRunner.DefaultTimeout
         };
         options.ValidateCallerIdentity();
         return options;

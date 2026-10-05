@@ -77,7 +77,7 @@ public static class SolutionLoader
                 "the per-project failures.");
         }
 
-        return new SolutionLoadResult(solution, skipped);
+        return new SolutionLoadResult(TransitiveProjectReferences.Close(solution, onDiagnostic), skipped);
     }
 
     /// <summary>
@@ -113,7 +113,7 @@ public static class SolutionLoader
         }
 
         var skipped = ReconcileSkipped(projectPaths, solution, failures, thrownSkipped, onDiagnostic);
-        return new SolutionLoadResult(solution, skipped);
+        return new SolutionLoadResult(TransitiveProjectReferences.Close(solution, onDiagnostic), skipped);
     }
 
     /// <summary>
@@ -209,7 +209,7 @@ public static class SolutionLoader
             ExceptionDispatchInfo.Throw(originalException);
         }
 
-        return new SolutionLoadResult(loadedSolution, skipped);
+        return new SolutionLoadResult(TransitiveProjectReferences.Close(loadedSolution, onDiagnostic), skipped);
     }
 
     // Reconciles the DECLARED projects against what actually loaded to produce the skipped set. A project
