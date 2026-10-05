@@ -18,12 +18,11 @@ namespace Sextant.Service.Tests;
 public sealed partial class AgentSizedOutputHttpTests
 {
     // Before #145 tools/list was 29159 characters for 24 tools (the #145 budget was half of that, 14579). Measured
-    // with a required selection / delegate callers: the eight agent tools of S12 plus search_symbols (which declares
-    // its own strict schema), 5546 / 5756 (640 per tool). Without search_symbols: the eight, 4719 / 4929 (616 per
-    // tool); nine (+get_type_dependents), 5322 / 5562; twelve (+semantic_search, find_by_attribute,
-    // find_unreferenced), 7207 / 7537 (628 per tool). The budget scales with ServiceApp.RemoteQueryTools, so a change
-    // to the set needs no edit here; a tool whose description or schema grows well past the average still fails it.
-    private const int ToolsListBudgetPerTool = 660;
+    // with a required selection / delegate callers: the eight agent tools of S12, 4719 / 4929 (616 per tool); nine
+    // (+get_type_dependents), 5322 / 5562; twelve (+semantic_search, find_by_attribute, find_unreferenced), 7207 /
+    // 7537 (628 per tool). The budget scales with ServiceApp.RemoteQueryTools, so a change to the set needs no edit
+    // here; a tool whose description or schema grows well past the average still fails it.
+    private const int ToolsListBudgetPerTool = 640;
     private static int ToolsListBudget => ToolsListBudgetPerTool * ExpectedTools.Length;
     private const int InstructionsBudget = 600;
     private const int UnboundedChars = 10_000_000;

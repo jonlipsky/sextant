@@ -7,7 +7,7 @@ namespace Sextant.Store;
 /// NOCASE, like <c>LIKE</c>, folds only the ASCII letters and otherwise compares UTF-8 bytes, which order like Unicode
 /// scalar values. So a text starts with the prefix (ignoring ASCII case) exactly when, under NOCASE, it is at least
 /// <see cref="Lo"/> and, unless <see cref="Hi"/> is null, below <see cref="Hi"/>. That turns a prefix match into an
-/// index range. Shared by the service's <c>search_symbols</c> page seek and the MCP symbol resolver's suggestions.
+/// index range. Used by the MCP symbol resolver's suggestions.
 /// </summary>
 /// <param name="Lo">The prefix with its ASCII letters folded to lowercase.</param>
 /// <param name="Hi">

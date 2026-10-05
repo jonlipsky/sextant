@@ -454,7 +454,7 @@ public sealed partial class SnapshotService
                 : _snapshots.GetBranch(repositoryId, branch);
 
         // The lowest-id consumer repository with the key. The map is built once per reader (a listing describes every
-        // visible repository). search_symbols does not use it: it looks up only the caller's keys (issue #196).
+        // visible repository).
         public long? RepositoryId(string key)
         {
             if (_repositoryIds is null)

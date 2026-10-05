@@ -68,11 +68,9 @@ public class McpStdioProtocolTests
         Assert.IsTrue(tools.GetArrayLength() >= expectedTools.Length,
             $"Expected >= {expectedTools.Length} tools, got {tools.GetArrayLength()}");
 
-        // The service-only tools (SVC-4 list_repositories, SVC-F search_symbols) are never registered locally. The
-        // local surface keeps every query tool above; only the service's remote surface is narrowed to the agent
-        // tools (S12).
+        // The service-only tool (SVC-4 list_repositories) is never registered locally. The local surface keeps every
+        // query tool above; only the service's remote surface is narrowed to the agent tools (S12).
         Assert.IsFalse(toolNames.Contains("list_repositories"), "list_repositories is service-only");
-        Assert.IsFalse(toolNames.Contains("search_symbols"), "search_symbols is service-only");
     }
 
     [TestMethod]

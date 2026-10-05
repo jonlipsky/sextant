@@ -101,42 +101,6 @@ public sealed record ServiceOptions
     internal const int DefaultMaxGrantsPerTenant = 5000;
 
     /// <summary>
-    /// The most snapshots one <c>search_symbols</c> call reads (SVC-F). The caller's other visible targets are
-    /// deferred to later pages, round-robin, and reported as <c>truncated</c>. <c>SEXTANT_SERVICE_SEARCH_MAX_WIDTH</c>
-    /// (default 50); a missing, non-positive or unparseable value keeps the default, and a larger value is clamped to
-    /// <see cref="SearchMaxWidthCeiling"/>.
-    /// </summary>
-    public int SearchMaxWidth { get; init; } = DefaultSearchMaxWidth;
-
-    internal const int DefaultSearchMaxWidth = 50;
-
-    /// <summary>
-    /// The largest <see cref="SearchMaxWidth"/> honoured, and the most snapshots one search tracks at once (the most
-    /// positions a search cursor carries, which keeps it within its 16 KiB bound).
-    /// </summary>
-    public const int SearchMaxWidthCeiling = 100;
-
-    /// <summary>
-    /// The most symbols one <c>search_symbols</c> call returns across all the snapshots it reads (issue #196). The
-    /// per-snapshot <c>limit</c> still applies; the page divides this budget among the snapshots it reads, in hash
-    /// order, so every one of them gets at least one row and the rest resume on later pages.
-    /// <c>SEXTANT_SERVICE_SEARCH_MAX_HITS</c> (default 500); a missing, non-positive or unparseable value keeps the
-    /// default, and any other value is clamped to <see cref="SearchMaxHitsFloor"/>..<see cref="SearchMaxHitsCeiling"/>.
-    /// </summary>
-    public int SearchMaxHits { get; init; } = DefaultSearchMaxHits;
-
-    internal const int DefaultSearchMaxHits = 500;
-
-    /// <summary>
-    /// The smallest <see cref="SearchMaxHits"/> honoured: <see cref="SearchMaxWidthCeiling"/>, so every snapshot a
-    /// page reads gets at least one row of the budget (the round-robin fairness bound depends on it).
-    /// </summary>
-    public const int SearchMaxHitsFloor = SearchMaxWidthCeiling;
-
-    /// <summary>The largest <see cref="SearchMaxHits"/> honoured.</summary>
-    public const int SearchMaxHitsCeiling = 5000;
-
-    /// <summary>
     /// The most characters one <c>/mcp</c> tool result may hold, measured on the text the client receives
     /// (<see cref="Sextant.Mcp.ResponseBudget"/>): a list that does not fit ends at the last row that does, with
     /// <c>meta.next_cursor</c> or a hint to narrow the query. <c>SEXTANT_SERVICE_MAX_RESPONSE_CHARS</c> (default
@@ -448,10 +412,6 @@ public sealed record ServiceOptions
                 ? perPrincipal : DefaultMaxGrantsPerPrincipal,
             MaxGrantsPerTenant = EnvInt("MAX_GRANTS_PER_TENANT") is int perTenant and > 0
                 ? perTenant : DefaultMaxGrantsPerTenant,
-            SearchMaxWidth = EnvInt("SEARCH_MAX_WIDTH") is int width and > 0
-                ? Math.Min(width, SearchMaxWidthCeiling) : DefaultSearchMaxWidth,
-            SearchMaxHits = EnvInt("SEARCH_MAX_HITS") is int hits and > 0
-                ? Math.Clamp(hits, SearchMaxHitsFloor, SearchMaxHitsCeiling) : DefaultSearchMaxHits,
             MaxResponseChars = Sextant.Mcp.ResponseBudget.Clamp(EnvInt("MAX_RESPONSE_CHARS")),
             BindAddress = EnvHost("BIND_ADDRESS") ?? "localhost",
             ControlPort = EnvInt("CONTROL_PORT") ?? 3011,

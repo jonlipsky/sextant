@@ -64,7 +64,7 @@ Your AI agent now has access to 13+ semantic tools. It can find symbols, trace r
 | `get_index_status` | What's indexed and how fresh |
 
 These are the local tools. A shared index service's remote `/mcp` offers only the first seven plus
-`list_repositories` and `search_symbols` (see [service.md](docs/service.md#agent-sized-output-on-mcp)).
+`list_repositories` (see [service.md](docs/service.md#agent-sized-output-on-mcp)).
 
 ## How It Works
 

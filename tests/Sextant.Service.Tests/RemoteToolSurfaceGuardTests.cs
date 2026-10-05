@@ -49,7 +49,7 @@ public sealed partial class RemoteToolSurfaceGuardTests
         .ToArray();
 
     // Tools that were once on the remote surface and no longer exist in any assembly; no text may bring them back.
-    private static readonly string[] RetiredToolNames = ["research_codebase"];
+    private static readonly string[] RetiredToolNames = ["search_symbols", "research_codebase"];
 
     private static readonly Assembly[] ToolAssemblies = [typeof(FindSymbolTool).Assembly, typeof(SnapshotService).Assembly];
 
@@ -87,7 +87,7 @@ public sealed partial class RemoteToolSurfaceGuardTests
         var forbidden = Forbidden.Value;
 
         // Tools that never go remote (they read outside the grant gate, or report on the whole local index).
-        foreach (var name in new[] { "get_index_status", "get_source_context", "get_base_snapshot_symbols", "find_cross_repository_usages" })
+        foreach (var name in new[] { "get_index_status", "get_source_context", "get_base_snapshot_symbols", "find_cross_repository_usages", "search_symbols" })
             CollectionAssert.Contains(forbidden.ToList(), name);
         Assert.AreEqual(0, forbidden.Intersect(AgentTools).Count());
         Assert.IsTrue(AgentTools.Length > 0);
@@ -191,7 +191,6 @@ public sealed partial class RemoteToolSurfaceGuardTests
             ("implementors", SizeCut, "get_implementors", new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetInterface, ["repository"] = repoA }),
             ("ambiguous member", "ambiguous_symbol", "get_call_hierarchy", new JsonObject { ["symbol_fqn"] = "Get", ["direction"] = "callers", ["repository"] = repoA }),
             ("list_repositories without a caller", "caller_required", "list_repositories", new JsonObject()),
-            ("search_symbols without a caller", "caller_required", "search_symbols", new JsonObject { ["name_prefix"] = "IStore" }),
             // Candidates for the surface: their rows run only while the tool is on it, so adding one to
             // RemoteQueryTools needs no edit here.
             ("dependents", SizeCut, "get_type_dependents", new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetInterface, ["repository"] = repoA }),
