@@ -11,6 +11,7 @@ using Sextant.Service;
 using Sextant.Service.Backup;
 using Sextant.Service.Contributions;
 using Sextant.Service.Placement;
+using Sextant.Service.Restore;
 using Sextant.Service.Sandbox;
 using Sextant.Service.SdkPin;
 using Sextant.Store;
@@ -86,8 +87,14 @@ public static class ServiceHostRunner
                 JournalRoot = Path.Combine(paths.CheckoutRoot, SdkPinOptions.JournalDirectoryName)
             },
             log: Console.Error.WriteLine);
+        // NuGet restore before the load, so packages' compile assets and the transitive ProjectReference closure
+        // reach the compiler. Its toggle MUST be options.PackageRestore: it also sets the SnapshotService's request
+        // identity (ServiceOptions.RestoreIdentityComponent), and the worker publishes under the runner's.
+        var packageRestore = new PackageRestoreRunner(
+            options.PackageRestore, options.PackageRestoreTimeout, Console.Error.WriteLine);
         var localWorker = new LocalIndexerSnapshotWorker(
-            database, config, checkoutProvider, Console.Error.WriteLine, nodeCapability, sandbox, sdkPinGuard);
+            database, config, checkoutProvider, Console.Error.WriteLine, nodeCapability, sandbox, sdkPinGuard,
+            packageRestore);
         var defaultPlacement = new LocalPlacement(nodeCapability, localWorker);
         var worker = new CapabilityRoutingSnapshotWorker(
             defaultPlacement,

@@ -1,6 +1,7 @@
 using Sextant.Core;
 using Sextant.Core.Platform;
 using Sextant.Indexer;
+using Sextant.Service.Restore;
 using Sextant.Service.Sandbox;
 using Sextant.Service.SdkPin;
 using Sextant.Store;
@@ -181,10 +182,15 @@ public sealed class LocalIndexerSnapshotWorker(
     Action<string>? log = null,
     WorkerCapability? capability = null,
     IEvaluationSandbox? sandbox = null,
-    SdkPinGuard? sdkPinGuard = null) : ISnapshotWorker
+    SdkPinGuard? sdkPinGuard = null,
+    PackageRestoreRunner? packageRestore = null) : ISnapshotWorker
 {
     // Issue #113: neutralizes an unsatisfiable global.json SDK pin for the duration of the MSBuild load only.
     private readonly SdkPinGuard _sdkPinGuard = sdkPinGuard ?? new SdkPinGuard(log: log);
+
+    // Restores the selected solutions before the load so package compile assets and the SDK's transitive
+    // project references exist; without them code that reaches a type through another project cannot bind.
+    private readonly PackageRestoreRunner _packageRestore = packageRestore ?? new PackageRestoreRunner(log: log);
 
     public async Task<SnapshotWorkResult> ProduceAsync(
         EnsureSnapshotRequest request, string identityHash, string scratchDir, CancellationToken cancellationToken)
@@ -222,7 +228,8 @@ public sealed class LocalIndexerSnapshotWorker(
                 BuildConfigErrorDiagnostics(checkoutDir, resolution));
         }
 
-        var context = CreateSnapshotContext(request, capability, _sdkPinGuard.IdentityComponent);
+        var context = CreateSnapshotContext(
+            request, capability, _sdkPinGuard.IdentityComponent, _packageRestore.IdentityComponent);
         var pinState = new SdkPinLoadState();
 
         // The untrusted region: loading the solution EVALUATES its MSBuild projects (arbitrary imported
@@ -238,8 +245,14 @@ public sealed class LocalIndexerSnapshotWorker(
             var pinOverlay = _sdkPinGuard.Apply(checkoutDir, resolution.SelectedSolutions);
             pinState.Overlay = pinOverlay;
             MultiSolutionLoadResult load;
+            PackageRestoreOutcome restore;
             try
             {
+                // Restore BEFORE the load and while an unsatisfiable SDK pin is still neutralized, so the restore
+                // resolves the same SDK the load will. A failed or partial restore never fails the job.
+                restore = await _packageRestore.RunAsync(checkoutDir, resolution.SelectedSolutions, token)
+                    .ConfigureAwait(false);
+
                 // Load the DETERMINISTIC selected solution set into ONE workspace (union of projects,
                 // de-duplicated by project path/identity). A single selected solution keeps the byte-identical
                 // whole-solution fast path; multiple solutions — an explicit list, or the no-config default
@@ -284,10 +297,12 @@ public sealed class LocalIndexerSnapshotWorker(
             var inventory = SnapshotCoverageBuilder.Inventory.Scan(checkoutDir);
             var pinOverrides = pins.Where(p => p.OverrideApplied).Select(p => p.ToCoverageOverride()).ToList();
             var coverage = SnapshotCoverageBuilder.Build(checkoutDir, resolution, load, inventory, pinOverrides);
+            coverage = coverage with { Coverage = SnapshotCoverageBuilder.WithNotes(coverage.Coverage, restore.Notes()) };
             var indexContext = context with
             {
                 Coverage = coverage.Coverage,
-                ProviderCoverage = SnapshotCoverageBuilder.BuildProviders(checkoutDir, resolution, load, inventory, pinOverrides)
+                ProviderCoverage = SnapshotCoverageBuilder.BuildProviders(checkoutDir, resolution, load, inventory, pinOverrides),
+                ProjectLoadIssues = restore.Projects.Count > 0 ? restore.ProjectLoadIssues() : null
             };
 
             var orchestrator = new IndexOrchestrator(
@@ -313,7 +328,7 @@ public sealed class LocalIndexerSnapshotWorker(
             var recorded = new SnapshotCoverageStore(database.GetConnection()).Get(published.Id) ?? coverage.Coverage;
             return BuildResult(
                 published.Id, checkoutDir, resolution, load, coverage with { Coverage = recorded },
-                pins, InstalledSdks(pins, load: load));
+                pins, InstalledSdks(pins, load: load), restore);
         }
 
         // A failed restore outranks every other outcome: the checkout no longer matches its commit, so the job
@@ -421,11 +436,35 @@ public sealed class LocalIndexerSnapshotWorker(
     internal static SnapshotWorkResult BuildResult(
         long snapshotId, string checkoutDir, CheckoutResolution resolution, MultiSolutionLoadResult load,
         SnapshotCoverageBuilder.Result coverage,
-        IReadOnlyList<SdkPinFinding>? sdkPins = null, IReadOnlyList<string>? installedSdks = null)
+        IReadOnlyList<SdkPinFinding>? sdkPins = null, IReadOnlyList<string>? installedSdks = null,
+        PackageRestoreOutcome? restore = null)
     {
         var diagnostics = BuildDiagnostics(
             checkoutDir, resolution, load, sdkPins ?? [], installedSdks ?? [], published: true);
         diagnostics.AddRange(coverage.Diagnostics);
+        if (restore is { Clean: false })
+        {
+            // Package ids and codes only: a raw restore message can name a package source URL.
+            foreach (var issue in restore.Projects)
+            {
+                diagnostics.Add(new ProjectOutcome
+                {
+                    Severity = JobDiagnosticSeverity.Warning,
+                    Code = PackageRestoreIncompleteCode,
+                    ProjectPath = issue.Project,
+                    Message = $"Project '{issue.Project}' did not restore fully ({issue.Describe()}); code that uses the missing packages may not bind."
+                });
+            }
+            foreach (var note in restore.Notes())
+            {
+                diagnostics.Add(new ProjectOutcome
+                {
+                    Severity = JobDiagnosticSeverity.Warning,
+                    Code = PackageRestoreIncompleteCode,
+                    Message = note
+                });
+            }
+        }
 
         if (coverage.Coverage.IsPartial)
         {
@@ -591,6 +630,9 @@ public sealed class LocalIndexerSnapshotWorker(
     /// <summary>Diagnostic code: hostfxr could not resolve the SDK a global.json pins, and it was not overridden.</summary>
     public const string SdkResolutionFailedCode = "sdk_resolution_failed";
 
+    /// <summary>Diagnostic code: the pre-load package restore could not restore everything (the job still publishes).</summary>
+    public const string PackageRestoreIncompleteCode = "package_restore_incomplete";
+
     /// <summary>
     /// Diagnostic code: a neutralized global.json could not be restored to its committed bytes (or a leftover
     /// restore journal could not be replayed). Carried by a <see cref="TransientProvisioningException"/>, so the
@@ -752,9 +794,11 @@ public sealed class LocalIndexerSnapshotWorker(
     /// unconditional-advance behavior byte-for-byte. Internal + static so it is unit-testable without a
     /// real checkout/MSBuild. <paramref name="sdkPinPolicy"/> is the guard's non-default SDK-pin identity
     /// component (issue #113); the orchestrator folds it into the identity of every snapshot it publishes.
+    /// <paramref name="restorePolicy"/> is the restore runner's identity component, folded the same way.
     /// </summary>
     internal static SnapshotContext CreateSnapshotContext(
-        EnsureSnapshotRequest request, WorkerCapability? capability, string? sdkPinPolicy = null) => new()
+        EnsureSnapshotRequest request, WorkerCapability? capability, string? sdkPinPolicy = null,
+        string? restorePolicy = null) => new()
     {
         RepositoryRemoteUrl = request.RepositoryRemoteUrl,
         CommitSha = request.CommitSha,
@@ -778,6 +822,8 @@ public sealed class LocalIndexerSnapshotWorker(
             : null,
         // Issue #113: must equal the service's ServiceOptions.SdkPinIdentityComponent, or the service's
         // ValidateWorkerResult fails the job closed (published identity != requested identity).
-        SdkPinPolicy = sdkPinPolicy
+        SdkPinPolicy = sdkPinPolicy,
+        // Same contract for the package-restore toggle (ServiceOptions.RestoreIdentityComponent).
+        RestorePolicy = restorePolicy
     };
 }

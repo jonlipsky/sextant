@@ -38,20 +38,58 @@ public class SnapshotCoverageBuilderTests
         };
 
     [TestMethod]
-    public void UnreferencedProjectFile_UnderDefaultSelection_IsPartial()
+    public void UnreferencedProjectFile_UnderDefaultSelection_IsANoteNotAPartialVerdict()
     {
+        // Under the no-config union every discovered solution is indexed, so a project file no solution declares
+        // and no loaded project references is outside every build: only the code inside it is missing, which a
+        // note names. Downgrading the whole verdict for it made every answer read as untrustworthy.
         var load = Load([At("src/App/App.csproj")]);
         var inventory = new SnapshotCoverageBuilder.Inventory(
-            [At("src/App/App.csproj"), At("tools/Orphan/Orphan.csproj")], []);
+            [At("src/App/App.csproj"), At("tools/Orphan/Orphan.csproj"), At("samples/Demo/Demo.csproj")], []);
 
         var result = SnapshotCoverageBuilder.Build(CheckoutDir, Resolution(), load, inventory);
 
-        Assert.AreEqual(SnapshotCoverageVerdict.Partial, result.Coverage.Verdict);
-        Assert.AreEqual(1, result.Coverage.ProjectFilesUnreferenced);
-        Assert.AreEqual(2, result.Coverage.ProjectFilesOnDisk);
-        var diag = result.Diagnostics.Single(d => d.Code == "project_file_unreferenced");
-        Assert.AreEqual(JobDiagnosticSeverity.Warning, diag.Severity);
-        Assert.AreEqual("tools/Orphan/Orphan.csproj", diag.ProjectPath, "diagnostics are checkout-relative");
+        Assert.AreEqual(SnapshotCoverageVerdict.Complete, result.Coverage.Verdict);
+        Assert.AreEqual(0, result.Coverage.Reasons.Count);
+        Assert.AreEqual(2, result.Coverage.ProjectFilesUnreferenced, "still counted for visibility");
+        Assert.AreEqual(3, result.Coverage.ProjectFilesOnDisk);
+        Assert.AreEqual(
+            "2 project file(s) outside every selected solution were not indexed: " +
+            "samples/Demo/Demo.csproj, tools/Orphan/Orphan.csproj.",
+            result.Coverage.Notes!.Single(), "the note names the files, checkout-relative and sorted");
+        var diag = result.Diagnostics.Single(d => d.Code == "project_file_unreferenced" && d.ProjectPath == "samples/Demo/Demo.csproj");
+        Assert.AreEqual(JobDiagnosticSeverity.Info, diag.Severity, "diagnostics are checkout-relative and informational");
+    }
+
+    [TestMethod]
+    public void UnreferencedProjectFiles_NoteNamesAtMostMaxNamedInReasonFiles()
+    {
+        var count = SnapshotCoverageBuilder.MaxNamedInReason + 3;
+        var files = Enumerable.Range(0, count).Select(i => At($"samples/S{i:D2}/S{i:D2}.csproj")).ToList();
+        var load = Load([At("src/App/App.csproj")]);
+        var inventory = new SnapshotCoverageBuilder.Inventory([At("src/App/App.csproj"), .. files], []);
+
+        var result = SnapshotCoverageBuilder.Build(CheckoutDir, Resolution(), load, inventory);
+
+        Assert.AreEqual(SnapshotCoverageVerdict.Complete, result.Coverage.Verdict);
+        StringAssert.StartsWith(result.Coverage.Notes!.Single(),
+            $"{count} project file(s) outside every selected solution were not indexed: samples/S00/S00.csproj,");
+        StringAssert.EndsWith(result.Coverage.Notes!.Single(), ", +3 more.");
+    }
+
+    [TestMethod]
+    public void WithNotes_AppendsAndNeverChangesTheVerdict()
+    {
+        var partial = new SnapshotCoverage
+        {
+            Verdict = SnapshotCoverageVerdict.Partial, Reasons = ["a gap."], Notes = ["first."]
+        };
+
+        var result = SnapshotCoverageBuilder.WithNotes(partial, ["second."]);
+
+        Assert.AreEqual(SnapshotCoverageVerdict.Partial, result.Verdict);
+        CollectionAssert.AreEqual(new[] { "first.", "second." }, result.Notes!.ToArray());
+        Assert.AreSame(partial, SnapshotCoverageBuilder.WithNotes(partial, []), "no notes ⇒ unchanged");
     }
 
     [TestMethod]

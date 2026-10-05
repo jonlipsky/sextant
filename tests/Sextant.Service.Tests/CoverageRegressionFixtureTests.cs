@@ -88,9 +88,12 @@ public class CoverageRegressionFixtureTests
         Assert.AreEqual(1, c.SubmodulesUnpopulated,
             "the fixture's submodule url (https://example.invalid) is refused by the submodule host policy");
         Assert.AreEqual(0, c.ScanErrors);
-        Assert.AreEqual(2, c.Reasons.Count, "one reason per remaining gap: unpopulated submodule, orphan project");
+        Assert.AreEqual(1, c.Reasons.Count, "one reason per remaining gap: the unpopulated submodule");
         Assert.IsTrue(c.Reasons.Any(r => r.Contains("libs/shared (url refused", StringComparison.Ordinal)),
             "the unpopulated submodule's reason names WHY it was not provisioned (issue #125)");
+        Assert.AreEqual(
+            "1 project file(s) outside every selected solution were not indexed: orphans/Orphan/Orphan.csproj.",
+            c.Notes!.Single(), "the orphan project is a note, not a coverage gap");
         Assert.AreEqual(SubmoduleProvisioningStatus.UrlRefused, resolution.SubmoduleProvisioning.Single().Status);
 
         Assert.IsFalse(result.Projects.Any(p => p.Code == "solution_not_selected"));
