@@ -485,6 +485,9 @@ Hierarchical view of namespaces and their types.
 | `project_id` | string | no | Filter by project canonical ID |
 | `depth` | int | no | How many namespace levels deep to traverse (default: 1) |
 
+The result is one row (`namespace`, `child_namespaces`, `symbols`); `meta.result_count` counts its child
+namespaces plus its symbols, the rows the [response size budget](#response-size-budget) keeps in that order.
+
 ### get_source_context
 
 Retrieves source code lines around a given location.
