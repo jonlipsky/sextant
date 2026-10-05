@@ -243,6 +243,47 @@ public sealed partial class AgentSizedOutputHttpTests
         Assert.AreEqual(Paging.InvalidCursorCode, ErrorCode(otherRepository), "and to the snapshot");
     }
 
+    // include_source changes no row, only what each row carries, so an agent that drops it while paging keeps going.
+    [TestMethod]
+    [DataRow("find_references")]
+    [DataRow("get_call_hierarchy")]
+    public async Task Cursor_CarriesOverWhenIncludeSourceIsToggled(string tool)
+    {
+        await using var host = await AgentOutputHarness.StartAsync(maxResponseChars: UnboundedChars);
+        JsonObject Arguments(int limit, bool includeSource, string? cursor = null)
+        {
+            var arguments = tool == "find_references"
+                ? new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetInterface }
+                : new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetMethod, ["direction"] = "callers" };
+            arguments["limit"] = limit;
+            if (includeSource) arguments["include_source"] = true;
+            if (cursor is not null) arguments["cursor"] = cursor;
+            return arguments;
+        }
+        static List<string> Rows(JsonElement body) => body.GetProperty("results").EnumerateArray().Select(r => r.GetRawText()).ToList();
+        static List<string> Locations(JsonElement body) => body.GetProperty("results").EnumerateArray()
+            .Select(r => r.TryGetProperty("call_site_line", out var callLine)
+                ? $"{r.GetProperty("fully_qualified_name").GetString()}@{r.GetProperty("call_site_file").GetString()}:{callLine.GetInt32()}"
+                : $"{r.GetProperty("file_path").GetString()}:{r.GetProperty("line").GetInt32()}")
+            .ToList();
+
+        var first = await host.CallAsync(tool, Arguments(10, includeSource: true));
+        Assert.IsNull(ErrorCode(first), first.ToString());
+        var cursor = first.GetProperty("meta").GetProperty("next_cursor").GetString()!;
+        var second = await host.CallAsync(tool, Arguments(10, includeSource: false, cursor));
+        var both = await host.CallAsync(tool, Arguments(20, includeSource: false));
+
+        Assert.IsNull(ErrorCode(second), "a cursor issued with include_source resumes without it: " + second);
+        CollectionAssert.AreEqual(Locations(both), Locations(first).Concat(Locations(second)).ToList(),
+            "the second page resumes exactly after the first");
+        CollectionAssert.AreEqual(Rows(both).Skip(10).ToList(), Rows(second), "and carries no source, as asked");
+
+        var otherQuery = await host.CallAsync(tool, tool == "find_references"
+            ? Args(AgentOutputFixture.TargetInterface, cursor: cursor, groupBy: "file")
+            : new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetMethod, ["direction"] = "callees", ["cursor"] = cursor });
+        Assert.AreEqual(Paging.InvalidCursorCode, ErrorCode(otherQuery), "an argument that shapes the rows is still bound");
+    }
+
     [TestMethod]
     [DataRow("get_implementors", AgentOutputFixture.HandlerCount)]
     [DataRow("get_call_hierarchy", AgentOutputFixture.HandlerCount)]

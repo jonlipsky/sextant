@@ -23,8 +23,9 @@ public static class GetCallHierarchyTool
 
         var config = SextantConfiguration.FromEnvironment();
         depth = Math.Min(depth, config.MaxCallHierarchyDepth);
+        // include_source only adds each call site's surrounding lines, so a cursor carries over when it is toggled.
         if (!Paging.TryBegin("get_call_hierarchy", limit, cursor, readContext, out var page, out var cursorError,
-                symbol_fqn, direction, depth, include_source))
+                symbol_fqn, direction, depth))
             return cursorError;
 
         using var conn = db.OpenReadConnection();

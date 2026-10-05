@@ -854,7 +854,8 @@ The remote tools answer an agent, so every response is shaped to fit its context
   and reports `meta.total` and `meta.next_cursor` (see [Paged results](mcp-tools.md#paged-results)). A
   truncated first page leads with a `summary` (counts per project, file or kind) before `results`. A cursor
   is bound to the tool, its query arguments and the served snapshot (so its repository and branch): reused
-  anywhere else, or after the branch has moved, it fails with `meta.error.code = invalid_cursor`.
+  anywhere else, or after the branch has moved, it fails with `meta.error.code = invalid_cursor`. `limit` and
+  `include_source` change no row, so they are not bound.
 - **Paths.** Every path in a response is repository-relative (`src/App/Foo.cs`); the worker's checkout
   directory never appears (#145). A path outside every checkout (a package's source file) is reduced to its file
   name, including where it keys a summary count. Path inputs (`file_path`,

@@ -37,9 +37,12 @@ public static class RemoteResponsePresenter
     /// </summary>
     public const int MaxPartialWarningChars = 160;
 
-    /// <summary>The lean meta's warning for a snapshot built by an incompatible indexer.</summary>
+    /// <summary>
+    /// The lean meta's warning for a snapshot the running binary flags as incompatible: a newer schema, or a
+    /// different analyzer version, toolchain or worker capability (<see cref="ReadCompatibility"/>).
+    /// </summary>
     public const string IncompatibleWarning =
-        "The index was built by a different Sextant version, so results may differ.";
+        "The index was built by a different indexer, toolchain or worker, so results may differ.";
 
     /// <summary>The lean meta's warning for a snapshot that includes uncommitted working-tree changes.</summary>
     public const string DirtyWarning = "The index includes uncommitted working-tree changes.";
