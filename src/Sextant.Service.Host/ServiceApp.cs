@@ -153,7 +153,7 @@ public static class ServiceApp
                     selectionRequired: options.RequireRepositorySelection,
                     implicitSelection: options.DelegateTokens.Count > 0))
                 .AddCallToolFilter(ToolSelectionFilters.CallToolFilter(options.RepositoryUrlPolicy, RepositoryScopedTools))
-                // S13: a verified caller's symbol or path call that names no repository reads the ONE readable
+                // A verified caller's symbol or path call that names no repository reads the ONE readable
                 // repository holding its argument. Inside the selection filter, so it sees the call's selection.
                 .AddCallToolFilter(RepositoryInferenceFilter.CallToolFilter(service, options.RepositoryUrlPolicy))
                 // A tool result carrying a structured meta.error is an MCP tool error (isError: true), so a client
