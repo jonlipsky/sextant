@@ -777,6 +777,9 @@ public class CallerAssertionHttpTests
 
         public string Logs() => _logs.Text;
 
+        /// <summary>How many repositories repository inference has probed in this app.</summary>
+        public long InferenceProbes() => App.Services.GetRequiredService<RepositoryInferenceProbeCount>().Value;
+
         /// <summary>Every route endpoint the app maps (for route-inventory guards).</summary>
         public IReadOnlyList<Microsoft.AspNetCore.Routing.RouteEndpoint> RouteEndpoints() =>
             ((Microsoft.AspNetCore.Routing.IEndpointRouteBuilder)App).DataSources

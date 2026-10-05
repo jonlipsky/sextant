@@ -177,7 +177,9 @@ most 25 of them:
 Only repositories the caller can already read are ever looked up, so a repository it cannot read is never chosen or
 named, even when it is the only one that holds the symbol. A call that names a `branch`, a `find_symbol` narrowed by
 `project_id`, `fuzzy` or a `scope` other than `all`, an absolute path, and a caller with more than 25 readable
-repositories are not inferred. A caller that can read exactly one repository keeps the implicit selection
+repositories are not inferred. A caller past 25 is never looked up in any of them, whatever their order: the call
+gets the ordinary `repository_required`, which lists its first 20 repositories by name and how many more there are.
+A caller that can read exactly one repository keeps the implicit selection
 (`"repository_selection": "implicit"`).
 
 ### Tool errors

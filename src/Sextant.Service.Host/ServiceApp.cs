@@ -108,6 +108,9 @@ public static class ServiceApp
                 ReadAdmitted = context => RemoteOutputFilter.Record(http.HttpContext, context)
             };
         });
+        // How many repositories inference probed (a diagnostic the tests read through the container).
+        var inferenceProbes = new RepositoryInferenceProbeCount();
+        builder.Services.AddSingleton(inferenceProbes);
         // Explicit ALLOWLIST for the remote HTTP MCP surface (hardening review, criterion 1): register ONLY
         // the index-query tools that route through DatabaseProvider.TryBeginRead and thus enforce the
         // fail-closed read authorizer + per-repository scope. Assembly-wide registration would also expose
@@ -155,7 +158,7 @@ public static class ServiceApp
                 .AddCallToolFilter(ToolSelectionFilters.CallToolFilter(options.RepositoryUrlPolicy, RepositoryScopedTools))
                 // A verified caller's symbol or path call that names no repository reads the ONE readable
                 // repository holding its argument. Inside the selection filter, so it sees the call's selection.
-                .AddCallToolFilter(RepositoryInferenceFilter.CallToolFilter(service, options.RepositoryUrlPolicy))
+                .AddCallToolFilter(RepositoryInferenceFilter.CallToolFilter(service, options.RepositoryUrlPolicy, inferenceProbes))
                 // A tool result carrying a structured meta.error is an MCP tool error (isError: true), so a client
                 // never mistakes a failed call for an empty answer (issue #163). It reads the presented text below,
                 // which keeps meta.error.

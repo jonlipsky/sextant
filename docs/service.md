@@ -982,12 +982,14 @@ across requests, so a revocation takes effect on the next call. Once a request h
   filter right after the SVC-2 selection filter). If exactly one holds the symbol (or path), the call reads it and
   `meta.snapshot.repository_selection` is `inferred`; a repository holding the name as written outranks one holding
   only its trailing name. If several hold it, the call is `repository_required` listing only those. If none does,
-  it is the `repository_required` above. A `find_symbol` narrowed by `project_id`, `fuzzy` or a `scope` other than
-  `all`, and an absolute path, are not inferred. **It never widens access:** the candidates are only the caller's
-  own visible repositories (`SnapshotService.ListSelectableRepositories`); each lookup is a read through the
-  request's own authorizer (`DatabaseProvider.ProbeRepositories`), so a repository the caller could not read by
-  naming it is skipped before anything in it is looked at; the inferred read is then authorized again like any
-  named read; and the error names only repositories that passed both. A repository the caller cannot read is
+  it is the `repository_required` above. A caller that can read more than 25 is not inferred and no repository is
+  looked up: the decision is a count, not a choice of 25, so the call is always the `repository_required` above
+  (its first 20 repositories by name, then how many more). A `find_symbol` narrowed by `project_id`, `fuzzy` or a
+  `scope` other than `all`, and an absolute path, are not inferred. **It never widens access:** the candidates are
+  only the caller's own visible repositories (`SnapshotService.ListSelectableRepositories`); each lookup is a read
+  through the request's own authorizer (`DatabaseProvider.ProbeRepositories`), so a repository the caller could not
+  read by naming it is skipped before anything in it is looked at; the inferred read is then authorized again like
+  any named read; and the error names only repositories that passed both. A repository the caller cannot read is
   never chosen or named, even when it alone holds the symbol: the call reads exactly like one for a symbol no
   repository holds. Each lookup is a few indexed queries per repository, so an inferred call costs roughly one
   extra symbol lookup per readable repository.
