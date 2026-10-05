@@ -490,13 +490,16 @@ public class EnsureBranchCasConvergenceTests
     };
 
     // The real worker's orchestrator step over an in-memory solution: the SAME SnapshotContext mapping as
-    // LocalIndexerSnapshotWorker, so the branch decision is the orchestrator's own.
-    internal static SnapshotWorkResult IndexWithOrchestrator(IndexDatabase db, string root, EnsureSnapshotRequest request)
+    // LocalIndexerSnapshotWorker, so the branch decision is the orchestrator's own. `restorePolicy` must equal the
+    // service's ServiceOptions.RestoreIdentityComponent, exactly as the real worker's; `source` replaces the one
+    // document's text.
+    internal static SnapshotWorkResult IndexWithOrchestrator(
+        IndexDatabase db, string root, EnsureSnapshotRequest request, string? restorePolicy = null, string? source = null)
     {
-        var context = LocalIndexerSnapshotWorker.CreateSnapshotContext(request, capability: null);
+        var context = LocalIndexerSnapshotWorker.CreateSnapshotContext(request, capability: null, restorePolicy: restorePolicy);
         new IndexOrchestrator(db, useDocumentExtractor: true)
-            .IndexSolutionAsync(BuildSolution(root), snapshotContext: context).GetAwaiter().GetResult();
-        var identity = request.ToIdentity(IndexProfileDescriptor.Full.ConfigurationHash);
+            .IndexSolutionAsync(BuildSolution(root, source), snapshotContext: context).GetAwaiter().GetResult();
+        var identity = request.ToIdentity(IndexProfileDescriptor.Full.ConfigurationHash, restorePolicy: restorePolicy);
         var published = new SnapshotStore(db.GetConnection()).GetByIdentityHash(identity.Hash);
         return published is { Status: SnapshotStatus.Complete }
             ? SnapshotWorkResult.Complete(published.Id)
@@ -534,13 +537,15 @@ public class EnsureBranchCasConvergenceTests
         return state;
     }
 
-    internal static Solution BuildSolution(string root)
+    internal const string WidgetSource = "namespace App { public class Widget { public int Size() => 1; } }";
+
+    internal static Solution BuildSolution(string root, string? source = null)
     {
+        source ??= WidgetSource;
         var projectDir = Path.Combine(root, "src", "App");
         Directory.CreateDirectory(projectDir);
         var projectPath = Path.Combine(projectDir, "App.csproj");
         var sourcePath = Path.Combine(projectDir, "Widget.cs");
-        const string source = "namespace App { public class Widget { public int Size() => 1; } }";
         File.WriteAllText(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\" />");
         File.WriteAllText(sourcePath, source);
 
