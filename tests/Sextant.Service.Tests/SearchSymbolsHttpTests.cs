@@ -636,13 +636,16 @@ public class SearchSymbolsHttpTests
         var truncated = first.GetProperty("truncated").EnumerateArray()
             .Select(t => byRepository[t.GetProperty("repository").GetString()!]).ToList();
         Assert.IsTrue(truncated.Count > 0, "the turn ended before the last snapshot: " + first);
-        CollectionAssert.AreEqual(ordered.Take(ordered.Count - truncated.Count).ToList(), returned.Distinct().ToList(),
+        // `symbols` is in (name, hash) order and `truncated` in (repository, branch) order, so both are compared as sets;
+        // the identity hashes (and so which repositories come first) differ by toolchain.
+        CollectionAssert.AreEquivalent(ordered.Take(ordered.Count - truncated.Count).ToList(), returned.Distinct().ToList(),
             "the turn keeps a prefix of its snapshots, in hash order");
-        CollectionAssert.AreEqual(ordered.Skip(ordered.Count - truncated.Count).ToList(), truncated);
+        CollectionAssert.AreEquivalent(ordered.Skip(ordered.Count - truncated.Count).ToList(), truncated,
+            "the snapshots after that prefix wait in `truncated`");
 
         var second = await SearchAsync(host, WithCursor(TypePrefix, first.GetProperty("next_cursor").GetString()), assertion);
-        Assert.AreEqual(truncated[0], second.GetProperty("symbols")[0].GetProperty("identity_hash").GetString(),
-            "the snapshot left out is read first on the next page, not after another round");
+        Assert.AreEqual(ordered[ordered.Count - truncated.Count], second.GetProperty("symbols")[0].GetProperty("identity_hash").GetString(),
+            "the first snapshot left out is read first on the next page, not after another round");
     }
 
     [TestMethod]
