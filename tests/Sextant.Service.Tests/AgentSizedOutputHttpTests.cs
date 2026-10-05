@@ -17,19 +17,19 @@ namespace Sextant.Service.Tests;
 [TestClass]
 public sealed partial class AgentSizedOutputHttpTests
 {
-    // Before #145 tools/list was 29159 characters for 24 tools (the #145 budget was half of that, 14579). S12 lists
-    // the eight agent tools plus the service-only search_symbols: 5546 characters with a required selection, 5756
-    // with delegate callers.
-    private const int ToolsListBudget = 5900;
+    // Before #145 tools/list was 29159 characters for 24 tools (the #145 budget was half of that, 14579). Measured
+    // with a required selection / delegate callers: the eight agent tools of S12 plus search_symbols (which declares
+    // its own strict schema), 5546 / 5756 (640 per tool). Without search_symbols: the eight, 4719 / 4929 (616 per
+    // tool); nine (+get_type_dependents), 5322 / 5562; twelve (+semantic_search, find_by_attribute,
+    // find_unreferenced), 7207 / 7537 (628 per tool). The budget scales with ServiceApp.RemoteQueryTools, so a change
+    // to the set needs no edit here; a tool whose description or schema grows well past the average still fails it.
+    private const int ToolsListBudgetPerTool = 660;
+    private static int ToolsListBudget => ToolsListBudgetPerTool * ExpectedTools.Length;
     private const int InstructionsBudget = 600;
     private const int UnboundedChars = 10_000_000;
 
-    // The remote surface lists the agent tools only (S12); RemoteToolSurfaceGuardTests pins what their texts may name.
-    private static readonly string[] ExpectedTools =
-    [
-        "find_references", "find_symbol", "get_call_hierarchy", "get_file_symbols", "get_implementors",
-        "get_type_hierarchy", "get_type_members", "list_repositories", "search_symbols"
-    ];
+    // The remote surface is ServiceApp.RemoteQueryTools; RemoteToolSurfaceGuardTests pins what their texts may name.
+    private static readonly string[] ExpectedTools = RemoteToolSurfaceGuardTests.AgentTools;
 
     // ==== tools/list and initialize ===================================================================
 

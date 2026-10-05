@@ -177,13 +177,15 @@ public static class ServiceApp
         "meta.next_cursor. A meta.snapshot.warning means results may be incomplete.";
 
     /// <summary>
-    /// The tool types exposed over the remote HTTP MCP surface: the eight tools coding agents actually call
-    /// (agent-behaviour harness, 48 transcripts: no other tool was ever called), plus the service-only
-    /// <c>search_symbols</c>. Fewer tools means better tool selection and a smaller <c>tools/list</c>; the local stdio
-    /// server (<c>McpServerSetup</c>) keeps the full assembly-wide set. Every index-query tool takes a
-    /// <see cref="DatabaseProvider"/> and enters through <c>TryBeginRead</c> (fail-closed authz + scope); the two
-    /// exceptions, <see cref="ListRepositoriesTool"/> and <see cref="SearchSymbolsTool"/>, answer only a verified
-    /// caller and read only what that caller's grants make visible.
+    /// The tool types exposed over the remote HTTP MCP surface: the tools coding agents actually call, as measured by
+    /// the agent-behaviour harness (48 transcripts: no other tool was ever called). Fewer tools means better tool
+    /// selection and a smaller <c>tools/list</c>; the local stdio server (<c>McpServerSetup</c>) keeps the full
+    /// assembly-wide set. This is the ONE place the remote set is decided: the selection filter and every test of the
+    /// surface read it, so changing the set is a change to this list (plus the docs).
+    /// Every index-query tool takes a <see cref="DatabaseProvider"/> and enters through
+    /// <c>TryBeginRead</c> (fail-closed authz + scope); the two exceptions, <see cref="ListRepositoriesTool"/> and
+    /// <see cref="SearchSymbolsTool"/>, answer only a verified caller and read only what that caller's grants make
+    /// visible.
     /// This is a default-deny ALLOWLIST: a newly added tool is never exposed remotely until it is added here, and
     /// every text the remote surface sends (descriptions, instructions, warnings, errors) may name only these tools
     /// (<c>RemoteToolSurfaceGuardTests</c>). Local-only tools that bypass or out-scope the read gate must never be

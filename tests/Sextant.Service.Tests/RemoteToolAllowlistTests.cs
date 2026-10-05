@@ -1,3 +1,6 @@
+using System.Reflection;
+using ModelContextProtocol.Server;
+using Sextant.Mcp;
 using Sextant.Mcp.Tools;
 using Sextant.Service.Host;
 
@@ -5,7 +8,7 @@ namespace Sextant.Service.Tests;
 
 /// <summary>
 /// Phase 17 — criterion 1, narrowed by S12. The remote HTTP MCP surface (<see cref="ServiceApp.RemoteQueryTools"/>) is
-/// a default-DENY allowlist of the 8 tools agents use: it exposes only index-query tools that route through the
+/// a default-DENY allowlist of the tools agents use: it exposes only index-query tools that route through the
 /// fail-closed <c>DatabaseProvider.TryBeginRead</c> gate, plus the service-only <c>list_repositories</c> and
 /// <c>search_symbols</c>, and NEVER the local-only
 /// tools that bypass or out-scope that gate: <c>get_source_context</c> (reads an arbitrary absolute path off
@@ -31,20 +34,26 @@ public class RemoteToolAllowlistTests
     }
 
     [TestMethod]
-    public void RemoteSurface_IsExactlyTheEightAgentToolsPlusSearchSymbols()
+    public void RemoteSurface_IsGatedIndexToolsPlusTheServiceOnlyTools()
     {
-        // The allowlist is fixed, so a newly added tool is never exposed remotely by default: it must be triaged
-        // and added here (and to the guard test) on purpose.
-        CollectionAssert.AreEquivalent(
-            new[]
-            {
-                typeof(FindSymbolTool), typeof(FindReferencesTool), typeof(GetCallHierarchyTool),
-                typeof(GetImplementorsTool), typeof(GetTypeHierarchyTool), typeof(GetTypeMembersTool),
-                typeof(GetFileSymbolsTool), typeof(Sextant.Service.Grants.ListRepositoriesTool),
-                typeof(Sextant.Service.Search.SearchSymbolsTool)
-            },
-            ServiceApp.RemoteQueryTools.ToList(),
-            "the remote allowlist is exactly the 8 agent tools plus the service-only search_symbols");
+        // RemoteQueryTools is the one place the set is decided (the agent-behaviour harness picks it); whatever it
+        // holds, each entry declares exactly one tool, and every tool but the service-only ones (which read the
+        // caller's grants, not one index) reads the index through the DatabaseProvider (so through the fail-closed
+        // TryBeginRead gate).
+        var types = ServiceApp.RemoteQueryTools;
+        Assert.AreEqual(types.Count, types.Distinct().Count(), "no tool type is listed twice");
+        CollectionAssert.Contains(types.ToList(), typeof(Sextant.Service.Grants.ListRepositoriesTool));
+        foreach (var type in types)
+        {
+            var tools = type.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                .Where(m => m.GetCustomAttribute<McpServerToolAttribute>() is not null)
+                .ToList();
+            Assert.AreEqual(1, tools.Count, $"{type.Name} declares one tool");
+            if (ServiceOnlyTools.Contains(type))
+                continue;
+            Assert.IsTrue(tools[0].GetParameters().Any(p => p.ParameterType == typeof(DatabaseProvider)),
+                $"{type.Name} reads through the DatabaseProvider gate");
+        }
     }
 
     [TestMethod]
