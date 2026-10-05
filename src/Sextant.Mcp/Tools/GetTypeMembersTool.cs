@@ -60,7 +60,7 @@ public static class GetTypeMembersTool
         if (note is not null)
             message = message is null ? note : message + " " + note;
         return ResponseBuilder.BuildPage(mapped, members.Count, page, freshness, lookup.Ambiguity, readContext.Provenance,
-            message: message);
+            message: message, warning: lookup.Warning);
     }
 
     // The members a type declares itself, in source order. A type whose key is not a documentation ID (a legacy or

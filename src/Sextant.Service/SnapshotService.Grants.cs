@@ -186,24 +186,37 @@ public sealed partial class SnapshotService
     /// </summary>
     public string? ResolveImplicitRepository(IReadOnlySet<string> visibleKeys)
     {
+        var selectable = ListSelectableRepositories(visibleKeys, limit: 2);
+        return selectable.Count == 1 ? selectable[0] : null;
+    }
+
+    /// <summary>
+    /// The repositories a delegate read that names none could select: the remote URL of each catalog repository whose
+    /// <see cref="RepositoryGrantKey"/> is in <paramref name="visibleKeys"/> and that has a complete default-branch
+    /// snapshot (one URL per key, the first spelling that has one), in catalog id order, stopping at
+    /// <paramref name="limit"/>. Only the caller's own visible keys are ever returned.
+    /// </summary>
+    public IReadOnlyList<string> ListSelectableRepositories(IReadOnlySet<string> visibleKeys, int limit)
+    {
         ArgumentNullException.ThrowIfNull(visibleKeys);
-        if (visibleKeys.Count == 0)
-            return null;
+        if (visibleKeys.Count == 0 || limit <= 0)
+            return [];
         return ReadCatalog(conn =>
         {
             var snapshots = new SnapshotStore(conn);
-            string? selectedKey = null;
-            string? selectedUrl = null;
+            var selected = new List<string>();
+            var keys = new HashSet<string>(StringComparer.Ordinal);
             foreach (var (key, url) in new GrantCatalogReader(conn).ConsumerRepositories())
             {
-                if (!visibleKeys.Contains(key) || snapshots.GetSelectedSnapshotIdForRepository(url) is null)
+                if (keys.Contains(key) || !visibleKeys.Contains(key)
+                    || snapshots.GetSelectedSnapshotIdForRepository(url) is null)
                     continue;
-                if (selectedKey is not null && selectedKey != key)
-                    return null;
-                selectedKey ??= key;
-                selectedUrl ??= url;
+                keys.Add(key);
+                selected.Add(url);
+                if (selected.Count >= limit)
+                    break;
             }
-            return selectedUrl;
+            return (IReadOnlyList<string>)selected;
         });
     }
 

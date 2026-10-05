@@ -58,6 +58,7 @@ public static class FindCommentsTool
         List<Core.CommentInfo> comments;
         SymbolAmbiguity? ambiguity = null;
         string? note = null;
+        string? warning = null;
         var namer = new SymbolNamer(symbolStore);
 
         if (in_symbol != null)
@@ -67,6 +68,7 @@ public static class FindCommentsTool
                 return SymbolResolver.ErrorResponse(symbolStore, projectStore, lookup, readContext.Provenance);
             ambiguity = lookup.Ambiguity;
             note = SymbolResolver.ResolutionNote(symbolStore, lookup);
+            warning = lookup.Warning;
             comments = commentStore.GetBySymbol(lookup.Symbol!.Id);
             if (projectDbId != null)
                 comments = comments.Where(c => c.ProjectId == projectDbId.Value).ToList();
@@ -121,7 +123,7 @@ public static class FindCommentsTool
 
         var freshness = comments.Count > 0 ? comments.Min(c => c.LastIndexedAt) : 0;
         return ResponseBuilder.BuildPage(results, comments.Count, page, freshness, ambiguity, readContext.Provenance, Summary,
-            message: note);
+            message: note, warning: warning);
     }
 
     private static readonly string[] KnownTags = ["TODO", "HACK", "FIXME", "BUG", "NOTE", "UNDONE"];

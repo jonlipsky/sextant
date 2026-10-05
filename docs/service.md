@@ -866,8 +866,9 @@ The remote tools answer an agent, so every response is shaped to fit its context
   local stdio server keeps its absolute paths.
 - **Lean `meta.snapshot`.** Each response carries only `{repository, branch, commit, coverage, warning?}`
   (the 12-character commit; `warning` only when the answer may be incomplete: partial coverage, an incompatible
-  indexer, or a dirty working tree), plus `repository_selection: "implicit"` when the caller named no repository
-  and the service read its one visible repository. A tool error carries the same lean block. The coverage
+  indexer, or a dirty working tree), plus `repository_selection` when the caller named no repository and the
+  service chose it: `implicit` for its one visible repository, `inferred` for the one visible repository that holds
+  the call's symbol or path (repository inference, below). A tool error carries the same lean block. The coverage
   record is in `/control/resolve`, and the full provenance in a local server's `get_index_status`
   `index.snapshot`. A
   partial-coverage warning counts what is missing and names no project or tool, in at most 160 characters
@@ -935,7 +936,8 @@ With no `CALLER_KEYS`, an assertion on `/control/*` is `assertion_not_allowed`. 
 the assertion, another claim or a token.
 
 **What a caller may read.** A verified caller must name its repository (as if
-`REQUIRE_REPOSITORY_SELECTION` were on for that request), unless implicit selection picks it (below). A
+`REQUIRE_REPOSITORY_SELECTION` were on for that request), unless implicit selection or repository inference picks
+it (below). A
 delegate read is decided by the caller's [repository grants](#repository-grants-and-visibility-svc-4): a
 repository the caller holds no grant for gets the uniform not-found, and a delegate snapshot-page request for
 it is the uniform `404`. A delegate token therefore opens nothing on its own. A request without a delegate
@@ -970,8 +972,25 @@ across requests, so a revocation takes effect on the next call. Once a request h
 - **Cross-repository tools** list only consumer repositories the caller can see.
 - **Implicit selection:** a delegate read that names neither a repository nor a branch reads the caller's
   **one** visible repository with a complete default-branch snapshot, and says so: `meta.snapshot.repository`
-  names it and `meta.snapshot.repository_selection` is `implicit`. With none or several, it fails with
-  `repository_required` (`isError: true`), whose message lists the caller's visible repositories.
+  names it and `meta.snapshot.repository_selection` is `implicit`. With none, it fails with
+  `repository_required` (`isError: true`), whose message lists the caller's visible repositories. With several,
+  repository inference (next) may still pick one.
+- **Repository inference:** when a caller can read several such repositories (at most 25), a call of
+  `find_symbol`, `find_references`, `get_call_hierarchy`, `get_implementors`, `get_type_hierarchy`,
+  `get_type_members` or `get_file_symbols` that names neither a repository nor a branch is looked up in each of
+  them, with the tool's own argument read exactly as the tool reads it (`RepositoryInferenceFilter`, a `tools/call`
+  filter right after the SVC-2 selection filter). If exactly one holds the symbol (or path), the call reads it and
+  `meta.snapshot.repository_selection` is `inferred`; a repository holding the name as written outranks one holding
+  only its trailing name. If several hold it, the call is `repository_required` listing only those. If none does,
+  it is the `repository_required` above. A `find_symbol` narrowed by `project_id`, `fuzzy` or a `scope` other than
+  `all`, and an absolute path, are not inferred. **It never widens access:** the candidates are only the caller's
+  own visible repositories (`SnapshotService.ListSelectableRepositories`); each lookup is a read through the
+  request's own authorizer (`DatabaseProvider.ProbeRepositories`), so a repository the caller could not read by
+  naming it is skipped before anything in it is looked at; the inferred read is then authorized again like any
+  named read; and the error names only repositories that passed both. A repository the caller cannot read is
+  never chosen or named, even when it alone holds the symbol: the call reads exactly like one for a symbol no
+  repository holds. Each lookup is a few indexed queries per repository, so an inferred call costs roughly one
+  extra symbol lookup per readable repository.
 - **`/control/ensure`** by a user caller needs the repository to be visible, otherwise `403 not_granted`
   (audited `ensure`/`denied`), and its body is then bounded (SX-6d, see
   [User callers on the control plane](#user-callers-on-the-control-plane-issue-193)). An application caller
@@ -1862,7 +1881,7 @@ catalog, and a `FakeSnapshotWorker`. The suite maps to the acceptance criteria:
 | 1 — idempotent ensure | `SnapshotServiceTests` (concurrent ensures attach to one job; worker runs once); `EnsureCallerDisconnectTests` / `EnsureCallerDisconnectHttpTests` (#148: caller disconnect never cancels production, re-ensure attaches to the in-flight run, `wait=false`, prompt status/resolve during a run, shutdown requeues); `QueuedControlWriteHttpTests` / `JobIdReservationsTests` (#158: `wait=false` and retire answer `202` within the bound while a production holds the writer, reserved job ids resolve and are never reused, apply-time retire guards, submission order, coalescing, shutdown drain) |
 | 2 — restart recovery | `SnapshotServiceTests` (catalog survives restart; orphaned `running` jobs reconciled) |
 | 3 — scratch cannot delete published | `ServicePathsTests` (scratch/persistent separation + `ReleaseScratch` refusal) |
-| 4 — query via HTTP MCP without ProcessStack | `ServiceHttpTests` (`/mcp` mapped + auth-gated; `/query` paging); `RepositorySelectionHttpTests` (the `X-Sextant-Repository` header without a read policy, the legacy no-header unscoped read, `repository_required`); `ToolArgumentSelectionHttpTests` + `ToolSelectionFiltersTests` (SVC-2: the reserved `repository`/`branch` arguments listed on repository-scoped tools and stripped on call, argument-over-header precedence, `selector_conflict`/`invalid_selector`, branch pinning, `branch` without a repository, the unknown-branch uniform not-found); `McpClientCompatibilityTests` (an SDK client selecting through the `repository` argument); `QueryToolInputResolutionHttpTests` (issues #149/#163: symbol arguments without `global::`, `Type.Member`, parameter lists and documentation IDs; exact type lookup and `kind`; ambiguity and not-found as tool errors with candidates; `get_type_members`; implicit selection naming its repository and `repository_required` listing the caller's repositories); `AgentSizedOutputHttpTests` (#145: paging, truncation summary, cursor binding, lean `meta.snapshot`, repo-relative paths in and out, server `instructions`, the `tools/list` size pin); `RemoteToolSurfaceGuardTests` (S12: exactly the agent tools of `RemoteQueryTools`, and no remote text naming another tool); `SubmoduleCheckoutIntegrationTests.RemoteMcp_RepositoryRelativePaths_*` (#145 on a real worker index: repo-relative inputs over `/mcp`, a submodule file included) |
+| 4 — query via HTTP MCP without ProcessStack | `ServiceHttpTests` (`/mcp` mapped + auth-gated; `/query` paging); `RepositorySelectionHttpTests` (the `X-Sextant-Repository` header without a read policy, the legacy no-header unscoped read, `repository_required`); `ToolArgumentSelectionHttpTests` + `ToolSelectionFiltersTests` (SVC-2: the reserved `repository`/`branch` arguments listed on repository-scoped tools and stripped on call, argument-over-header precedence, `selector_conflict`/`invalid_selector`, branch pinning, `branch` without a repository, the unknown-branch uniform not-found); `McpClientCompatibilityTests` (an SDK client selecting through the `repository` argument); `QueryToolInputResolutionHttpTests` (issues #149/#163: symbol arguments without `global::`, `Type.Member`, parameter lists and documentation IDs; exact type lookup and `kind`; ambiguity and not-found as tool errors with candidates; `get_type_members`; implicit selection naming its repository and `repository_required` listing the caller's repositories; HTML-escaped names and the unique trailing-name fallback with `meta.warning`); `RepositoryInferenceHttpTests` (repository inference: one holder inferred, several holders listed, none, and a repository the caller cannot read never probed, chosen or named); `AgentSizedOutputHttpTests` (#145: paging, truncation summary, cursor binding, lean `meta.snapshot`, repo-relative paths in and out, server `instructions`, the `tools/list` size pin); `RemoteToolSurfaceGuardTests` (S12: exactly the agent tools of `RemoteQueryTools`, and no remote text naming another tool); `SubmoduleCheckoutIntegrationTests.RemoteMcp_RepositoryRelativePaths_*` (#145 on a real worker index: repo-relative inputs over `/mcp`, a submodule file included) |
 | 5 — structured per-project diagnostics | `SnapshotServiceTests` (partial/failed/unsupported diagnostics) |
 | 6 — local-only remains functional | `ArchitectureBoundaryTests` (core assemblies never reference the service; local query without a service) |
 

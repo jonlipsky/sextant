@@ -91,6 +91,15 @@ public sealed class DatabaseProvider : IDisposable
     public Func<bool> RepositorySelectedImplicitly { get; set; } = () => false;
 
     /// <summary>
+    /// Whether the repository <see cref="RequestedRepository"/> yields for the current request was inferred by the host
+    /// from the call's own symbol or path argument (the request named none, and exactly one repository the caller can
+    /// read holds it; see <see cref="RepositoryInference"/>). When true, a successful read stamps the repository and
+    /// <c>repository_selection: "inferred"</c> into <c>meta.snapshot</c>. The default (<c>() =&gt; false</c>) leaves
+    /// provenance unchanged.
+    /// </summary>
+    public Func<bool> RepositoryInferred { get; set; } = () => false;
+
+    /// <summary>
     /// True on the service's remote MCP surface (issue #145): every read's <see cref="FederatedReadContext.Paths"/>
     /// refuses absolute path inputs (callers pass repository-relative paths), and the context resolves the
     /// selected repository and branch names that the remote response post-pass
@@ -247,10 +256,48 @@ public sealed class DatabaseProvider : IDisposable
     // and only with the repository the request already resolved to, so nothing is revealed that the read did not serve.
     private FederatedReadContext StampImplicitSelection(FederatedReadContext context)
     {
-        if (context.Provenance is not { } provenance || !RepositorySelectedImplicitly()
-            || RequestedRepository() is not { Length: > 0 } repository)
+        if (context.Provenance is not { } provenance || RequestedRepository() is not { Length: > 0 } repository)
             return context;
-        return context.WithProvenance(provenance with { Repository = repository, RepositorySelection = "implicit" });
+        var selection = RepositoryInferred() ? "inferred" : RepositorySelectedImplicitly() ? "implicit" : null;
+        return selection is null
+            ? context
+            : context.WithProvenance(provenance with { Repository = repository, RepositorySelection = selection });
+    }
+
+    /// <summary>
+    /// Runs <paramref name="probe"/> once per repository in <paramref name="repositories"/>, each over the read the
+    /// request would get had it named that repository (its default branch), and returns the repositories whose probe
+    /// returned a rank, with that rank, in input order. Every probe read goes through the same
+    /// <see cref="Authorizer"/> as <see cref="TryBeginRead"/>: a repository the authorizer denies (or that has no
+    /// complete default-branch snapshot) is skipped without running the probe, so a probe never sees data the caller
+    /// could not read by naming that repository itself. It neither stamps nor admits a read
+    /// (<see cref="ReadAdmitted"/>): the host uses it only to choose the repository the real read then names. Nothing
+    /// is probed when the index is not ready.
+    /// </summary>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public IReadOnlyList<(string Repository, int Rank)> ProbeRepositories(
+        IReadOnlyList<string> repositories,
+        Func<IndexDatabase, FederatedReadContext, int?> probe,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(repositories);
+        ArgumentNullException.ThrowIfNull(probe);
+        var hits = new List<(string Repository, int Rank)>();
+        if (repositories.Count == 0 || GetReadyDatabase(out _) is not { } ready)
+            return hits;
+        foreach (var repository in repositories)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (string.IsNullOrWhiteSpace(repository)
+                || !ReadContextGate.TryResolve(
+                    ready, out var context, out _, FederationMode.Federated, Authorizer, compatibility: null,
+                    () => repository, () => null, RemoteSurface))
+                continue;
+            context.MaxResponseChars = MaxResponseChars;
+            if (probe(ready, context) is int rank)
+                hits.Add((repository, rank));
+        }
+        return hits;
     }
 
     public void Dispose()

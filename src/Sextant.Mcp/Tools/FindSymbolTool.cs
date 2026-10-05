@@ -154,15 +154,18 @@ public static class FindSymbolTool
                 ? FinalizeRemoteBaseProvenance(readContext.Provenance!, remoteSource != null, outcome: null)
                 : readContext.Provenance;
 
-            if (lookup.Status == SymbolLookupStatus.Resolved)
+            List<object> LocalHit(SymbolInfo symbol) =>
+            [
+                MapSymbol(symbol, ResolveCanonicalId(symbol.ProjectId, canonicalIdCache), serveSource, namer.QualifiedName(symbol))
+            ];
+
+            // A name resolved only by its trailing Type.Member or Type is answered locally unless the remote base
+            // holds the exact name (below).
+            if (lookup.Status == SymbolLookupStatus.Resolved && !(federateRemote && lookup.ByTrailingName))
             {
                 var symbol = lookup.Symbol!;
-                var localHit = new List<object>
-                {
-                    MapSymbol(symbol, ResolveCanonicalId(symbol.ProjectId, canonicalIdCache), serveSource, namer.QualifiedName(symbol))
-                };
-                return ResponseBuilder.Build(localHit, symbol.LastIndexedAt, lookup.Ambiguity, localProv,
-                    message: SymbolResolver.ResolutionNote(symbolStore, lookup));
+                return ResponseBuilder.Build(LocalHit(symbol), symbol.LastIndexedAt, lookup.Ambiguity, localProv,
+                    message: SymbolResolver.ResolutionNote(symbolStore, lookup), warning: lookup.Warning);
             }
 
             if (lookup.Status == SymbolLookupStatus.Ambiguous)
@@ -182,9 +185,9 @@ public static class FindSymbolTool
                     message: message);
             }
 
-            // Not resolvable locally. For a remote-base overlay, the definition may live in an UNCHANGED
-            // (untouched) project that exists only in the committed base on the peer — federate it.
-            if (federateRemote && lookup.Status == SymbolLookupStatus.NotFound)
+            // Not resolvable locally (or only by its trailing name). For a remote-base overlay, the definition may live
+            // in an UNCHANGED (untouched) project that exists only in the committed base on the peer — federate it.
+            if (federateRemote && (lookup.Status == SymbolLookupStatus.NotFound || lookup.ByTrailingName))
             {
                 var term = name.Trim();
                 var bare = term.StartsWith("global::", StringComparison.Ordinal) ? term["global::".Length..] : term;
@@ -202,6 +205,12 @@ public static class FindSymbolTool
                 {
                     var remoteHit = new List<object> { RemoteBaseSymbolFederation.MapRemoteSymbol(outcome.Rows[0]) };
                     return ResponseBuilder.Build(remoteHit, provenance.Freshness, provenance: provenance);
+                }
+                if (lookup.Status == SymbolLookupStatus.Resolved)
+                {
+                    var symbol = lookup.Symbol!;
+                    return ResponseBuilder.Build(LocalHit(symbol), symbol.LastIndexedAt, lookup.Ambiguity, localProv,
+                        message: SymbolResolver.ResolutionNote(symbolStore, lookup), warning: lookup.Warning);
                 }
                 return SymbolResolver.ErrorResponse(symbolStore, projectStore, lookup, provenance);
             }

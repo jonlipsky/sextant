@@ -97,6 +97,7 @@ public static class ServiceApp
             {
                 RequestedRepository = RequestedRepositoryAccessor(http, service),
                 RepositorySelectedImplicitly = RepositorySelectedImplicitlyAccessor(http, service),
+                RepositoryInferred = () => ToolCallSelection.Get(http.HttpContext)?.Source == ToolSelectionSource.Inferred,
                 RepositoryRequiredGuidance = RepositoryRequiredGuidanceAccessor(http, service, options.RepositoryUrlPolicy),
                 RequestedBranch = RequestedBranchAccessor(http),
                 RequireRepositorySelection = RepositorySelectionRequirement(options, CallerAssertionGate.CallerPrincipalAccessor(http)),
@@ -152,6 +153,9 @@ public static class ServiceApp
                     selectionRequired: options.RequireRepositorySelection,
                     implicitSelection: options.DelegateTokens.Count > 0))
                 .AddCallToolFilter(ToolSelectionFilters.CallToolFilter(options.RepositoryUrlPolicy, RepositoryScopedTools))
+                // S13: a verified caller's symbol or path call that names no repository reads the ONE readable
+                // repository holding its argument. Inside the selection filter, so it sees the call's selection.
+                .AddCallToolFilter(RepositoryInferenceFilter.CallToolFilter(service, options.RepositoryUrlPolicy))
                 // A tool result carrying a structured meta.error is an MCP tool error (isError: true), so a client
                 // never mistakes a failed call for an empty answer (issue #163). It reads the presented text below,
                 // which keeps meta.error.
@@ -741,7 +745,8 @@ public static class ServiceApp
     /// <summary>
     /// Resolves the caller-declared repository (its git remote URL) for the current request: the call's
     /// <see cref="ToolCallSelection"/> when <see cref="ToolSelectionFilters"/> recorded one (the reserved
-    /// <c>repository</c> argument or the header), else the
+    /// <c>repository</c> argument, the header, or the repository <see cref="RepositoryInferenceFilter"/> inferred from
+    /// the call's argument), else the
     /// <c>X-Sextant-Repository</c> request header. Reads the ambient request at call time so a
     /// singleton <see cref="DatabaseProvider"/> stays request-correct; returns null when nothing names a
     /// repository (the read planner then reads the unselected default, or fails with

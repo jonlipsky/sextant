@@ -22,6 +22,9 @@ public sealed record CrossRepositoryUsageResult(
     /// <summary>The provider symbol the input resolved to, when <see cref="StableIdentityResolved"/>.</summary>
     public SymbolInfo? Symbol { get; init; }
 
+    /// <summary>The resolver's note when the input resolved only by its trailing name (<see cref="SymbolLookup.Warning"/>).</summary>
+    public string? Warning { get; init; }
+
     /// <summary>
     /// When the input names several DIFFERENT provider symbols equally well (overloads, or same-named members of
     /// different types): those symbols, best first. No usages are read; the caller must name one (issue #163).
@@ -119,7 +122,10 @@ public static class CrossRepositoryUsageResolver
         }
 
         return new CrossRepositoryUsageResult(
-            StableIdentityResolved: true, ResolvedSymbolKeys: providerKeys, Usages: usages) { Symbol = lookup.Symbol };
+            StableIdentityResolved: true, ResolvedSymbolKeys: providerKeys, Usages: usages)
+        {
+            Symbol = lookup.Symbol, Warning = lookup.Warning
+        };
     }
 
     /// <summary>

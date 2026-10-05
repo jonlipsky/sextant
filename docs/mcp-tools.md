@@ -139,9 +139,46 @@ that shares its name. `find_symbol` honours `kind` on its exact path too. It is 
 stored keys and signatures: no re-index is needed. An argument longer than 2048 characters, or with generic
 arguments or tuples nested more than 32 deep, is an `invalid_argument` error.
 
+Two forgiving readings apply only to an argument that resolves to nothing as written, so they never change an answer
+that already resolves:
+
+- **HTML entities.** An argument copied from HTML-escaped text is read again with `&lt;`, `&gt;`, `&amp;`, `&quot;`
+  and `&#39;` decoded, so `IStore&lt;T&gt;.PublishAsync` resolves like `IStore<T>.PublishAsync`.
+- **Trailing name.** A qualified name whose namespace or containing types are wrong (a moved or renamed namespace, a
+  guessed path) is read by its trailing `Type.Member` (keeping any parameter list), then by its trailing `Type`
+  (types only, never for a tool that accepts no type). If that matches exactly one symbol, the tool answers for it
+  and says so in `meta.warning`, for example `No symbol is named 'Old.Drawing.Canvas.Draw'; resolved its trailing
+  name to global::Library.Drawing.Canvas.Draw() (method).`; check that it is the symbol you meant. If it matches
+  several, the call is `symbol_not_found` with those symbols first in `meta.candidates`. A member is never looked
+  up by its simple name alone: `Wrong.Describe` does not fall back to a `Describe` method. A name that does match as
+  written but is filtered out (a parameter list no overload has, a kind the tool does not take, or a symbol outside
+  the requested `scope`/`project_id`) names a real symbol, so it is never read by its trailing name: the
+  `symbol_not_found` names that symbol and why.
+
+Both are query-time readings over the stored data, so they need no re-index.
+
 The `fully_qualified_name` a tool prints for a symbol is in one of those accepted forms (a type's
 `global::Ns.Type`, a method's `global::Ns.Type.Method(int)`, a field's `global::Ns.Type.Field`, else its
 documentation ID), so any name a tool returns can be passed back to another tool as is.
+
+### Repository inference (service)
+
+On the service's `/mcp`, a verified caller that can read several repositories may still omit `repository` on
+`find_symbol`, `find_references`, `get_call_hierarchy`, `get_implementors`, `get_type_hierarchy`, `get_type_members`
+and `get_file_symbols`. The service looks the call's symbol (or path) up in each repository the caller can read, at
+most 25 of them:
+
+- **One holds it:** the call is answered from that repository, and `meta.snapshot` names it with
+  `"repository_selection": "inferred"`. A repository that holds the name as written outranks one that holds only its
+  trailing name.
+- **Several hold it:** `repository_required`, whose message lists only those repositories.
+- **None holds it:** `repository_required` listing the repositories the caller can read, as when nothing is inferred.
+
+Only repositories the caller can already read are ever looked up, so a repository it cannot read is never chosen or
+named, even when it is the only one that holds the symbol. A call that names a `branch`, a `find_symbol` narrowed by
+`project_id`, `fuzzy` or a `scope` other than `all`, an absolute path, and a caller with more than 25 readable
+repositories are not inferred. A caller that can read exactly one repository keeps the implicit selection
+(`"repository_selection": "implicit"`).
 
 ### Tool errors
 
@@ -154,7 +191,7 @@ the JSON envelope with `meta.error.code` and a top-level `message` saying what t
 | `ambiguous_symbol` | A tool that needs one symbol was given a name that several different symbols match equally well (e.g. a bare method name, or an overloaded method without its parameter list). The tool never picks one | `meta.ambiguous`, `meta.ambiguous_match_count`, and `meta.candidates` (the first ten) |
 | `invalid_argument` | An argument is malformed or names nothing the tool accepts (an unknown `project_id`, `scope`, `kind`, `accessibility`, namespace or commit; on the remote `/mcp`, an absolute path) | |
 | `invalid_cursor` | A `cursor` that was issued for another tool, other arguments or an older snapshot, or is malformed. Re-run without it | |
-| `repository_required` (service) | The call must name a repository; for a verified caller the message lists the repositories it can read | |
+| `repository_required` (service) | The call must name a repository; for a verified caller the message lists the repositories it can read, or, when several of them hold the call's symbol or path, only those (see [Repository inference](#repository-inference-service)) | |
 | `repository_not_found` (service) | The named repository or branch serves nothing to this caller: not indexed, no complete snapshot on that branch, or not readable by it. Under a read policy every such case gets the same bytes, so it never tells an existing repository from an absent one | |
 
 `find_symbol` is a search, so several equally good matches are an answer there: it lists them (best first) and its

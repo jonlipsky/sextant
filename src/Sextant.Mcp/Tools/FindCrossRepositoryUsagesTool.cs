@@ -85,7 +85,7 @@ public static class FindCrossRepositoryUsagesTool
             ? $"No authorized consumer repository uses {resolved} in the selected scope."
             : $"Usages of {resolved}.";
         return ResponseBuilder.BuildPage(results, outcome.Usages.Count, page, readContext.Provenance?.Freshness,
-            provenance: readContext.Provenance, summary: Summary, message: message);
+            provenance: readContext.Provenance, summary: Summary, message: message, warning: outcome.Warning);
     }
 
     private static string Describe(Microsoft.Data.Sqlite.SqliteConnection conn, SymbolInfo symbol) =>

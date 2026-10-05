@@ -53,8 +53,8 @@ public static class TraceValueTool
         var note = SymbolResolver.ResolutionNote(symbolStore, lookup);
 
         if (directionName == "origins")
-            return TraceOrigins(methodSymbol, parameter, page, symbolStore, namer, callGraphStore, argumentFlowStore, lookup.Ambiguity, readContext.Provenance, note);
-        return TraceDestinations(methodSymbol, page, symbolStore, namer, callGraphStore, returnFlowStore, lookup.Ambiguity, readContext.Provenance, note);
+            return TraceOrigins(methodSymbol, parameter, page, symbolStore, namer, callGraphStore, argumentFlowStore, lookup.Ambiguity, readContext.Provenance, note, lookup.Warning);
+        return TraceDestinations(methodSymbol, page, symbolStore, namer, callGraphStore, returnFlowStore, lookup.Ambiguity, readContext.Provenance, note, lookup.Warning);
     }
 
     private static readonly SymbolLookupOptions MethodOptions = new()
@@ -66,7 +66,7 @@ public static class TraceValueTool
     private static string TraceOrigins(
         SymbolInfo method, string? parameter, PageRequest page,
         SymbolStore symbolStore, SymbolNamer namer, CallGraphStore callGraphStore, ArgumentFlowStore argumentFlowStore,
-        SymbolAmbiguity? ambiguity, SnapshotProvenance? provenance, string? note)
+        SymbolAmbiguity? ambiguity, SnapshotProvenance? provenance, string? note, string? warning)
     {
         // Find all call graph edges where this method is the callee
         var callerEdges = callGraphStore.GetByCallee(method.Id);
@@ -130,13 +130,14 @@ public static class TraceValueTool
                     parameter_name = g.Key,
                     parameter_ordinal = g.First().Ordinal,
                     callers = g.Select(f => f.Caller).ToList()
-                }).ToList());
+                }).ToList(),
+            warning: warning);
     }
 
     private static string TraceDestinations(
         SymbolInfo method, PageRequest page,
         SymbolStore symbolStore, SymbolNamer namer, CallGraphStore callGraphStore, ReturnFlowStore returnFlowStore,
-        SymbolAmbiguity? ambiguity, SnapshotProvenance? provenance, string? note)
+        SymbolAmbiguity? ambiguity, SnapshotProvenance? provenance, string? note, string? warning)
     {
         // Find all call graph edges where this method is the callee
         var callerEdges = callGraphStore.GetByCallee(method.Id)
@@ -166,6 +167,6 @@ public static class TraceValueTool
             ? $"{SymbolResolver.Describe(namer, method)} has no indexed callers, so its return value flows nowhere in the index."
             : null;
         return ResponseBuilder.BuildPage(results, callerEdges.Count, page, method.LastIndexedAt, ambiguity, provenance, Summary,
-            message: ResponseBuilder.JoinMessages(note, empty));
+            message: ResponseBuilder.JoinMessages(note, empty), warning: warning);
     }
 }
