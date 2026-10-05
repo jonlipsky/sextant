@@ -226,7 +226,7 @@ public class PackageRestoreTests
     {
         var runner = new PackageRestoreRunner(enabled: false) { DotnetPath = "definitely-not-dotnet-" + Guid.NewGuid().ToString("N") };
 
-        var outcome = await runner.RunAsync(Checkout, ["x.sln"], CancellationToken.None);
+        var outcome = await runner.RunAsync(Checkout, ["x.sln"], limit: null, CancellationToken.None);
 
         Assert.AreSame(PackageRestoreOutcome.Disabled, outcome);
         Assert.AreEqual(PackageRestoreRunner.DisabledIdentityComponent, runner.IdentityComponent);
@@ -241,13 +241,43 @@ public class PackageRestoreTests
             DotnetPath = Path.Combine(Path.GetTempPath(), "no-dotnet-" + Guid.NewGuid().ToString("N"), "dotnet")
         };
 
-        var outcome = await runner.RunAsync(Checkout, ["a.sln", "b.sln"], CancellationToken.None);
+        var outcome = await runner.RunAsync(Checkout, ["a.sln", "b.sln"], limit: null, CancellationToken.None);
 
         Assert.AreEqual(2, outcome.SolutionsAttempted);
         Assert.AreEqual(2, outcome.SolutionsNotStarted);
         Assert.IsFalse(outcome.Clean);
         StringAssert.StartsWith(outcome.Notes()[0], "Package restore could not be started for 2 solution(s)");
         Assert.IsTrue(logs.Any(l => l.Contains("could not start", StringComparison.Ordinal)));
+    }
+
+    [TestMethod]
+    public async Task Runner_Limit_ShorterThanTheTimeout_IsTheDeadline_AndNeverExtendsIt()
+    {
+        // Issue #245: the worker passes its time plan's restore share as the limit. A missing host makes every
+        // started restore return at once, so the outcome shows the deadline each run was given.
+        var runner = new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(300))
+        {
+            DotnetPath = Path.Combine(Path.GetTempPath(), "no-dotnet-" + Guid.NewGuid().ToString("N"), "dotnet")
+        };
+
+        var shorter = await runner.RunAsync(Checkout, ["a.sln"], TimeSpan.FromSeconds(7), CancellationToken.None);
+        Assert.AreEqual(TimeSpan.FromSeconds(7), shorter.Timeout);
+        Assert.AreEqual(1, shorter.SolutionsAttempted);
+
+        var longer = await runner.RunAsync(Checkout, ["a.sln"], TimeSpan.FromMinutes(10), CancellationToken.None);
+        Assert.AreEqual(TimeSpan.FromSeconds(300), longer.Timeout, "a longer limit never extends the configured timeout");
+
+        var none = await runner.RunAsync(Checkout, ["a.sln"], limit: null, CancellationToken.None);
+        Assert.AreEqual(TimeSpan.FromSeconds(300), none.Timeout);
+
+        foreach (var spent in new[] { TimeSpan.Zero, TimeSpan.FromSeconds(-5) })
+        {
+            var outcome = await runner.RunAsync(Checkout, ["a.sln", "b.sln"], spent, CancellationToken.None);
+            Assert.AreEqual(0, outcome.SolutionsAttempted, $"no time left ({spent}): nothing is started");
+            Assert.IsTrue(outcome.TimedOut);
+            Assert.AreEqual(TimeSpan.Zero, outcome.Timeout);
+            StringAssert.StartsWith(outcome.Notes().Single(), "Package restore did not finish within 0s");
+        }
     }
 
     [TestMethod]
@@ -326,7 +356,7 @@ public class PackageRestoreTests
                 """);
 
             var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromMinutes(4))
-                .RunAsync(root, [solution], CancellationToken.None);
+                .RunAsync(root, [solution], limit: null, CancellationToken.None);
 
             Assert.AreEqual(1, outcome.SolutionsAttempted);
             Assert.IsFalse(outcome.TimedOut);

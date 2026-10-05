@@ -106,4 +106,28 @@ public sealed class MultiSolutionLoaderTests
         Assert.AreEqual(1, coverage[0].DeclaredProjectCount, "a duplicate declaration counts once");
         Assert.AreEqual(1, coverage[0].LoadedProjectCount);
     }
+
+    [TestMethod]
+    public void BuildCoverage_DeferredProject_IsNeitherLoadedNorSkipped_ForEveryDeclaringSolution()
+    {
+        // Issue #245: the load deadline passed before B and the shared Late project were opened.
+        var perSolution = new List<(string Solution, IReadOnlyList<string> Declared)>
+        {
+            ("A.slnx", new[] { P("Core.csproj"), P("A.csproj"), P("Late.csproj") }),
+            ("B.slnx", new[] { P("Core.csproj"), P("B.csproj"), P("Late.csproj") })
+        };
+        var deferred = new[] { Path.Combine("repo", ".", "B.csproj"), P("Late.csproj") };
+
+        var coverage = MultiSolutionLoader.BuildCoverage(perSolution, [], deferred);
+
+        var a = coverage.Single(c => c.SolutionPath == "A.slnx");
+        Assert.AreEqual(3, a.DeclaredProjectCount);
+        Assert.AreEqual(2, a.LoadedProjectCount);
+        Assert.AreEqual(1, a.DeferredProjectCount);
+        Assert.AreEqual(0, a.SkippedProjects.Count, "a deferred project is not a load failure");
+
+        var b = coverage.Single(c => c.SolutionPath == "B.slnx");
+        Assert.AreEqual(1, b.LoadedProjectCount, "only Core loaded for B; a differently spelled path still matches");
+        Assert.AreEqual(2, b.DeferredProjectCount);
+    }
 }

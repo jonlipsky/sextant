@@ -183,7 +183,8 @@ public sealed class LocalIndexerSnapshotWorker(
     WorkerCapability? capability = null,
     IEvaluationSandbox? sandbox = null,
     SdkPinGuard? sdkPinGuard = null,
-    PackageRestoreRunner? packageRestore = null) : ISnapshotWorker
+    PackageRestoreRunner? packageRestore = null,
+    TimeProvider? clock = null) : ISnapshotWorker
 {
     // Issue #113: neutralizes an unsatisfiable global.json SDK pin for the duration of the MSBuild load only.
     private readonly SdkPinGuard _sdkPinGuard = sdkPinGuard ?? new SdkPinGuard(log: log);
@@ -191,6 +192,9 @@ public sealed class LocalIndexerSnapshotWorker(
     // Restores the selected solutions before the load so package compile assets and the SDK's transitive
     // project references exist; without them code that reaches a type through another project cannot bind.
     private readonly PackageRestoreRunner _packageRestore = packageRestore ?? new PackageRestoreRunner(log: log);
+
+    // The clock the time-budget plan reads (issue #245); tests drive it by hand.
+    private readonly TimeProvider _clock = clock ?? TimeProvider.System;
 
     public async Task<SnapshotWorkResult> ProduceAsync(
         EnsureSnapshotRequest request, string identityHash, string scratchDir, CancellationToken cancellationToken)
@@ -238,6 +242,14 @@ public sealed class LocalIndexerSnapshotWorker(
         // With no sandbox (the byte-identical single-node local default) it runs directly.
         async Task<SnapshotWorkResult> EvaluateAsync(CancellationToken token)
         {
+            // Issue #245: plan the phases inside the sandbox's time budget, so a checkout too large to index in
+            // time is published PARTIAL (what was not done recorded as coverage gaps) before the hard abort.
+            var plan = sandbox?.TimeBudget is { } budget && budget > TimeSpan.Zero
+                ? EvaluationTimePlan.Begin(_clock, budget)
+                : null;
+            if (plan is not null)
+                log?.Invoke(plan.Describe());
+
             // Issue #113: a global.json pin hostfxr cannot satisfy (e.g. rollForward "disable" on an SDK band
             // this worker lacks) would fail the BuildHost before any project evaluates. Neutralize ONLY such
             // pins for the load, and put the committed bytes back before anything else reads the checkout —
@@ -250,15 +262,19 @@ public sealed class LocalIndexerSnapshotWorker(
             {
                 // Restore BEFORE the load and while an unsatisfiable SDK pin is still neutralized, so the restore
                 // resolves the same SDK the load will. A failed or partial restore never fails the job.
-                restore = await _packageRestore.RunAsync(checkoutDir, resolution.SelectedSolutions, token)
+                restore = await _packageRestore.RunAsync(
+                        checkoutDir, resolution.SelectedSolutions, plan?.RestoreLimit, token)
                     .ConfigureAwait(false);
 
                 // Load the DETERMINISTIC selected solution set into ONE workspace (union of projects,
                 // de-duplicated by project path/identity). A single selected solution keeps the byte-identical
                 // whole-solution fast path; multiple solutions — an explicit list, or the no-config default
                 // union of every discovered solution (#124) — aggregate into one repository snapshot (#109).
+                // Under a time budget the union load stops opening projects at its deadline.
                 load = await MultiSolutionLoader.LoadAsync(
-                    resolution.SelectedSolutions, log, token).ConfigureAwait(false);
+                    resolution.SelectedSolutions, log,
+                    deadline: plan?.LoadDeadline(_clock.GetUtcNow()), onProgress: log, cancellationToken: token)
+                    .ConfigureAwait(false);
             }
             finally
             {
@@ -302,7 +318,8 @@ public sealed class LocalIndexerSnapshotWorker(
             {
                 Coverage = coverage.Coverage,
                 ProviderCoverage = SnapshotCoverageBuilder.BuildProviders(checkoutDir, resolution, load, inventory, pinOverrides),
-                ProjectLoadIssues = restore.Projects.Count > 0 ? restore.ProjectLoadIssues() : null
+                ProjectLoadIssues = restore.Projects.Count > 0 ? restore.ProjectLoadIssues() : null,
+                TimeBudget = plan?.ForIndexing(checkoutDir, load.DeferredProjects)
             };
 
             var orchestrator = new IndexOrchestrator(
@@ -333,10 +350,10 @@ public sealed class LocalIndexerSnapshotWorker(
 
         // A failed restore outranks every other outcome: the checkout no longer matches its commit, so the job
         // must report THAT (the journal is kept so the next job can repair the checkout before reusing it).
-        SnapshotWorkResult Fail(string message) =>
+        SnapshotWorkResult Fail(string message, IReadOnlyList<ProjectOutcome>? diagnostics = null) =>
             pinState.Overlay is { RestoreError: { } restoreError } failedOverlay
                 ? throw SdkPinRestoreFailure(failedOverlay, restoreError)
-                : SnapshotWorkResult.Failed(message);
+                : SnapshotWorkResult.Failed(message, diagnostics);
 
         try
         {
@@ -346,8 +363,9 @@ public sealed class LocalIndexerSnapshotWorker(
         }
         catch (SandboxLimitExceededException ex)
         {
-            // A budget breach aborts the job cleanly — Failed (retryable), never a partial/complete publish.
-            return Fail(ex.Message);
+            // A budget breach aborts the job cleanly — Failed, never a partial/complete publish. The diagnostics
+            // record the aborting policy, so the service retries the identity once the policy changes (issue #245).
+            return Fail(ex.Message, BudgetExceededDiagnostics(ex, sandbox));
         }
         catch (SandboxViolationException ex)
         {
@@ -462,6 +480,26 @@ public sealed class LocalIndexerSnapshotWorker(
                     Severity = JobDiagnosticSeverity.Warning,
                     Code = PackageRestoreIncompleteCode,
                     Message = note
+                });
+            }
+        }
+
+        if (coverage.Coverage.TimeBudget is { Exhausted: true } budget)
+        {
+            diagnostics.Add(new ProjectOutcome
+            {
+                Severity = JobDiagnosticSeverity.Warning,
+                Code = TimeBudgetExhaustedCode,
+                Message = TimeBudgetCoverageBuilder.Describe(budget, coverage.Coverage.SolutionsSelected)
+            });
+            foreach (var solution in budget.UnfinishedSolutions)
+            {
+                diagnostics.Add(new ProjectOutcome
+                {
+                    Severity = JobDiagnosticSeverity.Warning,
+                    Code = SolutionDeferredCode,
+                    ProjectPath = solution,
+                    Message = $"Solution '{solution}' was not fully indexed before the time budget ran out."
                 });
             }
         }
@@ -632,6 +670,43 @@ public sealed class LocalIndexerSnapshotWorker(
 
     /// <summary>Diagnostic code: the pre-load package restore could not restore everything (the job still publishes).</summary>
     public const string PackageRestoreIncompleteCode = "package_restore_incomplete";
+
+    /// <summary>
+    /// Diagnostic code: the evaluation's time budget ran out before the whole checkout was indexed, so the
+    /// snapshot was published partial (issue #245). Its message is the coverage reason.
+    /// </summary>
+    public const string TimeBudgetExhaustedCode = "time_budget_exhausted";
+
+    /// <summary>Diagnostic code: one selected solution the time budget left unfinished (issue #245).</summary>
+    public const string SolutionDeferredCode = "solution_deferred";
+
+    /// <summary>
+    /// The diagnostics of a job the sandbox aborted: the error, and the aborting policy's token so the service
+    /// can tell a stale abort from one under the current policy (<see cref="EvaluationBudgetPolicy"/>).
+    /// </summary>
+    internal static IReadOnlyList<ProjectOutcome> BudgetExceededDiagnostics(
+        SandboxLimitExceededException exception, IEvaluationSandbox? sandbox)
+    {
+        var diagnostics = new List<ProjectOutcome>
+        {
+            new()
+            {
+                Severity = JobDiagnosticSeverity.Error,
+                Code = EvaluationBudgetPolicy.ExceededCode,
+                Message = exception.Message
+            }
+        };
+        if ((exception.PolicyToken ?? sandbox?.BudgetPolicyToken) is { } token)
+        {
+            diagnostics.Add(new ProjectOutcome
+            {
+                Severity = JobDiagnosticSeverity.Info,
+                Code = EvaluationBudgetPolicy.PolicyCode,
+                Message = token
+            });
+        }
+        return diagnostics;
+    }
 
     /// <summary>
     /// Diagnostic code: a neutralized global.json could not be restored to its committed bytes (or a leftover

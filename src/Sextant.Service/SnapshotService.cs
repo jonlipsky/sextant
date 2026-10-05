@@ -5,6 +5,7 @@ using Sextant.Service.Backup;
 using Sextant.Service.Contributions;
 using Sextant.Service.Observability;
 using Sextant.Service.Rollout;
+using Sextant.Service.Sandbox;
 using Sextant.Store;
 
 namespace Sextant.Service;
@@ -694,7 +695,7 @@ public sealed partial class SnapshotService : IDisposable
         var (row, wasExisting) = RegisterJobLocked(jobs, hash, request.RepositoryRemoteUrl, request.CommitSha, request.BranchName);
         // The row committed (this write is not inside a transaction), so a status read now finds it.
         _jobIds.Release(hash);
-        if (!SnapshotJobStatus.IsTerminal(row.Status) || !TerminalResultUsable(row, hash, new SnapshotStore(_conn)))
+        if (!SnapshotJobStatus.IsTerminal(row.Status) || !TerminalResultUsable(row, hash, new SnapshotStore(_conn), jobs))
             return (row, wasExisting, null);
         var advanced = AdvanceOrAttachBranchPointer(request, row.SnapshotId);
         var attached = Attach(row, wasExisting, CoverageFor(row.SnapshotId)) with { BranchAdvanced = advanced };
@@ -795,7 +796,7 @@ public sealed partial class SnapshotService : IDisposable
         var snapshots = new SnapshotStore(_conn);
 
         var current = jobs.GetJob(jobId)!;
-        if (SnapshotJobStatus.IsTerminal(current.Status) && TerminalResultUsable(current, hash, snapshots))
+        if (SnapshotJobStatus.IsTerminal(current.Status) && TerminalResultUsable(current, hash, snapshots, jobs))
         {
             var terminalAdvanced = AdvanceOrAttachBranchPointer(request, current.SnapshotId);
             return Attach(current, existed, CoverageFor(current.SnapshotId)) with { BranchAdvanced = terminalAdvanced };
@@ -2103,15 +2104,31 @@ public sealed partial class SnapshotService : IDisposable
     // a complete/partial job MUST still point at a published COMPLETE snapshot that carries this exact
     // identity. If retention has since reclaimed that snapshot (its snapshot_id NULLed via ON DELETE SET
     // NULL, or the row replaced), the "complete" result is a phantom and the job must be regenerated.
-    // Failed/unsupported/cancelled carry no snapshot to verify, so they remain terminal as recorded.
-    private static bool TerminalResultUsable(SnapshotJobRow job, string identityHash, SnapshotStore snapshots)
+    // Unsupported/cancelled carry no snapshot to verify, so they remain terminal as recorded. So does a
+    // failure, except a sandbox budget abort under an older policy (issue #245): the worker has since learned
+    // to publish a partial snapshot inside the budget, so the identity is produced again, once per policy.
+    private bool TerminalResultUsable(
+        SnapshotJobRow job, string identityHash, SnapshotStore snapshots, SnapshotJobStore jobs)
     {
+        if (job.Status == SnapshotJobStatus.Failed)
+            return !IsStaleBudgetAbort(job, jobs);
         if (job.Status is not (SnapshotJobStatus.Complete or SnapshotJobStatus.Partial))
             return true;
         if (job.SnapshotId is not long id || snapshots.GetById(id) is not { Status: SnapshotStatus.Complete })
             return false;
         var byIdentity = snapshots.GetByIdentityHash(identityHash);
         return byIdentity is not null && byIdentity.Id == id;
+    }
+
+    // Whether a failed job is a budget abort recorded under a policy other than this service's (or before the
+    // policy was recorded at all), and so should be produced again rather than reused (issue #245).
+    private bool IsStaleBudgetAbort(SnapshotJobRow job, SnapshotJobStore jobs)
+    {
+        var diagnostics = jobs.GetDiagnostics(job.Id);
+        var exceeded = diagnostics.Any(d => d.Code == EvaluationBudgetPolicy.ExceededCode);
+        var recorded = diagnostics.FirstOrDefault(d => d.Code == EvaluationBudgetPolicy.PolicyCode)?.Message;
+        return EvaluationBudgetPolicy.IsStaleAbort(
+            exceeded, recorded, job.LastError, EvaluationBudgetPolicy.Token(_options.Sandbox));
     }
 
     // Validation before we trust a worker's terminal status: a worker that claims Complete/Partial MUST

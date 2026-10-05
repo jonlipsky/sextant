@@ -44,7 +44,8 @@ public sealed class SolutionEvaluationProbe(ICheckoutProvider checkoutProvider) 
             // Probe the UNION of the deterministically-selected solutions (#109) so platform-aware routing
             // sees every project across every selected solution, not one arbitrary solution's slice.
             load = await MultiSolutionLoader.LoadAsync(
-                resolution.SelectedSolutions, onDiagnostic: d => diagnostics.Enqueue(d), cancellationToken)
+                resolution.SelectedSolutions, onDiagnostic: d => diagnostics.Enqueue(d),
+                cancellationToken: cancellationToken)
                 .ConfigureAwait(false);
         }
         catch (OperationCanceledException)
