@@ -29,19 +29,25 @@ internal sealed class AgentOutputHarness : IAsyncDisposable
     /// <summary>
     /// Starts the host. <paramref name="delegateCallers"/> also configures a delegate token and a caller key (the
     /// gateway deployment), which changes only what <c>tools/list</c> says about the <c>repository</c> argument; the
-    /// harness itself still calls with the query token.
+    /// harness itself still calls with the query token. <paramref name="maxResponseChars"/> sets the response
+    /// budget (<c>SEXTANT_SERVICE_MAX_RESPONSE_CHARS</c>; null keeps the default), and <paramref name="seed"/> adds
+    /// rows to the fixture before the host starts.
     /// </summary>
-    public static async Task<AgentOutputHarness> StartAsync(bool delegateCallers = false)
+    public static async Task<AgentOutputHarness> StartAsync(
+        bool delegateCallers = false, int? maxResponseChars = null, Action<IndexDatabase, AgentOutputFixture>? seed = null)
     {
         var dbPath = ServiceTestFixtures.NewDbPath();
         var db = new IndexDatabase(dbPath);
         db.RunMigrations();
         var fixture = AgentOutputFixture.Create(db);
+        seed?.Invoke(db, fixture);
 
         var options = ServiceTestFixtures.NewOptions(dbPath, queryToken: QueryToken) with
         {
             RequireRepositorySelection = true
         };
+        if (maxResponseChars is int budget)
+            options = options with { MaxResponseChars = budget };
         if (delegateCallers)
         {
             options = options with

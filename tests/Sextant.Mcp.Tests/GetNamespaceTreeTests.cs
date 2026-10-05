@@ -14,13 +14,16 @@ public class GetNamespaceTreeTests
         var result = GetNamespaceTreeTool.GetNamespaceTree(_fixture.DbProvider);
         var doc = JsonDocument.Parse(result);
         var meta = doc.RootElement.GetProperty("meta");
-        Assert.AreEqual(1, meta.GetProperty("result_count").GetInt32());
+        Assert.AreEqual(1, doc.RootElement.GetProperty("results").GetArrayLength());
 
         var first = doc.RootElement.GetProperty("results")[0];
         Assert.AreEqual("(root)", first.GetProperty("namespace").GetString());
 
         var childNamespaces = first.GetProperty("child_namespaces");
         Assert.IsTrue(childNamespaces.GetArrayLength() >= 1);
+        // result_count counts the listed entries (child namespaces and types), like every other wrapped result.
+        Assert.AreEqual(childNamespaces.GetArrayLength() + first.GetProperty("symbols").GetArrayLength(),
+            meta.GetProperty("result_count").GetInt32());
     }
 
     [TestMethod]

@@ -57,7 +57,9 @@ public static class IndexConfigurationHash
     /// <c>"4"</c> → <c>"5"</c>: the document extractor now keeps a usage site that does not bind exactly as a
     /// candidate occurrence (occurrence flag bit 2) instead of dropping it, the loader closes each unrestored
     /// project's ProjectReferences transitively, and the service worker restores NuGet packages before the
-    /// load, so the same commit now yields more references and call edges.
+    /// load, so the same commit now yields more references and call edges. The indexer also records each
+    /// member's C# declaration (<c>symbols.declaration</c>, migration 026) for the tools' <c>signature</c> field,
+    /// so a snapshot indexed before it has no declarations and must not be reused for the same identity.
     /// </para>
     /// </remarks>
     public const string AnalyzerVersion = "5";

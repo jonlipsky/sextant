@@ -112,17 +112,21 @@ public static class GetNamespaceTreeTool
                 .ToList();
         }
 
-        var result = new List<object>
-        {
-            new
+        // The child namespaces, then the namespace's own types, are the rows the size budget keeps in order; the
+        // response wraps the kept ones in the one namespace row.
+        var rows = childNamespaces.Select(n => (Namespace: true, Row: n))
+            .Concat(directSymbols.Select(s => (Namespace: false, Row: s)))
+            .ToList();
+        return ResponseBuilder.BuildBounded(rows, readContext, provenance: readContext.Provenance,
+            shape: kept => new List<object>
             {
-                @namespace = namespace_prefix ?? "(root)",
-                child_namespaces = childNamespaces,
-                symbols = directSymbols
-            }
-        };
-
-        return ResponseBuilder.Build(result, null, provenance: readContext.Provenance);
+                new
+                {
+                    @namespace = namespace_prefix ?? "(root)",
+                    child_namespaces = kept.Where(r => r.Namespace).Select(r => r.Row).ToList(),
+                    symbols = kept.Where(r => !r.Namespace).Select(r => r.Row).ToList()
+                }
+            });
     }
 
     private static string UnknownNamespace(

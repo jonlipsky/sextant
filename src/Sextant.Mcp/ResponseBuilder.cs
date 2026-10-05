@@ -1,3 +1,4 @@
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -5,11 +6,20 @@ namespace Sextant.Mcp;
 
 public static class ResponseBuilder
 {
+    // A tool result is JSON text an agent reads as is, never embedded in HTML, so characters such as `<`, `>`, `&`,
+    // `'` and `+` are written literally: `Task<int>` instead of `Task\u003Cint\u003E`, which is shorter and readable.
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-        WriteIndented = false
+        WriteIndented = false,
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+    };
+
+    /// <summary>The writer options for re-serializing a tool result (<see cref="RemoteResponsePresenter"/>).</summary>
+    internal static readonly JsonSerializerOptions NodeWriteOptions = new()
+    {
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
     };
 
     public static string Build<T>(
@@ -41,61 +51,177 @@ public static class ResponseBuilder
     }
 
     /// <summary>
-    /// Builds one page of a bounded result (<see cref="Paging"/>): <paramref name="results"/> are this page's
-    /// rows (already sliced and mapped), <paramref name="total"/> the size of the whole result. <c>meta.total</c>
-    /// is always present, <c>meta.next_cursor</c> only when rows remain, and <paramref name="summary"/> (counts
-    /// per file/project/…, set by the tool on a truncated first page) comes BEFORE the rows so an agent can
-    /// narrow the query instead of paging. <c>meta.result_count</c> is the number of rows on this page.
-    /// <paramref name="message"/> is an explicit statement about a valid answer, as in <see cref="Build{T}"/>.
+    /// Builds one page of a bounded result (<see cref="Paging"/>): <paramref name="rows"/> are this page's rows
+    /// (already sliced to <c>limit</c> and mapped), <paramref name="total"/> the size of the whole result.
+    /// The page then ends at the last row whose response fits <see cref="PageRequest.MaxChars"/>
+    /// (<see cref="ResponseBudget"/>; at least one row): a page cut that way says so in
+    /// <c>meta.page_truncated_by: "size"</c> and its message, and its <c>meta.next_cursor</c> resumes at the first
+    /// row it left out, exactly like a page that ended at <c>limit</c>. <c>meta.total</c> is always present,
+    /// <c>meta.next_cursor</c> only when rows remain, and <paramref name="summary"/> (counts per file/project/…)
+    /// is computed only for a first page that does not hold the whole result and comes BEFORE the rows so an
+    /// agent can narrow the query instead of paging. <c>meta.result_count</c> is the number of rows on this page.
+    /// <paramref name="shape"/> turns the page's rows into the <c>results</c> value when it is not the plain list
+    /// (e.g. grouped). <paramref name="message"/> is an explicit statement about a valid answer, as in
+    /// <see cref="Build{T}"/>.
     /// </summary>
     public static string BuildPage<T>(
-        List<T> results, int total, PageRequest page, long? indexFreshness = null, SymbolAmbiguity? ambiguity = null,
-        SnapshotProvenance? provenance = null, object? summary = null, int? resultCount = null, string? message = null)
+        List<T> rows, int total, PageRequest page, long? indexFreshness = null, SymbolAmbiguity? ambiguity = null,
+        SnapshotProvenance? provenance = null, Func<object?>? summary = null, string? message = null,
+        Func<List<T>, object>? shape = null)
     {
-        var response = new
-        {
-            Meta = new MetaObject
-            {
-                QueriedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                IndexFreshness = indexFreshness ?? 0,
-                ResultCount = resultCount ?? results.Count,
-                Total = total,
-                Ambiguous = ambiguity != null ? true : null,
-                AmbiguousMatchCount = ambiguity?.Candidates.Count,
-                SelectedProjectId = ambiguity?.SelectedProjectId,
-                SelectedSymbolKey = ambiguity?.SelectedSymbolKey,
-                Candidates = ambiguity?.Candidates,
-                Snapshot = SnapshotMeta.From(provenance),
-                NextCursor = page.NextCursor(total)
-            },
-            Summary = summary,
-            Results = results,
-            Message = message
-        };
+        var queriedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var summaryValue = new Lazy<object?>(() => summary?.Invoke());
 
-        return JsonSerializer.Serialize(response, JsonOptions);
+        string Render(int count)
+        {
+            var pageRows = count == rows.Count ? rows : rows.GetRange(0, count);
+            var end = page.Offset + count;
+            var more = end < total;
+            var cut = count < rows.Count;
+            var response = new
+            {
+                Meta = new MetaObject
+                {
+                    QueriedAt = queriedAt,
+                    IndexFreshness = indexFreshness ?? 0,
+                    ResultCount = count,
+                    Total = total,
+                    Ambiguous = ambiguity != null ? true : null,
+                    AmbiguousMatchCount = ambiguity?.Candidates.Count,
+                    SelectedProjectId = ambiguity?.SelectedProjectId,
+                    SelectedSymbolKey = ambiguity?.SelectedSymbolKey,
+                    Candidates = ambiguity?.Candidates,
+                    Snapshot = SnapshotMeta.From(provenance),
+                    NextCursor = more ? Paging.EncodeCursor(end, page.Binding) : null,
+                    PageTruncatedBy = cut ? ResponseBudget.SizeTruncation : null
+                },
+                Summary = page.Offset == 0 && more ? summaryValue.Value : null,
+                Results = shape != null ? shape(pageRows) : (object)pageRows,
+                Message = cut ? JoinMessages(message, ResponseBudget.PageCutMessage(count, page.MaxChars)) : message
+            };
+
+            return JsonSerializer.Serialize(response, JsonOptions);
+        }
+
+        return ResponseBudget.Fit(rows.Count, page.MaxChars, Render, page.Measure);
+    }
+
+    /// <summary>
+    /// Builds the response of a tool that does not page, bounded like <see cref="BuildPage{T}"/>: when every row
+    /// does not fit <see cref="FederatedReadContext.MaxResponseChars"/>, it keeps the most leading rows that do
+    /// (at least one), sets <c>meta.total</c> to the full count and <c>meta.page_truncated_by: "size"</c>, and says
+    /// how to narrow the query. There is no cursor. A result that fits is byte-identical to
+    /// <see cref="Build{T}"/>. <paramref name="shape"/> turns the kept rows into the <c>results</c> value.
+    /// </summary>
+    public static string BuildBounded<T>(
+        List<T> rows, FederatedReadContext context, long? indexFreshness = null, SymbolAmbiguity? ambiguity = null,
+        SnapshotProvenance? provenance = null, string? message = null, Func<List<T>, object>? shape = null)
+    {
+        var queriedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var maxChars = context.MaxResponseChars;
+
+        string Render(int count)
+        {
+            var kept = count == rows.Count ? rows : rows.GetRange(0, count);
+            var cut = count < rows.Count;
+            var response = new
+            {
+                Meta = new MetaObject
+                {
+                    QueriedAt = queriedAt,
+                    IndexFreshness = indexFreshness ?? 0,
+                    ResultCount = count,
+                    Total = cut ? rows.Count : null,
+                    Ambiguous = ambiguity != null ? true : null,
+                    AmbiguousMatchCount = ambiguity?.Candidates.Count,
+                    SelectedProjectId = ambiguity?.SelectedProjectId,
+                    SelectedSymbolKey = ambiguity?.SelectedSymbolKey,
+                    Candidates = ambiguity?.Candidates,
+                    Snapshot = SnapshotMeta.From(provenance),
+                    PageTruncatedBy = cut ? ResponseBudget.SizeTruncation : null
+                },
+                Results = shape != null ? shape(kept) : (object)kept,
+                Message = cut ? JoinMessages(message, ResponseBudget.ResultCutMessage(count, rows.Count, maxChars)) : message
+            };
+
+            return JsonSerializer.Serialize(response, JsonOptions);
+        }
+
+        return ResponseBudget.Fit(rows.Count, maxChars, Render, text => ResponseBudget.Measure(text, context));
+    }
+
+    /// <summary>
+    /// Builds one page of a keyset-paged result (a cursor that names the last row returned, not an offset), bounded
+    /// like <see cref="BuildPage{T}"/>: a page over <see cref="FederatedReadContext.MaxResponseChars"/> keeps its
+    /// most leading rows that fit (at least one) and resumes after the last of them
+    /// (<paramref name="cursorAfter"/>), with <c>meta.page_truncated_by: "size"</c>. A page that fits is
+    /// byte-identical to <see cref="Build{T}"/> with <paramref name="nextCursor"/>.
+    /// </summary>
+    public static string BuildKeysetPage<T>(
+        List<T> rows, Func<T, string> cursorAfter, string? nextCursor, FederatedReadContext context,
+        long? indexFreshness = null, SnapshotProvenance? provenance = null)
+    {
+        var maxChars = context.MaxResponseChars;
+
+        string Render(int count)
+        {
+            if (count == rows.Count)
+                return Build(rows, indexFreshness, ambiguity: null, provenance, nextCursor);
+            var response = new
+            {
+                Meta = new MetaObject
+                {
+                    QueriedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                    IndexFreshness = indexFreshness ?? 0,
+                    ResultCount = count,
+                    Snapshot = SnapshotMeta.From(provenance),
+                    NextCursor = cursorAfter(rows[count - 1]),
+                    PageTruncatedBy = ResponseBudget.SizeTruncation
+                },
+                Results = rows.GetRange(0, count),
+                Message = ResponseBudget.PageCutMessage(count, maxChars)
+            };
+
+            return JsonSerializer.Serialize(response, JsonOptions);
+        }
+
+        return ResponseBudget.Fit(rows.Count, maxChars, Render, text => ResponseBudget.Measure(text, context));
     }
 
     /// <summary>
     /// Builds an index-status response (Phase 8) — the standard results/meta envelope plus a top-level
     /// <c>index</c> object describing the active profile, its enabled feature capabilities, and retained
-    /// storage. Serialized with the same snake_case policy as every other response.
+    /// storage, and one page of the per-project rows (<see cref="BuildPage{T}"/> paging and size budget).
+    /// Serialized with the same snake_case policy as every other response.
     /// </summary>
-    public static string BuildStatus<T>(List<T> results, long indexFreshness, object index)
+    public static string BuildStatus<T>(List<T> rows, int total, PageRequest page, long indexFreshness, object index)
     {
-        var response = new
-        {
-            Meta = new MetaObject
-            {
-                QueriedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                IndexFreshness = indexFreshness,
-                ResultCount = results.Count
-            },
-            Index = index,
-            Results = results
-        };
+        var queriedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-        return JsonSerializer.Serialize(response, JsonOptions);
+        string Render(int count)
+        {
+            var end = page.Offset + count;
+            var cut = count < rows.Count;
+            var response = new
+            {
+                Meta = new MetaObject
+                {
+                    QueriedAt = queriedAt,
+                    IndexFreshness = indexFreshness,
+                    ResultCount = count,
+                    Total = total,
+                    NextCursor = end < total ? Paging.EncodeCursor(end, page.Binding) : null,
+                    PageTruncatedBy = cut ? ResponseBudget.SizeTruncation : null
+                },
+                Index = index,
+                Results = count == rows.Count ? rows : rows.GetRange(0, count),
+                Message = cut ? ResponseBudget.PageCutMessage(count, page.MaxChars) : null
+            };
+
+            return JsonSerializer.Serialize(response, JsonOptions);
+        }
+
+        return ResponseBudget.Fit(rows.Count, page.MaxChars, Render, page.Measure);
     }
 
     /// <summary>
@@ -457,6 +583,13 @@ public sealed class MetaObject
 
     [JsonPropertyName("next_cursor")]
     public string? NextCursor { get; set; }
+
+    /// <summary>
+    /// <c>"size"</c> when the response holds fewer rows than it could because the next row would exceed the
+    /// response size budget (<see cref="ResponseBudget"/>); omitted otherwise.
+    /// </summary>
+    [JsonPropertyName("page_truncated_by")]
+    public string? PageTruncatedBy { get; set; }
 
     [JsonPropertyName("error")]
     public ErrorInfo? Error { get; set; }

@@ -97,13 +97,11 @@ public static class GetTypeDependentsTool
             .ThenBy(d => d.Value.LineStart).ThenBy(d => d.Key, StringComparer.Ordinal)
             .Select(d => d.Value)
             .ToList();
-        object? summary = page.IsTruncatedFirstPage(dependents.Count)
-            ? new
-            {
-                ByRelationship = Paging.CountBy(readableKinds, k => k),
-                ByFile = Paging.CountBy(dependents, d => d.FilePath)
-            }
-            : null;
+        object? Summary() => new
+        {
+            ByRelationship = Paging.CountBy(readableKinds, k => k),
+            ByFile = Paging.CountBy(dependents, d => d.FilePath)
+        };
 
         var results = page.Slice(dependents).Select(d => (object)new
         {
@@ -120,7 +118,7 @@ public static class GetTypeDependentsTool
               (kindFilter is null ? "." : $" through '{dependency_kind!.Trim()}'.")
             : null;
         return ResponseBuilder.BuildPage(results, dependents.Count, page, targetSymbol.LastIndexedAt, lookup.Ambiguity,
-            readContext.Provenance, summary,
+            readContext.Provenance, Summary,
             message: ResponseBuilder.JoinMessages(SymbolResolver.ResolutionNote(symbolStore, lookup), empty));
     }
 

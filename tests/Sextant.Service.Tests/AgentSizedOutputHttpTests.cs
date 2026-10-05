@@ -21,6 +21,7 @@ public sealed partial class AgentSizedOutputHttpTests
     // tools; the budget is half of that.
     private const int ToolsListBudget = 14579;
     private const int InstructionsBudget = 600;
+    private const int UnboundedChars = 10_000_000;
 
     private static readonly string[] ExpectedTools =
     [
@@ -140,7 +141,8 @@ public sealed partial class AgentSizedOutputHttpTests
     [TestMethod]
     public async Task FindReferences_LimitIsClamped_AndASmallResultHasNoSummaryOrCursor()
     {
-        await using var host = await AgentOutputHarness.StartAsync();
+        // A budget no page reaches, so only the row limit cuts (ResponseBudgetHttpTests pins the size cut).
+        await using var host = await AgentOutputHarness.StartAsync(maxResponseChars: UnboundedChars);
 
         var body = await host.CallAsync("find_references", Args(AgentOutputFixture.TargetInterface, limit: 300));
         Assert.AreEqual(Paging.MaxLimit, body.GetProperty("results").GetArrayLength(), "the limit is clamped to the maximum");
@@ -157,7 +159,7 @@ public sealed partial class AgentSizedOutputHttpTests
     [TestMethod]
     public async Task FindReferences_CursorWalksEveryRowExactlyOnce()
     {
-        await using var host = await AgentOutputHarness.StartAsync();
+        await using var host = await AgentOutputHarness.StartAsync(maxResponseChars: UnboundedChars);
 
         var seen = new List<string>();
         string? cursor = null;
@@ -397,10 +399,16 @@ public sealed partial class AgentSizedOutputHttpTests
         await using var host = await AgentOutputHarness.StartAsync();
 
         var body = await host.CallAsync("find_references", Args(AgentOutputFixture.TargetInterface, limit: 200));
-        var rest = await host.CallAsync("find_references",
-            Args(AgentOutputFixture.TargetInterface, limit: 200, cursor: body.GetProperty("meta").GetProperty("next_cursor").GetString()));
+        var rows = body.GetProperty("results").EnumerateArray().ToList();
+        var page = body;
+        while (page.GetProperty("meta").TryGetProperty("next_cursor", out var next) && rows.Count < AgentOutputFixture.ReferenceCount)
+        {
+            page = await host.CallAsync("find_references",
+                Args(AgentOutputFixture.TargetInterface, limit: 200, cursor: next.GetString()));
+            rows.AddRange(page.GetProperty("results").EnumerateArray());
+        }
 
-        var paths = body.GetProperty("results").EnumerateArray().Concat(rest.GetProperty("results").EnumerateArray())
+        var paths = rows
             .Select(r => r.GetProperty("file_path").GetString()!).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToList();
         CollectionAssert.AreEquivalent(host.Fixture.ReferenceFiles.ToList(), paths);
         Assert.IsTrue(paths.Any(p => p.StartsWith("external/lib/src/Lib/", StringComparison.Ordinal)),

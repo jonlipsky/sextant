@@ -59,13 +59,11 @@ public static class FindUnreferencedTool
             .OrderBy(s => s.FilePath, StringComparer.Ordinal).ThenBy(s => s.LineStart).ThenBy(s => s.Id)
             .ToList();
 
-        object? summary = page.IsTruncatedFirstPage(symbols.Count)
-            ? new
-            {
-                ByKind = Paging.CountBy(symbols, s => s.Kind.ToString().ToLowerInvariant()),
-                ByProject = Paging.CountBy(symbols, s => FindSymbolTool.ResolveCanonicalId(s.ProjectId, canonicalIdCache))
-            }
-            : null;
+        object? Summary() => new
+        {
+            ByKind = Paging.CountBy(symbols, s => s.Kind.ToString().ToLowerInvariant()),
+            ByProject = Paging.CountBy(symbols, s => FindSymbolTool.ResolveCanonicalId(s.ProjectId, canonicalIdCache))
+        };
 
         var results = page.Slice(symbols)
             .Select(s => FindSymbolTool.MapSymbol(
@@ -74,7 +72,7 @@ public static class FindUnreferencedTool
         var freshness = symbols.Count > 0 ? symbols.Min(s => s.LastIndexedAt) : 0L;
 
         return ResponseBuilder.BuildPage(results, symbols.Count, page, freshness, provenance: readContext.Provenance,
-            summary: summary, message: symbols.Count == 0 ? "No unreferenced symbol matches the given filters." : null);
+            summary: Summary, message: symbols.Count == 0 ? "No unreferenced symbol matches the given filters." : null);
     }
 
     private static readonly string[] AccessibilityNames =

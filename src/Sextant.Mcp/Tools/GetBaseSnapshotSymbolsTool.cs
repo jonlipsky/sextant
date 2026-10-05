@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Globalization;
 using Sextant.Store;
 using ModelContextProtocol.Server;
 
@@ -61,7 +62,7 @@ public static class GetBaseSnapshotSymbolsTool
                 Freshness = local.PublishedAt ?? local.CreatedAt,
                 Coverage = localPage.Coverage
             };
-            return BuildPage(localPage, localProvenance);
+            return BuildPage(localPage, localProvenance, readContext);
         }
 
         // Not resolvable locally. Federate to a configured peer when one exists; otherwise say so plainly
@@ -95,7 +96,7 @@ public static class GetBaseSnapshotSymbolsTool
                 Freshness = readContext.Provenance?.Freshness ?? 0,
                 Coverage = remotePage.Coverage
             };
-            return BuildPage(remotePage, remoteProvenance);
+            return BuildPage(remotePage, remoteProvenance, readContext);
         }
         catch (Exception ex) when (ex is RemoteSnapshotUnavailableException or HttpRequestException)
         {
@@ -112,18 +113,17 @@ public static class GetBaseSnapshotSymbolsTool
         }
     }
 
-    private static string BuildPage(SnapshotSymbolPage page, SnapshotProvenance provenance)
+    // The rows' own cursor (the symbol id) resumes after a row, so a page cut by the size budget continues at the
+    // first row it left out.
+    private static string BuildPage(SnapshotSymbolPage page, SnapshotProvenance provenance, FederatedReadContext readContext)
     {
-        var results = page.Symbols.Select(s => (object)new
-        {
-            symbol_key = s.SymbolKey,
-            fully_qualified_name = s.FullyQualifiedName,
-            display_name = s.DisplayName,
-            kind = s.Kind,
-            accessibility = s.Accessibility,
-            cursor = s.Cursor
-        }).ToList();
+        var results = page.Symbols.Select(s => new BaseSymbolRow(
+            s.SymbolKey, s.FullyQualifiedName, s.DisplayName, s.Kind, s.Accessibility, s.Cursor)).ToList();
 
-        return ResponseBuilder.Build(results, provenance.Freshness, ambiguity: null, provenance, page.NextCursor);
+        return ResponseBuilder.BuildKeysetPage(results, row => row.Cursor.ToString(CultureInfo.InvariantCulture),
+            page.NextCursor, readContext, provenance.Freshness, provenance);
     }
+
+    private sealed record BaseSymbolRow(
+        string SymbolKey, string FullyQualifiedName, string DisplayName, int Kind, int Accessibility, long Cursor);
 }
