@@ -15,8 +15,6 @@ public sealed class ToolSelectionFiltersTests
 {
     private const string Widgets = "https://github.com/acme/widgets";
     private static readonly IReadOnlySet<string> BothReserved = new HashSet<string> { "repository", "branch" };
-    private static readonly Func<bool> NotRequired = () => false;
-    private static readonly Func<bool> Required = () => true;
 
     // ==== Resolve =================================================================================
 
@@ -35,15 +33,14 @@ public sealed class ToolSelectionFiltersTests
     [TestMethod]
     public void Resolve_DoesNotStripAnArgumentTheToolDeclaresItself()
     {
-        var arguments = Arguments(("provider_repository_url", Widgets), ("repository", Widgets), ("branch", "release"));
+        var arguments = Arguments(("own_argument", Widgets), ("repository", Widgets), ("branch", "release"));
 
         var outcome = ToolSelectionFilters.Resolve(
-            arguments, new HashSet<string> { "repository" }, "find_submodule_consumers", null,
-            RepositoryUrlPolicy.Default, NotRequired);
+            arguments, new HashSet<string> { "repository" }, null, RepositoryUrlPolicy.Default);
 
         Assert.AreEqual(new ToolCallSelection(Widgets, null, ToolSelectionSource.Argument), outcome.Selection,
             "the tool's own branch argument is neither a selector nor stripped");
-        CollectionAssert.AreEquivalent(new[] { "provider_repository_url", "branch" }, arguments.Keys.ToList());
+        CollectionAssert.AreEquivalent(new[] { "own_argument", "branch" }, arguments.Keys.ToList());
     }
 
     [TestMethod]
@@ -64,8 +61,7 @@ public sealed class ToolSelectionFiltersTests
     [TestMethod]
     public void Resolve_NoArguments_IsAnEmptySelection()
     {
-        var outcome = ToolSelectionFilters.Resolve(
-            null, BothReserved, "find_symbol", null, RepositoryUrlPolicy.Default, NotRequired);
+        var outcome = ToolSelectionFilters.Resolve(null, BothReserved, null, RepositoryUrlPolicy.Default);
 
         Assert.AreEqual(new ToolCallSelection(null, null, ToolSelectionSource.None), outcome.Selection);
     }
@@ -100,8 +96,8 @@ public sealed class ToolSelectionFiltersTests
     public void Resolve_HeaderOnly_KeepsTheHeaderAsSent()
     {
         var outcome = ToolSelectionFilters.Resolve(
-            Arguments(("branch", "main")), BothReserved, "find_symbol", "https://GitHub.com/acme/widgets.git",
-            RepositoryUrlPolicy.Default, NotRequired);
+            Arguments(("branch", "main")), BothReserved, "https://GitHub.com/acme/widgets.git",
+            RepositoryUrlPolicy.Default);
 
         Assert.AreEqual(
             new ToolCallSelection("https://GitHub.com/acme/widgets.git", "main", ToolSelectionSource.Header),
@@ -112,8 +108,8 @@ public sealed class ToolSelectionFiltersTests
     public void Resolve_ArgumentMatchingTheHeader_Wins()
     {
         var outcome = ToolSelectionFilters.Resolve(
-            Arguments(("repository", "acme/widgets")), BothReserved, "find_symbol",
-            "https://github.com/Acme/Widgets.git", RepositoryUrlPolicy.Default, NotRequired);
+            Arguments(("repository", "acme/widgets")), BothReserved,
+            "https://github.com/Acme/Widgets.git", RepositoryUrlPolicy.Default);
 
         Assert.AreEqual(new ToolCallSelection(Widgets, null, ToolSelectionSource.Argument), outcome.Selection);
     }
@@ -122,38 +118,11 @@ public sealed class ToolSelectionFiltersTests
     public void Resolve_ArgumentConflictingWithTheHeader_IsAConflict()
     {
         var outcome = ToolSelectionFilters.Resolve(
-            Arguments(("repository", "acme/widgets")), BothReserved, "find_symbol",
-            "https://github.com/acme/gadgets", RepositoryUrlPolicy.Default, NotRequired);
+            Arguments(("repository", "acme/widgets")), BothReserved,
+            "https://github.com/acme/gadgets", RepositoryUrlPolicy.Default);
 
         Assert.IsNull(outcome.Selection);
         Assert.AreEqual("selector_conflict", ErrorCode(outcome.Error));
-    }
-
-    [TestMethod]
-    public void Resolve_ProviderDefault_OnlyWhenSelectionIsRequired()
-    {
-        foreach (var (require, expected) in new[]
-                 {
-                     (Required, new ToolCallSelection(Widgets, null, ToolSelectionSource.ProviderDefault)),
-                     (NotRequired, new ToolCallSelection(null, null, ToolSelectionSource.None))
-                 })
-        {
-            var outcome = ToolSelectionFilters.Resolve(
-                Arguments(("provider_repository_url", $" {Widgets} ")), new HashSet<string> { "repository" },
-                "find_cross_repository_usages", null, RepositoryUrlPolicy.Default, require);
-
-            Assert.AreEqual(expected, outcome.Selection);
-        }
-    }
-
-    [TestMethod]
-    public void Resolve_ProviderDefault_NeverAppliesToOtherTools()
-    {
-        var outcome = ToolSelectionFilters.Resolve(
-            Arguments(("provider_repository_url", Widgets)), BothReserved, "find_symbol", null,
-            RepositoryUrlPolicy.Default, Required);
-
-        Assert.AreEqual(new ToolCallSelection(null, null, ToolSelectionSource.None), outcome.Selection);
     }
 
     // ==== EvaluateRepository ========================================================================
@@ -209,12 +178,12 @@ public sealed class ToolSelectionFiltersTests
     public async Task ListToolsFilter_AugmentsOnlyScopedTools_WithoutMutatingTheShared()
     {
         var scoped = Tool("find_symbol", """{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}""");
-        var ownBranch = Tool("find_submodule_consumers",
+        var ownBranch = Tool("own_branch_tool",
             """{"type":"object","properties":{"branch":{"type":"string","description":"own"}}}""");
         var unscoped = Tool("list_everything", """{"type":"object","properties":{}}""");
         var originalSchema = scoped.InputSchema.GetRawText();
         var filter = ToolSelectionFilters.ListToolsFilter(
-            RepositoryUrlPolicy.Default, new HashSet<string> { "find_symbol", "find_submodule_consumers" });
+            RepositoryUrlPolicy.Default, new HashSet<string> { "find_symbol", "own_branch_tool" });
         var shared = new ListToolsResult { Tools = [scoped, ownBranch, unscoped] };
 
         var result = await filter((_, _) => ValueTask.FromResult(shared))(null!, CancellationToken.None);
@@ -263,7 +232,7 @@ public sealed class ToolSelectionFiltersTests
     {
         var nullable = Tool("find_references",
             """{"type":"object","properties":{"limit":{"type":["integer","null"],"default":null},"flag":{"type":"boolean","default":false},"either":{"type":["string","integer"]}}}""");
-        var plain = Tool("get_index_status", """{"type":"object","properties":{"name":{"type":"string"}}}""");
+        var plain = Tool("plain_tool", """{"type":"object","properties":{"name":{"type":"string"}}}""");
         var originalSchema = nullable.InputSchema.GetRawText();
         var shared = new ListToolsResult { Tools = [nullable, plain] };
 
@@ -285,15 +254,19 @@ public sealed class ToolSelectionFiltersTests
         var names = ToolSelectionFilters.RepositoryScopedToolNames(ServiceApp.RemoteQueryTools);
 
         CollectionAssert.AreEquivalent(names.ToList(), ServiceApp.RepositoryScopedTools.ToList());
-        Assert.IsTrue(names.Contains("find_symbol"));
-        Assert.IsTrue(names.Contains("find_cross_repository_usages"));
-        Assert.IsFalse(names.Contains("get_base_snapshot_symbols"), "the local-only tool is not on the remote surface");
+        CollectionAssert.AreEquivalent(
+            new[]
+            {
+                "find_symbol", "find_references", "get_call_hierarchy", "get_implementors",
+                "get_type_hierarchy", "get_type_members", "get_file_symbols"
+            },
+            names.ToList(), "every remote tool but list_repositories and search_symbols reads one selected repository");
     }
 
     // ==== helpers ===================================================================================
 
     private static ToolSelectionFilters.SelectionOutcome Resolve(IDictionary<string, JsonElement> arguments) =>
-        ToolSelectionFilters.Resolve(arguments, BothReserved, "find_symbol", null, RepositoryUrlPolicy.Default, NotRequired);
+        ToolSelectionFilters.Resolve(arguments, BothReserved, null, RepositoryUrlPolicy.Default);
 
     private static Dictionary<string, JsonElement> Arguments(params (string Key, string Value)[] pairs) =>
         pairs.ToDictionary(p => p.Key, p => JsonSerializer.SerializeToElement(p.Value));

@@ -50,7 +50,7 @@ internal static class RemoteOutputFilter
                 if (string.Equals(presented, original, StringComparison.Ordinal))
                     continue;
                 text.Text = presented;
-                // A tool that mirrors its text as structuredContent (search_symbols) keeps the two identical.
+                // A tool that mirrors its text as structuredContent keeps the two identical.
                 if (result.StructuredContent is { } structured && structured.GetRawText() == original)
                 {
                     using var document = JsonDocument.Parse(presented);

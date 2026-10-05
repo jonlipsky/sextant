@@ -146,17 +146,12 @@ public class QueryToolInputResolutionHttpTests
     [DataRow("get_implementors", """{"symbol_fqn":"Library.Shapes.IShape"}""")]
     [DataRow("get_type_hierarchy", """{"symbol_fqn":"Library.Shapes.Circle"}""")]
     [DataRow("get_type_members", """{"symbol_fqn":"Library.Shapes.Circle"}""")]
-    [DataRow("get_type_dependents", """{"symbol_fqn":"Library.Shapes.IShape"}""")]
-    [DataRow("get_impact", """{"symbol_fqn":"Library.Shapes.IShape"}""")]
     [DataRow("get_call_hierarchy", """{"symbol_fqn":"Library.Drawing.Canvas.Draw","direction":"callees"}""")]
-    [DataRow("trace_value", """{"method_fqn":"Library.Drawing.Canvas.Total","direction":"origins"}""")]
-    [DataRow("find_by_attribute", """{"attribute_fqn":"System.ObsoleteAttribute"}""")]
     public async Task FqnWithoutTheGlobalAlias_Resolves(string tool, string arguments)
     {
         var call = await CallAsync(tool, WithRepository(arguments), Solo);
 
         Assert.IsFalse(call.IsError, call.Body.ToString());
-        // The results, not meta.result_count: get_impact's result_count counts its paged consumers (none here).
         Assert.IsTrue(call.Body.GetProperty("results").GetArrayLength() > 0, call.Body.ToString());
     }
 

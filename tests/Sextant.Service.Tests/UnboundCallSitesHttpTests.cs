@@ -4,6 +4,8 @@ using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.Text;
 using Sextant.Core;
 using Sextant.Indexer;
+using Sextant.Mcp;
+using Sextant.Mcp.Tools;
 using Sextant.Store;
 using static Sextant.Service.Tests.CallerAssertionHttpTests;
 
@@ -15,7 +17,7 @@ namespace Sextant.Service.Tests;
 /// ProjectReference that never flowed because restore did not run) is indexed by the real orchestrator. Before the
 /// fix, <c>find_references</c> of that method returned nothing, <c>get_call_hierarchy</c> of its callers was empty, and
 /// the snapshot claimed complete coverage. Now every call site is returned (marked <c>candidate</c>), and the lean
-/// <c>meta.snapshot.warning</c> names the project that did not bind.
+/// <c>meta.snapshot.warning</c> counts the project that did not bind.
 /// </summary>
 [TestClass]
 public class UnboundCallSitesHttpTests
@@ -88,33 +90,30 @@ public class UnboundCallSitesHttpTests
     }
 
     [TestMethod]
-    public async Task Meta_Snapshot_IsPartial_AndTheWarningNamesTheProjectThatDidNotBind()
+    public async Task Meta_Snapshot_IsPartial_AndTheWarningCountsTheProjectThatDidNotBind()
     {
         var call = await CallAsync("find_symbol", """{"name":"Core.IStore"}""");
 
         var snapshot = call.Body.GetProperty("meta").GetProperty("snapshot");
         Assert.AreEqual("partial", snapshot.GetProperty("coverage").GetString());
         var warning = snapshot.GetProperty("warning").GetString()!;
-        StringAssert.StartsWith(warning,
-            "Partial index: Code in 1 project(s) did not fully compile on the indexer, so references and calls " +
-            "inside them may be missing (src/App/App.csproj: ");
-        StringAssert.EndsWith(warning,
-            "Calls that failed to bind are kept as candidate matches. Call get_index_status for details.");
-        StringAssert.Contains(warning, "Partial index: Code in 1 project(s)");
-        Assert.IsFalse(warning.Contains("some projects or submodules were not indexed", StringComparison.Ordinal),
-            "not the generic caution");
+        Assert.AreEqual("Partial index: 1 project did not compile, so results may be incomplete.", warning,
+            "a count, not the generic caution, and no project path or tool name");
+        Assert.IsTrue(warning.Length <= RemoteResponsePresenter.MaxPartialWarningChars, warning);
         var keys = snapshot.EnumerateObject().Select(p => p.Name).Order(StringComparer.Ordinal).ToArray();
         CollectionAssert.AreEqual(
             new[] { "branch", "commit", "coverage", "repository", "repository_selection", "warning" }, keys,
             "the lean #225 shape is unchanged");
     }
 
+    // get_index_status is local-only (the remote surface lists the agent tools only); it reads the same catalog.
     [TestMethod]
-    public async Task GetIndexStatus_ReportsBindingHealthPerProject_AndTheNotes()
+    public void LocalGetIndexStatus_ReportsBindingHealthPerProject_AndTheNotes()
     {
-        var call = await CallAsync("get_index_status", "{}");
+        using var local = new DatabaseProvider(_host.DbPath) { RequestedRepository = () => Store };
+        var body = JsonDocument.Parse(GetIndexStatusTool.GetIndexStatus(local)).RootElement;
 
-        var coverage = call.Body.GetProperty("index").GetProperty("coverage");
+        var coverage = body.GetProperty("index").GetProperty("coverage");
         Assert.AreEqual("partial", coverage.GetProperty("verdict").GetString());
         var binding = coverage.GetProperty("binding");
         Assert.AreEqual(1, binding.GetProperty("projects_degraded").GetInt32());

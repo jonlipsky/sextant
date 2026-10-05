@@ -88,16 +88,6 @@ public partial class SubmoduleCheckoutIntegrationTests
             var spelled = await CallAsync(client, "get_file_symbols", parentUrl, new JsonObject { ["file_path"] = @".\App\Program.cs" });
             Assert.AreEqual(programRows.Count, Results(spelled).Count, spelled.GetRawText());
 
-            // A submodule project is indexed into its provider snapshot, not the parent's (Phase 12), so the
-            // parent's use of it is read through find_cross_repository_usages: the consumer file comes back
-            // by its path in the parent's repository, never the worker's checkout path.
-            var providerUrl = new Uri(providerDir).AbsoluteUri;
-            var usages = await CallAsync(client, "find_cross_repository_usages", parentUrl,
-                new JsonObject { ["provider_repository_url"] = providerUrl, ["symbol_fqn"] = "global::Mix.Combiner" });
-            var usageRows = Results(usages);
-            Assert.IsTrue(usageRows.Count > 0, usages.GetRawText());
-            Assert.IsTrue(usageRows.All(r => r.GetProperty("file_path").GetString() == "App/Program.cs"), usages.GetRawText());
-
             // A file: scope takes the same repository-relative form.
             var scoped = await CallAsync(client, "find_symbol", parentUrl,
                 new JsonObject { ["name"] = "Program", ["fuzzy"] = true, ["scope"] = "file:App/Program.cs" });
@@ -113,7 +103,7 @@ public partial class SubmoduleCheckoutIntegrationTests
             // No response leaks the worker's checkout path. (meta.snapshot.repository names the repository the
             // caller asked for; this fixture's is a local file URL, a hosted one is https://host/owner/repo.)
             var checkoutVolume = Path.Combine(_tempDir, "service");
-            foreach (var response in new[] { program, spelled, usages, scoped, absolute })
+            foreach (var response in new[] { program, spelled, scoped, absolute })
             {
                 var text = response.GetRawText();
                 Assert.IsFalse(text.Contains(checkoutVolume.Replace("\\", "\\\\"), StringComparison.OrdinalIgnoreCase)

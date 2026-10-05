@@ -13,7 +13,7 @@ public static class FindReferencesTool
     public static string FindReferences(
         DatabaseProvider dbProvider,
         [Description(ToolText.SymbolFqn)] string symbol_fqn,
-        [Description("Comma-separated canonical_ids")] string? include_projects = null,
+        [Description("Comma-separated project_ids from find_symbol.")] string? include_projects = null,
         [Description("project, file and/or kind, e.g. project,file.")] string? group_by = null,
         bool include_source = false,
         [Description(ToolText.Scope)] string? scope = null,
@@ -62,7 +62,7 @@ public static class FindReferencesTool
                 var proj = projectStore.GetByCanonicalId(canonicalId);
                 if (proj == null)
                     return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode,
-                        $"Unknown project '{canonicalId}' in include_projects. Use project canonical IDs as listed by get_index_status.",
+                        $"Unknown project '{canonicalId}' in include_projects. Use project_ids from find_symbol results.",
                         readContext.Provenance);
                 includedProjectIds.Add(proj.Value.id);
             }

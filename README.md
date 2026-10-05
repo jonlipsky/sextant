@@ -63,6 +63,9 @@ Your AI agent now has access to 13+ semantic tools. It can find symbols, trace r
 | `semantic_search` | Full-text search over symbol names and docs |
 | `get_index_status` | What's indexed and how fresh |
 
+These are the local tools. A shared index service's remote `/mcp` offers only the first seven plus
+`list_repositories` and `search_symbols` (see [service.md](docs/service.md#agent-sized-output-on-mcp)).
+
 ## How It Works
 
 Sextant uses Roslyn to extract a complete semantic graph from your .NET solution and stores it in SQLite. The MCP server queries the database directly — responses are instant (< 5ms for exact lookups).

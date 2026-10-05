@@ -35,7 +35,7 @@ internal static class ScopeResolver
             // narrower answer than that.
             if (proj == null)
                 return ScopeFilter.Invalid(
-                    $"Unknown project '{scope[8..]}' in scope '{scope}'. Use a project canonical ID as listed by get_index_status.");
+                    $"Unknown project '{scope[8..]}' in scope '{scope}'. Use a project_id from a find_symbol result.");
             return new ScopeFilter { ProjectIds = new HashSet<long> { proj.Value.id } };
         }
 
@@ -73,7 +73,7 @@ internal static class ScopeResolver
         }
 
         return ScopeFilter.Invalid(
-            $"Unrecognized scope '{scope}'. Use 'file:<path>', 'project:<canonical_id>', 'solution:<path>' (repository-relative paths), or 'all'.");
+            $"Unrecognized scope '{scope}'. Use 'file:<path>', 'project:<project_id>', 'solution:<path>' (repository-relative paths), or 'all'.");
     }
 
     private static IEnumerable<string> SolutionCandidates(SqliteConnection conn, SnapshotReadScope? pinnedScope, string relative)
