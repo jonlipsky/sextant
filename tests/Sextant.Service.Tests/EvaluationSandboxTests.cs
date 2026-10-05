@@ -190,6 +190,10 @@ public class EvaluationSandboxTests
     {
         public bool WasInvoked { get; private set; }
 
+        public TimeSpan? TimeBudget => null;
+
+        public string? BudgetPolicyToken => null;
+
         public Task<T> RunAsync<T>(
             string checkoutDir, string scratchDir, Func<CancellationToken, Task<T>> evaluate, CancellationToken cancellationToken)
         {

@@ -97,6 +97,28 @@ public class ProviderCoverageBuilderTests
     }
 
     [TestMethod]
+    public void ProviderProjectTheLoadDeferred_IsPartial_NamedRelativeToTheProvider()
+    {
+        // Issue #245: the parent's load deadline passed before the provider project was opened.
+        var resolution = Resolution([At("App.slnx"), At("libs/mix/Mix.slnx")]);
+        var mix = At("libs/mix/src/Mix/Mix.csproj");
+        var load = Load([At("src/App/App.csproj"), mix], loaded: [At("src/App/App.csproj")]) with
+        {
+            DeferredProjects = [mix]
+        };
+        var inventory = Inventory([At("src/App/App.csproj"), mix], [Mix], solutions: [At("libs/mix/Mix.slnx")]);
+
+        var coverage = SnapshotCoverageBuilder.BuildProviders(CheckoutDir, resolution, load, inventory)["libs/mix"];
+
+        Assert.AreEqual(SnapshotCoverageVerdict.Partial, coverage.Verdict);
+        Assert.AreEqual(0, coverage.ProjectsSkipped, "a deferred project is not a load failure");
+        Assert.AreEqual(0, coverage.ProjectFilesUnreferenced, "it was declared, so it is accounted for");
+        var reason = coverage.Reasons.Single();
+        StringAssert.Contains(reason, "time budget ran out (src/Mix/Mix.csproj)");
+        Assert.IsFalse(reason.Contains("libs/mix", StringComparison.Ordinal), "the parent's layout never leaks");
+    }
+
+    [TestMethod]
     public void NestedUnpopulatedSubmodule_MakesTheOuterProviderPartial_AndUnpopulatedHasNoEntry()
     {
         var resolution = Resolution([At("App.slnx"), At("libs/mix/Mix.slnx")]);

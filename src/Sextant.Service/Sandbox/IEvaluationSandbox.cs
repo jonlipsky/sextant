@@ -14,10 +14,29 @@ public interface IEvaluationSandbox
     /// </summary>
     Task<T> RunAsync<T>(
         string checkoutDir, string scratchDir, Func<CancellationToken, Task<T>> evaluate, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// The wall-clock budget <see cref="RunAsync"/> enforces, or null when it enforces none. The worker plans its
+    /// own phase deadlines inside it, so a large checkout degrades to a partial snapshot before the hard abort.
+    /// </summary>
+    TimeSpan? TimeBudget { get; }
+
+    /// <summary>
+    /// The policy token recorded on a job the sandbox aborted (<see cref="EvaluationBudgetPolicy.Token"/>), or null
+    /// when the sandbox enforces no budget.
+    /// </summary>
+    string? BudgetPolicyToken { get; }
 }
 
 /// <summary>Thrown when untrusted evaluation exceeds a sandbox budget (time or memory) and is aborted.</summary>
-public sealed class SandboxLimitExceededException(string message) : Exception(message);
+public sealed class SandboxLimitExceededException(string message) : Exception(message)
+{
+    /// <summary>The budget that was exceeded: <c>time</c> or <c>memory</c>.</summary>
+    public string? Kind { get; init; }
+
+    /// <summary>The <see cref="EvaluationBudgetPolicy.Token"/> of the policy that aborted the run.</summary>
+    public string? PolicyToken { get; init; }
+}
 
 /// <summary>Thrown, fail-closed, when a sandbox invariant cannot be satisfied (e.g. scratch outside the scratch root).</summary>
 public sealed class SandboxViolationException(string message) : Exception(message);

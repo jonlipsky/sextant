@@ -1,4 +1,5 @@
 using Microsoft.CodeAnalysis;
+using Sextant.Core;
 using Sextant.Indexer;
 
 namespace Sextant.Indexer.Tests;
@@ -23,8 +24,8 @@ public sealed class SolutionLoaderFaultIsolationTests
         var loader = new FakeProjectLoader(throwFor: [ProjB]);
         var diagnostics = new List<string>();
 
-        var (solution, skipped) = await SolutionLoader.LoadProjectsIndividuallyAsync(
-            [ProjA, ProjB, ProjC], loader, diagnostics.Add, CancellationToken.None);
+        var (solution, skipped, _) = await SolutionLoader.LoadProjectsIndividuallyAsync(
+            [ProjA, ProjB, ProjC], loader, diagnostics.Add, deadline: null, onProgress: null, CancellationToken.None);
 
         // The two loadable projects produce a NON-empty solution — not an empty index (issue #90).
         CollectionAssert.AreEquivalent(
@@ -45,8 +46,8 @@ public sealed class SolutionLoaderFaultIsolationTests
     {
         var loader = new FakeProjectLoader();
 
-        var (solution, skipped) = await SolutionLoader.LoadProjectsIndividuallyAsync(
-            [ProjA, ProjB, ProjC], loader, null, CancellationToken.None);
+        var (solution, skipped, _) = await SolutionLoader.LoadProjectsIndividuallyAsync(
+            [ProjA, ProjB, ProjC], loader, null, deadline: null, onProgress: null, CancellationToken.None);
 
         Assert.AreEqual(3, solution.Projects.Count());
         Assert.AreEqual(0, skipped.Count);
@@ -58,8 +59,8 @@ public sealed class SolutionLoaderFaultIsolationTests
         var loader = new FakeProjectLoader();
 
         // The same project appears twice (e.g. once directly, once already pulled in transitively).
-        var (_, skipped) = await SolutionLoader.LoadProjectsIndividuallyAsync(
-            [ProjA, ProjA], loader, null, CancellationToken.None);
+        var (_, skipped, _) = await SolutionLoader.LoadProjectsIndividuallyAsync(
+            [ProjA, ProjA], loader, null, deadline: null, onProgress: null, CancellationToken.None);
 
         Assert.AreEqual(0, skipped.Count);
         Assert.AreEqual(1, loader.OpenCount, "an already-loaded project must not be opened twice");
@@ -73,10 +74,96 @@ public sealed class SolutionLoaderFaultIsolationTests
 
         await Assert.ThrowsExactlyAsync<OperationCanceledException>(async () =>
             await SolutionLoader.LoadProjectsIndividuallyAsync(
-                [ProjA, ProjB, ProjC], loader, skippedSoFar.Add, CancellationToken.None));
+                [ProjA, ProjB, ProjC], loader, skippedSoFar.Add, deadline: null, onProgress: null, CancellationToken.None));
 
         // A cancellation is not a per-project load fault, so it must never be swallowed as a skip.
         Assert.IsFalse(skippedSoFar.Any(d => d.StartsWith("Skipped project", StringComparison.Ordinal)));
+    }
+
+    // ---- Issue #245: the union load stops opening projects at its deadline -------------------------------
+
+    private static readonly string ProjD = Path.Combine("repo", "D", "D.csproj");
+
+    [TestMethod]
+    public async Task Deadline_DefersTheProjectsNotYetOpened_AndReportsThem()
+    {
+        var clock = new ManualClock();
+        var deadline = new IndexDeadline(clock, clock.GetUtcNow() + TimeSpan.FromMinutes(10));
+        // Each open takes six minutes: A ends at +6 (before the deadline), B at +12 (after it).
+        var loader = new FakeProjectLoader(onOpen: _ => clock.Advance(TimeSpan.FromMinutes(6)));
+        var diagnostics = new List<string>();
+        var progress = new List<string>();
+
+        var (solution, skipped, deferred) = await SolutionLoader.LoadProjectsIndividuallyAsync(
+            [ProjA, ProjB, ProjC, ProjD], loader, diagnostics.Add, deadline, progress.Add, CancellationToken.None);
+
+        CollectionAssert.AreEqual(new[] { ProjA, ProjB }, solution.Projects.Select(p => p.FilePath).ToArray());
+        CollectionAssert.AreEqual(new[] { ProjC, ProjD }, deferred, "the rest are deferred, in declaration order");
+        Assert.AreEqual(0, skipped.Count, "a deferred project is not a load failure");
+        Assert.AreEqual(2, loader.OpenCount, "nothing is opened after the deadline");
+        CollectionAssert.AreEqual(
+            new[] { "Loading project 1/4: A.csproj", "Loading project 2/4: B.csproj" }, progress);
+        Assert.IsTrue(diagnostics.Any(d => d.Contains("2 of the 4 declared project(s) were not loaded")),
+            string.Join(" | ", diagnostics));
+    }
+
+    [TestMethod]
+    public async Task DeadlineAlreadyPassed_StillOpensTheFirstProject()
+    {
+        var clock = new ManualClock();
+        var deadline = new IndexDeadline(clock, clock.GetUtcNow() - TimeSpan.FromSeconds(1));
+        var loader = new FakeProjectLoader();
+
+        var (solution, _, deferred) = await SolutionLoader.LoadProjectsIndividuallyAsync(
+            [ProjA, ProjB, ProjC], loader, null, deadline, onProgress: null, CancellationToken.None);
+
+        Assert.AreEqual(ProjA, solution.Projects.Single().FilePath, "a load that starts late still makes progress");
+        CollectionAssert.AreEqual(new[] { ProjB, ProjC }, deferred);
+    }
+
+    [TestMethod]
+    public async Task Deadline_DoesNotDeferAProjectAlreadyLoadedThroughAReference()
+    {
+        var clock = new ManualClock();
+        var deadline = new IndexDeadline(clock, clock.GetUtcNow() + TimeSpan.FromMinutes(1));
+        // Opening A pulls C in (as MSBuildWorkspace does for a project reference) and uses up the budget.
+        var loader = new FakeProjectLoader(
+            onOpen: _ => clock.Advance(TimeSpan.FromMinutes(2)),
+            alsoLoads: new() { [ProjA] = [ProjC] });
+
+        var (solution, _, deferred) = await SolutionLoader.LoadProjectsIndividuallyAsync(
+            [ProjA, ProjB, ProjC, ProjD], loader, null, deadline, onProgress: null, CancellationToken.None);
+
+        CollectionAssert.AreEquivalent(new[] { ProjA, ProjC }, solution.Projects.Select(p => p.FilePath).ToArray());
+        CollectionAssert.AreEqual(new[] { ProjB, ProjD }, deferred, "C is in the workspace, so it is not deferred");
+    }
+
+    [TestMethod]
+    public async Task Deadline_AFailureBeforeIt_IsStillASkip()
+    {
+        var clock = new ManualClock();
+        var deadline = new IndexDeadline(clock, clock.GetUtcNow() + TimeSpan.FromMinutes(10));
+        var loader = new FakeProjectLoader(throwFor: [ProjB], onOpen: _ => clock.Advance(TimeSpan.FromMinutes(4)));
+
+        var (_, skipped, deferred) = await SolutionLoader.LoadProjectsIndividuallyAsync(
+            [ProjA, ProjB, ProjC, ProjD], loader, null, deadline, onProgress: null, CancellationToken.None);
+
+        Assert.AreEqual(Path.GetFullPath(ProjB), Path.GetFullPath(skipped.Single().ProjectPath));
+        CollectionAssert.AreEqual(new[] { ProjD }, deferred, "A, B and C were attempted before the deadline at +10");
+    }
+
+    [TestMethod]
+    public async Task DeadlineNotReached_LoadsEverything()
+    {
+        var clock = new ManualClock();
+        var deadline = new IndexDeadline(clock, clock.GetUtcNow() + TimeSpan.FromMinutes(10));
+        var loader = new FakeProjectLoader();
+
+        var (solution, _, deferred) = await SolutionLoader.LoadProjectsIndividuallyAsync(
+            [ProjA, ProjB, ProjC], loader, null, deadline, onProgress: null, CancellationToken.None);
+
+        Assert.AreEqual(3, solution.Projects.Count());
+        Assert.AreEqual(0, deferred.Count);
     }
 
     private sealed class FakeProjectLoader : SolutionLoader.IWorkspaceProjectLoader
@@ -84,11 +171,17 @@ public sealed class SolutionLoaderFaultIsolationTests
         private readonly AdhocWorkspace _workspace = new();
         private readonly HashSet<string> _throwFor;
         private readonly HashSet<string> _cancelFor;
+        private readonly Action<string>? _onOpen;
+        private readonly Dictionary<string, string[]> _alsoLoads;
 
-        public FakeProjectLoader(IEnumerable<string>? throwFor = null, IEnumerable<string>? cancelFor = null)
+        public FakeProjectLoader(
+            IEnumerable<string>? throwFor = null, IEnumerable<string>? cancelFor = null,
+            Action<string>? onOpen = null, Dictionary<string, string[]>? alsoLoads = null)
         {
             _throwFor = new HashSet<string>(throwFor ?? [], StringComparer.OrdinalIgnoreCase);
             _cancelFor = new HashSet<string>(cancelFor ?? [], StringComparer.OrdinalIgnoreCase);
+            _onOpen = onOpen;
+            _alsoLoads = alsoLoads ?? [];
         }
 
         public int OpenCount { get; private set; }
@@ -102,18 +195,26 @@ public sealed class SolutionLoaderFaultIsolationTests
         public Task OpenProjectAsync(string projectPath, CancellationToken cancellationToken)
         {
             OpenCount++;
+            _onOpen?.Invoke(projectPath);
             if (_cancelFor.Contains(projectPath))
                 throw new OperationCanceledException();
             if (_throwFor.Contains(projectPath))
                 throw new InvalidOperationException(
                     $"simulated BuildHost crash for {Path.GetFileName(projectPath)}");
 
+            Add(projectPath);
+            foreach (var referenced in _alsoLoads.GetValueOrDefault(projectPath, []))
+                Add(referenced);
+            return Task.CompletedTask;
+        }
+
+        private void Add(string projectPath)
+        {
             var name = Path.GetFileNameWithoutExtension(projectPath);
             var info = ProjectInfo.Create(
                 ProjectId.CreateNewId(), VersionStamp.Create(), name, name, LanguageNames.CSharp,
                 filePath: projectPath);
             _workspace.AddProject(info);
-            return Task.CompletedTask;
         }
     }
 }

@@ -25,4 +25,10 @@ public sealed record SolutionLoadResult(Solution Solution, IReadOnlyList<Skipped
 {
     /// <summary>True when at least one declared project failed to load.</summary>
     public bool IsPartial => SkippedProjects.Count > 0;
+
+    /// <summary>
+    /// Declared projects (absolute paths, declaration order) the load did not open because its deadline
+    /// passed. They are neither loaded nor skipped: nothing is known about whether they would have loaded.
+    /// </summary>
+    public IReadOnlyList<string> DeferredProjects { get; init; } = [];
 }

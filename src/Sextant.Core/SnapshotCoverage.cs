@@ -111,9 +111,56 @@ public sealed record SnapshotCoverage
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public IReadOnlyList<string>? Notes { get; init; }
 
+    /// <summary>
+    /// What the service worker left out because its evaluation time budget ran out: projects not loaded, not
+    /// indexed, or indexed without relationships, references, calls and comments, and the selected solutions they
+    /// leave unfinished. Any entry makes the verdict partial. Null when the budget did not run out (and on every
+    /// row written before it existed); omitted from the JSON.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public TimeBudgetCoverage? TimeBudget { get; init; }
+
     /// <summary>True when <see cref="Verdict"/> is <see cref="SnapshotCoverageVerdict.Partial"/>.</summary>
     [JsonIgnore]
     public bool IsPartial => string.Equals(Verdict, SnapshotCoverageVerdict.Partial, StringComparison.Ordinal);
+}
+
+/// <summary>
+/// The part of a checkout a time-budgeted evaluation left out (<see cref="SnapshotCoverage.TimeBudget"/>).
+/// Serialized snake_case.
+/// </summary>
+public sealed record TimeBudgetCoverage
+{
+    /// <summary>The cap on <see cref="UnfinishedSolutions"/>.</summary>
+    public const int MaxSolutions = 100;
+
+    /// <summary>The evaluation's whole time budget, in seconds.</summary>
+    public long BudgetSeconds { get; init; }
+
+    /// <summary>Declared project files the loader did not open before its share of the budget ran out.</summary>
+    public int ProjectsNotLoaded { get; init; }
+
+    /// <summary>Loaded project versions left without symbols (and so without anything else).</summary>
+    public int ProjectsNotIndexed { get; init; }
+
+    /// <summary>
+    /// Project versions that have symbols but whose relationships, references, calls or comments were cut short
+    /// when the extraction deadline passed (some may have references but no comments).
+    /// </summary>
+    public int ProjectsNotFullyExtracted { get; init; }
+
+    /// <summary>Selected solutions that declare, or reach through a project reference, any project left out.</summary>
+    public int SolutionsUnfinished { get; init; }
+
+    /// <summary>
+    /// The unfinished solutions, relative to the checkout root (forward slashes), in selection order, capped at
+    /// <see cref="MaxSolutions"/>.
+    /// </summary>
+    public IReadOnlyList<string> UnfinishedSolutions { get; init; } = [];
+
+    /// <summary>True when anything was left out.</summary>
+    [JsonIgnore]
+    public bool Exhausted => ProjectsNotLoaded > 0 || ProjectsNotIndexed > 0 || ProjectsNotFullyExtracted > 0;
 }
 
 /// <summary>

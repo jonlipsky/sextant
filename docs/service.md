@@ -101,13 +101,13 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_CONTRIB_REQUIRE_GIT_VERIFY` | Require Git-content verification of uploads (Phase 16) | `false` |
 | `SEXTANT_SERVICE_CONTRIB_MAX_ARTIFACT_BYTES` | Max accepted contribution artifact size (Phase 16) | policy default |
 | `SEXTANT_SERVICE_SANDBOX_ENABLED` | Enforce the evaluation sandbox (Phase 17) | `true` |
-| `SEXTANT_SERVICE_SANDBOX_TIME_BUDGET_SECONDS` | Wall-clock evaluation time budget | policy default |
-| `SEXTANT_SERVICE_SANDBOX_MEMORY_BUDGET_BYTES` | Watchdog memory ceiling | policy default |
+| `SEXTANT_SERVICE_SANDBOX_TIME_BUDGET_SECONDS` | Wall-clock budget for one evaluation: restore, load and indexing. The worker plans its phases inside it and publishes a **partial** snapshot when the checkout does not fit; only a step that runs to the full budget is aborted (see [The time budget](#the-time-budget-publish-what-fits-abort-what-will-not-stop-issue-245)). Changing it lets a job an older budget aborted run again | `1800` (30 min) |
+| `SEXTANT_SERVICE_SANDBOX_MEMORY_BUDGET_BYTES` | Watchdog memory ceiling (the service process's working set). Set it below the container's memory limit, or the kernel OOM killer acts first | `8589934592` (8 GiB) |
 | `SEXTANT_SERVICE_SANDBOX_ALLOW_NETWORK` | Allow network during evaluation (a best-effort posture, not a network block; it does not gate package restore, see [Package restore](#package-restore-before-the-load)) | `false` |
 | `SEXTANT_SERVICE_SANDBOX_SCRUB_SECRETS` | Scrub secrets from the evaluation environment | `true` |
 | `SEXTANT_SERVICE_SDK_PIN_OVERRIDE` | Temporarily neutralize a checkout `global.json` SDK pin that no installed SDK satisfies, so the checkout still indexes with an installed SDK (issue #113; see [SDK pins](#repository-globaljson-sdk-pins-issue-113)). `false` leaves such pins alone and the job fails / goes partial with a typed `sdk_resolution_failed` diagnostic. `false` is part of the snapshot identity, so flipping the toggle re-indexes a commit instead of reusing a result built under the other policy. An unparseable value **fails startup** | `true` |
 | `SEXTANT_SERVICE_PACKAGE_RESTORE` | Run `dotnet restore` over the selected solutions before the load (see [Package restore](#package-restore-before-the-load)). `false` loads unrestored projects, which compile against their direct project references only, so calls into transitively referenced projects may not bind. `false` is part of the snapshot identity (`restore=off`). An unparseable value **fails startup** | `true` |
-| `SEXTANT_SERVICE_PACKAGE_RESTORE_TIMEOUT_SECONDS` | Bound on one job's whole restore step (all solutions), clamped to 3600. On expiry the restore process tree is killed and the load goes ahead with whatever was restored | `300` |
+| `SEXTANT_SERVICE_PACKAGE_RESTORE_TIMEOUT_SECONDS` | Bound on one job's whole restore step (all solutions), clamped to 3600. Under the sandbox the step also stops at a fifth of the sandbox time budget, whichever is shorter. On expiry the restore process tree is killed and the load goes ahead with whatever was restored | `300` |
 
 Boolean toggles accept `1/0`, `true/false`, `yes/no`, `on/off` (case-insensitive); any other non-empty
 value **fails startup** rather than silently disabling a security-relevant control (fail-closed). The
@@ -328,7 +328,9 @@ recorded skipped-with-reason.
 
 The worker runs `dotnet restore <solution> -p:DesignTimeBuild=true --ignore-failed-sources
 --disable-build-servers -nodeReuse:false` over every selected solution, in order and under one deadline
-(`SEXTANT_SERVICE_PACKAGE_RESTORE_TIMEOUT_SECONDS`, default 300 s), inside the evaluation sandbox and while
+(`SEXTANT_SERVICE_PACKAGE_RESTORE_TIMEOUT_SECONDS`, default 300 s, and never more than a fifth of the
+sandbox time budget, see [The time budget](#the-time-budget-publish-what-fits-abort-what-will-not-stop-issue-245)),
+inside the evaluation sandbox and while
 an unsatisfiable `global.json` SDK pin is still neutralized, then loads the solutions. **Why:** without a
 restore there is no `obj/project.assets.json`, so the design-time build gets no package compile assets and the
 SDK never adds the **transitive** project references the assets file lists. Each project then compiles against
@@ -371,12 +373,19 @@ URL, and NuGet would send those credentials to it.
 
 Cost: 15-60 s per job for a large repository with a warm NuGet cache. The sandbox gives each job its own
 `NUGET_PACKAGES`, so a cold job downloads every package (about 2.6 GB for a 188-project repository) into job
-scratch, which is released with the job. The restore writes `obj/` files (`project.assets.json`,
+scratch, which is released with the job. A repository with many overlapping solutions costs far more, because
+each solution is restored by its own `dotnet restore`: on a 61-solution, 468-project repository the step used
+its whole 300 s and reached only 19 of the 61 solutions (issue #246 tracks restoring the union once). The restore writes `obj/` files (`project.assets.json`,
 `*.nuget.g.props`) into the checkout, which `EvaluationFingerprint` hashes; a different commit is a fresh clone,
 so they never carry over to another commit. The toggle is part of the snapshot identity: `restore=off` is folded
 only when `SEXTANT_SERVICE_PACKAGE_RESTORE=false`, so the default leaves identities unchanged and flipping it
 re-indexes. The worker also closes each loaded project's transitive project-reference graph in the workspace
-(`TransitiveProjectReferences`), which covers a project restore could not restore at all.
+(`TransitiveProjectReferences`), which covers a project restore could not restore at all. A project that keeps a
+reference to a project the workspace did not load (a platform head skipped on Linux) still gets the closure: the
+references are replaced as a whole with `WithProjectReferences`, because Roslyn's `AddProjectReferences`
+re-validates the existing references and throws on the dangling one (before issue #245 the worker then logged
+`Could not add transitive project references to 'X': Unexpected null - file SolutionState.cs line 363` and left
+the project with its direct references only).
 
 #### Binding health
 
@@ -681,6 +690,10 @@ permanently poisoning a commit that would have recovered. The attempt counter is
 counts cancellation re-attempts and snapshot regenerations for the same identity), so it is a safety ceiling,
 not an exact transient-retry budget.
 
+A job the evaluation sandbox **aborted** (time or memory budget) is terminal `failed` and reused like a
+deterministic failure, with one exception: once the node's budget policy differs from the one that aborted it,
+the next ensure runs it again on the same job. See [Retrying an aborted job](#retrying-an-aborted-job).
+
 > **Credential-rotation caveat.** `SEXTANT_SERVICE_CHECKOUT_TOKEN` is **not** part of the snapshot identity
 > hash, so an `authentication failed` outcome is classified **deterministic** and cached terminal. Rotating
 > the token alone will **not** revive that cached job — the token is not in the identity, so the ensure
@@ -872,7 +885,8 @@ The remote tools answer an agent, so every response is shaped to fit its context
   record is in `/control/resolve`, and the full provenance in a local server's `get_index_status`
   `index.snapshot`. A
   partial-coverage warning counts what is missing and names no project or tool, in at most 160 characters
-  (`RemoteResponsePresenter.MaxPartialWarningChars`): `Partial index: ` + counted gaps (`N of T projects did
+  (`RemoteResponsePresenter.MaxPartialWarningChars`): `Partial index: ` + counted gaps (first `the time budget
+  left N of T projects not fully indexed`, see "The time budget" below; then `N of T projects did
   not load`/`did not compile`/`did not load or compile`, `U of D submodules were not checked out`, `S configured
   solution(s) could not be used`, `E part(s) of the checkout could not be scanned`; a gap that does not fit is
   folded into `, and other gaps`) + `, so results may be incomplete.` A partial record that counts no gap gets
@@ -1491,7 +1505,9 @@ machine-parseable `code`, `severity`, and `message`. `GET /control/status/{jobId
 client learns **which** projects failed and **why** (extending the Phase-9 completeness gate + Phase-8
 capability meta) instead of a single opaque failure. A node with no configured worker uses
 `UnavailableSnapshotWorker`: it is available for **queries** but reports no capacity, and any ensure
-resolves to an `unsupported` job rather than hanging queued forever.
+resolves to an `unsupported` job rather than hanging queued forever. The evaluation time budget adds
+`time_budget_exhausted` and `solution_deferred` (partial) and `evaluation_budget_exceeded` /
+`evaluation_budget_policy` (aborted); see [The time budget](#the-time-budget-publish-what-fits-abort-what-will-not-stop-issue-245).
 
 ## Platform-specific routing by worker capability (Phase 15)
 
@@ -1589,6 +1605,81 @@ over an **out-of-process** evaluator) is tracked as **issue #76** and is a **doc
 untrusted multi-tenant production — it will be wired into the security runbook and the pilot exit criteria
 (criterion 7), and cross-referenced from the ProcessStack integration (#19). The single-node local CLI/daemon
 path does not run this worker, so leaving the sandbox unwired there keeps local operation byte-identical.
+
+### The time budget: publish what fits, abort what will not stop (issue #245)
+
+The sandbox's time budget (`SEXTANT_SERVICE_SANDBOX_TIME_BUDGET_SECONDS`, default 30 min) covers the whole
+evaluation: restore, load and indexing. Before issue #245, a checkout that did not fit was aborted at the
+budget and published nothing, however much of it had been indexed. In production, `elevenworks/monorepo` (61
+solutions, 468 declared projects) spent 300 s restoring, about 19 min loading and 4 min on symbols, and was
+aborted during reference extraction. On a 24-core dev machine the same commit took 953 s with restore on (316
+restore, ~285 load, 133 symbols, 126 references and calls, and 39 for comments, dependencies and the API
+surface) and 481 s with restore off. Under a 7 GiB memory cap and 14 CPUs, like production, it took 797 s and
+peaked at 2.8 GB of anonymous memory, so memory is not what makes production slower (issue #247).
+
+The worker now plans its phases inside the budget (`EvaluationTimePlan`, clock-driven, so tests replace the
+clock):
+
+| Step | May use | What the budget leaves out |
+|---|---|---|
+| Package restore | a fifth of the budget, or `PACKAGE_RESTORE_TIMEOUT_SECONDS` if shorter | packages of the solutions not reached (the existing restore notes) |
+| Load (multi-solution union only) | 45% of the time from the restore's end to the extraction deadline | declared projects not opened by then: never loaded, reported as **not loaded** (not as skipped) |
+| Symbols | 40% of the time from the load's end to the extraction deadline | later projects are registered but get **no symbols** |
+| Relationships, references, calls, comments | until 90% of the budget (the extraction deadline) | later projects get **no relationships, references, calls or comments** |
+| Dependencies, API surface, publish | the last 10% | nothing |
+
+Each deadline is checked between projects, and the first project of the load and of the symbol step always runs,
+so a step that starts late still makes progress. Each step's share is computed from when the step before it
+actually ended, so a stopped restore that overruns its limit while its process tree is killed (at most 40 s) is
+absorbed by the steps after it. Provider (submodule) projects are never left out of the symbol or extraction
+steps: a provider snapshot is shared and reused, so an empty provider project would be reused empty. A provider
+project the load did not reach is reported in the provider's own coverage. A single selected solution is opened
+by `OpenSolutionAsync` in one call, so the load step has no deadline there (the later steps still do).
+
+**What gets recorded.** When anything was left out, the snapshot is published **partial**. The coverage gains a
+`time_budget` object (`budget_seconds`, `projects_not_loaded`, `projects_not_indexed`,
+`projects_not_fully_extracted`, `solutions_unfinished`, and `unfinished_solutions`, the first 100 by selection
+order, repository-relative). A selected solution is unfinished when it declares a project that was not loaded, or
+covers (declares or reaches through a project reference) a project left out of a later step. The budget's
+reason goes **first**, because on a repository too large for the budget it is the largest gap: "The indexing time
+budget (30 min) ran out before the whole checkout was indexed: 2 of 61 selected solution(s) are unfinished
+(Apps/Mobile.sln, Tools/Tools.sln). 14 project(s) were not loaded, 0 have no symbols, and 3 are missing
+relationships, references, calls or comments." Up to 5 solutions are named, then "+N more". The lean query
+warning counts the same gap first, naming nothing: `Partial index: the time budget left 17 of 468 projects not
+fully indexed, so results may be incomplete.` (the three counts summed, out of the declared projects). The job records a
+`time_budget_exhausted` warning (the same sentence) and one `solution_deferred` warning per unfinished
+solution, with the solution's path in `project_path`.
+
+**The hard abort stays.** The plan cannot interrupt a step that is already running: one project that takes too
+long to open or compile, or evaluation code that will not stop. The sandbox still cancels the evaluation at the
+full budget; the job fails, publishes nothing, and records an `evaluation_budget_exceeded` error plus an
+`evaluation_budget_policy` info diagnostic whose message is the aborting policy's token (below). Untrusted
+evaluation is never unbounded.
+
+**A partial snapshot is final for its identity.** It is published like any other snapshot, so a later ensure
+of the same identity reuses it; raising the budget does not rebuild it (the budget is not part of the identity,
+so a raise re-indexes nothing), and the next commit is indexed afresh. What fits depends on the machine and its
+load, so a partial snapshot's content is not reproducible; the first run to publish an identity is the one
+served. Readers can still observe a run's earlier batches before it publishes, as for any run (Phase 3).
+
+#### Retrying an aborted job
+
+A terminal failed job is reused for its identity (#153), which would make a budget abort permanent: before issue
+#245, every ensure of `elevenworks/monorepo` at its head attached to the aborted job 187. So the worker records
+the aborting policy as a token, `v2;time=<seconds>;memory=<bytes>` (`EvaluationBudgetPolicy.Token`; the leading
+version is bumped whenever the worker's degradation changes in a way that lets an aborted repository finish).
+On the next ensure the service treats the failed job as **stale**, and runs it again on the same job, when:
+
+- the job recorded an `evaluation_budget_exceeded` diagnostic with a token different from the node's current
+  one (the budget, or the handling version, changed since it was aborted); or
+- the job predates tokens (no such diagnostic) and its error is exactly the sandbox's abort message
+  (`untrusted repository evaluation exceeded its time budget and was aborted.`, or its memory form).
+
+Every other failed job, an abort under the current policy, and an abort that recorded no token are reused as
+before. So each recorded abort is retried at most once per policy change, and nothing re-indexes in a loop. No
+identity or schema changes: after this ships, job 187 runs again on the next ensure of that commit (the
+ProcessStack app's nightly reconcile re-ensures it, because the branch still points at an old-identity
+snapshot), with no control-token action, and no other repository re-indexes.
 
 ## Retention & GC — the service is the lease owner (#46 / #37 / #54 / #38)
 

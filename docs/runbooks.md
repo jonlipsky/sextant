@@ -42,7 +42,10 @@ refused, or a project shape the indexer does not model).
 2. If it is a genuinely unsupported SDK/TFM, that is expected — communicate the supported matrix; the job is
    correctly terminal, not stuck.
 3. If the sandbox refused a legitimate evaluation, review `SEXTANT_SERVICE_SANDBOX_*` limits (time/memory)
-   and the evaluation logs, then re-`ensure`.
+   and the evaluation logs. An aborted job (`evaluation_budget_exceeded`) is reused for its commit until the
+   budget changes: after raising `SEXTANT_SERVICE_SANDBOX_TIME_BUDGET_SECONDS` or
+   `SEXTANT_SERVICE_SANDBOX_MEMORY_BUDGET_BYTES`, the next ensure of that commit runs it again (issue #245).
+   A repository that only ran out of time is published **partial** (`time_budget_exhausted`), not aborted.
 4. Assembled-snapshot **Partial** states are a *known limitation*, not a failure — see "Known limitations"
    below (issue #79).
 

@@ -294,6 +294,7 @@ public static class SnapshotCoverageBuilder
     /// subtree alone, and is PARTIAL when:
     /// <list type="bullet">
     /// <item>a declared project in the subtree failed to load;</item>
+    /// <item>a declared project in the subtree was not loaded because the parent's time budget ran out (issue #245);</item>
     /// <item>a project file in the subtree is on disk but was neither declared nor loaded (always a gap for
     /// the provider, even under a <c>configured</c> parent scope: nobody scoped the PROVIDER repository);</item>
     /// <item>one of the provider's OWN solutions was not selected — in particular when none was, i.e. the
@@ -332,6 +333,7 @@ public static class SnapshotCoverageBuilder
             var declared = declaredFiles.Where(InSubtree).ToList();
             var loaded = loadedFiles.Where(InSubtree).ToList();
             var skipped = load.SkippedProjects.Where(s => InSubtree(Path.GetFullPath(s.ProjectPath))).ToList();
+            var deferred = load.DeferredProjects.Select(Path.GetFullPath).Where(InSubtree).ToList();
             var onDisk = inventory.ProjectFilesOnDisk.Where(p => InSubtree(Path.GetFullPath(p))).ToList();
             var accounted = new HashSet<string>(declared, comparer);
             accounted.UnionWith(loaded);
@@ -354,6 +356,10 @@ public static class SnapshotCoverageBuilder
                 reasons.Add(
                     $"{skipped.Count} project(s) of this repository could not be loaded while indexing the checkout " +
                     $"that pins it ({NameSample(skipped.Select(s => Rel(Path.GetFullPath(s.ProjectPath))).ToList())}).");
+            if (deferred.Count > 0)
+                reasons.Add(
+                    $"{deferred.Count} project(s) of this repository were not loaded because the indexing checkout's " +
+                    $"time budget ran out ({NameSample(deferred.Select(Rel).ToList())}).");
             if (selectedOwn.Count == 0 && ownSolutions.Count > 0)
                 reasons.Add(
                     $"none of this repository's {ownSolutions.Count} solution(s) was selected; it was built only from " +
