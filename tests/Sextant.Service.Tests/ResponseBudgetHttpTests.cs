@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Sextant.Mcp;
+using Sextant.Mcp.Tools;
 
 namespace Sextant.Service.Tests;
 
@@ -8,8 +9,9 @@ namespace Sextant.Service.Tests;
 /// Every tool result fits a character budget (<see cref="ResponseBudget"/>, <c>SEXTANT_SERVICE_MAX_RESPONSE_CHARS</c>),
 /// so an MCP client that caps tool output (Claude Code's <c>MAX_MCP_OUTPUT_TOKENS</c>) never refuses it. A paged tool
 /// ends a page at the last row that fits and returns <c>meta.next_cursor</c> exactly as at <c>limit</c>, with
-/// <c>meta.page_truncated_by: "size"</c>; an unpaged tool keeps the leading rows that fit and says so. Every case goes
-/// through the service's <c>/mcp</c> over HTTP, where the budget is measured on the text the client receives.
+/// <c>meta.page_truncated_by: "size"</c>; an unpaged tool keeps the leading rows that fit and says so. The remote tools
+/// go through the service's <c>/mcp</c> over HTTP, where the budget is measured on the text the client receives; the
+/// local-only tools (S12) read the same catalog through a local provider with the same budget.
 /// </summary>
 [TestClass]
 public sealed class ResponseBudgetHttpTests
@@ -109,7 +111,8 @@ public sealed class ResponseBudgetHttpTests
         });
         Assert.AreEqual(Paging.InvalidCursorCode, ErrorCode(otherLimit), "a size-cut cursor is bound to the arguments");
 
-        var otherTool = await host.CallAsync("find_comments", new JsonObject { ["cursor"] = cursor });
+        var otherTool = await host.CallAsync("get_implementors",
+            new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetInterface, ["cursor"] = cursor });
         Assert.AreEqual(Paging.InvalidCursorCode, ErrorCode(otherTool), "and to the tool");
 
         var otherSnapshot = await host.CallAsync("find_references", new JsonObject
@@ -135,14 +138,16 @@ public sealed class ResponseBudgetHttpTests
         const int budget = 2_000;
         await using var host = await AgentOutputHarness.StartAsync(maxResponseChars: budget);
 
-        var arguments = tool switch
+        using var local = host.LocalProvider(maxResponseChars: budget);
+        var text = tool switch
         {
-            "find_symbol" => new JsonObject { ["name"] = "Handler*", ["fuzzy"] = true },
-            "semantic_search" => new JsonObject { ["query"] = "Handler*" },
-            _ => new JsonObject { ["namespace_prefix"] = "App.Feature" }
+            "find_symbol" => await host.CallTextAsync(tool, new JsonObject
+            {
+                ["name"] = "Handler*", ["fuzzy"] = true, ["repository"] = AgentOutputFixture.RepoA
+            }),
+            "semantic_search" => SemanticSearchTool.SemanticSearch(local, "Handler*"),
+            _ => GetNamespaceTreeTool.GetNamespaceTree(local, "App.Feature")
         };
-        arguments["repository"] = AgentOutputFixture.RepoA;
-        var text = await host.CallTextAsync(tool, arguments);
 
         Assert.IsTrue(text.Length <= budget, $"{tool} returned {text.Length} characters");
         var body = JsonDocument.Parse(text).RootElement;
@@ -163,8 +168,9 @@ public sealed class ResponseBudgetHttpTests
     public async Task UnpagedTool_ThatFits_IsUnchanged()
     {
         await using var host = await AgentOutputHarness.StartAsync();
+        using var local = host.LocalProvider();
 
-        var body = await host.CallAsync("get_namespace_tree", new JsonObject { ["namespace_prefix"] = "App.Feature" });
+        var body = JsonDocument.Parse(GetNamespaceTreeTool.GetNamespaceTree(local, "App.Feature")).RootElement;
 
         var meta = body.GetProperty("meta");
         Assert.IsFalse(meta.TryGetProperty("page_truncated_by", out _));
@@ -172,21 +178,20 @@ public sealed class ResponseBudgetHttpTests
         Assert.AreEqual(AgentOutputFixture.HandlerCount, body.GetProperty("results")[0].GetProperty("symbols").GetArrayLength());
     }
 
-    // ==== get_index_status ============================================================================
+    // ==== get_index_status (local-only) ===============================================================
 
     [TestMethod]
     public async Task GetIndexStatus_SummarizesTheIndex_AndPagesItsProjects()
     {
         await using var host = await AgentOutputHarness.StartAsync();
+        using var local = host.LocalProvider();
 
         var paths = new List<string>();
         string? cursor = null;
         var pages = 0;
         do
         {
-            var arguments = new JsonObject { ["limit"] = 1 };
-            if (cursor is not null) arguments["cursor"] = cursor;
-            var body = await host.CallAsync("get_index_status", arguments);
+            var body = JsonDocument.Parse(GetIndexStatusTool.GetIndexStatus(local, limit: 1, cursor: cursor)).RootElement;
             pages++;
 
             var index = body.GetProperty("index");
@@ -207,7 +212,7 @@ public sealed class ResponseBudgetHttpTests
         Assert.AreEqual(4, paths.Distinct(StringComparer.Ordinal).Count(), "each project is listed once");
         CollectionAssert.AreEqual(paths.Order(StringComparer.Ordinal).ToList(), paths, "projects page in path order");
 
-        var stale = await host.CallAsync("get_index_status", new JsonObject { ["cursor"] = "not-a-cursor" });
+        var stale = JsonDocument.Parse(GetIndexStatusTool.GetIndexStatus(local, cursor: "not-a-cursor")).RootElement;
         Assert.AreEqual(Paging.InvalidCursorCode, ErrorCode(stale));
     }
 
@@ -215,9 +220,10 @@ public sealed class ResponseBudgetHttpTests
     public async Task GetIndexStatus_FitsTheBudget()
     {
         const int budget = 1_500;
-        await using var host = await AgentOutputHarness.StartAsync(maxResponseChars: budget);
+        await using var host = await AgentOutputHarness.StartAsync();
+        using var local = host.LocalProvider(maxResponseChars: budget);
 
-        var text = await host.CallTextAsync("get_index_status", new JsonObject { ["repository"] = AgentOutputFixture.RepoA });
+        var text = GetIndexStatusTool.GetIndexStatus(local);
 
         Assert.IsTrue(text.Length <= budget, $"get_index_status is {text.Length} characters");
         var body = JsonDocument.Parse(text).RootElement;

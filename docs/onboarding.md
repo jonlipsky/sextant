@@ -104,9 +104,9 @@ Other tools use the same URL and header, only the config file and root key diffe
 
 `tools/list` shows:
 
-- the service's query tools under their own names: `list_repositories`, `search_symbols`, `find_symbol`,
-  `find_references`, `get_type_hierarchy`, `get_call_hierarchy`, `get_impact`, `get_index_status`, and the
-  rest of the remote query set (the local-only tools are not offered);
+- the service's eight query tools under their own names: `list_repositories`, `find_symbol`,
+  `find_references`, `get_call_hierarchy`, `get_implementors`, `get_type_hierarchy`, `get_type_members` and
+  `get_file_symbols` (the other index tools are local-only and are not offered);
 - the app's own tools: `start-indexing` (index an exact commit of a repository you watch),
   `get-indexing-status` (poll the job it returns) and `import-legacy-watches` (below).
 
@@ -140,7 +140,6 @@ Good first calls:
   **Call this first.**
 - `find_symbol` — look up any symbol by name (exact or fuzzy).
 - `find_references` — every usage of a symbol.
-- `search_symbols` — a name-prefix search across **every** repository you can see, paged with a cursor.
 
 Name the repository on each call with the optional `repository` argument (`owner/repo` or its full URL)
 and, if you need a branch other than the default, `branch`. When you can see exactly one repository with an
@@ -282,7 +281,7 @@ identity hash — ordinary queries such as `find_symbol` read your local index a
 
 **Empty results in Mode A ⇒ you hold no grant.** The service answers only for the repositories you watch
 (or that your tenant's GitHub App installation sends events for), so a new key sees nothing until you watch
-one: `list_repositories` comes back empty, `search_symbols` answers `no_visible_repositories`, and a query
+one: `list_repositories` comes back empty, and a query
 that names a repository you cannot see gets the same not-found answer as one that does not exist. Fix it
 with the `sextant` chat: `watch owner/repo on <branch>`, then `what am I watching` to confirm. A new watch
 returns data once its first snapshot is published; `list_repositories` shows whether each branch is

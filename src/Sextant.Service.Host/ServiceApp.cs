@@ -10,7 +10,6 @@ using Sextant.Service;
 using Sextant.Service.CallerIdentity;
 using Sextant.Service.Grants;
 using Sextant.Service.Observability;
-using Sextant.Service.Search;
 using Sextant.Store;
 
 namespace Sextant.Service.Host;
@@ -152,7 +151,6 @@ public static class ServiceApp
                     options.RepositoryUrlPolicy, RepositoryScopedTools,
                     selectionRequired: options.RequireRepositorySelection,
                     implicitSelection: options.DelegateTokens.Count > 0))
-                .AddListToolsFilter(SearchSymbolsTool.ListToolsFilter())
                 .AddCallToolFilter(ToolSelectionFilters.CallToolFilter(options.RepositoryUrlPolicy, RepositoryScopedTools))
                 // A tool result carrying a structured meta.error is an MCP tool error (isError: true), so a client
                 // never mistakes a failed call for an empty answer (issue #163). It reads the presented text below,
@@ -165,45 +163,43 @@ public static class ServiceApp
 
     /// <summary>
     /// The server's <c>instructions</c> (returned by <c>initialize</c>): when to reach for these tools and how to
-    /// call them. Kept short (pinned by a test), because a client may put it in every prompt.
+    /// call them. Kept short (pinned by a test), because a client may put it in every prompt. It names only tools on
+    /// the remote surface (<see cref="RemoteQueryTools"/>; pinned by <c>RemoteToolSurfaceGuardTests</c>).
     /// </summary>
     internal const string ServerInstructions =
         "Sextant answers .NET code questions from a Roslyn index. Use it instead of grep or reading files " +
-        "to find symbols, references, callers, implementations, tests and attributes. Pass `repository` " +
-        "(owner/repo or host/owner/repo) on each call; list_repositories shows what you can read, and search_symbols searches all of " +
-        "them by name. Paths are repository-relative (src/App/Foo.cs). Large results are paged: read meta.total " +
-        "and the summary, narrow with scope (file:, project:, solution:) or pass meta.next_cursor " +
-        "(search_symbols: next_cursor). A meta.snapshot.warning means results may be incomplete.";
+        "to find declarations, references, callers, implementations, type hierarchies, members and file outlines. " +
+        "Pass `repository` (owner/repo or host/owner/repo) on each call; list_repositories shows what you can read. " +
+        "Paths are repository-relative (src/App/Foo.cs). Large results are paged: read meta.total and the summary, " +
+        "narrow with scope (file:, project:, solution:) or pass meta.next_cursor. A meta.snapshot.warning means " +
+        "results may be incomplete.";
 
     /// <summary>
-    /// The vetted tool types exposed over the remote HTTP MCP surface. Every index-query tool takes a
-    /// <see cref="DatabaseProvider"/> and enters through <c>TryBeginRead</c> (fail-closed authz + scope); the two
-    /// exceptions, <see cref="ListRepositoriesTool"/> and <see cref="SearchSymbolsTool"/>, answer only a verified caller
-    /// and read only what that caller's grants make visible.
-    /// Local-only tools that bypass or out-scope that gate are deliberately EXCLUDED so they are never
-    /// reachable by a remote principal: <c>get_source_context</c> (reads an arbitrary absolute path),
-    /// <c>get_daemon_status</c> (probes a local daemon), and <c>get_base_snapshot_symbols</c> — the last
-    /// takes a caller-supplied <c>identity_hash</c> that is NOT bound to the repository scope
-    /// <c>TryBeginRead</c> authorizes, so on the multi-tenant surface a principal scoped to repo A could
-    /// name repo B's snapshot. Cross-service snapshot federation on the service surface goes through the
-    /// per-hash-authorized <c>/query/snapshots/{identityHash}/symbols</c> HTTP endpoint instead; the tool
-    /// is a single-tenant LOCAL planner path (AllowAll authorizer) only.
+    /// The tool types exposed over the remote HTTP MCP surface: the tools coding agents actually call, as measured by
+    /// the agent-behaviour harness (48 transcripts: no other tool was ever called). Fewer tools means better tool
+    /// selection and a smaller <c>tools/list</c>; the local stdio server (<c>McpServerSetup</c>) keeps the full
+    /// assembly-wide set. This is the ONE place the remote set is decided: the selection filter and every test of the
+    /// surface read it, so changing the set is a change to this list (plus the docs).
+    /// Every index-query tool takes a <see cref="DatabaseProvider"/> and enters through
+    /// <c>TryBeginRead</c> (fail-closed authz + scope); the one exception, <see cref="ListRepositoriesTool"/>, answers
+    /// only a verified caller and reads only what that caller's grants make visible.
+    /// This is a default-deny ALLOWLIST: a newly added tool is never exposed remotely until it is added here, and
+    /// every text the remote surface sends (descriptions, instructions, warnings, errors) may name only these tools
+    /// (<c>RemoteToolSurfaceGuardTests</c>). Local-only tools that bypass or out-scope the read gate must never be
+    /// added: <c>get_source_context</c> (reads an arbitrary absolute path), <c>get_daemon_status</c> (probes a local
+    /// daemon), and <c>get_base_snapshot_symbols</c> — the last takes a caller-supplied <c>identity_hash</c> that is
+    /// NOT bound to the repository scope <c>TryBeginRead</c> authorizes, so on the multi-tenant surface a principal
+    /// scoped to repo A could name repo B's snapshot. Cross-service snapshot federation on the service surface goes
+    /// through the per-hash-authorized <c>/query/snapshots/{identityHash}/symbols</c> HTTP endpoint instead.
     /// </summary>
     internal static readonly IReadOnlyList<Type> RemoteQueryTools =
     [
-        typeof(FindSymbolTool), typeof(FindReferencesTool), typeof(FindByAttributeTool),
-        typeof(FindBySignatureTool), typeof(FindCommentsTool), typeof(FindTestsTool),
-        typeof(FindUnreferencedTool), typeof(FindCrossRepositoryUsagesTool), typeof(FindSubmoduleConsumersTool),
-        typeof(GetApiSurfaceTool), typeof(GetCallHierarchyTool), typeof(GetFileSymbolsTool),
-        typeof(GetImpactTool), typeof(GetImplementorsTool), typeof(GetIndexStatusTool),
-        typeof(GetNamespaceTreeTool), typeof(GetProjectDependenciesTool), typeof(GetTypeDependentsTool),
-        typeof(GetTypeHierarchyTool), typeof(GetTypeMembersTool), typeof(SemanticSearchTool),
-        typeof(TraceValueTool),
+        typeof(FindSymbolTool), typeof(FindReferencesTool), typeof(GetCallHierarchyTool),
+        typeof(GetImplementorsTool), typeof(GetTypeHierarchyTool), typeof(GetTypeMembersTool),
+        typeof(GetFileSymbolsTool),
         // SVC-4: a service-only tool over the caller's grants (no index read, so no TryBeginRead gate); it answers
         // only a verified caller and lists only the repositories that caller may read.
-        typeof(ListRepositoriesTool),
-        // SVC-F: a service-only search across the caller's visible snapshots, re-resolved from its grants on every call.
-        typeof(SearchSymbolsTool)
+        typeof(ListRepositoriesTool)
     ];
 
     /// <summary>
@@ -745,7 +741,7 @@ public static class ServiceApp
     /// <summary>
     /// Resolves the caller-declared repository (its git remote URL) for the current request: the call's
     /// <see cref="ToolCallSelection"/> when <see cref="ToolSelectionFilters"/> recorded one (the reserved
-    /// <c>repository</c> argument, the header, or a cross-repository tool's provider default), else the
+    /// <c>repository</c> argument or the header), else the
     /// <c>X-Sextant-Repository</c> request header. Reads the ambient request at call time so a
     /// singleton <see cref="DatabaseProvider"/> stays request-correct; returns null when nothing names a
     /// repository (the read planner then reads the unselected default, or fails with

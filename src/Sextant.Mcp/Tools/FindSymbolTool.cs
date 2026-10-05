@@ -49,7 +49,7 @@ public static class FindSymbolTool
             var proj = projectStore.GetByCanonicalId(project_id);
             if (proj == null)
                 return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode,
-                    $"Unknown project_id '{project_id}'. Use a project canonical ID as listed by get_index_status.",
+                    $"Unknown project_id '{project_id}'. Use a project_id from a find_symbol result.",
                     readContext.Provenance);
             projectDbId = proj.Value.id;
         }

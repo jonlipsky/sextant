@@ -9,7 +9,7 @@ namespace Sextant.Service.Tests;
 /// <summary>
 /// The remote MCP surface's output fits an agent's context window (issue #145 and the agent-UX review): large
 /// results are paged with <c>limit</c>/<c>cursor</c>/<c>meta.total</c> and lead with a summary when truncated, the
-/// per-response <c>meta.snapshot</c> is lean (full provenance in <c>get_index_status</c>), paths are
+/// per-response <c>meta.snapshot</c> is lean (repository, branch, commit, coverage and a short warning), paths are
 /// repository-relative in and out, <c>tools/list</c> is small, and <c>initialize</c> carries short instructions.
 /// Every case goes through the service's <c>/mcp</c> over HTTP, against a catalog published from a worker checkout
 /// with absolute project paths, like the live service.
@@ -17,27 +17,25 @@ namespace Sextant.Service.Tests;
 [TestClass]
 public sealed partial class AgentSizedOutputHttpTests
 {
-    // On main before this change (after research_codebase was removed) tools/list was 29159 characters for 24
-    // tools; the budget is half of that.
-    private const int ToolsListBudget = 14579;
+    // Before #145 tools/list was 29159 characters for 24 tools (the #145 budget was half of that, 14579). Measured
+    // with a required selection / delegate callers: the eight agent tools of S12, 4719 / 4929 (616 per tool); nine
+    // (+get_type_dependents), 5322 / 5562; twelve (+semantic_search, find_by_attribute, find_unreferenced), 7207 /
+    // 7537 (628 per tool). The budget scales with ServiceApp.RemoteQueryTools, so a change to the set needs no edit
+    // here; a tool whose description or schema grows well past the average still fails it.
+    private const int ToolsListBudgetPerTool = 640;
+    private static int ToolsListBudget => ToolsListBudgetPerTool * ExpectedTools.Length;
     private const int InstructionsBudget = 600;
     private const int UnboundedChars = 10_000_000;
 
-    private static readonly string[] ExpectedTools =
-    [
-        "find_by_attribute", "find_by_signature", "find_comments", "find_cross_repository_usages", "find_references",
-        "find_submodule_consumers", "find_symbol", "find_tests", "find_unreferenced", "get_api_surface",
-        "get_call_hierarchy", "get_file_symbols", "get_impact", "get_implementors", "get_index_status",
-        "get_namespace_tree", "get_project_dependencies", "get_type_dependents", "get_type_hierarchy",
-        "get_type_members", "list_repositories", "search_symbols", "semantic_search", "trace_value"
-    ];
+    // The remote surface is ServiceApp.RemoteQueryTools; RemoteToolSurfaceGuardTests pins what their texts may name.
+    private static readonly string[] ExpectedTools = RemoteToolSurfaceGuardTests.AgentTools;
 
     // ==== tools/list and initialize ===================================================================
 
     [TestMethod]
     [DataRow(false, DisplayName = "query token, selection required")]
     [DataRow(true, DisplayName = "delegate callers (implicit selection)")]
-    public async Task ToolsList_FitsHalfTheFormerSize_AndKeepsEveryToolName(bool delegateCallers)
+    public async Task ToolsList_FitsTheBudget_AndListsExactlyTheAgentTools(bool delegateCallers)
     {
         await using var host = await AgentOutputHarness.StartAsync(delegateCallers);
 
@@ -183,10 +181,9 @@ public sealed partial class AgentSizedOutputHttpTests
     }
 
     [TestMethod]
-    [DataRow("get_implementors")]
-    [DataRow("get_type_dependents")]
-    public async Task RelationshipTools_WalkEveryReadableRowOnceInOrder_AndSummarizeOnlyThose(string tool)
+    public async Task GetImplementors_WalksEveryReadableRowOnceInOrder_AndSummarizesOnlyThose()
     {
+        const string tool = "get_implementors";
         await using var host = await AgentOutputHarness.StartAsync();
 
         var rows = new List<(string Name, string File, int Line)>();
@@ -204,7 +201,7 @@ public sealed partial class AgentSizedOutputHttpTests
             Assert.AreEqual(AgentOutputFixture.HandlerCount, body.GetProperty("meta").GetProperty("total").GetInt32(),
                 "the total counts only implementors this read can see");
             rows.AddRange(body.GetProperty("results").EnumerateArray().Select(r => (
-                r.GetProperty(tool == "get_implementors" ? "fully_qualified_name" : "dependent_type").GetString()!,
+                r.GetProperty("fully_qualified_name").GetString()!,
                 r.GetProperty("file_path").GetString()!,
                 r.GetProperty("line_start").GetInt32())));
             cursor = body.GetProperty("meta").TryGetProperty("next_cursor", out var next) ? next.GetString() : null;
@@ -214,15 +211,10 @@ public sealed partial class AgentSizedOutputHttpTests
         Assert.AreEqual(5, pages);
         Assert.AreEqual(AgentOutputFixture.HandlerCount, rows.Select(r => r.Name).Distinct(StringComparer.Ordinal).Count(), "no row repeats");
         Assert.IsFalse(rows.Any(r => r.Name.Contains("OtherStore", StringComparison.Ordinal)), "another repository's implementor is not listed");
-        var ordered = tool == "get_implementors"
-            ? rows.OrderBy(r => r.File, StringComparer.Ordinal).ThenBy(r => r.Line).ToList()
-            : rows.OrderBy(r => r.Name, StringComparer.Ordinal).ToList();
+        var ordered = rows.OrderBy(r => r.File, StringComparer.Ordinal).ThenBy(r => r.Line).ToList();
         CollectionAssert.AreEqual(ordered, rows, $"{tool} pages in its documented order");
 
         Assert.AreEqual(AgentOutputFixture.HandlerCount, summary.GetProperty("by_file").EnumerateObject().Sum(p => p.Value.GetInt32()));
-        if (tool == "get_type_dependents")
-            Assert.AreEqual(AgentOutputFixture.HandlerCount, summary.GetProperty("by_relationship").GetProperty("implements").GetInt32(),
-                "the relationship summary counts only readable dependents");
     }
 
     [TestMethod]
@@ -241,7 +233,8 @@ public sealed partial class AgentSizedOutputHttpTests
             Args(AgentOutputFixture.TargetInterface, cursor: cursor, scope: "project:App.Core"));
         Assert.AreEqual(Paging.InvalidCursorCode, ErrorCode(otherArguments), "a cursor is bound to the arguments that issued it");
 
-        var otherTool = await host.CallAsync("find_comments", new JsonObject { ["cursor"] = cursor });
+        var otherTool = await host.CallAsync("get_implementors",
+            new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetInterface, ["cursor"] = cursor });
         Assert.AreEqual(Paging.InvalidCursorCode, ErrorCode(otherTool), "and to the tool");
 
         var otherRepository = await host.CallAsync("find_references",
@@ -249,25 +242,60 @@ public sealed partial class AgentSizedOutputHttpTests
         Assert.AreEqual(Paging.InvalidCursorCode, ErrorCode(otherRepository), "and to the snapshot");
     }
 
+    // include_source changes no row, only what each row carries, so an agent that drops it while paging keeps going.
+    [TestMethod]
+    [DataRow("find_references")]
+    [DataRow("get_call_hierarchy")]
+    public async Task Cursor_CarriesOverWhenIncludeSourceIsToggled(string tool)
+    {
+        await using var host = await AgentOutputHarness.StartAsync(maxResponseChars: UnboundedChars);
+        JsonObject Arguments(int limit, bool includeSource, string? cursor = null)
+        {
+            var arguments = tool == "find_references"
+                ? new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetInterface }
+                : new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetMethod, ["direction"] = "callers" };
+            arguments["limit"] = limit;
+            if (includeSource) arguments["include_source"] = true;
+            if (cursor is not null) arguments["cursor"] = cursor;
+            return arguments;
+        }
+        static List<string> Rows(JsonElement body) => body.GetProperty("results").EnumerateArray().Select(r => r.GetRawText()).ToList();
+        static List<string> Locations(JsonElement body) => body.GetProperty("results").EnumerateArray()
+            .Select(r => r.TryGetProperty("call_site_line", out var callLine)
+                ? $"{r.GetProperty("fully_qualified_name").GetString()}@{r.GetProperty("call_site_file").GetString()}:{callLine.GetInt32()}"
+                : $"{r.GetProperty("file_path").GetString()}:{r.GetProperty("line").GetInt32()}")
+            .ToList();
+
+        var first = await host.CallAsync(tool, Arguments(10, includeSource: true));
+        Assert.IsNull(ErrorCode(first), first.ToString());
+        var cursor = first.GetProperty("meta").GetProperty("next_cursor").GetString()!;
+        var second = await host.CallAsync(tool, Arguments(10, includeSource: false, cursor));
+        var both = await host.CallAsync(tool, Arguments(20, includeSource: false));
+
+        Assert.IsNull(ErrorCode(second), "a cursor issued with include_source resumes without it: " + second);
+        CollectionAssert.AreEqual(Locations(both), Locations(first).Concat(Locations(second)).ToList(),
+            "the second page resumes exactly after the first");
+        CollectionAssert.AreEqual(Rows(both).Skip(10).ToList(), Rows(second), "and carries no source, as asked");
+
+        var otherQuery = await host.CallAsync(tool, tool == "find_references"
+            ? Args(AgentOutputFixture.TargetInterface, cursor: cursor, groupBy: "file")
+            : new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetMethod, ["direction"] = "callees", ["cursor"] = cursor });
+        Assert.AreEqual(Paging.InvalidCursorCode, ErrorCode(otherQuery), "an argument that shapes the rows is still bound");
+    }
+
     [TestMethod]
     [DataRow("get_implementors", AgentOutputFixture.HandlerCount)]
     [DataRow("get_call_hierarchy", AgentOutputFixture.HandlerCount)]
-    [DataRow("find_comments", AgentOutputFixture.FileCount * 2)]
-    [DataRow("get_type_dependents", AgentOutputFixture.HandlerCount)]
-    [DataRow("find_unreferenced", -1)]
     [DataRow("get_file_symbols", -1)]
-    [DataRow("find_by_signature", -1)]
     public async Task LargeResultTools_ArePaged(string tool, int expectedTotal)
     {
         await using var host = await AgentOutputHarness.StartAsync();
 
         var arguments = tool switch
         {
-            "get_implementors" or "get_type_dependents" => new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetInterface },
+            "get_implementors" => new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetInterface },
             "get_call_hierarchy" => new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetMethod, ["direction"] = "callers", ["depth"] = 1 },
             "get_file_symbols" => new JsonObject { ["file_path"] = host.Fixture.ReferenceFiles[0] },
-            "find_unreferenced" => new JsonObject { ["exclude_test_projects"] = false },
-            "find_by_signature" => new JsonObject(),
             _ => new JsonObject()
         };
         arguments["limit"] = 2;
@@ -314,22 +342,24 @@ public sealed partial class AgentSizedOutputHttpTests
     {
         await using var host = await AgentOutputHarness.StartAsync();
 
-        var body = await host.CallAsync("get_namespace_tree", new JsonObject(), AgentOutputFixture.RepoB);
+        var body = await host.CallAsync("find_symbol", new JsonObject { ["name"] = "OtherStore" }, AgentOutputFixture.RepoB);
 
         var snapshot = body.GetProperty("meta").GetProperty("snapshot");
         Assert.AreEqual("partial", snapshot.GetProperty("coverage").GetString());
         Assert.AreEqual(
-            "Partial index: submodule_unpopulated: external/tools. Call get_index_status for details.",
-            snapshot.GetProperty("warning").GetString(), "the warning names what is missing");
-        Assert.IsFalse(snapshot.TryGetProperty("reasons", out _), "the partial reasons stay in get_index_status");
+            "Partial index: 1 of 1 submodules were not checked out, so results may be incomplete.",
+            snapshot.GetProperty("warning").GetString(), "the warning counts what is missing");
+        Assert.IsFalse(snapshot.TryGetProperty("reasons", out _), "the partial reasons are not repeated on every result");
     }
 
+    // get_index_status is local-only (S12); the full provenance it reports is read from the same catalog.
     [TestMethod]
-    public async Task GetIndexStatus_KeepsTheFullProvenance()
+    public async Task LocalGetIndexStatus_KeepsTheFullProvenance()
     {
         await using var host = await AgentOutputHarness.StartAsync();
+        using var local = host.LocalProvider(AgentOutputFixture.RepoB);
 
-        var body = await host.CallAsync("get_index_status", new JsonObject(), AgentOutputFixture.RepoB);
+        var body = JsonDocument.Parse(Sextant.Mcp.Tools.GetIndexStatusTool.GetIndexStatus(local)).RootElement;
 
         var full = body.GetProperty("index").GetProperty("snapshot");
         Assert.AreEqual(host.Fixture.SnapshotB, full.GetProperty("base_snapshot_id").GetInt64());
@@ -337,7 +367,6 @@ public sealed partial class AgentSizedOutputHttpTests
         Assert.IsTrue(full.TryGetProperty("compatible", out _));
         Assert.AreEqual("partial", full.GetProperty("coverage").GetProperty("verdict").GetString());
         StringAssert.Contains(body.GetProperty("index").GetProperty("coverage").GetRawText(), "submodule_unpopulated");
-        Assert.IsTrue(body.GetProperty("meta").GetProperty("snapshot").TryGetProperty("warning", out _), "its meta is lean too");
     }
 
     // ==== paths out ===================================================================================
@@ -349,16 +378,9 @@ public sealed partial class AgentSizedOutputHttpTests
     [DataRow("find_symbol")]
     [DataRow("get_implementors")]
     [DataRow("get_call_hierarchy")]
-    [DataRow("trace_value")]
-    [DataRow("get_type_dependents")]
-    [DataRow("find_unreferenced")]
-    [DataRow("find_comments")]
     [DataRow("get_file_symbols")]
-    [DataRow("get_api_surface")]
-    [DataRow("get_impact")]
-    [DataRow("get_index_status")]
-    [DataRow("get_namespace_tree")]
-    [DataRow("semantic_search")]
+    [DataRow("get_type_hierarchy")]
+    [DataRow("get_type_members")]
     public async Task Outputs_NeverExposeTheWorkerCheckout(string call)
     {
         await using var host = await AgentOutputHarness.StartAsync();
@@ -374,15 +396,9 @@ public sealed partial class AgentSizedOutputHttpTests
             {
                 ["symbol_fqn"] = AgentOutputFixture.TargetMethod, ["direction"] = "callers", ["include_source"] = true
             }),
-            "trace_value" => ("trace_value", new JsonObject { ["method_fqn"] = AgentOutputFixture.TargetMethod, ["direction"] = "origins" }),
-            "get_type_dependents" => ("get_type_dependents", new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetInterface }),
-            "find_unreferenced" => ("find_unreferenced", new JsonObject()),
-            "find_comments" => ("find_comments", new JsonObject()),
             "get_file_symbols" => ("get_file_symbols", new JsonObject { ["file_path"] = host.Fixture.ReferenceFiles[^1] }),
-            "get_api_surface" => ("get_api_surface", new JsonObject { ["project_id"] = $"App.Core:{host.Fixture.SnapshotA}" }),
-            "get_impact" => ("get_impact", new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetInterface }),
-            "get_namespace_tree" => ("get_namespace_tree", new JsonObject { ["namespace_prefix"] = "global::App.Feature" }),
-            "semantic_search" => ("semantic_search", new JsonObject { ["query"] = "Handler" }),
+            "get_type_hierarchy" => ("get_type_hierarchy", new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetInterface }),
+            "get_type_members" => ("get_type_members", new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetInterface }),
             _ => (call, new JsonObject())
         };
 
@@ -551,7 +567,7 @@ public sealed partial class AgentSizedOutputHttpTests
         }
     }
 
-    // A leading "//" or "/*" is a code comment (find_comments), not a path.
+    // A leading "//" or "/*" is a code comment, not a path.
     [GeneratedRegex(@"^(/[^/*\s]|[A-Za-z]:[\\/]|\\\\)")]
     private static partial Regex AbsolutePath();
 }

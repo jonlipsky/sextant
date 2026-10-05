@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using Sextant.Core;
 using Sextant.Mcp;
+using Sextant.Mcp.Tools;
 using Sextant.Store;
 
 namespace Sextant.Service.Tests;
@@ -11,7 +12,8 @@ namespace Sextant.Service.Tests;
 /// 026, analyzer version 5), so an agent can answer "what does this interface declare" without opening the file,
 /// while its <c>fully_qualified_name</c> is printed exactly as before and still resolves (#219). A row indexed before
 /// 026 (no declaration) keeps its legacy signature, so a catalog holding snapshots from both builds serves both.
-/// Every case goes through the service's <c>/mcp</c> over HTTP.
+/// The tools the remote surface lists go through the service's <c>/mcp</c> over HTTP; the local-only signature tools
+/// (<c>get_api_surface</c>, <c>find_by_signature</c>) read the same catalog through a local provider.
 /// </summary>
 [TestClass]
 public sealed class MemberSignatureHttpTests
@@ -85,7 +87,7 @@ public sealed class MemberSignatureHttpTests
     }
 
     [TestMethod]
-    public async Task FileSymbolsAndApiSurface_ShowTheDeclaration()
+    public async Task FileSymbolsAndLocalApiSurface_ShowTheDeclaration()
     {
         await using var host = await StartAsync();
 
@@ -94,13 +96,12 @@ public sealed class MemberSignatureHttpTests
             .Single(r => r.GetProperty("display_name").GetString() == "CreateAsync");
         Assert.AreEqual(CreateDeclaration, create.GetProperty("signature").GetString());
 
+        using var local = host.LocalProvider();
         string? cursor = null;
         JsonElement? surfaceRow = null;
         for (var pages = 0; pages < 20 && surfaceRow is null; pages++)
         {
-            var arguments = new JsonObject { ["project_id"] = $"App.Core:{host.Fixture.SnapshotA}", ["limit"] = 200 };
-            if (cursor is not null) arguments["cursor"] = cursor;
-            var surface = await host.CallAsync("get_api_surface", arguments);
+            var surface = Parse(GetApiSurfaceTool.GetApiSurface(local, $"App.Core:{host.Fixture.SnapshotA}", limit: 200, cursor: cursor));
             Assert.IsFalse(surface.GetProperty("meta").TryGetProperty("error", out var error), error.ToString());
             surfaceRow = surface.GetProperty("results").EnumerateArray()
                 .Where(r => r.GetProperty("display_name").GetString() == "CreateAsync").Select(r => (JsonElement?)r).FirstOrDefault();
@@ -148,28 +149,29 @@ public sealed class MemberSignatureHttpTests
         var current = await host.CallAsync("get_type_members", new JsonObject { ["symbol_fqn"] = ChannelStore });
         Assert.AreEqual(CreateDeclaration, current.GetProperty("results")[0].GetProperty("signature").GetString());
 
-        var byParameters = await host.CallAsync("find_by_signature",
-            new JsonObject { ["parameter_type"] = "CancellationToken", ["parameter_count"] = 2 }, AgentOutputFixture.RepoB);
+        using var localB = host.LocalProvider(AgentOutputFixture.RepoB);
+        var byParameters = Parse(FindBySignatureTool.FindBySignature(localB, parameter_type: "CancellationToken", parameter_count: 2));
         Assert.AreEqual(LoadLegacy, byParameters.GetProperty("results").EnumerateArray().Single().GetProperty("signature").GetString(),
             "parameter filters still read a legacy signature");
     }
 
     [TestMethod]
-    public async Task FindBySignature_MatchesTheDeclaration()
+    public async Task LocalFindBySignature_MatchesTheDeclaration()
     {
         await using var host = await StartAsync();
+        using var local = host.LocalProvider();
 
-        var byReturn = await host.CallAsync("find_by_signature", new JsonObject { ["return_type"] = "Task<ChannelRecord>" });
+        var byReturn = Parse(FindBySignatureTool.FindBySignature(local, return_type: "Task<ChannelRecord>"));
         Assert.AreEqual(CreateDeclaration, byReturn.GetProperty("results").EnumerateArray().Single().GetProperty("signature").GetString(),
             "the return type is read from the declaration");
 
-        var byParameters = await host.CallAsync("find_by_signature",
-            new JsonObject { ["parameter_type"] = "DateTime", ["parameter_count"] = 5 });
+        var byParameters = Parse(FindBySignatureTool.FindBySignature(local, parameter_type: "DateTime", parameter_count: 5));
         Assert.AreEqual(CreateDeclaration, byParameters.GetProperty("results").EnumerateArray().Single().GetProperty("signature").GetString());
 
-        var noParameters = await host.CallAsync("find_by_signature",
-            new JsonObject { ["return_type"] = "ChannelRecord?", ["parameter_count"] = 2 });
+        var noParameters = Parse(FindBySignatureTool.FindBySignature(local, return_type: "ChannelRecord?", parameter_count: 2));
         Assert.AreEqual(FindDeclaration, noParameters.GetProperty("results").EnumerateArray().Single().GetProperty("signature").GetString(),
             "a default value is not a parameter type");
     }
+
+    private static JsonElement Parse(string text) => JsonDocument.Parse(text).RootElement.Clone();
 }

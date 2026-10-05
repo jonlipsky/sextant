@@ -2,6 +2,12 @@
 
 Sextant exposes its index through MCP (Model Context Protocol) tools. The MCP server reads from the SQLite database directly and does not depend on the daemon being running.
 
+The local stdio server (and `sextant serve`) registers every tool below. The index service's remote `/mcp` lists
+only the eight tools agents use: `find_symbol`, `find_references`, `get_call_hierarchy`, `get_implementors`,
+`get_type_hierarchy`, `get_type_members`, `get_file_symbols` and `list_repositories` (S12). Nothing the remote
+surface sends (tool and parameter descriptions, the `initialize` instructions, warnings, errors, messages) names a
+tool outside those eight; `RemoteToolSurfaceGuardTests` checks that over HTTP and against the source.
+
 ## Response Format
 
 Every tool response includes a `meta` object:
@@ -45,7 +51,8 @@ or the `changes` of a comparison), `get_call_hierarchy`, `get_file_symbols`, `ge
 - `meta.total` is the size of the whole result; `meta.result_count` the rows on this page.
 - `meta.next_cursor` is present only when rows remain. A cursor is bound to the tool, its arguments and the
   snapshot it was issued for; reusing it with other arguments, another tool, or after the index moved to a new
-  snapshot is `meta.error.code = "invalid_cursor"` (re-run without a cursor).
+  snapshot is `meta.error.code = "invalid_cursor"` (re-run without a cursor). `limit` and `include_source`,
+  which change no row, are not bound: the next page may change either.
 - A **truncated first page** leads with a `summary` (counts per project, file, kind, … — the top 10 of each,
   then a `(N more)` entry) before the rows, so an agent can narrow the query (`scope`, `project_id`, …)
   instead of paging. A result that fits its page has no summary.
@@ -79,14 +86,6 @@ refused counted as more than 25,000 tokens, so 20,000 characters stays well insi
 - `get_base_snapshot_symbols` (local only) pages by the symbol id: a page cut by size returns the id of its last
   row as `meta.next_cursor`, with `meta.page_truncated_by: "size"` (it reports no `meta.total`).
 - At least one row is always returned, even if that row alone is over the budget.
-- `search_symbols` (service only) applies the budget after its hit cap (`SEARCH_MAX_HITS`). A page over it first
-  keeps fewer symbols from each repository read (each resumes at its first symbol left out), and if one symbol from
-  each is still too much it returns only as many of the first repositories of its turn as fit: the others with
-  matches are listed in `truncated` and are the first ones read on the next page (a repository with no match is
-  never held back). The page then has `meta.page_truncated_by: "size"` and a top-level
-  `message` ("…Pass next_cursor for the rest, or narrow with repository, branch or kind."). Its `pending`,
-  `unavailable` and `truncated` lists and its cursor are never cut, so a caller with very many repositories can
-  still get a page over the budget; narrow with `repository`.
 
 Result text is written without HTML escaping: `Task<int>`, not `Task\u003Cint\u003E`.
 
@@ -108,13 +107,16 @@ On the remote `/mcp`, `meta.snapshot` is lean — what an agent needs to trust t
 ```
 
 `coverage` is `complete` or `partial`; a `warning` is added only when the answer may be incomplete (a partial
-index, an incompatible indexer, or a dirty working tree). A partial warning names what is missing, for example
-`Partial index: Code in 1 project(s) did not fully compile on the indexer, so references and calls inside them
-may be missing (src/App/App.csproj: 412 unbound name(s)). Calls that failed to bind are kept as candidate
-matches. Call get_index_status for details.` The full provenance described below stays available
-from `get_index_status` as `index.snapshot`, and the coverage record (its `binding` health per project and its
-informational `notes`) as `index.coverage`. The server's `initialize` result carries short `instructions`
-(when to use the tools, the `repository` argument, paging) for clients that surface them.
+index, an incompatible indexer, or a dirty working tree). A partial warning counts what is missing and names no
+project or tool, in at most 160 characters, for example
+`Partial index: 3 of 40 projects did not load or compile, 1 of 2 submodules were not checked out, so results may be
+incomplete.` (a gap that does not fit is folded into `and other gaps`; a partial record that counts no gap gets
+`Partial index: some projects or submodules were not indexed, so results may be incomplete.`). The full
+provenance and the coverage record (its reasons, its `binding` health per project and its informational `notes`)
+are not on the remote surface; an operator reads them from `get_index_status` (`index.snapshot`,
+`index.coverage`) on a local server over the same catalog, or from `/control/resolve`. The server's `initialize`
+result carries short `instructions` (when to use the tools, the `repository` argument, paging) for clients that
+surface them.
 
 ### Symbol arguments
 
@@ -316,7 +318,11 @@ When `fuzzy` is false, matches exactly on `fully_qualified_name`. When true, use
 
 ### find_references
 
-All usages of a symbol across the codebase.
+All usages of a symbol across the codebase, from the compiler's binding: it includes the uses a text search
+misses (a qualified `new Ns.Type(...)`, a target-typed `new()`, a type named through a `using` alias, a call made
+through an interface) and none of its false matches (comments, strings, a namesake in another namespace). A
+call through an interface binds to the interface member, so it is listed under that member, not under the
+implementation.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
@@ -350,7 +356,9 @@ All symbols defined in a source file.
 
 ### get_call_hierarchy
 
-Callers or callees of a method with configurable depth.
+Callers or callees of a method with configurable depth. It includes calls a text search misses (a call
+through a `using` alias or `using static`, a call made through an interface); as with `find_references`, a call
+through an interface is an edge to the interface member, not to the implementation.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|

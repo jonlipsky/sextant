@@ -261,7 +261,7 @@ public class ServiceHttpTests
         await using var host = await ServiceHttpHarness.StartAsync(withWorker: true, seedComplete: true);
 
         using var request = BuildJsonRpc(
-            """{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_index_status","arguments":{}}}""",
+            """{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"find_symbol","arguments":{"name":"Anything"}}}""",
             QueryToken);
         var response = await host.Client.SendAsync(request);
 
