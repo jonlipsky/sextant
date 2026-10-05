@@ -356,6 +356,70 @@ public class RepositorySelectionTests
         Assert.IsFalse(provider.RequireRepositorySelection());
     }
 
+    [TestMethod]
+    public void ProbeRepositories_SkipsARepositoryTheAuthorizerDenies_WithoutRunningTheProbeOnIt()
+    {
+        var snapshots = new SnapshotStore(_db.GetConnection());
+        var deniedId = snapshots.GetRepositoryId(RepoB)!.Value;
+        var expectedSnapshot = snapshots.GetSelectedSnapshotRowForRepository(RepoA)!.Id;
+        using var provider = new DatabaseProvider(_dbPath, new DenyingRepositoryAuthorizer(deniedId));
+        var probed = new List<long?>();
+
+        var hits = provider.ProbeRepositories(
+            [RepoA, RepoB, "https://github.com/org/not-indexed"],
+            (_, context) =>
+            {
+                probed.Add(context.SelectedSnapshotId);
+                return RepositoryInference.ExactRank;
+            });
+
+        CollectionAssert.AreEqual(new[] { RepoA }, hits.Select(h => h.Repository).ToArray());
+        CollectionAssert.AreEqual(new long?[] { expectedSnapshot }, probed,
+            "only the readable repository is probed, on its own snapshot; the denied and the unindexed one never are");
+    }
+
+    [TestMethod]
+    public void ProbeRepositories_ASymbolProbe_ReadsOnlyTheProbedRepository()
+    {
+        var deniedId = new SnapshotStore(_db.GetConnection()).GetRepositoryId(RepoB)!.Value;
+        using var both = new DatabaseProvider(_dbPath, new AllowingEnforcingAuthorizer());
+        using var onlyA = new DatabaseProvider(_dbPath, new DenyingRepositoryAuthorizer(deniedId));
+        var probe = RepositoryInference.ProbeFor("find_symbol",
+            new Dictionary<string, JsonElement> { ["name"] = JsonDocument.Parse("\"Shared.T\"").RootElement })!;
+
+        CollectionAssert.AreEqual(new[] { RepoA, RepoB },
+            RepositoryInference.Holders(both.ProbeRepositories([RepoA, RepoB], probe)).ToArray());
+        CollectionAssert.AreEqual(new[] { RepoA },
+            RepositoryInference.Holders(onlyA.ProbeRepositories([RepoA, RepoB], probe)).ToArray(),
+            "a repository the caller cannot read never counts as holding the symbol");
+    }
+
+    [TestMethod]
+    public void Holders_AreTheRepositoriesAtTheBestRank_InInputOrder()
+    {
+        CollectionAssert.AreEqual(new[] { "b", "c" }, RepositoryInference.Holders(
+            [("a", RepositoryInference.TrailingNameRank), ("b", RepositoryInference.ExactRank), ("c", RepositoryInference.ExactRank)]).ToArray());
+        CollectionAssert.AreEqual(new[] { "a" }, RepositoryInference.Holders([("a", RepositoryInference.TrailingNameRank)]).ToArray());
+        Assert.AreEqual(0, RepositoryInference.Holders([]).Count);
+    }
+
+    [TestMethod]
+    [DataRow("find_symbol", """{"name":"Shared.T","fuzzy":true}""")]
+    [DataRow("find_symbol", """{"name":"Shared.T","project_id":"logical_A"}""")]
+    [DataRow("find_symbol", """{"name":"Shared.T","scope":"file:src/P/T.cs"}""")]
+    [DataRow("find_symbol", """{"name":"Shared.T","kind":"nonsense"}""")]
+    [DataRow("find_symbol", """{"name":"  "}""")]
+    [DataRow("get_file_symbols", """{"file_path":"/abs/src/P/T.cs"}""")]
+    [DataRow("get_impact", """{"symbol_fqn":"Shared.T"}""")]
+    [DataRow("find_references", """{"symbol_fqn":7}""")]
+    public void ProbeFor_ANarrowedOrUnreadableCall_HasNoProbe(string tool, string arguments)
+    {
+        var parsed = JsonDocument.Parse(arguments).RootElement.EnumerateObject()
+            .ToDictionary(p => p.Name, p => p.Value.Clone());
+
+        Assert.IsNull(RepositoryInference.ProbeFor(tool, parsed));
+    }
+
     private static string FindShared(DatabaseProvider provider) =>
         FindSymbolTool.FindSymbol(provider, SharedFqn).GetAwaiter().GetResult();
 
@@ -410,5 +474,17 @@ public class RepositorySelectionTests
         public bool IsEnforcing => true;
         public ReadAuthorization Authorize(SnapshotRow? selected) => ReadAuthorization.Allow;
         public ReadAuthorization AuthorizeRepository(long repositoryId, string remoteUrl) => ReadAuthorization.Allow;
+    }
+
+    /// <summary>Enforcing; denies one repository and allows every other.</summary>
+    private sealed class DenyingRepositoryAuthorizer(long deniedRepositoryId) : IReadAuthorizer
+    {
+        public bool IsEnforcing => true;
+
+        public ReadAuthorization Authorize(SnapshotRow? selected) =>
+            selected is null || selected.RepositoryId == deniedRepositoryId ? ReadAuthorization.Deny("denied") : ReadAuthorization.Allow;
+
+        public ReadAuthorization AuthorizeRepository(long repositoryId, string remoteUrl) =>
+            repositoryId == deniedRepositoryId ? ReadAuthorization.Deny("denied") : ReadAuthorization.Allow;
     }
 }

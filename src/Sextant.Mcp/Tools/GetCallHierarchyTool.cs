@@ -121,11 +121,11 @@ public static class GetCallHierarchyTool
                 ? $"{SymbolResolver.Describe(namer, rootSymbol)} has no indexed {(callees ? "callees" : "callers")}."
                 : null);
         return ResponseBuilder.BuildPage(results, hits.Count, page, freshness, lookup.Ambiguity, readContext.Provenance, Summary,
-            message: message);
+            message: message, warning: lookup.Warning);
     }
 
     // The call graph links members with bodies: methods, constructors, and property/indexer/event accessors.
-    private static readonly SymbolLookupOptions CallableOptions = new()
+    internal static readonly SymbolLookupOptions CallableOptions = new()
     {
         Kinds = new HashSet<SymbolKind>
         {

@@ -140,7 +140,7 @@ public static class FindReferencesTool
 
         return ResponseBuilder.BuildPage(mapped, refs.Count, page, symbol.LastIndexedAt, lookup.Ambiguity,
             readContext.Provenance, Summary, message,
-            shape: groups.Length == 0 ? null : rows => GroupReferences(rows, groups));
+            shape: groups.Length == 0 ? null : rows => GroupReferences(rows, groups), warning: lookup.Warning);
     }
 
     private static List<object> GroupReferences(List<object> refs, string[] groupKeys)

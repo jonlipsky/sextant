@@ -24,7 +24,7 @@ public static class ResponseBuilder
 
     public static string Build<T>(
         List<T> results, long? indexFreshness = null, SymbolAmbiguity? ambiguity = null,
-        SnapshotProvenance? provenance = null, string? nextCursor = null, string? message = null)
+        SnapshotProvenance? provenance = null, string? nextCursor = null, string? message = null, string? warning = null)
     {
         var response = new
         {
@@ -33,6 +33,7 @@ public static class ResponseBuilder
                 QueriedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 IndexFreshness = indexFreshness ?? 0,
                 ResultCount = results.Count,
+                Warning = warning,
                 Ambiguous = ambiguity != null ? true : null,
                 AmbiguousMatchCount = ambiguity?.Candidates.Count,
                 SelectedProjectId = ambiguity?.SelectedProjectId,
@@ -67,7 +68,7 @@ public static class ResponseBuilder
     public static string BuildPage<T>(
         List<T> rows, int total, PageRequest page, long? indexFreshness = null, SymbolAmbiguity? ambiguity = null,
         SnapshotProvenance? provenance = null, Func<object?>? summary = null, string? message = null,
-        Func<List<T>, object>? shape = null)
+        Func<List<T>, object>? shape = null, string? warning = null)
     {
         var queriedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var summaryValue = new Lazy<object?>(() => summary?.Invoke());
@@ -86,6 +87,7 @@ public static class ResponseBuilder
                     IndexFreshness = indexFreshness ?? 0,
                     ResultCount = count,
                     Total = total,
+                    Warning = warning,
                     Ambiguous = ambiguity != null ? true : null,
                     AmbiguousMatchCount = ambiguity?.Candidates.Count,
                     SelectedProjectId = ambiguity?.SelectedProjectId,
@@ -115,7 +117,8 @@ public static class ResponseBuilder
     /// </summary>
     public static string BuildBounded<T>(
         List<T> rows, FederatedReadContext context, long? indexFreshness = null, SymbolAmbiguity? ambiguity = null,
-        SnapshotProvenance? provenance = null, string? message = null, Func<List<T>, object>? shape = null)
+        SnapshotProvenance? provenance = null, string? message = null, Func<List<T>, object>? shape = null,
+        string? warning = null)
     {
         var queriedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var maxChars = context.MaxResponseChars;
@@ -132,6 +135,7 @@ public static class ResponseBuilder
                     IndexFreshness = indexFreshness ?? 0,
                     ResultCount = count,
                     Total = cut ? rows.Count : null,
+                    Warning = warning,
                     Ambiguous = ambiguity != null ? true : null,
                     AmbiguousMatchCount = ambiguity?.Candidates.Count,
                     SelectedProjectId = ambiguity?.SelectedProjectId,
@@ -559,6 +563,13 @@ public sealed class MetaObject
     /// <summary>The size of the whole result of a paged tool (<see cref="Paging"/>); omitted by unpaged tools.</summary>
     [JsonPropertyName("total")]
     public int? Total { get; set; }
+
+    /// <summary>
+    /// A short note when the answer is for a symbol the argument did not name exactly (a qualified name resolved by
+    /// its trailing <c>Type.Member</c> or <c>Type</c>); omitted otherwise.
+    /// </summary>
+    [JsonPropertyName("warning")]
+    public string? Warning { get; set; }
 
     [JsonPropertyName("ambiguous")]
     public bool? Ambiguous { get; set; }

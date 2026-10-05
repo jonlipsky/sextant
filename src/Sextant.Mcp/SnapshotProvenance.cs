@@ -200,11 +200,14 @@ public sealed record SnapshotProvenance
 
     /// <summary>
     /// The repository the read was served from, stamped ONLY when the request named none and the host selected one
-    /// for it (<see cref="RepositorySelection"/> = "implicit"); null otherwise, so an explicitly selected or local
-    /// read is byte-identical.
+    /// for it (<see cref="RepositorySelection"/> = "implicit" or "inferred"); null otherwise, so an explicitly selected
+    /// or local read is byte-identical.
     /// </summary>
     public string? Repository { get; init; }
 
-    /// <summary>How <see cref="Repository"/> was chosen: "implicit" when the host selected it; null otherwise.</summary>
+    /// <summary>
+    /// How <see cref="Repository"/> was chosen: "implicit" when it is the caller's one readable repository, "inferred"
+    /// when it is the one readable repository that holds the call's symbol or path; null otherwise.
+    /// </summary>
     public string? RepositorySelection { get; init; }
 }

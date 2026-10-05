@@ -77,7 +77,8 @@ public static class RemoteResponsePresenter
 
     /// <summary>
     /// The lean <c>meta.snapshot</c>: repository, branch, short commit, coverage, a warning when needed, and
-    /// <c>repository_selection: "implicit"</c> when the host chose the repository because the request named none.
+    /// <c>repository_selection</c> (<c>"implicit"</c> or <c>"inferred"</c>) when the host chose the repository because
+    /// the request named none.
     /// </summary>
     public static JsonObject LeanSnapshot(FederatedReadContext context, SnapshotProvenance provenance)
     {

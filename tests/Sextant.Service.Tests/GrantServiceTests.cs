@@ -187,6 +187,29 @@ public class GrantServiceTests
         Assert.AreEqual(Gadgets, service.ResolveImplicitRepository(service.GetVisibleRepositoryKeys(App("tenant-a"))));
     }
 
+    [TestMethod]
+    public async Task SelectableRepositories_AreOnlyTheCallersVisibleOnes_WithACompleteDefaultHead_UpToTheLimit()
+    {
+        PublishOnBranch(Widgets, "commit-w1", "main", isDefault: true);
+        PublishOnBranch(Gadgets, "commit-g1", "main", isDefault: true);
+        PublishOnBranch(Gizmos, "commit-z1", "feature", isDefault: false);
+        PublishOnBranch("https://github.com/acme/hidden", "commit-h1", "main", isDefault: true);
+        var service = Start();
+        var user = User("tenant-a", "user-1");
+        await service.PutGrantAsync(user, GrantScope.Self, Gadgets, Key(Gadgets), "");
+        await service.PutGrantAsync(user, GrantScope.Self, Widgets, Key(Widgets), "");
+        await service.PutGrantAsync(user, GrantScope.Self, Gizmos, Key(Gizmos), "");
+        // Another caller's grant on a repository this one cannot read.
+        await service.PutGrantAsync(User("tenant-a", "user-2"), GrantScope.Self, "https://github.com/acme/hidden",
+            Key("https://github.com/acme/hidden"), "");
+        var keys = service.GetVisibleRepositoryKeys(user);
+
+        CollectionAssert.AreEqual(new[] { Widgets, Gadgets }, service.ListSelectableRepositories(keys, 10).ToArray(),
+            "the visible repositories with a complete default head, in catalog order; never another caller's");
+        CollectionAssert.AreEqual(new[] { Widgets }, service.ListSelectableRepositories(keys, 1).ToArray());
+        Assert.AreEqual(0, service.ListSelectableRepositories(new HashSet<string>(), 10).Count, "no grant: nothing");
+    }
+
     // ==== status and list_repositories ==============================================================
 
     [TestMethod]

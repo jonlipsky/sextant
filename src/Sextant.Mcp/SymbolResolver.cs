@@ -74,6 +74,12 @@ public sealed record SymbolLookupOptions
     /// <summary>How the restriction reads in a message ("in project 'x'"), or null.</summary>
     public string? ScopeDescription { get; init; }
 
+    /// <summary>
+    /// Skips the near-miss search of a lookup that resolves to nothing (<see cref="SymbolLookup.Suggestions"/> stays
+    /// empty), for a caller that only asks whether the argument resolves (a repository-inference probe).
+    /// </summary>
+    internal bool SkipSuggestions { get; init; }
+
     public static readonly SymbolLookupOptions Any = new();
 
     /// <summary>Types only (get_type_members, get_type_hierarchy, get_type_dependents).</summary>
@@ -104,6 +110,18 @@ public sealed class SymbolLookup
 
     /// <summary>The closest near misses when <see cref="SymbolLookupStatus.NotFound"/> (at most five).</summary>
     public IReadOnlyList<SymbolSuggestion> Suggestions { get; init; } = [];
+
+    /// <summary>
+    /// Whether the argument resolved only by its trailing <c>Type.Member</c> or <c>Type</c> (the qualified name it
+    /// gave matched nothing); <see cref="Warning"/> then names what it resolved to.
+    /// </summary>
+    public bool ByTrailingName { get; init; }
+
+    /// <summary>
+    /// A short note for <c>meta.warning</c> when the answer is for a symbol the argument did not name exactly
+    /// (<see cref="ByTrailingName"/>), or null.
+    /// </summary>
+    public string? Warning { get; init; }
 }
 
 /// <summary>
@@ -136,16 +154,53 @@ public static class SymbolResolver
     private static readonly string[] MemberKeyPrefixes = ["M:", "P:", "F:", "E:"];
 
     /// <summary>Resolves <paramref name="input"/> within <paramref name="store"/>'s scope.</summary>
+    /// <remarks>
+    /// Two forgiving steps apply only to an argument that would otherwise not resolve: an argument holding HTML
+    /// entities (<c>List&amp;lt;T&amp;gt;</c>) is read again decoded; and a qualified name that matches nothing is read
+    /// by its trailing <c>Type.Member</c> (keeping its parameter list), then by its trailing <c>Type</c> (types only).
+    /// A trailing reading that matches exactly one symbol resolves to it with <see cref="SymbolLookup.Warning"/> set;
+    /// one that matches several leaves the lookup not found, with those symbols as its first suggestions. A member is
+    /// never looked up by its simple name alone, and a name that matched as written but was filtered out by its
+    /// parameter list, kind or scope is never read by its trailing name.
+    /// </remarks>
     public static SymbolLookup Lookup(
         SymbolStore store, ProjectStore projects, string? input, SymbolLookupOptions? options = null)
     {
         options ??= SymbolLookupOptions.Any;
         var constructorsOnly = options.Kinds is { Count: 1 } kinds && kinds.Contains(SymbolKind.Constructor);
-        var query = SymbolQuery.Parse(input, constructorsOnly);
+        var attempt = Evaluate(store, projects, SymbolQuery.Parse(input, constructorsOnly), options, exactKeys: true);
+        if (attempt.Found is { } found)
+            return found;
+        if (SymbolQuery.Unescape(input) is { } decoded)
+        {
+            var second = Evaluate(store, projects, SymbolQuery.Parse(decoded, constructorsOnly), options, exactKeys: true);
+            if (second.Found is { } decodedFound)
+                return decodedFound;
+            if (!second.Invalid || attempt.Invalid)
+                attempt = second;
+        }
+        if (attempt.Invalid)
+            return new SymbolLookup { Status = SymbolLookupStatus.Invalid, Query = attempt.Query, Options = options };
+        return ByTrailingName(store, projects, attempt, options);
+    }
 
+    // One reading of the argument, before the forgiving steps: what it found (resolved or ambiguous), or why not.
+    private sealed class Attempt
+    {
+        public required SymbolQuery Query { get; init; }
+        public SymbolLookup? Found { get; init; }
+        public bool Invalid { get; init; }
+        public List<SymbolInfo> ParameterMisses { get; init; } = [];
+        public List<(SymbolInfo Row, MatchScore Score)> KindMisses { get; init; } = [];
+        public List<(SymbolInfo Row, MatchScore Score)> ScopeMisses { get; init; } = [];
+    }
+
+    private static Attempt Evaluate(
+        SymbolStore store, ProjectStore projects, SymbolQuery query, SymbolLookupOptions options, bool exactKeys)
+    {
         var rows = new Dictionary<long, SymbolInfo>();
         var exactIds = new HashSet<long>();
-        foreach (var key in ExactKeys(query))
+        foreach (var key in exactKeys ? ExactKeys(query) : [])
         {
             foreach (var row in store.GetBySymbolKeyInScope(key))
             {
@@ -154,7 +209,7 @@ public static class SymbolResolver
             }
         }
         if (query.Error is not null && rows.Count == 0)
-            return new SymbolLookup { Status = SymbolLookupStatus.Invalid, Query = query, Options = options };
+            return new Attempt { Query = query, Invalid = true };
         foreach (var form in query.Forms)
         {
             foreach (var row in Retrieve(store, form))
@@ -193,10 +248,9 @@ public static class SymbolResolver
 
         if (accepted.Count == 0)
         {
-            var suggestions = Suggest(store, query, options, parameterMisses, kindMisses, scopeMisses);
-            return new SymbolLookup
+            return new Attempt
             {
-                Status = SymbolLookupStatus.NotFound, Query = query, Options = options, Suggestions = suggestions
+                Query = query, ParameterMisses = parameterMisses, KindMisses = kindMisses, ScopeMisses = scopeMisses
             };
         }
 
@@ -223,22 +277,95 @@ public static class SymbolResolver
 
         if (topCount > 1)
         {
-            return new SymbolLookup
+            return new Attempt
             {
-                Status = SymbolLookupStatus.Ambiguous, Query = query, Options = options, Matches = byKey,
-                TopMatchCount = topCount
+                Query = query,
+                Found = new SymbolLookup
+                {
+                    Status = SymbolLookupStatus.Ambiguous, Query = query, Options = options, Matches = byKey,
+                    TopMatchCount = topCount
+                }
             };
         }
 
         var symbol = byKey[0];
         var sameKey = accepted.Where(a => a.Row.SymbolKey == symbol.SymbolKey).Select(a => a.Row).ToList();
-        return new SymbolLookup
+        return new Attempt
         {
-            Status = SymbolLookupStatus.Resolved, Query = query, Options = options, Symbol = symbol, Matches = byKey,
-            TopMatchCount = 1,
-            Ambiguity = sameKey.Count > 1 ? SameKeyAmbiguity(store, projects, symbol, sameKey) : null
+            Query = query,
+            Found = new SymbolLookup
+            {
+                Status = SymbolLookupStatus.Resolved, Query = query, Options = options, Symbol = symbol, Matches = byKey,
+                TopMatchCount = 1,
+                Ambiguity = sameKey.Count > 1 ? SameKeyAmbiguity(store, projects, symbol, sameKey) : null
+            }
         };
     }
+
+    // A qualified name that matched nothing, read by its trailing `Type.Member`, then (only when that matches nothing)
+    // by its trailing `Type`. Exactly one match resolves, with a warning naming it; several are offered first. A name
+    // that DID match as written but was filtered out by its parameter list, kind or scope names a real symbol, so it is
+    // never read by its trailing name: the reasoned not-found (which names that symbol and why) is the answer.
+    private static SymbolLookup ByTrailingName(
+        SymbolStore store, ProjectStore projects, Attempt attempt, SymbolLookupOptions options)
+    {
+        var query = attempt.Query;
+        var matchedAsWritten =
+            attempt.ParameterMisses.Count > 0 || attempt.KindMisses.Count > 0 || attempt.ScopeMisses.Count > 0;
+        IReadOnlyList<SymbolInfo> trailing = [];
+        foreach (var derive in matchedAsWritten ? [] : TrailingReadings(options))
+        {
+            if (derive(query) is not { } derived
+                || Evaluate(store, projects, derived, options, exactKeys: false).Found is not { } found)
+                continue;
+            if (found.Matches.Count == 1)
+            {
+                var symbol = found.Symbol!;
+                return new SymbolLookup
+                {
+                    Status = SymbolLookupStatus.Resolved, Query = query, Options = options, Symbol = symbol,
+                    Matches = found.Matches, TopMatchCount = 1, Ambiguity = found.Ambiguity, ByTrailingName = true,
+                    Warning = $"No symbol is named '{query.Raw.Trim()}'; resolved its trailing name to " +
+                              $"{Describe(new SymbolNamer(store), symbol)}."
+                };
+            }
+            trailing = found.Matches;
+            break;
+        }
+
+        var suggestions = new List<SymbolSuggestion>();
+        if (!options.SkipSuggestions)
+        {
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var row in trailing.Take(MaxSuggestions))
+            {
+                if (seen.Add(row.SymbolKey))
+                    suggestions.Add(new SymbolSuggestion(row, null));
+            }
+            if (suggestions.Count < MaxSuggestions)
+            {
+                foreach (var suggestion in Suggest(store, query, options, attempt.ParameterMisses, attempt.KindMisses,
+                             attempt.ScopeMisses))
+                {
+                    if (suggestions.Count < MaxSuggestions && seen.Add(suggestion.Symbol.SymbolKey))
+                        suggestions.Add(suggestion);
+                }
+            }
+        }
+        return new SymbolLookup
+        {
+            Status = SymbolLookupStatus.NotFound, Query = query, Options = options, Suggestions = suggestions
+        };
+    }
+
+    // The trailing readings tried, in order: `Type.Member`, then `Type` unless the tool accepts no type.
+    private static IEnumerable<Func<SymbolQuery, SymbolQuery?>> TrailingReadings(SymbolLookupOptions options)
+    {
+        yield return q => q.TrailingMember();
+        if (options.Kinds is null || options.Kinds.Overlaps(SymbolQuery.TypeKinds))
+            yield return q => q.TrailingType();
+    }
+
 
     // The stored keys the argument may spell exactly: its documentation ID or src:/meta: key, and (for an index whose
     // keys are display names, from before documentation-ID keys) the argument itself with and without `global::`.

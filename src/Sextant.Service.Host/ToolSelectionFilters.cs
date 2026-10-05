@@ -22,7 +22,13 @@ internal enum ToolSelectionSource
     Header,
 
     /// <summary>The reserved <c>repository</c> tool argument, canonicalized by the SVC-5 URL policy.</summary>
-    Argument
+    Argument,
+
+    /// <summary>
+    /// Inferred by <see cref="RepositoryInferenceFilter"/>: the call named none, and its symbol or path argument is held
+    /// by exactly one repository the verified caller can read.
+    /// </summary>
+    Inferred
 }
 
 /// <summary>
@@ -310,6 +316,6 @@ internal static class ToolSelectionFilters
     private static SelectionOutcome Fail(string code, string message) =>
         new(null, ResponseBuilder.BuildError(code, message));
 
-    private static CallToolResult ErrorResult(string body) =>
+    internal static CallToolResult ErrorResult(string body) =>
         new() { IsError = true, Content = [new TextContentBlock { Text = body }] };
 }
