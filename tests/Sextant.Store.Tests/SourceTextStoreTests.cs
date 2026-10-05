@@ -105,7 +105,7 @@ public class SourceTextStoreTests
     }
 
     [TestMethod]
-    public void DeleteUnreferenced_KeepsReferencedBlobs_DeletesOrphansUpToTheMax_AndAllTempFiles()
+    public void DeleteUnreferenced_KeepsReferencedBlobs_DeletesOrphansUpToTheMax_AndTempFiles()
     {
         var store = new SourceTextStore(_root);
         var kept = Bytes("class Kept { }");
@@ -114,11 +114,11 @@ public class SourceTextStoreTests
             store.Put(SHA256.HashData(content), content);
         var temp = Path.Combine(Path.GetDirectoryName(BlobPath(kept))!, "crashed.write.tmp");
         File.WriteAllText(temp, "partial");
-        var referenced = new HashSet<string> { Convert.ToHexStringLower(SHA256.HashData(kept)) };
+        var referenced = new HashSet<UInt128> { SourceTextStore.SweepKey(SHA256.HashData(kept)) };
 
         Assert.AreEqual(2, store.DeleteUnreferenced(referenced, maxDeletes: 2), "at most maxDeletes blobs go per pass");
-        Assert.IsFalse(File.Exists(temp), "a leftover temp file is always swept");
         Assert.AreEqual(1, store.DeleteUnreferenced(referenced, maxDeletes: 10));
+        Assert.IsFalse(File.Exists(temp), "a pass that walks the whole store sweeps a leftover temp file");
         Assert.AreEqual(0, store.DeleteUnreferenced(referenced, maxDeletes: 10));
 
         CollectionAssert.AreEqual(kept, store.TryGet(SHA256.HashData(kept)));
@@ -127,7 +127,7 @@ public class SourceTextStoreTests
 
     [TestMethod]
     public void DeleteUnreferenced_NoStoreYet_DeletesNothing() =>
-        Assert.AreEqual(0, new SourceTextStore(_root).DeleteUnreferenced(new HashSet<string>(), maxDeletes: 10));
+        Assert.AreEqual(0, new SourceTextStore(_root).DeleteUnreferenced(new HashSet<UInt128>(), maxDeletes: 10));
 
     [TestMethod]
     public void FileStore_StoresTheHashedBytes_AndReportsEveryReferencedHash()
@@ -160,9 +160,9 @@ public class SourceTextStoreTests
             Assert.AreEqual(2, Directory.EnumerateFiles(texts.Root, "*.br", SearchOption.AllDirectories).Count(),
                 "a missing file stores nothing");
 
-            var referenced = files.ReferencedContentHashes();
+            var referenced = files.ReferencedSourceTextKeys();
             Assert.AreEqual(3, referenced.Count, "the missing file's placeholder hash is referenced too");
-            Assert.IsTrue(referenced.Contains(Convert.ToHexStringLower(capturedHash)));
+            Assert.IsTrue(referenced.Contains(SourceTextStore.SweepKey(capturedHash)));
         }
         finally
         {

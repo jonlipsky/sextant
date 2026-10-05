@@ -1883,7 +1883,8 @@ public sealed partial class SnapshotService : IDisposable
             () => Task.FromResult(RunRetentionLocked(execute, principal)), cancellationToken).ConfigureAwait(false);
     }
 
-    // Bounds one retention pass's source-text deletes, so a large backlog cannot hold the writer for long.
+    // Bounds one retention pass's source-text deletes (the sweep stops walking there), so a large backlog is reclaimed
+    // over several passes instead of holding the writer for one long one.
     private const int MaxSourceTextDeletesPerPass = 100_000;
 
     private RetentionReport RunRetentionLocked(bool execute, AuditCaller principal)
@@ -1897,7 +1898,7 @@ public sealed partial class SnapshotService : IDisposable
             report = report with
             {
                 SourceTextsDeleted = SourceTexts.DeleteUnreferenced(
-                    new FileStore(_conn).ReferencedContentHashes(), MaxSourceTextDeletesPerPass)
+                    new FileStore(_conn).ReferencedSourceTextKeys(), MaxSourceTextDeletesPerPass)
             };
         // Service-wide audit row (no single repository scope). Records the operator + whether it was a
         // dry-run plan or an executed GC pass (criterion 5, audit).

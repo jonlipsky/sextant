@@ -101,8 +101,10 @@ public sealed class SourceContextRetriever(FileStore files, SourceTextStore? tex
             return null;
 
         // The stored text is verified against the same hash, so it is exactly the indexed version whatever the
-        // working tree now holds (issue #244).
-        if (texts?.TryGet(stored) is { } indexed)
+        // working tree now holds (issue #244). It is read only for a project indexed from a checkout here (it has a
+        // disk path), whose hashes this service computed over bytes it read. A contributed project's hashes come from
+        // the client (imported with no disk path), so one naming another repository's file must not read its text.
+        if (texts != null && files.GetRepoRoot(projectId) != null && texts.TryGet(stored) is { } indexed)
             return DecodeLines(indexed);
 
         // File.Exists first: a file missing at index time stores a placeholder hash that a still-missing

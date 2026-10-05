@@ -291,19 +291,19 @@ public sealed class FileStore(SqliteConnection connection)
     }
 
     /// <summary>
-    /// The lowercase hex of every content hash a file version records, i.e. every stored source text
-    /// (<see cref="SourceTextStore"/>) some indexed file still needs.
+    /// The <see cref="SourceTextStore.SweepKey"/> of every content hash a file version records, i.e. of every stored
+    /// source text some indexed file still needs. One scan, deduplicated in memory as 16-byte keys.
     /// </summary>
-    public HashSet<string> ReferencedContentHashes()
+    public HashSet<UInt128> ReferencedSourceTextKeys()
     {
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = "SELECT DISTINCT content_hash FROM file_versions;";
-        var hashes = new HashSet<string>(StringComparer.Ordinal);
+        cmd.CommandText = "SELECT content_hash FROM file_versions;";
+        var keys = new HashSet<UInt128>();
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
-            if (reader[0] is byte[] hash)
-                hashes.Add(Convert.ToHexStringLower(hash));
-        return hashes;
+            if (reader[0] is byte[] { Length: >= 16 } hash)
+                keys.Add(SourceTextStore.SweepKey(hash));
+        return keys;
     }
 
     /// <summary>Raw SHA-256 of the on-disk file, or a stable path-derived placeholder when absent.</summary>
