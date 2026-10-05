@@ -10,7 +10,6 @@ using Sextant.Service;
 using Sextant.Service.CallerIdentity;
 using Sextant.Service.Grants;
 using Sextant.Service.Observability;
-using Sextant.Service.Search;
 using Sextant.Store;
 
 namespace Sextant.Service.Host;
@@ -152,7 +151,6 @@ public static class ServiceApp
                     options.RepositoryUrlPolicy, RepositoryScopedTools,
                     selectionRequired: options.RequireRepositorySelection,
                     implicitSelection: options.DelegateTokens.Count > 0))
-                .AddListToolsFilter(SearchSymbolsTool.ListToolsFilter())
                 .AddCallToolFilter(ToolSelectionFilters.CallToolFilter(options.RepositoryUrlPolicy, RepositoryScopedTools))
                 // A tool result carrying a structured meta.error is an MCP tool error (isError: true), so a client
                 // never mistakes a failed call for an empty answer (issue #163). It reads the presented text below,
@@ -171,10 +169,10 @@ public static class ServiceApp
     internal const string ServerInstructions =
         "Sextant answers .NET code questions from a Roslyn index. Use it instead of grep or reading files " +
         "to find declarations, references, callers, implementations, type hierarchies, members and file outlines. " +
-        "Pass `repository` (owner/repo or host/owner/repo) on each call; list_repositories shows what you can read, " +
-        "and search_symbols searches all of them by name. Paths are repository-relative (src/App/Foo.cs). Large " +
-        "results are paged: read meta.total and the summary, narrow with scope (file:, project:, solution:) or pass " +
-        "meta.next_cursor. A meta.snapshot.warning means results may be incomplete.";
+        "Pass `repository` (owner/repo or host/owner/repo) on each call; list_repositories shows what you can read. " +
+        "Paths are repository-relative (src/App/Foo.cs). Large results are paged: read meta.total and the summary, " +
+        "narrow with scope (file:, project:, solution:) or pass meta.next_cursor. A meta.snapshot.warning means " +
+        "results may be incomplete.";
 
     /// <summary>
     /// The tool types exposed over the remote HTTP MCP surface: the tools coding agents actually call, as measured by
@@ -183,9 +181,8 @@ public static class ServiceApp
     /// assembly-wide set. This is the ONE place the remote set is decided: the selection filter and every test of the
     /// surface read it, so changing the set is a change to this list (plus the docs).
     /// Every index-query tool takes a <see cref="DatabaseProvider"/> and enters through
-    /// <c>TryBeginRead</c> (fail-closed authz + scope); the two exceptions, <see cref="ListRepositoriesTool"/> and
-    /// <see cref="SearchSymbolsTool"/>, answer only a verified caller and read only what that caller's grants make
-    /// visible.
+    /// <c>TryBeginRead</c> (fail-closed authz + scope); the one exception, <see cref="ListRepositoriesTool"/>, answers
+    /// only a verified caller and reads only what that caller's grants make visible.
     /// This is a default-deny ALLOWLIST: a newly added tool is never exposed remotely until it is added here, and
     /// every text the remote surface sends (descriptions, instructions, warnings, errors) may name only these tools
     /// (<c>RemoteToolSurfaceGuardTests</c>). Local-only tools that bypass or out-scope the read gate must never be
@@ -202,9 +199,7 @@ public static class ServiceApp
         typeof(GetFileSymbolsTool),
         // SVC-4: a service-only tool over the caller's grants (no index read, so no TryBeginRead gate); it answers
         // only a verified caller and lists only the repositories that caller may read.
-        typeof(ListRepositoriesTool),
-        // SVC-F: a service-only search across the caller's visible snapshots, re-resolved from its grants on every call.
-        typeof(SearchSymbolsTool)
+        typeof(ListRepositoriesTool)
     ];
 
     /// <summary>

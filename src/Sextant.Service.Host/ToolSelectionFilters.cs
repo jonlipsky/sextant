@@ -84,12 +84,10 @@ internal static class ToolSelectionFilters
 
     /// <summary>
     /// Tools on the remote surface that are NOT repository-scoped, so the reserved arguments are neither advertised
-    /// nor stripped for them: <c>list_repositories</c> (SVC-4) reads the caller's grants, not one index, and
-    /// <c>search_symbols</c> (SVC-F) searches every visible repository and declares its own <c>repository</c> and
-    /// <c>branch</c> narrowing arguments.
+    /// nor stripped for them: <c>list_repositories</c> (SVC-4) reads the caller's grants, not one index.
     /// </summary>
     internal static readonly IReadOnlySet<string> SelectionExemptTools =
-        new HashSet<string>(StringComparer.Ordinal) { "list_repositories", "search_symbols" };
+        new HashSet<string>(StringComparer.Ordinal) { "list_repositories" };
 
     private static readonly string[] ReservedArguments = [RepositoryArgument, BranchArgument];
 

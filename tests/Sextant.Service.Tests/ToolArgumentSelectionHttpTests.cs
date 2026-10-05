@@ -41,19 +41,12 @@ public class ToolArgumentSelectionHttpTests
         var tools = (await host.RpcAsync("tools/list", "{}")).GetProperty("tools").EnumerateArray().ToList();
 
         Assert.AreEqual(ServiceApp.RepositoryScopedTools.Count + ToolSelectionFilters.SelectionExemptTools.Count, tools.Count,
-            "every remote tool is repository-scoped except the selection-exempt ones (list_repositories, search_symbols)");
+            "every remote tool is repository-scoped except the selection-exempt list_repositories");
         foreach (var tool in tools)
         {
             var name = tool.GetProperty("name").GetString()!;
             if (ToolSelectionFilters.SelectionExemptTools.Contains(name))
             {
-                if (name == Sextant.Service.Search.SearchSymbolsTool.ToolName)
-                {
-                    // search_symbols declares its own repository/branch narrowing: its schema is exactly its own.
-                    Assert.AreEqual(Sextant.Service.Search.SearchSymbolsTool.InputSchema.GetRawText(),
-                        tool.GetProperty("inputSchema").GetRawText(), name);
-                    continue;
-                }
                 var exemptProperties = tool.GetProperty("inputSchema").TryGetProperty("properties", out var p) ? p : default;
                 Assert.IsFalse(exemptProperties.ValueKind == JsonValueKind.Object && exemptProperties.TryGetProperty("repository", out _), name);
                 continue;

@@ -8,8 +8,8 @@ the distributed-indexing initiative was built toward.
 It lives in two projects that depend on the core libraries — **never the reverse**:
 
 - **`Sextant.Service`** — the data-plane library: the `SnapshotService` control core, service contracts,
-  on-disk volume management, caller identity, repository grants, and the service-only MCP tools
-  (`list_repositories`, `search_symbols`). It references `Sextant.Core`, `Sextant.Store`, `Sextant.Indexer`
+  on-disk volume management, caller identity, repository grants, and the service-only MCP tool
+  `list_repositories`. It references `Sextant.Core`, `Sextant.Store`, `Sextant.Indexer`
   and `Sextant.Mcp`.
 - **`Sextant.Service.Host`** — the ASP.NET Core composition root: the HTTP surface, auth middleware, and
   MCP transport. It references only `Sextant.Service` (and reaches `Sextant.Mcp` through it). The CLI's
@@ -89,9 +89,7 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_CALLER_APPS` | Optional comma-separated allow-list on the signed `app` claim (exact, case-sensitive match). ProcessStack fills `app` with the calling application's **id** (a ULID such as `01M389V5MBGQKSF18HC2EGC3FY`; see [Production deployment checklist](#production-deployment-checklist-gateways) for how to find it), not its slug or name, so list ids here. A slug makes every assertion-bearing call fail with `caller_not_allowed`, while health, discovery and connection tests still succeed | none (any app) |
 | `SEXTANT_SERVICE_MAX_GRANTS_PER_PRINCIPAL` | Most repository grants one user caller may hold in a tenant (see [Repository grants](#repository-grants-and-visibility-svc-4)); creating one more is `409 grant_limit`. The tenant-wide `'*'` grants are not counted. A missing or non-positive value uses the default | `200` |
 | `SEXTANT_SERVICE_MAX_GRANTS_PER_TENANT` | Most repository grant rows a tenant may hold, tenant-wide grants included; creating one more is `409 grant_limit` | `5000` |
-| `SEXTANT_SERVICE_SEARCH_MAX_WIDTH` | Most snapshots one [`search_symbols`](#search_symbols-svc-f) call reads (round-robin over the tracked ones); the rest are listed in `truncated` and searched on later pages. Values above `100` are clamped to `100` (the most snapshots a search tracks at once, which keeps a cursor within 16 KiB); a missing or non-positive value uses the default | `50` |
-| `SEXTANT_SERVICE_SEARCH_MAX_HITS` | Most symbols one [`search_symbols`](#search_symbols-svc-f) call returns in all; the snapshots it reads share it evenly (each still gets at least one row, so the round-robin is unchanged), and what a snapshot did not return is searched on its next turn. Clamped to `100`–`5000`; a missing or non-positive value uses the default | `500` |
-| `SEXTANT_SERVICE_MAX_RESPONSE_CHARS` | Character budget of one `/mcp` tool result, measured on the text the caller receives. A paged tool cuts its page at the last row that fits and returns `meta.next_cursor` with `meta.page_truncated_by: "size"`; an unpaged one keeps the leading rows and says to narrow the query (see [mcp-tools.md](mcp-tools.md#response-size-budget)). At least `1000`; a missing or non-positive value uses the default. `search_symbols` applies it too, after its `SEARCH_MAX_HITS` cap | `20000` |
+| `SEXTANT_SERVICE_MAX_RESPONSE_CHARS` | Character budget of one `/mcp` tool result, measured on the text the caller receives. A paged tool cuts its page at the last row that fits and returns `meta.next_cursor` with `meta.page_truncated_by: "size"`; an unpaged one keeps the leading rows and says to narrow the query (see [mcp-tools.md](mcp-tools.md#response-size-budget)). At least `1000`; a missing or non-positive value uses the default. | `20000` |
 | `SEXTANT_SERVICE_BIND_ADDRESS` | Network interface the HTTP surface binds to | `localhost` |
 | `SEXTANT_SERVICE_CONTROL_PORT` | HTTP port | `3011` |
 | `SEXTANT_SERVICE_QUERY_PORT` | Optional dedicated query port (shares the control port when unset) | none (shared) |
@@ -815,7 +813,7 @@ per call through two reserved arguments. The service adds them in MCP request fi
 
 - **`tools/list`** advertises two string arguments, `repository` and `branch`, on every
   repository-scoped remote tool (every tool on the remote allowlist except `list_repositories`, which reads no
-  index, and `search_symbols`, which declares its own `repository`/`branch` narrowing arguments). The
+  index). The
   `repository` description says "Optional" only when omitting it can read something: with
   `REQUIRE_REPOSITORY_SELECTION` on it says "Required", and with delegate tokens configured it states the one case
   in which a verified caller may omit it (implicit selection, below). A tool that already declares an
@@ -840,12 +838,11 @@ The filter errors are MCP tool errors (`isError: true`) whose text is the usual 
 
 The remote tools answer an agent, so every response is shaped to fit its context:
 
-- **Agent tools.** `/mcp` lists only the tools agents call (`ServiceApp.RemoteQueryTools`, S12): `find_symbol`,
+- **Eight tools.** `/mcp` lists only the tools agents call (`ServiceApp.RemoteQueryTools`, S12): `find_symbol`,
   `find_references`, `get_call_hierarchy`, `get_implementors`, `get_type_hierarchy`, `get_type_members`,
-  `get_file_symbols` and `list_repositories`, plus the service-only [`search_symbols`](#search_symbols-svc-f).
-  The other index tools (`get_index_status`, `semantic_search`,
+  `get_file_symbols` and `list_repositories`. The other index tools (`get_index_status`, `semantic_search`,
   `get_api_surface`, …) stay on the local stdio server only, and nothing the remote surface sends names them:
-  descriptions, the `initialize` instructions, warnings, errors and size-cut messages point only at that list.
+  descriptions, the `initialize` instructions, warnings, errors and size-cut messages point only at the eight.
   `project_id`, `include_projects` and `project:` scopes take the `project_id` that `find_symbol`,
   `get_file_symbols` and `get_type_members` print (`in_project_id` on a `find_references` row).
   `RemoteToolSurfaceGuardTests` pins the list and the texts through the real host, and scans every string
@@ -1021,93 +1018,13 @@ every visible repository, with its catalog branches plus any granted branch not 
 arguments and is exempt from the reserved `repository`/`branch` arguments. A request with no verified caller
 gets the tool error `caller_required`.
 
-### `search_symbols` (SVC-F)
+### `search_symbols` (removed in S12)
 
-`search_symbols` is a service-only MCP tool on `/mcp` (the local stdio server does not register it). It searches
-symbol names across every repository the verified caller can see under its [grants](#repository-grants-and-visibility-svc-4):
-a user caller sees its own grants plus the tenant-wide ones, and an application caller sees the tenant-wide ones only.
-A request with no verified caller (a plain query token) gets the tool error `caller_required` and reads nothing.
-
-| Argument | Type | Rule |
-|---|---|---|
-| `name_prefix` | string, **required** | Case-insensitive (ASCII) literal prefix of the symbol's name (`display_name`); `%`, `_` and `\` match themselves. Trimmed; 1–256 characters |
-| `repository` | string? | Search only this repository: `https://{host}/{owner}/{repo}`, `{host}/{owner}/{repo}` or, with one host in `REPOSITORY_HOSTS`, `{owner}/{repo}`, under the [URL policy](#repository-url-policy-svc-5). A repository the caller cannot see is the same `no_visible_repositories` error as one that does not exist |
-| `branch` | string? | Search only this branch. Visibility is repository-level, so it can name any indexed branch of a visible repository. Absent = every **granted** branch (a default-branch grant searches the default branch) |
-| `kind` | string? | Only symbols of this kind: a lowercase `SymbolKind` name such as `class`, `method` or `typeparameter` |
-| `cursor` | string? | The previous page's `next_cursor`, passed back with the same other arguments |
-| `limit` | int? | The most symbols read from each snapshot per page; default 50, clamped to 1–200. The call's total is also capped by `SEARCH_MAX_HITS` (default 500), shared by the snapshots the page reads |
-
-The schema has `additionalProperties: false`, so an unknown argument is an error. The tool is exempt from the
-[reserved selector arguments](#reserved-tool-arguments-svc-2) and ignores the `X-Sextant-Repository` header: its
-own `repository`/`branch` narrow the search, and neither can widen it beyond the caller's grants.
-
-**Result.** A text block and the same JSON as `structuredContent`:
-
-```json
-{
-  "symbols": [{"repository": "...", "branch": "main", "identity_hash": "...", "symbol_key": "...",
-               "name": "TypeA", "fully_qualified_name": "global::App.TypeA", "kind": "class",
-               "accessibility": "public", "project": "..."}],
-  "next_cursor": "...",
-  "pending": [{"repository": "...", "branch": ""}],
-  "unavailable": [{"repository": "...", "branch": "main"}],
-  "truncated": [{"repository": "...", "branch": "main"}],
-  "meta": {"queried_at": 0, "index_freshness": 0, "result_count": 1}
-}
-```
-
-- `kind` and `accessibility` are **names**, rendered as the local tools render them. (The snapshot page
-  `/query/snapshots/{identityHash}/symbols` still emits them as integers.)
-- `pending` lists granted branches with no complete snapshot yet (`branch` is `""` when the default branch is
-  not known yet). `unavailable` lists branches whose snapshot could not be read on this call; they keep their
-  place in the cursor and are retried on a later page (within the same round-robin bound). `truncated` lists
-  branches not read on this call because of `SEARCH_MAX_WIDTH`, or left out of a page cut by the response size
-  budget; they are searched on later pages.
-- Branches that share one snapshot are searched once, labeled with the first (repository, branch) in order.
-- `next_cursor` is always present, and is `null` once every snapshot is exhausted.
-
-**Paging.** Targets are deduplicated by snapshot identity hash. Up to 100 snapshots are tracked at a time, in hash
-order. Each call reads at most `SEARCH_MAX_WIDTH` of them, round-robin: a page continues in hash order after the
-last snapshot the previous page read, and once it reaches the end the next page starts a new round from the lowest
-hash. A snapshot that has not been searched yet joins, as tracked ones are exhausted, at the end of a round. So a
-snapshot with many matches never keeps the others waiting: with V visible snapshots, each tracked one is read at
-least once every ⌈min(V, 100) / `SEARCH_MAX_WIDTH`⌉ pages. Each page reads up to `limit` rows from each snapshot
-it reads, and at most `SEARCH_MAX_HITS` rows in all, shared evenly by those snapshots. It orders them by name, then
-identity hash, then row. A page can return fewer symbols than it could (with a `kind` filter, even none) and still
-have a `next_cursor`: keep paging until it is `null`. While the grants and branch heads do not change,
-walking every page returns every match exactly once.
-
-**Size.** A page's text also stays under `SEXTANT_SERVICE_MAX_RESPONSE_CHARS` (20,000 by default; see
-[mcp-tools.md](mcp-tools.md#response-size-budget)). A page over it keeps, from each snapshot it read, the first
-symbols of that snapshot's own page, so the snapshot resumes at the first one left out; if one symbol from each is
-still too much, it keeps as many of the first snapshots of its turn as fit, and the others with matches are listed
-in `truncated` and read first on the next page (a snapshot with no match is never held back). Such a page has `meta.page_truncated_by: "size"` and a top-level `message`. A size cut can
-make a round take more pages than the bound above (each page then returns fewer snapshots than
-`SEARCH_MAX_WIDTH`), but the round-robin order is kept, so no snapshot is starved. The `pending`, `unavailable`
-and `truncated` lists and the cursor are never cut, and at least one symbol is always returned.
-
-The cursor is opaque
-base64url JSON of at most 16 KiB. It carries each snapshot's position, and a digest binds it to the tenant, the
-caller and the query arguments other than `limit`. A tampered or oversized cursor, or one issued to another caller,
-tenant or query, gets `invalid_cursor`, and so does a cursor from a Sextant before issue #196 (restart the search).
-The digest is not an authorization control. Every call reads the caller's
-grants again, so a revoked grant stops being searched on the next page, and a cursor naming a snapshot the caller
-cannot see is treated exactly like one naming a snapshot that does not exist.
-
-**Cost.** One call is bounded, whatever the size of the snapshots (issue #196):
-- Each snapshot's page seeks the prefix's range in a name index (`ix_symbols_project_name_nocase`, migration
-  `025`), so a prefix that matches nothing costs a few index lookups per snapshot, never a scan.
-- The call returns at most `SEARCH_MAX_HITS` symbols.
-- With a `kind` filter, it examines at most 8192 rows in all.
-- The caller's repositories are found by one indexed query over the caller's own grants.
-- If the client disconnects or cancels the request, the search stops: before its next snapshot, at the next row it
-  reads, or by interrupting the SQLite statement that is running. The read connection is released cleanly.
-
-**Errors** (all tool errors): `caller_required`, `invalid_arguments` (a missing or blank `name_prefix`, a wrong
-type, an unknown argument or `kind`), `invalid_selector` (a `repository` the URL policy refuses),
-`invalid_cursor`, and `no_visible_repositories` (nothing to search: no grants, or an explicit `repository` or
-`branch` that matches nothing visible). A failure to read the grants fails the call; it is never presented as
-`no_visible_repositories` or as an unscoped search.
+The service-only `search_symbols` tool (SVC-F: a grant-scoped name-prefix search across every visible
+repository) is gone, with its `SEXTANT_SERVICE_SEARCH_MAX_WIDTH`/`SEARCH_MAX_HITS` settings (now ignored).
+To find a declaration, call `find_symbol` (`fuzzy: true` for a full-text search) in the repository you name;
+`list_repositories` still lists what a caller can read. Migration `025`'s name index stays, because the symbol
+resolver seeks it too; its repository-URL index is now unused but kept (dropping it would need a migration).
 
 ### User callers on the control plane (issue #193)
 
@@ -1901,7 +1818,8 @@ branch-head advance on the ensure path (Phase 14, issue #84); `022_snapshot_cove
 per-snapshot `snapshot_coverage` record (issue #119); `023_partial_occurrence_source_index.sql` rebuilds
 `ix_occ_source` as a partial index over call edges only (issue #160); `024_repository_grants.sql` adds the
 `repository_grants` table behind per-caller visibility (SVC-4); `025_symbol_name_prefix_index.sql` adds the
-`NOCASE` name and repository-URL indexes that bound `search_symbols` (issue #196); `026_symbol_declaration.sql`
+`NOCASE` name and repository-URL indexes that bound `search_symbols` (issue #196; the tool was removed in S12,
+and the resolver still uses the name index); `026_symbol_declaration.sql`
 adds `symbols.declaration`, the member declaration the MCP `signature` shows. All are additive/forward-only. See
 [`schema.md`](schema.md) for the table definitions. `LatestSchemaVersion` auto-derives from the highest
 migration and is **26**. Snapshot identities fold `SnapshotSchemaVersion` instead, which skips identity-neutral
@@ -1917,8 +1835,7 @@ migration and is **26**. Snapshot identities fold `SnapshotSchemaVersion` instea
 > `/control/resolve`'s `branch` and `commit_sha`, and that commit as `expected_head_commit`).
 > Deploy at low traffic, watch CPU, disk and the ensure queue while the re-index runs, and check that queries
 > keep answering meanwhile. Migration `025` is identity-neutral, so upgrading from 24 to 25 re-indexes
-> nothing. (A `search_symbols` cursor issued by a build before SX-7b answers `invalid_cursor`, because the
-> cursor is now v2; the client re-queries.)
+> nothing.
 
 > **One-time full re-index when upgrading to schema 26.** Migration `026` stores a new column, and
 > `AnalyzerVersion` is `5`, so `SnapshotSchemaVersion` moves from 24 to 26 and every snapshot identity changes

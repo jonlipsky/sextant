@@ -3,11 +3,10 @@
 Sextant exposes its index through MCP (Model Context Protocol) tools. The MCP server reads from the SQLite database directly and does not depend on the daemon being running.
 
 The local stdio server (and `sextant serve`) registers every tool below. The index service's remote `/mcp` lists
-the eight tools agents use: `find_symbol`, `find_references`, `get_call_hierarchy`, `get_implementors`,
-`get_type_hierarchy`, `get_type_members`, `get_file_symbols` and `list_repositories` (S12), plus the service-only
-`search_symbols`. Nothing the remote surface sends (tool and parameter descriptions, the `initialize` instructions,
-warnings, errors, messages) names a tool outside that list; `RemoteToolSurfaceGuardTests` checks that over HTTP and
-against the source.
+only the eight tools agents use: `find_symbol`, `find_references`, `get_call_hierarchy`, `get_implementors`,
+`get_type_hierarchy`, `get_type_members`, `get_file_symbols` and `list_repositories` (S12). Nothing the remote
+surface sends (tool and parameter descriptions, the `initialize` instructions, warnings, errors, messages) names a
+tool outside those eight; `RemoteToolSurfaceGuardTests` checks that over HTTP and against the source.
 
 ## Response Format
 
@@ -87,14 +86,6 @@ refused counted as more than 25,000 tokens, so 20,000 characters stays well insi
 - `get_base_snapshot_symbols` (local only) pages by the symbol id: a page cut by size returns the id of its last
   row as `meta.next_cursor`, with `meta.page_truncated_by: "size"` (it reports no `meta.total`).
 - At least one row is always returned, even if that row alone is over the budget.
-- `search_symbols` (service only) applies the budget after its hit cap (`SEARCH_MAX_HITS`). A page over it first
-  keeps fewer symbols from each repository read (each resumes at its first symbol left out), and if one symbol from
-  each is still too much it returns only as many of the first repositories of its turn as fit: the others with
-  matches are listed in `truncated` and are the first ones read on the next page (a repository with no match is
-  never held back). The page then has `meta.page_truncated_by: "size"` and a top-level
-  `message` ("…Pass next_cursor for the rest, or narrow with repository, branch or kind."). Its `pending`,
-  `unavailable` and `truncated` lists and its cursor are never cut, so a caller with very many repositories can
-  still get a page over the budget; narrow with `repository`.
 
 Result text is written without HTML escaping: `Task<int>`, not `Task\u003Cint\u003E`.
 
