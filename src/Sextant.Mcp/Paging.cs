@@ -29,8 +29,7 @@ public sealed record PageRequest(int Offset, int Limit, string Binding)
 /// <summary>
 /// Bounded results for the tools that can return hundreds of rows: a <c>limit</c> (default
 /// <see cref="DefaultLimit"/>, at most <see cref="MaxLimit"/>), an opaque <c>cursor</c> that resumes after the
-/// previous page (<c>meta.next_cursor</c>; <c>search_symbols</c> returns its own top-level <c>next_cursor</c>),
-/// and <c>meta.total</c>
+/// previous page (<c>meta.next_cursor</c>), and <c>meta.total</c>
 /// always. A cursor is base64url JSON <c>{v, o, b}</c>: its offset and a digest binding it to the tool, the
 /// query-shaping arguments and the pinned snapshot, so a cursor reused with other arguments, or after the
 /// index moved to a new snapshot, is <see cref="InvalidCursorCode"/> instead of resuming at a position that

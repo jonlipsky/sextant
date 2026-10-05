@@ -22,10 +22,7 @@ internal enum ToolSelectionSource
     Header,
 
     /// <summary>The reserved <c>repository</c> tool argument, canonicalized by the SVC-5 URL policy.</summary>
-    Argument,
-
-    /// <summary>A cross-repository tool's own <c>provider_repository_url</c> argument, as sent.</summary>
-    ProviderDefault
+    Argument
 }
 
 /// <summary>
@@ -85,25 +82,14 @@ internal static class ToolSelectionFilters
     /// <summary>The reason code for an <c>owner/repo</c> short form when the policy has no single host to expand it with.</summary>
     public const string ShortFormHostRequired = RepositoryUrlRejection.HostRequired;
 
-    /// <summary>The cross-repository tools' own argument naming the provider repository.</summary>
-    public const string ProviderRepositoryArgument = "provider_repository_url";
-
     /// <summary>
-    /// Tools on the remote surface that are NOT repository-scoped: they declare their own selection arguments,
-    /// so the reserved arguments are neither advertised nor stripped for them. A tool that spans repositories by
-    /// design belongs here: <c>list_repositories</c> (SVC-4) reads the caller's grants, not one index, and
+    /// Tools on the remote surface that are NOT repository-scoped, so the reserved arguments are neither advertised
+    /// nor stripped for them: <c>list_repositories</c> (SVC-4) reads the caller's grants, not one index, and
     /// <c>search_symbols</c> (SVC-F) searches every visible repository and declares its own <c>repository</c> and
     /// <c>branch</c> narrowing arguments.
     /// </summary>
     internal static readonly IReadOnlySet<string> SelectionExemptTools =
         new HashSet<string>(StringComparer.Ordinal) { "list_repositories", "search_symbols" };
-
-    /// <summary>
-    /// Cross-repository tools whose read gate otherwise names no repository. When the call must select one
-    /// and names none, the selection defaults to the tool's own <see cref="ProviderRepositoryArgument"/>.
-    /// </summary>
-    internal static readonly IReadOnlySet<string> ProviderScopedTools =
-        new HashSet<string>(StringComparer.Ordinal) { "find_cross_repository_usages", "find_submodule_consumers" };
 
     private static readonly string[] ReservedArguments = [RepositoryArgument, BranchArgument];
 
@@ -174,12 +160,9 @@ internal static class ToolSelectionFilters
                 ?? throw new InvalidOperationException("Per-call selection requires the request services.");
             var http = services.GetService<IHttpContextAccessor>()?.HttpContext
                 ?? throw new InvalidOperationException("Per-call selection requires the HTTP request.");
-            var provider = services.GetRequiredService<DatabaseProvider>();
 
             var reserved = reservedByTool.GetOrAdd(name, _ => ReservedArgumentsFor(tool.ProtocolTool));
-            var outcome = Resolve(
-                context.Params!.Arguments, reserved, name, ServiceApp.RepositoryHeaderValue(http), policy,
-                provider.RequireRepositorySelection);
+            var outcome = Resolve(context.Params!.Arguments, reserved, ServiceApp.RepositoryHeaderValue(http), policy);
             if (outcome.Error is { } error)
                 return ErrorResult(error);
 
@@ -194,18 +177,14 @@ internal static class ToolSelectionFilters
     /// <summary>
     /// Resolves one call's selection. Removes the <paramref name="reserved"/> arguments from
     /// <paramref name="arguments"/> (in place, so the tool never binds them), canonicalizes a
-    /// <c>repository</c> argument, and applies the precedence argument &gt; <paramref name="header"/> &gt;
-    /// the cross-repository provider default (only when <paramref name="requireSelection"/> says the call must
-    /// name a repository, so an unselected legacy read keeps its behavior). A JSON <c>null</c> or blank value
-    /// counts as absent.
+    /// <c>repository</c> argument, and applies the precedence argument &gt; <paramref name="header"/>. A JSON
+    /// <c>null</c> or blank value counts as absent.
     /// </summary>
     internal static SelectionOutcome Resolve(
         IDictionary<string, JsonElement>? arguments,
         IReadOnlySet<string> reserved,
-        string toolName,
         string? header,
-        RepositoryUrlPolicy policy,
-        Func<bool> requireSelection)
+        RepositoryUrlPolicy policy)
     {
         if (!TryTake(arguments, reserved, RepositoryArgument, out var repositoryArgument)
             || !TryTake(arguments, reserved, BranchArgument, out var branch))
@@ -230,11 +209,6 @@ internal static class ToolSelectionFilters
 
         if (header is not null)
             return new SelectionOutcome(new ToolCallSelection(header, branch, ToolSelectionSource.Header), null);
-
-        if (ProviderScopedTools.Contains(toolName) && requireSelection()
-            && StringArgument(arguments, ProviderRepositoryArgument) is { } providerRepository)
-            return new SelectionOutcome(
-                new ToolCallSelection(providerRepository, branch, ToolSelectionSource.ProviderDefault), null);
 
         return new SelectionOutcome(new ToolCallSelection(null, branch, ToolSelectionSource.None), null);
     }
@@ -266,15 +240,10 @@ internal static class ToolSelectionFilters
         }
     }
 
-    private static string? StringArgument(IDictionary<string, JsonElement>? arguments, string key) =>
-        arguments is not null && arguments.TryGetValue(key, out var element) && element.ValueKind == JsonValueKind.String
-            ? Blank(element.GetString())
-            : null;
-
     private static string? Blank(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 
-    // The reserved arguments a tool gets: both, minus any name its own schema already declares (a
-    // cross-repository tool's `branch`, for example, filters consumers and keeps that meaning).
+    // The reserved arguments a tool gets: both, minus any name its own schema already declares (so a tool whose
+    // own `branch` argument means something else keeps that meaning).
     private static IReadOnlySet<string> ReservedArgumentsFor(Tool tool)
     {
         var declared = DeclaredProperties(tool.InputSchema);

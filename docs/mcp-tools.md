@@ -2,6 +2,13 @@
 
 Sextant exposes its index through MCP (Model Context Protocol) tools. The MCP server reads from the SQLite database directly and does not depend on the daemon being running.
 
+The local stdio server (and `sextant serve`) registers every tool below. The index service's remote `/mcp` lists
+the eight tools agents use: `find_symbol`, `find_references`, `get_call_hierarchy`, `get_implementors`,
+`get_type_hierarchy`, `get_type_members`, `get_file_symbols` and `list_repositories` (S12), plus the service-only
+`search_symbols`. Nothing the remote surface sends (tool and parameter descriptions, the `initialize` instructions,
+warnings, errors, messages) names a tool outside that list; `RemoteToolSurfaceGuardTests` checks that over HTTP and
+against the source.
+
 ## Response Format
 
 Every tool response includes a `meta` object:
@@ -108,13 +115,16 @@ On the remote `/mcp`, `meta.snapshot` is lean — what an agent needs to trust t
 ```
 
 `coverage` is `complete` or `partial`; a `warning` is added only when the answer may be incomplete (a partial
-index, an incompatible indexer, or a dirty working tree). A partial warning names what is missing, for example
-`Partial index: Code in 1 project(s) did not fully compile on the indexer, so references and calls inside them
-may be missing (src/App/App.csproj: 412 unbound name(s)). Calls that failed to bind are kept as candidate
-matches. Call get_index_status for details.` The full provenance described below stays available
-from `get_index_status` as `index.snapshot`, and the coverage record (its `binding` health per project and its
-informational `notes`) as `index.coverage`. The server's `initialize` result carries short `instructions`
-(when to use the tools, the `repository` argument, paging) for clients that surface them.
+index, an incompatible indexer, or a dirty working tree). A partial warning counts what is missing and names no
+project or tool, in at most 160 characters, for example
+`Partial index: 3 of 40 projects did not load or compile, 1 of 2 submodules were not checked out, so results may be
+incomplete.` (a gap that does not fit is folded into `and other gaps`; a partial record that counts no gap gets
+`Partial index: some projects or submodules were not indexed, so results may be incomplete.`). The full
+provenance and the coverage record (its reasons, its `binding` health per project and its informational `notes`)
+are not on the remote surface; an operator reads them from `get_index_status` (`index.snapshot`,
+`index.coverage`) on a local server over the same catalog, or from `/control/resolve`. The server's `initialize`
+result carries short `instructions` (when to use the tools, the `repository` argument, paging) for clients that
+surface them.
 
 ### Symbol arguments
 

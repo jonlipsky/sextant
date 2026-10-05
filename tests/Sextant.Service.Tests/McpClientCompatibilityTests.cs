@@ -63,7 +63,8 @@ public class McpClientCompatibilityTests
         StringAssert.Contains(text, "global::App.Type0", "the tool answered from the seeded snapshot");
 
         // A pooled client reuses one connection for many calls; each stateless POST stands alone.
-        var status = await client.CallToolAsync("get_index_status");
+        var status = await client.CallToolAsync(
+            "find_references", new Dictionary<string, object?> { ["symbol_fqn"] = "global::App.Type0" });
         Assert.IsFalse(status.IsError is true, "a second call over the same client also succeeds");
         Assert.IsTrue(status.Content.OfType<TextContentBlock>().Any(), "the second call returned MCP content");
     }

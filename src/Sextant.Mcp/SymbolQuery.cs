@@ -396,7 +396,7 @@ public sealed class SymbolQuery
     private static SymbolQuery ParseDocumentationId(string raw, string text)
     {
         if (text[0] == 'N')
-            return Invalid(raw, "Namespaces are not indexed as symbols; use get_namespace_tree to explore a namespace.");
+            return Invalid(raw, "Namespaces are not indexed as symbols; name a type or member in the namespace instead.");
         var body = text[2..];
         var paramOpen = body.IndexOf('(');
         IReadOnlyList<SymbolTypeTerm>? parameters = null;
