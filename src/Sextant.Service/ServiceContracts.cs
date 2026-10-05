@@ -314,6 +314,30 @@ public sealed record ResolvedBranchHead
 
     /// <summary>The snapshot's durable coverage record (issue #119), or null when none was recorded.</summary>
     public SnapshotCoverage? Coverage { get; init; }
+
+    /// <summary>
+    /// The snapshot identity hash an ensure of this branch's commit would compute on this node NOW — the default
+    /// profile/configuration (no <c>config_hash</c>), no tree sha, and the node's present schema, analyzer,
+    /// toolchain, capability, SDK-pin and restore components — or null when it is not reported: the snapshot
+    /// records no commit, or it was assembled from client contributions (whose identity no service ensure
+    /// reproduces, and which their contributors refresh). The repository URL is spelled as the snapshot's own
+    /// ensure, the resolve request, or the catalog spelled it, whichever reproduces the snapshot's identity (a
+    /// spelling variant alone is never stale); when none does, as the resolve request spelled it. Serialized as
+    /// <c>current_identity_hash</c>.
+    /// </summary>
+    public string? CurrentIdentityHash { get; init; }
+
+    /// <summary>
+    /// Whether the pointed snapshot is current under this node's present identity: its identity hash equals
+    /// <see cref="CurrentIdentityHash"/>. False after an identity change (an <c>AnalyzerVersion</c> or schema bump, a
+    /// toolchain or policy change) or for a head built with a non-default <c>config_hash</c> or tree sha; an
+    /// <c>expected_head_commit</c> CAS ensure of that commit then builds the current identity (unless its job already
+    /// ended failed or unsupported, which the ensure returns as recorded) and re-points the branch at it. Null when
+    /// <see cref="CurrentIdentityHash"/> is (serialized as an absent <c>identity_current</c>, never <c>null</c>).
+    /// </summary>
+    public bool? IdentityCurrent => CurrentIdentityHash is { } current
+        ? string.Equals(current, Snapshot.IdentityHash, StringComparison.Ordinal)
+        : null;
 }
 
 /// <summary>
