@@ -434,6 +434,14 @@ public static class ServiceApp
             body["is_default"] = head.IsDefault;
             if (head.HeadSequence is long headSequence)
                 body["head_sequence"] = headSequence;
+            // Additive: whether the snapshot (`identity_hash`, already in the row) is what an ensure of its commit would
+            // build on this node now. Both fields are omitted together, never null, when it cannot be computed, so a
+            // client treats an absent identity_current as current (as against an older service).
+            if (head.CurrentIdentityHash is { } currentIdentityHash)
+            {
+                body["current_identity_hash"] = currentIdentityHash;
+                body["identity_current"] = head.IdentityCurrent is true;
+            }
             return Results.Json(body, ServiceJson.Options);
         }).DecidesUserCallers();
 

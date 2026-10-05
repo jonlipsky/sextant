@@ -409,6 +409,15 @@ public sealed partial class SnapshotService : IDisposable
         }
     }
 
+    // The snapshot identity hash an ensure of `request` computes on this node NOW: the request's own fields folded with
+    // this node's schema/analyzer/toolchain, its default profile configuration and capability, and its non-default
+    // SDK-pin (issue #113) and restore policies, so flipping SEXTANT_SERVICE_SDK_PIN_OVERRIDE or
+    // SEXTANT_SERVICE_PACKAGE_RESTORE never reuses a snapshot (or failed job) built under the other policy. The ONE
+    // place the service computes a request identity: the ensure path and /control/resolve's identity_current share it.
+    private string IdentityHashFor(EnsureSnapshotRequest request) => request.ToIdentity(
+        _options.DefaultConfigHash, _options.DefaultCapabilityFingerprint, _options.SdkPinIdentityComponent,
+        _options.RestoreIdentityComponent).Hash;
+
     // Starts one ensure as a service-owned background operation and returns (accepted, completion, identity hash): the
     // completion is the ensure's final result; accepted settles as soon as the job is registered (wait=false).
     // The operation is tracked so Dispose can drain it, and neither task can ever surface as an unobserved
@@ -423,13 +432,8 @@ public sealed partial class SnapshotService : IDisposable
         if (request.BranchGuardProblem() is { } problem)
             throw new ArgumentException($"The ensure request's branch guards are invalid ({problem}).", nameof(request));
 
-        // Issue #113: the non-default SDK-pin policy is part of the identity, so flipping
-        // SEXTANT_SERVICE_SDK_PIN_OVERRIDE never reuses a snapshot (or failed job) built under the other policy. The
-        // same holds for SEXTANT_SERVICE_PACKAGE_RESTORE. The remote-default lookup (issue #199) is not part of it,
-        // so the hash is known before that lookup runs.
-        var hash = request.ToIdentity(
-            _options.DefaultConfigHash, _options.DefaultCapabilityFingerprint, _options.SdkPinIdentityComponent,
-            _options.RestoreIdentityComponent).Hash;
+        // The remote-default lookup (issue #199) is not part of the identity, so the hash is known before that lookup runs.
+        var hash = IdentityHashFor(request);
         var accepted = new TaskCompletionSource<EnsureSnapshotResult>(TaskCreationOptions.RunContinuationsAsynchronously);
         Task<EnsureSnapshotResult> completion;
         lock (_inFlightLock)
@@ -1637,8 +1641,9 @@ public sealed partial class SnapshotService : IDisposable
     /// <summary>
     /// <see cref="ResolveBranch"/> plus the branch it resolved through — its name (the default branch's own
     /// name when <paramref name="branchName"/> is null), default designation and #84 head sequence — the
-    /// snapshot's commit SHA and its durable coverage (SVC-6, <c>/control/resolve</c>). One consistent read
-    /// on an independent read connection; null exactly when <see cref="ResolveBranch"/> is.
+    /// snapshot's commit SHA, its durable coverage (SVC-6, <c>/control/resolve</c>) and whether the snapshot is
+    /// current under this node's present identity (<see cref="ResolvedBranchHead.CurrentIdentityHash"/>). One
+    /// consistent read on an independent read connection; null exactly when <see cref="ResolveBranch"/> is.
     /// </summary>
     public ResolvedBranchHead? ResolveBranchHead(string repositoryRemoteUrl, string? branchName)
     {
@@ -1657,16 +1662,46 @@ public sealed partial class SnapshotService : IDisposable
             var row = snapshots.GetById(snapId);
             if (row is not { Status: SnapshotStatus.Complete })
                 return null;
+            var commitSha = snapshots.GetCommitSha(row.CommitId);
             return new ResolvedBranchHead
             {
                 Snapshot = row,
                 Branch = branch.Name,
                 IsDefault = branch.IsDefault,
                 HeadSequence = branch.HeadSequence,
-                CommitSha = snapshots.GetCommitSha(row.CommitId),
-                Coverage = CoverageOn(conn, row.Id)
+                CommitSha = commitSha,
+                Coverage = CoverageOn(conn, row.Id),
+                CurrentIdentityHash = commitSha is null
+                    ? null
+                    : CurrentIdentityHash(conn, snapshots, row, repositoryRemoteUrl, commitSha)
             };
         });
+    }
+
+    // The identity hash an ensure of the pointed snapshot's commit computes NOW (default profile, no tree sha), for
+    // /control/resolve's identity_current. The identity folds the RAW repository URL spelling, and one repository is
+    // ensured under several spellings (a push names GitHub's clone_url `…/repo.git`, a reconcile the grant's stored
+    // spelling), so a spelling difference alone must never read as stale: the snapshot is current when an ensure under
+    // ANY known spelling of its repository — the one the snapshot's own job submitted, this request's, or the catalog
+    // row's — reproduces its identity, and that hash is returned. Otherwise the hash under this request's spelling is
+    // returned: the identity the caller's own ensure of the commit will produce.
+    private string CurrentIdentityHash(
+        SqliteConnection conn, SnapshotStore snapshots, SnapshotRow row, string requestedUrl, string commitSha)
+    {
+        var job = new SnapshotJobStore(conn).GetJobByIdentity(row.IdentityHash);
+        (string Url, string Commit)?[] spellings =
+        [
+            job is null ? null : (job.RepositoryUrl, job.CommitSha),
+            (requestedUrl, commitSha),
+            snapshots.GetRepositoryRemoteUrl(row.RepositoryId) is { } catalogUrl ? (catalogUrl, commitSha) : null
+        ];
+        foreach (var (url, commit) in spellings.OfType<(string Url, string Commit)>().Distinct())
+        {
+            var hash = IdentityHashFor(new EnsureSnapshotRequest { RepositoryRemoteUrl = url, CommitSha = commit });
+            if (string.Equals(hash, row.IdentityHash, StringComparison.Ordinal))
+                return hash;
+        }
+        return IdentityHashFor(new EnsureSnapshotRequest { RepositoryRemoteUrl = requestedUrl, CommitSha = commitSha });
     }
 
     /// <summary>
