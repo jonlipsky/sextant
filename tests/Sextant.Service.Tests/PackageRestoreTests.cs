@@ -56,6 +56,53 @@ public class PackageRestoreTests
     }
 
     [TestMethod]
+    public void Parser_RecordsTheNU1801Warning_ThatIgnoreFailedSourcesReports_EvenWhenItsMessageSaysError()
+    {
+        // The shape `dotnet restore --ignore-failed-sources` prints for an unreachable source (captured from a real
+        // restore against https://127.0.0.1:9): a project-scoped WARNING, never the error NU1301.
+        var parser = new RestoreOutputParser(Checkout);
+        var bad = Path.Combine(Checkout, "Bad", "Bad.csproj");
+        parser.Accept($"{bad} : warning NU1801: Unable to load the service index for source https://127.0.0.1:9/v3/index.json. [{Checkout}\\All.slnx]");
+        var api = Path.Combine(Checkout, "Api", "Api.csproj");
+        parser.Accept($"{api} : warning NU1801: Unable to load the service index for source https://user:hunter2@feed.example.test/index.json. An error occurred while sending the request.");
+        parser.Accept($"{api} : warning NU1603: Acme.Core 1.0.0 depends on Foo (>= 1.0.0) but Foo 1.0.0 was not found.");
+
+        var projects = parser.Projects();
+        CollectionAssert.AreEqual(new[] { "Api/Api.csproj", "Bad/Bad.csproj" }, projects.Select(p => p.Project).ToArray());
+        Assert.IsTrue(projects.All(p => p.SourceUnreachable));
+        CollectionAssert.AreEqual(new[] { "NU1801" }, projects[0].Codes.ToArray(), "other warnings are not restore failures");
+        Assert.AreEqual(0, parser.GeneralCodes().Count, "the word 'error' in an NU1801 message is not an error line");
+        Assert.IsFalse(parser.SourceUnreachableGeneral);
+
+        var outcome = new PackageRestoreOutcome { SolutionsAttempted = 1, SolutionsSucceeded = 1, Projects = projects };
+        Assert.IsFalse(outcome.Clean, "a restore that skipped a source did not restore everything");
+        var text = string.Join("\n", outcome.Notes()) + "\n" + string.Join("\n", outcome.ProjectLoadIssues().Values);
+        StringAssert.Contains(text, "A configured package source could not be reached while restoring 2 project(s)");
+        Assert.IsFalse(text.Contains("hunter2", StringComparison.Ordinal), text);
+        Assert.IsFalse(text.Contains("example.test", StringComparison.Ordinal), text);
+        Assert.IsFalse(text.Contains("127.0.0.1", StringComparison.Ordinal), text);
+    }
+
+    [TestMethod]
+    public void Parser_AnNU1801WarningThatNamesNoProject_IsAGeneralSourceFailure()
+    {
+        var parser = new RestoreOutputParser(Checkout);
+        parser.Accept("  warning NU1801: Unable to load the service index for source https://feed.example.test/index.json.");
+
+        Assert.IsTrue(parser.SourceUnreachableGeneral);
+        Assert.AreEqual(0, parser.Projects().Count);
+        var outcome = new PackageRestoreOutcome
+        {
+            SolutionsAttempted = 1, SolutionsSucceeded = 1, SourceUnreachableGeneral = parser.SourceUnreachableGeneral
+        };
+        Assert.IsFalse(outcome.Clean);
+        CollectionAssert.AreEqual(new[]
+        {
+            "A configured package source could not be reached during package restore; packages only that source provides were not restored."
+        }, outcome.Notes().ToArray());
+    }
+
+    [TestMethod]
     public void Parser_APathOutsideTheCheckout_KeepsOnlyItsFileName()
     {
         var parser = new RestoreOutputParser(Checkout);
@@ -146,6 +193,26 @@ public class PackageRestoreTests
     }
 
     [TestMethod]
+    public void Outcome_AFailureWithNoRecognizedCode_StillLeavesANote()
+    {
+        var outcome = new PackageRestoreOutcome { SolutionsAttempted = 3, SolutionsSucceeded = 1 };
+
+        Assert.AreEqual(2, outcome.SolutionsFailed);
+        Assert.IsFalse(outcome.Clean);
+        CollectionAssert.AreEqual(new[]
+        {
+            "Package restore failed for 2 solution(s) without a recognized error code; their projects may have been loaded without restored packages, so code in them may not bind."
+        }, outcome.Notes().ToArray());
+
+        var timedOut = new PackageRestoreOutcome
+        {
+            SolutionsAttempted = 1, TimedOut = true, Timeout = TimeSpan.FromSeconds(10)
+        };
+        Assert.AreEqual(0, timedOut.SolutionsFailed, "the solution a timeout stopped is reported as the timeout");
+        Assert.AreEqual(1, timedOut.Notes().Count);
+    }
+
+    [TestMethod]
     public void Outcome_JoinCapped_SummarisesTheRest()
     {
         Assert.AreEqual("a, b", PackageRestoreOutcome.JoinCapped(["a", "b"], 5));
@@ -191,6 +258,32 @@ public class PackageRestoreTests
             PackageRestoreRunner.Arguments("All.slnx").ToArray());
         Assert.AreEqual(PackageRestoreRunner.DefaultTimeout, new PackageRestoreRunner(timeout: TimeSpan.Zero).Timeout);
         Assert.AreEqual(TimeSpan.FromSeconds(7), new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(7)).Timeout);
+        Assert.AreEqual(PackageRestoreRunner.MaxTimeout, new PackageRestoreRunner(timeout: TimeSpan.FromDays(400)).Timeout,
+            "a huge configured bound is clamped, so arming the deadline can never throw after the child started");
+    }
+
+    [TestMethod]
+    public void Runner_ChildEnvironment_CarriesNoServiceSetting()
+    {
+        const string secret = "SEXTANT_SERVICE_CONTROL_TOKEN";
+        const string lower = "sextant_peer_query_token";
+        var before = (Environment.GetEnvironmentVariable(secret), Environment.GetEnvironmentVariable(lower));
+        Environment.SetEnvironmentVariable(secret, "control-token-value");
+        Environment.SetEnvironmentVariable(lower, "peer-token-value");
+        try
+        {
+            var startInfo = new PackageRestoreRunner().CreateStartInfo(Path.Combine(Checkout, "All.slnx"));
+
+            Assert.IsFalse(startInfo.Environment.Keys.Any(k => k.StartsWith("SEXTANT_", StringComparison.OrdinalIgnoreCase)),
+                string.Join(", ", startInfo.Environment.Keys.Where(k => k.Contains("SEXTANT", StringComparison.OrdinalIgnoreCase))));
+            Assert.IsFalse(startInfo.Environment.ContainsKey("MSBUILD_EXE_PATH"));
+            Assert.AreEqual("1", startInfo.Environment["MSBUILDDISABLENODEREUSE"]);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(secret, before.Item1);
+            Environment.SetEnvironmentVariable(lower, before.Item2);
+        }
     }
 
     [TestMethod]

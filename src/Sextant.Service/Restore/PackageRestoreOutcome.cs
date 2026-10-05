@@ -72,10 +72,19 @@ public sealed record PackageRestoreOutcome
     /// <summary>Error codes that named no project.</summary>
     public IReadOnlyList<string> GeneralCodes { get; init; } = [];
 
+    /// <summary>A package source could not be reached, reported on a line that named no project.</summary>
+    public bool SourceUnreachableGeneral { get; init; }
+
+    /// <summary>
+    /// Solutions whose restore ran to completion within the bound but exited non-zero (the one a timeout stopped
+    /// is not counted here; <see cref="TimedOut"/> reports it).
+    /// </summary>
+    public int SolutionsFailed => Math.Max(0, SolutionsAttempted - SolutionsSucceeded - SolutionsNotStarted - (TimedOut ? 1 : 0));
+
     /// <summary>True when every attempted restore exited 0 within the bound, or restore is disabled.</summary>
     public bool Clean => !Enabled
         || (!TimedOut && SolutionsNotStarted == 0 && SolutionsSucceeded == SolutionsAttempted
-            && Projects.Count == 0 && GeneralCodes.Count == 0);
+            && Projects.Count == 0 && GeneralCodes.Count == 0 && !SourceUnreachableGeneral);
 
     /// <summary>
     /// The coverage notes describing what the restore could not do. Each names counts, package ids and codes;
@@ -117,6 +126,12 @@ public sealed record PackageRestoreOutcome
                 $"A configured package source could not be reached while restoring {unreachable} project(s); " +
                 "packages only that source provides were not restored.");
         }
+        else if (SourceUnreachableGeneral)
+        {
+            notes.Add(
+                "A configured package source could not be reached during package restore; packages only that " +
+                "source provides were not restored.");
+        }
 
         var other = Projects.Where(p => p.MissingPackages.Count == 0 && !p.SourceUnreachable).ToList();
         if (other.Count > 0 || ProjectsDropped > 0 || GeneralCodes.Count > 0)
@@ -128,6 +143,16 @@ public sealed record PackageRestoreOutcome
                 count > 0
                     ? $"Package restore reported errors ({JoinCapped(codes, 5)}) for {count} project(s)."
                     : $"Package restore reported errors ({JoinCapped(codes, 5)}).");
+        }
+
+        // A restore that exited non-zero without one recognizable error line (a host crash, an unhandled
+        // exception) must still say so, or the binding failures it causes would show up with no stated cause.
+        if (SolutionsFailed > 0 && Projects.Count == 0 && ProjectsDropped == 0 && GeneralCodes.Count == 0
+            && !SourceUnreachableGeneral)
+        {
+            notes.Add(
+                $"Package restore failed for {SolutionsFailed} solution(s) without a recognized error code; their " +
+                "projects may have been loaded without restored packages, so code in them may not bind.");
         }
         return notes;
     }

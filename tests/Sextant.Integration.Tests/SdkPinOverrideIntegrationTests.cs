@@ -108,9 +108,14 @@ public class SdkPinOverrideIntegrationTests
         Assert.AreEqual(0, Directory.Exists(_journalRoot) ? Directory.GetFiles(_journalRoot).Length : 0, "no restore journal is left");
 
         // EvaluationFingerprint hashes global.json at index time — after the restore — so it equals the pristine value.
+        // The worker's package restore writes obj/project.assets.json, which the fingerprint also hashes,
+        // so the expected value is taken from the checkout as the job left it: committed global.json + restore output.
         Assert.IsNotNull(fingerprintBefore);
-        Assert.AreEqual(fingerprintBefore, EvaluationFingerprint.Compute(appProject, _checkout));
-        Assert.AreEqual(fingerprintBefore, ScalarString(
+        Assert.IsTrue(File.Exists(Path.Combine(_checkout, "src", "App", "obj", "project.assets.json")),
+            "the worker restored the project before loading it");
+        var fingerprintAfter = EvaluationFingerprint.Compute(appProject, _checkout);
+        Assert.AreNotEqual(fingerprintBefore, fingerprintAfter, "the restored assets are an evaluation input");
+        Assert.AreEqual(fingerprintAfter, ScalarString(
             "SELECT evaluation_fingerprint FROM projects WHERE repo_relative_path LIKE '%App.csproj' LIMIT 1;"),
             "the stored evaluation fingerprint is the committed checkout's, never the neutralized one's");
     }

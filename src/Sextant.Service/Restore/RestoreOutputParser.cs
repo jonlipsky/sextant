@@ -25,8 +25,9 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
     // Restore codes meaning "a package with this id (or version) was not found in any source".
     private static readonly HashSet<string> MissingPackageCodes = new(StringComparer.Ordinal) { "NU1101", "NU1102", "NU1103" };
 
-    // Restore codes meaning "a configured package source could not be reached" (NU1801 is the same failure
-    // reported as a warning, which a repository's TreatWarningsAsErrors turns into an error).
+    // Restore codes meaning "a configured package source could not be reached". The runner passes
+    // --ignore-failed-sources, under which NuGet reports the failure as the WARNING NU1801 instead of the error
+    // NU1301, so NU1801 is accepted from a warning line too (a repository's TreatWarningsAsErrors makes it an error).
     internal static readonly IReadOnlySet<string> SourceUnreachableCodes = new HashSet<string>(StringComparer.Ordinal) { "NU1301", "NU1801" };
 
     private readonly string _checkoutDir = Path.GetFullPath(checkoutDir);
@@ -34,6 +35,17 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
     private readonly Dictionary<string, Accumulator> _projects = new(StringComparer.Ordinal);
     private readonly SortedSet<string> _generalCodes = new(StringComparer.Ordinal);
     private int _projectsDropped;
+    private bool _sourceUnreachable;
+
+    /// <summary>A source-unreachable code was reported on a line that named no project.</summary>
+    public bool SourceUnreachableGeneral
+    {
+        get
+        {
+            lock (_gate)
+                return _sourceUnreachable;
+        }
+    }
 
     /// <summary>Projects that reported errors after <see cref="MaxProjects"/> were already tracked.</summary>
     public int ProjectsDropped
@@ -48,7 +60,12 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
     /// <summary>Feeds one line of restore output.</summary>
     public void Accept(string? line)
     {
-        if (string.IsNullOrWhiteSpace(line) || !line.Contains("error", StringComparison.OrdinalIgnoreCase))
+        if (string.IsNullOrWhiteSpace(line))
+            return;
+        // Checked first: an NU1801 message can itself contain "error" ("An error occurred while sending ...").
+        if (line.Contains("NU1801", StringComparison.OrdinalIgnoreCase) && TryAcceptSourceWarning(line))
+            return;
+        if (!line.Contains("error", StringComparison.OrdinalIgnoreCase))
             return;
 
         var projectMatch = ProjectError().Match(line);
@@ -100,6 +117,23 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
     {
         lock (_gate)
             return [.. _generalCodes];
+    }
+
+    // A source-unreachable WARNING (NU1801 under --ignore-failed-sources): recorded against its project when the
+    // line names one, else as a general flag. Only the code is kept, never the message (it names the source URL).
+    private bool TryAcceptSourceWarning(string line)
+    {
+        var projectMatch = ProjectSourceWarning().Match(line);
+        if (projectMatch.Success)
+        {
+            Record(Relativize(projectMatch.Groups["path"].Value), projectMatch.Groups["code"].Value.ToUpperInvariant(), null);
+            return true;
+        }
+        if (!GeneralSourceWarning().IsMatch(line))
+            return false;
+        lock (_gate)
+            _sourceUnreachable = true;
+        return true;
     }
 
     private void Record(string project, string code, string? packageId)
@@ -156,6 +190,16 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
     [GeneratedRegex(@"(?:^|[\s:])error\s+(?<code>[A-Za-z]{2,8}\d{3,5})\s*:",
         RegexOptions.CultureInvariant, matchTimeoutMilliseconds: 1000)]
     private static partial Regex GeneralError();
+
+    // "<project path> : warning NU1801: Unable to load the service index for source ... [<solution path>]".
+    [GeneratedRegex(@"^\s*(?<path>[^\r\n]+?\.(?:cs|vb|fs)proj)\s*:\s*warning\s+(?<code>NU1801)\s*:",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, matchTimeoutMilliseconds: 1000)]
+    private static partial Regex ProjectSourceWarning();
+
+    // An NU1801 warning that names no project.
+    [GeneratedRegex(@"(?:^|[\s:])warning\s+NU1801\s*:",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, matchTimeoutMilliseconds: 1000)]
+    private static partial Regex GeneralSourceWarning();
 
     // NU1101 "Unable to find package Foo.Bar. No packages exist ...", NU1102 "Unable to find package Foo with
     // version (>= 1.0)", NU1103 "Unable to find a stable package Foo with version ...".
