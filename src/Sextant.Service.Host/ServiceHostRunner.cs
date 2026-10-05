@@ -92,9 +92,11 @@ public static class ServiceHostRunner
         // identity (ServiceOptions.RestoreIdentityComponent), and the worker publishes under the runner's.
         var packageRestore = new PackageRestoreRunner(
             options.PackageRestore, options.PackageRestoreTimeout, Console.Error.WriteLine);
+        // Issue #244: the worker keeps every indexed file's bytes on the artifact volume, where the query surface
+        // (SnapshotService.SourceTexts, the same root) reads each snapshot's own source text back.
         var localWorker = new LocalIndexerSnapshotWorker(
             database, config, checkoutProvider, Console.Error.WriteLine, nodeCapability, sandbox, sdkPinGuard,
-            packageRestore);
+            packageRestore, new SourceTextStore(paths.SourceTextRoot, Console.Error.WriteLine));
         var defaultPlacement = new LocalPlacement(nodeCapability, localWorker);
         var worker = new CapabilityRoutingSnapshotWorker(
             defaultPlacement,

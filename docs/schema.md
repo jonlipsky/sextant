@@ -107,7 +107,7 @@ Cross-project usages have `target_symbol_id` in the dependency project and `in_p
 | `flags` | `INTEGER NOT NULL DEFAULT 0` | Bit-packed. Bits 0–1 = access kind: 0 none, 1 read, 2 write, 3 read/write. Bit 2 (`0b100`) = candidate: the site did not bind exactly and the target is one of the compiler's candidate symbols. |
 | `last_indexed_at` | `INTEGER NOT NULL DEFAULT 0` | Unix epoch ms |
 
-Context snippets are **no longer stored**: they are reproduced at query time from the exact matching source version (read the local file only when its content hash matches `file_versions.content_hash`; otherwise return the location without a snippet).
+Context snippets are **no longer stored** in the database: they are reproduced at query time from the exact matching source version, read from the service's content-addressed source-text store by `file_versions.content_hash` (issue #244, see `docs/service.md`) or else from the local file only when its content hash matches; otherwise the location is returned without a snippet.
 
 ### `relationships`
 

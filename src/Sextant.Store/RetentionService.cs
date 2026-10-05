@@ -37,6 +37,12 @@ public sealed record RetentionReport
     public int SnapshotProjectVersionsDeleted { get; init; }
 
     public long ReclaimedBytes { get; init; }
+
+    /// <summary>
+    /// Stored source-text blobs (issue #244) the pass deleted because no file version references them any more.
+    /// Null on a dry run and where no source-text store is kept.
+    /// </summary>
+    public int? SourceTextsDeleted { get; init; }
 }
 
 /// <summary>

@@ -85,6 +85,7 @@ public sealed partial class SnapshotService : IDisposable
         _options = options;
         _worker = worker;
         _paths = paths;
+        SourceTexts = new SourceTextStore(paths.SourceTextRoot);
         _db = db;
         _conn = db.GetConnection();
         _lease = lease;
@@ -99,6 +100,14 @@ public sealed partial class SnapshotService : IDisposable
     }
 
     public ServicePaths Paths => _paths;
+
+    /// <summary>
+    /// The content-addressed source text published snapshots serve their snippets and <c>include_source</c> from
+    /// (issue #244), on the artifact volume. The worker writes it (it must be built over
+    /// <see cref="ServicePaths.SourceTextRoot"/> too), the query surface reads it, and an executed retention pass
+    /// deletes the blobs no indexed file version references any more.
+    /// </summary>
+    public SourceTextStore SourceTexts { get; }
 
     /// <summary>
     /// False once <see cref="Dispose"/> gave up waiting for an in-flight production that ignored cancellation
@@ -1874,10 +1883,22 @@ public sealed partial class SnapshotService : IDisposable
             () => Task.FromResult(RunRetentionLocked(execute, principal)), cancellationToken).ConfigureAwait(false);
     }
 
+    // Bounds one retention pass's source-text deletes, so a large backlog cannot hold the writer for long.
+    private const int MaxSourceTextDeletesPerPass = 100_000;
+
     private RetentionReport RunRetentionLocked(bool execute, AuditCaller principal)
     {
         var retention = new RetentionService(_conn, _options.Retention);
         var report = execute ? retention.Execute() : retention.Plan();
+        // Issue #244: once the catalog GC has run, drop the stored source text no file version references any more.
+        // This runs under the write gate, which a production holds for its whole run, so no blob stored ahead of its
+        // file_versions row is mistaken for an orphan.
+        if (execute)
+            report = report with
+            {
+                SourceTextsDeleted = SourceTexts.DeleteUnreferenced(
+                    new FileStore(_conn).ReferencedContentHashes(), MaxSourceTextDeletesPerPass)
+            };
         // Service-wide audit row (no single repository scope). Records the operator + whether it was a
         // dry-run plan or an executed GC pass (criterion 5, audit).
         new AuditLogStore(_conn).Append(

@@ -128,6 +128,13 @@ public sealed class DatabaseProvider : IDisposable
 
     private readonly int _maxResponseChars = ResponseBudget.DefaultMaxChars;
 
+    /// <summary>
+    /// The stored source text of indexed files (issue #244), which source-serving tools read first so a published
+    /// snapshot serves its own text even after the working tree it was indexed from has moved to another commit.
+    /// Null (the default, the local stdio/CLI path) reads only the hash-verified working-tree file, as before.
+    /// </summary>
+    public SourceTextStore? SourceTexts { get; init; }
+
     public bool DatabaseExists => File.Exists(_dbPath);
 
     public IndexDatabase? GetDatabase()
