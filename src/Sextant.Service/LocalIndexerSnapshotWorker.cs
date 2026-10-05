@@ -317,7 +317,8 @@ public sealed class LocalIndexerSnapshotWorker(
             var indexContext = context with
             {
                 Coverage = coverage.Coverage,
-                ProviderCoverage = SnapshotCoverageBuilder.BuildProviders(checkoutDir, resolution, load, inventory, pinOverrides),
+                ProviderCoverage = SnapshotCoverageBuilder.BuildProviders(
+                    checkoutDir, resolution, load, inventory, pinOverrides, plan?.Budget),
                 ProjectLoadIssues = restore.Projects.Count > 0 ? restore.ProjectLoadIssues() : null,
                 TimeBudget = plan?.ForIndexing(checkoutDir, load.DeferredProjects)
             };

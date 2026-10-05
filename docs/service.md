@@ -1633,7 +1633,9 @@ so a step that starts late still makes progress. Each step's share is computed f
 actually ended, so a stopped restore that overruns its limit while its process tree is killed (at most 40 s) is
 absorbed by the steps after it. Provider (submodule) projects are never left out of the symbol or extraction
 steps: a provider snapshot is shared and reused, so an empty provider project would be reused empty. A provider
-project the load did not reach is reported in the provider's own coverage. A single selected solution is opened
+project the load did not reach is reported in the provider's own coverage: a reason, and a `time_budget` that
+counts it (`projects_not_loaded`) and names the provider's own selected solutions that declare it, relative to the
+provider. A single selected solution is opened
 by `OpenSolutionAsync` in one call, so the load step has no deadline there (the later steps still do).
 
 **What gets recorded.** When anything was left out, the snapshot is published **partial**. The coverage gains a
