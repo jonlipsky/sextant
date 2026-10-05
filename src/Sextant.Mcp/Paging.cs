@@ -62,7 +62,8 @@ public static class Paging
 
     /// <summary>
     /// Starts a page of <paramref name="tool"/>. <paramref name="queryArguments"/> are every argument that
-    /// shapes the full result (not <c>limit</c> or <c>cursor</c>). False, with the ready-made error response,
+    /// shapes the full result (not <c>limit</c> or <c>cursor</c>, nor a presentation-only one such as
+    /// <c>include_source</c>, which changes no row). False, with the ready-made error response,
     /// when <paramref name="cursor"/> is not one this query issued for the same snapshot.
     /// </summary>
     public static bool TryBegin(

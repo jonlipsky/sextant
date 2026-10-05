@@ -744,7 +744,7 @@ public static class ServiceApp
     /// <summary>
     /// Resolves the caller-declared repository (its git remote URL) for the current request: the call's
     /// <see cref="ToolCallSelection"/> when <see cref="ToolSelectionFilters"/> recorded one (the reserved
-    /// <c>repository</c> argument, the header, or a cross-repository tool's provider default), else the
+    /// <c>repository</c> argument or the header), else the
     /// <c>X-Sextant-Repository</c> request header. Reads the ambient request at call time so a
     /// singleton <see cref="DatabaseProvider"/> stays request-correct; returns null when nothing names a
     /// repository (the read planner then reads the unselected default, or fails with

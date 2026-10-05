@@ -139,53 +139,64 @@ public sealed partial class RemoteToolSurfaceGuardTests
     {
         await using var host = await AgentOutputHarness.StartAsync(maxResponseChars: 1_500);
         var repoA = AgentOutputFixture.RepoA;
-        var calls = new (string Label, string Tool, JsonObject Arguments)[]
+        // Each call states the outcome it must reach (an error code, a size cut, the partial warning, or a plain
+        // answer), so a call that fails earlier than its label (say, on selection) cannot silently stop scanning
+        // the text it is here for.
+        var calls = new (string Label, string Expected, string Tool, JsonObject Arguments)[]
         {
-            ("partial warning", "find_symbol", new JsonObject { ["name"] = "OtherStore", ["repository"] = AgentOutputFixture.RepoB }),
-            ("no repository", "find_symbol", new JsonObject { ["name"] = "IStore" }),
-            ("unknown repository", "find_symbol", new JsonObject { ["name"] = "IStore", ["repository"] = "org/absent" }),
-            ("symbol not found", "find_references", new JsonObject { ["symbol_fqn"] = "App.NoSuchType", ["repository"] = repoA }),
-            ("namespace", "find_references", new JsonObject { ["symbol_fqn"] = "N:App.Core", ["repository"] = repoA }),
-            ("malformed symbol", "get_type_members", new JsonObject { ["symbol_fqn"] = "App.Core.IStore.Get(int", ["repository"] = repoA }),
-            ("unknown project_id", "find_symbol", new JsonObject { ["name"] = "IStore", ["project_id"] = "0000000000000000", ["repository"] = repoA }),
-            ("unknown include_projects", "find_references", new JsonObject
+            ("partial warning", Warned, "find_symbol", new JsonObject { ["name"] = "OtherStore", ["repository"] = AgentOutputFixture.RepoB }),
+            ("no repository", "repository_required", "find_symbol", new JsonObject { ["name"] = "IStore" }),
+            ("unknown repository", "repository_not_found", "find_symbol", new JsonObject { ["name"] = "IStore", ["repository"] = "org/absent" }),
+            ("symbol not found", "symbol_not_found", "find_references", new JsonObject { ["symbol_fqn"] = "App.NoSuchType", ["repository"] = repoA }),
+            ("namespace", InvalidArgument, "find_references", new JsonObject { ["symbol_fqn"] = "N:App.Core", ["repository"] = repoA }),
+            ("malformed symbol", InvalidArgument, "get_type_members", new JsonObject { ["symbol_fqn"] = "App.Core.IStore.Get(int", ["repository"] = repoA }),
+            ("unknown project_id", InvalidArgument, "find_symbol", new JsonObject { ["name"] = "IStore", ["project_id"] = "0000000000000000", ["repository"] = repoA }),
+            ("unknown include_projects", InvalidArgument, "find_references", new JsonObject
             {
                 ["symbol_fqn"] = AgentOutputFixture.TargetInterface, ["include_projects"] = "0000000000000000", ["repository"] = repoA
             }),
-            ("unknown project scope", "find_references", new JsonObject
+            ("unknown project scope", InvalidArgument, "find_references", new JsonObject
             {
                 ["symbol_fqn"] = AgentOutputFixture.TargetInterface, ["scope"] = "project:0000000000000000", ["repository"] = repoA
             }),
-            ("unknown solution scope", "find_symbol", new JsonObject { ["name"] = "IStore", ["scope"] = "solution:Missing.slnx", ["repository"] = repoA }),
-            ("bad scope", "find_symbol", new JsonObject { ["name"] = "IStore", ["scope"] = "folder:src", ["repository"] = repoA }),
-            ("bad kind", "find_symbol", new JsonObject { ["name"] = "IStore", ["kind"] = "namespace", ["repository"] = repoA }),
-            ("bad cursor", "find_references", new JsonObject
+            ("unknown solution scope", InvalidArgument, "find_symbol", new JsonObject { ["name"] = "IStore", ["scope"] = "solution:Missing.slnx", ["repository"] = repoA }),
+            ("bad scope", InvalidArgument, "find_symbol", new JsonObject { ["name"] = "IStore", ["scope"] = "folder:src", ["repository"] = repoA }),
+            ("bad kind", InvalidArgument, "find_symbol", new JsonObject { ["name"] = "IStore", ["kind"] = "namespace", ["repository"] = repoA }),
+            ("bad cursor", Paging.InvalidCursorCode, "find_references", new JsonObject
             {
                 ["symbol_fqn"] = AgentOutputFixture.TargetInterface, ["cursor"] = "not-a-cursor", ["repository"] = repoA
             }),
-            ("size-cut page", "find_references", new JsonObject
+            ("size-cut page", SizeCut, "find_references", new JsonObject
             {
                 ["symbol_fqn"] = AgentOutputFixture.TargetInterface, ["limit"] = 200, ["repository"] = repoA
             }),
-            ("size-cut unpaged", "find_symbol", new JsonObject { ["name"] = "Handler*", ["fuzzy"] = true, ["repository"] = repoA }),
-            ("absolute path", "get_file_symbols", new JsonObject { ["file_path"] = "/etc/passwd", ["repository"] = repoA }),
-            ("callers", "get_call_hierarchy", new JsonObject
+            ("size-cut unpaged", SizeCut, "find_symbol", new JsonObject { ["name"] = "Handler*", ["fuzzy"] = true, ["repository"] = repoA }),
+            ("absolute path", InvalidArgument, "get_file_symbols", new JsonObject { ["file_path"] = "/etc/passwd", ["repository"] = repoA }),
+            ("callers", SizeCut, "get_call_hierarchy", new JsonObject
             {
                 ["symbol_fqn"] = AgentOutputFixture.TargetMethod, ["direction"] = "callers", ["repository"] = repoA
             }),
-            ("bad direction", "get_call_hierarchy", new JsonObject
+            ("bad direction", InvalidArgument, "get_call_hierarchy", new JsonObject
             {
                 ["symbol_fqn"] = AgentOutputFixture.TargetMethod, ["direction"] = "sideways", ["repository"] = repoA
             }),
-            ("hierarchy", "get_type_hierarchy", new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetInterface, ["repository"] = repoA }),
-            ("implementors", "get_implementors", new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetInterface, ["repository"] = repoA }),
-            ("ambiguous member", "get_type_members", new JsonObject { ["symbol_fqn"] = "Get", ["repository"] = repoA }),
-            ("list_repositories without a caller", "list_repositories", new JsonObject()),
-            ("search_symbols without a caller", "search_symbols", new JsonObject { ["name_prefix"] = "IStore" })
+            ("hierarchy", Answered, "get_type_hierarchy", new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetInterface, ["repository"] = repoA }),
+            ("implementors", SizeCut, "get_implementors", new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetInterface, ["repository"] = repoA }),
+            ("ambiguous member", "ambiguous_symbol", "get_call_hierarchy", new JsonObject { ["symbol_fqn"] = "Get", ["direction"] = "callers", ["repository"] = repoA }),
+            ("list_repositories without a caller", "caller_required", "list_repositories", new JsonObject()),
+            ("search_symbols without a caller", "caller_required", "search_symbols", new JsonObject { ["name_prefix"] = "IStore" })
         };
 
-        foreach (var (label, tool, arguments) in calls)
-            AssertNamesNoOtherTool($"{tool} ({label})", await host.CallTextAsync(tool, arguments));
+        var missed = new List<string>();
+        foreach (var (label, expected, tool, arguments) in calls)
+        {
+            var text = await host.CallTextAsync(tool, arguments);
+            var outcome = Outcome(text);
+            if (outcome != expected)
+                missed.Add($"{tool} ({label}): expected {expected}, got {outcome}");
+            AssertNamesNoOtherTool($"{tool} ({label})", text);
+        }
+        Assert.AreEqual(0, missed.Count, "a call did not reach the text it scans:\n" + string.Join("\n", missed));
 
         var warning = (await host.CallAsync("find_symbol", new JsonObject { ["name"] = "OtherStore" }, AgentOutputFixture.RepoB))
             .GetProperty("meta").GetProperty("snapshot").GetProperty("warning").GetString()!;
@@ -272,6 +283,26 @@ public sealed partial class RemoteToolSurfaceGuardTests
 
     // ==== helpers =====================================================================================
 
+    private const string InvalidArgument = "invalid_argument";
+    private const string SizeCut = "size cut";
+    private const string Warned = "partial warning";
+    private const string Answered = "answered";
+
+    // What a tool call reached: its error code, else a size-cut page, else an answer carrying the snapshot warning,
+    // else a plain answer.
+    private static string Outcome(string text)
+    {
+        using var doc = JsonDocument.Parse(text);
+        if (!doc.RootElement.TryGetProperty("meta", out var meta))
+            return Answered;
+        if (meta.TryGetProperty("error", out var error))
+            return error.GetProperty("code").GetString()!;
+        if (meta.TryGetProperty("page_truncated_by", out var cut) && cut.GetString() == "size")
+            return SizeCut;
+        if (meta.TryGetProperty("snapshot", out var snapshot) && snapshot.TryGetProperty("warning", out _))
+            return Warned;
+        return Answered;
+    }
     private static void AssertNamesNoOtherTool(string where, string text)
     {
         foreach (var name in Forbidden.Value)

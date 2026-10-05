@@ -52,7 +52,8 @@ or the `changes` of a comparison), `get_call_hierarchy`, `get_file_symbols`, `ge
 - `meta.total` is the size of the whole result; `meta.result_count` the rows on this page.
 - `meta.next_cursor` is present only when rows remain. A cursor is bound to the tool, its arguments and the
   snapshot it was issued for; reusing it with other arguments, another tool, or after the index moved to a new
-  snapshot is `meta.error.code = "invalid_cursor"` (re-run without a cursor).
+  snapshot is `meta.error.code = "invalid_cursor"` (re-run without a cursor). `limit` and `include_source`,
+  which change no row, are not bound: the next page may change either.
 - A **truncated first page** leads with a `summary` (counts per project, file, kind, … — the top 10 of each,
   then a `(N more)` entry) before the rows, so an agent can narrow the query (`scope`, `project_id`, …)
   instead of paging. A result that fits its page has no summary.

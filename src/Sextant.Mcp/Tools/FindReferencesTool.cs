@@ -25,8 +25,9 @@ public static class FindReferencesTool
         var mode = FederationModes.Parse(federation);
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError, mode))
             return authError;
+        // include_source only adds each row's surrounding lines, so a cursor carries over when it is toggled.
         if (!Paging.TryBegin("find_references", limit, cursor, readContext, out var page, out var cursorError,
-                symbol_fqn, include_projects, group_by, include_source, scope, access_kind, federation))
+                symbol_fqn, include_projects, group_by, scope, access_kind, federation))
             return cursorError;
 
         using var conn = db.OpenReadConnection();
