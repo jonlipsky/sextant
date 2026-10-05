@@ -90,34 +90,27 @@ public static class TraceValueTool
                 .OrderBy(r => r.Edge?.CallSiteFile, StringComparer.Ordinal).ThenBy(r => r.Edge?.CallSiteLine).ThenBy(r => r.Flow.Id))
             .ToList();
 
-        object? summary = page.IsTruncatedFirstPage(rows.Count)
-            ? new
-            {
-                ByParameter = Paging.CountBy(rows, r => r.Flow.ParameterName),
-                ByFile = Paging.CountBy(rows, r => r.Edge?.CallSiteFile)
-            }
-            : null;
+        object? Summary() => new
+        {
+            ByParameter = Paging.CountBy(rows, r => r.Flow.ParameterName),
+            ByFile = Paging.CountBy(rows, r => r.Edge?.CallSiteFile)
+        };
 
-        var results = page.Slice(rows)
-            .GroupBy(r => r.Flow.ParameterName)
-            .Select(g => (object)new
+        // One row per argument flow; the page's rows are grouped by parameter when the response is shaped, so a page
+        // cut by size groups only the flows it returns.
+        var results = page.Slice(rows).Select(r =>
+        {
+            var callerSymbol = r.Edge != null ? symbolStore.GetById(r.Edge.CallerSymbolId) : null;
+            return (Parameter: r.Flow.ParameterName, r.Ordinal, Caller: (object)new
             {
-                parameter_name = g.Key,
-                parameter_ordinal = g.First().Ordinal,
-                callers = g.Select(r =>
-                {
-                    var callerSymbol = r.Edge != null ? symbolStore.GetById(r.Edge.CallerSymbolId) : null;
-                    return (object)new
-                    {
-                        caller_fqn = callerSymbol is null ? "unknown" : namer.QualifiedName(callerSymbol),
-                        argument_expression = r.Flow.ArgumentExpression,
-                        argument_kind = r.Flow.ArgumentKind,
-                        source_symbol_fqn = r.Flow.SourceSymbolFqn,
-                        call_site_file = r.Edge?.CallSiteFile,
-                        call_site_line = r.Edge?.CallSiteLine ?? 0
-                    };
-                }).ToList()
-            }).ToList();
+                caller_fqn = callerSymbol is null ? "unknown" : namer.QualifiedName(callerSymbol),
+                argument_expression = r.Flow.ArgumentExpression,
+                argument_kind = r.Flow.ArgumentKind,
+                source_symbol_fqn = r.Flow.SourceSymbolFqn,
+                call_site_file = r.Edge?.CallSiteFile,
+                call_site_line = r.Edge?.CallSiteLine ?? 0
+            });
+        }).ToList();
 
         string? empty = null;
         if (rows.Count == 0)
@@ -128,9 +121,16 @@ public static class TraceValueTool
                 : $"{target} has no traced parameter '{parameter}'. Traced parameters: " +
                   $"{string.Join(", ", allGroups.Select(g => $"{g.Key} ({g.First().ParameterOrdinal})"))}.";
         }
-        return ResponseBuilder.BuildPage(results, rows.Count, page, method.LastIndexedAt, ambiguity, provenance, summary,
-            resultCount: Math.Max(0, Math.Min(page.Limit, rows.Count - page.Offset)),
-            message: ResponseBuilder.JoinMessages(note, empty));
+        return ResponseBuilder.BuildPage(results, rows.Count, page, method.LastIndexedAt, ambiguity, provenance, Summary,
+            ResponseBuilder.JoinMessages(note, empty),
+            shape: flows => flows
+                .GroupBy(f => f.Parameter)
+                .Select(g => (object)new
+                {
+                    parameter_name = g.Key,
+                    parameter_ordinal = g.First().Ordinal,
+                    callers = g.Select(f => f.Caller).ToList()
+                }).ToList());
     }
 
     private static string TraceDestinations(
@@ -144,9 +144,7 @@ public static class TraceValueTool
             .ToList();
         var allReturnFlows = returnFlowStore.GetByCallGraphIds(callerEdges.Select(e => e.Id).ToList());
 
-        object? summary = page.IsTruncatedFirstPage(callerEdges.Count)
-            ? new { ByFile = Paging.CountBy(callerEdges, e => e.CallSiteFile) }
-            : null;
+        object? Summary() => new { ByFile = Paging.CountBy(callerEdges, e => e.CallSiteFile) };
 
         var results = page.Slice(callerEdges).Select(edge =>
         {
@@ -167,7 +165,7 @@ public static class TraceValueTool
         var empty = callerEdges.Count == 0
             ? $"{SymbolResolver.Describe(namer, method)} has no indexed callers, so its return value flows nowhere in the index."
             : null;
-        return ResponseBuilder.BuildPage(results, callerEdges.Count, page, method.LastIndexedAt, ambiguity, provenance, summary,
+        return ResponseBuilder.BuildPage(results, callerEdges.Count, page, method.LastIndexedAt, ambiguity, provenance, Summary,
             message: ResponseBuilder.JoinMessages(note, empty));
     }
 }

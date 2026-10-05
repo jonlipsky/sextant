@@ -14,6 +14,30 @@ public static partial class SymbolExtractor
 
     private static readonly SymbolDisplayFormat FqnFormat = SymbolDisplayFormat.FullyQualifiedFormat;
 
+    /// <summary>
+    /// A member as C# declares it (<c>Task&lt;Record&gt; CreateAsync(string id, CancellationToken ct = default)</c>):
+    /// return type, parameter names, ref/out/in/params/this modifiers, default and constant values, and the member
+    /// modifiers (static, abstract, virtual, override, sealed, const, readonly, required). Types are named as written
+    /// (no namespace) so the text stays short; the symbol's <c>fully_qualified_name</c> carries the qualified name.
+    /// </summary>
+    internal static readonly SymbolDisplayFormat DeclarationFormat = new(
+        globalNamespaceStyle: SymbolDisplayGlobalNamespaceStyle.Omitted,
+        typeQualificationStyle: SymbolDisplayTypeQualificationStyle.NameOnly,
+        genericsOptions: SymbolDisplayGenericsOptions.IncludeTypeParameters | SymbolDisplayGenericsOptions.IncludeVariance,
+        memberOptions: SymbolDisplayMemberOptions.IncludeType | SymbolDisplayMemberOptions.IncludeParameters
+            | SymbolDisplayMemberOptions.IncludeRef | SymbolDisplayMemberOptions.IncludeExplicitInterface
+            | SymbolDisplayMemberOptions.IncludeConstantValue | SymbolDisplayMemberOptions.IncludeModifiers,
+        delegateStyle: SymbolDisplayDelegateStyle.NameAndSignature,
+        parameterOptions: SymbolDisplayParameterOptions.IncludeType | SymbolDisplayParameterOptions.IncludeName
+            | SymbolDisplayParameterOptions.IncludeParamsRefOut | SymbolDisplayParameterOptions.IncludeDefaultValue
+            | SymbolDisplayParameterOptions.IncludeExtensionThis | SymbolDisplayParameterOptions.IncludeModifiers,
+        propertyStyle: SymbolDisplayPropertyStyle.ShowReadWriteDescriptor,
+        miscellaneousOptions: SymbolDisplayMiscellaneousOptions.UseSpecialTypes
+            | SymbolDisplayMiscellaneousOptions.EscapeKeywordIdentifiers
+            | SymbolDisplayMiscellaneousOptions.IncludeNullableReferenceTypeModifier
+            | SymbolDisplayMiscellaneousOptions.UseAsterisksInMultiDimensionalArrays
+            | SymbolDisplayMiscellaneousOptions.AllowDefaultLiteral);
+
     public static async Task<List<Sextant.Core.SymbolInfo>> ExtractFromProjectAsync(
         Project project, long projectId, bool includeDocComments = true)
         => (await ExtractFromProjectWithStatusAsync(project, projectId, includeDocComments)).Symbols;
@@ -80,6 +104,7 @@ public static partial class SymbolExtractor
                     IsOverride = declaredSymbol.IsOverride,
                     Signature = signature,
                     SignatureHash = signature != null ? HashSignature(signature) : null,
+                    Declaration = GetDeclaration(declaredSymbol),
                     DocComment = includeDocComments ? GetDocComment(declaredSymbol) : null,
                     FilePath = syntaxTree.FilePath,
                     LineStart = lineSpan.StartLinePosition.Line + 1,
@@ -121,6 +146,7 @@ public static partial class SymbolExtractor
             IsOverride = declaredSymbol.IsOverride,
             Signature = signature,
             SignatureHash = signature != null ? HashSignature(signature) : null,
+            Declaration = GetDeclaration(declaredSymbol),
             DocComment = GetDocComment(declaredSymbol),
             FilePath = location.SourceTree?.FilePath ?? "",
             LineStart = lineSpan.StartLinePosition.Line + 1,
@@ -196,6 +222,14 @@ public static partial class SymbolExtractor
             return property.ToDisplayString();
         return null;
     }
+
+    /// <summary>The <see cref="DeclarationFormat"/> text of a member or delegate; null for every other kind.</summary>
+    internal static string? GetDeclaration(ISymbol symbol) => symbol switch
+    {
+        IMethodSymbol or IPropertySymbol or IFieldSymbol or IEventSymbol => symbol.ToDisplayString(DeclarationFormat),
+        INamedTypeSymbol { TypeKind: TypeKind.Delegate } => symbol.ToDisplayString(DeclarationFormat),
+        _ => null
+    };
 
     private static string HashSignature(string signature)
     {

@@ -34,6 +34,10 @@ internal sealed class AgentOutputFixture : IDisposable
     public required long SnapshotA { get; init; }
     public required long SnapshotB { get; init; }
 
+    /// <summary>The App.Core project of repository A, and RepoB's one project (for tests that add rows).</summary>
+    public required long CoreProject { get; init; }
+    public required long OtherProject { get; init; }
+
     /// <summary>Repository-relative path of every reference file, in fixture order.</summary>
     public required IReadOnlyList<string> ReferenceFiles { get; init; }
 
@@ -150,6 +154,8 @@ internal sealed class AgentOutputFixture : IDisposable
             CheckoutRoot = checkoutRoot,
             SnapshotA = snapId,
             SnapshotB = snapB,
+            CoreProject = core,
+            OtherProject = other,
             ReferenceFiles = files
         };
     }
@@ -186,7 +192,7 @@ internal sealed class AgentOutputFixture : IDisposable
 
     // Writes the file into the checkout and records its version with the real SHA-256, so the service's
     // hash-gated SourceContextRetriever serves snippets exactly as it does on a worker.
-    private static long SourceFile(
+    internal static long SourceFile(
         SqliteConnection conn, string checkoutRoot, long projectId, string storedRelative, string checkoutRelative,
         IEnumerable<string> lines, long now)
     {
@@ -216,18 +222,25 @@ internal sealed class AgentOutputFixture : IDisposable
         return kind == SymbolKind.Method ? $"M:{name}(System.String)" : $"T:{name}";
     }
 
-    private static long Symbol(
+    /// <summary>
+    /// Inserts a symbol row. <paramref name="key"/> defaults to the fixture's documentation ID;
+    /// <paramref name="signature"/> is the legacy display and <paramref name="declaration"/> the declaration
+    /// (migration 026; null on a row indexed before it).
+    /// </summary>
+    internal static long Symbol(
         SqliteConnection conn, long projectId, string fqn, string name, SymbolKind kind, long fileVersionId,
-        int lineStart, int lineEnd, long now)
+        int lineStart, int lineEnd, long now, string? key = null, string? signature = null, string? declaration = null)
     {
         using var s = conn.CreateCommand();
         s.CommandText = """
             INSERT INTO symbols (project_id, symbol_key, fully_qualified_name, display_name, kind, accessibility,
-                                 file_version_id, line_start, line_end, last_indexed_at)
-            VALUES (@p, @key, @fqn, @name, @kind, 0, @fv, @ls, @le, @now) RETURNING id;
+                                 file_version_id, line_start, line_end, last_indexed_at, signature, declaration)
+            VALUES (@p, @key, @fqn, @name, @kind, 0, @fv, @ls, @le, @now, @sig, @decl) RETURNING id;
             """;
         s.Parameters.AddWithValue("@p", projectId);
-        s.Parameters.AddWithValue("@key", DocumentationId(fqn, kind));
+        s.Parameters.AddWithValue("@key", key ?? DocumentationId(fqn, kind));
+        s.Parameters.AddWithValue("@sig", (object?)signature ?? DBNull.Value);
+        s.Parameters.AddWithValue("@decl", (object?)declaration ?? DBNull.Value);
         s.Parameters.AddWithValue("@fqn", fqn);
         s.Parameters.AddWithValue("@name", name);
         s.Parameters.AddWithValue("@kind", (int)kind);

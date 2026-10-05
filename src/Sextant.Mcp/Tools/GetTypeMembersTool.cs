@@ -14,10 +14,15 @@ public static class GetTypeMembersTool
     public static string GetTypeMembers(
         DatabaseProvider dbProvider,
         [Description("Type, fully qualified.")] string symbol_fqn,
-        bool include_inherited = false)
+        bool include_inherited = false,
+        [Description(ToolText.Limit)] int? limit = null,
+        [Description(ToolText.Cursor)] string? cursor = null)
     {
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
+        if (!Paging.TryBegin("get_type_members", limit, cursor, readContext, out var page, out var cursorError,
+                symbol_fqn, include_inherited))
+            return cursorError;
 
         using var conn = db.OpenReadConnection();
         var symbolStore = new SymbolStore(conn) { Scope = readContext.Scope };
@@ -37,7 +42,9 @@ public static class GetTypeMembersTool
 
         var canonicalIdCache = FindSymbolTool.BuildCanonicalIdCache(projectStore);
         var namer = new SymbolNamer(symbolStore);
-        var mapped = members
+        // Declared members in source order, then inherited ones nearest base first: a stable order, so a cursor
+        // resumes exactly where the previous page ended. Only this page is mapped.
+        var mapped = page.Slice(members)
             .Select(s => FindSymbolTool.MapSymbol(
                 s, FindSymbolTool.ResolveCanonicalId(s.ProjectId, canonicalIdCache), qualifiedName: namer.QualifiedName(s)))
             .ToList<object>();
@@ -52,7 +59,8 @@ public static class GetTypeMembersTool
         var note = SymbolResolver.ResolutionNote(symbolStore, lookup);
         if (note is not null)
             message = message is null ? note : message + " " + note;
-        return ResponseBuilder.Build(mapped, freshness, lookup.Ambiguity, readContext.Provenance, message: message);
+        return ResponseBuilder.BuildPage(mapped, members.Count, page, freshness, lookup.Ambiguity, readContext.Provenance,
+            message: message);
     }
 
     // The members a type declares itself, in source order. A type whose key is not a documentation ID (a legacy or

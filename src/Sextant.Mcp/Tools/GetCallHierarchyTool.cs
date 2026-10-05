@@ -77,13 +77,11 @@ public static class GetCallHierarchyTool
             }
         }
 
-        object? summary = page.IsTruncatedFirstPage(hits.Count)
-            ? new
-            {
-                ByDepth = Paging.CountBy(hits, h => h.Depth.ToString(System.Globalization.CultureInfo.InvariantCulture)),
-                ByFile = Paging.CountBy(hits, h => h.Edge.CallSiteFile)
-            }
-            : null;
+        object? Summary() => new
+        {
+            ByDepth = Paging.CountBy(hits, h => h.Depth.ToString(System.Globalization.CultureInfo.InvariantCulture)),
+            ByFile = Paging.CountBy(hits, h => h.Edge.CallSiteFile)
+        };
 
         var results = page.Slice(hits).Select(hit =>
         {
@@ -121,7 +119,7 @@ public static class GetCallHierarchyTool
             hits.Count == 0
                 ? $"{SymbolResolver.Describe(namer, rootSymbol)} has no indexed {(callees ? "callees" : "callers")}."
                 : null);
-        return ResponseBuilder.BuildPage(results, hits.Count, page, freshness, lookup.Ambiguity, readContext.Provenance, summary,
+        return ResponseBuilder.BuildPage(results, hits.Count, page, freshness, lookup.Ambiguity, readContext.Provenance, Summary,
             message: message);
     }
 

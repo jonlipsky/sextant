@@ -9,17 +9,22 @@ namespace Sextant.Mcp.Tools;
 public static class GetIndexStatusTool
 {
     [McpServerTool(Name = "get_index_status"), Description("What is indexed, with full snapshot provenance and coverage. Call when meta.snapshot has a warning.")]
-    public static string GetIndexStatus(DatabaseProvider dbProvider)
+    public static string GetIndexStatus(
+        DatabaseProvider dbProvider,
+        [Description(ToolText.Limit)] int? limit = null,
+        [Description(ToolText.Cursor)] string? cursor = null)
     {
         // Fail closed (criterion 1): status reveals project names, git remotes, symbol/reference counts and
         // storage — all existence/count signals. An unauthorized principal must get the uniform not-found,
         // never the status, so authorize BEFORE reading anything.
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
+        if (!Paging.TryBegin("get_index_status", limit, cursor, readContext, out var page, out var cursorError))
+            return cursorError;
 
         using var conn = db.OpenReadConnection();
 
-        var results = new List<object>();
+        var projects = new List<ProjectRow>();
         long freshness = 0;
 
         // Default to the selected snapshot's project versions (criterion 6): a scope-less status call
@@ -50,27 +55,53 @@ public static class GetIndexStatusTool
                 if (freshness == 0 || lastIndexed < freshness)
                     freshness = lastIndexed;
 
-                results.Add(new
+                projects.Add(new ProjectRow
                 {
-                    canonical_id = reader.GetString(reader.GetOrdinal("canonical_id")),
-                    git_remote_url = reader.GetString(reader.GetOrdinal("git_remote_url")),
-                    repo_relative_path = reader.GetString(reader.GetOrdinal("repo_relative_path")),
-                    assembly_name = reader.IsDBNull(reader.GetOrdinal("assembly_name")) ? null : reader.GetString(reader.GetOrdinal("assembly_name")),
-                    is_test_project = reader.GetInt64(reader.GetOrdinal("is_test_project")) != 0,
-                    last_indexed_at = lastIndexed,
-                    symbol_count = reader.GetInt64(reader.GetOrdinal("symbol_count")),
-                    reference_count = reader.GetInt64(reader.GetOrdinal("reference_count"))
+                    CanonicalId = reader.GetString(reader.GetOrdinal("canonical_id")),
+                    GitRemoteUrl = reader.GetString(reader.GetOrdinal("git_remote_url")),
+                    RepoRelativePath = reader.GetString(reader.GetOrdinal("repo_relative_path")),
+                    AssemblyName = reader.IsDBNull(reader.GetOrdinal("assembly_name")) ? null : reader.GetString(reader.GetOrdinal("assembly_name")),
+                    IsTestProject = reader.GetInt64(reader.GetOrdinal("is_test_project")) != 0,
+                    LastIndexedAt = lastIndexed,
+                    SymbolCount = reader.GetInt64(reader.GetOrdinal("symbol_count")),
+                    ReferenceCount = reader.GetInt64(reader.GetOrdinal("reference_count"))
                 });
             }
         }
 
-        var index = BuildIndexInfo(conn, selected, dbProvider.Authorizer.IsEnforcing, readContext.Provenance);
-        return ResponseBuilder.BuildStatus(results, freshness, index);
+        // The totals summarize every project; the rows are one page of them, by path so a cursor resumes exactly
+        // where the previous page ended (a repository with a hundred projects is otherwise one oversized answer).
+        var ordered = projects
+            .OrderBy(p => p.RepoRelativePath, StringComparer.Ordinal)
+            .ThenBy(p => p.CanonicalId, StringComparer.Ordinal)
+            .ToList();
+        var totals = new
+        {
+            projects = projects.Count,
+            test_projects = projects.Count(p => p.IsTestProject),
+            symbols = projects.Sum(p => p.SymbolCount),
+            references = projects.Sum(p => p.ReferenceCount)
+        };
+        var index = BuildIndexInfo(conn, selected, dbProvider.Authorizer.IsEnforcing, readContext.Provenance, totals);
+        return ResponseBuilder.BuildStatus(page.Slice(ordered), ordered.Count, page, freshness, index);
+    }
+
+    /// <summary>One project row of <c>get_index_status</c>, serialized as its snake_case fields.</summary>
+    private sealed class ProjectRow
+    {
+        public required string CanonicalId { get; init; }
+        public required string GitRemoteUrl { get; init; }
+        public required string RepoRelativePath { get; init; }
+        public string? AssemblyName { get; init; }
+        public bool IsTestProject { get; init; }
+        public long LastIndexedAt { get; init; }
+        public long SymbolCount { get; init; }
+        public long ReferenceCount { get; init; }
     }
 
     private static object BuildIndexInfo(
         Microsoft.Data.Sqlite.SqliteConnection conn, long? selectedSnapshotId, bool policyEnforced,
-        SnapshotProvenance? provenance)
+        SnapshotProvenance? provenance, object totals)
     {
         // Under an enforced multi-tenant policy, scope run metadata (profile / config_hash / features) to
         // the caller's SELECTED snapshot's own index run instead of the DB-wide latest complete run, which
@@ -96,6 +127,8 @@ public static class GetIndexStatusTool
         {
             profile,
             config_hash = run?.ConfigHash,
+            // The whole index at a glance, whichever page of project rows this response carries.
+            totals,
             features = IndexProfiles.FeatureNames(features),
             overlay = BuildOverlayInfo(conn, selectedSnapshotId),
             coverage = BuildCoverageInfo(conn, selectedSnapshotId),

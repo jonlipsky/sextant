@@ -38,7 +38,7 @@ public class SymbolNamePrefixIndexMigrationTests
             db.RunMigrations();
             var conn = db.GetConnection();
             Exec(conn, "DROP INDEX ix_symbols_project_name_nocase; DROP INDEX ix_repositories_remote_url_nocase; " +
-                "DELETE FROM schema_version WHERE version = 25;");
+                "ALTER TABLE symbols DROP COLUMN declaration; DELETE FROM schema_version WHERE version >= 25;");
             var runs = new IndexRunStore(conn);
             Assert.AreEqual(1, runs.MarkComplete(runs.BeginRun("full", 1), 2, 1));
             Assert.AreEqual(24, db.CurrentSchemaVersion);

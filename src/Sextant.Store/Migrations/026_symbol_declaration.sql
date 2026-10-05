@@ -1,0 +1,21 @@
+-- C#-like member declarations for the MCP tools' `signature` field.
+--
+-- The tools used to print the legacy `symbols.signature` (Roslyn's default display, e.g.
+-- `Ns.IStore.CreateAsync(string, System.DateTime)`): no return type and no parameter names, so an agent asked what a
+-- member declares had to read the file. The indexer now also records the declaration as C# spells it, e.g.
+-- `Task<Record> CreateAsync(string tenantId, DateTime installedAt, CancellationToken cancellationToken = default)`,
+-- for methods, constructors, properties, indexers, fields, events and delegates.
+--
+-- `signature` and `signature_hash` are NOT changed: SymbolNamer builds every printed member name
+-- (`global::Ns.Type.Method(int, string)`, the #219 round-trip contract) from `signature`, and api_surface diffs compare
+-- `signature_hash`. A row with no declaration (one indexed before this migration, or a kind without one) keeps
+-- printing its `signature`.
+--
+-- Metadata-only on purpose: ADD COLUMN with no DEFAULT and no backfill only rewrites the table's schema entry in
+-- sqlite_schema, so it is instant on a large catalog. Existing rows read NULL until their snapshot is re-indexed.
+--
+-- NOT identity-neutral: it changes what the indexer stores, so it advances IndexDatabase.SnapshotSchemaVersion (from 24
+-- to 26: 025 is index-only and identity-neutral, so the snapshot schema skips it). Together with AnalyzerVersion "5"
+-- every snapshot identity changes once and each repository re-indexes on its next ensure.
+
+ALTER TABLE symbols ADD COLUMN declaration TEXT;

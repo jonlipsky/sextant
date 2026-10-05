@@ -98,7 +98,7 @@ public static class FindSymbolTool
             var freshness = results.Count > 0 ? results.Min(s => s.LastIndexedAt) : 0L;
 
             if (!isRemoteBaseOverlay)
-                return ResponseBuilder.Build(mapped, freshness, provenance: readContext.Provenance);
+                return ResponseBuilder.BuildBounded(mapped, readContext, freshness, provenance: readContext.Provenance);
 
             RemoteBaseSymbolFederation.Outcome? outcome = null;
             if (federateRemote && mapped.Count < config.FtsMaxResults)
@@ -121,7 +121,7 @@ public static class FindSymbolTool
             // base was federated in), not 0 — mirroring the exact branch, which stamps provenance.Freshness
             // for a remote hit. Pure-local (non-overlay) freshness is untouched (criterion 4).
             var effectiveFreshness = results.Count > 0 ? freshness : provenance.Freshness;
-            return ResponseBuilder.Build(mapped, effectiveFreshness, provenance: provenance);
+            return ResponseBuilder.BuildBounded(mapped, readContext, effectiveFreshness, provenance: provenance);
         }
         else
         {
@@ -178,7 +178,8 @@ public static class FindSymbolTool
                     $"'{name.Trim()}' matches {lookup.TopMatchCount} different symbols{shown}. Tools that need one " +
                     "symbol accept any fully_qualified_name listed here (or qualify the name with its containing type " +
                     "and parameter list, e.g. 'Type.Method(int)').";
-                return ResponseBuilder.Build(listed, top.Min(s => s.LastIndexedAt), provenance: localProv, message: message);
+                return ResponseBuilder.BuildBounded(listed, readContext, top.Min(s => s.LastIndexedAt), provenance: localProv,
+                    message: message);
             }
 
             // Not resolvable locally. For a remote-base overlay, the definition may live in an UNCHANGED
@@ -280,7 +281,7 @@ public static class FindSymbolTool
             ["line_start"] = s.LineStart,
             ["line_end"] = s.LineEnd,
             ["accessibility"] = SymbolStore.FormatAccessibility(s.Accessibility),
-            ["signature"] = s.Signature
+            ["signature"] = s.Declaration ?? s.Signature
         };
 
         if (includeSource)

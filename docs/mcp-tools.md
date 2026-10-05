@@ -24,9 +24,10 @@ Every tool response includes a `meta` object:
 ### Paged results
 
 The tools that can return hundreds of rows — `find_references`, `find_by_attribute`, `find_by_signature`,
-`find_comments`, `find_tests`, `find_unreferenced`, `find_cross_repository_usages`, `get_api_surface` (list
-mode), `get_call_hierarchy`, `get_file_symbols`, `get_impact` (its `consumers`), `get_implementors`,
-`get_type_dependents` and `trace_value` — return one page at a time:
+`find_comments`, `find_tests`, `find_unreferenced`, `find_cross_repository_usages`, `get_api_surface` (its rows,
+or the `changes` of a comparison), `get_call_hierarchy`, `get_file_symbols`, `get_impact` (its `consumers`),
+`get_implementors`, `get_index_status` (its project rows), `get_type_dependents`, `get_type_members` and
+`trace_value` — return one page at a time:
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -50,6 +51,37 @@ mode), `get_call_hierarchy`, `get_file_symbols`, `get_impact` (its `consumers`),
   instead of paging. A result that fits its page has no summary.
 - `group_by` (`find_references`) groups the rows of the page; `meta.result_count` counts those rows.
 - `find_tests`, `find_comments` and `find_by_signature` replaced their former `max_results` with `limit`.
+- A page also ends early when its rows would not fit the [response budget](#response-size-budget).
+
+### Response size budget
+
+Every tool result stays under a character budget (default **20,000** characters of the text the client receives;
+`max_response_chars` in `sextant.json` / `SEXTANT_MAX_RESPONSE_CHARS` locally, `SEXTANT_SERVICE_MAX_RESPONSE_CHARS`
+on the service; at least 1,000). MCP clients cap what they accept from a tool — Claude Code refuses a result over
+`MAX_MCP_OUTPUT_TOKENS` (25,000 by default, estimated from the character count); the 57,953-character result it
+refused counted as more than 25,000 tokens, so 20,000 characters stays well inside the cap even at a pessimistic
+1.5 characters per token.
+
+- A **paged** tool fills its page until the next row would not fit, then stops with `meta.next_cursor` exactly as
+  if it had reached `limit` (`limit` is an upper bound). The page says so:
+
+  ```json
+  "meta": { "result_count": 37, "total": 259, "next_cursor": "eyJ2Ijox…", "page_truncated_by": "size" },
+  "message": "Page cut to 37 rows to stay under 20,000 characters. Pass meta.next_cursor for the next rows, or narrow the query."
+  ```
+
+  `meta.total` stays exact, the next page resumes at the first row left out, and the cursor is bound like any
+  other (tool, arguments, snapshot). A first page cut this way also leads with its `summary`.
+- An **unpaged** tool (`find_symbol` lists, `semantic_search`, `get_type_hierarchy`, `get_namespace_tree`,
+  `get_project_dependencies`, `find_submodule_consumers`) keeps the leading rows that fit, sets `meta.total` and
+  `meta.page_truncated_by: "size"`, and its `message` says to narrow the query; it has no cursor. A result that
+  fits is unchanged.
+- `get_base_snapshot_symbols` (local only) pages by the symbol id: a page cut by size returns the id of its last
+  row as `meta.next_cursor`, with `meta.page_truncated_by: "size"` (it reports no `meta.total`).
+- At least one row is always returned, even if that row alone is over the budget.
+- `search_symbols` (service only) keeps its own hit cap (`SEARCH_MAX_HITS`).
+
+Result text is written without HTML escaping: `Task<int>`, not `Task\u003Cint\u003E`.
 
 ### Paths
 
@@ -247,9 +279,16 @@ When a tool returns symbols, each includes at minimum:
   "line_start": 42,
   "line_end": 55,
   "accessibility": "public",
-  "signature": "public string MyMethod(string input)"
+  "signature": "string MyMethod(string input, int retries = 3)"
 }
 ```
+
+`signature` is the member's C# declaration: return (or property/field/event) type, name, type parameters,
+parameter modifiers (`this`, `params`, `ref`, `out`, `in`), parameter names and default values, and for a property
+its accessors, with type names written as in source (`Task<ChannelRecord> CreateAsync(string tenantId, DateTime
+installedAt, CancellationToken cancellationToken)`). It comes from the index (migration 026, analyzer version 5):
+a snapshot indexed before that keeps the earlier display, `Ns.Type.Member(string, System.DateTime)`, until it is
+re-indexed. Fields, events and delegates now have a `signature` too; other types have none. `fully_qualified_name` is unchanged and is the name to pass back to a tool.
 
 The `fully_qualified_name` is display/query data and is **not** unique — overloads and same-named members share one. The stable per-definition identity (`symbol_key`, a Roslyn documentation ID or a version-scoped fallback) is surfaced in the ambiguity `candidates` above when an FQN collides, so callers can tell the definitions apart.
 
@@ -291,6 +330,7 @@ Members of a type with their signatures.
 |---|---|---|---|
 | `symbol_fqn` | string | yes | Fully qualified name of the type |
 | `include_inherited` | bool | no | Include members from base types |
+| `limit` / `cursor` | int / string | no | Paging (see [Paged results](#paged-results)); declared members in source order, then inherited ones |
 
 ### get_file_symbols
 
@@ -344,11 +384,16 @@ FTS5 full-text search over symbol names and documentation comments.
 
 ### get_index_status
 
-Returns the current state of the index: project count, symbol count, reference count, last indexed timestamp, and per-project details. Call this first to see what data is available.
+Returns the current state of the index: a summary of the whole index, and one page of per-project rows
+(`canonical_id`, `git_remote_url`, `repo_relative_path`, `assembly_name`, `is_test_project`, `last_indexed_at`,
+`symbol_count`, `reference_count`) ordered by `repo_relative_path`.
 
-No parameters.
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `limit` / `cursor` | int / string | no | Pages the project rows (see [Paged results](#paged-results)) |
 
-The response also includes an `index` block describing the served generation: the active `profile`
+The response also includes an `index` block describing the served generation: `totals` over every project
+(`projects`, `test_projects`, `symbols`, `references`, whichever page is shown), the active `profile`
 (indexing profile), its `config_hash`, the enabled `features` (the capability names built under that
 profile), an `overlay` block when the served generation is a Phase-10 working-tree overlay or a full local
 fallback (`is_overlay`, `base_snapshot_id`, `has_working_tree_delta`, `fallback_reason`), a `snapshot` block
@@ -376,7 +421,8 @@ repository's service (issue #60). Falls back to a cached page when a warmed peer
 
 `meta.snapshot.origin` (`local`/`remote`) and `base_identity_hash` record where the rows came from;
 `meta.snapshot.completeness` / `coverage` report the snapshot's checkout coverage (a partial snapshot's rows
-are still served, with `completeness: "partial"`, issue #119); `meta.next_cursor` continues paging. When the
+are still served, with `completeness: "partial"`, issue #119); `meta.next_cursor` continues paging, and a page
+over the [response size budget](#response-size-budget) ends early with `meta.page_truncated_by: "size"`. When the
 snapshot is neither local nor served by any peer, the response is an empty result with an explanatory
 `message` (never a silent zero-symbol answer).
 
@@ -514,9 +560,12 @@ Finds methods/properties by signature characteristics.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `return_type` | string | no | Return type to match (partial match) |
-| `parameter_type` | string | no | Parameter type to match (partial match) |
+| `return_type` | string | no | Return type to match (case-insensitive substring of the declared type, e.g. `Task` matches `Task<int>`) |
+| `parameter_type` | string | no | Parameter type to match (case-insensitive substring of any parameter's type) |
 | `parameter_count` | int | no | Exact number of parameters |
+
+The filters read the member's declaration (see [Symbol Result Object](#symbol-result-object)). A snapshot indexed
+before analyzer version 5 has no return types, so `return_type` matches nothing there until it is re-indexed.
 | `kind` | string | no | Symbol kind filter (default: method) |
 | `project_id` | string | no | Filter by project canonical ID |
 | `limit` / `cursor` | int / string | no | Paging (see [Paged results](#paged-results)) |

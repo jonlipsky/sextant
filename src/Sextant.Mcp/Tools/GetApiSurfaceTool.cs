@@ -45,27 +45,25 @@ public static class GetApiSurfaceTool
             var ordered = publicSymbols
                 .OrderBy(s => s.FilePath, StringComparer.Ordinal).ThenBy(s => s.LineStart).ThenBy(s => s.Id)
                 .ToList();
-            object? summary = page.IsTruncatedFirstPage(ordered.Count)
-                ? new
-                {
-                    ByKind = Paging.CountBy(ordered, s => s.Kind.ToString().ToLowerInvariant()),
-                    ByFile = Paging.CountBy(ordered, s => s.FilePath)
-                }
-                : null;
+            object? Summary() => new
+            {
+                ByKind = Paging.CountBy(ordered, s => s.Kind.ToString().ToLowerInvariant()),
+                ByFile = Paging.CountBy(ordered, s => s.FilePath)
+            };
             var results = page.Slice(ordered).Select(s => new
             {
                 fully_qualified_name = namer.QualifiedName(s),
                 display_name = s.DisplayName,
                 kind = s.Kind.ToString().ToLowerInvariant(),
                 accessibility = SymbolStore.FormatAccessibility(s.Accessibility),
-                signature = s.Signature,
+                signature = s.Declaration ?? s.Signature,
                 signature_hash = s.SignatureHash,
                 file_path = s.FilePath,
                 line_start = s.LineStart
             }).ToList<object>();
 
             return ResponseBuilder.BuildPage(results, ordered.Count, page, project.Value.lastIndexedAt,
-                provenance: readContext.Provenance, summary: summary);
+                provenance: readContext.Provenance, summary: Summary);
         }
 
         // Diff mode: compare current symbols against a previous snapshot
@@ -99,21 +97,30 @@ public static class GetApiSurfaceTool
         var changes = BreakingChangeDetector.DetectChanges(oldSurface, newSurface);
         var overall = BreakingChangeDetector.GetOverallClassification(changes);
 
-        var diffResults = new List<object>
+        // The changes are the page's rows, in a stable order so a cursor resumes where the previous page ended; the
+        // response wraps the ones it keeps in the one comparison row.
+        var orderedChanges = changes
+            .OrderBy(c => c.SymbolFqn, StringComparer.Ordinal)
+            .ThenBy(c => c.Classification)
+            .ThenBy(c => c.Reason, StringComparer.Ordinal)
+            .ToList();
+        var changeRows = page.Slice(orderedChanges).Select(c => (object)new
         {
-            new
-            {
-                overall_classification = overall.ToString().ToLowerInvariant(),
-                compared_against = compare_to_commit,
-                changes = changes.Select(c => new
-                {
-                    symbol_fqn = c.SymbolFqn,
-                    classification = c.Classification.ToString().ToLowerInvariant(),
-                    reason = c.Reason
-                }).ToList()
-            }
-        };
+            symbol_fqn = c.SymbolFqn,
+            classification = c.Classification.ToString().ToLowerInvariant(),
+            reason = c.Reason
+        }).ToList();
 
-        return ResponseBuilder.Build(diffResults, project.Value.lastIndexedAt, provenance: readContext.Provenance);
+        return ResponseBuilder.BuildPage(changeRows, orderedChanges.Count, page, project.Value.lastIndexedAt,
+            provenance: readContext.Provenance,
+            shape: kept => new List<object>
+            {
+                new
+                {
+                    overall_classification = overall.ToString().ToLowerInvariant(),
+                    compared_against = compare_to_commit,
+                    changes = kept
+                }
+            });
     }
 }

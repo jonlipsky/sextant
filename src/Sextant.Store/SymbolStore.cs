@@ -34,7 +34,7 @@ public sealed class SymbolStore(SqliteConnection connection)
     private const string SelectBase = """
         SELECT s.id, s.project_id, s.symbol_key, s.fully_qualified_name, s.display_name, s.kind,
                s.accessibility, s.is_static, s.is_abstract, s.is_virtual, s.is_override, s.signature,
-               s.signature_hash, s.doc_comment, s.line_start, s.line_end, s.attributes, s.last_indexed_at,
+               s.signature_hash, s.declaration, s.doc_comment, s.line_start, s.line_end, s.attributes, s.last_indexed_at,
                f.repo_relative_path AS repo_relative_path, p.disk_path AS disk_path,
                p.repo_relative_path AS project_repo_relative
         FROM symbols s
@@ -49,10 +49,10 @@ public sealed class SymbolStore(SqliteConnection connection)
 
     private const string InsertSql = """
         INSERT INTO symbols (project_id, symbol_key, fully_qualified_name, display_name, kind, accessibility,
-            is_static, is_abstract, is_virtual, is_override, signature, signature_hash,
+            is_static, is_abstract, is_virtual, is_override, signature, signature_hash, declaration,
             doc_comment, file_version_id, line_start, line_end, attributes, last_indexed_at)
         VALUES (@project_id, @symbol_key, @fqn, @display_name, @kind, @accessibility,
-            @is_static, @is_abstract, @is_virtual, @is_override, @signature, @signature_hash,
+            @is_static, @is_abstract, @is_virtual, @is_override, @signature, @signature_hash, @declaration,
             @doc_comment, @file_version_id, @line_start, @line_end, @attributes, @last_indexed_at)
         ON CONFLICT(project_id, symbol_key) DO UPDATE SET
             fully_qualified_name = excluded.fully_qualified_name,
@@ -65,6 +65,7 @@ public sealed class SymbolStore(SqliteConnection connection)
             is_override = excluded.is_override,
             signature = excluded.signature,
             signature_hash = excluded.signature_hash,
+            declaration = excluded.declaration,
             doc_comment = excluded.doc_comment,
             file_version_id = excluded.file_version_id,
             line_start = excluded.line_start,
@@ -114,6 +115,7 @@ public sealed class SymbolStore(SqliteConnection connection)
         SqlParam.Set(cmd, "@is_override", symbol.IsOverride ? 1 : 0);
         SqlParam.Set(cmd, "@signature", symbol.Signature);
         SqlParam.Set(cmd, "@signature_hash", symbol.SignatureHash);
+        SqlParam.Set(cmd, "@declaration", symbol.Declaration);
         SqlParam.Set(cmd, "@doc_comment", symbol.DocComment);
         SqlParam.Set(cmd, "@file_version_id", fileVersionId);
         SqlParam.Set(cmd, "@line_start", symbol.LineStart);
@@ -296,7 +298,7 @@ public sealed class SymbolStore(SqliteConnection connection)
     private const string SelectColumns = """
         SELECT s.id, s.project_id, s.symbol_key, s.fully_qualified_name, s.display_name, s.kind,
                s.accessibility, s.is_static, s.is_abstract, s.is_virtual, s.is_override, s.signature,
-               s.signature_hash, s.doc_comment, s.line_start, s.line_end, s.attributes, s.last_indexed_at,
+               s.signature_hash, s.declaration, s.doc_comment, s.line_start, s.line_end, s.attributes, s.last_indexed_at,
                f.repo_relative_path AS repo_relative_path, p.disk_path AS disk_path,
                p.repo_relative_path AS project_repo_relative
         """;
@@ -610,16 +612,18 @@ public sealed class SymbolStore(SqliteConnection connection)
             sql.Append($" AND s.kind IN ({(int)SymbolKind.Method}, {(int)SymbolKind.Constructor})");
         }
 
+        // A coarse prefilter over the printed signature (the declaration when recorded, migration 026, else the
+        // legacy display): any row whose text contains the pattern. The caller decides on the parsed signature.
         if (returnTypePattern != null)
         {
-            sql.Append(" AND s.signature LIKE @return_type_pattern");
-            cmd.Parameters.AddWithValue("@return_type_pattern", $"%{returnTypePattern} %");
+            sql.Append(" AND COALESCE(s.declaration, s.signature) LIKE @return_type_pattern");
+            cmd.Parameters.AddWithValue("@return_type_pattern", $"%{returnTypePattern}%");
         }
 
         if (paramTypePattern != null)
         {
-            sql.Append(" AND s.signature LIKE @param_type_pattern");
-            cmd.Parameters.AddWithValue("@param_type_pattern", $"%(%{paramTypePattern}%");
+            sql.Append(" AND COALESCE(s.declaration, s.signature) LIKE @param_type_pattern");
+            cmd.Parameters.AddWithValue("@param_type_pattern", $"%{paramTypePattern}%");
         }
 
         if (projectId.HasValue)
@@ -714,6 +718,7 @@ public sealed class SymbolStore(SqliteConnection connection)
             IsOverride = reader.GetInt64(reader.GetOrdinal("is_override")) != 0,
             Signature = reader.IsDBNull(reader.GetOrdinal("signature")) ? null : reader.GetString(reader.GetOrdinal("signature")),
             SignatureHash = reader.IsDBNull(reader.GetOrdinal("signature_hash")) ? null : reader.GetString(reader.GetOrdinal("signature_hash")),
+            Declaration = reader.IsDBNull(reader.GetOrdinal("declaration")) ? null : reader.GetString(reader.GetOrdinal("declaration")),
             DocComment = reader.IsDBNull(reader.GetOrdinal("doc_comment")) ? null : reader.GetString(reader.GetOrdinal("doc_comment")),
             FilePath = filePath,
             LineStart = reader.GetInt32(reader.GetOrdinal("line_start")),

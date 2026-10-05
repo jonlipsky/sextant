@@ -40,8 +40,15 @@ public sealed class FederatedReadContext
         new(Scope, provenance, Authorization, SelectedSnapshotId, RemoteBase, Paths, SelectionUnresolved, BranchRequested)
         {
             RepositoryUrl = RepositoryUrl,
-            BranchName = BranchName
+            BranchName = BranchName,
+            MaxResponseChars = MaxResponseChars
         };
+
+    /// <summary>
+    /// The most characters one tool result of this request may hold (<see cref="ResponseBudget"/>), set by
+    /// <see cref="DatabaseProvider"/> from its configuration.
+    /// </summary>
+    public int MaxResponseChars { get; internal set; } = ResponseBudget.DefaultMaxChars;
 
     /// <summary>
     /// How this request presents and matches source paths (issue #145): repository-relative inputs on every

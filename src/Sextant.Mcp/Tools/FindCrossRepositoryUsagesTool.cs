@@ -64,9 +64,7 @@ public static class FindCrossRepositoryUsagesTool
                 provider_repository_url, symbol_fqn, branch, consumer_commit, ConsumerHeads(outcome.Usages)))
             return cursorError;
 
-        object? summary = page.IsTruncatedFirstPage(outcome.Usages.Count)
-            ? new { ByRepository = Paging.CountBy(outcome.Usages, u => u.ConsumerRepositoryUrl) }
-            : null;
+        object? Summary() => new { ByRepository = Paging.CountBy(outcome.Usages, u => u.ConsumerRepositoryUrl) };
 
         var results = page.Slice(outcome.Usages).Select(u => (object)new
         {
@@ -87,7 +85,7 @@ public static class FindCrossRepositoryUsagesTool
             ? $"No authorized consumer repository uses {resolved} in the selected scope."
             : $"Usages of {resolved}.";
         return ResponseBuilder.BuildPage(results, outcome.Usages.Count, page, readContext.Provenance?.Freshness,
-            provenance: readContext.Provenance, summary: summary, message: message);
+            provenance: readContext.Provenance, summary: Summary, message: message);
     }
 
     private static string Describe(Microsoft.Data.Sqlite.SqliteConnection conn, SymbolInfo symbol) =>

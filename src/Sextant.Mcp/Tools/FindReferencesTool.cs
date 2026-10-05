@@ -101,13 +101,11 @@ public static class FindReferencesTool
             .ThenBy(r => r.InProjectId).ThenBy(r => r.Id).ToList();
 
         var canonicalIdCache = FindSymbolTool.BuildCanonicalIdCache(projectStore);
-        object? summary = page.IsTruncatedFirstPage(refs.Count)
-            ? new
-            {
-                ByProject = Paging.CountBy(refs, r => FindSymbolTool.ResolveCanonicalId(r.InProjectId, canonicalIdCache)),
-                ByFile = Paging.CountBy(refs, r => r.FilePath)
-            }
-            : null;
+        object? Summary() => new
+        {
+            ByProject = Paging.CountBy(refs, r => FindSymbolTool.ResolveCanonicalId(r.InProjectId, canonicalIdCache)),
+            ByFile = Paging.CountBy(refs, r => r.FilePath)
+        };
 
         // Only this page's rows are mapped, so snippets are read for at most `limit` references.
         var pageRefs = page.Slice(refs);
@@ -134,14 +132,14 @@ public static class FindReferencesTool
             return result;
         }).ToList<object>();
 
-        if (!string.IsNullOrEmpty(group_by))
-        {
-            var groups = group_by.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
-            mapped = GroupReferences(mapped, groups);
-        }
+        // Grouping shapes the rows the page keeps, so a page cut by size groups only the rows it returns.
+        string[] groups = string.IsNullOrEmpty(group_by)
+            ? []
+            : group_by.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
 
         return ResponseBuilder.BuildPage(mapped, refs.Count, page, symbol.LastIndexedAt, lookup.Ambiguity,
-            readContext.Provenance, summary, resultCount: pageRefs.Count, message: message);
+            readContext.Provenance, Summary, message,
+            shape: groups.Length == 0 ? null : rows => GroupReferences(rows, groups));
     }
 
     private static List<object> GroupReferences(List<object> refs, string[] groupKeys)

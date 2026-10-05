@@ -104,6 +104,7 @@ public static class ServiceApp
                 // Issue #145: refuse absolute path inputs and record each admitted read for the output pass
                 // (RemoteOutputFilter), which makes paths repository-relative and the snapshot meta lean.
                 RemoteSurface = true,
+                MaxResponseChars = options.MaxResponseChars,
                 ReadAdmitted = context => RemoteOutputFilter.Record(http.HttpContext, context)
             };
         });

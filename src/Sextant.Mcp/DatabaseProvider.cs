@@ -106,6 +106,19 @@ public sealed class DatabaseProvider : IDisposable
     /// </summary>
     public Action<FederatedReadContext>? ReadAdmitted { get; init; }
 
+    /// <summary>
+    /// The most characters one tool result may hold (<see cref="ResponseBudget"/>): absent or not positive means
+    /// <see cref="ResponseBudget.DefaultMaxChars"/>, and a value below <see cref="ResponseBudget.MinMaxChars"/> is
+    /// raised to it. Every admitted read carries it in <see cref="FederatedReadContext.MaxResponseChars"/>.
+    /// </summary>
+    public int MaxResponseChars
+    {
+        get => _maxResponseChars;
+        init => _maxResponseChars = ResponseBudget.Clamp(value);
+    }
+
+    private readonly int _maxResponseChars = ResponseBudget.DefaultMaxChars;
+
     public bool DatabaseExists => File.Exists(_dbPath);
 
     public IndexDatabase? GetDatabase()
@@ -203,6 +216,7 @@ public sealed class DatabaseProvider : IDisposable
 
             database = ready;
             context = StampImplicitSelection(context);
+            context.MaxResponseChars = MaxResponseChars;
             failureResponse = string.Empty;
             ReadAdmitted?.Invoke(context);
             return true;
@@ -223,6 +237,7 @@ public sealed class DatabaseProvider : IDisposable
             return false;
 
         context = StampImplicitSelection(context);
+        context.MaxResponseChars = MaxResponseChars;
         failureResponse = string.Empty;
         ReadAdmitted?.Invoke(context);
         return true;

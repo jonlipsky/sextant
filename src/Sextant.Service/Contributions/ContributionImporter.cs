@@ -221,7 +221,7 @@ public sealed class ContributionImporter(SqliteConnection target)
         read.CommandText = """
             SELECT id, symbol_key, fully_qualified_name, display_name, kind, accessibility, is_static, is_abstract,
                    is_virtual, is_override, signature, signature_hash, doc_comment, file_version_id, line_start,
-                   line_end, attributes, last_indexed_at
+                   line_end, attributes, last_indexed_at, declaration
             FROM symbols WHERE project_id = @p ORDER BY id;
             """;
         read.Parameters.AddWithValue("@p", payloadProjectId);
@@ -235,9 +235,9 @@ public sealed class ContributionImporter(SqliteConnection target)
                 INSERT INTO symbols
                     (project_id, symbol_key, fully_qualified_name, display_name, kind, accessibility, is_static,
                      is_abstract, is_virtual, is_override, signature, signature_hash, doc_comment, file_version_id,
-                     line_start, line_end, attributes, last_indexed_at)
+                     line_start, line_end, attributes, last_indexed_at, declaration)
                 VALUES (@p, @key, @fqn, @name, @kind, @acc, @static, @abstract, @virtual, @override, @sig, @sighash,
-                        @doc, @fv, @ls, @le, @attr, @now)
+                        @doc, @fv, @ls, @le, @attr, @now, @decl)
                 RETURNING id;
                 """;
             ins.Parameters.AddWithValue("@p", newProjectId);
@@ -258,6 +258,7 @@ public sealed class ContributionImporter(SqliteConnection target)
             ins.Parameters.AddWithValue("@le", reader.GetInt64(15));
             ins.Parameters.AddWithValue("@attr", reader.IsDBNull(16) ? DBNull.Value : reader.GetString(16));
             ins.Parameters.AddWithValue("@now", reader.GetInt64(17));
+            ins.Parameters.AddWithValue("@decl", reader.IsDBNull(18) ? DBNull.Value : reader.GetString(18));
             symbolMap[oldId] = (long)ins.ExecuteScalar()!;
             count++;
         }

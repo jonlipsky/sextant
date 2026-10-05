@@ -38,8 +38,9 @@ public static class McpServerSetup
                 // A pre-built instance passed to AddSingleton would never be disposed by the container.
                 services.AddSingleton(_ =>
                 {
-                    var provider = new DatabaseProvider(dbPath);
-                    provider.AttachRemoteFederation(RemoteBaseSnapshotFederation.Create(SextantConfiguration.Load()));
+                    var config = SextantConfiguration.Load();
+                    var provider = new DatabaseProvider(dbPath) { MaxResponseChars = config.MaxResponseChars };
+                    provider.AttachRemoteFederation(RemoteBaseSnapshotFederation.Create(config));
                     return provider;
                 });
                 services.AddMcpServer()
@@ -71,8 +72,9 @@ public static class McpServerSetup
         // Factory registration so the container owns/disposes the singleton on shutdown (see stdio host).
         builder.Services.AddSingleton(_ =>
         {
-            var provider = new DatabaseProvider(dbPath);
-            provider.AttachRemoteFederation(RemoteBaseSnapshotFederation.Create(SextantConfiguration.Load()));
+            var config = SextantConfiguration.Load();
+            var provider = new DatabaseProvider(dbPath) { MaxResponseChars = config.MaxResponseChars };
+            provider.AttachRemoteFederation(RemoteBaseSnapshotFederation.Create(config));
             return provider;
         });
         // Stateful, as before the SDK 2.x upgrade: SDK 2.0 flipped the Streamable HTTP default to stateless,
