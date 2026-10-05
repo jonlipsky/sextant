@@ -25,13 +25,18 @@ namespace Sextant.Service.Host;
 /// </summary>
 internal static class RepositoryInferenceFilter
 {
-    /// <summary>The most repositories one call probes. A caller that can read more gets no inference.</summary>
+    /// <summary>
+    /// The most repositories one call probes. A caller that can read more gets no inference and no probe at all,
+    /// whatever their order: the call goes on unchanged, so it gets the ordinary <c>repository_required</c>.
+    /// </summary>
     public const int MaxRepositories = 25;
 
-    public static McpRequestFilter<CallToolRequestParams, CallToolResult> CallToolFilter(SnapshotService service, RepositoryUrlPolicy policy)
+    public static McpRequestFilter<CallToolRequestParams, CallToolResult> CallToolFilter(
+        SnapshotService service, RepositoryUrlPolicy policy, RepositoryInferenceProbeCount probes)
     {
         ArgumentNullException.ThrowIfNull(service);
         ArgumentNullException.ThrowIfNull(policy);
+        ArgumentNullException.ThrowIfNull(probes);
         return next => async (context, cancellationToken) =>
         {
             if (context.Params is not { Name: { } name } parameters || !RepositoryInference.Tools.ContainsKey(name))
@@ -51,7 +56,11 @@ internal static class RepositoryInferenceFilter
                 return await next(context, cancellationToken);
 
             var provider = services.GetRequiredService<DatabaseProvider>();
-            var holders = RepositoryInference.Holders(provider.ProbeRepositories(candidates, probe, cancellationToken));
+            var holders = RepositoryInference.Holders(provider.ProbeRepositories(candidates, (db, read) =>
+            {
+                probes.Increment();
+                return probe(db, read);
+            }, cancellationToken));
             if (holders.Count == 1)
             {
                 ToolCallSelection.Set(http, new ToolCallSelection(holders[0], null, ToolSelectionSource.Inferred));
@@ -75,4 +84,17 @@ internal static class RepositoryInferenceFilter
         return $"{what} is in {names.Count} repositories this caller can read: " +
                $"{string.Join(", ", names.Select(n => $"'{n}'"))}. Pass the 'repository' argument (e.g. '{names[0]}').";
     }
+}
+
+/// <summary>
+/// How many repositories <see cref="RepositoryInferenceFilter"/> has looked an argument up in, over one app's
+/// lifetime. A diagnostic: the tests read it to prove that a caller past the limit is never probed.
+/// </summary>
+internal sealed class RepositoryInferenceProbeCount
+{
+    private long _value;
+
+    public long Value => Interlocked.Read(ref _value);
+
+    public void Increment() => Interlocked.Increment(ref _value);
 }
