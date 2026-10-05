@@ -31,7 +31,7 @@ public sealed class CallGraphStore(SqliteConnection connection)
 
     private const string InsertSql = """
         INSERT INTO occurrences (in_project_id, target_symbol_id, source_symbol_id, file_version_id, line, col, kind, flags, last_indexed_at)
-        VALUES (@in_project_id, @callee, @caller, @file_version_id, @line, @col, @kind, 0, @last_indexed_at)
+        VALUES (@in_project_id, @callee, @caller, @file_version_id, @line, @col, @kind, @flags, @last_indexed_at)
         RETURNING id;
         """;
 
@@ -40,7 +40,7 @@ public sealed class CallGraphStore(SqliteConnection connection)
     // column so two distinct calls on one line (e.g. `F(a); F(b);`) stay distinguishable occurrences —
     // the discriminator the unified schema reserves for same-line disambiguation.
     private const string SelectBase = """
-        SELECT o.id AS id, o.source_symbol_id, o.target_symbol_id, o.line, o.col, o.last_indexed_at,
+        SELECT o.id AS id, o.source_symbol_id, o.target_symbol_id, o.line, o.col, o.flags, o.last_indexed_at,
                f.repo_relative_path AS repo_relative_path, p.disk_path AS disk_path,
                p.repo_relative_path AS project_repo_relative
         FROM occurrences o
@@ -87,6 +87,7 @@ public sealed class CallGraphStore(SqliteConnection connection)
         SqlParam.Set(cmd, "@line", edge.CallSiteLine);
         SqlParam.Set(cmd, "@col", edge.CallSiteColumn);
         SqlParam.Set(cmd, "@kind", (int)ReferenceKind.Invocation);
+        SqlParam.Set(cmd, "@flags", ReferenceStore.ToFlags(access: null, edge.IsCandidate));
         SqlParam.Set(cmd, "@last_indexed_at", edge.LastIndexedAt);
         return (long)cmd.ExecuteScalar()!;
     }
@@ -185,6 +186,7 @@ public sealed class CallGraphStore(SqliteConnection connection)
                 CallSiteFile = callSiteFile,
                 CallSiteLine = reader.GetInt32(reader.GetOrdinal("line")),
                 CallSiteColumn = reader.GetInt32(reader.GetOrdinal("col")),
+                IsCandidate = ReferenceStore.IsCandidateFlag(reader.GetInt64(reader.GetOrdinal("flags"))),
                 LastIndexedAt = reader.GetInt64(reader.GetOrdinal("last_indexed_at"))
             });
         }

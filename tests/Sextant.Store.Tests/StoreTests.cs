@@ -153,6 +153,68 @@ public class StoreTests
     }
 
     [TestMethod]
+    public void CandidateFlag_RoundTrips_WithoutDisturbingAccess()
+    {
+        var projectId = InsertTestProject();
+        var callee = InsertMethod(projectId, "Callee");
+        var caller = InsertMethod(projectId, "Caller");
+
+        _referenceStore.Insert(new ReferenceInfo
+        {
+            SymbolId = callee, InProjectId = projectId, FilePath = "src/A.cs", Line = 1,
+            ReferenceKind = ReferenceKind.Invocation, IsCandidate = true
+        });
+        _referenceStore.Insert(new ReferenceInfo
+        {
+            SymbolId = callee, InProjectId = projectId, FilePath = "src/A.cs", Line = 2,
+            ReferenceKind = ReferenceKind.TypeRef, AccessKind = AccessKind.ReadWrite, IsCandidate = true
+        });
+        _referenceStore.Insert(new ReferenceInfo
+        {
+            SymbolId = callee, InProjectId = projectId, FilePath = "src/A.cs", Line = 3,
+            ReferenceKind = ReferenceKind.TypeRef, AccessKind = AccessKind.Write
+        });
+        var callGraph = new CallGraphStore(_db.GetConnection());
+        callGraph.Insert(new CallGraphEdge
+        {
+            CallerSymbolId = caller, CalleeSymbolId = callee, CallSiteFile = "src/A.cs", CallSiteLine = 1, IsCandidate = true
+        });
+        callGraph.Insert(new CallGraphEdge
+        {
+            CallerSymbolId = caller, CalleeSymbolId = callee, CallSiteFile = "src/A.cs", CallSiteLine = 4
+        });
+
+        var refs = _referenceStore.GetBySymbolId(callee).Where(r => r.SymbolId == callee && r.FilePath.EndsWith("A.cs"))
+            .ToDictionary(r => r.Line);
+        Assert.IsTrue(refs[1].IsCandidate);
+        Assert.IsNull(refs[1].AccessKind);
+        Assert.IsTrue(refs[2].IsCandidate);
+        Assert.AreEqual(AccessKind.ReadWrite, refs[2].AccessKind, "access bits 0-1 survive the candidate bit");
+        Assert.IsFalse(refs[3].IsCandidate);
+        Assert.AreEqual(AccessKind.Write, refs[3].AccessKind);
+
+        var edges = callGraph.GetByCaller(caller).ToDictionary(e => e.CallSiteLine);
+        Assert.IsTrue(edges[1].IsCandidate);
+        Assert.IsFalse(edges[4].IsCandidate);
+        Assert.AreEqual(4, ReferenceStore.ToFlags(null, isCandidate: true));
+        Assert.AreEqual(2, ReferenceStore.ToFlags(AccessKind.Write, isCandidate: false),
+            "an exact occurrence keeps the flags it always had");
+    }
+
+    private long InsertMethod(long projectId, string name) => _symbolStore.Insert(new SymbolInfo
+    {
+        ProjectId = projectId,
+        SymbolKey = $"M:N.C.{name}", FullyQualifiedName = $"global::N.C.{name}",
+        DisplayName = name,
+        Kind = SymbolKind.Method,
+        Accessibility = Accessibility.Public,
+        FilePath = "src/C.cs",
+        LineStart = 1,
+        LineEnd = 2,
+        LastIndexedAt = 1000
+    });
+
+    [TestMethod]
     public void RelationshipStore_InsertAndGetBySymbol()
     {
         var relationshipStore = new RelationshipStore(_db.GetConnection());

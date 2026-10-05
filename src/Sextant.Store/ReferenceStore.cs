@@ -78,7 +78,7 @@ public sealed class ReferenceStore(SqliteConnection connection)
         SqlParam.Set(cmd, "@file_version_id", fileVersionId);
         SqlParam.Set(cmd, "@line", reference.Line);
         SqlParam.Set(cmd, "@kind", (int)reference.ReferenceKind);
-        SqlParam.Set(cmd, "@flags", AccessToFlags(reference.AccessKind));
+        SqlParam.Set(cmd, "@flags", ToFlags(reference.AccessKind, reference.IsCandidate));
         SqlParam.Set(cmd, "@last_indexed_at", reference.LastIndexedAt);
         return (long)cmd.ExecuteScalar()!;
     }
@@ -199,11 +199,23 @@ public sealed class ReferenceStore(SqliteConnection connection)
                 ContextSnippet = null,
                 ReferenceKind = (ReferenceKind)reader.GetInt64(reader.GetOrdinal("kind")),
                 AccessKind = FlagsToAccess(flags),
+                IsCandidate = IsCandidateFlag(flags),
                 LastIndexedAt = reader.GetInt64(reader.GetOrdinal("last_indexed_at"))
             });
         }
         return results;
     }
+
+    /// <summary>
+    /// Occurrence flag bit 2: the usage did not bind exactly and the target is one of the compiler's
+    /// candidate symbols. Exactly bound occurrences leave it clear, so their flags are unchanged.
+    /// </summary>
+    internal const int CandidateFlag = 0b100;
+
+    internal static int ToFlags(AccessKind? access, bool isCandidate)
+        => AccessToFlags(access) | (isCandidate ? CandidateFlag : 0);
+
+    internal static bool IsCandidateFlag(long flags) => (flags & CandidateFlag) != 0;
 
     // Access is packed into occurrence flag bits 0-1: 0 = none, 1 = read, 2 = write, 3 = read/write.
     internal static int AccessToFlags(AccessKind? access) => access switch

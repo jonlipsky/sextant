@@ -192,9 +192,12 @@ public sealed record EnsureSnapshotRequest
     /// <paramref name="sdkPinPolicy"/> is the node's non-default SDK-pin policy component (issue #113,
     /// <see cref="ServiceOptions.SdkPinIdentityComponent"/>), the SAME value the worker publishes under. Null
     /// (the default override-on policy, tests, local) leaves the identity byte-identical.
+    /// <paramref name="restorePolicy"/> is the node's non-default NuGet restore policy component
+    /// (<see cref="ServiceOptions.RestoreIdentityComponent"/>), again the SAME value the worker publishes under.
     /// </summary>
     public SnapshotIdentity ToIdentity(
-        string? fallbackConfigHash = null, string? fallbackCapability = null, string? sdkPinPolicy = null) => new()
+        string? fallbackConfigHash = null, string? fallbackCapability = null, string? sdkPinPolicy = null,
+        string? restorePolicy = null) => new()
     {
         RepositoryRemoteUrl = RepositoryRemoteUrl,
         CommitSha = CommitSha,
@@ -204,7 +207,8 @@ public sealed record EnsureSnapshotRequest
         ConfigHash = ConfigHash ?? fallbackConfigHash,
         ToolchainFingerprint = ToolchainFingerprint.Current,
         CapabilityFingerprint = fallbackCapability,
-        SdkPinPolicy = sdkPinPolicy
+        SdkPinPolicy = sdkPinPolicy,
+        RestorePolicy = restorePolicy
     };
 }
 

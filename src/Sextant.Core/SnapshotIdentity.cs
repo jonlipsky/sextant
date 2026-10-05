@@ -18,7 +18,8 @@ namespace Sextant.Core;
 ///   <item><see cref="ToolchainFingerprint"/> — the runtime that produced it
 ///   (<see cref="Core.ToolchainFingerprint.Current"/>).</item>
 ///   <item>Optional components folded only when set: the working-tree delta + overlay discriminator,
-///   the <see cref="CapabilityFingerprint"/>, and the non-default <see cref="SdkPinPolicy"/>.</item>
+///   the <see cref="CapabilityFingerprint"/>, the non-default <see cref="SdkPinPolicy"/>, and the non-default
+///   <see cref="RestorePolicy"/>.</item>
 /// </list>
 /// Two runs with the same tuple produce the same <see cref="Hash"/>, so a duplicate publish attaches
 /// to the existing snapshot instead of creating a second one (acceptance criterion 3). A difference in
@@ -84,6 +85,17 @@ public sealed record SnapshotIdentity
     public string? SdkPinPolicy { get; init; }
 
     /// <summary>
+    /// The service worker's NuGet restore policy when it is NOT the default, or <c>null</c>. The service worker
+    /// restores each selected solution before loading it, so package types and the SDK's transitive project
+    /// references bind; with restore disabled the same commit can publish an index in which code using those
+    /// types failed to bind. Reuse never rebuilds, so the non-default policy is part of the identity, folded
+    /// into <see cref="Hash"/> ONLY when non-null (the service sets <c>off</c> only when restore is disabled).
+    /// Every other identity keeps its pre-image: the default service, the local CLI/daemon (which never
+    /// restores), contributions, and remote-base addressing.
+    /// </summary>
+    public string? RestorePolicy { get; init; }
+
+    /// <summary>
     /// The stable idempotency/compatibility hash over the identity tuple. Deterministic across
     /// machines and runs: a fixed, ordered <c>key=value;</c> pre-image hashed with SHA-256 (hex).
     /// </summary>
@@ -107,6 +119,9 @@ public sealed record SnapshotIdentity
             // it null, keeping their identity byte-identical to before this field existed.
             if (SdkPinPolicy != null)
                 canonical += $";sdkpin={SdkPinPolicy}";
+            // Fold the restore policy ONLY when set: the default service and every local run leave it null.
+            if (RestorePolicy != null)
+                canonical += $";restore={RestorePolicy}";
             var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(canonical));
             return Convert.ToHexStringLower(bytes);
         }

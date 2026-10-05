@@ -19,10 +19,22 @@ namespace Sextant.Mcp;
 /// </summary>
 public static class RemoteResponsePresenter
 {
-    /// <summary>The lean meta's warning for a snapshot that does not cover the whole checkout.</summary>
+    /// <summary>
+    /// The lean meta's warning for a snapshot that does not cover the whole checkout when its coverage record
+    /// gives no reason (a partial snapshot without a recorded coverage row).
+    /// </summary>
     public const string PartialWarning =
         "Partial index: some projects or submodules were not indexed, so results may be incomplete. " +
         "Call get_index_status for details.";
+
+    /// <summary>The prefix of a partial warning that names what is missing.</summary>
+    public const string PartialWarningPrefix = "Partial index: ";
+
+    /// <summary>The suffix of a partial warning that names what is missing.</summary>
+    public const string PartialWarningSuffix = " Call get_index_status for details.";
+
+    /// <summary>The cap on the coverage reasons quoted in a partial warning, in characters.</summary>
+    public const int MaxWarningReasonChars = 600;
 
     /// <summary>The lean meta's warning for a snapshot built by an incompatible indexer.</summary>
     public const string IncompatibleWarning =
@@ -80,7 +92,7 @@ public static class RemoteResponsePresenter
 
         var warnings = new List<string>();
         if (partial)
-            warnings.Add(PartialWarning);
+            warnings.Add(PartialWarningFor(provenance.Coverage));
         if (!provenance.Compatible)
             warnings.Add(IncompatibleWarning);
         if (provenance.Dirty)
@@ -88,6 +100,28 @@ public static class RemoteResponsePresenter
         if (warnings.Count > 0)
             lean["warning"] = string.Join(" ", warnings);
         return lean;
+    }
+
+    /// <summary>
+    /// The partial warning for <paramref name="coverage"/>: its recorded reasons, so an agent learns WHAT is
+    /// missing (which projects did not compile, which submodule is absent) and can judge whether its question is
+    /// affected, instead of a generic caution that reads as "distrust every answer". Quoted reasons are capped at
+    /// <see cref="MaxWarningReasonChars"/>; the generic <see cref="PartialWarning"/> is used when no reason was
+    /// recorded.
+    /// </summary>
+    public static string PartialWarningFor(SnapshotCoverage? coverage)
+    {
+        var reasons = coverage?.Reasons.Where(r => !string.IsNullOrWhiteSpace(r)).Select(r => r.Trim()).ToList();
+        if (reasons is not { Count: > 0 })
+            return PartialWarning;
+
+        var text = string.Join(" ", reasons.Select(r => r.EndsWith('.') ? r : r + "."));
+        if (text.Length > MaxWarningReasonChars)
+        {
+            var cut = text.LastIndexOf(' ', MaxWarningReasonChars - 1);
+            text = text[..(cut > 0 ? cut : MaxWarningReasonChars - 1)].TrimEnd(',', ';', ' ') + " ...";
+        }
+        return PartialWarningPrefix + text + PartialWarningSuffix;
     }
 
     // "https://github.com/org/app.git" → "github.com/org/app": the form the `repository` argument accepts.

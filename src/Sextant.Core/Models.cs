@@ -38,6 +38,14 @@ public sealed class ReferenceInfo
     public string? ContextSnippet { get; init; }
     public required ReferenceKind ReferenceKind { get; init; }
     public AccessKind? AccessKind { get; init; }
+
+    /// <summary>
+    /// True when the usage did not bind exactly and the target is one of the compiler's candidate symbols
+    /// (an overload-resolution failure, an ambiguity, an inaccessible member, ...). Stored in occurrence
+    /// flag bit 2; false for every exactly bound occurrence.
+    /// </summary>
+    public bool IsCandidate { get; init; }
+
     public long LastIndexedAt { get; init; }
 }
 
@@ -58,6 +66,13 @@ public sealed class CallGraphEdge
     public required string CallSiteFile { get; init; }
     public int CallSiteLine { get; init; }
     public int CallSiteColumn { get; init; }
+
+    /// <summary>
+    /// True when the call did not bind exactly and the callee is one of the compiler's candidate methods
+    /// (see <see cref="ReferenceInfo.IsCandidate"/>). Stored in occurrence flag bit 2.
+    /// </summary>
+    public bool IsCandidate { get; init; }
+
     public long LastIndexedAt { get; init; }
 }
 

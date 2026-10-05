@@ -53,8 +53,14 @@ public static class IndexConfigurationHash
     /// unpopulated (missing the submodule-provided projects and their Phase-12 provider snapshots /
     /// cross-repository usage edges) — would be reused instead of re-indexing with the submodules present.
     /// </para>
+    /// <para>
+    /// <c>"4"</c> → <c>"5"</c>: the document extractor now keeps a usage site that does not bind exactly as a
+    /// candidate occurrence (occurrence flag bit 2) instead of dropping it, the loader closes each unrestored
+    /// project's ProjectReferences transitively, and the service worker restores NuGet packages before the
+    /// load, so the same commit now yields more references and call edges.
+    /// </para>
     /// </remarks>
-    public const string AnalyzerVersion = "4";
+    public const string AnalyzerVersion = "5";
 
     /// <summary>
     /// Computes the configuration hash for a resolved profile. The canonical pre-image is a fixed,

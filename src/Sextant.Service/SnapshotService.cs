@@ -425,9 +425,11 @@ public sealed partial class SnapshotService : IDisposable
 
         // Issue #113: the non-default SDK-pin policy is part of the identity, so flipping
         // SEXTANT_SERVICE_SDK_PIN_OVERRIDE never reuses a snapshot (or failed job) built under the other policy. The
-        // remote-default lookup (issue #199) is not part of it, so the hash is known before that lookup runs.
+        // same holds for SEXTANT_SERVICE_PACKAGE_RESTORE. The remote-default lookup (issue #199) is not part of it,
+        // so the hash is known before that lookup runs.
         var hash = request.ToIdentity(
-            _options.DefaultConfigHash, _options.DefaultCapabilityFingerprint, _options.SdkPinIdentityComponent).Hash;
+            _options.DefaultConfigHash, _options.DefaultCapabilityFingerprint, _options.SdkPinIdentityComponent,
+            _options.RestoreIdentityComponent).Hash;
         var accepted = new TaskCompletionSource<EnsureSnapshotResult>(TaskCreationOptions.RunContinuationsAsynchronously);
         Task<EnsureSnapshotResult> completion;
         lock (_inFlightLock)

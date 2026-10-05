@@ -43,6 +43,22 @@ public sealed record SnapshotContext
     public string? SdkPinPolicy { get; init; }
 
     /// <summary>
+    /// The service worker's non-default NuGet restore policy (<c>off</c> when restore is disabled), or
+    /// <c>null</c>. When set it is folded into <see cref="SnapshotIdentity.RestorePolicy"/> of every snapshot
+    /// this run publishes, like <see cref="SdkPinPolicy"/>. <c>null</c> for the default restore-on policy and
+    /// for every local CLI/daemon run, which keeps the identity byte-identical.
+    /// </summary>
+    public string? RestorePolicy { get; init; }
+
+    /// <summary>
+    /// Per-project load problems the producing worker observed before indexing (for example a package the
+    /// restore could not resolve), keyed by the project file's checkout-relative path with <c>/</c>
+    /// separators, or <c>null</c>. The orchestrator attaches each to the project's binding health in the
+    /// recorded coverage. Not part of snapshot identity.
+    /// </summary>
+    public IReadOnlyDictionary<string, string>? ProjectLoadIssues { get; init; }
+
+    /// <summary>
     /// An OPTIONAL monotonic per-branch head sequence for the SERVICE ensure path (issue #84). When set,
     /// <c>AdvanceBranchToSnapshot</c> advances the branch pointer only when this value is strictly greater
     /// than the sequence already recorded for the branch (forward-only), so an out-of-order/older service

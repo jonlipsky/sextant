@@ -100,6 +100,11 @@ public static class GetCallHierarchyTool
                 ["depth"] = hitDepth
             };
 
+            // The call did not bind exactly (for example an argument type is unresolved on the indexer); this
+            // method is one of the compiler's candidates for it.
+            if (edge.IsCandidate)
+                entry["candidate"] = true;
+
             // Raw host-filesystem read (no content-hash verification): suppress under an enforced
             // multi-tenant policy so a reconstructed absolute call-site path cannot expose a file
             // outside the caller's authorized repository. Location-only under enforcement; the
