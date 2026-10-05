@@ -72,6 +72,7 @@ public static class GetImplementorsTool
         }
         var freshness = implementors.Count > 0 ? targetSymbol.LastIndexedAt : 0;
         return ResponseBuilder.BuildPage(results, implementors.Count, page, freshness, lookup.Ambiguity, readContext.Provenance,
-            Summary, message: ResponseBuilder.JoinMessages(SymbolResolver.ResolutionNote(symbolStore, lookup), empty));
+            Summary, message: ResponseBuilder.JoinMessages(SymbolResolver.ResolutionNote(symbolStore, lookup), empty),
+            warning: lookup.Warning);
     }
 }

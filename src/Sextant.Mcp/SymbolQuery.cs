@@ -393,6 +393,73 @@ public sealed class SymbolQuery
 
     private static SymbolQuery Invalid(string raw, string error) => new(raw) { Error = error };
 
+    private static readonly (string Entity, char Character)[] Entities =
+        [("&lt;", '<'), ("&gt;", '>'), ("&amp;", '&'), ("&quot;", '"'), ("&#39;", '\'')];
+
+    /// <summary>
+    /// <paramref name="raw"/> with the HTML entities a client may have escaped it with (<c>&amp;lt;</c>, <c>&amp;gt;</c>,
+    /// <c>&amp;amp;</c>, <c>&amp;quot;</c>, <c>&amp;#39;</c>) decoded in one pass, so <c>List&amp;lt;T&amp;gt;</c> reads as
+    /// <c>List&lt;T&gt;</c>; null when it holds none of them.
+    /// </summary>
+    internal static string? Unescape(string? raw)
+    {
+        if (raw is null || !raw.Contains('&'))
+            return null;
+        var text = new StringBuilder(raw.Length);
+        var changed = false;
+        for (var i = 0; i < raw.Length; i++)
+        {
+            var entity = raw[i] == '&'
+                ? Array.FindIndex(Entities, e => string.CompareOrdinal(raw, i, e.Entity, 0, e.Entity.Length) == 0)
+                : -1;
+            if (entity < 0)
+            {
+                text.Append(raw[i]);
+                continue;
+            }
+            text.Append(Entities[entity].Character);
+            i += Entities[entity].Entity.Length - 1;
+            changed = true;
+        }
+        return changed ? text.ToString() : null;
+    }
+
+    /// <summary>
+    /// The argument's trailing <c>Type.Member</c>: each reading whose path has more than one qualifying segment, cut to
+    /// the last one (<c>Wrong.Ns.Type.Method(int)</c> reads as <c>Type.Method(int)</c>), with the parameter list and
+    /// kind constraint kept. Null when no reading has such a path.
+    /// </summary>
+    internal SymbolQuery? TrailingMember()
+    {
+        if (Error is not null)
+            return null;
+        var forms = Forms.Where(f => f.Qualifier.Count > 1)
+            .Select(f => f with { Qualifier = [f.Qualifier[^1]] })
+            .ToList();
+        return forms.Count == 0
+            ? null
+            : new SymbolQuery(Raw) { Forms = forms, Parameters = Parameters, KindConstraint = KindConstraint };
+    }
+
+    /// <summary>
+    /// The argument's trailing <c>Type</c>: the simple name of a qualified plain reading without a parameter list
+    /// (<c>Wrong.Ns.Type</c> reads as <c>Type</c>), restricted to types, so a member name is never read on its own.
+    /// Null when the argument has a parameter list, no qualified plain reading, or a kind constraint that excludes
+    /// every type.
+    /// </summary>
+    internal SymbolQuery? TrailingType()
+    {
+        if (Error is not null || Parameters is not null)
+            return null;
+        var form = Forms.FirstOrDefault(f => f.NameKind == SymbolNameKind.Plain && f.Qualifier.Count > 0);
+        if (form is null)
+            return null;
+        var kinds = KindConstraint is null ? TypeKinds : new HashSet<SymbolKind>(TypeKinds.Where(KindConstraint.Contains));
+        return kinds.Count == 0
+            ? null
+            : new SymbolQuery(Raw) { Forms = [form with { Qualifier = [] }], KindConstraint = kinds };
+    }
+
     private static SymbolQuery ParseDocumentationId(string raw, string text)
     {
         if (text[0] == 'N')

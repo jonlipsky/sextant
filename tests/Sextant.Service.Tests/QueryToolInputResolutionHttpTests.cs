@@ -68,9 +68,10 @@ public class QueryToolInputResolutionHttpTests
     }
 
     [TestMethod]
-    public async Task OmittedRepository_SeveralGrantedRepositories_IsAToolError_ListingThem()
+    public async Task OmittedRepository_SeveralGrantedRepositories_NoneHoldingTheSymbol_IsAToolError_ListingThem()
     {
-        var call = await CallAsync("find_symbol", """{"name":"global::Library.Shapes.Circle"}""", Duo);
+        // A symbol one of them holds is inferred to it (RepositoryInferenceHttpTests); one that neither holds is not.
+        var call = await CallAsync("find_symbol", """{"name":"global::Nowhere.Missing"}""", Duo);
 
         Assert.IsTrue(call.IsError, call.Body.ToString());
         Assert.AreEqual("repository_required", ErrorCode(call.Body));
@@ -358,11 +359,131 @@ public class QueryToolInputResolutionHttpTests
         Assert.AreEqual("invalid_argument", ErrorCode(call.Body));
     }
 
+    // ==== forgiving input: HTML entities and a wrong namespace =======================================
+
+    [TestMethod]
+    [DataRow("IStore&lt;T&gt;.PublishAsync")]
+    [DataRow("Library.Storage.IStore&lt;string&gt;.PublishAsync(string, CancellationToken)")]
+    [DataRow("global::Library.Storage.IStore&lt;T&gt;.PublishAsync(T, CancellationToken)")]
+    public async Task HtmlEscapedGenericName_IsDecoded(string name)
+    {
+        var call = await CallAsync("find_references",
+            WithRepository($$"""{"symbol_fqn":{{JsonSerializer.Serialize(name)}}}"""), Solo);
+
+        Assert.IsFalse(call.IsError, call.Body.ToString());
+        var files = call.Body.GetProperty("results").EnumerateArray()
+            .Select(r => Path.GetFileName(r.GetProperty("file_path").GetString()!))
+            .Distinct()
+            .ToArray();
+        CollectionAssert.AreEqual(new[] { "Publisher.cs" }, files, call.Body.ToString());
+        Assert.IsFalse(call.Body.GetProperty("meta").TryGetProperty("warning", out _), "decoding is not a guess");
+    }
+
+    [TestMethod]
+    [DataRow("Library.Storage.Result&lt;T&gt;", "global::Library.Storage.Result<T>")]
+    [DataRow("Result&lt;T&gt;", "global::Library.Storage.Result<T>")]
+    [DataRow("Library.Storage.Holder&lt;Item&gt;", "global::Library.Storage.Holder<Item>")]
+    public async Task HtmlEscapedGenericType_FindSymbol_IsDecoded(string name, string expected)
+    {
+        var call = await CallAsync("find_symbol", WithRepository($$"""{"name":{{JsonSerializer.Serialize(name)}}}"""), Solo);
+
+        Assert.IsFalse(call.IsError, call.Body.ToString());
+        Assert.AreEqual(expected, Names(call.Body).Single(), call.Body.ToString());
+    }
+
+    [TestMethod]
+    [DataRow("find_symbol", """{"name":"Wrong.Drawing.Canvas.Draw"}""", "Wrong.Drawing.Canvas.Draw", "global::Library.Drawing.Canvas.Draw()")]
+    [DataRow("find_references", """{"symbol_fqn":"Library.Shape.IShape"}""", "Library.Shape.IShape", "global::Library.Shapes.IShape")]
+    [DataRow("get_type_members", """{"symbol_fqn":"Wrong.Ns.Canvas"}""", "Wrong.Ns.Canvas", "global::Library.Drawing.Canvas")]
+    [DataRow("get_call_hierarchy", """{"symbol_fqn":"Old.Drawing.Canvas.Draw","direction":"callees"}""", "Old.Drawing.Canvas.Draw", "global::Library.Drawing.Canvas.Draw()")]
+    [DataRow("get_implementors", """{"symbol_fqn":"Wrong.IShape"}""", "Wrong.IShape", "global::Library.Shapes.IShape")]
+    [DataRow("find_references", """{"symbol_fqn":"Wrong.Shapes.Circle.Scale(double, bool)"}""", "Wrong.Shapes.Circle.Scale(double, bool)", "global::Library.Shapes.Circle.Scale(double, bool)")]
+    public async Task QualifiedNameMiss_WithOneTrailingMatch_Resolves_AndWarnsWhichSymbolItIs(
+        string tool, string arguments, string asked, string resolved)
+    {
+        var call = await CallAsync(tool, WithRepository(arguments), Solo);
+
+        Assert.IsFalse(call.IsError, call.Body.ToString());
+        var warning = call.Body.GetProperty("meta").GetProperty("warning").GetString()!;
+        StringAssert.Contains(warning, $"'{asked}'");
+        StringAssert.Contains(warning, resolved);
+        if (tool == "find_symbol")
+            Assert.AreEqual(resolved, Names(call.Body).Single(), call.Body.ToString());
+    }
+
+    [TestMethod]
+    [DataRow("find_references", """{"symbol_fqn":"Wrong.Ns.Circle.Scale"}""",
+        "global::Library.Shapes.Circle.Scale(double)|global::Library.Shapes.Circle.Scale(double, bool)")]
+    [DataRow("get_type_members", """{"symbol_fqn":"Wrong.Result"}""",
+        "global::Library.Storage.Result|global::Library.Storage.Result<T>")]
+    public async Task QualifiedNameMiss_WithSeveralTrailingMatches_IsNotFound_ListingThemFirst(
+        string tool, string arguments, string expected)
+    {
+        var call = await CallAsync(tool, WithRepository(arguments), Solo);
+
+        Assert.IsTrue(call.IsError, call.Body.ToString());
+        Assert.AreEqual("symbol_not_found", ErrorCode(call.Body));
+        var first = expected.Split('|');
+        CollectionAssert.AreEquivalent(first, Candidates(call.Body).Take(first.Length).ToArray(), call.Body.ToString());
+        Assert.IsFalse(call.Body.GetProperty("meta").TryGetProperty("warning", out _));
+    }
+
+    [TestMethod]
+    [DataRow("find_references", """{"symbol_fqn":"Wrong.Describe"}""")]
+    [DataRow("find_symbol", """{"name":"Wrong.Describe"}""")]
+    [DataRow("get_call_hierarchy", """{"symbol_fqn":"Library.Unused","direction":"callers"}""")]
+    public async Task ABareMemberName_IsNeverAFallback(string tool, string arguments)
+    {
+        // Describe and Unused are members with one declaration each, but a member is only ever found through its type.
+        var call = await CallAsync(tool, WithRepository(arguments), Solo);
+
+        Assert.AreEqual(0, call.Body.GetProperty("results").GetArrayLength(), call.Body.ToString());
+        Assert.IsFalse(call.Body.GetProperty("meta").TryGetProperty("warning", out _), call.Body.ToString());
+        if (call.IsError)
+            Assert.AreEqual("symbol_not_found", ErrorCode(call.Body));
+    }
+
+    [TestMethod]
+    [DataRow("get_type_members")]
+    [DataRow("get_type_hierarchy")]
+    public async Task ANameThatMatchesAsWritten_ButIsNotAType_IsNeverReadByItsTrailingName(string tool)
+    {
+        // StyleKeys.Circle is a field. Its trailing name is the Circle class, but the argument names the field, so a type
+        // tool says what the field is instead of answering for an unrelated class.
+        var call = await CallAsync(tool, WithRepository("""{"symbol_fqn":"Library.Styles.StyleKeys.Circle"}"""), Solo);
+
+        Assert.IsTrue(call.IsError, call.Body.ToString());
+        Assert.AreEqual("symbol_not_found", ErrorCode(call.Body));
+        Assert.AreEqual("global::Library.Styles.StyleKeys.Circle", Candidates(call.Body).First(), call.Body.ToString());
+        StringAssert.Contains(Message(call.Body), "[a field]");
+        Assert.IsFalse(call.Body.GetProperty("meta").TryGetProperty("warning", out _), call.Body.ToString());
+    }
+
+    [TestMethod]
+    public async Task ANameThatMatchesAsWritten_ButIsOutsideTheScope_IsNeverReadByItsTrailingName()
+    {
+        // The field StyleKeys.Circle is not declared in the Circle class's file: scoped to that file, the field is a scope
+        // miss, never the class that shares its trailing name.
+        var circle = await CallAsync("find_symbol", WithRepository("""{"name":"Library.Shapes.Circle","kind":"class"}"""), Solo);
+        var circleFile = circle.Body.GetProperty("results").EnumerateArray().Single().GetProperty("file_path").GetString()!;
+
+        var call = await CallAsync("find_symbol", JsonSerializer.Serialize(new
+        {
+            name = "Library.Styles.StyleKeys.Circle", scope = "file:" + circleFile, repository = "acme/library"
+        }), Solo);
+
+        Assert.IsTrue(call.IsError, call.Body.ToString());
+        Assert.AreEqual("symbol_not_found", ErrorCode(call.Body));
+        Assert.AreEqual("global::Library.Styles.StyleKeys.Circle", Candidates(call.Body).First(), call.Body.ToString());
+        StringAssert.Contains(Message(call.Body), "[outside the requested scope]");
+        Assert.IsFalse(call.Body.GetProperty("meta").TryGetProperty("warning", out _), call.Body.ToString());
+    }
+
     // ==== loud failures, and honest empty answers =====================================================
 
     [TestMethod]
     [DataRow("find_references", """{"symbol_fqn":"Library.Shapes.Circel"}""", "global::Library.Shapes.Circle")]
-    [DataRow("get_type_members", """{"symbol_fqn":"Library.Shape.IShape"}""", "global::Library.Shapes.IShape")]
+    [DataRow("get_type_members", """{"symbol_fqn":"Library.Shapes.IShap"}""", "global::Library.Shapes.IShape")]
     [DataRow("get_call_hierarchy", """{"symbol_fqn":"Circle.Aera","direction":"callers"}""", "global::Library.Shapes.Circle.Area()")]
     public async Task UnknownName_IsAToolError_WithTheClosestCandidates(string tool, string arguments, string closest)
     {

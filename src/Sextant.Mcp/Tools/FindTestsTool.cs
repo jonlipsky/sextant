@@ -55,6 +55,7 @@ public static class FindTestsTool
         var testMethods = allTestMethods;
         SymbolAmbiguity? ambiguity = null;
         string? message = null;
+        string? warning = null;
         var namer = new SymbolNamer(symbolStore);
         var referencing = false;
 
@@ -65,6 +66,7 @@ public static class FindTestsTool
                 return SymbolResolver.ErrorResponse(symbolStore, projectStore, lookup, readContext.Provenance);
             var targetSymbol = lookup.Symbol!;
             ambiguity = lookup.Ambiguity;
+            warning = lookup.Warning;
 
             var refs = referenceStore.GetBySymbolId(targetSymbol.Id);
             var testFiles = testMethods.Select(t => t.FilePath).ToHashSet();
@@ -128,7 +130,7 @@ public static class FindTestsTool
 
         var freshness = testMethods.Count > 0 ? testMethods.Min(t => t.LastIndexedAt) : 0;
         return ResponseBuilder.BuildPage(results, testMethods.Count, page, freshness, ambiguity, readContext.Provenance, Summary,
-            message: message);
+            message: message, warning: warning);
     }
 
     // The simple name of the class declaring a test method: from its documentation-ID key, else (an index from before
