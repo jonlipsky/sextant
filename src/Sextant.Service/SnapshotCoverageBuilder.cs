@@ -294,6 +294,9 @@ public static class SnapshotCoverageBuilder
     /// subtree alone, and is PARTIAL when:
     /// <list type="bullet">
     /// <item>a declared project in the subtree failed to load;</item>
+    /// <item>a declared project in the subtree was not loaded because the parent's time budget ran out (issue #245);
+    /// the provider's <see cref="SnapshotCoverage.TimeBudget"/> then counts those projects and names its own
+    /// selected solutions that declare one, so the lean query warning counts them like the parent's gap;</item>
     /// <item>a project file in the subtree is on disk but was neither declared nor loaded (always a gap for
     /// the provider, even under a <c>configured</c> parent scope: nobody scoped the PROVIDER repository);</item>
     /// <item>one of the provider's OWN solutions was not selected — in particular when none was, i.e. the
@@ -308,7 +311,7 @@ public static class SnapshotCoverageBuilder
     /// </summary>
     public static IReadOnlyDictionary<string, SnapshotCoverage> BuildProviders(
         string checkoutDir, CheckoutResolution resolution, MultiSolutionLoadResult load, Inventory inventory,
-        IReadOnlyList<SdkPinOverride>? sdkPinOverrides = null)
+        IReadOnlyList<SdkPinOverride>? sdkPinOverrides = null, TimeSpan? timeBudget = null)
     {
         var comparer = CheckoutInventory.PathComparer;
         var root = Path.GetFullPath(checkoutDir);
@@ -332,6 +335,7 @@ public static class SnapshotCoverageBuilder
             var declared = declaredFiles.Where(InSubtree).ToList();
             var loaded = loadedFiles.Where(InSubtree).ToList();
             var skipped = load.SkippedProjects.Where(s => InSubtree(Path.GetFullPath(s.ProjectPath))).ToList();
+            var deferred = load.DeferredProjects.Select(Path.GetFullPath).Where(InSubtree).ToList();
             var onDisk = inventory.ProjectFilesOnDisk.Where(p => InSubtree(Path.GetFullPath(p))).ToList();
             var accounted = new HashSet<string>(declared, comparer);
             accounted.UnionWith(loaded);
@@ -354,6 +358,10 @@ public static class SnapshotCoverageBuilder
                 reasons.Add(
                     $"{skipped.Count} project(s) of this repository could not be loaded while indexing the checkout " +
                     $"that pins it ({NameSample(skipped.Select(s => Rel(Path.GetFullPath(s.ProjectPath))).ToList())}).");
+            if (deferred.Count > 0)
+                reasons.Add(
+                    $"{deferred.Count} project(s) of this repository were not loaded because the indexing checkout's " +
+                    $"time budget ran out ({NameSample(deferred.Select(Rel).ToList())}).");
             if (selectedOwn.Count == 0 && ownSolutions.Count > 0)
                 reasons.Add(
                     $"none of this repository's {ownSolutions.Count} solution(s) was selected; it was built only from " +
@@ -383,6 +391,20 @@ public static class SnapshotCoverageBuilder
                 .Where(p => PinAppliesTo(p.GlobalJsonPath, submodule.Path))
                 .Select(p => p with { GlobalJsonPath = ProviderPinPath(p.GlobalJsonPath, submodule.Path) })
                 .ToList();
+            // The load is the only step that can leave a provider project out (#245), so the provider's gap is
+            // its projects not loaded and its own selected solutions that declare one.
+            TimeBudgetCoverage? budget = null;
+            if (deferred.Count > 0)
+            {
+                var deferredSet = new HashSet<string>(deferred, comparer);
+                var unfinished = selectedOwn
+                    .Where(s => load.Membership.Any(m =>
+                        comparer.Equals(Path.GetFullPath(m.SolutionPath), s) &&
+                        m.DeclaredProjects.Any(p => deferredSet.Contains(Path.GetFullPath(p)))))
+                    .Select(Rel)
+                    .ToList();
+                budget = TimeBudgetCoverageBuilder.Build(timeBudget ?? TimeSpan.Zero, deferred.Count, 0, 0, unfinished);
+            }
             result[submodule.Path] = new SnapshotCoverage
             {
                 Verdict = reasons.Count > 0 ? SnapshotCoverageVerdict.Partial : SnapshotCoverageVerdict.Complete,
@@ -400,7 +422,8 @@ public static class SnapshotCoverageBuilder
                 SubmodulesDeclared = nested.Count,
                 SubmodulesUnpopulated = nestedUnpopulated.Count,
                 ScanErrors = scanErrors.Count,
-                SdkPinOverrides = pins.Count > 0 ? pins : null
+                SdkPinOverrides = pins.Count > 0 ? pins : null,
+                TimeBudget = budget
             };
         }
 

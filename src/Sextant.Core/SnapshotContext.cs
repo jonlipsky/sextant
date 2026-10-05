@@ -116,4 +116,13 @@ public sealed record SnapshotContext
     /// (never backfilled). Not part of snapshot identity.
     /// </summary>
     public IReadOnlyDictionary<string, SnapshotCoverage>? ProviderCoverage { get; init; }
+
+    /// <summary>
+    /// The time the orchestrator may spend extracting a full index, set by the service worker when its
+    /// evaluation runs under a time budget. When the budget runs out the remaining projects are left out and
+    /// the gap is folded into <see cref="Coverage"/> at publish, so a checkout too large for the budget is
+    /// published PARTIAL rather than aborted. <c>null</c> (the local CLI/daemon path) keeps indexing unbounded.
+    /// Not part of snapshot identity.
+    /// </summary>
+    public IndexTimeBudget? TimeBudget { get; init; }
 }

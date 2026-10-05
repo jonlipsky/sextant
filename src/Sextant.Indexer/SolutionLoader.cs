@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Runtime.ExceptionServices;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.MSBuild;
+using Sextant.Core;
 
 namespace Sextant.Indexer;
 
@@ -87,11 +88,14 @@ public static class SolutionLoader
     /// project's reference graph are opened once (de-duplicated by the caller and again via
     /// <see cref="IWorkspaceProjectLoader.IsLoaded"/>). The workspace is intentionally NOT disposed on the
     /// success path so the returned <see cref="Solution"/> stays usable (mirroring
-    /// <see cref="LoadSolutionResilientlyAsync"/>).
+    /// <see cref="LoadSolutionResilientlyAsync"/>). When <paramref name="deadline"/> passes, the projects not
+    /// yet opened are returned in <see cref="SolutionLoadResult.DeferredProjects"/> instead of being loaded.
     /// </summary>
     internal static async Task<SolutionLoadResult> LoadProjectsResilientlyAsync(
         IReadOnlyList<string> projectPaths,
         Action<string>? onDiagnostic = null,
+        IndexDeadline? deadline = null,
+        Action<string>? onProgress = null,
         CancellationToken cancellationToken = default)
     {
         var failures = new ConcurrentQueue<LoadFailure>();
@@ -100,11 +104,12 @@ public static class SolutionLoader
 
         Solution solution;
         List<SkippedProject> thrownSkipped;
+        List<string> deferred;
         try
         {
             var loader = new MSBuildWorkspaceProjectLoader(workspace);
-            (solution, thrownSkipped) =
-                await LoadProjectsIndividuallyAsync(projectPaths, loader, onDiagnostic, cancellationToken);
+            (solution, thrownSkipped, deferred) = await LoadProjectsIndividuallyAsync(
+                projectPaths, loader, onDiagnostic, deadline, onProgress, cancellationToken);
         }
         catch
         {
@@ -112,24 +117,39 @@ public static class SolutionLoader
             throw;
         }
 
-        var skipped = ReconcileSkipped(projectPaths, solution, failures, thrownSkipped, onDiagnostic);
-        return new SolutionLoadResult(TransitiveProjectReferences.Close(solution, onDiagnostic), skipped);
+        // A deferred project was never opened, so it is neither loaded nor skipped: reconcile only the rest.
+        var deferredSet = new HashSet<string>(deferred.Select(NormalizePath), StringComparer.OrdinalIgnoreCase);
+        var attempted = deferred.Count == 0
+            ? projectPaths
+            : projectPaths.Where(p => !deferredSet.Contains(NormalizePath(p))).ToList();
+        var skipped = ReconcileSkipped(attempted, solution, failures, thrownSkipped, onDiagnostic);
+        return new SolutionLoadResult(TransitiveProjectReferences.Close(solution, onDiagnostic), skipped)
+        {
+            DeferredProjects = deferred
+        };
     }
 
     /// <summary>
     /// Opens each declared project individually, isolating a per-project load failure. Factored out
     /// (over the <see cref="IWorkspaceProjectLoader"/> seam) so the isolation logic is unit-testable
-    /// without a real crashing MSBuild toolchain.
+    /// without a real crashing MSBuild toolchain. Once <paramref name="deadline"/> has passed, every project
+    /// not yet in the workspace is returned as deferred instead of being opened; the first project is always
+    /// attempted, so a load that starts late still makes progress.
     /// </summary>
-    internal static async Task<(Solution Solution, List<SkippedProject> Skipped)> LoadProjectsIndividuallyAsync(
+    internal static async Task<(Solution Solution, List<SkippedProject> Skipped, List<string> Deferred)> LoadProjectsIndividuallyAsync(
         IReadOnlyList<string> projectPaths,
         IWorkspaceProjectLoader loader,
         Action<string>? onDiagnostic,
+        IndexDeadline? deadline,
+        Action<string>? onProgress,
         CancellationToken cancellationToken)
     {
         var skipped = new List<SkippedProject>();
-        foreach (var projectPath in projectPaths)
+        var deferred = new List<string>();
+        var attempted = 0;
+        for (var i = 0; i < projectPaths.Count; i++)
         {
+            var projectPath = projectPaths[i];
             cancellationToken.ThrowIfCancellationRequested();
 
             // Skip a project already pulled into the workspace transitively by an earlier project's
@@ -137,6 +157,19 @@ public static class SolutionLoader
             if (loader.IsLoaded(projectPath))
                 continue;
 
+            if (attempted > 0 && deadline is { HasPassed: true })
+            {
+                for (var j = i; j < projectPaths.Count; j++)
+                    if (!loader.IsLoaded(projectPaths[j]))
+                        deferred.Add(projectPaths[j]);
+                onDiagnostic?.Invoke(
+                    $"The load deadline passed after opening {attempted} project(s); {deferred.Count} of the " +
+                    $"{projectPaths.Count} declared project(s) were not loaded.");
+                break;
+            }
+
+            attempted++;
+            onProgress?.Invoke($"Loading project {i + 1}/{projectPaths.Count}: {Path.GetFileName(projectPath)}");
             try
             {
                 await loader.OpenProjectAsync(projectPath, cancellationToken);
@@ -153,7 +186,7 @@ public static class SolutionLoader
             }
         }
 
-        return (loader.CurrentSolution, skipped);
+        return (loader.CurrentSolution, skipped, deferred);
     }
 
     private static async Task<SolutionLoadResult> LoadPerProjectAsync(
@@ -180,8 +213,9 @@ public static class SolutionLoader
         try
         {
             var loader = new MSBuildWorkspaceProjectLoader(workspace);
-            (loadedSolution, thrownSkipped) =
-                await LoadProjectsIndividuallyAsync(projectPaths, loader, onDiagnostic, cancellationToken);
+            (loadedSolution, thrownSkipped, _) =
+                await LoadProjectsIndividuallyAsync(
+                    projectPaths, loader, onDiagnostic, deadline: null, onProgress: null, cancellationToken);
         }
         catch
         {

@@ -1,4 +1,5 @@
 using Microsoft.CodeAnalysis;
+using Sextant.Core;
 
 namespace Sextant.Indexer;
 
@@ -9,13 +10,17 @@ namespace Sextant.Indexer;
 /// </summary>
 /// <param name="SolutionPath">The solution this coverage describes.</param>
 /// <param name="DeclaredProjectCount">Distinct recognized projects the solution declared.</param>
-/// <param name="LoadedProjectCount">Declared projects that loaded (declared minus skipped).</param>
+/// <param name="LoadedProjectCount">Declared projects that loaded (declared minus skipped and deferred).</param>
 /// <param name="SkippedProjects">Declared projects that failed to load, with reasons.</param>
 public sealed record SolutionCoverage(
     string SolutionPath,
     int DeclaredProjectCount,
     int LoadedProjectCount,
-    IReadOnlyList<SkippedProject> SkippedProjects);
+    IReadOnlyList<SkippedProject> SkippedProjects)
+{
+    /// <summary>Declared projects the load did not open because its deadline passed.</summary>
+    public int DeferredProjectCount { get; init; }
+}
 
 /// <summary>
 /// The projects one selected solution DECLARES (absolute paths, declaration order). A multi-solution load
@@ -52,6 +57,13 @@ public sealed record MultiSolutionLoadResult(
     /// <c>solution → project</c> mappings (issue #124).
     /// </summary>
     public IReadOnlyList<SolutionMembership> Membership { get; init; } = [];
+
+    /// <summary>
+    /// Declared projects (absolute paths) the union load did not open because its deadline passed. They are
+    /// neither loaded nor skipped. Always empty for a single selected solution, whose whole-solution load has
+    /// no per-project step to stop at.
+    /// </summary>
+    public IReadOnlyList<string> DeferredProjects { get; init; } = [];
 }
 
 /// <summary>
@@ -77,11 +89,15 @@ public static class MultiSolutionLoader
     /// Loads <paramref name="solutionPaths"/> (already selected + deterministically ordered by
     /// <see cref="SolutionSelector"/>) into one workspace. A single solution takes the standard resilient
     /// whole-solution path; multiple solutions load the union of their declared projects individually with
-    /// per-project fault isolation.
+    /// per-project fault isolation. When <paramref name="deadline"/> passes during a union load, the projects
+    /// not yet opened are returned in <see cref="MultiSolutionLoadResult.DeferredProjects"/>;
+    /// <paramref name="onProgress"/> receives one line per project opened.
     /// </summary>
     public static async Task<MultiSolutionLoadResult> LoadAsync(
         IReadOnlyList<string> solutionPaths,
         Action<string>? onDiagnostic = null,
+        IndexDeadline? deadline = null,
+        Action<string>? onProgress = null,
         CancellationToken cancellationToken = default)
     {
         if (solutionPaths.Count == 0)
@@ -114,16 +130,17 @@ public static class MultiSolutionLoader
         else
         {
             loaded = await SolutionLoader.LoadProjectsResilientlyAsync(
-                union, onDiagnostic, cancellationToken).ConfigureAwait(false);
+                union, onDiagnostic, deadline, onProgress, cancellationToken).ConfigureAwait(false);
         }
 
-        var coverage = BuildCoverage(perSolutionDeclared, loaded.SkippedProjects);
+        var coverage = BuildCoverage(perSolutionDeclared, loaded.SkippedProjects, loaded.DeferredProjects);
         return new MultiSolutionLoadResult(loaded.Solution, loaded.SkippedProjects, coverage)
         {
             DeclaredProjects = union,
             Membership = perSolutionDeclared
                 .Select(p => new SolutionMembership(Path.GetFullPath(p.Solution), p.Declared))
-                .ToList()
+                .ToList(),
+            DeferredProjects = loaded.DeferredProjects
         };
     }
 
@@ -150,15 +167,18 @@ public static class MultiSolutionLoader
     /// <summary>
     /// Attributes the union's skipped projects back to each solution that declared them, producing
     /// per-solution coverage. A project skipped once is reported skipped for every solution that declared
-    /// it (each head that expected it has reduced coverage).
+    /// it (each head that expected it has reduced coverage). A deferred project (not opened before the load
+    /// deadline) is likewise not counted as loaded for any solution that declared it.
     /// </summary>
     internal static IReadOnlyList<SolutionCoverage> BuildCoverage(
         IReadOnlyList<(string Solution, IReadOnlyList<string> Declared)> perSolutionDeclared,
-        IReadOnlyList<SkippedProject> skippedProjects)
+        IReadOnlyList<SkippedProject> skippedProjects,
+        IReadOnlyList<string>? deferredProjects = null)
     {
         var skippedByPath = new Dictionary<string, SkippedProject>(PathComparer);
         foreach (var skip in skippedProjects)
             skippedByPath[Path.GetFullPath(skip.ProjectPath)] = skip;
+        var deferred = new HashSet<string>((deferredProjects ?? []).Select(Path.GetFullPath), PathComparer);
 
         var result = new List<SolutionCoverage>(perSolutionDeclared.Count);
         foreach (var (solution, declared) in perSolutionDeclared)
@@ -172,12 +192,16 @@ public static class MultiSolutionLoader
                 .Where(skippedByPath.ContainsKey)
                 .Select(p => skippedByPath[p])
                 .ToList();
+            var solutionDeferred = declaredFull.Count(deferred.Contains);
 
             result.Add(new SolutionCoverage(
                 solution,
                 declaredFull.Count,
-                declaredFull.Count - solutionSkipped.Count,
-                solutionSkipped));
+                declaredFull.Count - solutionSkipped.Count - solutionDeferred,
+                solutionSkipped)
+            {
+                DeferredProjectCount = solutionDeferred
+            });
         }
         return result;
     }
