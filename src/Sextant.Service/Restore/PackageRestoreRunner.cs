@@ -25,6 +25,9 @@ public sealed class PackageRestoreRunner(bool enabled = true, TimeSpan? timeout 
     /// <summary>The default bound on one job's restore step (<c>SEXTANT_SERVICE_PACKAGE_RESTORE_TIMEOUT_SECONDS</c>).</summary>
     public static readonly TimeSpan DefaultTimeout = TimeSpan.FromMinutes(5);
 
+    /// <summary>The largest accepted bound; a larger configured value is clamped to it.</summary>
+    public static readonly TimeSpan MaxTimeout = TimeSpan.FromHours(1);
+
     /// <summary>The identity component a node with restore disabled publishes under.</summary>
     public const string DisabledIdentityComponent = "off";
 
@@ -42,8 +45,10 @@ public sealed class PackageRestoreRunner(bool enabled = true, TimeSpan? timeout 
     /// <summary>Restore runs on this node.</summary>
     public bool Enabled => enabled;
 
-    /// <summary>The bound on one job's restore step.</summary>
-    public TimeSpan Timeout { get; } = timeout is { } t && t > TimeSpan.Zero ? t : DefaultTimeout;
+    /// <summary>The bound on one job's restore step, clamped to <see cref="MaxTimeout"/>.</summary>
+    public TimeSpan Timeout { get; } = timeout is { } t && t > TimeSpan.Zero
+        ? (t > MaxTimeout ? MaxTimeout : t)
+        : DefaultTimeout;
 
     /// <summary>The <see cref="Sextant.Core.SnapshotIdentity.RestorePolicy"/> component this runner publishes under.</summary>
     public string? IdentityComponent => IdentityComponentFor(enabled);
@@ -105,7 +110,8 @@ public sealed class PackageRestoreRunner(bool enabled = true, TimeSpan? timeout 
             Elapsed = stopwatch.Elapsed,
             Projects = parser.Projects(),
             ProjectsDropped = parser.ProjectsDropped,
-            GeneralCodes = parser.GeneralCodes()
+            GeneralCodes = parser.GeneralCodes(),
+            SourceUnreachableGeneral = parser.SourceUnreachableGeneral
         };
         log?.Invoke(
             $"package restore: {succeeded}/{attempted} solution(s) restored cleanly in {outcome.Elapsed.TotalSeconds:0.#}s" +
@@ -173,7 +179,7 @@ public sealed class PackageRestoreRunner(bool enabled = true, TimeSpan? timeout 
         return process.HasExited && process.ExitCode == 0 ? RunResult.Succeeded : RunResult.Failed;
     }
 
-    private ProcessStartInfo CreateStartInfo(string solution)
+    internal ProcessStartInfo CreateStartInfo(string solution)
     {
         var startInfo = new ProcessStartInfo(DotnetPath)
         {
@@ -188,6 +194,11 @@ public sealed class PackageRestoreRunner(bool enabled = true, TimeSpan? timeout 
             startInfo.ArgumentList.Add(argument);
 
         foreach (var name in InheritedMSBuildVariables)
+            startInfo.Environment.Remove(name);
+        // The service's own settings (control/query tokens, caller keys, clone credentials) never reach a process
+        // that evaluates the repository's MSBuild files and talks to the package sources its nuget.config names.
+        foreach (var name in startInfo.Environment.Keys
+                     .Where(k => k.StartsWith("SEXTANT_", StringComparison.OrdinalIgnoreCase)).ToList())
             startInfo.Environment.Remove(name);
         // No build server, compiler server or reused MSBuild node may outlive the restore and hold its pipes.
         startInfo.Environment["MSBUILDDISABLENODEREUSE"] = "1";

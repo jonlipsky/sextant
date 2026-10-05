@@ -104,11 +104,11 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_SANDBOX_ENABLED` | Enforce the evaluation sandbox (Phase 17) | `true` |
 | `SEXTANT_SERVICE_SANDBOX_TIME_BUDGET_SECONDS` | Wall-clock evaluation time budget | policy default |
 | `SEXTANT_SERVICE_SANDBOX_MEMORY_BUDGET_BYTES` | Watchdog memory ceiling | policy default |
-| `SEXTANT_SERVICE_SANDBOX_ALLOW_NETWORK` | Allow network during evaluation | `false` |
+| `SEXTANT_SERVICE_SANDBOX_ALLOW_NETWORK` | Allow network during evaluation (a best-effort posture, not a network block; it does not gate package restore, see [Package restore](#package-restore-before-the-load)) | `false` |
 | `SEXTANT_SERVICE_SANDBOX_SCRUB_SECRETS` | Scrub secrets from the evaluation environment | `true` |
 | `SEXTANT_SERVICE_SDK_PIN_OVERRIDE` | Temporarily neutralize a checkout `global.json` SDK pin that no installed SDK satisfies, so the checkout still indexes with an installed SDK (issue #113; see [SDK pins](#repository-globaljson-sdk-pins-issue-113)). `false` leaves such pins alone and the job fails / goes partial with a typed `sdk_resolution_failed` diagnostic. `false` is part of the snapshot identity, so flipping the toggle re-indexes a commit instead of reusing a result built under the other policy. An unparseable value **fails startup** | `true` |
 | `SEXTANT_SERVICE_PACKAGE_RESTORE` | Run `dotnet restore` over the selected solutions before the load (see [Package restore](#package-restore-before-the-load)). `false` loads unrestored projects, which compile against their direct project references only, so calls into transitively referenced projects may not bind. `false` is part of the snapshot identity (`restore=off`). An unparseable value **fails startup** | `true` |
-| `SEXTANT_SERVICE_PACKAGE_RESTORE_TIMEOUT_SECONDS` | Bound on one job's whole restore step (all solutions). On expiry the restore process tree is killed and the load goes ahead with whatever was restored | `300` |
+| `SEXTANT_SERVICE_PACKAGE_RESTORE_TIMEOUT_SECONDS` | Bound on one job's whole restore step (all solutions), clamped to 3600. On expiry the restore process tree is killed and the load goes ahead with whatever was restored | `300` |
 
 Boolean toggles accept `1/0`, `true/false`, `yes/no`, `on/off` (case-insensitive); any other non-empty
 value **fails startup** rather than silently disabling a security-relevant control (fail-closed). The
@@ -341,18 +341,40 @@ parameter of such a type.
 
 A restore never fails the job. `--ignore-failed-sources` lets an unreachable or credential-gated feed (for
 example a private feed authenticated by an environment variable the worker does not have) leave the other
-packages restored; `-p:DesignTimeBuild=true` keeps a missing optional workload from failing it, like the load.
-What it could not do is recorded: per-project `package_restore_incomplete` warnings (codes and package ids
-only, never a raw message, which can name a source URL), `coverage.notes` lines such as "Package restore could
-not find 2 package(s) (Acme.Auth, Acme.Auth.UI) for 1 project(s); code that uses them may not bind.", and each
-affected project's `coverage.binding.projects[].load_issue`. A restore problem alone does not make the snapshot
-partial; the code that then fails to bind does (below). The process tree is killed on expiry or cancellation,
-stdin is closed, and stdout/stderr are drained concurrently with a bounded wait, so a leaked MSBuild node cannot
-hang the job.
+packages restored; NuGet then reports the source as the per-project **warning** `NU1801` (not the error
+`NU1301`), and the parser records that warning as "a package source was unreachable", even when its message
+contains the word "error". `-p:DesignTimeBuild=true` keeps a missing optional workload from failing the restore,
+like the load. What it could not do is recorded: per-project `package_restore_incomplete` warnings (codes and
+package ids only, never a raw message, which can name a source URL), `coverage.notes` lines such as "Package
+restore could not find 2 package(s) (Acme.Auth, Acme.Auth.UI) for 1 project(s); code that uses them may not
+bind.", and each affected project's `coverage.binding.projects[].load_issue`. A restore that exits non-zero
+without a recognizable error line still leaves a note ("Package restore failed for N solution(s) without a
+recognized error code; ..."). A restore problem alone does not make the snapshot partial; the code that then
+fails to bind does (below). The process tree is killed on expiry or cancellation, stdin is closed, and
+stdout/stderr are drained concurrently with a bounded wait, so a leaked MSBuild node cannot hang the job.
+
+A restore problem is **not retried**: the job publishes with the notes above, and a later ensure of the same
+commit attaches to that snapshot. Retrying would rarely help, because each job restores into its own cold
+`NUGET_PACKAGES` (a timed-out restore would time out again), and a credential-gated feed never becomes
+reachable. The binding-health verdict below is what tells an agent that results may be missing; the next commit
+re-indexes.
+
+**Network and credentials.** Restore contacts nuget.org and every package source the repository's
+`nuget.config` names, from the worker host. `SEXTANT_SERVICE_SANDBOX_ALLOW_NETWORK` does **not** gate it: that
+setting is a best-effort offline posture for evaluation (telemetry and first-run variables) and never blocked
+the network, and the repository's design-time targets can already reach it during the load (only
+out-of-process worker isolation, #76, contains them). Set `SEXTANT_SERVICE_PACKAGE_RESTORE=false` on a host that
+must not make outbound requests on behalf of indexed repositories. The restore inherits the sandbox's scrubbed
+environment, and never any `SEXTANT_*` variable, so a `%VAR%` in a repository's `nuget.config` cannot send the
+service's own tokens to a source it names. Do not give the service account a user-level `NuGet.Config` with
+`packageSourceCredentials`: a repository's `nuget.config` can declare a source with the same key and another
+URL, and NuGet would send those credentials to it.
 
 Cost: 15-60 s per job for a large repository with a warm NuGet cache. The sandbox gives each job its own
 `NUGET_PACKAGES`, so a cold job downloads every package (about 2.6 GB for a 188-project repository) into job
-scratch, which is released with the job. The toggle is part of the snapshot identity: `restore=off` is folded
+scratch, which is released with the job. The restore writes `obj/` files (`project.assets.json`,
+`*.nuget.g.props`) into the checkout, which `EvaluationFingerprint` hashes; a different commit is a fresh clone,
+so they never carry over to another commit. The toggle is part of the snapshot identity: `restore=off` is folded
 only when `SEXTANT_SERVICE_PACKAGE_RESTORE=false`, so the default leaves identities unchanged and flipping it
 re-indexes. The worker also closes each loaded project's transitive project-reference graph in the workspace
 (`TransitiveProjectReferences`), which covers a project restore could not restore at all.
