@@ -466,7 +466,7 @@ public class SearchSymbolsCostTests
     private static SymbolSearchOutcome Search(
         SnapshotService service, string prefix, int limit = SymbolSearchQuery.DefaultLimit, SymbolKind? kind = null,
         SymbolSearchCursorState? resume = null, CancellationToken cancellationToken = default) =>
-        service.SearchSymbols(Caller, new SymbolSearchQuery { NamePrefix = prefix, Limit = limit, Kind = kind }, resume, cancellationToken);
+        service.SearchSymbols(Caller, new SymbolSearchQuery { NamePrefix = prefix, Limit = limit, Kind = kind }, resume, cancellationToken: cancellationToken);
 
     private static List<SymbolSearchOutcome> Walk(SnapshotService service, string prefix, int limit, SymbolKind? kind = null) =>
         Pages(service, prefix, limit, kind).ToList();

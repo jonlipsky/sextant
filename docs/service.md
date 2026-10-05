@@ -91,7 +91,7 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_MAX_GRANTS_PER_TENANT` | Most repository grant rows a tenant may hold, tenant-wide grants included; creating one more is `409 grant_limit` | `5000` |
 | `SEXTANT_SERVICE_SEARCH_MAX_WIDTH` | Most snapshots one [`search_symbols`](#search_symbols-svc-f) call reads (round-robin over the tracked ones); the rest are listed in `truncated` and searched on later pages. Values above `100` are clamped to `100` (the most snapshots a search tracks at once, which keeps a cursor within 16 KiB); a missing or non-positive value uses the default | `50` |
 | `SEXTANT_SERVICE_SEARCH_MAX_HITS` | Most symbols one [`search_symbols`](#search_symbols-svc-f) call returns in all; the snapshots it reads share it evenly (each still gets at least one row, so the round-robin is unchanged), and what a snapshot did not return is searched on its next turn. Clamped to `100`–`5000`; a missing or non-positive value uses the default | `500` |
-| `SEXTANT_SERVICE_MAX_RESPONSE_CHARS` | Character budget of one `/mcp` tool result, measured on the text the caller receives. A paged tool cuts its page at the last row that fits and returns `meta.next_cursor` with `meta.page_truncated_by: "size"`; an unpaged one keeps the leading rows and says to narrow the query (see [mcp-tools.md](mcp-tools.md#response-size-budget)). At least `1000`; a missing or non-positive value uses the default. `search_symbols` keeps its own `SEARCH_MAX_HITS` cap | `20000` |
+| `SEXTANT_SERVICE_MAX_RESPONSE_CHARS` | Character budget of one `/mcp` tool result, measured on the text the caller receives. A paged tool cuts its page at the last row that fits and returns `meta.next_cursor` with `meta.page_truncated_by: "size"`; an unpaged one keeps the leading rows and says to narrow the query (see [mcp-tools.md](mcp-tools.md#response-size-budget)). At least `1000`; a missing or non-positive value uses the default. `search_symbols` applies it too, after its `SEARCH_MAX_HITS` cap | `20000` |
 | `SEXTANT_SERVICE_BIND_ADDRESS` | Network interface the HTTP surface binds to | `localhost` |
 | `SEXTANT_SERVICE_CONTROL_PORT` | HTTP port | `3011` |
 | `SEXTANT_SERVICE_QUERY_PORT` | Optional dedicated query port (shares the control port when unset) | none (shared) |
@@ -1050,7 +1050,8 @@ own `repository`/`branch` narrow the search, and neither can widen it beyond the
 - `pending` lists granted branches with no complete snapshot yet (`branch` is `""` when the default branch is
   not known yet). `unavailable` lists branches whose snapshot could not be read on this call; they keep their
   place in the cursor and are retried on a later page (within the same round-robin bound). `truncated` lists
-  branches not read on this call because of `SEARCH_MAX_WIDTH`; they are searched on later pages.
+  branches not read on this call because of `SEARCH_MAX_WIDTH`, or left out of a page cut by the response size
+  budget; they are searched on later pages.
 - Branches that share one snapshot are searched once, labeled with the first (repository, branch) in order.
 - `next_cursor` is always present, and is `null` once every snapshot is exhausted.
 
@@ -1063,7 +1064,18 @@ least once every ⌈min(V, 100) / `SEARCH_MAX_WIDTH`⌉ pages. Each page reads u
 it reads, and at most `SEARCH_MAX_HITS` rows in all, shared evenly by those snapshots. It orders them by name, then
 identity hash, then row. A page can return fewer symbols than it could (with a `kind` filter, even none) and still
 have a `next_cursor`: keep paging until it is `null`. While the grants and branch heads do not change,
-walking every page returns every match exactly once. The cursor is opaque
+walking every page returns every match exactly once.
+
+**Size.** A page's text also stays under `SEXTANT_SERVICE_MAX_RESPONSE_CHARS` (20,000 by default; see
+[mcp-tools.md](mcp-tools.md#response-size-budget)). A page over it keeps, from each snapshot it read, the first
+symbols of that snapshot's own page, so the snapshot resumes at the first one left out; if one symbol from each is
+still too much, it keeps as many of the first snapshots of its turn as fit, and the others with matches are listed
+in `truncated` and read first on the next page (a snapshot with no match is never held back). Such a page has `meta.page_truncated_by: "size"` and a top-level `message`. A size cut can
+make a round take more pages than the bound above (each page then returns fewer snapshots than
+`SEARCH_MAX_WIDTH`), but the round-robin order is kept, so no snapshot is starved. The `pending`, `unavailable`
+and `truncated` lists and the cursor are never cut, and at least one symbol is always returned.
+
+The cursor is opaque
 base64url JSON of at most 16 KiB. It carries each snapshot's position, and a digest binds it to the tenant, the
 caller and the query arguments other than `limit`. A tampered or oversized cursor, or one issued to another caller,
 tenant or query, gets `invalid_cursor`, and so does a cursor from a Sextant before issue #196 (restart the search).
