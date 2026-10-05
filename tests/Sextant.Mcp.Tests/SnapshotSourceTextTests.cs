@@ -135,6 +135,32 @@ public class SnapshotSourceTextTests
         Assert.IsNull(retriever.GetContextBlock(projectId, _user, 4, 2));
     }
 
+    [TestMethod]
+    public void Retriever_AContributedProjectNamingAStoredHash_ReadsNoStoredText()
+    {
+        MoveWorkingTree();
+        var conn = _db.GetConnection();
+        var files = new FileStore(conn);
+        var projectId = new ProjectStore(conn).GetAll().Single().id;
+        // A contribution is imported with no disk path, and its file versions carry client-supplied hashes: here the
+        // hash of another project's file, whose bytes the store holds.
+        var contributed = new ProjectStore(conn).Insert(new ProjectIdentity
+        {
+            CanonicalId = "snaptext00000002",
+            GitRemoteUrl = "https://github.com/org/other",
+            RepoRelativePath = "src/Other/Other.csproj",
+            TargetFramework = "net10.0"
+        }, 1);
+        var widgetHash = files.TryGetStoredContentHash(projectId, _widget)!;
+        files.ResolveFileVersionId(contributed, "src/Other/Copied.cs", widgetHash);
+
+        var retriever = new SourceContextRetriever(files, _texts);
+
+        Assert.AreEqual(WidgetLines[3].Trim(), retriever.GetLineSnippet(projectId, _widget, 4), "the indexing project reads it");
+        Assert.IsNull(retriever.GetLineSnippet(contributed, "src/Other/Copied.cs", 4));
+        Assert.IsNull(retriever.GetDeclaration(contributed, "src/Other/Copied.cs", 2, 5));
+    }
+
     private void Seed()
     {
         var conn = _db.GetConnection();

@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.IO.Compression;
 using System.Security.Cryptography;
 
@@ -124,12 +125,20 @@ public sealed class SourceTextStore
     }
 
     /// <summary>
-    /// Deletes stored blobs whose hash is not in <paramref name="referencedHashes"/> (lowercase hex SHA-256), at
-    /// most <paramref name="maxDeletes"/> of them, plus any temp file a crashed write left behind. Run it only
-    /// where no index is writing (the service holds its writer gate), so a blob stored ahead of its
-    /// <c>file_versions</c> row is never mistaken for an orphan. Returns the number of blobs deleted.
+    /// The key <see cref="DeleteUnreferenced"/> matches a blob by: the first 128 bits of its SHA-256, so the set of
+    /// every referenced key stays compact. Two hashes sharing a key can only keep an unreferenced blob, never delete
+    /// a referenced one.
     /// </summary>
-    public int DeleteUnreferenced(IReadOnlySet<string> referencedHashes, int maxDeletes)
+    public static UInt128 SweepKey(ReadOnlySpan<byte> contentHash) => BinaryPrimitives.ReadUInt128BigEndian(contentHash);
+
+    /// <summary>
+    /// Deletes stored blobs whose <see cref="SweepKey"/> is not in <paramref name="referencedKeys"/>, plus any temp
+    /// file a crashed write left behind, and stops walking the store once <paramref name="maxDeletes"/> blobs are
+    /// deleted (the rest wait for the next pass). Run it only where no index is writing (the service holds its
+    /// writer gate), so a blob stored ahead of its <c>file_versions</c> row is never mistaken for an orphan.
+    /// Returns the number of blobs deleted.
+    /// </summary>
+    public int DeleteUnreferenced(IReadOnlySet<UInt128> referencedKeys, int maxDeletes)
     {
         if (!Directory.Exists(Root))
             return 0;
@@ -149,6 +158,9 @@ public sealed class SourceTextStore
         {
             foreach (var path in files)
             {
+                if (deleted >= maxDeletes)
+                    break;
+
                 var name = Path.GetFileName(path);
                 if (name.EndsWith(TempExtension, StringComparison.Ordinal))
                 {
@@ -156,9 +168,9 @@ public sealed class SourceTextStore
                     continue;
                 }
 
-                if (deleted >= maxDeletes || !name.EndsWith(BlobExtension, StringComparison.Ordinal))
+                if (!name.EndsWith(BlobExtension, StringComparison.Ordinal))
                     continue;
-                if (referencedHashes.Contains(name[..^BlobExtension.Length]))
+                if (TryParseBlobKey(name, out var key) && referencedKeys.Contains(key))
                     continue;
                 if (TryDelete(path))
                     deleted++;
@@ -169,6 +181,23 @@ public sealed class SourceTextStore
             _log?.Invoke($"Source text sweep stopped early: {ex.Message}");
         }
         return deleted;
+    }
+
+    // A blob's name is its 64-digit hex hash; any other name is not one Put wrote, so it is never referenced.
+    private static bool TryParseBlobKey(string name, out UInt128 key)
+    {
+        key = default;
+        if (name.Length != HashLength * 2 + BlobExtension.Length)
+            return false;
+        try
+        {
+            key = SweepKey(Convert.FromHexString(name.AsSpan(0, HashLength * 2)));
+            return true;
+        }
+        catch (FormatException)
+        {
+            return false;
+        }
     }
 
     private string BlobPath(byte[] contentHash)
