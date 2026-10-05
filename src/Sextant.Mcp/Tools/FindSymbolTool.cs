@@ -25,12 +25,14 @@ public static class FindSymbolTool
         var symbolStore = new SymbolStore(conn) { Scope = readContext.Scope };
         var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
 
-        // Raw host-filesystem source reads (SourceReader, no content-hash verification) must not be served
-        // over an enforced multi-tenant surface: the reconstructed absolute path can point outside the
-        // caller's authorized repository (e.g. a crafted project with '..' in a source item, or another
-        // tenant's retained checkout). Under enforcement the caller gets locations only; the zero-policy
-        // local path is byte-identical (hardening review, criteria 1 & 2).
-        var serveSource = include_source && !dbProvider.Authorizer.IsEnforcing;
+        // Source reads must not be served over an enforced multi-tenant surface: the reconstructed absolute path
+        // can point outside the caller's authorized repository (e.g. a crafted project with '..' in a source item,
+        // or another tenant's retained checkout). Under enforcement the caller gets locations only; the zero-policy
+        // local path is unchanged (hardening review, criteria 1 & 2). Where it is served, the source is the
+        // symbol's own indexed version (stored text or a hash-verified file), never drifted text (issue #244).
+        var serveSource = include_source && !dbProvider.Authorizer.IsEnforcing
+            ? new SourceContextRetriever(new FileStore(conn), dbProvider.SourceTexts)
+            : null;
 
         var canonicalIdCache = BuildCanonicalIdCache(projectStore);
 
@@ -273,12 +275,15 @@ public static class FindSymbolTool
     internal static string ResolveCanonicalId(long projectId, Dictionary<long, string> cache)
         => cache.TryGetValue(projectId, out var cid) ? cid : projectId.ToString();
 
+    /// <param name="source">
+    /// Set to serve the declaration's <c>source_context</c> from the symbol's indexed source version; null omits it.
+    /// </param>
     /// <param name="qualifiedName">
     /// The name to print as <c>fully_qualified_name</c>, in a form the tools accept back (<see cref="SymbolNamer"/>);
     /// the stored name when null.
     /// </param>
     internal static object MapSymbol(
-        SymbolInfo s, string? canonicalId = null, bool includeSource = false, string? qualifiedName = null)
+        SymbolInfo s, string? canonicalId = null, SourceContextRetriever? source = null, string? qualifiedName = null)
     {
         var result = new Dictionary<string, object?>
         {
@@ -293,8 +298,8 @@ public static class FindSymbolTool
             ["signature"] = s.Declaration ?? s.Signature
         };
 
-        if (includeSource)
-            result["source_context"] = SourceReader.ReadDeclaration(s.FilePath, s.LineStart, s.LineEnd);
+        if (source != null)
+            result["source_context"] = source.GetDeclaration(s.ProjectId, s.FilePath, s.LineStart, s.LineEnd);
 
         return result;
     }

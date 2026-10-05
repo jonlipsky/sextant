@@ -45,6 +45,13 @@ public static class GetCallHierarchyTool
             return SymbolResolver.ErrorResponse(symbolStore, projectStore, lookup, readContext.Provenance);
         var rootSymbol = lookup.Symbol!;
         var namer = new SymbolNamer(symbolStore);
+        // Source reads are suppressed under an enforced multi-tenant policy so a reconstructed absolute call-site
+        // path cannot expose a file outside the caller's authorized repository. Location-only under enforcement
+        // (hardening review, criteria 1 & 2). Where it is served, the call site's own indexed version is read
+        // (stored text or a hash-verified file), never drifted text (issue #244).
+        var source = include_source && !dbProvider.Authorizer.IsEnforcing
+            ? new SourceContextRetriever(new FileStore(conn), dbProvider.SourceTexts)
+            : null;
 
         var hits = new List<(SymbolInfo Target, CallGraphEdge Edge, int Depth)>();
         var visited = new HashSet<long>();
@@ -104,12 +111,8 @@ public static class GetCallHierarchyTool
             if (edge.IsCandidate)
                 entry["candidate"] = true;
 
-            // Raw host-filesystem read (no content-hash verification): suppress under an enforced
-            // multi-tenant policy so a reconstructed absolute call-site path cannot expose a file
-            // outside the caller's authorized repository. Location-only under enforcement; the
-            // zero-policy local path is byte-identical (hardening review, criteria 1 & 2).
-            if (include_source && !dbProvider.Authorizer.IsEnforcing)
-                entry["source_context"] = SourceReader.ReadContext(edge.CallSiteFile, edge.CallSiteLine, 2);
+            if (source != null)
+                entry["source_context"] = source.GetContextBlock(edge.InProjectId, edge.CallSiteFile, edge.CallSiteLine, 2);
 
             return (object)entry;
         }).ToList();

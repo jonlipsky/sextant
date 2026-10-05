@@ -17,20 +17,4 @@ internal static class SourceReader
                 .ToList()
         };
     }
-
-    public static object? ReadDeclaration(string filePath, int lineStart, int lineEnd)
-    {
-        if (!File.Exists(filePath)) return null;
-        var allLines = File.ReadAllLines(filePath);
-        var start = Math.Max(0, lineStart - 1);
-        var end = Math.Min(allLines.Length, lineEnd);
-        return new
-        {
-            start_line = lineStart,
-            end_line = lineEnd,
-            lines = allLines[start..end]
-                .Select((text, i) => new { line_number = start + i + 1, content = text })
-                .ToList()
-        };
-    }
 }

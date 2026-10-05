@@ -184,6 +184,7 @@ public sealed class LocalIndexerSnapshotWorker(
     IEvaluationSandbox? sandbox = null,
     SdkPinGuard? sdkPinGuard = null,
     PackageRestoreRunner? packageRestore = null,
+    SourceTextStore? sourceTexts = null,
     TimeProvider? clock = null) : ISnapshotWorker
 {
     // Issue #113: neutralizes an unsatisfiable global.json SDK pin for the duration of the MSBuild load only.
@@ -326,7 +327,12 @@ public sealed class LocalIndexerSnapshotWorker(
             var orchestrator = new IndexOrchestrator(
                 database, log, configuration.DocumentExtractor,
                 ExtractionParallelismOptions.FromConfiguration(configuration),
-                IndexProfileDescriptor.FromConfiguration(configuration));
+                IndexProfileDescriptor.FromConfiguration(configuration))
+            {
+                // Issue #244: keep the indexed bytes, so the snapshot serves its own source text once the shared
+                // checkout has moved to another commit.
+                SourceTexts = sourceTexts
+            };
 
             await orchestrator.IndexSolutionAsync(
                 load.Solution, progress: null, metrics: null, cancellationToken: token,

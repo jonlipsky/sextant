@@ -105,6 +105,8 @@ public static class ServiceApp
                 // (RemoteOutputFilter), which makes paths repository-relative and the snapshot meta lean.
                 RemoteSurface = true,
                 MaxResponseChars = options.MaxResponseChars,
+                // Issue #244: each snapshot's source text comes from the bytes it indexed, not the moving checkout.
+                SourceTexts = service.SourceTexts,
                 ReadAdmitted = context => RemoteOutputFilter.Record(http.HttpContext, context)
             };
         });

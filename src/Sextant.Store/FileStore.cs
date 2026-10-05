@@ -37,6 +37,13 @@ public sealed class FileStore(SqliteConnection connection)
     private readonly Dictionary<(long ProjectId, string Path), byte[]> _analyzedHashByKey = new();
 
     /// <summary>
+    /// Where the bytes behind every content hash this store takes from disk are kept, so a published snapshot can
+    /// serve its own source text after the working tree moves on (issue #244). Null (the default, the local
+    /// CLI/daemon) keeps nothing; the index service sets it.
+    /// </summary>
+    public SourceTextStore? SourceTexts { get; set; }
+
+    /// <summary>
     /// Captures (once) the raw-disk SHA-256 of an on-disk source file at analysis time and returns it,
     /// so a later <see cref="ResolveFileVersionId"/> for the same path persists exactly these bytes'
     /// hash rather than re-reading the (possibly drifted) file at persist time (issue #35). Idempotent
@@ -50,7 +57,7 @@ public sealed class FileStore(SqliteConnection connection)
         if (_analyzedHashByKey.TryGetValue(key, out var existing))
             return existing;
 
-        var hash = ComputeContentHash(repoRoot, repoRelative, path);
+        var hash = DiskHash(repoRoot, repoRelative, path);
         _analyzedHashByKey[key] = hash;
         return hash;
     }
@@ -94,7 +101,21 @@ public sealed class FileStore(SqliteConnection connection)
     private byte[] AnalyzedOrDiskHash(long projectId, string? repoRoot, string repoRelative, string path)
         => _analyzedHashByKey.TryGetValue((projectId, repoRelative), out var captured)
             ? captured
-            : ComputeContentHash(repoRoot, repoRelative, path);
+            : DiskHash(repoRoot, repoRelative, path);
+
+    // ComputeContentHash, also keeping the hashed bytes in SourceTexts when it is set: one read, so the stored
+    // text is exactly the bytes behind the persisted hash.
+    private byte[] DiskHash(string? repoRoot, string repoRelative, string path)
+    {
+        if (SourceTexts is not { } texts)
+            return ComputeContentHash(repoRoot, repoRelative, path);
+
+        if (ReadSource(repoRoot, repoRelative, path) is not { } bytes)
+            return MissingFileHash(repoRelative);
+        var hash = SHA256.HashData(bytes);
+        texts.Put(hash, bytes);
+        return hash;
+    }
 
     private long? FindExistingFileVersion(long projectId, string repoRelative)
     {
@@ -269,19 +290,42 @@ public sealed class FileStore(SqliteConnection connection)
         return cmd.ExecuteScalar() is byte[] hash ? hash : null;
     }
 
+    /// <summary>
+    /// The <see cref="SourceTextStore.SweepKey"/> of every content hash a file version records, i.e. of every stored
+    /// source text some indexed file still needs. One scan, deduplicated in memory as 16-byte keys.
+    /// </summary>
+    public HashSet<UInt128> ReferencedSourceTextKeys()
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT content_hash FROM file_versions;";
+        var keys = new HashSet<UInt128>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            if (reader[0] is byte[] { Length: >= 16 } hash)
+                keys.Add(SourceTextStore.SweepKey(hash));
+        return keys;
+    }
+
     /// <summary>Raw SHA-256 of the on-disk file, or a stable path-derived placeholder when absent.</summary>
     public static byte[] ComputeContentHash(string? repoRoot, string repoRelative, string originalPath)
+        => ReadSource(repoRoot, repoRelative, originalPath) is { } bytes
+            ? SHA256.HashData(bytes)
+            : MissingFileHash(repoRelative);
+
+    private static byte[]? ReadSource(string? repoRoot, string repoRelative, string originalPath)
     {
         var absolute = SourcePaths.ToAbsolute(repoRoot, originalPath is { Length: > 0 } ? originalPath : repoRelative);
         try
         {
             if (File.Exists(absolute))
-                return SHA256.HashData(File.ReadAllBytes(absolute));
+                return File.ReadAllBytes(absolute);
         }
         catch { /* fall through to placeholder */ }
-
-        // No readable source: a deterministic placeholder that will never match real file content, so
-        // the query-time snippet gate correctly declines to synthesize a snippet.
-        return SHA256.HashData(Encoding.UTF8.GetBytes("\0missing\0" + repoRelative));
+        return null;
     }
+
+    // No readable source: a deterministic placeholder that will never match real file content, so
+    // the query-time snippet gate correctly declines to synthesize a snippet.
+    private static byte[] MissingFileHash(string repoRelative)
+        => SHA256.HashData(Encoding.UTF8.GetBytes("\0missing\0" + repoRelative));
 }

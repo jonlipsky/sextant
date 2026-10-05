@@ -1702,6 +1702,25 @@ snapshot-DATA garbage collection Phase 9 deferred:
 - **#38 — single-writer lease.** Retention/publish/GC run under the `writer_lease`, so they can never race
   a live daemon/service. The lease is acquired fail-closed at `Start`, heartbeated for the service's
   lifetime, and a stale lease may be stolen so a crash never wedges the DB.
+- **#244 — stored source text follows the file versions.** An executed pass then deletes every blob in the
+  artifact volume's `source-text/` store whose SHA-256 no `file_versions` row records any more (at most
+  100,000 per pass), and reports the count as `source_texts_deleted` (absent on a dry run). It runs under
+  the writer gate, so a blob an index stored ahead of its row is never swept.
+
+## Snapshot source text (#244)
+
+Reference snippets (`context_snippet`, `source_context`) and `include_source` blocks come from the bytes
+the snapshot indexed, never from the repository's checkout: that checkout is shared by every branch and
+pull-request head of the repository, and a later index moves it to another commit. As the worker hashes
+each file for its `file_versions` row it also stores the bytes, Brotli-compressed, in
+`<artifact-root>/source-text/<2 hex>/<sha-256 hex>.br` (content-addressed, so identical files share one
+blob; a file over 16 MiB is not kept). A query reads the blob for the file version's recorded hash and
+serves it only when the decompressed bytes hash to it. Only a project indexed from a checkout on this service
+reads the store: a contributed project's hashes come from the client, so a contribution naming another
+repository's file hash must not read its text. When there is no verified blob (a snapshot indexed before #244
+whose content no later index stored, a reused provider, or an overlay) or the project was contributed, it falls
+back to the checkout file, again only when its hash matches, and otherwise returns the location without text.
+No schema or identity change: an old snapshot serves text again once its files are stored.
 
 ## Remote snapshot federation (#51)
 
