@@ -1671,7 +1671,10 @@ public sealed partial class SnapshotService : IDisposable
                 HeadSequence = branch.HeadSequence,
                 CommitSha = commitSha,
                 Coverage = CoverageOn(conn, row.Id),
-                CurrentIdentityHash = commitSha is null
+                // A contributed head is its contributors' to refresh: no service ensure reproduces a contribution's
+                // identity (its own tree sha, no toolchain), and rebuilding it here could replace client-built
+                // (e.g. Windows-only) projects with a narrower server snapshot. Its currency is not reported.
+                CurrentIdentityHash = commitSha is null || new ContributionStore(conn).HasContributions(row.Id)
                     ? null
                     : CurrentIdentityHash(conn, snapshots, row, repositoryRemoteUrl, commitSha)
             };
