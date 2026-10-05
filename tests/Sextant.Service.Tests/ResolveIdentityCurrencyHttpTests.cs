@@ -7,6 +7,7 @@ using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Logging;
 using Sextant.Core;
 using Sextant.Mcp;
+using Sextant.Mcp.Tools;
 using Sextant.Service.Host;
 using Sextant.Store;
 
@@ -84,7 +85,7 @@ public class ResolveIdentityCurrencyHttpTests
         Assert.AreEqual(oldSnapshotId, stale.GetProperty("id").GetInt64(), "the old snapshot is still served");
         Assert.AreEqual(Commit, stale.GetProperty("commit_sha").GetString());
         Assert.AreEqual(SymbolNotFound, (await after.FindGadgetAsync()).Code);
-        Assert.AreEqual(oldSnapshotId, await after.ServedSnapshotIdAsync());
+        Assert.AreEqual(oldSnapshotId, after.ServedSnapshotId());
 
         // What the app's reconcile sends for a stale branch: the same head commit, advance, CAS on that commit.
         var refreshed = await after.EnsureAsync(Repo, expected: Commit, update: BranchUpdateMode.Advance);
@@ -107,7 +108,7 @@ public class ResolveIdentityCurrencyHttpTests
         var gadget = await after.FindGadgetAsync();
         Assert.IsNull(gadget.Code, gadget.Body.ToString());
         Assert.AreEqual(1, gadget.Body.GetProperty("meta").GetProperty("result_count").GetInt32());
-        Assert.AreEqual(newSnapshotId, await after.ServedSnapshotIdAsync());
+        Assert.AreEqual(newSnapshotId, after.ServedSnapshotId());
 
         var again = await after.EnsureAsync(Repo, expected: Commit, update: BranchUpdateMode.Advance);
         Assert.IsFalse(again.GetProperty("branch_advanced").GetBoolean(), "already pointed at it");
@@ -146,11 +147,12 @@ public class ResolveIdentityCurrencyHttpTests
         Assert.IsFalse(stale.GetProperty("identity_current").GetBoolean(), stale.ToString());
         Assert.AreEqual(previous.Hash, stale.GetProperty("identity_hash").GetString());
         Assert.AreEqual(currentHash, stale.GetProperty("current_identity_hash").GetString());
-        var status = await host.CallAsync("get_index_status", "{}");
-        var served = status.Body.GetProperty("index").GetProperty("snapshot");
-        Assert.AreEqual(snapshotId, served.GetProperty("base_snapshot_id").GetInt64());
-        Assert.IsFalse(served.GetProperty("compatible").GetBoolean(), "agents already see the analyzer drift");
-        StringAssert.Contains(served.GetProperty("incompatibilities").GetRawText(), "\"analyzer\"");
+        Assert.AreEqual(snapshotId, host.ServedSnapshotId());
+        var widget = await host.CallAsync("find_symbol", """{"name":"App.Widget"}""");
+        Assert.IsNull(widget.Code, widget.Body.ToString());
+        Assert.AreEqual(RemoteResponsePresenter.IncompatibleWarning,
+            widget.Body.GetProperty("meta").GetProperty("snapshot").GetProperty("warning").GetString(),
+            "agents already see the analyzer drift");
 
         var refreshed = await host.EnsureAsync(Repo, expected: Commit, update: BranchUpdateMode.Advance);
         Assert.AreEqual(currentHash, refreshed.GetProperty("identity_hash").GetString());
@@ -161,7 +163,7 @@ public class ResolveIdentityCurrencyHttpTests
         Assert.IsTrue(current.GetProperty("identity_current").GetBoolean(), current.ToString());
         Assert.AreEqual(refreshed.GetProperty("snapshot_id").GetInt64(), current.GetProperty("id").GetInt64());
         Assert.AreEqual(SnapshotStatus.Superseded, StatusOf(snapshotId));
-        Assert.AreEqual(current.GetProperty("id").GetInt64(), await host.ServedSnapshotIdAsync());
+        Assert.AreEqual(current.GetProperty("id").GetInt64(), host.ServedSnapshotId());
     }
 
     [TestMethod]
@@ -292,6 +294,7 @@ public class ResolveIdentityCurrencyHttpTests
         public FakeSnapshotWorker Worker { get; private init; } = null!;
         public SnapshotService Service { get; private init; } = null!;
         private WebApplication App { get; init; } = null!;
+        private string DbPath { get; init; } = "";
 
         // A service + HTTP host over the shared catalog; its worker runs the real orchestrator under the node's
         // restore policy (the published identity must equal the requested one). Disposing it releases the writer
@@ -309,7 +312,7 @@ public class ResolveIdentityCurrencyHttpTests
             var app = builder.Build();
             ServiceApp.MapEndpoints(app, options);
             await app.StartAsync();
-            return new Host { Client = app.GetTestClient(), App = app, Service = service, Worker = worker };
+            return new Host { Client = app.GetTestClient(), App = app, Service = service, Worker = worker, DbPath = db.DbPath };
         }
 
         public async Task<JsonElement> EnsureAsync(string repository, string? expected = null, string? update = null)
@@ -347,11 +350,14 @@ public class ResolveIdentityCurrencyHttpTests
         public Task<(JsonElement Body, string? Code)> FindGadgetAsync() =>
             CallAsync("find_symbol", """{"name":"App.Gadget"}""");
 
-        public async Task<long> ServedSnapshotIdAsync()
+        // The snapshot a read of the repository is served from. The remote surface prints only its commit, which
+        // several snapshots here share, so a local provider over the same catalog reads its id.
+        public long ServedSnapshotId()
         {
-            var status = await CallAsync("get_index_status", "{}");
-            Assert.IsNull(status.Code, status.Body.ToString());
-            return status.Body.GetProperty("index").GetProperty("snapshot").GetProperty("base_snapshot_id").GetInt64();
+            using var local = new DatabaseProvider(DbPath) { RequestedRepository = () => Repo };
+            var status = JsonDocument.Parse(GetIndexStatusTool.GetIndexStatus(local)).RootElement;
+            Assert.IsFalse(status.GetProperty("meta").TryGetProperty("error", out _), status.ToString());
+            return status.GetProperty("index").GetProperty("snapshot").GetProperty("base_snapshot_id").GetInt64();
         }
 
         // One anonymous /mcp tools/call selecting the repository by header; the tool's JSON text and its error code.

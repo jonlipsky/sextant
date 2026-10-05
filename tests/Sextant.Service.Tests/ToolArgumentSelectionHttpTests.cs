@@ -41,19 +41,12 @@ public class ToolArgumentSelectionHttpTests
         var tools = (await host.RpcAsync("tools/list", "{}")).GetProperty("tools").EnumerateArray().ToList();
 
         Assert.AreEqual(ServiceApp.RepositoryScopedTools.Count + ToolSelectionFilters.SelectionExemptTools.Count, tools.Count,
-            "every remote tool is repository-scoped except the selection-exempt ones (list_repositories, search_symbols)");
+            "every remote tool is repository-scoped except the selection-exempt list_repositories");
         foreach (var tool in tools)
         {
             var name = tool.GetProperty("name").GetString()!;
             if (ToolSelectionFilters.SelectionExemptTools.Contains(name))
             {
-                if (name == Sextant.Service.Search.SearchSymbolsTool.ToolName)
-                {
-                    // search_symbols declares its own repository/branch narrowing: its schema is exactly its own.
-                    Assert.AreEqual(Sextant.Service.Search.SearchSymbolsTool.InputSchema.GetRawText(),
-                        tool.GetProperty("inputSchema").GetRawText(), name);
-                    continue;
-                }
                 var exemptProperties = tool.GetProperty("inputSchema").TryGetProperty("properties", out var p) ? p : default;
                 Assert.IsFalse(exemptProperties.ValueKind == JsonValueKind.Object && exemptProperties.TryGetProperty("repository", out _), name);
                 continue;
@@ -98,22 +91,6 @@ public class ToolArgumentSelectionHttpTests
                     .GetProperty("description").GetString(),
                 tool.GetProperty("name").GetString());
         }
-    }
-
-    [TestMethod]
-    [DataRow("find_cross_repository_usages")]
-    [DataRow("find_submodule_consumers")]
-    public async Task ToolsList_CrossRepositoryTool_KeepsItsOwnBranchArgument(string toolName)
-    {
-        await using var host = await Harness.StartAsync();
-
-        var tool = (await host.RpcAsync("tools/list", "{}")).GetProperty("tools").EnumerateArray()
-            .Single(t => t.GetProperty("name").GetString() == toolName);
-        var properties = tool.GetProperty("inputSchema").GetProperty("properties");
-
-        Assert.IsTrue(properties.TryGetProperty("repository", out _), "the repository selector is added");
-        StringAssert.Contains(properties.GetProperty("branch").GetProperty("description").GetString(), "consumers",
-            "the tool's own consumer-branch filter is not replaced by the reserved selector");
     }
 
     // ==== tools/call: repository ====================================================================
@@ -306,52 +283,6 @@ public class ToolArgumentSelectionHttpTests
         Assert.AreEqual(notFound, WithoutTimestamp(unknownBranch.Body), "an unknown branch is the uniform not-found");
         Assert.AreEqual(notFound, WithoutTimestamp(incompleteBranch.Body), "a branch with no complete snapshot is too");
         Assert.AreEqual(notFound, WithoutTimestamp(foreignRepository.Body), "and so is another tenant's branch");
-    }
-
-    // ==== cross-repository tools ====================================================================
-
-    [TestMethod]
-    // The fixture pins no consumer to the provider, so the usages tool reaches its own (loud) not-found: what matters
-    // here is that the selection requirement is met, never `repository_required`.
-    [DataRow("find_cross_repository_usages", """{"provider_repository_url":"https://github.com/acme/widgets","symbol_fqn":"global::App.Type0","branch":"main"}""", "symbol_not_found")]
-    [DataRow("find_submodule_consumers", """{"provider_repository_url":"https://github.com/acme/widgets","branch":"main"}""", null)]
-    public async Task Call_CrossRepositoryTool_DefaultsSelectorToProvider_WhenSelectionIsRequired(
-        string toolName, string arguments, string? toolError)
-    {
-        await using var host = await Harness.StartAsync(requireSelection: true);
-
-        var call = await host.CallRawAsync(toolName, arguments);
-
-        var code = call.Body.GetProperty("meta").TryGetProperty("error", out var error)
-            ? error.GetProperty("code").GetString()
-            : null;
-        Assert.AreEqual(toolError, code, $"the provider repository satisfies the requirement: {call.Body}");
-        Assert.AreEqual(toolError is not null, call.IsError, call.Body.ToString());
-        Assert.AreEqual(new ToolCallSelection(Widgets, null, ToolSelectionSource.ProviderDefault), host.Probe.Selection);
-        CollectionAssert.Contains(host.Probe.ArgumentNames, "branch",
-            "the tool's own branch argument is passed through, not taken as the selector");
-    }
-
-    [TestMethod]
-    public async Task Call_CrossRepositoryTool_WithoutRequirement_KeepsTheUnselectedGate()
-    {
-        await using var host = await Harness.StartAsync(requireSelection: false);
-
-        await host.CallRawAsync("find_submodule_consumers", $$"""{"provider_repository_url":"{{Widgets}}"}""");
-
-        Assert.AreEqual(new ToolCallSelection(null, null, ToolSelectionSource.None), host.Probe.Selection,
-            "with no requirement a call that names nothing keeps today's unselected read");
-    }
-
-    [TestMethod]
-    public async Task Call_CrossRepositoryTool_ExplicitSelector_WinsOverProviderDefault()
-    {
-        await using var host = await Harness.StartAsync(requireSelection: true);
-
-        await host.CallRawAsync("find_submodule_consumers",
-            $$"""{"provider_repository_url":"{{Widgets}}","repository":"acme/gadgets"}""");
-
-        Assert.AreEqual(new ToolCallSelection(Gadgets, null, ToolSelectionSource.Argument), host.Probe.Selection);
     }
 
     // ==== helpers ===================================================================================

@@ -688,7 +688,7 @@ public class CallerAssertionHttpTests
         private HttpClient Client { get; set; } = null!;
         private WebApplication App { get; set; } = null!;
         private IndexDatabase Db { get; set; } = null!;
-        private string DbPath { get; set; } = "";
+        public string DbPath { get; private set; } = "";
         private int _nextId;
 
         public static async Task<Harness> StartAsync(

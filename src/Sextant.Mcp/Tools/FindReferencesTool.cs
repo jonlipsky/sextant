@@ -9,11 +9,11 @@ namespace Sextant.Mcp.Tools;
 public static class FindReferencesTool
 {
 
-    [McpServerTool(Name = "find_references"), Description("Every use of a symbol. Use instead of grep: no false matches from comments, strings or namesakes.")]
+    [McpServerTool(Name = "find_references"), Description("Every use of a symbol, including the uses grep misses (qualified new Ns.Type(...), target-typed new(...), calls through interfaces) and none of its false matches (comments, strings, namesakes). Use instead of grep.")]
     public static string FindReferences(
         DatabaseProvider dbProvider,
         [Description(ToolText.SymbolFqn)] string symbol_fqn,
-        [Description("Comma-separated canonical_ids")] string? include_projects = null,
+        [Description("Comma-separated project_ids from find_symbol.")] string? include_projects = null,
         [Description("project, file and/or kind, e.g. project,file.")] string? group_by = null,
         bool include_source = false,
         [Description(ToolText.Scope)] string? scope = null,
@@ -25,8 +25,9 @@ public static class FindReferencesTool
         var mode = FederationModes.Parse(federation);
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError, mode))
             return authError;
+        // include_source only adds each row's surrounding lines, so a cursor carries over when it is toggled.
         if (!Paging.TryBegin("find_references", limit, cursor, readContext, out var page, out var cursorError,
-                symbol_fqn, include_projects, group_by, include_source, scope, access_kind, federation))
+                symbol_fqn, include_projects, group_by, scope, access_kind, federation))
             return cursorError;
 
         using var conn = db.OpenReadConnection();
@@ -62,7 +63,7 @@ public static class FindReferencesTool
                 var proj = projectStore.GetByCanonicalId(canonicalId);
                 if (proj == null)
                     return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode,
-                        $"Unknown project '{canonicalId}' in include_projects. Use project canonical IDs as listed by get_index_status.",
+                        $"Unknown project '{canonicalId}' in include_projects. Use project_ids from find_symbol results.",
                         readContext.Provenance);
                 includedProjectIds.Add(proj.Value.id);
             }

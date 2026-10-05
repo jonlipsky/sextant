@@ -334,8 +334,8 @@ public class RepositorySelectionTests
     [TestMethod]
     public void LocalStdioHost_RegistersNoServiceOnlyTools()
     {
-        // list_repositories (SVC-4) and search_symbols (SVC-F) live in Sextant.Service: the local stdio server only
-        // registers Sextant.Mcp's tools, so its tools/list is unchanged by them.
+        // list_repositories (SVC-4) lives in Sextant.Service: the local stdio server only registers Sextant.Mcp's
+        // tools, so its tools/list is unchanged by it.
         using var host = McpServerSetup.CreateMcpHost([], _dbPath).Build();
         var names = host.Services.GetServices<ModelContextProtocol.Server.McpServerTool>()
             .Select(t => t.ProtocolTool.Name)
@@ -343,7 +343,6 @@ public class RepositorySelectionTests
 
         Assert.IsTrue(names.Contains("find_symbol"), string.Join(", ", names));
         CollectionAssert.DoesNotContain(names, "list_repositories");
-        CollectionAssert.DoesNotContain(names, "search_symbols");
     }
 
     [TestMethod]

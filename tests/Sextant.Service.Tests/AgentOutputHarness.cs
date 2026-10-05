@@ -125,6 +125,14 @@ internal sealed class AgentOutputHarness : IAsyncDisposable
         return JsonDocument.Parse(text).RootElement.Clone();
     }
 
+    /// <summary>
+    /// A local (stdio-style) provider over the same catalog, selecting <paramref name="repository"/>, for tools the
+    /// remote surface does not list. The caller disposes it.
+    /// </summary>
+    public Sextant.Mcp.DatabaseProvider LocalProvider(
+        string repository = AgentOutputFixture.RepoA, int maxResponseChars = Sextant.Mcp.ResponseBudget.DefaultMaxChars) =>
+        new(DbPath) { RequestedRepository = () => repository, MaxResponseChars = maxResponseChars };
+
     public async ValueTask DisposeAsync()
     {
         Client.Dispose();

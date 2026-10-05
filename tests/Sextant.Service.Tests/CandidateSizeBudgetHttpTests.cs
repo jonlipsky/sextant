@@ -7,8 +7,7 @@ namespace Sextant.Service.Tests;
 /// <summary>
 /// The response size budget over a repository whose call sites did not bind (the <see cref="UnboundCallSitesHttpTests"/>
 /// fixture, indexed by the real orchestrator): a page cut by size keeps every row's <c>candidate</c> marker, the walk
-/// returns every row exactly once, and every <c>get_index_status</c> page keeps the coverage block (binding health
-/// and notes) whole while its project rows give way.
+/// returns every row exactly once.
 /// </summary>
 [TestClass]
 public class CandidateSizeBudgetHttpTests
@@ -55,29 +54,6 @@ public class CandidateSizeBudgetHttpTests
         Assert.AreEqual(CallerMethods, pages[0].GetProperty("meta").GetProperty("total").GetInt32());
         Assert.AreEqual(CallerMethods, rows.Select(r => r.GetRawText()).Distinct().Count(), "no row is returned twice");
         Assert.IsTrue(rows.All(r => r.GetProperty("candidate").GetBoolean()), "every unbound site stays a candidate");
-    }
-
-    [TestMethod]
-    public async Task GetIndexStatus_EveryPageKeepsTheBindingHealthAndNotes()
-    {
-        var pages = await WalkAsync("get_index_status", "\"limit\":200");
-
-        var projects = pages.SelectMany(p => p.GetProperty("results").EnumerateArray())
-            .Select(r => r.GetProperty("repo_relative_path").GetString()).ToList();
-        Assert.AreEqual(pages[0].GetProperty("meta").GetProperty("total").GetInt32(), projects.Count);
-        Assert.AreEqual(projects.Count, projects.Distinct().Count());
-        foreach (var page in pages)
-        {
-            var coverage = page.GetProperty("index").GetProperty("coverage");
-            var binding = coverage.GetProperty("binding");
-            Assert.AreEqual(1, binding.GetProperty("projects_degraded").GetInt32());
-            Assert.IsTrue(binding.GetProperty("names_examined").GetInt64() > 0);
-            Assert.IsTrue(binding.GetProperty("unbound_names").GetInt64() > 0);
-            Assert.IsTrue(binding.GetProperty("candidate_occurrences").GetInt64() >= 4L * CallerMethods);
-            Assert.AreEqual("src/App/App.csproj", binding.GetProperty("projects")[0].GetProperty("project").GetString());
-            Assert.AreEqual(1, coverage.GetProperty("notes").GetArrayLength());
-            Assert.IsTrue(page.GetProperty("index").TryGetProperty("totals", out _));
-        }
     }
 
     private static async Task<List<JsonElement>> WalkAsync(string tool, string arguments)

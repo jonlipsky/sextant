@@ -11,9 +11,8 @@ namespace Sextant.Mcp;
 /// <list type="bullet">
 /// <item>Source paths become repository-relative and no checkout path survives (<see cref="PathPresenter.Redact"/>).</item>
 /// <item><c>meta.snapshot</c> becomes the lean block an agent needs to trust the answer — repository, branch,
-/// short commit, a one-word coverage state, and a warning only when the answer may be incomplete
-/// (<see cref="LeanSnapshot"/>). The full provenance stays available from <c>get_index_status</c>
-/// (<c>index.snapshot</c>).</item>
+/// short commit, a one-word coverage state, and a short, self-contained warning only when the answer may be
+/// incomplete (<see cref="LeanSnapshot"/>).</item>
 /// </list>
 /// The local stdio/CLI surface never runs it, so its output is unchanged.
 /// </summary>
@@ -21,24 +20,29 @@ public static class RemoteResponsePresenter
 {
     /// <summary>
     /// The lean meta's warning for a snapshot that does not cover the whole checkout when its coverage record
-    /// gives no reason (a partial snapshot without a recorded coverage row).
+    /// counts no gap (a partial snapshot without a recorded coverage row, or one whose gaps have no count).
     /// </summary>
     public const string PartialWarning =
-        "Partial index: some projects or submodules were not indexed, so results may be incomplete. " +
-        "Call get_index_status for details.";
+        "Partial index: some projects or submodules were not indexed, so results may be incomplete.";
 
-    /// <summary>The prefix of a partial warning that names what is missing.</summary>
+    /// <summary>The prefix of a partial warning that counts what is missing.</summary>
     public const string PartialWarningPrefix = "Partial index: ";
 
-    /// <summary>The suffix of a partial warning that names what is missing.</summary>
-    public const string PartialWarningSuffix = " Call get_index_status for details.";
+    /// <summary>The suffix of a partial warning that counts what is missing.</summary>
+    public const string PartialWarningSuffix = ", so results may be incomplete.";
 
-    /// <summary>The cap on the coverage reasons quoted in a partial warning, in characters.</summary>
-    public const int MaxWarningReasonChars = 600;
+    /// <summary>
+    /// The most characters a partial warning holds. It counts the gaps and names no project, so it stays a
+    /// one-line caution on every result instead of a report.
+    /// </summary>
+    public const int MaxPartialWarningChars = 160;
 
-    /// <summary>The lean meta's warning for a snapshot built by an incompatible indexer.</summary>
+    /// <summary>
+    /// The lean meta's warning for a snapshot the running binary flags as incompatible: a newer schema, or a
+    /// different analyzer version, toolchain or worker capability (<see cref="ReadCompatibility"/>).
+    /// </summary>
     public const string IncompatibleWarning =
-        "The index was built by a different Sextant version, so results may differ. Call get_index_status for details.";
+        "The index was built by a different indexer, toolchain or worker, so results may differ.";
 
     /// <summary>The lean meta's warning for a snapshot that includes uncommitted working-tree changes.</summary>
     public const string DirtyWarning = "The index includes uncommitted working-tree changes.";
@@ -103,26 +107,62 @@ public static class RemoteResponsePresenter
     }
 
     /// <summary>
-    /// The partial warning for <paramref name="coverage"/>: its recorded reasons, so an agent learns WHAT is
-    /// missing (which projects did not compile, which submodule is absent) and can judge whether its question is
-    /// affected, instead of a generic caution that reads as "distrust every answer". Quoted reasons are capped at
-    /// <see cref="MaxWarningReasonChars"/>; the generic <see cref="PartialWarning"/> is used when no reason was
-    /// recorded.
+    /// The partial warning for <paramref name="coverage"/>: it counts what is missing (projects that did not load
+    /// or compile, submodules not checked out, solutions or parts of the checkout that could not be read) from the
+    /// recorded coverage, so an agent can judge whether its question is affected, without naming a project or a
+    /// tool. It holds at most <see cref="MaxPartialWarningChars"/> characters; a gap that does not fit is folded
+    /// into "and other gaps". The generic <see cref="PartialWarning"/> is used when the record counts no gap.
     /// </summary>
     public static string PartialWarningFor(SnapshotCoverage? coverage)
     {
-        var reasons = coverage?.Reasons.Where(r => !string.IsNullOrWhiteSpace(r)).Select(r => r.Trim()).ToList();
-        if (reasons is not { Count: > 0 })
+        var parts = coverage is null ? [] : CountedGaps(coverage);
+        if (parts.Count == 0)
             return PartialWarning;
 
-        var text = string.Join(" ", reasons.Select(r => r.EndsWith('.') ? r : r + "."));
-        if (text.Length > MaxWarningReasonChars)
+        const string andOthers = ", and other gaps";
+        var text = PartialWarningPrefix + parts[0];
+        for (var i = 1; i < parts.Count; i++)
         {
-            var cut = text.LastIndexOf(' ', MaxWarningReasonChars - 1);
-            text = text[..(cut > 0 ? cut : MaxWarningReasonChars - 1)].TrimEnd(',', ';', ' ') + " ...";
+            var next = text + ", " + parts[i];
+            var reserve = i == parts.Count - 1 ? 0 : andOthers.Length;
+            if (next.Length + reserve + PartialWarningSuffix.Length > MaxPartialWarningChars)
+            {
+                text += andOthers;
+                break;
+            }
+            text = next;
         }
-        return PartialWarningPrefix + text + PartialWarningSuffix;
+        return text + PartialWarningSuffix;
     }
+
+    private static List<string> CountedGaps(SnapshotCoverage coverage)
+    {
+        var parts = new List<string>();
+        var skipped = Math.Max(coverage.ProjectsSkipped, 0);
+        var degraded = Math.Max(coverage.Binding?.ProjectsDegraded ?? 0, 0);
+        if (skipped > 0 || degraded > 0)
+        {
+            var failed = (long)skipped + degraded;
+            var total = Math.Max((long)coverage.ProjectsDeclared, (long)coverage.ProjectsLoaded + skipped);
+            var verb = skipped > 0 && degraded > 0 ? "did not load or compile"
+                : skipped > 0 ? "did not load"
+                : "did not compile";
+            parts.Add(total >= failed
+                ? $"{failed} of {total} projects {verb}"
+                : $"{failed} {Plural(failed, "project", "projects")} {verb}");
+        }
+        if (coverage.SubmodulesUnpopulated > 0)
+            parts.Add(coverage.SubmodulesDeclared >= coverage.SubmodulesUnpopulated
+                ? $"{coverage.SubmodulesUnpopulated} of {coverage.SubmodulesDeclared} submodules were not checked out"
+                : $"{coverage.SubmodulesUnpopulated} {Plural(coverage.SubmodulesUnpopulated, "submodule was", "submodules were")} not checked out");
+        if (coverage.SolutionsSkipped > 0)
+            parts.Add($"{coverage.SolutionsSkipped} configured {Plural(coverage.SolutionsSkipped, "solution", "solutions")} could not be used");
+        if (coverage.ScanErrors > 0)
+            parts.Add($"{coverage.ScanErrors} {Plural(coverage.ScanErrors, "part", "parts")} of the checkout could not be scanned");
+        return parts;
+    }
+
+    private static string Plural(long count, string one, string many) => count == 1 ? one : many;
 
     // "https://github.com/org/app.git" → "github.com/org/app": the form the `repository` argument accepts.
     private static string DisplayRepository(string remoteUrl)

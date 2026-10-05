@@ -8,7 +8,7 @@ namespace Sextant.Mcp.Tools;
 [McpServerToolType]
 public static class GetCallHierarchyTool
 {
-    [McpServerTool(Name = "get_call_hierarchy"), Description("Callers or callees of a method, transitively. Use instead of repeated grep and read.")]
+    [McpServerTool(Name = "get_call_hierarchy"), Description("Callers or callees of a method, transitively, including calls grep misses (aliases, using static, calls through interfaces). Use instead of repeated grep and read.")]
     public static string GetCallHierarchy(
         DatabaseProvider dbProvider,
         [Description("Method, fully qualified.")] string symbol_fqn,
@@ -23,8 +23,9 @@ public static class GetCallHierarchyTool
 
         var config = SextantConfiguration.FromEnvironment();
         depth = Math.Min(depth, config.MaxCallHierarchyDepth);
+        // include_source only adds each call site's surrounding lines, so a cursor carries over when it is toggled.
         if (!Paging.TryBegin("get_call_hierarchy", limit, cursor, readContext, out var page, out var cursorError,
-                symbol_fqn, direction, depth, include_source))
+                symbol_fqn, direction, depth))
             return cursorError;
 
         using var conn = db.OpenReadConnection();

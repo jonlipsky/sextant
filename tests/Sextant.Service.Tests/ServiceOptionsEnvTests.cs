@@ -20,8 +20,6 @@ public class ServiceOptionsEnvTests
     private const string MaxProvisioningAttempts = "SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS";
     private const string MaxGrantsPerPrincipal = "SEXTANT_SERVICE_MAX_GRANTS_PER_PRINCIPAL";
     private const string MaxGrantsPerTenant = "SEXTANT_SERVICE_MAX_GRANTS_PER_TENANT";
-    private const string SearchMaxWidth = "SEXTANT_SERVICE_SEARCH_MAX_WIDTH";
-    private const string SearchMaxHits = "SEXTANT_SERVICE_SEARCH_MAX_HITS";
     private const string ControlWriteWait = "SEXTANT_SERVICE_CONTROL_WRITE_WAIT_SECONDS";
     private const string RequireRepositorySelection = "SEXTANT_SERVICE_REQUIRE_REPOSITORY_SELECTION";
     private const string RepositoryHosts = "SEXTANT_SERVICE_REPOSITORY_HOSTS";
@@ -308,56 +306,6 @@ public class ServiceOptionsEnvTests
         {
             Environment.SetEnvironmentVariable(MaxGrantsPerPrincipal, null);
             Environment.SetEnvironmentVariable(MaxGrantsPerTenant, null);
-        }
-    }
-
-    [TestMethod]
-    [DataRow(null, 50)]
-    [DataRow("7", 7)]
-    [DataRow(" 12 ", 12)]
-    [DataRow("100", 100)]
-    [DataRow("500", 100)]
-    [DataRow("0", 50)]
-    [DataRow("-1", 50)]
-    [DataRow("abc", 50)]
-    public void SearchMaxWidth_BindsClampsOrFallsBackToDefault(string? value, int expected)
-    {
-        // SVC-F: a missing, non-positive or unparseable width keeps the default; a large one is clamped to the
-        // ceiling that keeps a search cursor under its 16 KiB bound.
-        Environment.SetEnvironmentVariable(SearchMaxWidth, value);
-        try
-        {
-            Assert.AreEqual(expected, ServiceOptions.FromEnvironment(Config()).SearchMaxWidth);
-        }
-        finally
-        {
-            Environment.SetEnvironmentVariable(SearchMaxWidth, null);
-        }
-    }
-
-    [TestMethod]
-    [DataRow(null, 500)]
-    [DataRow("250", 250)]
-    [DataRow(" 1000 ", 1000)]
-    [DataRow("7", 100)]
-    [DataRow("100", 100)]
-    [DataRow("5000", 5000)]
-    [DataRow("99999", 5000)]
-    [DataRow("0", 500)]
-    [DataRow("-1", 500)]
-    [DataRow("abc", 500)]
-    public void SearchMaxHits_BindsClampsOrFallsBackToDefault(string? value, int expected)
-    {
-        // Issue #196: the per-call total-hit cap. A missing, non-positive or unparseable value keeps the default; any
-        // other is clamped so every snapshot a page reads still gets at least one hit and one call stays bounded.
-        Environment.SetEnvironmentVariable(SearchMaxHits, value);
-        try
-        {
-            Assert.AreEqual(expected, ServiceOptions.FromEnvironment(Config()).SearchMaxHits);
-        }
-        finally
-        {
-            Environment.SetEnvironmentVariable(SearchMaxHits, null);
         }
     }
 

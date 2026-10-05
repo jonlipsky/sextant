@@ -8,8 +8,8 @@ the distributed-indexing initiative was built toward.
 It lives in two projects that depend on the core libraries — **never the reverse**:
 
 - **`Sextant.Service`** — the data-plane library: the `SnapshotService` control core, service contracts,
-  on-disk volume management, caller identity, repository grants, and the service-only MCP tools
-  (`list_repositories`, `search_symbols`). It references `Sextant.Core`, `Sextant.Store`, `Sextant.Indexer`
+  on-disk volume management, caller identity, repository grants, and the service-only MCP tool
+  `list_repositories`. It references `Sextant.Core`, `Sextant.Store`, `Sextant.Indexer`
   and `Sextant.Mcp`.
 - **`Sextant.Service.Host`** — the ASP.NET Core composition root: the HTTP surface, auth middleware, and
   MCP transport. It references only `Sextant.Service` (and reaches `Sextant.Mcp` through it). The CLI's
@@ -89,9 +89,7 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_CALLER_APPS` | Optional comma-separated allow-list on the signed `app` claim (exact, case-sensitive match). ProcessStack fills `app` with the calling application's **id** (a ULID such as `01M389V5MBGQKSF18HC2EGC3FY`; see [Production deployment checklist](#production-deployment-checklist-gateways) for how to find it), not its slug or name, so list ids here. A slug makes every assertion-bearing call fail with `caller_not_allowed`, while health, discovery and connection tests still succeed | none (any app) |
 | `SEXTANT_SERVICE_MAX_GRANTS_PER_PRINCIPAL` | Most repository grants one user caller may hold in a tenant (see [Repository grants](#repository-grants-and-visibility-svc-4)); creating one more is `409 grant_limit`. The tenant-wide `'*'` grants are not counted. A missing or non-positive value uses the default | `200` |
 | `SEXTANT_SERVICE_MAX_GRANTS_PER_TENANT` | Most repository grant rows a tenant may hold, tenant-wide grants included; creating one more is `409 grant_limit` | `5000` |
-| `SEXTANT_SERVICE_SEARCH_MAX_WIDTH` | Most snapshots one [`search_symbols`](#search_symbols-svc-f) call reads (round-robin over the tracked ones); the rest are listed in `truncated` and searched on later pages. Values above `100` are clamped to `100` (the most snapshots a search tracks at once, which keeps a cursor within 16 KiB); a missing or non-positive value uses the default | `50` |
-| `SEXTANT_SERVICE_SEARCH_MAX_HITS` | Most symbols one [`search_symbols`](#search_symbols-svc-f) call returns in all; the snapshots it reads share it evenly (each still gets at least one row, so the round-robin is unchanged), and what a snapshot did not return is searched on its next turn. Clamped to `100`–`5000`; a missing or non-positive value uses the default | `500` |
-| `SEXTANT_SERVICE_MAX_RESPONSE_CHARS` | Character budget of one `/mcp` tool result, measured on the text the caller receives. A paged tool cuts its page at the last row that fits and returns `meta.next_cursor` with `meta.page_truncated_by: "size"`; an unpaged one keeps the leading rows and says to narrow the query (see [mcp-tools.md](mcp-tools.md#response-size-budget)). At least `1000`; a missing or non-positive value uses the default. `search_symbols` applies it too, after its `SEARCH_MAX_HITS` cap | `20000` |
+| `SEXTANT_SERVICE_MAX_RESPONSE_CHARS` | Character budget of one `/mcp` tool result, measured on the text the caller receives. A paged tool cuts its page at the last row that fits and returns `meta.next_cursor` with `meta.page_truncated_by: "size"`; an unpaged one keeps the leading rows and says to narrow the query (see [mcp-tools.md](mcp-tools.md#response-size-budget)). At least `1000`; a missing or non-positive value uses the default. | `20000` |
 | `SEXTANT_SERVICE_BIND_ADDRESS` | Network interface the HTTP surface binds to | `localhost` |
 | `SEXTANT_SERVICE_CONTROL_PORT` | HTTP port | `3011` |
 | `SEXTANT_SERVICE_QUERY_PORT` | Optional dedicated query port (shares the control port when unset) | none (shared) |
@@ -277,8 +275,8 @@ says why, and every surface carries the `coverage` block:
   is seen on the next fetch. Multi-peer source affinity (binding a resumed cursor, or an overlay's
   recorded base coverage, to the peer that produced it) is tracked in #122.
 - MCP `meta.snapshot.completeness` is `partial` and `meta.snapshot.coverage` is set (on the service's
-  `/mcp` the lean `meta.snapshot.coverage` is the string `partial`, plus a `warning`; the full block is in
-  `get_index_status` `index.snapshot`); `get_index_status`
+  `/mcp` the lean `meta.snapshot.coverage` is the string `partial`, plus a short count-based `warning`; the
+  full block is in `/control/resolve` and in a local server's `get_index_status` `index.snapshot`); `get_index_status`
   reports `index.coverage` (an overlay reports its committed base's coverage; a baseless remote-base
   overlay records the peer's probed base coverage on its own row at publish, so a local hit that never
   contacts the peer still reports a partial remote base as partial).
@@ -618,7 +616,7 @@ silent:
 
 - `GET /control/status/{jobId}` lists the `sdk_pin_overridden` diagnostic.
 - The snapshot's durable `coverage` block (in ensure/status/resolve, query pages, local MCP
-  `meta.snapshot.coverage`, and `get_index_status` `index.snapshot.coverage` on the service's `/mcp`) carries
+  `meta.snapshot.coverage`, and a local server's `get_index_status` `index.snapshot.coverage`) carries
   `sdk_pin_overrides: [{ global_json_path, requested_version, roll_forward, resolved_sdk_version, installed_sdks }]`.
 - The ensure audit row's `detail` gains a suffix, e.g. `job_42;sdk_pin_overridden`. The suffixes are
   `;sdk_resolution_failed` and `;sdk_pin_restore_failed` for the other two outcomes.
@@ -815,12 +813,12 @@ per call through two reserved arguments. The service adds them in MCP request fi
 
 - **`tools/list`** advertises two string arguments, `repository` and `branch`, on every
   repository-scoped remote tool (every tool on the remote allowlist except `list_repositories`, which reads no
-  index, and `search_symbols`, which declares its own `repository`/`branch` narrowing arguments). The
+  index). The
   `repository` description says "Optional" only when omitting it can read something: with
   `REQUIRE_REPOSITORY_SELECTION` on it says "Required", and with delegate tokens configured it states the one case
   in which a verified caller may omit it (implicit selection, below). A tool that already declares an
-  argument of the same name keeps its own: `find_cross_repository_usages` and `find_submodule_consumers`
-  keep their consumer-filter `branch`, so they get only `repository`.
+  argument of the same name keeps its own and is advertised only the other one (no remote tool does
+  today).
 - **`tools/call`** removes the reserved arguments before the tool binds its own, so a tool never sees them.
   `repository` accepts `https://{host}/{owner}/{repo}[.git]`, `{host}/{owner}/{repo}`, or `{owner}/{repo}`
   when `REPOSITORY_HOSTS` lists exactly one host besides `*`. It must pass the same URL policy as
@@ -831,13 +829,6 @@ per call through two reserved arguments. The service adds them in MCP request fi
   same), the call fails with the tool error `selector_conflict`. A reserved argument that is not a string, or
   a repository the URL policy refuses, fails with `invalid_selector` (the message carries only the policy's
   reason code, never the value). A `branch` argument works with a header-selected repository.
-- **Cross-repository tools:** when a selection is required and the call names no repository, the two
-  cross-repository tools default the selection to their own `provider_repository_url`. The gate then pins
-  the provider's default-branch snapshot, so it serves a provider that has one (for example one also ensured
-  directly). A provider-only repository (indexed only as a submodule of its consumers) has no selectable
-  snapshot, so such a call gets the uniform not-found. Name a consumer repository you can read in
-  `repository` instead. With the requirement off the default does not apply, and these tools keep the
-  unselected read.
 
 The filter errors are MCP tool errors (`isError: true`) whose text is the usual JSON error envelope
 (`meta.error.code`). The selection of each call is kept in the request's `HttpContext.Items`
@@ -847,11 +838,25 @@ The filter errors are MCP tool errors (`isError: true`) whose text is the usual 
 
 The remote tools answer an agent, so every response is shaped to fit its context:
 
+- **Eight tools.** `/mcp` lists only the tools agents call (`ServiceApp.RemoteQueryTools`, S12): `find_symbol`,
+  `find_references`, `get_call_hierarchy`, `get_implementors`, `get_type_hierarchy`, `get_type_members`,
+  `get_file_symbols` and `list_repositories`. The other index tools (`get_index_status`, `semantic_search`,
+  `get_api_surface`, …) stay on the local stdio server only, and nothing the remote surface sends names them:
+  descriptions, the `initialize` instructions, warnings, errors and size-cut messages point only at the eight.
+  `project_id`, `include_projects` and `project:` scopes take the `project_id` that `find_symbol`,
+  `get_file_symbols` and `get_type_members` print (`in_project_id` on a `find_references` row).
+  `RemoteToolSurfaceGuardTests` pins the list and the texts through the real host, and scans every string
+  constant and literal on the remote path. A tool added later is never exposed by default. `RemoteQueryTools`
+  is the one list: the selection filter and every test of the surface read it, so adding or dropping a remote
+  tool is a one-line change there (plus this list and [MCP tools](mcp-tools.md)). The guard already holds calls
+  for the measured candidates (`get_type_dependents`, `semantic_search`, `find_by_attribute`,
+  `find_unreferenced`), which run only while the tool is listed.
 - **Paging.** Every tool that can return an unbounded list takes `limit` (default 50, max 200) and `cursor`,
   and reports `meta.total` and `meta.next_cursor` (see [Paged results](mcp-tools.md#paged-results)). A
   truncated first page leads with a `summary` (counts per project, file or kind) before `results`. A cursor
   is bound to the tool, its query arguments and the served snapshot (so its repository and branch): reused
-  anywhere else, or after the branch has moved, it fails with `meta.error.code = invalid_cursor`.
+  anywhere else, or after the branch has moved, it fails with `meta.error.code = invalid_cursor`. `limit` and
+  `include_source` change no row, so they are not bound.
 - **Paths.** Every path in a response is repository-relative (`src/App/Foo.cs`); the worker's checkout
   directory never appears (#145). A path outside every checkout (a package's source file) is reduced to its file
   name, including where it keys a summary count. Path inputs (`file_path`,
@@ -862,13 +867,16 @@ The remote tools answer an agent, so every response is shaped to fit its context
 - **Lean `meta.snapshot`.** Each response carries only `{repository, branch, commit, coverage, warning?}`
   (the 12-character commit; `warning` only when the answer may be incomplete: partial coverage, an incompatible
   indexer, or a dirty working tree), plus `repository_selection: "implicit"` when the caller named no repository
-  and the service read its one visible repository. A tool error carries the same lean block. `get_index_status`
-  reports the full provenance in `index.snapshot`. A partial-coverage warning names what is missing: it is
-  `Partial index: ` + the recorded coverage reasons (for example `Code in 1 project(s) did not fully compile on
-  the indexer, … (src/App/App.csproj: 412 unbound name(s)). …`), cut
-  at a word boundary past 600 characters, + ` Call get_index_status for details.` A partial record with no
-  reasons keeps the generic caution. `coverage.notes` (stray project files, restore problems) never produce a
-  warning.
+  and the service read its one visible repository. A tool error carries the same lean block. The coverage
+  record is in `/control/resolve`, and the full provenance in a local server's `get_index_status`
+  `index.snapshot`. A
+  partial-coverage warning counts what is missing and names no project or tool, in at most 160 characters
+  (`RemoteResponsePresenter.MaxPartialWarningChars`): `Partial index: ` + counted gaps (`N of T projects did
+  not load`/`did not compile`/`did not load or compile`, `U of D submodules were not checked out`, `S configured
+  solution(s) could not be used`, `E part(s) of the checkout could not be scanned`; a gap that does not fit is
+  folded into `, and other gaps`) + `, so results may be incomplete.` A partial record that counts no gap gets
+  `Partial index: some projects or submodules were not indexed, so results may be incomplete.`
+  `coverage.notes` (stray project files, restore problems) never produce a warning.
 - **Server `instructions`.** `initialize` returns a short instruction string telling the agent to pass
   `repository` and to page with `next_cursor`. A gateway that does not forward server instructions, or a client
   that drops them (Copilot CLI keeps them only for an allowlisted server), loses only this hint: the tool
@@ -1010,93 +1018,13 @@ every visible repository, with its catalog branches plus any granted branch not 
 arguments and is exempt from the reserved `repository`/`branch` arguments. A request with no verified caller
 gets the tool error `caller_required`.
 
-### `search_symbols` (SVC-F)
+### `search_symbols` (removed in S12)
 
-`search_symbols` is a service-only MCP tool on `/mcp` (the local stdio server does not register it). It searches
-symbol names across every repository the verified caller can see under its [grants](#repository-grants-and-visibility-svc-4):
-a user caller sees its own grants plus the tenant-wide ones, and an application caller sees the tenant-wide ones only.
-A request with no verified caller (a plain query token) gets the tool error `caller_required` and reads nothing.
-
-| Argument | Type | Rule |
-|---|---|---|
-| `name_prefix` | string, **required** | Case-insensitive (ASCII) literal prefix of the symbol's name (`display_name`); `%`, `_` and `\` match themselves. Trimmed; 1–256 characters |
-| `repository` | string? | Search only this repository: `https://{host}/{owner}/{repo}`, `{host}/{owner}/{repo}` or, with one host in `REPOSITORY_HOSTS`, `{owner}/{repo}`, under the [URL policy](#repository-url-policy-svc-5). A repository the caller cannot see is the same `no_visible_repositories` error as one that does not exist |
-| `branch` | string? | Search only this branch. Visibility is repository-level, so it can name any indexed branch of a visible repository. Absent = every **granted** branch (a default-branch grant searches the default branch) |
-| `kind` | string? | Only symbols of this kind: a lowercase `SymbolKind` name such as `class`, `method` or `typeparameter` |
-| `cursor` | string? | The previous page's `next_cursor`, passed back with the same other arguments |
-| `limit` | int? | The most symbols read from each snapshot per page; default 50, clamped to 1–200. The call's total is also capped by `SEARCH_MAX_HITS` (default 500), shared by the snapshots the page reads |
-
-The schema has `additionalProperties: false`, so an unknown argument is an error. The tool is exempt from the
-[reserved selector arguments](#reserved-tool-arguments-svc-2) and ignores the `X-Sextant-Repository` header: its
-own `repository`/`branch` narrow the search, and neither can widen it beyond the caller's grants.
-
-**Result.** A text block and the same JSON as `structuredContent`:
-
-```json
-{
-  "symbols": [{"repository": "...", "branch": "main", "identity_hash": "...", "symbol_key": "...",
-               "name": "TypeA", "fully_qualified_name": "global::App.TypeA", "kind": "class",
-               "accessibility": "public", "project": "..."}],
-  "next_cursor": "...",
-  "pending": [{"repository": "...", "branch": ""}],
-  "unavailable": [{"repository": "...", "branch": "main"}],
-  "truncated": [{"repository": "...", "branch": "main"}],
-  "meta": {"queried_at": 0, "index_freshness": 0, "result_count": 1}
-}
-```
-
-- `kind` and `accessibility` are **names**, rendered as the local tools render them. (The snapshot page
-  `/query/snapshots/{identityHash}/symbols` still emits them as integers.)
-- `pending` lists granted branches with no complete snapshot yet (`branch` is `""` when the default branch is
-  not known yet). `unavailable` lists branches whose snapshot could not be read on this call; they keep their
-  place in the cursor and are retried on a later page (within the same round-robin bound). `truncated` lists
-  branches not read on this call because of `SEARCH_MAX_WIDTH`, or left out of a page cut by the response size
-  budget; they are searched on later pages.
-- Branches that share one snapshot are searched once, labeled with the first (repository, branch) in order.
-- `next_cursor` is always present, and is `null` once every snapshot is exhausted.
-
-**Paging.** Targets are deduplicated by snapshot identity hash. Up to 100 snapshots are tracked at a time, in hash
-order. Each call reads at most `SEARCH_MAX_WIDTH` of them, round-robin: a page continues in hash order after the
-last snapshot the previous page read, and once it reaches the end the next page starts a new round from the lowest
-hash. A snapshot that has not been searched yet joins, as tracked ones are exhausted, at the end of a round. So a
-snapshot with many matches never keeps the others waiting: with V visible snapshots, each tracked one is read at
-least once every ⌈min(V, 100) / `SEARCH_MAX_WIDTH`⌉ pages. Each page reads up to `limit` rows from each snapshot
-it reads, and at most `SEARCH_MAX_HITS` rows in all, shared evenly by those snapshots. It orders them by name, then
-identity hash, then row. A page can return fewer symbols than it could (with a `kind` filter, even none) and still
-have a `next_cursor`: keep paging until it is `null`. While the grants and branch heads do not change,
-walking every page returns every match exactly once.
-
-**Size.** A page's text also stays under `SEXTANT_SERVICE_MAX_RESPONSE_CHARS` (20,000 by default; see
-[mcp-tools.md](mcp-tools.md#response-size-budget)). A page over it keeps, from each snapshot it read, the first
-symbols of that snapshot's own page, so the snapshot resumes at the first one left out; if one symbol from each is
-still too much, it keeps as many of the first snapshots of its turn as fit, and the others with matches are listed
-in `truncated` and read first on the next page (a snapshot with no match is never held back). Such a page has `meta.page_truncated_by: "size"` and a top-level `message`. A size cut can
-make a round take more pages than the bound above (each page then returns fewer snapshots than
-`SEARCH_MAX_WIDTH`), but the round-robin order is kept, so no snapshot is starved. The `pending`, `unavailable`
-and `truncated` lists and the cursor are never cut, and at least one symbol is always returned.
-
-The cursor is opaque
-base64url JSON of at most 16 KiB. It carries each snapshot's position, and a digest binds it to the tenant, the
-caller and the query arguments other than `limit`. A tampered or oversized cursor, or one issued to another caller,
-tenant or query, gets `invalid_cursor`, and so does a cursor from a Sextant before issue #196 (restart the search).
-The digest is not an authorization control. Every call reads the caller's
-grants again, so a revoked grant stops being searched on the next page, and a cursor naming a snapshot the caller
-cannot see is treated exactly like one naming a snapshot that does not exist.
-
-**Cost.** One call is bounded, whatever the size of the snapshots (issue #196):
-- Each snapshot's page seeks the prefix's range in a name index (`ix_symbols_project_name_nocase`, migration
-  `025`), so a prefix that matches nothing costs a few index lookups per snapshot, never a scan.
-- The call returns at most `SEARCH_MAX_HITS` symbols.
-- With a `kind` filter, it examines at most 8192 rows in all.
-- The caller's repositories are found by one indexed query over the caller's own grants.
-- If the client disconnects or cancels the request, the search stops: before its next snapshot, at the next row it
-  reads, or by interrupting the SQLite statement that is running. The read connection is released cleanly.
-
-**Errors** (all tool errors): `caller_required`, `invalid_arguments` (a missing or blank `name_prefix`, a wrong
-type, an unknown argument or `kind`), `invalid_selector` (a `repository` the URL policy refuses),
-`invalid_cursor`, and `no_visible_repositories` (nothing to search: no grants, or an explicit `repository` or
-`branch` that matches nothing visible). A failure to read the grants fails the call; it is never presented as
-`no_visible_repositories` or as an unscoped search.
+The service-only `search_symbols` tool (SVC-F: a grant-scoped name-prefix search across every visible
+repository) is gone, with its `SEXTANT_SERVICE_SEARCH_MAX_WIDTH`/`SEARCH_MAX_HITS` settings (now ignored).
+To find a declaration, call `find_symbol` (`fuzzy: true` for a full-text search) in the repository you name;
+`list_repositories` still lists what a caller can read. Migration `025`'s name index stays, because the symbol
+resolver seeks it too; its repository-URL index is now unused but kept (dropping it would need a migration).
 
 ### User callers on the control plane (issue #193)
 
@@ -1890,7 +1818,8 @@ branch-head advance on the ensure path (Phase 14, issue #84); `022_snapshot_cove
 per-snapshot `snapshot_coverage` record (issue #119); `023_partial_occurrence_source_index.sql` rebuilds
 `ix_occ_source` as a partial index over call edges only (issue #160); `024_repository_grants.sql` adds the
 `repository_grants` table behind per-caller visibility (SVC-4); `025_symbol_name_prefix_index.sql` adds the
-`NOCASE` name and repository-URL indexes that bound `search_symbols` (issue #196); `026_symbol_declaration.sql`
+`NOCASE` name and repository-URL indexes that bound `search_symbols` (issue #196; the tool was removed in S12,
+and the resolver still uses the name index); `026_symbol_declaration.sql`
 adds `symbols.declaration`, the member declaration the MCP `signature` shows. All are additive/forward-only. See
 [`schema.md`](schema.md) for the table definitions. `LatestSchemaVersion` auto-derives from the highest
 migration and is **26**. Snapshot identities fold `SnapshotSchemaVersion` instead, which skips identity-neutral
@@ -1906,8 +1835,7 @@ migration and is **26**. Snapshot identities fold `SnapshotSchemaVersion` instea
 > `/control/resolve`'s `branch` and `commit_sha`, and that commit as `expected_head_commit`).
 > Deploy at low traffic, watch CPU, disk and the ensure queue while the re-index runs, and check that queries
 > keep answering meanwhile. Migration `025` is identity-neutral, so upgrading from 24 to 25 re-indexes
-> nothing. (A `search_symbols` cursor issued by a build before SX-7b answers `invalid_cursor`, because the
-> cursor is now v2; the client re-queries.)
+> nothing.
 
 > **One-time full re-index when upgrading to schema 26.** Migration `026` stores a new column, and
 > `AnalyzerVersion` is `5`, so `SnapshotSchemaVersion` moves from 24 to 26 and every snapshot identity changes
@@ -1934,7 +1862,7 @@ catalog, and a `FakeSnapshotWorker`. The suite maps to the acceptance criteria:
 | 1 — idempotent ensure | `SnapshotServiceTests` (concurrent ensures attach to one job; worker runs once); `EnsureCallerDisconnectTests` / `EnsureCallerDisconnectHttpTests` (#148: caller disconnect never cancels production, re-ensure attaches to the in-flight run, `wait=false`, prompt status/resolve during a run, shutdown requeues); `QueuedControlWriteHttpTests` / `JobIdReservationsTests` (#158: `wait=false` and retire answer `202` within the bound while a production holds the writer, reserved job ids resolve and are never reused, apply-time retire guards, submission order, coalescing, shutdown drain) |
 | 2 — restart recovery | `SnapshotServiceTests` (catalog survives restart; orphaned `running` jobs reconciled) |
 | 3 — scratch cannot delete published | `ServicePathsTests` (scratch/persistent separation + `ReleaseScratch` refusal) |
-| 4 — query via HTTP MCP without ProcessStack | `ServiceHttpTests` (`/mcp` mapped + auth-gated; `/query` paging); `RepositorySelectionHttpTests` (the `X-Sextant-Repository` header without a read policy, the legacy no-header unscoped read, `repository_required`); `ToolArgumentSelectionHttpTests` + `ToolSelectionFiltersTests` (SVC-2: the reserved `repository`/`branch` arguments listed on repository-scoped tools and stripped on call, argument-over-header precedence, `selector_conflict`/`invalid_selector`, branch pinning, `branch` without a repository, the cross-repository provider default, the unknown-branch uniform not-found); `McpClientCompatibilityTests` (an SDK client selecting through the `repository` argument); `QueryToolInputResolutionHttpTests` (issues #149/#163: symbol arguments without `global::`, `Type.Member`, parameter lists and documentation IDs; exact type lookup and `kind`; ambiguity and not-found as tool errors with candidates; `get_type_members`; implicit selection naming its repository and `repository_required` listing the caller's repositories); `AgentSizedOutputHttpTests` (#145: paging, truncation summary, cursor binding, lean `meta.snapshot`, repo-relative paths in and out, server `instructions`, the `tools/list` size pin); `SubmoduleCheckoutIntegrationTests.RemoteMcp_RepositoryRelativePaths_*` (#145 on a real worker index: repo-relative inputs over `/mcp`, a submodule file included) |
+| 4 — query via HTTP MCP without ProcessStack | `ServiceHttpTests` (`/mcp` mapped + auth-gated; `/query` paging); `RepositorySelectionHttpTests` (the `X-Sextant-Repository` header without a read policy, the legacy no-header unscoped read, `repository_required`); `ToolArgumentSelectionHttpTests` + `ToolSelectionFiltersTests` (SVC-2: the reserved `repository`/`branch` arguments listed on repository-scoped tools and stripped on call, argument-over-header precedence, `selector_conflict`/`invalid_selector`, branch pinning, `branch` without a repository, the unknown-branch uniform not-found); `McpClientCompatibilityTests` (an SDK client selecting through the `repository` argument); `QueryToolInputResolutionHttpTests` (issues #149/#163: symbol arguments without `global::`, `Type.Member`, parameter lists and documentation IDs; exact type lookup and `kind`; ambiguity and not-found as tool errors with candidates; `get_type_members`; implicit selection naming its repository and `repository_required` listing the caller's repositories); `AgentSizedOutputHttpTests` (#145: paging, truncation summary, cursor binding, lean `meta.snapshot`, repo-relative paths in and out, server `instructions`, the `tools/list` size pin); `RemoteToolSurfaceGuardTests` (S12: exactly the agent tools of `RemoteQueryTools`, and no remote text naming another tool); `SubmoduleCheckoutIntegrationTests.RemoteMcp_RepositoryRelativePaths_*` (#145 on a real worker index: repo-relative inputs over `/mcp`, a submodule file included) |
 | 5 — structured per-project diagnostics | `SnapshotServiceTests` (partial/failed/unsupported diagnostics) |
 | 6 — local-only remains functional | `ArchitectureBoundaryTests` (core assemblies never reference the service; local query without a service) |
 

@@ -483,30 +483,6 @@ public class GrantHttpTests
         Assert.AreEqual(HttpStatusCode.NotFound, revoked.StatusCode);
     }
 
-    [TestMethod]
-    public async Task CrossRepositoryTool_DropsUngrantedConsumers_AndAnUngrantedProviderIsNotFound()
-    {
-        await using var host = await Harness.StartAsync(seed: db =>
-        {
-            var provider = new SnapshotStore(db.GetConnection()).GetSelectedSnapshotIdForRepository(Widgets)!.Value;
-            GrantServiceTests.SeedConsumer(db, Gadgets, "commit-g1", provider);
-            GrantServiceTests.SeedConsumer(db, Gizmos, "commit-z1", provider);
-        });
-        var args = $$"""{"provider_repository_url":"{{Widgets}}"}""";
-        await PutSelfAsync(host, host.UserAssertion(sub: "user-1"), Widgets);
-        await PutSelfAsync(host, host.UserAssertion(sub: "user-1"), Gadgets);
-        await PutSelfAsync(host, host.UserAssertion(sub: "user-2"), Gadgets);
-        await PutSelfAsync(host, host.UserAssertion(sub: "user-2"), Gizmos);
-
-        var granted = await host.CallAsync("find_submodule_consumers", args, DelegateToken, host.UserAssertion(sub: "user-1"));
-        var noProvider = await host.CallAsync("find_submodule_consumers", args, DelegateToken, host.UserAssertion(sub: "user-2"));
-
-        CollectionAssert.AreEqual(new[] { Gadgets },
-            granted.Body.GetProperty("results").EnumerateArray().Select(r => r.GetProperty("consumer_repository").GetString()).ToList(),
-            $"an ungranted consumer is dropped: {granted.Body}");
-        Assert.AreEqual(NotFound, WithoutTimestamp(noProvider.Body), "a caller who cannot read the provider learns nothing about it");
-    }
-
     // ==== implicit selection ========================================================================
 
     [TestMethod]
@@ -733,98 +709,6 @@ public class GrantHttpTests
     }
 
     [TestMethod]
-    public async Task FindCrossRepositoryUsages_UngrantedConsumersAreDropped()
-    {
-        await using var host = await Harness.StartAsync(seed: SeedUsages);
-        var args = $$"""{"provider_repository_url":"{{Widgets}}","symbol_fqn":"global::App.Type0"}""";
-        await PutSelfAsync(host, host.UserAssertion(sub: "user-1"), Widgets);
-        await PutSelfAsync(host, host.UserAssertion(sub: "user-1"), Gadgets);
-        foreach (var repository in new[] { Widgets, Gadgets, Gizmos })
-        {
-            using var tenant = await host.ControlAsync(HttpMethod.Put, TenantPath, ControlToken, AppAssertion(host), Body(repository));
-            Assert.AreEqual(HttpStatusCode.OK, tenant.StatusCode);
-        }
-
-        var everything = await host.CallAsync("find_cross_repository_usages", args, DelegateToken, AppAssertion(host));
-        var otherTenant = await host.CallAsync("find_cross_repository_usages", args, DelegateToken, host.UserAssertion(tenant: "tenant-b", sub: "user-1"));
-        using (var revoke = await host.ControlAsync(HttpMethod.Delete, TenantPath + "?repository=https://github.com/acme/gizmos", ControlToken, AppAssertion(host)))
-            Assert.AreEqual(HttpStatusCode.OK, revoke.StatusCode);
-        var ownGrants = await host.CallAsync("find_cross_repository_usages", args, DelegateToken, host.UserAssertion(sub: "user-1"));
-
-        CollectionAssert.AreEquivalent(new[] { Gadgets, Gizmos }, Consumers(everything.Body), $"both consumers use the symbol: {everything.Body}");
-        Assert.AreEqual(NotFound, WithoutTimestamp(otherTenant.Body), "another tenant's grants open nothing");
-        CollectionAssert.AreEquivalent(new[] { Gadgets }, Consumers(ownGrants.Body),
-            $"an ungranted consumer contributes no row: {ownGrants.Body}");
-        Assert.IsFalse(ownGrants.Body.ToString().Contains("gizmos", StringComparison.OrdinalIgnoreCase));
-
-        static List<string?> Consumers(JsonElement body) =>
-            body.GetProperty("results").EnumerateArray().Select(r => r.GetProperty("consumer_repository").GetString()).ToList();
-    }
-
-    [TestMethod]
-    public async Task FindCrossRepositoryUsages_FqnWithoutTheGlobalAlias_Resolves()
-    {
-        // #149: the provider symbol is named as an agent types it, without Roslyn's global:: alias.
-        await using var host = await Harness.StartAsync(seed: SeedUsages);
-        foreach (var repository in new[] { Widgets, Gadgets, Gizmos })
-            await PutSelfAsync(host, host.UserAssertion(), repository);
-
-        var call = await host.CallAsync("find_cross_repository_usages",
-            $$"""{"provider_repository_url":"{{Widgets}}","symbol_fqn":"App.Type0"}""", DelegateToken, host.UserAssertion());
-        var unknown = await host.CallAsync("find_cross_repository_usages",
-            $$"""{"provider_repository_url":"{{Widgets}}","symbol_fqn":"App.Type9"}""", DelegateToken, host.UserAssertion());
-
-        Assert.IsFalse(call.IsError, call.Body.ToString());
-        CollectionAssert.AreEquivalent(new[] { Gadgets, Gizmos },
-            call.Body.GetProperty("results").EnumerateArray().Select(r => r.GetProperty("consumer_repository").GetString()).ToList(),
-            call.Body.ToString());
-        Assert.IsTrue(unknown.IsError, $"a provider symbol that does not exist is a tool error, not an empty answer: {unknown.Body}");
-        Assert.AreEqual("symbol_not_found", ErrorCode(unknown.Body));
-    }
-
-    [TestMethod]
-    public async Task FindCrossRepositoryUsages_Cursor_IsInvalidOnceAConsumerHeadMoves()
-    {
-        // The rows come from each consumer's own branch head, not the selected snapshot: a cursor taken before a
-        // consumer moved must fail instead of skipping or repeating that consumer's rows.
-        await using var host = await Harness.StartAsync(seed: SeedUsages);
-        foreach (var repository in new[] { Widgets, Gadgets, Gizmos })
-            await PutSelfAsync(host, host.UserAssertion(), repository);
-        var args = $$"""{"provider_repository_url":"{{Widgets}}","symbol_fqn":"App.Type0","limit":1}""";
-
-        var first = await host.CallAsync("find_cross_repository_usages", args, DelegateToken, host.UserAssertion());
-        Assert.IsFalse(first.IsError, first.Body.ToString());
-        Assert.AreEqual(2, first.Body.GetProperty("meta").GetProperty("total").GetInt32(), first.Body.ToString());
-        var cursor = first.Body.GetProperty("meta").GetProperty("next_cursor").GetString();
-        var next = $$"""{"provider_repository_url":"{{Widgets}}","symbol_fqn":"App.Type0","limit":1,"cursor":"{{cursor}}"}""";
-
-        var unmoved = await host.CallAsync("find_cross_repository_usages", next, DelegateToken, host.UserAssertion());
-        host.ExecuteOnCatalog("UPDATE commits SET commit_sha = 'commit-g2' WHERE commit_sha = 'commit-g1';");
-        var moved = await host.CallAsync("find_cross_repository_usages", next, DelegateToken, host.UserAssertion());
-
-        Assert.IsFalse(unmoved.IsError, unmoved.Body.ToString());
-        Assert.AreEqual(1, unmoved.Body.GetProperty("results").GetArrayLength(), unmoved.Body.ToString());
-        Assert.IsTrue(moved.IsError, moved.Body.ToString());
-        Assert.AreEqual(Paging.InvalidCursorCode, ErrorCode(moved.Body), moved.Body.ToString());
-    }
-
-    [TestMethod]
-    public async Task FindCrossRepositoryUsages_UngrantedProvider_IsTheUniformNotFound_LikeAnAbsentOne()
-    {
-        await using var host = await Harness.StartAsync(seed: SeedUsages);
-        await PutSelfAsync(host, host.UserAssertion(), Gadgets);
-        await PutSelfAsync(host, host.UserAssertion(), Gizmos);
-
-        var ungranted = await host.CallAsync("find_cross_repository_usages",
-            $$"""{"provider_repository_url":"{{Widgets}}","symbol_fqn":"global::App.Type0"}""", DelegateToken, host.UserAssertion());
-        var absent = await host.CallAsync("find_cross_repository_usages",
-            """{"provider_repository_url":"https://github.com/acme/absent","symbol_fqn":"global::App.Type0"}""", DelegateToken, host.UserAssertion());
-
-        Assert.AreEqual(NotFound, WithoutTimestamp(ungranted.Body), "a caller who cannot read the provider learns nothing about it");
-        Assert.AreEqual(WithoutTimestamp(absent.Body), WithoutTimestamp(ungranted.Body));
-    }
-
-    [TestMethod]
     public async Task TenantGrant_Revoked_TakesEffectOnTheNextCall()
     {
         await using var host = await Harness.StartAsync();
@@ -877,19 +761,19 @@ public class GrantHttpTests
     }
 
     [TestMethod]
-    public async Task GetIndexStatus_Ungranted_IsByteIdenticalToAbsent()
+    public async Task TypeMembers_Ungranted_IsByteIdenticalToAbsent()
     {
         await using var host = await Harness.StartAsync(seed: db => GrantServiceTests.PublishOnBranch(db, Gadgets, "commit-g1", "main", isDefault: true));
         await PutSelfAsync(host, host.UserAssertion(), Widgets);
 
-        var granted = await host.CallAsync("get_index_status", """{"repository":"acme/widgets"}""", DelegateToken, host.UserAssertion());
-        var ungranted = await host.CallAsync("get_index_status", """{"repository":"acme/gadgets"}""", DelegateToken, host.UserAssertion());
-        var absent = await host.CallAsync("get_index_status", """{"repository":"acme/absent"}""", DelegateToken, host.UserAssertion());
+        var granted = await host.CallAsync("get_type_members", """{"symbol_fqn":"global::App.Type0","repository":"acme/widgets"}""", DelegateToken, host.UserAssertion());
+        var ungranted = await host.CallAsync("get_type_members", """{"symbol_fqn":"global::App.Type0","repository":"acme/gadgets"}""", DelegateToken, host.UserAssertion());
+        var absent = await host.CallAsync("get_type_members", """{"symbol_fqn":"global::App.Type0","repository":"acme/absent"}""", DelegateToken, host.UserAssertion());
 
         Assert.AreNotEqual(NotFound, WithoutTimestamp(granted.Body), granted.Body.ToString());
         Assert.AreEqual(NotFound, WithoutTimestamp(ungranted.Body));
         Assert.AreEqual(WithoutTimestamp(absent.Body), WithoutTimestamp(ungranted.Body),
-            "an ungranted, published repository's status reads exactly like an absent one");
+            "an ungranted, published repository reads exactly like an absent one");
         Assert.AreEqual(absent.IsError, ungranted.IsError);
     }
 
@@ -1023,46 +907,6 @@ public class GrantHttpTests
     }
 
     // ==== helpers ===================================================================================
-
-    // Gadgets and Gizmos pin Widgets (the provider) and each use its symbol global::App.Type0 once.
-    private static void SeedUsages(IndexDatabase db)
-    {
-        var provider = new SnapshotStore(db.GetConnection()).GetSelectedSnapshotIdForRepository(Widgets)!.Value;
-        foreach (var (consumer, commit) in new[] { (Gadgets, "commit-g1"), (Gizmos, "commit-z1") })
-        {
-            GrantServiceTests.SeedConsumer(db, consumer, commit, provider);
-            var conn = db.GetConnection();
-            var consumerRepository = new SnapshotStore(conn).GetRepositoryId(consumer)!.Value;
-            var consumerProject = Scalar(conn, """
-                SELECT d.consumer_project_id FROM snapshot_dependencies d
-                JOIN snapshots s ON s.id = d.consumer_snapshot_id WHERE s.repository_id = @a;
-                """, consumerRepository);
-            var target = Scalar(conn, """
-                SELECT s.id FROM symbols s JOIN snapshot_projects sp ON sp.project_id = s.project_id
-                WHERE sp.snapshot_id = @a AND s.fully_qualified_name = 'global::App.Type0';
-                """, provider);
-            var file = Scalar(conn, "INSERT INTO files (project_id, repo_relative_path) VALUES (@a, 'src/App/Use.cs') RETURNING id;", consumerProject);
-            var fileVersion = Scalar(conn,
-                "INSERT INTO file_versions (file_id, content_hash, last_indexed_at) VALUES (@a, randomblob(32), 1) RETURNING id;", file);
-            using var occurrence = conn.CreateCommand();
-            occurrence.CommandText = """
-                INSERT INTO occurrences (in_project_id, target_symbol_id, source_symbol_id, file_version_id, line, col, kind, flags)
-                VALUES (@project, @target, NULL, @fv, 7, 3, 0, 0);
-                """;
-            occurrence.Parameters.AddWithValue("@project", consumerProject);
-            occurrence.Parameters.AddWithValue("@target", target);
-            occurrence.Parameters.AddWithValue("@fv", fileVersion);
-            occurrence.ExecuteNonQuery();
-        }
-
-        static long Scalar(Microsoft.Data.Sqlite.SqliteConnection conn, string sql, long a)
-        {
-            using var cmd = conn.CreateCommand();
-            cmd.CommandText = sql;
-            cmd.Parameters.AddWithValue("@a", a);
-            return (long)cmd.ExecuteScalar()!;
-        }
-    }
 
     // The status of a request whose handler may throw (the test server then surfaces the failure to the client).
     private static async Task<HttpStatusCode?> StatusOrNullAsync(Func<Task<HttpResponseMessage>> send)
