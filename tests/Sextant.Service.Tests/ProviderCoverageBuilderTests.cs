@@ -94,21 +94,32 @@ public class ProviderCoverageBuilderTests
         Assert.AreEqual(SnapshotCoverageVerdict.Partial, coverage.Verdict);
         Assert.AreEqual(1, coverage.ProjectsSkipped);
         StringAssert.Contains(coverage.Reasons.Single(), "src/Mix/Mix.csproj");
+        Assert.IsNull(coverage.TimeBudget, "a project that failed to load is not a time-budget gap");
     }
 
     [TestMethod]
     public void ProviderProjectTheLoadDeferred_IsPartial_NamedRelativeToTheProvider()
     {
-        // Issue #245: the parent's load deadline passed before the provider project was opened.
-        var resolution = Resolution([At("App.slnx"), At("libs/mix/Mix.slnx")]);
+        // Issue #245: the parent's load deadline passed before the provider project was opened. The provider's
+        // Tools.slnx declares only a project that was loaded, so it is not unfinished.
+        var resolution = Resolution([At("App.slnx"), At("libs/mix/Mix.slnx"), At("libs/mix/Tools.slnx")]);
         var mix = At("libs/mix/src/Mix/Mix.csproj");
-        var load = Load([At("src/App/App.csproj"), mix], loaded: [At("src/App/App.csproj")]) with
+        var tools = At("libs/mix/src/Tools/Tools.csproj");
+        var load = Load([At("src/App/App.csproj"), mix, tools], loaded: [At("src/App/App.csproj"), tools]) with
         {
-            DeferredProjects = [mix]
+            DeferredProjects = [mix],
+            Membership =
+            [
+                new SolutionMembership(At("App.slnx"), [At("src/App/App.csproj"), mix]),
+                new SolutionMembership(At("libs/mix/Mix.slnx"), [mix]),
+                new SolutionMembership(At("libs/mix/Tools.slnx"), [tools])
+            ]
         };
-        var inventory = Inventory([At("src/App/App.csproj"), mix], [Mix], solutions: [At("libs/mix/Mix.slnx")]);
+        var inventory = Inventory([At("src/App/App.csproj"), mix, tools], [Mix],
+            solutions: [At("libs/mix/Mix.slnx"), At("libs/mix/Tools.slnx")]);
 
-        var coverage = SnapshotCoverageBuilder.BuildProviders(CheckoutDir, resolution, load, inventory)["libs/mix"];
+        var coverage = SnapshotCoverageBuilder.BuildProviders(
+            CheckoutDir, resolution, load, inventory, timeBudget: TimeSpan.FromMinutes(30))["libs/mix"];
 
         Assert.AreEqual(SnapshotCoverageVerdict.Partial, coverage.Verdict);
         Assert.AreEqual(0, coverage.ProjectsSkipped, "a deferred project is not a load failure");
@@ -116,6 +127,19 @@ public class ProviderCoverageBuilderTests
         var reason = coverage.Reasons.Single();
         StringAssert.Contains(reason, "time budget ran out (src/Mix/Mix.csproj)");
         Assert.IsFalse(reason.Contains("libs/mix", StringComparison.Ordinal), "the parent's layout never leaks");
+
+        // Counted like the parent's gap, so the count-based lean warning (#242) does not leave it out.
+        var budget = coverage.TimeBudget;
+        Assert.IsNotNull(budget, "the provider records the projects the load left out");
+        Assert.AreEqual(1800, budget.BudgetSeconds);
+        Assert.AreEqual(1, budget.ProjectsNotLoaded);
+        Assert.AreEqual(0, budget.ProjectsNotIndexed, "provider projects are never left out of the later steps");
+        Assert.AreEqual(0, budget.ProjectsNotFullyExtracted);
+        CollectionAssert.AreEqual(new[] { "Mix.slnx" }, budget.UnfinishedSolutions.ToList(),
+            "only the provider's own unfinished solution, relative to the provider; the parent's App.slnx is not its solution");
+        Assert.AreEqual(
+            "Partial index: the time budget left 1 of 2 projects not fully indexed, so results may be incomplete.",
+            Sextant.Mcp.RemoteResponsePresenter.PartialWarningFor(coverage));
     }
 
     [TestMethod]
