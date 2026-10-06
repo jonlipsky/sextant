@@ -98,8 +98,8 @@ public sealed class RetentionService
             budget.Check();
             Exec("BEGIN;");
             var (report, snapshots, commits, protections) = Classify();
-            var projects = snapshots.Sum(id => CountWhere("projects", "snapshot_id", id));
-            var apiRows = commits.Sum(commit => CountWhere("api_surface_snapshots", "git_commit", commit));
+            var projects = snapshots.Sum(id => CountRows(RetentionCount.ProjectVersions, id));
+            var apiRows = commits.Sum(commit => CountRows(RetentionCount.ApiRows, commit));
             var files = _policy.PruneSupersededSourceBlobs ? OrphanFileVersionIds(protections).Count : 0;
             return report with
             {
@@ -165,7 +165,7 @@ public sealed class RetentionService
                 cmd.CommandText = "DELETE FROM projects WHERE id IN (SELECT id FROM projects WHERE snapshot_id = @id ORDER BY id LIMIT 1);";
                 cmd.Parameters.AddWithValue("@id", id);
                 projectsDeleted = cmd.ExecuteNonQuery();
-                if (CountWhere("projects", "snapshot_id", id) == 0)
+                if (CountRows(RetentionCount.ProjectVersions, id) == 0)
                     snapshotsDeleted = DeleteEmptySnapshot(id);
             }
             // Do not remove ledger rows ahead of snapshot GC's classification.
@@ -644,10 +644,17 @@ public sealed class RetentionService
         return ids;
     }
 
-    private int CountWhere(string table, string column, object value)
+    private enum RetentionCount { ProjectVersions, ApiRows }
+
+    private int CountRows(RetentionCount count, object value)
     {
         using var cmd = _connection.CreateCommand();
-        cmd.CommandText = $"SELECT COUNT(*) FROM {table} WHERE {column} = @value;";
+        cmd.CommandText = count switch
+        {
+            RetentionCount.ProjectVersions => "SELECT COUNT(*) FROM projects WHERE snapshot_id = @value;",
+            RetentionCount.ApiRows => "SELECT COUNT(*) FROM api_surface_snapshots WHERE git_commit = @value;",
+            _ => throw new ArgumentOutOfRangeException(nameof(count))
+        };
         cmd.Parameters.AddWithValue("@value", value);
         return Convert.ToInt32(cmd.ExecuteScalar());
     }

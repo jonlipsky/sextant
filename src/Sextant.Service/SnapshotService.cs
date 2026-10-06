@@ -1860,7 +1860,7 @@ public sealed partial class SnapshotService : IDisposable
     /// Plans on an independent reader, or executes bounded, revalidated batches under the writer lease.
     /// </summary>
     public RetentionReport RunRetention(bool execute, AuditCaller principal = default)
-        => RunRetentionAsync(execute, principal).GetAwaiter().GetResult();
+        => RunRetentionAsync(execute, principal, _lifetime.Token).GetAwaiter().GetResult();
 
     /// <summary>
     /// An executed pass counts writer-queue wait against its budget and releases the gate between batches.
