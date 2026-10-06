@@ -12,7 +12,8 @@ namespace Sextant.Integration.Tests;
 /// fixture is the live incident's shape (<c>Abs ← Core ← App</c>, App references only Core) in a git checkout
 /// whose App also asks for a package no source has (a private feed the worker cannot read): the restore writes
 /// the assets files, so App's calls through Core bind exactly, and the missing package is reported as a coverage
-/// note, a per-project load issue and a job diagnostic instead of being silently ignored.
+/// note, a per-project load issue and a job diagnostic instead of being silently ignored. The resulting
+/// design-time evaluation failure makes coverage partial even though the surviving calls bind exactly.
 /// Offline: the checkout's <c>nuget.config</c> clears every source and points at an empty local folder.
 /// </summary>
 [TestClass]
@@ -70,8 +71,8 @@ public sealed class PackageRestoreWorkerIntegrationTests : IDisposable
         var result = await new LocalIndexerSnapshotWorker(db, config, new FixedCheckoutProvider(resolution))
             .ProduceAsync(request, identity, scratch, CancellationToken.None);
 
-        Assert.AreEqual(SnapshotJobStatus.Complete, result.Status,
-            "a package nothing uses is a load issue, not a binding gap: " + result.Error);
+        Assert.AreEqual(SnapshotJobStatus.Partial, result.Status,
+            "exactly bound surviving calls cannot override a failed MSBuild evaluation: " + result.Error);
         foreach (var project in new[] { "Abs", "Core", "App" })
         {
             Assert.IsTrue(File.Exists(Path.Combine(_checkout, "src", project, "obj", "project.assets.json")),
@@ -85,7 +86,20 @@ public sealed class PackageRestoreWorkerIntegrationTests : IDisposable
         Assert.IsFalse(refs.Any(r => r.IsCandidate), "and bound exactly, because App got its transitive reference");
 
         var coverage = new SnapshotCoverageStore(conn).Get(result.SnapshotId!.Value)!;
-        Assert.AreEqual(SnapshotCoverageVerdict.Complete, coverage.Verdict, string.Join(" ", coverage.Reasons));
+        Assert.AreEqual(SnapshotCoverageVerdict.Partial, coverage.Verdict, string.Join(" ", coverage.Reasons));
+        Assert.AreEqual(1, coverage.ProjectsDegraded);
+        var gap = coverage.EvaluationGaps!.Single();
+        Assert.AreEqual("src/App/App.csproj", gap.Project);
+        Assert.AreEqual($"net{Environment.Version.Major}.0", gap.TargetFramework);
+        Assert.IsTrue(gap.HasDocuments);
+        StringAssert.Contains(string.Join(" ", coverage.Reasons), "failed evaluation but exposed documents");
+        var snapshot = new SnapshotStore(conn).GetById(result.SnapshotId.Value)!;
+        Assert.AreEqual(SnapshotStatus.Complete, snapshot.Status, "partial results are still published");
+        var page = await new LocalBaseSnapshotSource(conn).FetchSymbolsAsync(
+            new SnapshotPageRequest { IdentityHash = snapshot.IdentityHash }, CancellationToken.None);
+        Assert.IsTrue(page.Published);
+        Assert.IsFalse(page.Complete, "query completeness must preserve the evaluation failure");
+        Assert.IsTrue(page.Symbols.Any(), "surviving symbols remain servable");
         Assert.AreEqual(
             $"Package restore could not find 1 package(s) ({MissingPackage}) for 1 project(s); code that uses them may not bind.",
             coverage.Notes!.Single());
@@ -97,6 +111,9 @@ public sealed class PackageRestoreWorkerIntegrationTests : IDisposable
         var diagnostic = result.Projects.First(p => p.Code == LocalIndexerSnapshotWorker.PackageRestoreIncompleteCode);
         Assert.AreEqual("src/App/App.csproj", diagnostic.ProjectPath);
         Assert.AreEqual(JobDiagnosticSeverity.Warning, diagnostic.Severity);
+        var evaluation = result.Projects.Single(p => p.Code == "project_evaluation_degraded");
+        Assert.AreEqual("src/App/App.csproj", evaluation.ProjectPath);
+        Assert.AreEqual(JobDiagnosticSeverity.Warning, evaluation.Severity);
     }
 
     // Abs <- Core <- App in a committed git checkout; App references only Core and asks for a missing package.

@@ -247,7 +247,12 @@ public sealed class SdkPinSurfaceTests
         var coverage = SnapshotCoverageBuilder.Build(CheckoutDir, Resolution(), load, new SnapshotCoverageBuilder.Inventory([], []));
 
         CollectionAssert.Contains(coverage.Coverage.Reasons.ToList(),
-            "1 declared project(s) could not be loaded on this worker (src/Ios/Ios.csproj); see the `project_skipped` diagnostics for each reason.");
+            "1 declared project(s) could not be loaded on this worker (src/Ios/Ios.csproj (TFM unknown)); see the `project_skipped` diagnostics for each reason.");
+        Assert.AreEqual(SnapshotCoverageVerdict.Partial, coverage.Coverage.Verdict);
+        var gap = coverage.Coverage.EvaluationGaps!.Single();
+        Assert.AreEqual("src/Ios/Ios.csproj", gap.Project);
+        Assert.IsNull(gap.TargetFramework, "a workload failure does not establish a loaded TFM");
+        Assert.IsFalse(gap.HasDocuments);
         Assert.IsFalse(coverage.Coverage.Reasons.Any(r => r.Contains("SDK", StringComparison.Ordinal)));
     }
 
