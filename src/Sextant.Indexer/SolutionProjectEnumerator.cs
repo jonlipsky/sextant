@@ -62,6 +62,7 @@ internal static class SolutionProjectEnumerator
 
     private static IEnumerable<string> ParseSln(string solutionPath)
     {
+        var paths = new List<string>();
         var header = false;
         var inProject = false;
         var inGlobal = false;
@@ -152,10 +153,11 @@ internal static class SolutionProjectEnumerator
 
             var path = tokens[1].Groups[1].Value;
             if (RecognizedExtensions.Contains(Path.GetExtension(path)))
-                yield return path;
+                paths.Add(path);
         }
         if (!header || inProject || inGlobal || sectionEnd != null)
             throw new FormatException("Truncated solution.");
+        return paths;
     }
 
     private static IEnumerable<string> ParseSlnx(string solutionPath)

@@ -100,6 +100,45 @@ public sealed class SolutionProjectEnumeratorTests
     }
 
     [TestMethod]
+    public void ClassicSln_WithProjectAndGlobalSections_IsReadable()
+    {
+        var path = Path.Combine(_dir, "Sections.sln");
+        File.WriteAllText(path, """
+            Microsoft Visual Studio Solution File, Format Version 12.00
+            Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Lib", "Lib.csproj", "{11111111-1111-1111-1111-111111111111}"
+                ProjectSection(ProjectDependencies) = postProject
+                    {22222222-2222-2222-2222-222222222222} = {22222222-2222-2222-2222-222222222222}
+                EndProjectSection
+            EndProject
+            Global
+                GlobalSection(SolutionConfigurationPlatforms) = preSolution
+                    Debug|Any CPU = Debug|Any CPU
+                EndGlobalSection
+            EndGlobal
+            """);
+        var result = SolutionProjectEnumerator.Read(path);
+        Assert.IsTrue(result.IsReadable);
+        CollectionAssert.AreEqual(new[] { Path.Combine(_dir, "Lib.csproj") }, result.Projects.ToArray());
+    }
+
+    [TestMethod]
+    [DataRow("GlobalSection(SolutionConfigurationPlatforms) = preSolution\nDebug|Any CPU\nEndGlobalSection\nEndGlobal")]
+    [DataRow("GlobalSection(SolutionConfigurationPlatforms) = preSolution\nDebug|Any CPU = Debug|Any CPU\nEndGlobal")]
+    [DataRow("GlobalSection(SolutionConfigurationPlatforms) = preSolution\nDebug|Any CPU = Debug|Any CPU\nEndProjectSection\nEndGlobal")]
+    [DataRow("UnexpectedEntry\nEndGlobal")]
+    public void ClassicSln_WithMalformedSection_DiscardsEarlierProjects(string tail)
+    {
+        var path = Path.Combine(_dir, "Sections.sln");
+        File.WriteAllText(path,
+            "Microsoft Visual Studio Solution File, Format Version 12.00\n" +
+            "Project(\"{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}\") = \"Lib\", \"Lib.csproj\", \"{11111111-1111-1111-1111-111111111111}\"\n" +
+            "EndProject\nGlobal\n" + tail);
+        var result = SolutionProjectEnumerator.Read(path);
+        Assert.IsFalse(result.IsReadable);
+        Assert.AreEqual(0, result.Projects.Count);
+    }
+
+    [TestMethod]
     public void UnreadableOrUnknownSolution_ReturnsEmpty_WithoutThrowing()
     {
         var missing = Path.Combine(_dir, "does-not-exist.sln");
