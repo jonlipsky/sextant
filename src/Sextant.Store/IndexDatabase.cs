@@ -214,12 +214,13 @@ public sealed class IndexDatabase : IDisposable
     public static int LatestSchemaVersion => LoadMigrations().Max(m => m.version);
 
     /// <summary>
-    /// Migrations that only create or drop indexes (issue #196). They change no table or row and nothing the indexer
-    /// writes, so the snapshots a build produces are the same with or without them, and they do not advance
+    /// Migrations that only create or drop indexes (issues #196 and #256). They change no
+    /// table or row and nothing the indexer writes, so snapshots remain identical and do not advance
     /// <see cref="SnapshotSchemaVersion"/>. Before 025 every migration advanced the snapshot schema (023 is an
     /// index-only migration that did), and those identities are left as they are.
     /// </summary>
-    public static IReadOnlySet<int> IdentityNeutralMigrations { get; } = new HashSet<int> { 25 };
+    public static IReadOnlySet<int> IdentityNeutralMigrations { get; } =
+        new HashSet<int> { 25, 27 };
 
     /// <summary>
     /// The schema version folded into a snapshot's identity (<c>SnapshotIdentity.SchemaVersion</c>) and compared by

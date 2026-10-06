@@ -1758,13 +1758,18 @@ rows.
   (idempotent-ensure attach rate + federation page-cache hit rate), and query latency (p50/p95/max). Add
   `?format=prometheus` for text exposition a scraper/dashboard can ingest directly. Alerts are evaluated
   over the snapshot (`queue_delay_high`, `low_success_rate`, `low_completeness_rate`, `worker_exhaustion`,
-  `storage_pressure`). `low_completeness_rate` uses complete jobs / all terminal jobs: partial jobs still
+  `storage_pressure`). The existing `jobs` block retains cumulative counts/rates and `low_success_rate`
+  keeps its cumulative behavior. A separate `recent_jobs` block reports terminal jobs by `completed_at`
+  over a rolling 24-hour window (`window_start_unix_ms` inclusive, `window_end_unix_ms` exclusive),
+  including bounds, sample count and recent rates. Its rates are null with no samples. `low_completeness_rate`
+  and pilot `snapshot_completeness` use recent complete jobs / recent terminal jobs: partial jobs still
   count as successful publication but not as complete. The existing `AlertThresholds` programmatic
   configuration sets `CompletenessRateWarn` (default 0.90), `CompletenessRateCrit` (0.50), and the shared
   `SuccessRateMinSamples` (5). Rates strictly below a threshold fire; equality does not cross that
-  threshold. With no terminal jobs or fewer than the minimum, completeness is not assessed, not proven
-  healthy. The job metric reflects recorded job outcomes, not a fresh audit of historical coverage rows.
-  The existing no-sample rate value of 1.0 is retained for wire compatibility; do not treat it as evidence.
+  threshold. With fewer than the minimum recent samples, completeness is not assessed, not proven healthy.
+  The recent job metric reflects recorded outcomes completed in that window, not a fresh audit of
+  historical coverage rows. The cumulative no-sample rate value of 1.0 remains for wire compatibility;
+  it is not used as evidence of recent health.
 - **`GET /control/audit`** serves the durable [`audit_log`](../src/Sextant.Store/Migrations/020_audit_log.sql)
   (migration 020): who did what to which repository scope, with what outcome and at what worker cost.
   The actor is stored as a **non-reversible hash**, never the raw token; the raw secret never touches the DB.

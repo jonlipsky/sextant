@@ -121,7 +121,7 @@ public class PilotReadinessTests
         {
             WorkloadClass = workload,
             HardOsIsolationAvailable = true,
-            Jobs = new JobMetrics { Complete = 8, Partial = 2 },
+            RecentJobs = Recent(complete: 8, partial: 2),
             Alerts = [new Alert { Id = "low_completeness_rate", Level = AlertLevel.Warning, Message = "partial" }]
         });
         var check = report.Checks.Single(c => c.Id == "snapshot_completeness");
@@ -141,7 +141,7 @@ public class PilotReadinessTests
         {
             WorkloadClass = PilotWorkloadClass.UntrustedMultiTenant,
             HardOsIsolationAvailable = true,
-            Jobs = new JobMetrics { Complete = complete }
+            RecentJobs = Recent(complete: complete)
         });
         var check = report.Checks.Single(c => c.Id == "snapshot_completeness");
         Assert.IsFalse(check.Passed);
@@ -152,7 +152,7 @@ public class PilotReadinessTests
     [TestMethod]
     public void MissingCompletenessMetrics_AreNotHealthy()
     {
-        var report = PilotReadiness.Evaluate(FullyGreen() with { Jobs = null });
+        var report = PilotReadiness.Evaluate(FullyGreen() with { RecentJobs = null });
         var check = report.Checks.Single(c => c.Id == "snapshot_completeness");
         Assert.IsFalse(check.Passed);
         Assert.IsFalse(check.Blocking);
@@ -168,7 +168,7 @@ public class PilotReadinessTests
     {
         var report = PilotReadiness.Evaluate(FullyGreen() with
         {
-            Jobs = new JobMetrics { Complete = complete, Partial = partial }
+            RecentJobs = Recent(complete, partial)
         }, new AlertThresholds { CompletenessRateWarn = threshold });
         Assert.AreEqual(passed, report.Checks.Single(c => c.Id == "snapshot_completeness").Passed);
     }
@@ -181,7 +181,7 @@ public class PilotReadinessTests
     {
         var report = PilotReadiness.Evaluate(FullyGreen() with
         {
-            Jobs = new JobMetrics { Complete = complete }
+            RecentJobs = Recent(complete)
         }, new AlertThresholds { SuccessRateMinSamples = minimum });
         Assert.AreEqual(passed, report.Checks.Single(c => c.Id == "snapshot_completeness").Passed);
     }
@@ -189,13 +189,13 @@ public class PilotReadinessTests
     [TestMethod]
     public void AllPartialJobs_FailCompleteness_AndCriticalAlertStillBlocksTrusted()
     {
-        var jobs = new JobMetrics { Partial = 5 };
+        var jobs = Recent(partial: 5);
         var report = PilotReadiness.Evaluate(FullyGreen() with
         {
-            Jobs = jobs,
+            RecentJobs = jobs,
             Alerts = [new Alert { Id = "low_completeness_rate", Level = AlertLevel.Critical, Message = "partial" }]
         });
-        Assert.AreEqual(1.0, jobs.SuccessRate);
+        Assert.AreEqual(1.0, jobs.SuccessRate, "partial outcomes are successful publication");
         Assert.IsFalse(report.Checks.Single(c => c.Id == "snapshot_completeness").Passed);
         Assert.IsFalse(report.Ready);
         Assert.IsTrue(report.Blockers.Any(c => c.Id == "no_critical_alerts"));
@@ -213,7 +213,16 @@ public class PilotReadinessTests
         RecentBackupAvailable = true,
         CatalogRecovered = true,
         WorkerCapacityAvailable = true,
-        Jobs = new JobMetrics { Complete = 5 },
+        RecentJobs = Recent(complete: 5),
         Alerts = []
+    };
+
+    private static RecentJobMetrics Recent(long complete = 0, long partial = 0) => new()
+    {
+        WindowStartUnixMs = 100,
+        WindowEndUnixMs = 200,
+        MinimumSamples = 5,
+        Complete = complete,
+        Partial = partial
     };
 }

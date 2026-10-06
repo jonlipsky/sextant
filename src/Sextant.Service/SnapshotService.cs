@@ -48,6 +48,7 @@ public sealed partial class SnapshotService : IDisposable
     private readonly IGitContentProvider _gitContent;
     private readonly ContributionPolicy _contributionPolicy;
     private readonly RemoteDefaultBranchLookup? _remoteDefaults;
+    private readonly TimeProvider _timeProvider;
     private readonly ServiceMetrics _metrics = new();
 
     // Issue #148: the service-owned lifetime every ensure operation + worker run is bound to (cancelled only
@@ -80,7 +81,7 @@ public sealed partial class SnapshotService : IDisposable
         ServiceOptions options, ISnapshotWorker worker, ServicePaths paths,
         IndexDatabase db, WriterLease lease, bool ownsDatabase,
         IContributionAuthorizer authorizer, IGitContentProvider gitContent, ContributionPolicy contributionPolicy,
-        IRemoteDefaultBranchResolver? remoteDefaults)
+        IRemoteDefaultBranchResolver? remoteDefaults, TimeProvider? timeProvider)
     {
         _options = options;
         _worker = worker;
@@ -94,6 +95,7 @@ public sealed partial class SnapshotService : IDisposable
         _gitContent = gitContent;
         _contributionPolicy = contributionPolicy;
         _remoteDefaults = remoteDefaults is null ? null : new RemoteDefaultBranchLookup(remoteDefaults);
+        _timeProvider = timeProvider ?? TimeProvider.System;
         _jobIds = new JobIdReservations(
             JobIdReservations.FloorPathFor(options.CatalogDbPath),
             () => ReadCatalog(conn => new SnapshotJobStore(conn).MaxJobId()));
@@ -147,7 +149,8 @@ public sealed partial class SnapshotService : IDisposable
     public static SnapshotService Start(
         ServiceOptions options, ISnapshotWorker? worker = null, IndexDatabase? database = null,
         IContributionAuthorizer? authorizer = null, IGitContentProvider? gitContent = null,
-        ContributionPolicy? contributionPolicy = null, IRemoteDefaultBranchResolver? remoteDefaults = null)
+        ContributionPolicy? contributionPolicy = null, IRemoteDefaultBranchResolver? remoteDefaults = null,
+        TimeProvider? timeProvider = null)
     {
         var effectivePolicy = contributionPolicy ?? options.Contribution;
         var effectiveAuthorizer = authorizer ?? OpenContributionAuthorizer.Instance;
@@ -187,7 +190,7 @@ public sealed partial class SnapshotService : IDisposable
                 db.Recover();
                 var service = new SnapshotService(
                     options, worker ?? new UnavailableSnapshotWorker(), paths, db, lease, ownsDatabase,
-                    effectiveAuthorizer, effectiveGitContent, effectivePolicy, remoteDefaults);
+                    effectiveAuthorizer, effectiveGitContent, effectivePolicy, remoteDefaults, timeProvider);
                 service._jobIds.Load();
                 service.ReconcileOnStartup();
                 return service;
@@ -1919,7 +1922,8 @@ public sealed partial class SnapshotService : IDisposable
     public MetricsSnapshot CollectMetrics(AlertThresholds? thresholds = null)
     {
         using var conn = OpenReadConnection();
-        var collector = new MetricsCollector(conn, _paths, _options.CatalogDbPath, _metrics, HasWorkerCapacity);
+        var collector = new MetricsCollector(
+            conn, _paths, _options.CatalogDbPath, _metrics, HasWorkerCapacity, _timeProvider);
         return collector.Collect(thresholds);
     }
 
@@ -2004,7 +2008,7 @@ public sealed partial class SnapshotService : IDisposable
             RecentBackupAvailable = recentBackup,
             CatalogRecovered = RecoveryCompleted,
             WorkerCapacityAvailable = HasWorkerCapacity,
-            Jobs = metrics.Jobs,
+            RecentJobs = metrics.RecentJobs,
             Alerts = metrics.Alerts
         });
     }

@@ -74,7 +74,8 @@ public class ObservabilityHttpTests
         foreach (var key in new[]
         {
             "indexing_latency", "queue_delay", "query_latency", "jobs", "success_rate",
-            "completeness_rate", "worker_capacity", "storage", "cache_reuse", "alerts", "cost_by_repository"
+            "completeness_rate", "recent_jobs", "window_start_unix_ms", "window_end_unix_ms",
+            "sample_count", "worker_capacity", "storage", "cache_reuse", "alerts", "cost_by_repository"
         })
             StringAssert.Contains(body, key, $"metrics snapshot reports '{key}' (criterion 5)");
     }
@@ -90,6 +91,9 @@ public class ObservabilityHttpTests
         Assert.AreEqual("text/plain", response.Content.Headers.ContentType?.MediaType);
         var body = await response.Content.ReadAsStringAsync();
         StringAssert.Contains(body, "# TYPE sextant_job_success_rate gauge");
+        StringAssert.Contains(body, "# TYPE sextant_recent_job_completeness_rate gauge");
+        StringAssert.Contains(body, "sextant_recent_jobs_sample_count");
+        StringAssert.Contains(body, "sextant_recent_jobs_window_start_unix_ms");
         StringAssert.Contains(body, "sextant_jobs_complete");
     }
 
@@ -152,6 +156,11 @@ public class ObservabilityHttpTests
         var alerts = metrics.RootElement.GetProperty("alerts").EnumerateArray().ToArray();
         Assert.AreEqual(partial, alerts.Any(a => a.GetProperty("id").GetString() == "low_completeness_rate"));
         Assert.IsFalse(alerts.Any(a => a.GetProperty("id").GetString() == "low_success_rate"));
+        var recentJobs = metrics.RootElement.GetProperty("recent_jobs");
+        Assert.AreEqual(5, recentJobs.GetProperty("sample_count").GetInt64());
+        Assert.AreEqual(partial ? 0.0 : 1.0, recentJobs.GetProperty("completeness_rate").GetDouble());
+        Assert.IsTrue(recentJobs.GetProperty("window_start_unix_ms").GetInt64() <
+                      recentJobs.GetProperty("window_end_unix_ms").GetInt64());
 
         using var pilotResponse = await Send(host, "/control/pilot?workload=trusted", ControlToken);
         Assert.AreEqual(HttpStatusCode.OK, pilotResponse.StatusCode);
