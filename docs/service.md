@@ -354,11 +354,12 @@ recognized error code; ..."). A restore problem alone does not make the snapshot
 fails to bind does (below). The process tree is killed on expiry or cancellation, stdin is closed, and
 stdout/stderr are drained concurrently with a bounded wait, so a leaked MSBuild node cannot hang the job.
 
-A restore problem is **not retried**: the job publishes with the notes above, and a later ensure of the same
+A restore problem is **not automatically retried**: the job publishes with the notes above, and a later ordinary ensure of the same
 commit attaches to that snapshot. Retrying would rarely help, because each job restores into its own cold
 `NUGET_PACKAGES` (a timed-out restore would time out again), and a credential-gated feed never becomes
 reachable. The binding-health verdict below is what tells an agent that results may be missing; the next commit
-re-indexes.
+re-indexes. After improving restore conditions, an operator can request a new immutable
+[rebuild generation](#rebuilding-a-published-commit-issues-235251).
 
 **Network and credentials.** Restore contacts nuget.org and every package source the repository's
 `nuget.config` names, from the worker host. `SEXTANT_SERVICE_SANDBOX_ALLOW_NETWORK` does **not** gate it: that
@@ -1660,9 +1661,60 @@ evaluation is never unbounded.
 
 **A partial snapshot is final for its identity.** It is published like any other snapshot, so a later ensure
 of the same identity reuses it; raising the budget does not rebuild it (the budget is not part of the identity,
-so a raise re-indexes nothing), and the next commit is indexed afresh. What fits depends on the machine and its
+so a raise re-indexes nothing). An operator can then request a new
+[rebuild generation](#rebuilding-a-published-commit-issues-235251) of that commit; the next commit is indexed afresh. What fits depends on the machine and its
 load, so a partial snapshot's content is not reproducible; the first run to publish an identity is the one
 served. Readers can still observe a run's earlier batches before it publishes, as for any run (Phase 3).
+
+### Rebuilding a published commit (issues #235/#251)
+
+An application/operator can send `POST /control/ensure` (including `?wait=false`) with an explicit
+`rebuild_generation` token after improving restore conditions or increasing the evaluation budget. This is
+not an in-place force flag: the token is folded into the immutable snapshot identity on both admission and
+publication, including submodule providers. A fresh token produces a separate job and generation; repeating
+the same token and inputs attaches to that job, even if it remains partial or failed. Omit the token for
+ordinary ensures, which retain their original identity and reuse behavior. No automatic retry, global
+budget identity component, schema bump, or mass reindex is introduced.
+
+For example, the ensure body for a branch currently at a known SHA is:
+
+```json
+{
+  "repository_remote_url": "https://github.com/org/repo.git",
+  "commit_sha": "<current-sha>",
+  "branch_name": "main",
+  "expected_head_commit": "<current-sha>",
+  "rebuild_generation": "budget-raised-20261006"
+}
+```
+
+The token must contain 1-64 ASCII letters, digits, `.`, `_`, or `-` (`400 invalid_rebuild_generation`).
+An advance requires a named branch and `expected_head_commit` equal to `commit_sha`
+(`400 rebuild_head_guard_required`); sequences cannot be combined with that CAS. Alternatively,
+`branch_update: "none"` builds without selecting any branch. The CAS is evaluated at publication: a
+branch that moved to another commit while this request waited is left alone, and `branch_advanced: false`
+reports that result. Only the named branch is selected; another branch at the same SHA keeps its existing
+snapshot. Verified `act=user` callers cannot request a rebuild (`403 rebuild_not_allowed`, after visibility
+and before any job exists); control-token-only operators and application callers can. Refusals and ensures
+are audited; a rebuild ensure's detail includes `rebuild=<token>;identity=<hash>`.
+
+The new generation records its actual coverage, never an assumed complete verdict. Its immutable
+`coverage.rebuild` contains `generation` and `original_identity_hash` (the same inputs without the token,
+not an overlay base or retention dependency). This provenance is returned by ensure/status/resolve and
+the immutable symbol-page endpoint. `/control/resolve` checks identity currency with the selected token,
+so a policy-compatible rebuild does not appear stale merely because an ordinary ensure omits it.
+
+The old snapshot's data and coverage are untouched. Rebuild selection deliberately leaves the previous
+snapshot published/servable, not superseded, under the existing retention rules. During staging, branch
+queries continue to select the old snapshot; the new pointer and coverage become visible atomically at
+publish. An in-flight reader stays on its pinned generation. An MCP cursor from before the branch changed
+gets `invalid_cursor` on that branch rather than silently resuming on different data; it still works on a
+branch selecting the old generation. Immutable HTTP symbol pages retain the old hash and row-id cursor
+space, while federation caches address the new generation with a different hash. An ordinary ensure of
+the recorded original identity can still return its old job/coverage, but cannot roll this branch back off
+the explicit rebuild (including CAS/sequence attaches). A newer sequence on such an attach is still
+consumed against the retained pointer, preventing a delayed event from regressing it. Reusing another explicit token is an operator
+selection, not an ordered generation counter.
 
 #### Retrying an aborted job
 
