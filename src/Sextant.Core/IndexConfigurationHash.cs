@@ -62,7 +62,7 @@ public static class IndexConfigurationHash
     /// so a snapshot indexed before it has no declarations and must not be reused for the same identity.
     /// </para>
     /// </remarks>
-    public const string AnalyzerVersion = "5";
+    public const string AnalyzerVersion = "6";
 
     /// <summary>
     /// Computes the configuration hash for a resolved profile. The canonical pre-image is a fixed,

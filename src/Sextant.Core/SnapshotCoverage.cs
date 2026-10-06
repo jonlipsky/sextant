@@ -65,6 +65,22 @@ public sealed record SnapshotCoverage
     /// <summary>Declared project files that failed to load on this worker.</summary>
     public int ProjectsSkipped { get; init; }
 
+    /// <summary>Skipped project files with at least one surviving document-bearing TFM; overlaps loaded/skipped.</summary>
+    public int ProjectsPartiallyLoaded { get; init; }
+
+    /// <summary>Distinct project files whose failed evaluation still exposed documents.</summary>
+    public int ProjectsDegraded { get; init; }
+
+    /// <summary>Selected solutions that could not be fully read, excluding valid empty solutions.</summary>
+    public int SolutionsUnreadable { get; init; }
+
+    /// <summary>Load failures that could not be attributed safely. Any such failure makes coverage partial.</summary>
+    public int UnattributedLoadFailures { get; init; }
+
+    /// <summary>Bounded per-project/TFM evaluation gaps; null on older coverage records.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IReadOnlyList<ProjectEvaluationGap>? EvaluationGaps { get; init; }
+
     /// <summary>Project files (<c>.csproj</c>/<c>.fsproj</c>/<c>.vbproj</c>) found on disk, excluding build output.</summary>
     public int ProjectFilesOnDisk { get; init; }
 
@@ -124,6 +140,10 @@ public sealed record SnapshotCoverage
     [JsonIgnore]
     public bool IsPartial => string.Equals(Verdict, SnapshotCoverageVerdict.Partial, StringComparison.Ordinal);
 }
+
+/// <summary>A missing or failed project version, with repository-relative identity and a safe reason.</summary>
+public sealed record ProjectEvaluationGap(
+    string Project, string? TargetFramework, bool HasDocuments, string Reason);
 
 /// <summary>
 /// The part of a checkout a time-budgeted evaluation left out (<see cref="SnapshotCoverage.TimeBudget"/>).

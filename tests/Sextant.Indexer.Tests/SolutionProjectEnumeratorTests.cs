@@ -109,4 +109,31 @@ public sealed class SolutionProjectEnumeratorTests
         File.WriteAllText(weird, "not a solution");
         Assert.AreEqual(0, SolutionProjectEnumerator.Enumerate(weird).Count);
     }
+
+    [TestMethod]
+    [DataRow(".sln", "Microsoft Visual Studio Solution File, Format Version 12.00\nGlobal\nEndGlobal\n")]
+    [DataRow(".slnx", "<Solution />")]
+    public void ValidEmptySolution_IsReadable(string extension, string contents)
+    {
+        var path = Path.Combine(_dir, "Empty" + extension);
+        File.WriteAllText(path, contents);
+        var result = SolutionProjectEnumerator.Read(path);
+        Assert.IsTrue(result.IsReadable);
+        Assert.AreEqual(0, result.Projects.Count);
+    }
+
+    [TestMethod]
+    [DataRow(".sln", "garbage")]
+    [DataRow(".sln", "Microsoft Visual Studio Solution File, Format Version 12.00\nProject(broken)\n")]
+    [DataRow(".slnx", "<NotASolution />")]
+    [DataRow(".slnx", "<Solution><Project Path=\"Good.csproj\" /><Project Path=\"Late.csproj\">")]
+    [DataRow(".slnx", "<Solution><Project /></Solution>")]
+    public void FailedParse_IsUnreadable_AndDiscardsEveryProject(string extension, string contents)
+    {
+        var path = Path.Combine(_dir, "Broken" + extension);
+        File.WriteAllText(path, contents);
+        var result = SolutionProjectEnumerator.Read(path);
+        Assert.IsFalse(result.IsReadable);
+        Assert.AreEqual(0, result.Projects.Count);
+    }
 }

@@ -8,11 +8,12 @@ namespace Sextant.Indexer;
 /// can open each one individually and isolate a per-project load failure (issue #90). Supports the
 /// classic <c>.sln</c> format and the XML <c>.slnx</c> format; only projects Roslyn can open
 /// (<c>.csproj</c>/<c>.vbproj</c>/<c>.fsproj</c>) are returned, so solution folders and unrecognized
-/// entries are ignored. Parsing is best-effort and never throws: an unreadable/unknown solution yields
-/// an empty list and the caller degrades to the previous whole-solution load.
+/// entries are ignored. A failed read discards every project, but is distinct from a readable empty solution.
 /// </summary>
 internal static class SolutionProjectEnumerator
 {
+    internal sealed record Result(bool IsReadable, IReadOnlyList<string> Projects);
+
     private static readonly HashSet<string> RecognizedExtensions =
         new(StringComparer.OrdinalIgnoreCase) { ".csproj", ".vbproj", ".fsproj" };
 
@@ -26,14 +27,19 @@ internal static class SolutionProjectEnumerator
     /// Returns the absolute, de-duplicated paths of the recognized projects declared in
     /// <paramref name="solutionPath"/>, preserving declaration order. Never throws.
     /// </summary>
-    public static IReadOnlyList<string> Enumerate(string solutionPath)
+    public static IReadOnlyList<string> Enumerate(string solutionPath) => Read(solutionPath).Projects;
+
+    public static Result Read(string solutionPath)
     {
         try
         {
             var solutionDir = Path.GetDirectoryName(Path.GetFullPath(solutionPath)) ?? ".";
-            var relativePaths = string.Equals(Path.GetExtension(solutionPath), ".slnx", StringComparison.OrdinalIgnoreCase)
-                ? ParseSlnx(solutionPath)
-                : ParseSln(solutionPath);
+            var relativePaths = Path.GetExtension(solutionPath).ToLowerInvariant() switch
+            {
+                ".slnx" => ParseSlnx(solutionPath),
+                ".sln" => ParseSln(solutionPath),
+                _ => throw new FormatException("Unrecognized solution format.")
+            };
 
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var result = new List<string>();
@@ -45,23 +51,84 @@ internal static class SolutionProjectEnumerator
                 if (RecognizedExtensions.Contains(Path.GetExtension(absolute)) && seen.Add(absolute))
                     result.Add(absolute);
             }
-            return result;
+            return new Result(true, result);
         }
-        catch
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or XmlException
+                                   or FormatException or ArgumentException or RegexMatchTimeoutException)
         {
-            // Best-effort: a solution we cannot parse simply yields no declared projects, so the caller
-            // falls back to the standard whole-solution load rather than failing here.
-            return [];
+            return new Result(false, []);
         }
     }
 
     private static IEnumerable<string> ParseSln(string solutionPath)
     {
+        var header = false;
+        var inProject = false;
+        var inGlobal = false;
+        string? sectionEnd = null;
         foreach (var line in File.ReadLines(solutionPath))
         {
-            var trimmed = line.TrimStart();
-            if (!trimmed.StartsWith("Project(", StringComparison.Ordinal))
+            var trimmed = line.Trim();
+            if (trimmed.Length == 0)
                 continue;
+            if (!header)
+            {
+                if (!trimmed.StartsWith("Microsoft Visual Studio Solution File, Format Version ", StringComparison.Ordinal))
+                    throw new FormatException("Invalid solution header.");
+                header = true;
+                continue;
+            }
+            if (trimmed == "EndProject")
+            {
+                if (!inProject || sectionEnd != null) throw new FormatException("Unmatched EndProject.");
+                inProject = false;
+                continue;
+            }
+            if (trimmed == "Global")
+            {
+                if (inProject || inGlobal) throw new FormatException("Invalid Global block.");
+                inGlobal = true;
+                continue;
+            }
+            if (trimmed == "EndGlobal")
+            {
+                if (!inGlobal || sectionEnd != null) throw new FormatException("Unmatched EndGlobal.");
+                inGlobal = false;
+                continue;
+            }
+            if (trimmed.StartsWith("ProjectSection(", StringComparison.Ordinal) ||
+                trimmed.StartsWith("GlobalSection(", StringComparison.Ordinal))
+            {
+                var projectSection = trimmed.StartsWith("ProjectSection(", StringComparison.Ordinal);
+                if (sectionEnd != null || !(projectSection ? inProject : inGlobal) ||
+                    !trimmed.Contains(") =", StringComparison.Ordinal))
+                    throw new FormatException("Invalid solution section.");
+                sectionEnd = projectSection ? "EndProjectSection" : "EndGlobalSection";
+                continue;
+            }
+            if (trimmed is "EndProjectSection" or "EndGlobalSection")
+            {
+                if (sectionEnd != trimmed) throw new FormatException("Unmatched section end.");
+                sectionEnd = null;
+                continue;
+            }
+            if (!trimmed.StartsWith("Project(", StringComparison.Ordinal))
+            {
+                if (trimmed.StartsWith('#')) continue;
+                if (sectionEnd != null)
+                {
+                    if (!trimmed.Contains('=')) throw new FormatException("Invalid section entry.");
+                    continue;
+                }
+                if (inProject || inGlobal ||
+                    (!trimmed.StartsWith("VisualStudioVersion =", StringComparison.Ordinal) &&
+                     !trimmed.StartsWith("MinimumVisualStudioVersion =", StringComparison.Ordinal)))
+                    throw new FormatException("Unrecognized solution entry.");
+                continue;
+            }
+
+            if (inProject || inGlobal) throw new FormatException("Invalid project block.");
+            inProject = true;
 
             // Classic .sln project entries are strictly positional:
             //   Project("{typeGuid}") = "DisplayName", "relative\path.csproj", "{projectGuid}"
@@ -71,19 +138,24 @@ internal static class SolutionProjectEnumerator
             // correct even when the DISPLAY NAME itself ends in a project extension; an extension scan
             // would pick the name and resolve it to the wrong folder. Solution folders put a bare folder
             // name in the path field, so the extension check below excludes them. Parsing is per-entry: a
-            // malformed line is skipped, not fatal to the whole enumeration.
+            // malformed line invalidates the entire enumeration, never a strict subset.
             var separator = trimmed.IndexOf('=');
             if (separator < 0)
-                continue;
+                throw new FormatException("Invalid project entry.");
 
             var tokens = QuotedToken.Matches(trimmed[(separator + 1)..]);
-            if (tokens.Count < 2)
-                continue;
+            var typeTokens = QuotedToken.Matches(trimmed[..separator]);
+            if (tokens.Count != 3 || typeTokens.Count != 1 ||
+                !Guid.TryParse(typeTokens[0].Groups[1].Value, out _) ||
+                !Guid.TryParse(tokens[2].Groups[1].Value, out _))
+                throw new FormatException("Invalid project entry.");
 
             var path = tokens[1].Groups[1].Value;
             if (RecognizedExtensions.Contains(Path.GetExtension(path)))
                 yield return path;
         }
+        if (!header || inProject || inGlobal || sectionEnd != null)
+            throw new FormatException("Truncated solution.");
     }
 
     private static IEnumerable<string> ParseSlnx(string solutionPath)
@@ -100,6 +172,9 @@ internal static class SolutionProjectEnumerator
             XmlResolver = null
         };
         using var reader = XmlReader.Create(solutionPath, settings);
+        reader.MoveToContent();
+        if (reader.Name != "Solution")
+            throw new FormatException("Invalid solution root.");
         while (reader.Read())
         {
             if (reader.NodeType != XmlNodeType.Element ||
@@ -107,8 +182,9 @@ internal static class SolutionProjectEnumerator
                 continue;
 
             var path = reader.GetAttribute("Path");
-            if (!string.IsNullOrWhiteSpace(path))
-                paths.Add(path);
+            if (string.IsNullOrWhiteSpace(path))
+                throw new FormatException("Project has no path.");
+            paths.Add(path);
         }
         return paths;
     }
