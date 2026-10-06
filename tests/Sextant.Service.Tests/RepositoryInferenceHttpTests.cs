@@ -50,6 +50,8 @@ public class RepositoryInferenceHttpTests
         await GrantAsync(Keeper, Secret);
         await GrantAsync(Keeper, Library);
         await GrantAsync(Solo, Library);
+        await GrantAsync(Reader, Secret, tenant: "tenant-b");
+        await GrantAsync(Reader, Geometry, tenant: "tenant-b");
     }
 
     [ClassCleanup]
@@ -131,7 +133,24 @@ public class RepositoryInferenceHttpTests
     // ==== several readable repositories hold it ======================================================
 
     [TestMethod]
+    [DataRow("""{"name":"Polyg*","fuzzy":true}""", "geometry", "global::Geometry.Polygon")]
+    [DataRow("""{"name":"IShape OR Perimeter","fuzzy":true,"kind":"interface"}""", "library", "global::Library.Shapes.IShape")]
+    [DataRow("""{"name":"IShape OR Perimeter","fuzzy":true,"kind":"method"}""", "geometry", "global::Geometry.Polygon.Perimeter()")]
+    [DataRow("""{"name":"IShape OR Perimeter","fuzzy":true,"kind":"type","scope":"all"}""", "library", "global::Library.Shapes.IShape")]
+    public async Task FuzzySearch_OneReadableRepositoryHasScopedFtsMatches_IsInferred(
+        string arguments, string repository, string symbol)
+    {
+        var call = await CallAsync("find_symbol", arguments, Reader);
+
+        Assert.IsFalse(call.IsError, call.Body.ToString());
+        CollectionAssert.Contains(Names(call.Body), symbol, call.Body.ToString());
+        AssertInferred(call.Body, repository);
+    }
+
+    [TestMethod]
     [DataRow("find_symbol", """{"name":"Shared.Common.Clock"}""")]
+    [DataRow("find_symbol", """{"name":"Circle","fuzzy":true}""")]
+    [DataRow("find_symbol", """{"name":"IShape OR Polygon","fuzzy":true}""")]
     [DataRow("get_type_members", """{"symbol_fqn":"Shared.Common.Clock"}""")]
     [DataRow("find_references", """{"symbol_fqn":"Circle"}""")]
     public async Task SeveralReadableRepositoriesHoldIt_IsRepositoryRequired_ListingOnlyThem(string tool, string arguments)
@@ -170,9 +189,11 @@ public class RepositoryInferenceHttpTests
     // ==== no readable repository holds it ============================================================
 
     [TestMethod]
-    public async Task NoReadableRepositoryHoldsIt_IsTodaysRepositoryRequired_ListingTheCallersRepositories()
+    [DataRow("""{"name":"Nowhere.Missing"}""")]
+    [DataRow("""{"name":"NoFtsCandidate*","fuzzy":true}""")]
+    public async Task NoReadableRepositoryHoldsIt_IsTodaysRepositoryRequired_ListingTheCallersRepositories(string arguments)
     {
-        var call = await CallAsync("find_symbol", """{"name":"Nowhere.Missing"}""", Reader);
+        var call = await CallAsync("find_symbol", arguments, Reader);
 
         Assert.IsTrue(call.IsError, call.Body.ToString());
         Assert.AreEqual("repository_required", ErrorCode(call.Body));
@@ -232,6 +253,81 @@ public class RepositoryInferenceHttpTests
     // ==== calls that are never inferred ==============================================================
 
     [TestMethod]
+    public async Task FuzzySearch_GrantsOfAnotherTenantAreNeverUsed()
+    {
+        var arguments = """{"name":"Key","fuzzy":true}""";
+        var reader = await CallAsync("find_symbol", arguments, Reader);
+        Assert.IsTrue(reader.IsError, reader.Body.ToString());
+        Assert.AreEqual("repository_required", ErrorCode(reader.Body));
+        Assert.IsFalse(reader.Body.ToString().Contains("secret", StringComparison.OrdinalIgnoreCase));
+
+        var otherTenant = await _host.CallAsync("find_symbol", arguments, DelegateToken,
+            _host.UserAssertion(tenant: "tenant-b", sub: Reader));
+        Assert.IsFalse(otherTenant.IsError, otherTenant.Body.ToString());
+        AssertInferred(otherTenant.Body, "secret");
+    }
+
+    [TestMethod]
+    public async Task FuzzySearch_UnreadableHolder_IsNeverUsedOrNamed()
+    {
+        var reader = await CallAsync("find_symbol", """{"name":"Key","fuzzy":true}""", Reader);
+        var missing = await CallAsync("find_symbol", """{"name":"NoFtsCandidate*","fuzzy":true}""", Reader);
+
+        Assert.IsTrue(reader.IsError, reader.Body.ToString());
+        Assert.AreEqual("repository_required", ErrorCode(reader.Body));
+        Assert.AreEqual(WithoutTimestamp(missing.Body), WithoutTimestamp(reader.Body));
+        Assert.IsFalse(reader.Body.ToString().Contains("secret", StringComparison.OrdinalIgnoreCase));
+
+        var keeper = await CallAsync("find_symbol", """{"name":"Key","fuzzy":true}""", Keeper);
+        Assert.IsFalse(keeper.IsError, keeper.Body.ToString());
+        AssertInferred(keeper.Body, "secret");
+    }
+
+    [TestMethod]
+    public async Task FuzzySearch_UnreadableMatchDoesNotMakeReadableHolderAmbiguous()
+    {
+        var reader = await CallAsync("find_symbol", """{"name":"Mirror","fuzzy":true}""", Reader);
+
+        Assert.IsFalse(reader.IsError, reader.Body.ToString());
+        AssertInferred(reader.Body, "library");
+        Assert.IsFalse(reader.Body.ToString().Contains("secret", StringComparison.OrdinalIgnoreCase));
+
+        var keeper = await CallAsync("find_symbol", """{"name":"Mirror","fuzzy":true}""", Keeper);
+        Assert.IsTrue(keeper.IsError, keeper.Body.ToString());
+        Assert.AreEqual("repository_required", ErrorCode(keeper.Body));
+        StringAssert.Contains(Message(keeper.Body), "'acme/secret'");
+        StringAssert.Contains(Message(keeper.Body), "'acme/library'");
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task FuzzySearch_ExplicitRepositoryIsPreserved(bool header)
+    {
+        var before = _host.InferenceProbes();
+        if (header)
+            _host.RepositoryHeader = Geometry;
+        try
+        {
+            var arguments = header
+                ? """{"name":"IShape","fuzzy":true}"""
+                : """{"name":"IShape","fuzzy":true,"repository":"acme/geometry"}""";
+            var call = await CallAsync("find_symbol", arguments, Reader);
+
+            Assert.IsFalse(call.IsError, call.Body.ToString());
+            Assert.AreEqual(0, call.Body.GetProperty("results").GetArrayLength(), call.Body.ToString());
+            var snapshot = call.Body.GetProperty("meta").GetProperty("snapshot");
+            Assert.AreEqual("github.com/acme/geometry", snapshot.GetProperty("repository").GetString());
+            Assert.IsFalse(snapshot.TryGetProperty("repository_selection", out _));
+            Assert.AreEqual(before, _host.InferenceProbes(), "explicit selection is never probed");
+        }
+        finally
+        {
+            _host.RepositoryHeader = null;
+        }
+    }
+
+    [TestMethod]
     public async Task TheOnlyReadableRepository_StaysTheImplicitSelection()
     {
         var call = await CallAsync("find_symbol", """{"name":"Library.Shapes.Circle"}""", Solo);
@@ -272,7 +368,9 @@ public class RepositoryInferenceHttpTests
     }
 
     [TestMethod]
-    [DataRow("""{"name":"Library.Shapes.Circle","fuzzy":true}""")]
+    [DataRow("""{"name":"Circle","fuzzy":true,"project_id":"unknown"}""")]
+    [DataRow("""{"name":"Circle","fuzzy":true,"scope":"project:1"}""")]
+    [DataRow("""{"name":"Circle","fuzzy":true,"branch":"main"}""")]
     [DataRow("""{"name":"Library.Shapes.Circle","branch":"main"}""")]
     [DataRow("""{"name":"Library.Shapes.Circle","scope":"project:1"}""")]
     public async Task ANarrowedFindSymbol_IsNotInferred(string arguments)
@@ -317,10 +415,10 @@ public class RepositoryInferenceHttpTests
     private static string Message(JsonElement body) =>
         body.TryGetProperty("message", out var message) ? message.GetString() ?? "" : "";
 
-    private static async Task GrantAsync(string sub, string repository)
+    private static async Task GrantAsync(string sub, string repository, string tenant = "tenant-a")
     {
         using var response = await _host.ControlAsync(HttpMethod.Put, "/control/grants/self", ControlToken,
-            _host.UserAssertion(sub: sub), JsonSerializer.Serialize(new { repository }));
+            _host.UserAssertion(tenant: tenant, sub: sub), JsonSerializer.Serialize(new { repository }));
         Assert.AreEqual(System.Net.HttpStatusCode.OK, response.StatusCode, await response.Content.ReadAsStringAsync());
     }
 

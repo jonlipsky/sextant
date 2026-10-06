@@ -998,7 +998,9 @@ across requests, so a revocation takes effect on the next call. Once a request h
   only its trailing name. If several hold it, the call is `repository_required` listing only those. If none does,
   it is the `repository_required` above. A caller that can read more than 25 is not inferred and no repository is
   looked up: the decision is a count, not a choice of 25, so the call is always the `repository_required` above
-  (its first 20 repositories by name, then how many more). A `find_symbol` narrowed by `project_id`, `fuzzy` or a
+  (its first 20 repositories by name, then how many more). Fuzzy `find_symbol` uses the same scoped FTS query,
+  result limit and kind filter as the tool: one repository with matches is inferred; several require explicit
+  selection regardless of relevance ranking. A `find_symbol` narrowed by `project_id` or a
   `scope` other than `all`, and an absolute path, are not inferred. **It never widens access:** the candidates are
   only the caller's own visible repositories (`SnapshotService.ListSelectableRepositories`); each lookup is a read
   through the request's own authorizer (`DatabaseProvider.ProbeRepositories`), so a repository the caller could not
