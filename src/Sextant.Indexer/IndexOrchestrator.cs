@@ -327,8 +327,8 @@ public sealed class IndexOrchestrator
                 // generation for this exact identity, or a Pending one abandoned by a crash) is about to be
                 // rebuilt from scratch below. Reset it to pending so the guarded pending→complete publish
                 // succeeds instead of tripping the "was not pending at publish" guard.
-                if (existed && status != SnapshotStatus.Pending)
-                    snapshotStore.MarkStatus(snapId, SnapshotStatus.Pending);
+                if (existed)
+                    snapshotStore.RestageForRun(snapId, runScope.RunId);
                 // Any coverage recorded for an earlier generation of this identity describes data that is
                 // about to be rebuilt; drop it so the publish records the coverage of THIS build.
                 if (existed)
@@ -380,8 +380,8 @@ public sealed class IndexOrchestrator
                     }
                     activeSnapshotId = overlayId;
                     isOverlayRun = true;
-                    if (overlayExisted && overlayStatus != SnapshotStatus.Pending)
-                        snapshotStore.MarkStatus(overlayId, SnapshotStatus.Pending);
+                    if (overlayExisted)
+                        snapshotStore.RestageForRun(overlayId, runScope.RunId);
                     // A baseless overlay carries its remote base's coverage (issue #119); an earlier
                     // generation's row is about to be superseded by this build's publish.
                     if (overlayExisted)
@@ -477,8 +477,8 @@ public sealed class IndexOrchestrator
             {
                 // Newly staged, or a prior partial/failed/abandoned provider generation to rebuild: reset
                 // to pending so the guarded pending->complete publish succeeds, and publish it this run.
-                if (provExisted && provStatus != SnapshotStatus.Pending)
-                    snapshotStore.MarkStatus(provId, SnapshotStatus.Pending);
+                if (provExisted)
+                    snapshotStore.RestageForRun(provId, runScope.RunId);
                 // Coverage recorded for an earlier generation of this identity describes a build that is
                 // being redone; drop it so this run's publish records its own (issue #162), exactly like
                 // a rebuilt parent snapshot.
@@ -539,7 +539,7 @@ public sealed class IndexOrchestrator
                     // than half-grown. Adding the new project version is additive: the provider's existing
                     // (published) project rows are never touched.
                     if (providerComplete && providerSnapshotsToPublish.Add(providerSnapId))
-                        snapshotStore.MarkStatus(providerSnapId, SnapshotStatus.Pending);
+                        snapshotStore.RestageForRun(providerSnapId, runScope.RunId);
                     projectId = projectStore.UpsertSnapshotProject(identity, providerSnapId, providerLogicalId, now);
                     snapshotStore.MapProject(providerSnapId, projectId);
                     // Empty-grown-project guard (issue #58): a provider project pulled in ONLY as a late

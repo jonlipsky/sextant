@@ -145,6 +145,125 @@ public class RetentionSnapshotGcTests
         Assert.IsNotNull(coverage.Get(_consumerNew), "a retained snapshot keeps its coverage");
     }
 
+    [TestMethod]
+    [DataRow(SnapshotStatus.Pending)]
+    [DataRow(SnapshotStatus.Failed)]
+    [DataRow(SnapshotStatus.Partial)]
+    public void RetriedSnapshot_RebindsToPublishingRun_StaysInWindowThenExpires(string status)
+    {
+        var runs = new IndexRunStore(_conn);
+        var first = runs.BeginRun("full", _now + 10, "retry", IndexProfiles.Deep, (long)IndexFeature.Deep);
+        var repo = _snapshots.EnsureRepository("https://github.com/org/retry", _now);
+        var retry = Snapshot(repo, first, "retry");
+        ProjectRow(retry, "retry");
+        _snapshots.MarkStatus(retry, status);
+        runs.AbandonRun(first, _now + 11);
+        var second = runs.BeginRun("full", _now + 20, "retry", IndexProfiles.Deep, (long)IndexFeature.Deep);
+        Exec("BEGIN IMMEDIATE;");
+        _snapshots.RestageForRun(retry, second);
+        Assert.AreEqual(second, _snapshots.GetById(retry)!.RunId);
+        Assert.AreEqual(SnapshotStatus.Pending, _snapshots.GetById(retry)!.Status);
+        _snapshots.MarkComplete(retry, _now + 21);
+        runs.MarkComplete(second, _now + 21, 1);
+        Exec("COMMIT;");
+        var newer = CompleteRun(30);
+
+        new RetentionService(_conn, new RetentionPolicy { KeepCompleteGenerations = 2 }).Execute();
+        Assert.IsNotNull(_snapshots.GetById(retry), "retry's publishing generation is inside the keep window");
+        Assert.AreEqual(second, _snapshots.GetById(retry)!.RunId);
+        Assert.IsNull(runs.GetAllRuns().SingleOrDefault(r => r.Id == first), "abandoned original run is collected");
+
+        new RetentionService(_conn, new RetentionPolicy { KeepCompleteGenerations = 1 }).Execute();
+        Assert.IsNull(_snapshots.GetById(retry), "unprotected retry expires only when its actual publishing run ages out");
+        Assert.AreEqual(newer, runs.GetLastCompleteRun()!.Id);
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public void LegacyRetry_AbandonedOrNullRunPointer_IsConservativelyProtected(bool removeRun)
+    {
+        var runs = new IndexRunStore(_conn);
+        var abandoned = runs.BeginRun("full", _now, "legacy", IndexProfiles.Deep, (long)IndexFeature.Deep);
+        var repo = _snapshots.EnsureRepository("https://github.com/org/legacy", _now);
+        var retry = Snapshot(repo, abandoned, "legacy");
+        var project = ProjectRow(retry, "legacy");
+        SymbolWithBlob(project, "legacy");
+        runs.AbandonRun(abandoned, _now + 1);
+        if (removeRun) runs.DeleteRun(abandoned);
+        CompleteRun(30);
+
+        new RetentionService(_conn, Policy()).Execute();
+        Assert.IsNotNull(_snapshots.GetById(retry), "an old broken ownership pointer cannot justify data deletion");
+        Assert.AreEqual(1L, ProjectCount(retry));
+    }
+
+    [TestMethod]
+    public void NextBatch_RevalidatesBranchPointerAndPendingRetry()
+    {
+        var retention = new RetentionService(_conn, Policy());
+        var plan = retention.Plan();
+        Assert.AreEqual(2, plan.SnapshotsDeleted);
+        retention.ExecuteBatch();
+
+        // Between batches an ensure re-selects the remaining formerly-orphaned provider.
+        var repo = _snapshots.GetById(_providerOrphan)!.RepositoryId;
+        var branch = _snapshots.EnsureBranch(repo, "restored", false, _now);
+        _snapshots.SetBranchPointer(branch, _providerOrphan, _now);
+        var report = retention.Execute();
+        Assert.IsFalse(report.MoreRemaining);
+        Assert.IsNotNull(_snapshots.GetById(_providerOrphan));
+        Assert.AreEqual(1L, ProjectCount(_providerOrphan));
+    }
+
+    [TestMethod]
+    public void PendingRetryAndItsProvider_AreNeverEligible()
+    {
+        _snapshots.MarkStatus(_consumerOld, SnapshotStatus.Pending);
+        new RetentionService(_conn, Policy()).Execute();
+        Assert.IsNotNull(_snapshots.GetById(_consumerOld));
+        Assert.IsNotNull(_snapshots.GetById(_providerOrphan), "pending consumers protect their provider closure");
+    }
+
+    [TestMethod]
+    public void MultiProjectGc_WithdrawsPublicationBeforeYield_AndRetryStopsFurtherCollection()
+    {
+        ProjectRow(_consumerOld, "second-project");
+        var retention = new RetentionService(_conn, Policy());
+        var batch = retention.ExecuteBatch();
+        Assert.AreEqual(1, batch.SnapshotProjectVersionsDeleted);
+        var collecting = _snapshots.GetById(_consumerOld)!;
+        Assert.AreEqual(SnapshotStatus.Failed, collecting.Status, "partially collected data is no longer publishable");
+        Assert.IsNull(collecting.RunId, "tombstone does not inherit keep-window protection");
+        Assert.IsNull(collecting.PublishedAt);
+        Assert.IsFalse(_snapshots.IsReselectable(_consumerOld), "an ensure must rebuild, not resurrect incomplete data");
+
+        var runs = new IndexRunStore(_conn);
+        var retry = runs.BeginRun("full", _now + 100);
+        _snapshots.RestageForRun(_consumerOld, retry);
+        retention.Execute();
+        Assert.AreEqual(1L, ProjectCount(_consumerOld), "pending retry ownership stops subsequent GC");
+    }
+
+    [TestMethod]
+    public void MultiProjectGc_ContinuesAcrossBatchesWithoutResurrectingQuotaVictim()
+    {
+        ProjectRow(_consumerOld, "second-project");
+        var retention = new RetentionService(_conn, Policy());
+        var total = retention.Execute();
+        Assert.IsFalse(total.MoreRemaining);
+        Assert.AreEqual(3, total.SnapshotProjectVersionsDeleted);
+        Assert.AreEqual(2, total.SnapshotsDeleted);
+        Assert.IsNull(_snapshots.GetById(_consumerOld));
+    }
+
+    private void Exec(string sql)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = sql;
+        cmd.ExecuteNonQuery();
+    }
+
     // === seeding helpers =========================================================================
 
     private long CompleteRun(long ord)

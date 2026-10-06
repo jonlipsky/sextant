@@ -103,6 +103,34 @@ public class RetentionQuotaAndPrProtectionTests
             Assert.IsNotNull(_snapshots.GetById(id), "with an unbounded quota every snapshot on a retained generation survives");
     }
 
+    [TestMethod]
+    public void Quota_MultiProjectVictim_RemainsEligibleAfterFirstBatchWithdrawsPublication()
+    {
+        var run = CompleteRun(1);
+        var oldest = Snapshot(run, "old", _now);
+        var newest = Snapshot(run, "new", _now + 1);
+        using (var seed = _conn.CreateCommand())
+        {
+            seed.CommandText = """
+                INSERT INTO projects (canonical_id, git_remote_url, repo_relative_path, last_indexed_at, snapshot_id)
+                VALUES ('quota-p1', 'https://github.com/org/app', 'one.csproj', 1, @id),
+                       ('quota-p2', 'https://github.com/org/app', 'two.csproj', 1, @id);
+                """;
+            seed.Parameters.AddWithValue("@id", oldest);
+            seed.ExecuteNonQuery();
+        }
+        var service = new RetentionService(_conn,
+            new RetentionPolicy { KeepCompleteGenerations = 10, MaxSnapshotsPerRepository = 1 });
+        var first = service.ExecuteBatch();
+        Assert.AreEqual(1, first.SnapshotProjectVersionsDeleted);
+        Assert.AreEqual(0, first.SnapshotsDeleted);
+        Assert.AreEqual(SnapshotStatus.Failed, _snapshots.GetById(oldest)!.Status);
+        Assert.IsNull(_snapshots.GetById(oldest)!.RunId);
+        Assert.IsFalse(service.Execute().MoreRemaining);
+        Assert.IsNull(_snapshots.GetById(oldest), "retained-run protection must not resurrect the GC tombstone");
+        Assert.IsNotNull(_snapshots.GetById(newest));
+    }
+
     // === helpers =================================================================================
 
     private RetentionPolicy ZeroKeep() =>

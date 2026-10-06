@@ -309,6 +309,21 @@ public sealed class SnapshotStore(SqliteConnection connection)
         return ((long)cmd.ExecuteScalar()!, false, SnapshotStatus.Pending);
     }
 
+    /// <summary>
+    /// Binds a rebuild (including a crashed pending attempt or provider growth) to its new owning run.
+    /// Invoke inside the staging write transaction; immutable re-selection must not call this.
+    /// </summary>
+    public void RestageForRun(long snapshotId, long runId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "UPDATE snapshots SET status = @pending, run_id = @run WHERE id = @id;";
+        cmd.Parameters.AddWithValue("@pending", SnapshotStatus.Pending);
+        cmd.Parameters.AddWithValue("@run", runId);
+        cmd.Parameters.AddWithValue("@id", snapshotId);
+        if (cmd.ExecuteNonQuery() != 1)
+            throw new InvalidOperationException($"Snapshot {snapshotId} vanished while restaging.");
+    }
+
     /// <summary>Maps a project version row into a snapshot (idempotent).</summary>
     public void MapProject(long snapshotId, long projectId)
     {

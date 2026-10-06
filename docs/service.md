@@ -1704,8 +1704,50 @@ snapshot-DATA garbage collection Phase 9 deferred:
   lifetime, and a stale lease may be stolen so a crash never wedges the DB.
 - **#244 — stored source text follows the file versions.** An executed pass then deletes every blob in the
   artifact volume's `source-text/` store whose SHA-256 no `file_versions` row records any more (at most
-  100,000 per pass), and reports the count as `source_texts_deleted` (absent on a dry run). It runs under
+  256 per sweep), and reports the count as `source_texts_deleted` (absent on a dry run). It runs under
   the writer gate, so a blob an index stored ahead of its row is never swept.
+
+### Bounded retention contract (#127 / #252)
+
+`POST /control/retention?execute=false` is a **read-only, point-in-time plan** on an independent WAL
+reader: no writer gate, lease acquisition, deletes, audit writes, migration, or VACUUM. It reports eligible
+generations/snapshots/projects, API rows, and *currently* orphaned file versions. File versions newly
+orphaned by future cascades are not simulated. `reclaimed_bytes_known: false` means no physical-space
+estimate is available; `reclaimed_bytes: 0` is not a claim that nothing can be reclaimed.
+
+`?execute=true` has a **10-second per-pass work budget, including writer-queue wait**, and releases the
+service writer between transactions. Every batch recomputes eligibility inside `BEGIN IMMEDIATE`:
+at most one project cascade/one orphan snapshot, 256 run rows, 256 API rows, and 256 orphan file versions.
+SQLite's progress handler interrupts long planning/deletion statements at a **2-second batch work
+deadline**; an interrupted cascade rolls back the whole batch. Native lock waits are 100 ms per attempt
+with a one-second command retry limit. Request cancellation stops subsequent work and rolls back an
+in-progress batch; earlier committed batches remain applied and have `retention`/`complete` audit rows
+with detail `execute_batch`. A queued publish runs before the next retention batch.
+
+`more_remaining: true` means another pass may be needed. `stop_reason: time_budget` or `sqlite_busy`
+explicitly reports bounded deferral, not completion. A timed-out plan also sets these fields; its empty
+counts are **not** a complete plan. Execution's `reclaimed_bytes_known: true` reports freed pages reusable
+by SQLite, **not a smaller database file**. No full VACUUM or blocking truncate-checkpoint runs on this hot
+path; the writer's existing automatic WAL checkpoints remain in effect. A pinned reader can still grow
+the WAL. Compaction is a separate offline operator action, not an implicit retention step.
+
+Branch pointers, open PRs, pending retry snapshots, and their transitive overlay/provider closure are
+never eligible. Restaging a retry binds `snapshots.run_id` to its new publishing run in the staging
+transaction; immutable re-selection preserves ownership. For existing catalogs with a complete/superseded
+snapshot bound to an abandoned or missing run, retention **conservatively retains** the snapshot and its
+dependencies: no migration, repair, or destructive inference from a stale pointer.
+
+These are cooperative work bounds, not real-time guarantees on filesystem I/O or SQLite rollback.
+A single project cascade that cannot finish within the deadline is deferred rather than partially
+deleting a potentially servable snapshot. Repeated `more_remaining`/`time_budget` responses require
+operator investigation; do not loop blindly. An approved daily runner could submit one bounded pass
+and inspect its report, but **no schedule is enabled or approved by this change**. Production scheduling
+remains deferred pending operator validation on a representative catalog.
+
+Multi-project snapshot GC withdraws publication (`failed`, NULL run/publish pointer) atomically with
+the first project deletion. This tombstone remains eligible across batches even for a quota eviction
+within a retained run. An intervening ensure must **rebuild**, never re-select half-collected data;
+restaging assigns a new run and pending protection immediately stops further collection.
 
 ## Snapshot source text (#244)
 

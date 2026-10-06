@@ -6,8 +6,8 @@ namespace Sextant.Store.Tests;
 
 /// <summary>
 /// Phase 8, acceptance criteria 4 &amp; 5: retention garbage-collects superseded generations, trims API
-/// history, and prunes orphan source blobs, while a dry-run reports exactly what execution would do
-/// (including reclaimed bytes) and the protected set — always including the currently-servable
+/// history, and prunes orphan source blobs, while a read-only dry-run reports eligibility
+/// and the protected set — always including the currently-servable
 /// generation — is never deleted.
 /// </summary>
 [TestClass]
@@ -88,11 +88,11 @@ public class RetentionServiceTests
         });
     }
 
-    private void SeedOrphanFileVersions(int count, long now)
+    private void SeedOrphanFileVersions(int count, long now, int start = 0)
     {
         InTransaction(() =>
         {
-            for (var i = 0; i < count; i++)
+            for (var i = start; i < start + count; i++)
             {
                 long fileId;
                 using (var fileCmd = _conn.CreateCommand())
@@ -208,7 +208,8 @@ public class RetentionServiceTests
 
         Assert.IsTrue(report.DryRun, "Plan() is a dry run");
         Assert.AreEqual(3, report.Deleted.Count, "6 complete runs, keep 3 ⇒ 3 superseded generations deleted");
-        Assert.IsTrue(report.ReclaimedBytes > 0, "dry-run must estimate freed bytes");
+        Assert.IsFalse(report.ReclaimedBytesKnown, "a read-only plan cannot measure cascade/freelist deltas");
+        Assert.AreEqual(0L, report.ReclaimedBytes);
         Assert.IsTrue(report.ApiSnapshotsDeleted > 0, "commits beyond the keep window are reported deletable");
         Assert.IsTrue(report.FileVersionsDeleted > 0, "orphan source blobs are reported prunable");
 
@@ -354,5 +355,123 @@ public class RetentionServiceTests
         public string Name => "test-fixed-commit";
         public void Contribute(SqliteConnection connection, RetentionProtectionBuilder builder)
             => builder.ProtectCommit(commit, "protected by test provider");
+    }
+
+    [TestMethod]
+    public void Plan_OnReadOnlyConnection_DoesNotWritePagesOrTakeWriterLock()
+    {
+        using var reader = new SqliteConnection(new SqliteConnectionStringBuilder
+            { DataSource = _dbPath, Mode = SqliteOpenMode.ReadOnly }.ToString());
+        reader.Open();
+        var walBefore = _db.WalBytes;
+        var plain = new RetentionService(reader, new RetentionPolicy()).Plan();
+        Assert.IsFalse(plain.MoreRemaining);
+        Assert.AreEqual(walBefore, _db.WalBytes, "planning writes no WAL pages");
+        var admissions = new ActionProtection(() =>
+        {
+            // A separate writer can publish while planning owns its read transaction.
+            Exec("BEGIN IMMEDIATE;");
+            var runs = new IndexRunStore(_conn);
+            var run = runs.BeginRun("full", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            runs.MarkComplete(run, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), 1);
+            Exec("COMMIT;");
+        });
+        var report = new RetentionService(reader, new RetentionPolicy(), [admissions]).Plan();
+        Assert.IsFalse(report.MoreRemaining);
+        Assert.AreEqual(7L, ScalarLong("SELECT COUNT(*) FROM index_runs;"), "index publish committed during the plan");
+        using var changes = reader.CreateCommand();
+        changes.CommandText = "SELECT total_changes();";
+        Assert.AreEqual(0L, Convert.ToInt64(changes.ExecuteScalar()));
+    }
+
+    [TestMethod]
+    public void ExecuteBatch_WhenAnotherWriterOwnsLock_ReturnsBoundedBusyWithoutDeleting()
+    {
+        using var blocker = _db.OpenReadConnection();
+        using var cmd = blocker.CreateCommand();
+        cmd.CommandText = "BEGIN IMMEDIATE;";
+        cmd.ExecuteNonQuery();
+        try
+        {
+            var started = System.Diagnostics.Stopwatch.StartNew();
+            var report = new RetentionService(_conn, new RetentionPolicy()).ExecuteBatch();
+            Assert.AreEqual("sqlite_busy", report.StopReason);
+            Assert.IsTrue(report.MoreRemaining);
+            Assert.AreEqual(0, report.Deleted.Count);
+            Assert.IsTrue(started.Elapsed < TimeSpan.FromSeconds(4));
+            Assert.AreEqual(6L, ScalarLong("SELECT COUNT(*) FROM index_runs;"));
+        }
+        finally
+        {
+            cmd.CommandText = "ROLLBACK;";
+            cmd.ExecuteNonQuery();
+        }
+        Assert.IsFalse(new RetentionService(_conn, new RetentionPolicy()).Execute().MoreRemaining);
+    }
+
+    [TestMethod]
+    public void ExecuteBatch_InterruptsSqliteVm_AndRollsBackEarlierDeletes()
+    {
+        var before = ScalarLong("SELECT COUNT(*) FROM file_versions;");
+        var service = new RetentionService(_conn, new RetentionPolicy());
+        var report = service.ExecuteBatch(timeLimit: TimeSpan.FromMilliseconds(100), beforeCommit: () =>
+        {
+            using var slow = _conn.CreateCommand();
+            slow.CommandText = """
+                WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i < 1000000000)
+                SELECT SUM(i) FROM n;
+                """;
+            slow.ExecuteScalar();
+        });
+        Assert.AreEqual("time_budget", report.StopReason);
+        Assert.IsTrue(report.MoreRemaining);
+        Assert.AreEqual(before, ScalarLong("SELECT COUNT(*) FROM file_versions;"), "interrupted batch rolls back");
+        Assert.AreEqual(6L, ScalarLong("SELECT COUNT(*) FROM index_runs;"));
+        Assert.IsFalse(service.Execute().MoreRemaining, "progress handler and transaction are cleaned up");
+    }
+
+    [TestMethod]
+    public void ExecuteBatch_CancellationRollsBackAndPropagates()
+    {
+        using var cancelled = new CancellationTokenSource();
+        var service = new RetentionService(_conn, new RetentionPolicy());
+        Assert.ThrowsExactly<OperationCanceledException>(() => service.ExecuteBatch(cancelled.Token,
+            beforeCommit: () => { cancelled.Cancel(); cancelled.Token.ThrowIfCancellationRequested(); }));
+        Assert.AreEqual(6L, ScalarLong("SELECT COUNT(*) FROM index_runs;"));
+        Assert.IsFalse(service.Execute().MoreRemaining);
+    }
+
+    [TestMethod]
+    public void RepeatedBatches_Converge_AndDoNotVacuum()
+    {
+        // VACUUM changes schema_version; reusable pages remain on the freelist instead of shrinking the DB.
+        var schemaBefore = ScalarLong("PRAGMA schema_version;");
+        SeedOrphanFileVersions(RetentionService.BatchRowLimit * 2, 1, start: 200);
+        var service = new RetentionService(_conn, new RetentionPolicy { KeepCompleteGenerations = 3, ApiSnapshotKeepCommits = 10 });
+        var planned = service.Plan();
+        var total = new RetentionReport { DryRun = false };
+        var passes = 0;
+        do
+        {
+            var batch = service.ExecuteBatch();
+            Assert.IsNull(batch.StopReason);
+            Assert.IsTrue(batch.FileVersionsDeleted <= RetentionService.BatchRowLimit);
+            Assert.IsTrue(batch.ApiSnapshotsDeleted <= RetentionService.BatchRowLimit);
+            total = RetentionService.Combine(total, batch);
+            Assert.IsTrue(++passes < 100);
+        } while (total.MoreRemaining);
+        Assert.IsTrue(passes > 1);
+        Assert.AreEqual(planned.Deleted.Count, total.Deleted.Count);
+        Assert.AreEqual(planned.ApiSnapshotsDeleted, total.ApiSnapshotsDeleted);
+        Assert.AreEqual(planned.FileVersionsDeleted, total.FileVersionsDeleted);
+        Assert.AreEqual(1L, ScalarLong("SELECT COUNT(*) FROM file_versions;"));
+        Assert.AreEqual(schemaBefore, ScalarLong("PRAGMA schema_version;"), "no full VACUUM");
+        Assert.IsTrue(ScalarLong("PRAGMA freelist_count;") > 0, "freed pages are reusable, not compacted");
+    }
+
+    private sealed class ActionProtection(Action action) : IRetentionProtectionProvider
+    {
+        public string Name => "test-action";
+        public void Contribute(SqliteConnection connection, RetentionProtectionBuilder builder) => action();
     }
 }
