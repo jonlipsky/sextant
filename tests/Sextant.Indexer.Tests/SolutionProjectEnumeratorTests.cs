@@ -126,6 +126,8 @@ public sealed class SolutionProjectEnumeratorTests
     [DataRow("GlobalSection(SolutionConfigurationPlatforms) = preSolution\nDebug|Any CPU = Debug|Any CPU\nEndGlobal")]
     [DataRow("GlobalSection(SolutionConfigurationPlatforms) = preSolution\nDebug|Any CPU = Debug|Any CPU\nEndProjectSection\nEndGlobal")]
     [DataRow("UnexpectedEntry\nEndGlobal")]
+    [DataRow("ProjectSection(ProjectDependencies) = postProject\nEndProjectSection\nEndGlobal")]
+    [DataRow("GlobalSection(SolutionConfigurationPlatforms) = preSolution\nGlobalSection(Nested) = preSolution\nEndGlobalSection\nEndGlobal")]
     public void ClassicSln_WithMalformedSection_DiscardsEarlierProjects(string tail)
     {
         var path = Path.Combine(_dir, "Sections.sln");
@@ -133,6 +135,23 @@ public sealed class SolutionProjectEnumeratorTests
             "Microsoft Visual Studio Solution File, Format Version 12.00\n" +
             "Project(\"{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}\") = \"Lib\", \"Lib.csproj\", \"{11111111-1111-1111-1111-111111111111}\"\n" +
             "EndProject\nGlobal\n" + tail);
+        var result = SolutionProjectEnumerator.Read(path);
+        Assert.IsFalse(result.IsReadable);
+        Assert.AreEqual(0, result.Projects.Count);
+    }
+
+    [TestMethod]
+    [DataRow("ProjectSection(ProjectDependencies) = postProject\nInvalidEntry\nEndProjectSection\nEndProject")]
+    [DataRow("ProjectSection(ProjectDependencies) = postProject\nEndGlobalSection\nEndProject")]
+    [DataRow("ProjectSection(ProjectDependencies) = postProject\nEndProject")]
+    [DataRow("GlobalSection(SolutionConfigurationPlatforms) = preSolution\nEndGlobalSection\nEndProject")]
+    public void ClassicSln_WithMalformedProjectSection_IsUnreadable(string tail)
+    {
+        var path = Path.Combine(_dir, "Sections.sln");
+        File.WriteAllText(path,
+            "Microsoft Visual Studio Solution File, Format Version 12.00\n" +
+            "Project(\"{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}\") = \"Lib\", \"Lib.csproj\", \"{11111111-1111-1111-1111-111111111111}\"\n" +
+            tail);
         var result = SolutionProjectEnumerator.Read(path);
         Assert.IsFalse(result.IsReadable);
         Assert.AreEqual(0, result.Projects.Count);

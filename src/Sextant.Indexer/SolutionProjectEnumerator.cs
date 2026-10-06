@@ -60,104 +60,105 @@ internal static class SolutionProjectEnumerator
         }
     }
 
+    private enum SlnState
+    {
+        Header,
+        TopLevel,
+        Project,
+        ProjectSection,
+        Global,
+        GlobalSection
+    }
+
     private static IEnumerable<string> ParseSln(string solutionPath)
     {
         var paths = new List<string>();
-        var header = false;
-        var inProject = false;
-        var inGlobal = false;
-        string? sectionEnd = null;
+        var state = SlnState.Header;
         foreach (var line in File.ReadLines(solutionPath))
         {
             var trimmed = line.Trim();
             if (trimmed.Length == 0)
                 continue;
-            if (!header)
-            {
-                if (!trimmed.StartsWith("Microsoft Visual Studio Solution File, Format Version ", StringComparison.Ordinal))
-                    throw new FormatException("Invalid solution header.");
-                header = true;
-                continue;
-            }
-            if (trimmed == "EndProject")
-            {
-                if (!inProject || sectionEnd != null) throw new FormatException("Unmatched EndProject.");
-                inProject = false;
-                continue;
-            }
-            if (trimmed == "Global")
-            {
-                if (inProject || inGlobal) throw new FormatException("Invalid Global block.");
-                inGlobal = true;
-                continue;
-            }
-            if (trimmed == "EndGlobal")
-            {
-                if (!inGlobal || sectionEnd != null) throw new FormatException("Unmatched EndGlobal.");
-                inGlobal = false;
-                continue;
-            }
-            if (trimmed.StartsWith("ProjectSection(", StringComparison.Ordinal) ||
-                trimmed.StartsWith("GlobalSection(", StringComparison.Ordinal))
-            {
-                var projectSection = trimmed.StartsWith("ProjectSection(", StringComparison.Ordinal);
-                if (sectionEnd != null || !(projectSection ? inProject : inGlobal) ||
-                    !trimmed.Contains(") =", StringComparison.Ordinal))
-                    throw new FormatException("Invalid solution section.");
-                sectionEnd = projectSection ? "EndProjectSection" : "EndGlobalSection";
-                continue;
-            }
-            if (trimmed is "EndProjectSection" or "EndGlobalSection")
-            {
-                if (sectionEnd != trimmed) throw new FormatException("Unmatched section end.");
-                sectionEnd = null;
-                continue;
-            }
-            if (!trimmed.StartsWith("Project(", StringComparison.Ordinal))
-            {
-                if (trimmed.StartsWith('#')) continue;
-                if (sectionEnd != null)
-                {
-                    if (!trimmed.Contains('=')) throw new FormatException("Invalid section entry.");
-                    continue;
-                }
-                if (inProject || inGlobal ||
-                    (!trimmed.StartsWith("VisualStudioVersion =", StringComparison.Ordinal) &&
-                     !trimmed.StartsWith("MinimumVisualStudioVersion =", StringComparison.Ordinal)))
-                    throw new FormatException("Unrecognized solution entry.");
-                continue;
-            }
-
-            if (inProject || inGlobal) throw new FormatException("Invalid project block.");
-            inProject = true;
-
-            // Classic .sln project entries are strictly positional:
-            //   Project("{typeGuid}") = "DisplayName", "relative\path.csproj", "{projectGuid}"
-            // Split on the separating '=' so the type GUID on the left (itself a quoted token) is not
-            // miscounted, then take the SECOND quoted token on the right — the path field. Taking it
-            // positionally (rather than scanning for the first token with a recognized extension) is
-            // correct even when the DISPLAY NAME itself ends in a project extension; an extension scan
-            // would pick the name and resolve it to the wrong folder. Solution folders put a bare folder
-            // name in the path field, so the extension check below excludes them. Parsing is per-entry: a
-            // malformed line invalidates the entire enumeration, never a strict subset.
-            var separator = trimmed.IndexOf('=');
-            if (separator < 0)
-                throw new FormatException("Invalid project entry.");
-
-            var tokens = QuotedToken.Matches(trimmed[(separator + 1)..]);
-            var typeTokens = QuotedToken.Matches(trimmed[..separator]);
-            if (tokens.Count != 3 || typeTokens.Count != 1 ||
-                !Guid.TryParse(typeTokens[0].Groups[1].Value, out _) ||
-                !Guid.TryParse(tokens[2].Groups[1].Value, out _))
-                throw new FormatException("Invalid project entry.");
-
-            var path = tokens[1].Groups[1].Value;
-            if (RecognizedExtensions.Contains(Path.GetExtension(path)))
-                paths.Add(path);
+            state = ReadSlnEntry(trimmed, state, paths);
         }
-        if (!header || inProject || inGlobal || sectionEnd != null)
+        if (state != SlnState.TopLevel)
             throw new FormatException("Truncated solution.");
         return paths;
+    }
+
+    private static SlnState ReadSlnEntry(string entry, SlnState state, List<string> paths)
+    {
+        if (state == SlnState.Header)
+        {
+            if (!entry.StartsWith("Microsoft Visual Studio Solution File, Format Version ", StringComparison.Ordinal))
+                throw new FormatException("Invalid solution header.");
+            return SlnState.TopLevel;
+        }
+        if (entry.StartsWith('#'))
+            return state;
+        switch (entry)
+        {
+            case "EndProject":
+                if (state != SlnState.Project) throw new FormatException("Unmatched EndProject.");
+                return SlnState.TopLevel;
+            case "Global":
+                if (state != SlnState.TopLevel) throw new FormatException("Invalid Global block.");
+                return SlnState.Global;
+            case "EndGlobal":
+                if (state != SlnState.Global) throw new FormatException("Unmatched EndGlobal.");
+                return SlnState.TopLevel;
+            case "EndProjectSection":
+                if (state != SlnState.ProjectSection) throw new FormatException("Unmatched section end.");
+                return SlnState.Project;
+            case "EndGlobalSection":
+                if (state != SlnState.GlobalSection) throw new FormatException("Unmatched section end.");
+                return SlnState.Global;
+        }
+        if (entry.StartsWith("ProjectSection(", StringComparison.Ordinal))
+        {
+            if (state != SlnState.Project || !entry.Contains(") =", StringComparison.Ordinal))
+                throw new FormatException("Invalid solution section.");
+            return SlnState.ProjectSection;
+        }
+        if (entry.StartsWith("GlobalSection(", StringComparison.Ordinal))
+        {
+            if (state != SlnState.Global || !entry.Contains(") =", StringComparison.Ordinal))
+                throw new FormatException("Invalid solution section.");
+            return SlnState.GlobalSection;
+        }
+        if (entry.StartsWith("Project(", StringComparison.Ordinal))
+        {
+            if (state != SlnState.TopLevel) throw new FormatException("Invalid project block.");
+            var path = ReadSlnProjectPath(entry);
+            if (RecognizedExtensions.Contains(Path.GetExtension(path)))
+                paths.Add(path);
+            return SlnState.Project;
+        }
+        if (state is SlnState.ProjectSection or SlnState.GlobalSection)
+        {
+            if (!entry.Contains('=')) throw new FormatException("Invalid section entry.");
+            return state;
+        }
+        if (state == SlnState.TopLevel &&
+            (entry.StartsWith("VisualStudioVersion =", StringComparison.Ordinal) ||
+             entry.StartsWith("MinimumVisualStudioVersion =", StringComparison.Ordinal)))
+            return state;
+        throw new FormatException("Unrecognized solution entry.");
+    }
+
+    private static string ReadSlnProjectPath(string entry)
+    {
+        // The path is the second RHS token, even when the display name ends in a project extension.
+        var separator = entry.IndexOf('=');
+        if (separator < 0)
+            throw new FormatException("Invalid project entry.");
+        var tokens = QuotedToken.Matches(entry[(separator + 1)..]);
+        var typeTokens = QuotedToken.Matches(entry[..separator]);
+        if (tokens.Count != 3 || typeTokens.Count != 1 ||
+            !Guid.TryParse(typeTokens[0].Groups[1].Value, out _) ||
+            !Guid.TryParse(tokens[2].Groups[1].Value, out _))
+            throw new FormatException("Invalid project entry.");
+        return tokens[1].Groups[1].Value;
     }
 
     private static IEnumerable<string> ParseSlnx(string solutionPath)
