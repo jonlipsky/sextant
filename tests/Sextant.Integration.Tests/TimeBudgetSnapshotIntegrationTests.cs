@@ -153,7 +153,9 @@ public sealed class TimeBudgetSnapshotIntegrationTests : IDisposable
                 .Select(p => p.Message)
                 .ToList();
             Assert.AreEqual(1, notes.Count, string.Join("\n", notes) + "\n" + string.Join("\n", log));
-            StringAssert.StartsWith(notes[0], "Package restore did not finish within 0s and was stopped");
+            Assert.IsTrue(notes[0].Contains("package restore did not finish within 0s and was stopped",
+                    StringComparison.OrdinalIgnoreCase),
+                "single-solution and project-union restore diagnostics both retain the timeout detail");
             Assert.IsNotNull(result.SnapshotId, result.Error + "\n" + string.Join("\n", log));
         }
     }

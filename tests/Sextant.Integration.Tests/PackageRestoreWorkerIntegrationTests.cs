@@ -70,8 +70,8 @@ public sealed class PackageRestoreWorkerIntegrationTests : IDisposable
         var result = await new LocalIndexerSnapshotWorker(db, config, new FixedCheckoutProvider(resolution))
             .ProduceAsync(request, identity, scratch, CancellationToken.None);
 
-        Assert.AreEqual(SnapshotJobStatus.Complete, result.Status,
-            "a package nothing uses is a load issue, not a binding gap: " + result.Error);
+        Assert.AreEqual(SnapshotJobStatus.Partial, result.Status,
+            "an incomplete best-effort restore is reported as partial even when these call sites bind: " + result.Error);
         foreach (var project in new[] { "Abs", "Core", "App" })
         {
             Assert.IsTrue(File.Exists(Path.Combine(_checkout, "src", project, "obj", "project.assets.json")),
@@ -85,7 +85,9 @@ public sealed class PackageRestoreWorkerIntegrationTests : IDisposable
         Assert.IsFalse(refs.Any(r => r.IsCandidate), "and bound exactly, because App got its transitive reference");
 
         var coverage = new SnapshotCoverageStore(conn).Get(result.SnapshotId!.Value)!;
-        Assert.AreEqual(SnapshotCoverageVerdict.Complete, coverage.Verdict, string.Join(" ", coverage.Reasons));
+        Assert.AreEqual(SnapshotCoverageVerdict.Partial, coverage.Verdict, string.Join(" ", coverage.Reasons));
+        Assert.IsTrue(coverage.Reasons.Any(reason =>
+            reason.Contains("package restore was incomplete", StringComparison.Ordinal)));
         Assert.AreEqual(
             $"Package restore could not find 1 package(s) ({MissingPackage}) for 1 project(s); code that uses them may not bind.",
             coverage.Notes!.Single());
