@@ -11,7 +11,7 @@ namespace Sextant.Indexer;
 /// entries are ignored. Parsing is best-effort and never throws: an unreadable/unknown solution yields
 /// an empty list and the caller degrades to the previous whole-solution load.
 /// </summary>
-internal static class SolutionProjectEnumerator
+public static class SolutionProjectEnumerator
 {
     private static readonly HashSet<string> RecognizedExtensions =
         new(StringComparer.OrdinalIgnoreCase) { ".csproj", ".vbproj", ".fsproj" };

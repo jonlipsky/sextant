@@ -61,8 +61,14 @@ public static class IndexConfigurationHash
     /// member's C# declaration (<c>symbols.declaration</c>, migration 026) for the tools' <c>signature</c> field,
     /// so a snapshot indexed before it has no declarations and must not be reused for the same identity.
     /// </para>
+    /// <para>
+    /// <c>"5"</c> → <c>"6"</c> (issue #246): the service worker restores the selected solutions' deduplicated
+    /// project union in one bounded MSBuild traversal, preserving the final selected-solution globals per
+    /// project. A repository previously left partially restored by repeated per-solution work must be indexed
+    /// again under the new restore policy.
+    /// </para>
     /// </remarks>
-    public const string AnalyzerVersion = "5";
+    public const string AnalyzerVersion = "6";
 
     /// <summary>
     /// Computes the configuration hash for a resolved profile. The canonical pre-image is a fixed,
