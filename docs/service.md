@@ -1745,9 +1745,14 @@ and inspect its report, but **no schedule is enabled or approved by this change*
 remains deferred pending operator validation on a representative catalog.
 
 Multi-project snapshot GC withdraws publication (`failed`, NULL run/publish pointer) atomically with
-the first project deletion. This tombstone remains eligible across batches even for a quota eviction
-within a retained run. An intervening ensure must **rebuild**, never re-select half-collected data;
-restaging assigns a new run and pending protection immediately stops further collection.
+the first project deletion, including every affected downstream consumer/overlay, transitively and
+cycle-safely. A provider cascade can remove a consumer's dependency edges and occurrences, so invalidating
+only the provider would leave damaged consumer data reusable. These tombstones remain eligible across
+batches even for a quota eviction within a retained run. An intervening ensure must **rebuild**, never
+re-select half-collected data; restaging assigns a new run and pending protection immediately stops
+further collection. Ledger rows owned by surviving snapshots (including retained providers/bases on
+expired runs) stay until those snapshots are collected, so normal GC never manufactures a legacy
+NULL ownership pointer and permanently protects healthy data.
 
 ## Snapshot source text (#244)
 

@@ -160,19 +160,7 @@ public sealed class RetentionService
             if (snapshots.Count > 0)
             {
                 var id = snapshots[0];
-                // A multi-project GC spans transactions. Withdraw publication in the FIRST deletion
-                // transaction so an ensure cannot re-select a half-collected snapshot between batches.
-                // NULL ownership keeps this tombstone eligible even if it was a quota eviction inside
-                // the run keep-window. A retry restages it with a new run and becomes protected again.
-                using (var invalidate = _connection.CreateCommand())
-                {
-                    invalidate.CommandText = """
-                        UPDATE snapshots SET status = @failed, run_id = NULL, published_at = NULL WHERE id = @id;
-                        """;
-                    invalidate.Parameters.AddWithValue("@failed", SnapshotStatus.Failed);
-                    invalidate.Parameters.AddWithValue("@id", id);
-                    invalidate.ExecuteNonQuery();
-                }
+                WithdrawAffectedPublication(id, snapshots.ToHashSet());
                 using var cmd = _connection.CreateCommand();
                 cmd.CommandText = "DELETE FROM projects WHERE id IN (SELECT id FROM projects WHERE snapshot_id = @id ORDER BY id LIMIT 1);";
                 cmd.Parameters.AddWithValue("@id", id);
@@ -326,6 +314,16 @@ public sealed class RetentionService
         // Snapshot-data GC (issue #46): reclaim the semantic rows owned by snapshots that no retained
         // generation, branch pointer, overlay base, or retained consumer still references (issue #54).
         var orphanedSnapshotIds = OrphanedSnapshotIds(deletableRunIds);
+        // A retained provider/base may own an expired run. Keep that ledger row until its last
+        // surviving snapshot is collected; otherwise ON DELETE SET NULL manufactures legacy-unknown
+        // ownership and makes healthy data permanently protected on the following pass.
+        var orphaned = orphanedSnapshotIds.ToHashSet();
+        var retainedRunIds = new SnapshotStore(_connection).GetSnapshotsForRetention()
+            .Where(s => !orphaned.Contains(s.id) && s.runId.HasValue)
+            .Select(s => s.runId!.Value).ToHashSet();
+        foreach (var generation in deletedGenerations.Where(g => retainedRunIds.Contains(g.Id)))
+            protectedGenerations.Add(generation with { Reason = "generation owns retained snapshot data" });
+        deletedGenerations.RemoveAll(g => retainedRunIds.Contains(g.Id));
 
         return (new RetentionReport
         {
@@ -342,6 +340,46 @@ public sealed class RetentionService
         foreach (var provider in _providers)
             provider.Contribute(_connection, builder);
         return builder.Build();
+    }
+
+    private void WithdrawAffectedPublication(long snapshotId, HashSet<long> eligible)
+    {
+        var store = new SnapshotStore(_connection);
+        var dependents = new Dictionary<long, List<long>>();
+        foreach (var (consumer, provider) in store.GetSnapshotDependencyEdges())
+        {
+            _budget?.Check();
+            (dependents.TryGetValue(provider, out var list) ? list : dependents[provider] = []).Add(consumer);
+        }
+        foreach (var snapshot in store.GetSnapshotsForRetention())
+        {
+            _budget?.Check();
+            if (snapshot.baseSnapshotId is long baseId)
+                (dependents.TryGetValue(baseId, out var list) ? list : dependents[baseId] = []).Add(snapshot.id);
+        }
+
+        // A provider cascade removes consumers' dependency edges AND target occurrences. Withdraw
+        // every affected consumer before yielding, transitively and cycle-safely, not just the owner.
+        // NULL ownership keeps these tombstones GC-eligible even inside a retained run/quota window.
+        var visited = new HashSet<long>();
+        var frontier = new Queue<long>();
+        frontier.Enqueue(snapshotId);
+        using var invalidate = _connection.CreateCommand();
+        invalidate.CommandText = "UPDATE snapshots SET status = @failed, run_id = NULL, published_at = NULL WHERE id = @id;";
+        invalidate.Parameters.AddWithValue("@failed", SnapshotStatus.Failed);
+        var id = invalidate.Parameters.Add("@id", SqliteType.Integer);
+        while (frontier.Count > 0)
+        {
+            _budget?.Check();
+            var current = frontier.Dequeue();
+            if (!visited.Add(current)) continue;
+            if (!eligible.Contains(current))
+                throw new InvalidOperationException("Retention cannot collect data required by an ineligible snapshot.");
+            id.Value = current;
+            invalidate.ExecuteNonQuery();
+            if (dependents.TryGetValue(current, out var consumers))
+                foreach (var consumer in consumers) frontier.Enqueue(consumer);
+        }
     }
 
     private static RetentionGeneration ToGeneration(IndexRun run, string reason) => new()

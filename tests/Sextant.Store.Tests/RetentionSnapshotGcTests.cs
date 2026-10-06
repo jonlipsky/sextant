@@ -257,6 +257,84 @@ public class RetentionSnapshotGcTests
         Assert.IsNull(_snapshots.GetById(_consumerOld));
     }
 
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public void ProviderCollectedFirst_WithdrawsEveryAffectedConsumerBeforeYield(bool cycle)
+    {
+        new RetentionService(_conn, Policy()).Execute();
+        var repo = _snapshots.EnsureRepository("https://github.com/org/provider-first", _now);
+        var oldRun = CompleteRun(40);
+        var provider = Snapshot(repo, oldRun, "provider-first", isProvider: true);
+        var providerProject = ProjectRow(provider, "provider-first");
+        SymbolWithBlob(providerProject, "provider-first");
+        var consumer = Snapshot(repo, oldRun, "consumer-second");
+        var consumerProject = ProjectRow(consumer, "consumer-second");
+        var consumerFile = SymbolWithBlob(consumerProject, "consumer-second");
+        var downstream = Snapshot(repo, oldRun, "downstream-third");
+        var downstreamProject = ProjectRow(downstream, "downstream-third");
+        SymbolWithBlob(downstreamProject, "downstream-third");
+        Dep(consumer, consumerProject, provider, providerProject, repo);
+        Dep(downstream, downstreamProject, consumer, consumerProject, repo);
+        if (cycle) Dep(provider, providerProject, downstream, downstreamProject, repo);
+        CompleteRun(41);
+        using (var occurrence = _conn.CreateCommand())
+        {
+            occurrence.CommandText = """
+                INSERT INTO occurrences (in_project_id, target_symbol_id, file_version_id, line, col, kind, flags)
+                SELECT @consumer, id, @file, 1, 1, 0, 0 FROM symbols WHERE project_id = @provider;
+                """;
+            occurrence.Parameters.AddWithValue("@consumer", consumerProject);
+            occurrence.Parameters.AddWithValue("@file", consumerFile);
+            occurrence.Parameters.AddWithValue("@provider", providerProject);
+            occurrence.ExecuteNonQuery();
+        }
+
+        var retention = new RetentionService(_conn, Policy());
+        // The earlier fixture's formerly-servable consumer may expire first. Stop at the provider's batch.
+        for (var i = 0; _snapshots.GetById(provider) != null && i < 20; i++)
+            Assert.IsNull(retention.ExecuteBatch().StopReason);
+        Assert.IsNull(_snapshots.GetById(provider));
+        Assert.AreEqual(0L, ScalarLong($"SELECT COUNT(*) FROM occurrences WHERE in_project_id = {consumerProject};"),
+            "the provider-symbol cascade has removed the consumer's occurrence");
+        foreach (var affected in new[] { consumer, downstream })
+        {
+            Assert.IsNotNull(_snapshots.GetById(affected), "the consumer still has data when the writer yields");
+            Assert.AreEqual(SnapshotStatus.Failed, _snapshots.GetById(affected)!.Status);
+            Assert.IsNull(_snapshots.GetById(affected)!.PublishedAt);
+            Assert.IsFalse(_snapshots.IsReselectable(affected), "lost edges cannot let damaged data be reselected");
+        }
+        Assert.IsFalse(retention.Execute().MoreRemaining, "cycle-safe withdrawal still converges");
+    }
+
+    [TestMethod]
+    public void RetainedProvider_KeepsItsLedgerOwnership_ThenExpiresWithItsLastConsumer()
+    {
+        new RetentionService(_conn, Policy()).Execute();
+        var repo = _snapshots.EnsureRepository("https://github.com/org/ledger", _now);
+        var providerRun = CompleteRun(40);
+        var provider = Snapshot(repo, providerRun, "ledger-provider", isProvider: true);
+        var providerProject = ProjectRow(provider, "ledger-provider");
+        var consumerRun = CompleteRun(41);
+        var consumer = Snapshot(repo, consumerRun, "ledger-consumer");
+        var consumerProject = ProjectRow(consumer, "ledger-consumer");
+        Dep(consumer, consumerProject, provider, providerProject, repo);
+        CompleteRun(42);
+        var runs = new IndexRunStore(_conn);
+
+        var report = new RetentionService(_conn, new RetentionPolicy { KeepCompleteGenerations = 2 }).Execute();
+        Assert.IsFalse(report.MoreRemaining);
+        Assert.AreEqual(providerRun, _snapshots.GetById(provider)!.RunId, "GC never manufactures unknown ownership");
+        Assert.IsNotNull(runs.GetById(providerRun), "retained dependency ownership keeps the expired ledger row");
+        Assert.IsTrue(report.Protected.Any(g => g.Id == providerRun));
+
+        Assert.IsFalse(new RetentionService(_conn, new RetentionPolicy { KeepCompleteGenerations = 1 }).Execute().MoreRemaining);
+        Assert.IsNull(_snapshots.GetById(consumer));
+        Assert.IsNull(_snapshots.GetById(provider), "healthy provider expires instead of becoming permanently protected");
+        Assert.IsNull(runs.GetById(providerRun));
+        Assert.IsNull(runs.GetById(consumerRun));
+    }
+
     private void Exec(string sql)
     {
         using var cmd = _conn.CreateCommand();
