@@ -374,6 +374,13 @@ implementation.
 
 Returns reference locations with `reference_kind` (invocation, type_ref, attribute, inheritance, override, object_creation) and `context_snippet`. A location whose code did not bind exactly (overload resolution failed, typically because an argument or parameter type is unresolved on the indexer, or the call is ambiguous) is still returned, against each compiler candidate, with `"candidate": true`, like a candidate location in Roslyn's Find References. Exact locations carry no `candidate` field.
 
+With the default document extractor (analyzer version 6), a source-declared constructor can be queried by its
+exact name, such as `Ns.Widget.Widget(int)`, or its symbol key `M:Ns.Widget.#ctor(System.Int32)`. Results
+include only creations bound to that overload (explicit or target-typed `new`) and explicit `this(...)`/`base(...)`
+initializer calls to it. An ambiguous constructor name remains an error with actionable overload names;
+query the type instead to see its type usages and all object creations. Pre-version-6 snapshots lack the
+constructor occurrences until they are indexed again; this is not a query-time fallback to all type usages.
+
 ### get_type_members
 
 Members of a type with their signatures.
@@ -398,6 +405,10 @@ All symbols defined in a source file.
 Callers or callees of a method with configurable depth. It includes calls a text search misses (a call
 through a `using` alias or `using static`, a call made through an interface); as with `find_references`, a call
 through an interface is an edge to the interface member, not to the implementation.
+
+The default document extractor also records creation and explicit initializer edges to source-declared
+constructor overloads, so callers and callees traverse constructor chains. A field initializer contributes
+a constructor reference but no synthetic caller. Implicit and metadata-only constructors are not stored.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|

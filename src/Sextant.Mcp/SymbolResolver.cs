@@ -842,10 +842,14 @@ public static class SymbolResolver
     {
         var listed = string.Join("; ", candidates.Take(MaxSuggestions).Select(Describe));
         var more = matchCount > MaxSuggestions ? $" (and {matchCount - MaxSuggestions} more)" : string.Empty;
+        var guidance = candidates.Count > 0 && candidates.All(c => c.Kind == "constructor")
+            ? $"To query one constructor overload, pass its fully_qualified_name with the parameter list " +
+              $"(e.g. '{candidates[0].FullyQualifiedName}') or its symbol_key."
+            : "Pass one of these names exactly (or its symbol_key), " +
+              "or qualify the name with its containing type and parameter list, e.g. 'Type.Method(int)'.";
         var message =
             $"'{raw}' matches {matchCount} different symbols{(where is null ? string.Empty : " " + where)}, and this " +
-            $"tool needs exactly one. Candidates: {listed}{more}. Pass one of these names exactly (or its symbol_key), " +
-            "or qualify the name with its containing type and parameter list, e.g. 'Type.Method(int)'.";
+            $"tool needs exactly one. Candidates: {listed}{more}. {guidance}";
         return ResponseBuilder.BuildSymbolError(
             ResponseBuilder.AmbiguousSymbolCode, message, candidates, matchCount, provenance);
     }
