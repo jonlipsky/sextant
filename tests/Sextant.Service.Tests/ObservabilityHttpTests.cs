@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Hosting;
@@ -133,11 +134,53 @@ public class ObservabilityHttpTests
             "request-supplied hard_isolation/recent_backup flags are ignored — #76 is still not satisfied");
     }
 
-    private static async Task EnsureViaControl(Harness host)
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task Completeness_ReflectsTerminalJobs_InMetricsAndPilot(bool partial)
+    {
+        await using var host = await Harness.StartAsync(partial);
+        for (var i = 0; i < 5; i++)
+            await EnsureViaControl(host, $"commit-{i}");
+
+        using var metricsResponse = await Send(host, "/control/metrics", ControlToken);
+        Assert.AreEqual(HttpStatusCode.OK, metricsResponse.StatusCode);
+        using var metrics = JsonDocument.Parse(await metricsResponse.Content.ReadAsStringAsync());
+        var jobs = metrics.RootElement.GetProperty("jobs");
+        Assert.AreEqual(1.0, jobs.GetProperty("success_rate").GetDouble());
+        Assert.AreEqual(partial ? 0.0 : 1.0, jobs.GetProperty("completeness_rate").GetDouble());
+        var alerts = metrics.RootElement.GetProperty("alerts").EnumerateArray().ToArray();
+        Assert.AreEqual(partial, alerts.Any(a => a.GetProperty("id").GetString() == "low_completeness_rate"));
+        Assert.IsFalse(alerts.Any(a => a.GetProperty("id").GetString() == "low_success_rate"));
+
+        using var pilotResponse = await Send(host, "/control/pilot?workload=trusted", ControlToken);
+        Assert.AreEqual(HttpStatusCode.OK, pilotResponse.StatusCode);
+        using var pilot = JsonDocument.Parse(await pilotResponse.Content.ReadAsStringAsync());
+        var check = pilot.RootElement.GetProperty("checks").EnumerateArray()
+            .Single(c => c.GetProperty("id").GetString() == "snapshot_completeness");
+        Assert.AreEqual(!partial, check.GetProperty("passed").GetBoolean());
+        Assert.IsFalse(check.GetProperty("blocking").GetBoolean());
+    }
+
+    [TestMethod]
+    public async Task Pilot_WithoutTerminalJobs_CompletenessIsNotAssessed()
+    {
+        await using var host = await Harness.StartAsync();
+        using var response = await Send(host, "/control/pilot?workload=untrusted", ControlToken);
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+        using var pilot = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        var check = pilot.RootElement.GetProperty("checks").EnumerateArray()
+            .Single(c => c.GetProperty("id").GetString() == "snapshot_completeness");
+        Assert.IsFalse(check.GetProperty("passed").GetBoolean());
+        Assert.IsTrue(check.GetProperty("blocking").GetBoolean());
+        StringAssert.Contains(check.GetProperty("message").GetString()!, "not assessed");
+    }
+
+    private static async Task EnsureViaControl(Harness host, string commit = "commit-aaaa")
     {
         using var request = new HttpRequestMessage(HttpMethod.Post, "/control/ensure")
         {
-            Content = JsonContent.Create(ServiceTestFixtures.Request(), options: ServiceJson.Options)
+            Content = JsonContent.Create(ServiceTestFixtures.Request(commit: commit), options: ServiceJson.Options)
         };
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", ControlToken);
         var response = await host.Client.SendAsync(request);
@@ -160,14 +203,18 @@ public class ObservabilityHttpTests
         private IndexDatabase Db { get; init; } = null!;
         private string DbPath { get; init; } = "";
 
-        public static async Task<Harness> StartAsync()
+        public static async Task<Harness> StartAsync(bool partial = false)
         {
             var dbPath = ServiceTestFixtures.NewDbPath();
             var db = new IndexDatabase(dbPath);
             db.RunMigrations();
 
             var options = ServiceTestFixtures.NewOptions(dbPath, controlToken: ControlToken, queryToken: QueryToken);
-            var service = SnapshotService.Start(options, new FakeSnapshotWorker(db), db);
+            var worker = new FakeSnapshotWorker(db, partial
+                ? (self, request) => SnapshotWorkResult.Partial(
+                    ServiceTestFixtures.PublishComplete(self.Database, request), "Some projects did not load.")
+                : null);
+            var service = SnapshotService.Start(options, worker, db);
 
             var builder = WebApplication.CreateBuilder();
             builder.WebHost.UseTestServer();

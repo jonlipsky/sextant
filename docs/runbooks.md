@@ -23,8 +23,18 @@ cross-tenant counts to a tenant (criterion-1 leakage guard).
 | Is a workload safe to pilot? | `GET /control/pilot?workload=…` |
 | Distributed traces | `Sextant.Service` `ActivitySource` (wire OpenTelemetry) |
 
-Alerts evaluated over the metrics snapshot: `queue_delay_high`, `low_success_rate`, `worker_exhaustion`,
-`storage_pressure`.
+Alerts evaluated over the metrics snapshot: `queue_delay_high`, `low_success_rate`, `low_completeness_rate`,
+`worker_exhaustion`, `storage_pressure`.
+
+`low_completeness_rate` warns when complete / terminal jobs is below 90% and is critical below 50%,
+after at least five terminal jobs. Equality at 90% is healthy; equality at 50% is warning, not critical.
+Partial publication remains a success for `low_success_rate`, but lowers completeness. These defaults
+are configurable through `AlertThresholds.CompletenessRateWarn`, `CompletenessRateCrit`, and the shared
+`SuccessRateMinSamples` programmatic settings (no environment-variable overrides). Inspect
+`/control/status/{jobId}` and `/control/resolve` for `coverage.reasons`, then check the repository's
+`solutions` configuration and project-load/submodule diagnostics. With too few terminal jobs the rate
+is not assessed; the no-sample exported value of 1.0 is not proof of healthy coverage. This signal uses
+recorded job outcomes, not a new coverage audit of legacy snapshots.
 
 ---
 
@@ -231,10 +241,13 @@ into existence with a query flag.
 | 6 | Catalog recovery completed cleanly on last start | `catalog_recovered` |
 | 7 | Worker capacity available | `worker_capacity` |
 | 8 | No active **critical** alerts | `no_critical_alerts` |
+| 9 | Job completeness meets the warning threshold with enough samples | `snapshot_completeness` — advisory for `trusted`, blocking for `untrusted`; missing/insufficient samples are not assessed and do not pass |
 
 - **Trusted single-tenant** pilots may exit with #76 informational (not blocking), but still require a
   secured control plane (check 2) — a tokenless control plane exposes cross-tenant observability/audit and
   is dev-only.
+- The completeness check is advisory for trusted workloads, but a **critical** `low_completeness_rate`
+  alert still blocks them via check 8. For untrusted workloads, both low and unassessed completeness block.
 - **Untrusted / multi-tenant** pilots **cannot** exit until #76 is green — the gate returns *not ready* and
   names `hard_os_isolation` as the blocker, no matter how healthy everything else is.
 

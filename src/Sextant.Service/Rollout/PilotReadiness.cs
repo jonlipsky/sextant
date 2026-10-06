@@ -51,6 +51,9 @@ public sealed record PilotReadinessInput
 
     /// <summary>The current alerts (a critical alert blocks pilot readiness).</summary>
     public IReadOnlyList<Alert> Alerts { get; init; } = [];
+
+    /// <summary>Observed job outcomes; null or too few terminal jobs means completeness is not assessed.</summary>
+    public JobMetrics? Jobs { get; init; }
 }
 
 /// <summary>One evaluated pilot exit-criterion check.</summary>
@@ -88,14 +91,20 @@ public sealed record PilotReadinessReport
 /// isolation (#76) is available. A trusted single-tenant pilot may proceed on the in-process sandbox
 /// (that check is advisory for it), but is never marked ready with authz disabled, the sandbox off, no
 /// restorable backup, an unrecovered catalog, no worker capacity, or an active critical alert. Pure and
-/// deterministic.
+/// deterministic. Snapshot completeness is advisory for trusted workloads and blocking for untrusted
+/// workloads; missing or insufficient job samples do not pass that check.
 /// </summary>
 public static class PilotReadiness
 {
-    public static PilotReadinessReport Evaluate(PilotReadinessInput input)
+    public static PilotReadinessReport Evaluate(PilotReadinessInput input, AlertThresholds? thresholds = null)
     {
+        var t = thresholds ?? AlertThresholds.Default;
         var untrusted = input.WorkloadClass == PilotWorkloadClass.UntrustedMultiTenant;
         var hasCritical = input.Alerts.Any(a => a.Level == AlertLevel.Critical);
+        var completenessAssessed = input.Jobs is { Terminal: > 0 } jobs &&
+                                   jobs.Terminal >= t.SuccessRateMinSamples;
+        var completenessPassed = completenessAssessed &&
+                                 input.Jobs!.CompletenessRate >= t.CompletenessRateWarn;
 
         var checks = new List<PilotCheck>
         {
@@ -168,6 +177,18 @@ public static class PilotReadiness
                 Message = input.WorkerCapacityAvailable
                     ? "Worker capacity is available to produce snapshots end-to-end."
                     : "No worker capacity — a pilot node must be able to produce snapshots."
+            },
+            new()
+            {
+                Id = "snapshot_completeness",
+                Passed = completenessPassed,
+                Blocking = untrusted,
+                Message = !completenessAssessed
+                    ? $"Snapshot completeness is not assessed: need at least {Math.Max(1, t.SuccessRateMinSamples)} terminal jobs."
+                    : completenessPassed
+                        ? $"Job completeness rate {input.Jobs!.CompletenessRate:P0} meets threshold {t.CompletenessRateWarn:P0}."
+                        : $"Job completeness rate {input.Jobs!.CompletenessRate:P0} is below threshold {t.CompletenessRateWarn:P0}. " +
+                          "Inspect coverage.reasons and the solutions config."
             },
             new()
             {
