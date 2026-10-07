@@ -120,9 +120,23 @@ public sealed record SnapshotCoverage
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public TimeBudgetCoverage? TimeBudget { get; init; }
 
+    /// <summary>
+    /// Immutable rebuild provenance, recorded at publish, not a coverage verdict. Absent on ordinary runs.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public SnapshotRebuild? Rebuild { get; init; }
+
     /// <summary>True when <see cref="Verdict"/> is <see cref="SnapshotCoverageVerdict.Partial"/>.</summary>
     [JsonIgnore]
     public bool IsPartial => string.Equals(Verdict, SnapshotCoverageVerdict.Partial, StringComparison.Ordinal);
+}
+
+/// <summary>Provenance of an explicitly requested, independently addressable rebuild generation.</summary>
+public sealed record SnapshotRebuild
+{
+    public required string Generation { get; init; }
+    /// <summary>The same inputs with no rebuild token, not an overlay base or a retention dependency.</summary>
+    public required string OriginalIdentityHash { get; init; }
 }
 
 /// <summary>

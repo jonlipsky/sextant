@@ -28,6 +28,17 @@ public class SnapshotIdentityTests
     };
 
     [TestMethod]
+    public void RebuildGeneration_IsOptionalDeterministicAndSeparatesPublishedData()
+    {
+        var original = Identity(null, false);
+        Assert.AreEqual(original.Hash, (original with { RebuildGeneration = null }).Hash);
+        var rebuilt = original with { RebuildGeneration = "operator-1" };
+        Assert.AreNotEqual(original.Hash, rebuilt.Hash);
+        Assert.AreEqual(rebuilt.Hash, (original with { RebuildGeneration = "operator-1" }).Hash);
+        Assert.AreNotEqual(rebuilt.Hash, (original with { RebuildGeneration = "operator-2" }).Hash);
+    }
+
+    [TestMethod]
     public void DirtyOverlay_AndDirtyFallback_SameTree_HaveDistinctIdentities()
     {
         var overlay = Identity("delta_edit1", isOverlay: true);

@@ -11,6 +11,10 @@ public sealed record AlertThresholds
     public double SuccessRateWarn { get; init; } = 0.90;
     public double SuccessRateCrit { get; init; } = 0.50;
 
+    /// <summary>Terminal-job completeness rate below which a warning/critical low-completeness alert fires.</summary>
+    public double CompletenessRateWarn { get; init; } = 0.90;
+    public double CompletenessRateCrit { get; init; } = 0.50;
+
     /// <summary>Queued-job depth (with no worker capacity) above which a worker-exhaustion alert fires.</summary>
     public long WorkerExhaustionQueueWarn { get; init; } = 1;
 
@@ -18,7 +22,7 @@ public sealed record AlertThresholds
     public long StorageWarnBytes { get; init; } = 0;
     public long StorageCritBytes { get; init; } = 0;
 
-    /// <summary>The minimum terminal-job sample size before the success-rate alert is meaningful.</summary>
+    /// <summary>The minimum terminal-job sample size before success/completeness-rate alerts are meaningful.</summary>
     public long SuccessRateMinSamples { get; init; } = 5;
 
     public static readonly AlertThresholds Default = new();
@@ -28,7 +32,8 @@ public sealed record AlertThresholds
 /// Evaluates operational alerts over a <see cref="MetricsSnapshot"/> (criterion 5: alerts). Pure and
 /// deterministic — no I/O — so the same snapshot always yields the same alerts, which is what the pilot
 /// gate and the tests rely on. Fires on queue backup, low success/completeness, worker exhaustion, and
-/// (when configured) storage pressure. Returns an empty list when everything is healthy.
+/// (when configured) storage pressure. Rate alerts require enough terminal samples; an empty list alone
+/// does not prove completeness.
 /// </summary>
 public static class AlertEvaluator
 {
@@ -57,7 +62,7 @@ public static class AlertEvaluator
                 });
         }
 
-        // Low success/completeness: too many terminal jobs failed/unsupported.
+        // Low success: partial snapshots still count as successfully published.
         if (snapshot.Jobs.Terminal >= t.SuccessRateMinSamples)
         {
             var success = snapshot.Jobs.SuccessRate;
@@ -74,6 +79,27 @@ public static class AlertEvaluator
                     Id = "low_success_rate",
                     Level = AlertLevel.Warning,
                     Message = $"Job success rate {success:P0} is below warning threshold {t.SuccessRateWarn:P0}."
+                });
+        }
+
+        if (snapshot.Jobs.Terminal > 0 && snapshot.Jobs.Terminal >= t.SuccessRateMinSamples)
+        {
+            var completeness = snapshot.Jobs.CompletenessRate;
+            if (completeness < t.CompletenessRateCrit)
+                alerts.Add(new Alert
+                {
+                    Id = "low_completeness_rate",
+                    Level = AlertLevel.Critical,
+                    Message = $"Job completeness rate {completeness:P0} is below critical threshold {t.CompletenessRateCrit:P0}. " +
+                              "Inspect coverage.reasons and the solutions config."
+                });
+            else if (completeness < t.CompletenessRateWarn)
+                alerts.Add(new Alert
+                {
+                    Id = "low_completeness_rate",
+                    Level = AlertLevel.Warning,
+                    Message = $"Job completeness rate {completeness:P0} is below warning threshold {t.CompletenessRateWarn:P0}. " +
+                              "Inspect coverage.reasons and the solutions config."
                 });
         }
 

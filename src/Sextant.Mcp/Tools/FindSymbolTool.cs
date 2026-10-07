@@ -79,10 +79,7 @@ public static class FindSymbolTool
         if (fuzzy)
         {
             var config = SextantConfiguration.FromEnvironment();
-            // One kind narrows the FTS query itself; a kind family ("type") filters its results.
-            var results = symbolStore.SearchFts(name, config.FtsMaxResults, kinds is { Count: 1 } ? kinds.First().ToString() : null);
-            if (kinds is { Count: > 1 })
-                results = results.Where(s => kinds.Contains(s.Kind)).ToList();
+            var results = SearchFuzzy(symbolStore, name, config.FtsMaxResults, kinds);
             if (projectDbId != null)
                 results = results.Where(s => s.ProjectId == projectDbId.Value).ToList();
 
@@ -222,6 +219,15 @@ public static class FindSymbolTool
     }
 
     private const int MaxAmbiguousResults = 25;
+
+    internal static List<SymbolInfo> SearchFuzzy(
+        SymbolStore symbols, string name, int maxResults, IReadOnlySet<SymbolKind>? kinds)
+    {
+        // Inference must use the same bounded, scoped FTS evidence as the eventual tool read.
+        var results = symbols.SearchFts(name, maxResults, kinds is { Count: 1 } ? kinds.First().ToString() : null);
+        return kinds is { Count: > 1 } ? results.Where(s => kinds.Contains(s.Kind)).ToList() : results;
+    }
+
     private static bool Contains(string? haystack, string needle)
         => haystack != null && haystack.Contains(needle, StringComparison.OrdinalIgnoreCase);
 

@@ -377,12 +377,25 @@ public class CallerAssertionHttpTests
     // ==== /control/* ===============================================================================
 
     [TestMethod]
+    public async Task Control_RetentionDryRun_WritesNoAudit()
+    {
+        await using var host = await Harness.StartAsync();
+        var application = host.Sign(CallerAssertionSigner.ApplicationClaims(DateTimeOffset.UtcNow));
+
+        using var retention = await host.ControlAsync(HttpMethod.Post, "/control/retention", ControlToken, application);
+
+        Assert.AreEqual(HttpStatusCode.OK, retention.StatusCode, await retention.Content.ReadAsStringAsync());
+        Assert.AreEqual(0, host.Service.RecentAudit(action: AuditAction.Retention).Count,
+            "a verified caller's read-only retention plan must not write an audit row");
+    }
+
+    [TestMethod]
     public async Task Control_VerifiedCaller_IsTheAuditActor()
     {
         await using var host = await Harness.StartAsync();
         var application = host.Sign(CallerAssertionSigner.ApplicationClaims(DateTimeOffset.UtcNow));
 
-        using (var retention = await host.ControlAsync(HttpMethod.Post, "/control/retention", ControlToken, application))
+        using (var retention = await host.ControlAsync(HttpMethod.Post, "/control/retention?execute=true", ControlToken, application))
             Assert.AreEqual(HttpStatusCode.OK, retention.StatusCode, await retention.Content.ReadAsStringAsync());
         using (var ensure = await host.ControlAsync(HttpMethod.Post, "/control/ensure", ControlToken,
             host.Sign(CallerAssertionSigner.ApplicationClaims(DateTimeOffset.UtcNow, tenantId: "tenant-b"), "kid-b"), EnsureBody()))
@@ -417,7 +430,7 @@ public class CallerAssertionHttpTests
         var claims = CallerAssertionSigner.ApplicationClaims(DateTimeOffset.UtcNow);
         claims.Remove("dep");
 
-        using var retention = await host.ControlAsync(HttpMethod.Post, "/control/retention", ControlToken, host.Sign(claims));
+        using var retention = await host.ControlAsync(HttpMethod.Post, "/control/retention?execute=true", ControlToken, host.Sign(claims));
 
         Assert.AreEqual(HttpStatusCode.OK, retention.StatusCode, await retention.Content.ReadAsStringAsync());
         var row = host.Service.RecentAudit(action: AuditAction.Retention).Single();
@@ -452,7 +465,7 @@ public class CallerAssertionHttpTests
     {
         await using var host = await Harness.StartAsync();
 
-        using var retention = await host.ControlAsync(HttpMethod.Post, "/control/retention", ControlToken);
+        using var retention = await host.ControlAsync(HttpMethod.Post, "/control/retention?execute=true", ControlToken);
 
         Assert.AreEqual(HttpStatusCode.OK, retention.StatusCode);
         Assert.AreEqual(AuditLogStore.HashActor(ControlToken),

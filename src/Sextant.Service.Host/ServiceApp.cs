@@ -358,6 +358,13 @@ public static class ServiceApp
                 }
                 // SVC-6/7: malformed branch guards (both expected_head_commit and branch_head_sequence, or an
                 // unknown branch_update) are refused before any job row exists, audited like the URL policy.
+                if (user is not null && request.RebuildGeneration is not null)
+                {
+                    await service.RecordUserEnsureDeniedAsync(RepositoryGrantKey.Of(request.RepositoryRemoteUrl),
+                        "rebuild_not_allowed", AuditActor(req), ct);
+                    return Results.Json(new { status = "rejected", reason = "rebuild_not_allowed" }, ServiceJson.Options,
+                        statusCode: StatusCodes.Status403Forbidden);
+                }
                 if (request.BranchGuardProblem() is { } guardProblem)
                 {
                     await service.RecordEnsureDeniedAsync(guardProblem, AuditActor(req), ct);

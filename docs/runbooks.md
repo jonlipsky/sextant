@@ -23,8 +23,18 @@ cross-tenant counts to a tenant (criterion-1 leakage guard).
 | Is a workload safe to pilot? | `GET /control/pilot?workload=…` |
 | Distributed traces | `Sextant.Service` `ActivitySource` (wire OpenTelemetry) |
 
-Alerts evaluated over the metrics snapshot: `queue_delay_high`, `low_success_rate`, `worker_exhaustion`,
-`storage_pressure`.
+Alerts evaluated over the metrics snapshot: `queue_delay_high`, `low_success_rate`, `low_completeness_rate`,
+`worker_exhaustion`, `storage_pressure`.
+
+`low_completeness_rate` warns when complete / terminal jobs is below 90% and is critical below 50%,
+after at least five terminal jobs. Equality at 90% is healthy; equality at 50% is warning, not critical.
+Partial publication remains a success for `low_success_rate`, but lowers completeness. These defaults
+are configurable through `AlertThresholds.CompletenessRateWarn`, `CompletenessRateCrit`, and the shared
+`SuccessRateMinSamples` programmatic settings (no environment-variable overrides). Inspect
+`/control/status/{jobId}` and `/control/resolve` for `coverage.reasons`, then check the repository's
+`solutions` configuration and project-load/submodule diagnostics. With too few terminal jobs the rate
+is not assessed; the no-sample exported value of 1.0 is not proof of healthy coverage. This signal uses
+recorded job outcomes, not a new coverage audit of legacy snapshots.
 
 ---
 
@@ -90,12 +100,37 @@ The standalone service runs its own retention/GC under the writer lease via `POS
 
 **Action.**
 1. Dry-run first — `sextant retention` reports the protected, retained, and deletable generations, API
-   history, and source blobs with reclaimable bytes, and changes nothing.
+   history, and currently orphaned source blobs with read-only SELECTs, and changes nothing. It needs
+   a current-schema catalog but takes no writer lease and performs no migration/recovery.
 2. Apply with `sextant retention --execute`.
 
 Retention honors the repo [`retention` policy](configuration.md#retention) (`keep_complete_generations`,
 `api_snapshot_keep_commits`, `prune_superseded_source_blobs`) and never deletes data referenced by a
 protected/default branch, an open pull request, a submodule pin, or an active overlay base.
+
+The service endpoint has the same [bounded retention contract](service.md#bounded-retention-contract-127--252):
+planning uses an independent reader and never queues behind indexing; execution yields the service writer
+between freshly revalidated batches. Each pass has a 10-second work budget (including gate wait), a
+2-second SQLite batch deadline, and a one-second lock retry limit. Inspect `more_remaining` and
+`stop_reason` (`time_budget`/`sqlite_busy`) before requesting a subsequent pass. Caller cancellation stops
+remaining work; already-committed batches stay applied. A large project cascade that cannot meet the
+deadline is rolled back and deferred, so repeated budget stops need investigation, not an unbounded retry
+loop. Local executed retention still requires exclusive writer-lease ownership; it must not run alongside
+the daemon/service.
+
+Plans report `reclaimed_bytes_known: false`: a read-only plan cannot simulate cascade freelist deltas.
+Execution measures **reusable pages**, not disk shrinkage. Retention no longer runs full `VACUUM` or a
+blocking `wal_checkpoint(TRUNCATE)`; normal automatic WAL checkpoints remain configured on the writer.
+Full compaction is a separate **offline**, explicitly approved maintenance operation requiring enough
+temporary disk space for a database rewrite. No incremental-auto-vacuum migration is introduced.
+
+Snapshots with a legacy abandoned/NULL retry-generation pointer are deliberately retained until their
+ownership can be established; this release neither migrates nor repairs them. All branch heads, pending
+retries, open PR roots, and required providers/bases remain protected.
+
+**Scheduling is deferred.** The API supports one bounded pass per future approved daily invocation, but
+this change adds no timer, workflow, production settings, or deletion approval. Validate the report and
+bounded behavior on a representative non-production catalog before approving any production schedule.
 
 ---
 
@@ -231,10 +266,13 @@ into existence with a query flag.
 | 6 | Catalog recovery completed cleanly on last start | `catalog_recovered` |
 | 7 | Worker capacity available | `worker_capacity` |
 | 8 | No active **critical** alerts | `no_critical_alerts` |
+| 9 | Job completeness meets the warning threshold with enough samples | `snapshot_completeness` — advisory for `trusted`, blocking for `untrusted`; missing/insufficient samples are not assessed and do not pass |
 
 - **Trusted single-tenant** pilots may exit with #76 informational (not blocking), but still require a
   secured control plane (check 2) — a tokenless control plane exposes cross-tenant observability/audit and
   is dev-only.
+- The completeness check is advisory for trusted workloads, but a **critical** `low_completeness_rate`
+  alert still blocks them via check 8. For untrusted workloads, both low and unassessed completeness block.
 - **Untrusted / multi-tenant** pilots **cannot** exit until #76 is green — the gate returns *not ready* and
   names `hard_os_isolation` as the blocker, no matter how healthy everything else is.
 

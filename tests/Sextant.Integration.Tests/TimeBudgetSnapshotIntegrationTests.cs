@@ -1,6 +1,9 @@
 using Microsoft.Data.Sqlite;
+using System.Text.Json;
 using Sextant.Core;
 using Sextant.Indexer;
+using Sextant.Mcp;
+using Sextant.Mcp.Tools;
 using Sextant.Service;
 using Sextant.Service.Restore;
 using Sextant.Service.Sandbox;
@@ -75,6 +78,95 @@ public sealed class TimeBudgetSnapshotIntegrationTests : IDisposable
             Assert.AreEqual(0, SymbolCount(conn, snapshotId, "P3"), "P3 is registered but has no symbols");
             Assert.AreEqual(1, ProjectCount(conn, snapshotId, "P3"));
             Assert.AreEqual(0, ProjectCount(conn, snapshotId, "P4"), "P4 was never loaded");
+        }
+    }
+
+    [TestMethod]
+    public async Task SameCommit_RebuildAfterBudgetImprovement_PreservesOldReadersAndCursors()
+    {
+        var request = new EnsureSnapshotRequest
+        {
+            RepositoryRemoteUrl = RemoteUrl, CommitSha = new string('c', 40), BranchName = "main"
+        };
+        var (partial, db, log) = await Produce(
+            line => line.StartsWith("Loading project ", StringComparison.Ordinal) ? 150 : line == "  P2..." ? 200 : 0,
+            request: request);
+        using (db)
+        {
+            Assert.AreEqual(SnapshotJobStatus.Partial, partial.Status, string.Join("\n", log));
+            var oldId = partial.SnapshotId!.Value;
+            var snapshots = new SnapshotStore(db.GetConnection());
+            var oldHash = snapshots.GetById(oldId)!.IdentityHash;
+            var oldCoverageJson = JsonSerializer.Serialize(new SnapshotCoverageStore(db.GetConnection()).Get(oldId));
+            var repoId = snapshots.GetRepositoryId(RemoteUrl)!.Value;
+            var releaseId = snapshots.AttachBranchPointer(repoId, "release", oldId, 1);
+            using var provider = new DatabaseProvider(db.DbPath)
+            {
+                RequestedRepository = () => RemoteUrl, RequestedBranch = () => "main"
+            };
+            var file = Path.Combine(new ServicePaths(ServiceVolumes.Rooted(_dataRoot)).CheckoutRoot,
+                ServicePaths.RepoDirectoryName(RemoteUrl), "P1", "Type1.cs");
+            var before = JsonDocument.Parse(GetFileSymbolsTool.GetFileSymbols(provider, file, limit: 1)).RootElement;
+            Assert.IsTrue(before.GetProperty("meta").TryGetProperty("next_cursor", out var next), before.GetRawText());
+            var cursor = next.GetString()!;
+            var pinned = FederatedReadContext.Resolve(db, requestedRepository: () => RemoteUrl, requestedBranch: () => "main");
+            using var oldReader = db.OpenReadConnection();
+            using var transaction = oldReader.BeginTransaction(deferred: true);
+            var oldSymbols = new SymbolStore(oldReader) { Scope = pinned.Scope };
+            var pinnedKeys = oldSymbols.GetByFile(file).Select(s => s.SymbolKey).ToArray();
+            Assert.IsTrue(pinnedKeys.Length > 1);
+            var source = new LocalBaseSnapshotSource(db.GetConnection());
+            var pageRequest = new SnapshotPageRequest { IdentityHash = oldHash, Limit = 1 };
+            var oldFirstPage = await source.FetchSymbolsAsync(pageRequest, CancellationToken.None);
+            var oldNextRequest = pageRequest with { Cursor = oldFirstPage.NextCursor };
+            var oldNextPage = await source.FetchSymbolsAsync(oldNextRequest, CancellationToken.None);
+            var cache = new SnapshotPageCache();
+            cache.Set(pageRequest.CacheKey, oldFirstPage);
+
+            var rebuild = request with { RebuildGeneration = "more-headroom-1", ExpectedHeadCommit = request.CommitSha };
+            var (complete, _, completeLog) = await Produce(_ => 0, request: rebuild, database: db,
+                budget: TimeSpan.FromSeconds(2000));
+            Assert.AreEqual(SnapshotJobStatus.Complete, complete.Status, string.Join("\n", completeLog));
+            var newId = complete.SnapshotId!.Value;
+            Assert.AreNotEqual(oldId, newId);
+            var rebuilt = snapshots.GetById(newId)!;
+            Assert.AreNotEqual(oldHash, rebuilt.IdentityHash);
+            Assert.AreEqual(newId, snapshots.GetSelectedSnapshotIdForRepositoryBranch(RemoteUrl, "main"));
+            Assert.AreEqual(oldId, snapshots.GetBranchSnapshotId(releaseId));
+            Assert.AreEqual(SnapshotStatus.Complete, snapshots.GetById(oldId)!.Status);
+            Assert.AreEqual(oldCoverageJson, JsonSerializer.Serialize(new SnapshotCoverageStore(db.GetConnection()).Get(oldId)));
+            var newCoverage = new SnapshotCoverageStore(db.GetConnection()).Get(newId)!;
+            Assert.AreEqual(SnapshotCoverageVerdict.Complete, newCoverage.Verdict);
+            Assert.IsNull(newCoverage.TimeBudget);
+            Assert.AreEqual("more-headroom-1", newCoverage.Rebuild!.Generation);
+            Assert.AreEqual(oldHash, newCoverage.Rebuild.OriginalIdentityHash);
+            for (var i = 1; i <= 4; i++)
+                Assert.IsTrue(SymbolCount(db.GetConnection(), newId, $"P{i}") > 0);
+
+            CollectionAssert.AreEqual(pinnedKeys,
+                oldSymbols.GetByFile(file).Select(s => s.SymbolKey).ToArray(),
+                "a reader in flight stays on the old immutable generation");
+            var changed = JsonDocument.Parse(GetFileSymbolsTool.GetFileSymbols(provider, file, 1, cursor)).RootElement;
+            Assert.AreEqual(Paging.InvalidCursorCode, changed.GetProperty("meta").GetProperty("error").GetProperty("code").GetString());
+            provider.RequestedBranch = () => "release";
+            var unchanged = JsonDocument.Parse(GetFileSymbolsTool.GetFileSymbols(provider, file, 1, cursor)).RootElement;
+            Assert.IsFalse(unchanged.GetProperty("meta").TryGetProperty("error", out _),
+                "the cursor still resumes on a branch that remains pinned to the old generation");
+            var resumedOldPage = await source.FetchSymbolsAsync(oldNextRequest, CancellationToken.None);
+            Assert.IsTrue(resumedOldPage.IsPublished);
+            CollectionAssert.AreEqual(oldNextPage.Symbols.Select(s => s.Cursor).ToArray(),
+                resumedOldPage.Symbols.Select(s => s.Cursor).ToArray());
+            Assert.IsTrue(cache.TryGet(pageRequest.CacheKey, out var cached));
+            Assert.AreSame(oldFirstPage, cached);
+            Assert.IsFalse(cache.TryGet((pageRequest with { IdentityHash = rebuilt.IdentityHash }).CacheKey, out _));
+            transaction.Commit();
+
+            // Both ordinary ensure and a repeated token remain idempotent; neither rebuilds or rolls the head back.
+            await Produce(_ => 0, request: request, database: db);
+            Assert.AreEqual(newId, snapshots.GetSelectedSnapshotIdForRepositoryBranch(RemoteUrl, "main"));
+            var (again, _, _) = await Produce(_ => 0, request: rebuild, database: db);
+            Assert.AreEqual(newId, again.SnapshotId);
+            Assert.AreEqual(oldCoverageJson, JsonSerializer.Serialize(new SnapshotCoverageStore(db.GetConnection()).Get(oldId)));
         }
     }
 
@@ -166,12 +258,15 @@ public sealed class TimeBudgetSnapshotIntegrationTests : IDisposable
         Func<string, int> advance,
         Func<ServicePaths, Action<string>, IEvaluationSandbox>? sandbox = null,
         TimeSpan? budget = null,
-        PackageRestoreRunner? packageRestore = null)
+        PackageRestoreRunner? packageRestore = null,
+        EnsureSnapshotRequest? request = null,
+        IndexDatabase? database = null)
     {
         var paths = new ServicePaths(ServiceVolumes.Rooted(_dataRoot));
-        CreateCheckout(paths);
+        if (database is null)
+            CreateCheckout(paths);
         var provider = new PersistentVolumeCheckoutProvider(paths);
-        var request = new EnsureSnapshotRequest
+        request ??= new EnsureSnapshotRequest
         {
             RepositoryRemoteUrl = RemoteUrl,
             CommitSha = new string('c', 40),
@@ -187,7 +282,7 @@ public sealed class TimeBudgetSnapshotIntegrationTests : IDisposable
                 clock.Advance(TimeSpan.FromSeconds(seconds));
         }
 
-        var db = new IndexDatabase(Path.Combine(_dataRoot, "catalog.db"), IndexWriteOptions.Default);
+        var db = database ?? new IndexDatabase(Path.Combine(_dataRoot, "catalog.db"), IndexWriteOptions.Default);
         db.RunMigrations();
         var config = new SextantConfiguration();
         packageRestore ??= new PackageRestoreRunner(enabled: false);
