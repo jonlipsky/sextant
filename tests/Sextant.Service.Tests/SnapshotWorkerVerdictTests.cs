@@ -97,11 +97,10 @@ public class SnapshotWorkerVerdictTests
     }
 
     [TestMethod]
-    public void BuildResult_SelectedSolutionDeclaredZeroProjects_IsPartial()
+    public void BuildResult_UnreadableSolution_IsPartial()
     {
-        // A selected solution that statically enumerated to zero recognized projects (unreadable / empty /
-        // unrecognized format on this worker) must force Partial — a silent 0/0 must never read as success.
-        var load = Load([new SolutionCoverage($"{CheckoutDir}/Broken.slnx", DeclaredProjectCount: 0, LoadedProjectCount: 0, [])]);
+        // A failed static read must force partial; a readable empty solution is a different outcome.
+        var load = Load([new SolutionCoverage($"{CheckoutDir}/Broken.slnx", DeclaredProjectCount: 0, LoadedProjectCount: 0, []) { IsReadable = false }]);
 
         var result = Verdict(3, Resolution(), load);
 

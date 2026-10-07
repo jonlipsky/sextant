@@ -599,13 +599,7 @@ public sealed class LocalIndexerSnapshotWorker(
 
         foreach (var coverage in load.Solutions)
         {
-            // A selected solution that declares ZERO recognized projects could not be STATICALLY enumerated
-            // on this worker (unreadable, empty, or an unrecognized solution shape). Because the multi-
-            // solution set is enumerated statically — the selected solutions frequently cannot be MSBuild-
-            // evaluated on this worker's platform (iOS/Android/Mac/WPF heads on Linux), which is the whole
-            // point of #109 — a zero-project read is a coverage gap that must NOT pass as fully covered.
-            // Surface it explicitly (warning ⇒ Partial) rather than letting a silent 0/0 read as success.
-            if (coverage.DeclaredProjectCount == 0)
+            if (!coverage.IsReadable)
             {
                 diagnostics.Add(new ProjectOutcome
                 {
@@ -614,8 +608,8 @@ public sealed class LocalIndexerSnapshotWorker(
                     ProjectPath = RepoRelative(checkoutDir, coverage.SolutionPath),
                     Message =
                         $"Selected solution '{RepoRelative(checkoutDir, coverage.SolutionPath)}' contributed no " +
-                        "recognized projects: it could not be statically enumerated on this worker (unreadable, " +
-                        "empty, or an unrecognized solution format), so its coverage is reported partial, not complete."
+                        "recognized projects: it could not be fully read on this worker, so its coverage is " +
+                        "reported partial, not complete."
                 });
                 continue;
             }
@@ -673,7 +667,7 @@ public sealed class LocalIndexerSnapshotWorker(
                 Code = "project_skipped",
                 ProjectPath = RepoRelative(checkoutDir, skippedProject.ProjectPath),
                 Message =
-                    $"Project '{skippedProject.ProjectName}' was declared in a selected solution but could " +
+                    $"Project '{skippedProject.ProjectName}' (TFM {skippedProject.TargetFramework ?? "unknown"}) was declared in a selected solution but could " +
                     $"not be loaded on this worker: {skippedProject.Reason}."
             });
         }
