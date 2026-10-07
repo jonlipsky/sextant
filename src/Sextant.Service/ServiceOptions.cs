@@ -369,6 +369,15 @@ public sealed record ServiceOptions
     public TimeSpan PackageRestoreTimeout { get; init; } = PackageRestoreRunner.DefaultTimeout;
 
     /// <summary>
+    /// Credentials for private package source HOSTS (issue #231), from
+    /// <c>SEXTANT_SERVICE_PACKAGE_SOURCE_CREDENTIALS</c> (<c>host=username:password;…</c>; unset → none; malformed →
+    /// refuse to start). The restore hands each to NuGet only for an <c>https</c> request to exactly its host, through
+    /// <see cref="FeedCredentialPlugin"/>; a repository's <c>nuget.config</c> cannot redirect it. They do not change
+    /// a snapshot identity: a commit indexed before they were configured keeps its snapshot until a rebuild.
+    /// </summary>
+    public IReadOnlyList<PackageSourceCredential> PackageSourceCredentials { get; init; } = [];
+
+    /// <summary>
     /// The <see cref="SnapshotIdentity.RestorePolicy"/> component folded into every ensure request's identity:
     /// null for the default restore-on policy and <c>off</c> when <see cref="PackageRestore"/> is disabled, so
     /// flipping the toggle rebuilds a commit instead of reusing a snapshot produced under the other policy.
@@ -466,10 +475,28 @@ public sealed record ServiceOptions
             SdkPinOverride = EnvBool("SDK_PIN_OVERRIDE") ?? true,
             PackageRestore = EnvBool("PACKAGE_RESTORE") ?? true,
             PackageRestoreTimeout = EnvInt("PACKAGE_RESTORE_TIMEOUT_SECONDS") is int restoreSeconds and > 0
-                ? TimeSpan.FromSeconds(restoreSeconds) : PackageRestoreRunner.DefaultTimeout
+                ? TimeSpan.FromSeconds(restoreSeconds) : PackageRestoreRunner.DefaultTimeout,
+            PackageSourceCredentials = ParsePackageSourceCredentials(Env("PACKAGE_SOURCE_CREDENTIALS"))
         };
         options.ValidateCallerIdentity();
         return options;
+    }
+
+    /// <summary>
+    /// Parses <c>SEXTANT_SERVICE_PACKAGE_SOURCE_CREDENTIALS</c>. A malformed value THROWS, naming the entry by
+    /// position only (fail closed); no value is ever echoed.
+    /// </summary>
+    internal static IReadOnlyList<PackageSourceCredential> ParsePackageSourceCredentials(string? value)
+    {
+        try
+        {
+            return PackageSourceCredential.ParseList(value);
+        }
+        catch (FormatException ex)
+        {
+            throw new InvalidOperationException(
+                $"Environment variable {EnvPrefix}PACKAGE_SOURCE_CREDENTIALS is invalid: {ex.Message} Refusing to start (fail closed).", ex);
+        }
     }
 
     /// <summary>

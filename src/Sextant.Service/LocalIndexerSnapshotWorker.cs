@@ -458,7 +458,8 @@ public sealed class LocalIndexerSnapshotWorker(
             return;
 
         var unknownGap = restore.TimedOut || restore.SolutionsNotStarted > 0 || restore.SolutionsFailed > 0
-            || restore.ProjectsDropped > 0 || restore.GeneralCodes.Count > 0 || restore.SourceUnreachableGeneral;
+            || restore.ProjectsDropped > 0 || restore.GeneralCodes.Count > 0 || restore.SourceUnreachableGeneral
+            || restore.CredentialsUnavailable;
         var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
         foreach (var path in providerCoverage.Keys.ToArray())
         {

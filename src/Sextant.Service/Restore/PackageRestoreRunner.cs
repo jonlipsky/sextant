@@ -29,9 +29,20 @@ namespace Sextant.Service.Restore;
 /// the pipes). Restore evaluates the repository's MSBuild files exactly as the in-process load does, so it runs
 /// inside the same evaluation sandbox and inherits its scrubbed environment.
 /// </para>
+/// <para>
+/// Issue #231: with <paramref name="sourceCredentials"/> configured, each restore writes them to an owner-only file in
+/// its scratch directory, points the child at <see cref="FeedCredentialPlugin"/> (<paramref name="credentialPluginPath"/>)
+/// through <c>NUGET_PLUGIN_PATHS</c> and at the file through <see cref="FeedCredentialPlugin.CredentialsFileVariable"/>,
+/// and deletes the file when the restore ends. The plugin answers only for an <c>https</c> request to a configured
+/// host, so a credential never reaches a source a repository's <c>nuget.config</c> points elsewhere.
+/// </para>
 /// </summary>
-public sealed class PackageRestoreRunner(bool enabled = true, TimeSpan? timeout = null, Action<string>? log = null)
+public sealed class PackageRestoreRunner(
+    bool enabled = true, TimeSpan? timeout = null, Action<string>? log = null,
+    IReadOnlyList<PackageSourceCredential>? sourceCredentials = null, string? credentialPluginPath = null)
 {
+    private readonly IReadOnlyList<PackageSourceCredential> _sourceCredentials = ValidateCredentials(sourceCredentials, credentialPluginPath);
+
     /// <summary>The default bound on one job's restore step (<c>SEXTANT_SERVICE_PACKAGE_RESTORE_TIMEOUT_SECONDS</c>).</summary>
     public static readonly TimeSpan DefaultTimeout = TimeSpan.FromMinutes(5);
 
@@ -63,6 +74,21 @@ public sealed class PackageRestoreRunner(bool enabled = true, TimeSpan? timeout 
     /// <summary>The <see cref="Sextant.Core.SnapshotIdentity.RestorePolicy"/> component this runner publishes under.</summary>
     public string? IdentityComponent => IdentityComponentFor(enabled);
 
+    /// <summary>The package source hosts this runner holds a credential for (never the credentials themselves).</summary>
+    public IReadOnlyList<string> CredentialHosts => _sourceCredentials.Select(c => c.HostAndPort).ToList();
+
+    private static IReadOnlyList<PackageSourceCredential> ValidateCredentials(
+        IReadOnlyList<PackageSourceCredential>? credentials, string? pluginPath)
+    {
+        if (credentials is not { Count: > 0 })
+            return [];
+        if (string.IsNullOrEmpty(pluginPath) || !File.Exists(pluginPath))
+            throw new ArgumentException(
+                "Package source credentials are configured, but the credential provider plugin assembly was not found.",
+                nameof(pluginPath));
+        return credentials;
+    }
+
     /// <summary>The <c>dotnet</c> host to run; tests point it at a missing file to exercise a failed start.</summary>
     internal string DotnetPath { get; init; } = ResolveDotnet();
 
@@ -82,33 +108,95 @@ public sealed class PackageRestoreRunner(bool enabled = true, TimeSpan? timeout 
 
         var deadline = limit is { } l && l < Timeout ? (l > TimeSpan.Zero ? l : TimeSpan.Zero) : Timeout;
         var stopwatch = Stopwatch.StartNew();
-        if (solutions.Count > 1)
+        var credentialsDir = PrepareCredentials(scratchDir, out var environment);
+        var credentialsUnavailable = _sourceCredentials.Count > 0 && credentialsDir is null;
+        try
         {
-            if (TryCreateProjectUnion(checkoutDir, solutions, cancellationToken, out var projects, out var fallbackReason))
+            if (solutions.Count > 1)
             {
-                var union = await RunProjectUnionAsync(
-                        checkoutDir, solutions.Count, projects, Remaining(deadline, stopwatch), cancellationToken, scratchDir)
-                    .ConfigureAwait(false);
-                if (union is not null)
-                    return union with { Timeout = deadline, Elapsed = stopwatch.Elapsed };
+                if (TryCreateProjectUnion(checkoutDir, solutions, cancellationToken, out var projects, out var fallbackReason))
+                {
+                    var union = await RunProjectUnionAsync(
+                            checkoutDir, solutions.Count, projects, Remaining(deadline, stopwatch), cancellationToken,
+                            scratchDir, environment)
+                        .ConfigureAwait(false);
+                    if (union is not null)
+                        return union with { Timeout = deadline, Elapsed = stopwatch.Elapsed, CredentialsUnavailable = credentialsUnavailable };
 
-                fallbackReason = "the scratch location could not hold the generated restore traversal";
+                    fallbackReason = "the scratch location could not hold the generated restore traversal";
+                }
+
+                log?.Invoke($"package restore: using per-solution fallback ({fallbackReason}).");
             }
 
-            log?.Invoke($"package restore: using per-solution fallback ({fallbackReason}).");
+            var fallback = await RunPerSolutionAsync(
+                    checkoutDir, solutions, Remaining(deadline, stopwatch), cancellationToken, environment)
+                .ConfigureAwait(false);
+            return fallback with { Timeout = deadline, Elapsed = stopwatch.Elapsed, CredentialsUnavailable = credentialsUnavailable };
         }
+        finally
+        {
+            DeleteCredentials(credentialsDir);
+        }
+    }
 
-        var fallback = await RunPerSolutionAsync(
-                checkoutDir, solutions, Remaining(deadline, stopwatch), cancellationToken)
-            .ConfigureAwait(false);
-        return fallback with { Timeout = deadline, Elapsed = stopwatch.Elapsed };
+    // Writes the configured credentials to an owner-only file in a fresh owner-only directory and returns that
+    // directory (null when none are configured or the file could not be written: the restore then runs without
+    // them, and the outcome reports CredentialsUnavailable so the snapshot records why sources were unreachable).
+    // environment gets the plugin variables for every restore child of this run.
+    private string? PrepareCredentials(string? scratchDir, out IReadOnlyDictionary<string, string> environment)
+    {
+        environment = new Dictionary<string, string>();
+        if (_sourceCredentials.Count == 0)
+            return null;
+        var dir = Path.Combine(Path.GetFullPath(scratchDir ?? Path.GetTempPath()), $"feed-credentials-{Guid.NewGuid():N}");
+        try
+        {
+            if (OperatingSystem.IsWindows())
+                Directory.CreateDirectory(dir);
+            else
+                Directory.CreateDirectory(dir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            var file = Path.Combine(dir, "credentials.json");
+            FeedCredentialPlugin.WriteCredentialsFile(file, _sourceCredentials);
+            environment = new Dictionary<string, string>
+            {
+                ["NUGET_PLUGIN_PATHS"] = credentialPluginPath!,
+                [FeedCredentialPlugin.CredentialsFileVariable] = file,
+                // NuGet caches each plugin's per-source claims for 30 days; a per-run cache means a host configured
+                // later is asked about at once, never answered from an older run's "no claim".
+                ["NUGET_PLUGINS_CACHE_PATH"] = Path.Combine(dir, "plugins-cache")
+            };
+            return dir;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            log?.Invoke($"package restore could not stage its package source credentials: {ex.GetType().Name}.");
+            DeleteCredentials(dir);
+            return null;
+        }
+    }
+
+    private void DeleteCredentials(string? dir)
+    {
+        if (dir is null)
+            return;
+        try
+        {
+            if (Directory.Exists(dir))
+                Directory.Delete(dir, recursive: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            log?.Invoke($"package restore could not delete its package source credentials: {ex.GetType().Name}.");
+        }
     }
 
     private static TimeSpan Remaining(TimeSpan deadline, Stopwatch stopwatch)
         => deadline > stopwatch.Elapsed ? deadline - stopwatch.Elapsed : TimeSpan.Zero;
 
     private async Task<PackageRestoreOutcome> RunPerSolutionAsync(
-        string checkoutDir, IReadOnlyList<string> solutions, TimeSpan deadline, CancellationToken cancellationToken)
+        string checkoutDir, IReadOnlyList<string> solutions, TimeSpan deadline, CancellationToken cancellationToken,
+        IReadOnlyDictionary<string, string> environment)
     {
         var parser = new RestoreOutputParser(checkoutDir);
         var stopwatch = Stopwatch.StartNew();
@@ -125,7 +213,7 @@ public sealed class PackageRestoreRunner(bool enabled = true, TimeSpan? timeout 
             }
 
             attempted++;
-            var result = await RunOneAsync(solution, remaining, parser, cancellationToken).ConfigureAwait(false);
+            var result = await RunOneAsync(solution, remaining, parser, cancellationToken, environment).ConfigureAwait(false);
             switch (result)
             {
                 case RunResult.Succeeded:
@@ -165,7 +253,8 @@ public sealed class PackageRestoreRunner(bool enabled = true, TimeSpan? timeout 
 
     private async Task<PackageRestoreOutcome?> RunProjectUnionAsync(
         string checkoutDir, int solutionCount, IReadOnlyList<UnionProject> projects,
-        TimeSpan deadline, CancellationToken cancellationToken, string? scratchDir)
+        TimeSpan deadline, CancellationToken cancellationToken, string? scratchDir,
+        IReadOnlyDictionary<string, string> environment)
     {
         var stopwatch = Stopwatch.StartNew();
         var stagingRoot = Path.GetFullPath(scratchDir ?? Path.GetTempPath());
@@ -185,7 +274,7 @@ public sealed class PackageRestoreRunner(bool enabled = true, TimeSpan? timeout 
             else
             {
                 result = await RunProcessAsync(
-                        CreateUnionStartInfo(traversal, checkoutDir), traversal, deadline, parser, cancellationToken)
+                        CreateUnionStartInfo(traversal, checkoutDir, environment), traversal, deadline, parser, cancellationToken)
                     .ConfigureAwait(false);
             }
 
@@ -241,9 +330,10 @@ public sealed class PackageRestoreRunner(bool enabled = true, TimeSpan? timeout 
     private enum RunResult { Succeeded, Failed, NotStarted, TimedOut }
 
     private async Task<RunResult> RunOneAsync(
-        string solution, TimeSpan timeLimit, RestoreOutputParser parser, CancellationToken cancellationToken)
+        string solution, TimeSpan timeLimit, RestoreOutputParser parser, CancellationToken cancellationToken,
+        IReadOnlyDictionary<string, string> environment)
     {
-        return await RunProcessAsync(CreateStartInfo(solution), solution, timeLimit, parser, cancellationToken)
+        return await RunProcessAsync(CreateStartInfo(solution, environment), solution, timeLimit, parser, cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -643,15 +733,17 @@ public sealed class PackageRestoreRunner(bool enabled = true, TimeSpan? timeout 
 
     private sealed record UnionProject(string ProjectPath, string SolutionPath);
 
-    internal ProcessStartInfo CreateStartInfo(string solution)
-        => CreateStartInfo(Arguments(solution), Path.GetDirectoryName(Path.GetFullPath(solution)) ?? Environment.CurrentDirectory);
+    internal ProcessStartInfo CreateStartInfo(string solution, IReadOnlyDictionary<string, string>? environment = null)
+        => CreateStartInfo(Arguments(solution), Path.GetDirectoryName(Path.GetFullPath(solution)) ?? Environment.CurrentDirectory,
+            environment);
 
-    private ProcessStartInfo CreateUnionStartInfo(string project, string checkoutDir)
+    private ProcessStartInfo CreateUnionStartInfo(string project, string checkoutDir, IReadOnlyDictionary<string, string> environment)
         => CreateStartInfo(
             ["msbuild", project, "-target:RestoreUnion", "-nologo", "-verbosity:minimal", "--disable-build-servers", "-nodeReuse:false"],
-            checkoutDir);
+            checkoutDir, environment);
 
-    private ProcessStartInfo CreateStartInfo(IReadOnlyList<string> arguments, string workingDirectory)
+    private ProcessStartInfo CreateStartInfo(
+        IReadOnlyList<string> arguments, string workingDirectory, IReadOnlyDictionary<string, string>? environment)
     {
         var startInfo = new ProcessStartInfo(DotnetPath)
         {
@@ -681,6 +773,14 @@ public sealed class PackageRestoreRunner(bool enabled = true, TimeSpan? timeout 
         startInfo.Environment["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1";
         // The parser reads English messages for package ids; codes are language neutral.
         startInfo.Environment["DOTNET_CLI_UI_LANGUAGE"] = "en-US";
+        // Issue #231: with credentials configured, this runner's plugin is the only one NuGet starts, and it reads the
+        // credentials from a file; the variables carry paths, never a credential.
+        startInfo.Environment.Remove(FeedCredentialPlugin.CredentialsFileVariable);
+        if (environment is not null)
+        {
+            foreach (var (name, value) in environment)
+                startInfo.Environment[name] = value;
+        }
         return startInfo;
     }
 
