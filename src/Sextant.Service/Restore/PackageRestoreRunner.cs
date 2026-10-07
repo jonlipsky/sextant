@@ -1,14 +1,24 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Security;
+using System.Text;
+using System.Xml;
+using System.Xml.Linq;
+using Sextant.Indexer;
 
 namespace Sextant.Service.Restore;
 
 /// <summary>
-/// Runs <c>dotnet restore</c> over a checkout's selected solutions before the worker loads them. Without a
+/// Restores a checkout's selected project union before the worker loads it. Without a
 /// restore there is no <c>obj/project.assets.json</c>, so the design-time build has no package compile assets
 /// and the SDK never adds the TRANSITIVE project references the assets file lists: a project then compiles
 /// against its direct references only, every type it reaches through another project is unresolved, and the
 /// calls that mention one cannot bind.
+/// <para>
+/// Multi-solution restores use one generated MSBuild traversal and schedule each declared project once, with
+/// the globals from its last selected solution. Solution configurations that cannot be reproduced safely
+/// fall back to the existing per-solution traversal.
+/// </para>
 /// <para>
 /// The restore is best effort and never fails the job. It runs with <c>--ignore-failed-sources</c>, so an
 /// unreachable or credential-gated source does not stop the other packages from being restored (the assets
@@ -57,19 +67,49 @@ public sealed class PackageRestoreRunner(bool enabled = true, TimeSpan? timeout 
     internal string DotnetPath { get; init; } = ResolveDotnet();
 
     /// <summary>
-    /// Restores every solution in <paramref name="solutions"/> in order, under one deadline: <see cref="Timeout"/>,
+    /// Restores <paramref name="solutions"/> under one deadline: <see cref="Timeout"/>,
     /// or <paramref name="limit"/> when it is shorter (the worker's share of a time-budgeted evaluation). Returns
     /// what was achieved; throws only <see cref="OperationCanceledException"/> when
     /// <paramref name="cancellationToken"/> is cancelled (after killing the running restore).
     /// </summary>
     public async Task<PackageRestoreOutcome> RunAsync(
-        string checkoutDir, IReadOnlyList<string> solutions, TimeSpan? limit, CancellationToken cancellationToken)
+        string checkoutDir, IReadOnlyList<string> solutions, TimeSpan? limit, CancellationToken cancellationToken,
+        string? scratchDir = null)
     {
         ArgumentNullException.ThrowIfNull(solutions);
         if (!enabled)
             return PackageRestoreOutcome.Disabled;
 
         var deadline = limit is { } l && l < Timeout ? (l > TimeSpan.Zero ? l : TimeSpan.Zero) : Timeout;
+        var stopwatch = Stopwatch.StartNew();
+        if (solutions.Count > 1)
+        {
+            if (TryCreateProjectUnion(checkoutDir, solutions, cancellationToken, out var projects, out var fallbackReason))
+            {
+                var union = await RunProjectUnionAsync(
+                        checkoutDir, solutions.Count, projects, Remaining(deadline, stopwatch), cancellationToken, scratchDir)
+                    .ConfigureAwait(false);
+                if (union is not null)
+                    return union with { Timeout = deadline, Elapsed = stopwatch.Elapsed };
+
+                fallbackReason = "the scratch location could not hold the generated restore traversal";
+            }
+
+            log?.Invoke($"package restore: using per-solution fallback ({fallbackReason}).");
+        }
+
+        var fallback = await RunPerSolutionAsync(
+                checkoutDir, solutions, Remaining(deadline, stopwatch), cancellationToken)
+            .ConfigureAwait(false);
+        return fallback with { Timeout = deadline, Elapsed = stopwatch.Elapsed };
+    }
+
+    private static TimeSpan Remaining(TimeSpan deadline, Stopwatch stopwatch)
+        => deadline > stopwatch.Elapsed ? deadline - stopwatch.Elapsed : TimeSpan.Zero;
+
+    private async Task<PackageRestoreOutcome> RunPerSolutionAsync(
+        string checkoutDir, IReadOnlyList<string> solutions, TimeSpan deadline, CancellationToken cancellationToken)
+    {
         var parser = new RestoreOutputParser(checkoutDir);
         var stopwatch = Stopwatch.StartNew();
         int attempted = 0, succeeded = 0, notStarted = 0;
@@ -105,6 +145,7 @@ public sealed class PackageRestoreRunner(bool enabled = true, TimeSpan? timeout 
         var outcome = new PackageRestoreOutcome
         {
             SolutionsAttempted = attempted,
+            SolutionsSelected = solutions.Count,
             SolutionsSucceeded = succeeded,
             SolutionsNotStarted = notStarted,
             TimedOut = timedOut,
@@ -122,12 +163,94 @@ public sealed class PackageRestoreRunner(bool enabled = true, TimeSpan? timeout 
         return outcome;
     }
 
+    private async Task<PackageRestoreOutcome?> RunProjectUnionAsync(
+        string checkoutDir, int solutionCount, IReadOnlyList<UnionProject> projects,
+        TimeSpan deadline, CancellationToken cancellationToken, string? scratchDir)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        var stagingRoot = Path.GetFullPath(scratchDir ?? Path.GetTempPath());
+        var stagingDir = Path.Combine(stagingRoot, $"package-restore-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(stagingDir);
+            var traversal = Path.Combine(stagingDir, "RestoreUnion.proj");
+            await File.WriteAllTextAsync(traversal, BuildUnionProject(projects), cancellationToken).ConfigureAwait(false);
+
+            var parser = new RestoreOutputParser(checkoutDir);
+            RunResult result;
+            if (deadline <= TimeSpan.Zero)
+            {
+                result = RunResult.TimedOut;
+            }
+            else
+            {
+                result = await RunProcessAsync(
+                        CreateUnionStartInfo(traversal, checkoutDir), traversal, deadline, parser, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            var timedOut = result == RunResult.TimedOut;
+            var succeeded = result == RunResult.Succeeded ? 1 : 0;
+            var outcome = new PackageRestoreOutcome
+            {
+                SolutionsAttempted = 1,
+                SolutionsSelected = solutionCount,
+                SolutionsSucceeded = succeeded,
+                SolutionsNotStarted = result == RunResult.NotStarted ? 1 : 0,
+                TimedOut = timedOut,
+                Timeout = deadline,
+                Elapsed = stopwatch.Elapsed,
+                ProjectsAttempted = projects.Count,
+                UsedProjectUnion = true,
+                Projects = parser.Projects(),
+                ProjectsDropped = parser.ProjectsDropped,
+                GeneralCodes = parser.GeneralCodes(),
+                SourceUnreachableGeneral = parser.SourceUnreachableGeneral
+            };
+            log?.Invoke(
+                $"package restore: {projects.Count} distinct project(s) from {solutionCount} selected solution(s) " +
+                $"in {outcome.Elapsed.TotalSeconds:0.#}s" +
+                (timedOut ? " (timed out)" : string.Empty) +
+                (outcome.Projects.Count > 0 ? $"; {outcome.Projects.Count} project(s) reported restore errors" : string.Empty) +
+                ".");
+            return outcome;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            log?.Invoke($"package restore could not prepare its project union: {ex.GetType().Name}.");
+            return null;
+        }
+        finally
+        {
+            try
+            {
+                if (Directory.Exists(stagingDir))
+                    Directory.Delete(stagingDir, recursive: true);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                log?.Invoke($"package restore scratch cleanup failed: {ex.GetType().Name}.");
+            }
+        }
+    }
+
     private enum RunResult { Succeeded, Failed, NotStarted, TimedOut }
 
     private async Task<RunResult> RunOneAsync(
         string solution, TimeSpan timeLimit, RestoreOutputParser parser, CancellationToken cancellationToken)
     {
-        var startInfo = CreateStartInfo(solution);
+        return await RunProcessAsync(CreateStartInfo(solution), solution, timeLimit, parser, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private async Task<RunResult> RunProcessAsync(
+        ProcessStartInfo startInfo, string description, TimeSpan timeLimit, RestoreOutputParser parser,
+        CancellationToken cancellationToken)
+    {
         using var process = new Process { StartInfo = startInfo };
         try
         {
@@ -136,7 +259,7 @@ public sealed class PackageRestoreRunner(bool enabled = true, TimeSpan? timeout 
         }
         catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or PlatformNotSupportedException)
         {
-            log?.Invoke($"package restore could not start '{Path.GetFileName(solution)}': {ex.GetType().Name}.");
+            log?.Invoke($"package restore could not start '{Path.GetFileName(description)}': {ex.GetType().Name}.");
             return RunResult.NotStarted;
         }
 
@@ -168,7 +291,7 @@ public sealed class PackageRestoreRunner(bool enabled = true, TimeSpan? timeout 
             }
             catch (OperationCanceledException)
             {
-                log?.Invoke($"package restore of '{Path.GetFileName(solution)}' did not exit after its process tree was killed.");
+                log?.Invoke($"package restore of '{Path.GetFileName(description)}' did not exit after its process tree was killed.");
             }
         }
 
@@ -181,7 +304,354 @@ public sealed class PackageRestoreRunner(bool enabled = true, TimeSpan? timeout 
         return process.HasExited && process.ExitCode == 0 ? RunResult.Succeeded : RunResult.Failed;
     }
 
+    private static bool TryCreateProjectUnion(
+        string checkoutDir, IReadOnlyList<string> solutions, CancellationToken cancellationToken,
+        out IReadOnlyList<UnionProject> projects, out string fallbackReason)
+    {
+        var ordered = new List<UnionProject>();
+        var indexes = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (var solution in solutions)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!CanPreserveSolutionGlobals(solution, out fallbackReason))
+            {
+                projects = [];
+                return false;
+            }
+
+            var declared = SolutionProjectEnumerator.Enumerate(solution);
+            if (declared.Count == 0)
+            {
+                projects = [];
+                fallbackReason = $"'{Path.GetFileName(solution)}' could not be enumerated completely";
+                return false;
+            }
+
+            var solutionPath = Path.GetFullPath(solution);
+            foreach (var project in declared)
+            {
+                var projectPath = Path.GetFullPath(project);
+                if (!SafeForMsBuildProperty(projectPath) || !SafeForMsBuildProperty(solutionPath))
+                {
+                    projects = [];
+                    fallbackReason = "a solution or project path contains MSBuild list/property syntax";
+                    return false;
+                }
+
+                if (indexes.TryGetValue(projectPath, out var index))
+                {
+                    // Existing per-solution restores run in selected-solution order and leave the last solution's
+                    // evaluation in project.assets.json. Keep that same owner while restoring each path only once.
+                    ordered[index] = ordered[index] with { SolutionPath = solutionPath };
+                }
+                else
+                {
+                    indexes.Add(projectPath, ordered.Count);
+                    ordered.Add(new UnionProject(projectPath, solutionPath));
+                }
+            }
+        }
+
+        projects = ordered;
+        var projectPaths = new HashSet<string>(ordered.Select(project => project.ProjectPath), StringComparer.OrdinalIgnoreCase);
+        foreach (var project in ordered)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!ProjectReferencesAreContained(project.ProjectPath, projectPaths, checkoutDir, out fallbackReason))
+            {
+                projects = [];
+                return false;
+            }
+        }
+        fallbackReason = string.Empty;
+        return ordered.Count > 0;
+    }
+
+    private static bool ProjectReferencesAreContained(
+        string projectPath, IReadOnlySet<string> projectPaths, string checkoutDir, out string reason)
+    {
+        reason = string.Empty;
+        try
+        {
+            var projectRoot = Path.GetFullPath(checkoutDir);
+            var projectDirectory = Path.GetDirectoryName(projectPath)!;
+            var relativeDirectory = Path.GetRelativePath(projectRoot, projectDirectory);
+            if (Path.IsPathRooted(relativeDirectory) || relativeDirectory == ".."
+                || relativeDirectory.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+            {
+                reason = $"'{Path.GetFileName(projectPath)}' is outside the checkout";
+                return false;
+            }
+
+            var directory = projectDirectory;
+            while (true)
+            {
+                foreach (var name in new[] { "Directory.Build.props", "Directory.Build.targets" })
+                {
+                    var buildFile = Path.Combine(directory, name);
+                    if (!File.Exists(buildFile))
+                        continue;
+                    using var buildReader = XmlReader.Create(buildFile,
+                        new XmlReaderSettings { DtdProcessing = DtdProcessing.Prohibit, XmlResolver = null });
+                    var buildDocument = XDocument.Load(buildReader);
+                    if (buildDocument.Descendants().Any(element =>
+                            element.Name.LocalName is "ProjectReference" or "Import" or "ImportGroup"))
+                    {
+                        reason = $"'{Path.GetFileName(projectPath)}' uses a Directory.Build file with additional project definitions";
+                        return false;
+                    }
+                }
+                var pathComparison = OperatingSystem.IsWindows()
+                    ? StringComparison.OrdinalIgnoreCase
+                    : StringComparison.Ordinal;
+                if (Path.GetFullPath(directory).Equals(projectRoot, pathComparison))
+                    break;
+                var parent = Path.GetDirectoryName(directory);
+                if (parent is null)
+                    break;
+                directory = parent;
+            }
+
+            using var reader = XmlReader.Create(projectPath,
+                new XmlReaderSettings { DtdProcessing = DtdProcessing.Prohibit, XmlResolver = null });
+            var document = XDocument.Load(reader);
+            var root = document.Root;
+            if (root is null || root.Name.LocalName != "Project")
+            {
+                reason = $"'{Path.GetFileName(projectPath)}' is not a readable MSBuild project";
+                return false;
+            }
+
+            if (root.Descendants().Any(element => element.Name.LocalName is "Import" or "ImportGroup"))
+            {
+                reason = $"'{Path.GetFileName(projectPath)}' imports additional project definitions";
+                return false;
+            }
+
+            foreach (var reference in root.Descendants().Where(element => element.Name.LocalName == "ProjectReference"))
+            {
+                if (HasCondition(reference, root)
+                    || reference.Attribute("Update") is not null
+                    || reference.Attribute("Remove") is not null
+                    || reference.Elements().Any(metadata =>
+                        metadata.Name.LocalName is "AdditionalProperties" or "GlobalPropertiesToRemove"
+                            or "SetConfiguration" or "SetPlatform"))
+                {
+                    reason = $"'{Path.GetFileName(projectPath)}' has conditional or customized project references";
+                    return false;
+                }
+
+                var include = reference.Attribute("Include")?.Value;
+                if (string.IsNullOrWhiteSpace(include)
+                    || include.Contains("$(", StringComparison.Ordinal)
+                    || include.Contains("@(", StringComparison.Ordinal)
+                    || include.Contains(';') || include.Contains('*') || include.Contains('?'))
+                {
+                    reason = $"'{Path.GetFileName(projectPath)}' has a project reference that cannot be enumerated safely";
+                    return false;
+                }
+
+                var referencedPath = Path.GetFullPath(
+                    include.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar),
+                    Path.GetDirectoryName(projectPath)!);
+                if (!projectPaths.Contains(referencedPath))
+                {
+                    reason = $"'{Path.GetFileName(projectPath)}' references a project outside the selected solution union";
+                    return false;
+                }
+            }
+
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or XmlException or ArgumentException)
+        {
+            reason = $"'{Path.GetFileName(projectPath)}' project references could not be inspected";
+            return false;
+        }
+    }
+
+    private static bool HasCondition(XElement reference, XElement project)
+    {
+        for (var element = reference; element is not null && element != project; element = element.Parent)
+            if (element.Attribute("Condition") is not null)
+                return true;
+        return project.Attribute("Condition") is not null;
+    }
+
+    private static bool CanPreserveSolutionGlobals(string solution, out string reason)
+    {
+        reason = string.Empty;
+        var extension = Path.GetExtension(solution);
+        if (extension.Equals(".sln", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                var section = string.Empty;
+                foreach (var line in File.ReadLines(solution))
+                {
+                    var trimmed = line.Trim();
+                    if (trimmed.StartsWith("GlobalSection(SolutionConfigurationPlatforms)", StringComparison.Ordinal))
+                    {
+                        section = "solution";
+                        continue;
+                    }
+                    if (trimmed.StartsWith("GlobalSection(ProjectConfigurationPlatforms)", StringComparison.Ordinal))
+                    {
+                        section = "project";
+                        continue;
+                    }
+                    if (trimmed.StartsWith("EndGlobalSection", StringComparison.Ordinal))
+                    {
+                        section = string.Empty;
+                        continue;
+                    }
+
+                    if (section == "solution" && trimmed.Contains('='))
+                    {
+                        var separator = trimmed.IndexOf('=');
+                        var configuration = trimmed[..separator].Trim();
+                        var mappedConfiguration = trimmed[(separator + 1)..].Trim();
+                        if (configuration is not ("Debug|Any CPU" or "Release|Any CPU" or "Debug|AnyCPU" or "Release|AnyCPU"))
+                        {
+                            reason = $"'{Path.GetFileName(solution)}' has a non-default solution configuration";
+                            return false;
+                        }
+                        if (!NormalizeConfiguration(configuration).Equals(
+                                NormalizeConfiguration(mappedConfiguration), StringComparison.OrdinalIgnoreCase))
+                        {
+                            reason = $"'{Path.GetFileName(solution)}' maps a solution configuration to a different configuration";
+                            return false;
+                        }
+                    }
+                    else if (section == "project" && !ProjectConfigurationMatches(trimmed))
+                    {
+                        reason = $"'{Path.GetFileName(solution)}' has a project-specific configuration mapping";
+                        return false;
+                    }
+                }
+                return true;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+            {
+                reason = $"'{Path.GetFileName(solution)}' configuration could not be inspected";
+                return false;
+            }
+        }
+
+        if (extension.Equals(".slnx", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                var settings = new XmlReaderSettings { DtdProcessing = DtdProcessing.Prohibit, XmlResolver = null };
+                using var reader = XmlReader.Create(solution, settings);
+                while (reader.Read())
+                {
+                    if (reader.NodeType == XmlNodeType.Element
+                        && (reader.LocalName.Contains("Configuration", StringComparison.OrdinalIgnoreCase)
+                            || reader.LocalName.Equals("Platform", StringComparison.OrdinalIgnoreCase)
+                            || reader.LocalName.Equals("BuildType", StringComparison.OrdinalIgnoreCase)))
+                    {
+                        reason = $"'{Path.GetFileName(solution)}' declares solution-specific configuration";
+                        return false;
+                    }
+                    if (reader.NodeType == XmlNodeType.Element)
+                    {
+                        for (var i = 0; i < reader.AttributeCount; i++)
+                        {
+                            reader.MoveToAttribute(i);
+                            if (reader.LocalName.Contains("Configuration", StringComparison.OrdinalIgnoreCase)
+                                || reader.LocalName.Equals("Platform", StringComparison.OrdinalIgnoreCase)
+                                || reader.LocalName.Equals("BuildType", StringComparison.OrdinalIgnoreCase))
+                            {
+                                reason = $"'{Path.GetFileName(solution)}' declares solution-specific configuration";
+                                return false;
+                            }
+                        }
+                        reader.MoveToElement();
+                    }
+                }
+                return true;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or XmlException or ArgumentException)
+            {
+                reason = $"'{Path.GetFileName(solution)}' configuration could not be inspected";
+                return false;
+            }
+        }
+
+        reason = $"'{Path.GetFileName(solution)}' is not a supported solution format";
+        return false;
+    }
+
+    private static bool ProjectConfigurationMatches(string line)
+    {
+        var marker = line.IndexOf(".ActiveCfg = ", StringComparison.Ordinal);
+        var markerLength = ".ActiveCfg = ".Length;
+        if (marker < 0)
+        {
+            marker = line.IndexOf(".Build.0 = ", StringComparison.Ordinal);
+            markerLength = ".Build.0 = ".Length;
+        }
+        if (marker < 0)
+            return true;
+
+        var guidEnd = line.IndexOf('}');
+        if (guidEnd < 0 || guidEnd + 2 > marker)
+            return false;
+        var source = line[(guidEnd + 2)..marker].Trim();
+        var target = line[(marker + markerLength)..].Trim();
+        return NormalizeConfiguration(source).Equals(NormalizeConfiguration(target), StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string NormalizeConfiguration(string value) => value.Replace("Any CPU", "AnyCPU", StringComparison.OrdinalIgnoreCase);
+
+    private static bool SafeForMsBuildProperty(string value) =>
+        !value.Contains(';') && !value.Contains('$') && !value.Contains('%');
+
+    private static string BuildUnionProject(IReadOnlyList<UnionProject> projects)
+    {
+        var xml = new StringBuilder();
+        xml.AppendLine("<Project>");
+        xml.AppendLine("  <Target Name=\"RestoreUnion\">");
+        foreach (var project in projects)
+        {
+            var solutionDir = Path.GetDirectoryName(project.SolutionPath) ?? ".";
+            solutionDir = Path.EndsInDirectorySeparator(solutionDir) ? solutionDir : solutionDir + Path.DirectorySeparatorChar;
+            var properties = string.Join(';',
+                "Configuration=Debug",
+                "Platform=AnyCPU",
+                "DesignTimeBuild=true",
+                "RestoreIgnoreFailedSources=true",
+                "RestoreProjectReferences=false",
+                "RestoreRecursive=false",
+                "BuildingSolutionFile=true",
+                $"SolutionDir={solutionDir}",
+                $"SolutionName={Path.GetFileNameWithoutExtension(project.SolutionPath)}",
+                $"SolutionPath={project.SolutionPath}",
+                $"SolutionFileName={Path.GetFileName(project.SolutionPath)}",
+                $"SolutionExt={Path.GetExtension(project.SolutionPath)}");
+            xml.AppendLine(
+                $"    <MSBuild Projects=\"{Xml(project.ProjectPath)}\" Targets=\"Restore\" BuildInParallel=\"false\" " +
+                $"ContinueOnError=\"ErrorAndContinue\" Properties=\"{Xml(properties)}\" />");
+        }
+        xml.AppendLine("  </Target>");
+        xml.AppendLine("</Project>");
+        return xml.ToString();
+    }
+
+    private static string Xml(string value) => SecurityElement.Escape(value) ?? string.Empty;
+
+    private sealed record UnionProject(string ProjectPath, string SolutionPath);
+
     internal ProcessStartInfo CreateStartInfo(string solution)
+        => CreateStartInfo(Arguments(solution), Path.GetDirectoryName(Path.GetFullPath(solution)) ?? Environment.CurrentDirectory);
+
+    private ProcessStartInfo CreateUnionStartInfo(string project, string checkoutDir)
+        => CreateStartInfo(
+            ["msbuild", project, "-target:RestoreUnion", "-nologo", "-verbosity:minimal", "--disable-build-servers", "-nodeReuse:false"],
+            checkoutDir);
+
+    private ProcessStartInfo CreateStartInfo(IReadOnlyList<string> arguments, string workingDirectory)
     {
         var startInfo = new ProcessStartInfo(DotnetPath)
         {
@@ -190,9 +660,9 @@ public sealed class PackageRestoreRunner(bool enabled = true, TimeSpan? timeout 
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
-            WorkingDirectory = Path.GetDirectoryName(Path.GetFullPath(solution)) ?? Environment.CurrentDirectory
+            WorkingDirectory = workingDirectory
         };
-        foreach (var argument in Arguments(solution))
+        foreach (var argument in arguments)
             startInfo.ArgumentList.Add(argument);
 
         foreach (var name in InheritedMSBuildVariables)

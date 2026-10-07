@@ -63,9 +63,10 @@ public static class SolutionLoader
         }
 
         var declared = SolutionProjectEnumerator.Enumerate(solutionPath);
-        var skipped = ReconcileSkipped(declared, solution, failures, [], onDiagnostic);
+        var reconciled = ReconcileLoads(declared, solution, failures, [], onDiagnostic);
+        var skipped = reconciled.SkippedProjects;
 
-        if (declared.Count > 0 && skipped.Count == declared.Count)
+        if (declared.Count > 0 && AllDeclaredSkipped(declared, solution, reconciled))
         {
             // OpenSolutionAsync did not throw, but EVERY declared project failed to produce content (all
             // empty stubs named by failures). The resulting index would be empty — fail LOUD rather than
@@ -78,7 +79,7 @@ public static class SolutionLoader
                 "the per-project failures.");
         }
 
-        return new SolutionLoadResult(TransitiveProjectReferences.Close(solution, onDiagnostic), skipped);
+        return reconciled.ToResult(TransitiveProjectReferences.Close(solution, onDiagnostic));
     }
 
     /// <summary>
@@ -122,8 +123,8 @@ public static class SolutionLoader
         var attempted = deferred.Count == 0
             ? projectPaths
             : projectPaths.Where(p => !deferredSet.Contains(NormalizePath(p))).ToList();
-        var skipped = ReconcileSkipped(attempted, solution, failures, thrownSkipped, onDiagnostic);
-        return new SolutionLoadResult(TransitiveProjectReferences.Close(solution, onDiagnostic), skipped)
+        var reconciled = ReconcileLoads(attempted, solution, failures, thrownSkipped, onDiagnostic);
+        return reconciled.ToResult(TransitiveProjectReferences.Close(solution, onDiagnostic)) with
         {
             DeferredProjects = deferred
         };
@@ -227,11 +228,8 @@ public static class SolutionLoader
 
         // Reconcile first, then decide whether ANY declared project actually loaded. Presence in the
         // solution is not success — MSBuild keeps empty stubs for failed projects (issue #90).
-        var skipped = ReconcileSkipped(projectPaths, loadedSolution, failures, thrownSkipped, onDiagnostic);
-
-        var skippedPaths = new HashSet<string>(
-            skipped.Select(s => NormalizePath(s.ProjectPath)), StringComparer.OrdinalIgnoreCase);
-        if (projectPaths.All(p => skippedPaths.Contains(NormalizePath(p))))
+        var reconciled = ReconcileLoads(projectPaths, loadedSolution, failures, thrownSkipped, onDiagnostic);
+        if (AllDeclaredSkipped(projectPaths, loadedSolution, reconciled))
         {
             // Every declared project was skipped: this was not one bad project but a global/environment
             // failure (broken toolchain, unreadable solution, ...). Fail LOUD with the original cause
@@ -243,17 +241,29 @@ public static class SolutionLoader
             ExceptionDispatchInfo.Throw(originalException);
         }
 
-        return new SolutionLoadResult(TransitiveProjectReferences.Close(loadedSolution, onDiagnostic), skipped);
+        return reconciled.ToResult(TransitiveProjectReferences.Close(loadedSolution, onDiagnostic));
     }
 
-    // Reconciles the DECLARED projects against what actually loaded to produce the skipped set. A project
-    // is skipped when it threw during open (<paramref name="knownSkipped"/>), when it is missing from the
-    // solution entirely, or when MSBuild retained it as an empty stub after a load failure (present with
-    // zero documents AND named by a WorkspaceFailed FAILURE diagnostic). Requiring the empty-stub shape
-    // avoids a false positive where a project that loaded real content is merely mentioned by an unrelated
-    // failure diagnostic. Internal so the reconciliation logic can be unit-tested with a synthetic
-    // solution + failure set (no real MSBuild required).
-    internal static List<SkippedProject> ReconcileSkipped(
+    internal sealed record LoadReconciliation(
+        IReadOnlyList<SkippedProject> SkippedProjects,
+        IReadOnlyList<DegradedProject> DegradedProjects,
+        int UnattributedFailureCount)
+    {
+        internal SolutionLoadResult ToResult(Solution solution) => new(solution, SkippedProjects)
+        {
+            DegradedProjects = DegradedProjects,
+            UnattributedFailureCount = UnattributedFailureCount
+        };
+    }
+
+    private static bool AllDeclaredSkipped(IReadOnlyList<string> declared, Solution solution, LoadReconciliation result) =>
+        !solution.Projects.Any(p => p.Documents.Any()) && result.DegradedProjects.Count == 0 && declared.All(p =>
+            result.SkippedProjects.Any(s => string.Equals(
+                NormalizePath(s.ProjectPath), NormalizePath(p), StringComparison.OrdinalIgnoreCase)));
+
+    // A typed ProjectId pins a failure to one TFM. A path-only failure cannot prove any of that
+    // file's variants healthy, even if MSBuild returned documents; retain those documents as degraded.
+    internal static LoadReconciliation ReconcileLoads(
         IReadOnlyList<string> declared, Solution solution, IReadOnlyCollection<LoadFailure> failures,
         List<SkippedProject> knownSkipped, Action<string>? onDiagnostic)
     {
@@ -264,36 +274,95 @@ public static class SolutionLoader
         var resolvedFailures = ResolveFailurePaths(failures, solution);
         var attributed = new HashSet<LoadFailure>();
         var result = new List<SkippedProject>(knownSkipped);
+        var degraded = new List<DegradedProject>();
         var seen = new HashSet<string>(
             result.Select(s => NormalizePath(s.ProjectPath)), StringComparer.OrdinalIgnoreCase);
 
         foreach (var projectPath in declared)
         {
-            if (!seen.Add(NormalizePath(projectPath)))
-                continue; // already recorded as a throw during per-project open
-
-            var failure = AttributeFailure(projectPath, resolvedFailures, ambiguousFileNames, attributed);
+            var wasThrown = !seen.Add(NormalizePath(projectPath));
+            var projectFailures = resolvedFailures.Where(f =>
+                AttributeFailure(projectPath, [f], ambiguousFileNames, attributed) != null).ToList();
             var present = loaded.TryGetValue(NormalizePath(projectPath), out var variants);
 
-            if (present)
+            if (!present)
             {
-                // A multi-targeted project appears once per TFM under the same file path. It counts as
-                // skipped only when NO target variant loaded real content AND a failure named it (the
-                // empty-stub shape MSBuild retains after a failed load). If any variant carries documents
-                // the project indexed — never report the whole project skipped. Order-independent, so the
-                // classification is deterministic regardless of the order Roslyn lists the variants.
-                var hasContent = variants!.Any(v => v.Documents.Any());
-                if (hasContent || failure == null)
-                    continue;
+                if (!wasThrown)
+                    result.Add(new SkippedProject(projectPath,
+                        projectFailures.FirstOrDefault()?.Message ?? "project was declared in the solution but did not load"));
+                continue;
             }
 
-            var reason = failure?.Message ?? "project was declared in the solution but did not load";
-            result.Add(new SkippedProject(projectPath, reason));
-            onDiagnostic?.Invoke($"Skipped project '{Path.GetFileName(projectPath)}': {reason}");
+            var thrown = knownSkipped.FirstOrDefault(s => string.Equals(
+                NormalizePath(s.ProjectPath), NormalizePath(projectPath), StringComparison.OrdinalIgnoreCase));
+            if (wasThrown)
+                result.RemoveAll(s => string.Equals(
+                    NormalizePath(s.ProjectPath), NormalizePath(projectPath), StringComparison.OrdinalIgnoreCase));
+            var expected = ReadExpectedFrameworks(projectPath);
+            foreach (var variant in variants!)
+            {
+                var failure = projectFailures.FirstOrDefault(f => f.ProjectId == variant.Id)
+                    ?? projectFailures.FirstOrDefault(f => f.ProjectId == null);
+                var reason = failure?.Message ?? thrown?.Reason;
+                if (reason == null)
+                    continue;
+                var tfm = VariantFramework(variant, expected);
+                if (variant.Documents.Any())
+                    degraded.Add(new DegradedProject(projectPath, tfm, reason));
+                else
+                    result.Add(new SkippedProject(projectPath, reason) { TargetFramework = tfm });
+            }
+            foreach (var failure in projectFailures.Where(f =>
+                         f.ProjectId != null && !variants.Any(v => v.Id == f.ProjectId)))
+                result.Add(new SkippedProject(projectPath, failure.Message));
+
+            // Only unconditional literal declarations establish an expected set. Do not interpret
+            // conditional properties or expand MSBuild expressions with a second, divergent evaluator.
+            foreach (var tfm in expected)
+                if (!variants.Any(v => string.Equals(VariantFramework(v, expected), tfm, StringComparison.OrdinalIgnoreCase)))
+                    result.Add(new SkippedProject(projectPath, "declared target framework did not load")
+                    {
+                        TargetFramework = tfm
+                    });
         }
 
         ReportUnattributedFailures(resolvedFailures, attributed, onDiagnostic);
-        return result;
+        var skips = result.DistinctBy(s => (NormalizePath(s.ProjectPath), s.TargetFramework)).ToList();
+        var degradedVersions = degraded.DistinctBy(s => (NormalizePath(s.ProjectPath), s.TargetFramework)).ToList();
+        foreach (var skip in skips)
+            onDiagnostic?.Invoke($"Skipped project '{skip.ProjectName}' ({skip.TargetFramework ?? "unknown TFM"}): {skip.Reason}");
+        foreach (var project in degradedVersions)
+            onDiagnostic?.Invoke($"Degraded project '{Path.GetFileName(project.ProjectPath)}' ({project.TargetFramework ?? "unknown TFM"}): {project.Reason}");
+        return new LoadReconciliation(skips, degradedVersions, resolvedFailures.Count(f => !attributed.Contains(f)));
+    }
+
+    private static string? VariantFramework(Project project, IReadOnlyList<string> expected)
+    {
+        var suffix = ProjectIdentityFactory.ExtractParentheticalSuffix(project.Name);
+        if (suffix != null && ProjectIdentityFactory.LooksLikeTfm(suffix))
+            return suffix;
+        return expected.Count == 1 ? expected[0] : null;
+    }
+
+    private static IReadOnlyList<string> ReadExpectedFrameworks(string? path)
+    {
+        if (path == null) return [];
+        try
+        {
+            var xml = System.Xml.Linq.XDocument.Load(path);
+            var properties = xml.Descendants().Where(e =>
+                e.Name.LocalName is "TargetFramework" or "TargetFrameworks").ToList();
+            if (properties.Any(e => e.AncestorsAndSelf().Any(a => a.Attribute("Condition") != null)
+                                    || e.Value.Contains("$(", StringComparison.Ordinal)))
+                return [];
+            return properties.SelectMany(e => e.Value.Split(';',
+                    StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                .Where(ProjectIdentityFactory.LooksLikeTfm).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Xml.XmlException)
+        {
+            return []; // Failure diagnostics, not a static XML guess, remain authoritative.
+        }
     }
 
     // File names that occur more than once across the declared projects — a failure diagnostic that only
@@ -383,13 +452,13 @@ public static class SolutionLoader
                 return Attribute(failure, attributed);
 
         foreach (var failure in failures)
-            if (failure.ProjectPath == null &&
+            if (failure.ProjectPath == null && failure.ProjectId == null &&
                 failure.Message.Contains(fullPath, StringComparison.OrdinalIgnoreCase))
                 return Attribute(failure, attributed);
 
         if (!ambiguousFileNames.Contains(fileName))
             foreach (var failure in failures)
-                if (failure.ProjectPath == null &&
+                if (failure.ProjectPath == null && failure.ProjectId == null &&
                     failure.Message.Contains(fileName, StringComparison.OrdinalIgnoreCase))
                     return Attribute(failure, attributed);
 
@@ -413,7 +482,7 @@ public static class SolutionLoader
             // Prefer the diagnostic's typed owning project (when Roslyn reports a ProjectDiagnostic) so
             // attribution keys on project identity, not brittle message-substring matching. The path may
             // not be resolvable yet (the project can be absent from CurrentSolution at event time), so we
-            // also carry the ProjectId for a late resolve in ReconcileSkipped.
+            // also carry the ProjectId for a late resolve in ReconcileLoads.
             ProjectId? projectId = null;
             string? projectPath = null;
             if (e.Diagnostic is ProjectDiagnostic projectDiagnostic)

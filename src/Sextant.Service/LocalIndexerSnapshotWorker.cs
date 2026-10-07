@@ -264,7 +264,7 @@ public sealed class LocalIndexerSnapshotWorker(
                 // Restore BEFORE the load and while an unsatisfiable SDK pin is still neutralized, so the restore
                 // resolves the same SDK the load will. A failed or partial restore never fails the job.
                 restore = await _packageRestore.RunAsync(
-                        checkoutDir, resolution.SelectedSolutions, plan?.RestoreLimit, token)
+                        checkoutDir, resolution.SelectedSolutions, plan?.RestoreLimit, token, scratchDir)
                     .ConfigureAwait(false);
 
                 // Load the DETERMINISTIC selected solution set into ONE workspace (union of projects,
@@ -314,12 +314,15 @@ public sealed class LocalIndexerSnapshotWorker(
             var inventory = SnapshotCoverageBuilder.Inventory.Scan(checkoutDir);
             var pinOverrides = pins.Where(p => p.OverrideApplied).Select(p => p.ToCoverageOverride()).ToList();
             var coverage = SnapshotCoverageBuilder.Build(checkoutDir, resolution, load, inventory, pinOverrides);
-            coverage = coverage with { Coverage = SnapshotCoverageBuilder.WithNotes(coverage.Coverage, restore.Notes()) };
+            coverage = coverage with { Coverage = SnapshotCoverageBuilder.WithRestoreOutcome(coverage.Coverage, restore) };
+            var providerCoverage = SnapshotCoverageBuilder.BuildProviders(
+                    checkoutDir, resolution, load, inventory, pinOverrides, plan?.Budget)
+                .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
+            AddProviderRestoreGaps(providerCoverage, restore);
             var indexContext = context with
             {
                 Coverage = coverage.Coverage,
-                ProviderCoverage = SnapshotCoverageBuilder.BuildProviders(
-                    checkoutDir, resolution, load, inventory, pinOverrides, plan?.Budget),
+                ProviderCoverage = providerCoverage,
                 ProjectLoadIssues = restore.Projects.Count > 0 ? restore.ProjectLoadIssues() : null,
                 TimeBudget = plan?.ForIndexing(checkoutDir, load.DeferredProjects)
             };
@@ -448,6 +451,29 @@ public sealed class LocalIndexerSnapshotWorker(
         return probed.Count > 0 ? probed : error?.InstalledSdks ?? [];
     }
 
+    private static void AddProviderRestoreGaps(
+        IDictionary<string, SnapshotCoverage> providerCoverage, PackageRestoreOutcome restore)
+    {
+        if (restore.Clean)
+            return;
+
+        var unknownGap = restore.TimedOut || restore.SolutionsNotStarted > 0 || restore.SolutionsFailed > 0
+            || restore.ProjectsDropped > 0 || restore.GeneralCodes.Count > 0 || restore.SourceUnreachableGeneral;
+        var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        foreach (var path in providerCoverage.Keys.ToArray())
+        {
+            var prefix = path.Replace('\\', '/').TrimEnd('/') + "/";
+            var hasProjectFailure = restore.Projects.Any(project =>
+                project.Project.Replace('\\', '/').StartsWith(prefix, comparison));
+            if (unknownGap || hasProjectFailure)
+            {
+                providerCoverage[path] = SnapshotCoverageBuilder.WithRestoreFailure(
+                    providerCoverage[path],
+                    "package restore was incomplete for projects in this provider; code binding may be incomplete.");
+            }
+        }
+    }
+
     /// <summary>
     /// Turns a published snapshot + its checkout coverage into the terminal work result. The result is
     /// <see cref="SnapshotWorkResult.Partial"/> — never Complete — whenever the coverage verdict is partial
@@ -573,13 +599,7 @@ public sealed class LocalIndexerSnapshotWorker(
 
         foreach (var coverage in load.Solutions)
         {
-            // A selected solution that declares ZERO recognized projects could not be STATICALLY enumerated
-            // on this worker (unreadable, empty, or an unrecognized solution shape). Because the multi-
-            // solution set is enumerated statically — the selected solutions frequently cannot be MSBuild-
-            // evaluated on this worker's platform (iOS/Android/Mac/WPF heads on Linux), which is the whole
-            // point of #109 — a zero-project read is a coverage gap that must NOT pass as fully covered.
-            // Surface it explicitly (warning ⇒ Partial) rather than letting a silent 0/0 read as success.
-            if (coverage.DeclaredProjectCount == 0)
+            if (!coverage.IsReadable)
             {
                 diagnostics.Add(new ProjectOutcome
                 {
@@ -588,8 +608,8 @@ public sealed class LocalIndexerSnapshotWorker(
                     ProjectPath = RepoRelative(checkoutDir, coverage.SolutionPath),
                     Message =
                         $"Selected solution '{RepoRelative(checkoutDir, coverage.SolutionPath)}' contributed no " +
-                        "recognized projects: it could not be statically enumerated on this worker (unreadable, " +
-                        "empty, or an unrecognized solution format), so its coverage is reported partial, not complete."
+                        "recognized projects: it could not be fully read on this worker, so its coverage is " +
+                        "reported partial, not complete."
                 });
                 continue;
             }
@@ -647,7 +667,7 @@ public sealed class LocalIndexerSnapshotWorker(
                 Code = "project_skipped",
                 ProjectPath = RepoRelative(checkoutDir, skippedProject.ProjectPath),
                 Message =
-                    $"Project '{skippedProject.ProjectName}' was declared in a selected solution but could " +
+                    $"Project '{skippedProject.ProjectName}' (TFM {skippedProject.TargetFramework ?? "unknown"}) was declared in a selected solution but could " +
                     $"not be loaded on this worker: {skippedProject.Reason}."
             });
         }

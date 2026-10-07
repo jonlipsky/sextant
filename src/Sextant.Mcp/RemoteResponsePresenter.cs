@@ -155,7 +155,8 @@ public static class RemoteResponsePresenter
         if (skipped > 0 || degraded > 0)
         {
             var failed = (long)skipped + degraded;
-            var total = Math.Max((long)coverage.ProjectsDeclared, (long)coverage.ProjectsLoaded + skipped);
+            var total = Math.Max((long)coverage.ProjectsDeclared,
+                (long)coverage.ProjectsLoaded + skipped - Math.Clamp(coverage.ProjectsPartiallyLoaded, 0, skipped));
             var verb = skipped > 0 && degraded > 0 ? "did not load or compile"
                 : skipped > 0 ? "did not load"
                 : "did not compile";
@@ -163,12 +164,18 @@ public static class RemoteResponsePresenter
                 ? $"{failed} of {total} projects {verb}"
                 : $"{failed} {Plural(failed, "project", "projects")} {verb}");
         }
+        if (coverage.ProjectsDegraded > 0)
+            parts.Add($"{coverage.ProjectsDegraded} {Plural(coverage.ProjectsDegraded, "project has", "projects have")} failed evaluation");
         if (coverage.SubmodulesUnpopulated > 0)
             parts.Add(coverage.SubmodulesDeclared >= coverage.SubmodulesUnpopulated
                 ? $"{coverage.SubmodulesUnpopulated} of {coverage.SubmodulesDeclared} submodules were not checked out"
                 : $"{coverage.SubmodulesUnpopulated} {Plural(coverage.SubmodulesUnpopulated, "submodule was", "submodules were")} not checked out");
         if (coverage.SolutionsSkipped > 0)
             parts.Add($"{coverage.SolutionsSkipped} configured {Plural(coverage.SolutionsSkipped, "solution", "solutions")} could not be used");
+        if (coverage.SolutionsUnreadable > 0)
+            parts.Add($"{coverage.SolutionsUnreadable} selected {Plural(coverage.SolutionsUnreadable, "solution", "solutions")} could not be read");
+        if (coverage.UnattributedLoadFailures > 0)
+            parts.Add($"{coverage.UnattributedLoadFailures} unattributed load {Plural(coverage.UnattributedLoadFailures, "failure", "failures")}");
         if (coverage.ScanErrors > 0)
             parts.Add($"{coverage.ScanErrors} {Plural(coverage.ScanErrors, "part", "parts")} of the checkout could not be scanned");
         return parts;

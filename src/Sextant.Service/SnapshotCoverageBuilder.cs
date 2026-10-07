@@ -1,5 +1,6 @@
 using Sextant.Core;
 using Sextant.Indexer;
+using Sextant.Service.Restore;
 using Sextant.Store;
 
 namespace Sextant.Service;
@@ -13,9 +14,9 @@ namespace Sextant.Service;
 /// The verdict is PARTIAL whenever the published snapshot does not cover the whole checkout: a discovered
 /// solution was left unselected (defensive — the no-config default selects the union of every discovered
 /// solution, issue #124, so this is empty unless a future selector narrows again), a configured solution
-/// was unusable, a declared project failed to load, a selected solution declared nothing readable, nothing
-/// loaded at all, a declared submodule is not populated, or (under the no-config default) a project file on
-/// disk is in no selected solution. Each gap is also recorded as a warning diagnostic, so a partial
+/// was unusable, a project/TFM evaluation failed, a selected solution could not be fully read, no expected project
+/// loaded, a declared submodule is not populated, or the checkout scan failed. On-disk projects outside every
+/// selected solution are notes, not gaps. Each gap is also recorded as a warning diagnostic, so a partial
 /// snapshot is never silent.
 /// </para>
 /// <para>
@@ -92,15 +93,12 @@ public static class SnapshotCoverageBuilder
         var diagnostics = new List<ProjectOutcome>();
 
         var totalLoaded = load.Solutions.Sum(c => c.LoadedProjectCount);
-        var emptySolutions = load.Solutions.Count(c => c.DeclaredProjectCount == 0);
+        var unreadableSolutions = load.Solutions.Count(c => !c.IsReadable);
 
         // Every project file the index actually accounts for: declared by a selected solution, or pulled
         // into the workspace by the load (e.g. a ProjectReference outside every selected solution). Physical
         // paths, so the per-TFM Roslyn projects of one multi-targeted file count once.
-        var loadedFiles = new HashSet<string>(comparer);
-        foreach (var project in load.Solution.Projects)
-            if (!string.IsNullOrEmpty(project.FilePath))
-                loadedFiles.Add(Path.GetFullPath(project.FilePath));
+        var loadedFiles = UsableFiles(load, comparer);
         var accounted = new HashSet<string>(load.DeclaredProjects.Select(Path.GetFullPath), comparer);
         accounted.UnionWith(loadedFiles);
         var unreferenced = inventory.ProjectFilesOnDisk
@@ -150,7 +148,7 @@ public static class SnapshotCoverageBuilder
                 // each project's load failure is in the `project_skipped` job diagnostics.
                 var sample = otherSkips
                     .Take(MaxNamedInReason)
-                    .Select(s => ReasonPath(checkoutDir, s.ProjectPath));
+                    .Select(s => VersionName(ReasonPath(checkoutDir, s.ProjectPath), s.TargetFramework));
                 var more = otherSkips.Count > MaxNamedInReason
                     ? $", +{otherSkips.Count - MaxNamedInReason} more"
                     : string.Empty;
@@ -174,10 +172,37 @@ public static class SnapshotCoverageBuilder
             }
         }
 
-        if (emptySolutions > 0)
-            reasons.Add($"{emptySolutions} selected solution(s) declared no readable projects.");
+        if (load.DegradedProjects.Count > 0)
+        {
+            reasons.Add(
+                $"{load.DegradedProjects.Count} project version(s) failed evaluation but exposed documents " +
+                $"({NameSample(load.DegradedProjects.Select(p => VersionName(ReasonPath(checkoutDir, p.ProjectPath), p.TargetFramework)).ToList())}); " +
+                "their references may be incomplete; see the `project_evaluation_degraded` diagnostics.");
+            AddCapped(diagnostics, load.DegradedProjects, p => new ProjectOutcome
+            {
+                Severity = JobDiagnosticSeverity.Warning,
+                Code = "project_evaluation_degraded",
+                ProjectPath = ReasonPath(checkoutDir, p.ProjectPath),
+                Message = $"{VersionName(ReasonPath(checkoutDir, p.ProjectPath), p.TargetFramework)} failed evaluation " +
+                    $"({EvaluationReason(p.Reason)}); surviving documents were indexed as partial."
+            }, "project_evaluation_degraded", "project versions failed evaluation");
+        }
 
-        if (totalLoaded == 0)
+        if (load.UnattributedFailureCount > 0)
+        {
+            reasons.Add($"{load.UnattributedFailureCount} load failure(s) could not be attributed to a project; healthy evaluation cannot be proven.");
+            diagnostics.Add(new ProjectOutcome
+            {
+                Severity = JobDiagnosticSeverity.Warning,
+                Code = "project_evaluation_unattributed",
+                Message = reasons[^1]
+            });
+        }
+
+        if (unreadableSolutions > 0)
+            reasons.Add($"{unreadableSolutions} selected solution(s) declared no readable projects because they could not be fully read.");
+
+        if (totalLoaded == 0 && (load.DeclaredProjects.Count > 0 || unreadableSolutions > 0))
             reasons.Add("no project across the selected solution(s) loaded.");
 
         if (unpopulated.Count > 0)
@@ -262,7 +287,13 @@ public static class SnapshotCoverageBuilder
             SolutionsSkipped = resolution.SkippedSolutions.Count,
             ProjectsDeclared = load.DeclaredProjects.Count,
             ProjectsLoaded = loadedFiles.Count,
-            ProjectsSkipped = load.SkippedProjects.Count,
+            ProjectsSkipped = load.SkippedProjects.Select(p => p.ProjectPath).Distinct(comparer).Count(),
+            ProjectsPartiallyLoaded = load.SkippedProjects.Select(p => Path.GetFullPath(p.ProjectPath))
+                .Distinct(comparer).Count(loadedFiles.Contains),
+            ProjectsDegraded = load.DegradedProjects.Select(p => p.ProjectPath).Distinct(comparer).Count(),
+            SolutionsUnreadable = unreadableSolutions,
+            UnattributedLoadFailures = load.UnattributedFailureCount,
+            EvaluationGaps = EvaluationGaps(load.SkippedProjects, load.DegradedProjects, p => ReasonPath(checkoutDir, p)),
             ProjectFilesOnDisk = inventory.ProjectFilesOnDisk.Count,
             ProjectFilesUnreferenced = unreferenced.Count,
             SubmodulesDeclared = inventory.Submodules.Count,
@@ -284,6 +315,39 @@ public static class SnapshotCoverageBuilder
         if (notes is not { Count: > 0 })
             return coverage;
         return coverage with { Notes = [.. coverage.Notes ?? [], .. notes] };
+    }
+
+    /// <summary>
+    /// Records best-effort restore diagnostics and makes an incomplete restore an explicit coverage gap.
+    /// </summary>
+    public static SnapshotCoverage WithRestoreOutcome(SnapshotCoverage coverage, PackageRestoreOutcome restore)
+    {
+        ArgumentNullException.ThrowIfNull(coverage);
+        ArgumentNullException.ThrowIfNull(restore);
+
+        var result = WithNotes(coverage, restore.Notes());
+        if (restore.Clean)
+            return result;
+
+        var reason = restore.UsedProjectUnion
+            ? $"package restore was incomplete for the union of {restore.ProjectsAttempted} distinct project(s) " +
+              $"from {restore.SolutionsSelected} selected solution(s); code binding may be incomplete."
+            : $"package restore was incomplete for {restore.SolutionsSelected} selected solution(s); code binding may be incomplete.";
+        return WithRestoreFailure(result, reason);
+    }
+
+    /// <summary>Marks a snapshot partial for a restore gap that applies to its project set.</summary>
+    public static SnapshotCoverage WithRestoreFailure(SnapshotCoverage coverage, string reason)
+    {
+        ArgumentNullException.ThrowIfNull(coverage);
+        ArgumentException.ThrowIfNullOrWhiteSpace(reason);
+        return coverage with
+        {
+            Verdict = SnapshotCoverageVerdict.Partial,
+            Reasons = coverage.Reasons.Contains(reason, StringComparer.Ordinal)
+                ? coverage.Reasons
+                : [.. coverage.Reasons, reason]
+        };
     }
 
     /// <summary>
@@ -317,10 +381,7 @@ public static class SnapshotCoverageBuilder
         var root = Path.GetFullPath(checkoutDir);
         var result = new Dictionary<string, SnapshotCoverage>(comparer);
 
-        var loadedFiles = new HashSet<string>(comparer);
-        foreach (var project in load.Solution.Projects)
-            if (!string.IsNullOrEmpty(project.FilePath))
-                loadedFiles.Add(Path.GetFullPath(project.FilePath));
+        var loadedFiles = UsableFiles(load, comparer);
         var declaredFiles = new HashSet<string>(load.DeclaredProjects.Select(Path.GetFullPath), comparer);
         var selectedSolutions = resolution.SelectedSolutions.Select(Path.GetFullPath).ToList();
         var providerSolutionsOnDisk = (inventory.SubmoduleSolutionFiles ?? []).Select(Path.GetFullPath).ToList();
@@ -350,14 +411,21 @@ public static class SnapshotCoverageBuilder
             var notSelectedOwn = ownSolutions.Where(s => !selectedOwn.Contains(s, comparer))
                 .OrderBy(s => Rel(s), StringComparer.Ordinal)
                 .ToList();
-            var emptyOwn = load.Solutions
-                .Count(c => c.DeclaredProjectCount == 0 && InSubtree(Path.GetFullPath(c.SolutionPath)));
+            var unreadableOwn = load.Solutions
+                .Count(c => !c.IsReadable && InSubtree(Path.GetFullPath(c.SolutionPath)));
+            var degraded = load.DegradedProjects.Where(p => InSubtree(Path.GetFullPath(p.ProjectPath))).ToList();
 
             var reasons = new List<string>();
             if (skipped.Count > 0)
                 reasons.Add(
                     $"{skipped.Count} project(s) of this repository could not be loaded while indexing the checkout " +
-                    $"that pins it ({NameSample(skipped.Select(s => Rel(Path.GetFullPath(s.ProjectPath))).ToList())}).");
+                    $"that pins it ({NameSample(skipped.Select(s => VersionName(Rel(Path.GetFullPath(s.ProjectPath)), s.TargetFramework)).ToList())}).");
+            if (degraded.Count > 0)
+                reasons.Add(
+                    $"{degraded.Count} project version(s) failed evaluation but exposed documents " +
+                    $"({NameSample(degraded.Select(p => VersionName(Rel(Path.GetFullPath(p.ProjectPath)), p.TargetFramework)).ToList())}); their references may be incomplete.");
+            if (load.UnattributedFailureCount > 0)
+                reasons.Add($"{load.UnattributedFailureCount} load failure(s) could not be attributed; healthy evaluation of this repository cannot be proven.");
             if (deferred.Count > 0)
                 reasons.Add(
                     $"{deferred.Count} project(s) of this repository were not loaded because the indexing checkout's " +
@@ -375,8 +443,8 @@ public static class SnapshotCoverageBuilder
                 reasons.Add(
                     $"{unreferenced.Count} of {onDisk.Count} project file(s) on disk were not reached by the indexing " +
                     $"checkout's solution selection and were not indexed ({NameSample(unreferenced.Select(p => Rel(Path.GetFullPath(p))).ToList())}).");
-            if (emptyOwn > 0)
-                reasons.Add($"{emptyOwn} selected solution(s) of this repository declared no readable projects.");
+            if (unreadableOwn > 0)
+                reasons.Add($"{unreadableOwn} selected solution(s) of this repository could not be fully read.");
             if (nestedUnpopulated.Count > 0)
                 reasons.Add(
                     $"{nestedUnpopulated.Count} of {nested.Count} nested submodule(s) are not populated " +
@@ -416,7 +484,13 @@ public static class SnapshotCoverageBuilder
                 SolutionsSkipped = 0,
                 ProjectsDeclared = declared.Count,
                 ProjectsLoaded = loaded.Count,
-                ProjectsSkipped = skipped.Count,
+                ProjectsSkipped = skipped.Select(p => p.ProjectPath).Distinct(comparer).Count(),
+                ProjectsPartiallyLoaded = skipped.Select(p => Path.GetFullPath(p.ProjectPath))
+                    .Distinct(comparer).Count(loadedFiles.Contains),
+                ProjectsDegraded = degraded.Select(p => p.ProjectPath).Distinct(comparer).Count(),
+                SolutionsUnreadable = unreadableOwn,
+                UnattributedLoadFailures = load.UnattributedFailureCount,
+                EvaluationGaps = EvaluationGaps(skipped, degraded, p => Rel(Path.GetFullPath(p))),
                 ProjectFilesOnDisk = onDisk.Count,
                 ProjectFilesUnreferenced = unreferenced.Count,
                 SubmodulesDeclared = nested.Count,
@@ -435,6 +509,35 @@ public static class SnapshotCoverageBuilder
     /// was selected: it was built only from the projects the indexing parent's selection reached (issue #162).
     /// </summary>
     public const string ParentSelectionSource = "parent_selection";
+
+    private static HashSet<string> UsableFiles(MultiSolutionLoadResult load, StringComparer comparer)
+    {
+        var skipped = load.SkippedProjects.Select(p => Path.GetFullPath(p.ProjectPath)).ToHashSet(comparer);
+        return load.Solution.Projects.Where(p => !string.IsNullOrEmpty(p.FilePath) &&
+                (p.Documents.Any() || !skipped.Contains(Path.GetFullPath(p.FilePath))))
+            .Select(p => Path.GetFullPath(p.FilePath!)).ToHashSet(comparer);
+    }
+
+    private static string VersionName(string project, string? tfm) => $"{project} (TFM {tfm ?? "unknown"})";
+
+    private static string EvaluationReason(string reason)
+    {
+        // Raw MSBuild text can include credentials in feed URLs or arbitrary checkout contents.
+        var codes = System.Text.RegularExpressions.Regex.Matches(reason, @"\b(?:MSB|NETSDK|NU)\d{4}\b",
+            System.Text.RegularExpressions.RegexOptions.None, TimeSpan.FromSeconds(1))
+            .Select(m => m.Value).Distinct(StringComparer.Ordinal).Take(5).ToList();
+        return codes.Count > 0 ? string.Join(", ", codes) : "evaluation failed or target framework missing";
+    }
+
+    private static IReadOnlyList<ProjectEvaluationGap>? EvaluationGaps(
+        IReadOnlyList<SkippedProject> skipped, IReadOnlyList<DegradedProject> degraded, Func<string, string> path)
+    {
+        var gaps = skipped.Select(p => new ProjectEvaluationGap(path(p.ProjectPath), p.TargetFramework, false, EvaluationReason(p.Reason)))
+            .Concat(degraded.Select(p => new ProjectEvaluationGap(path(p.ProjectPath), p.TargetFramework, true, EvaluationReason(p.Reason))))
+            .OrderBy(p => p.Project, StringComparer.Ordinal).ThenBy(p => p.TargetFramework, StringComparer.Ordinal)
+            .Take(MaxItemDiagnosticsPerKind).ToList();
+        return gaps.Count > 0 ? gaps : null;
+    }
 
     private static bool IsUnder(string directory, string fullPath)
     {

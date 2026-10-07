@@ -85,7 +85,12 @@ public sealed class DefaultUnionSnapshotIntegrationTests : IDisposable
             Assert.AreEqual(1, coverage.ProjectsSkipped);
             Assert.AreEqual(4, coverage.ProjectFilesOnDisk);
             Assert.AreEqual(0, coverage.ProjectFilesUnreferenced);
-            Assert.AreEqual(1, coverage.Reasons.Count, "the unloadable head is the only gap");
+            Assert.IsTrue(coverage.Reasons.Any(reason =>
+                reason.Contains("Mobile.iOS/Mobile.iOS.csproj", StringComparison.Ordinal)),
+                "the unloadable head remains visible as a coverage gap");
+            Assert.IsTrue(coverage.Reasons.Any(reason =>
+                reason.Contains("package restore was incomplete", StringComparison.Ordinal)),
+                "an incomplete best-effort restore is an additional explicit coverage gap");
 
             AssertSharedProjectStoredOncePerTfm(db.GetConnection(), result.SnapshotId.Value);
             // Solution scope (#124 review): the union workspace has no solution file of its own, yet each

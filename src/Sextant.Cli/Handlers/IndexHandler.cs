@@ -176,10 +176,13 @@ internal static class IndexHandler
 
         Console.WriteLine();
         Console.WriteLine(
-            $"  WARNING: {loadResult.SkippedProjects.Count} project(s) could not be loaded and were skipped. " +
-            "The index is PARTIAL — symbols from these projects are missing:");
+            $"  WARNING: {loadResult.SkippedProjects.Count} project version(s) skipped, " +
+            $"{loadResult.DegradedProjects.Count} degraded, {loadResult.UnattributedFailureCount} unattributed load failure(s). " +
+            "The index is PARTIAL; symbols or references may be missing:");
         foreach (var skipped in loadResult.SkippedProjects)
-            Console.WriteLine($"    - {skipped.ProjectName}: {skipped.Reason}");
+            Console.WriteLine($"    - {skipped.ProjectName} (TFM {skipped.TargetFramework ?? "unknown"}): {skipped.Reason}");
+        foreach (var degraded in loadResult.DegradedProjects)
+            Console.WriteLine($"    - {Path.GetFileName(degraded.ProjectPath)} (TFM {degraded.TargetFramework ?? "unknown"}, degraded): {degraded.Reason}");
     }
 
     private static void ClearLine()
