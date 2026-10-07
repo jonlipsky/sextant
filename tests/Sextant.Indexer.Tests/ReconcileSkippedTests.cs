@@ -16,6 +16,52 @@ public sealed class ReconcileSkippedTests
     private static readonly string Root = Path.Combine(Path.GetTempPath(), "sextant-reconcile");
 
     [TestMethod]
+    public void IsReplayedRestoreWarning_OnlyAnExactTrailingWarningMessage()
+    {
+        const string warning = "Your request could not be authenticated by the GitHub Packages service.";
+        var warnings = new[] { warning };
+
+        Assert.IsTrue(SolutionLoader.IsReplayedRestoreWarning(
+            $"Msbuild failed when processing the file '/r/A/A.csproj' with message: {warning}\n", warnings));
+        Assert.IsFalse(SolutionLoader.IsReplayedRestoreWarning(
+            $"Msbuild failed when processing the file '/r/A/A.csproj' with message: {warning} And then it crashed.", warnings));
+        Assert.IsFalse(SolutionLoader.IsReplayedRestoreWarning(
+            "Msbuild failed when processing the file '/r/A/A.csproj' with message: service.", warnings));
+        Assert.IsFalse(SolutionLoader.IsReplayedRestoreWarning(
+            $"Msbuild failed when processing the file '/r/A/A.csproj' with message: {warning}", []));
+    }
+
+    [TestMethod]
+    public void PresentProject_IsNotDegraded_ByAFailureThatReplaysAWarningFromItsOwnAssetsFile()
+    {
+        var a = Abs("Replay-" + Guid.NewGuid().ToString("N"), "A.csproj");
+        var obj = Path.Combine(Path.GetDirectoryName(a)!, "obj");
+        Directory.CreateDirectory(obj);
+        try
+        {
+            File.WriteAllText(Path.Combine(obj, "project.assets.json"),
+                """{"version":3,"logs":[{"code":"NU1801","level":"Warning","message":"Feed 401 notice."},{"code":"NU1101","level":"Error","message":"Missing package X."}]}""");
+            var solution = SolutionWith((a, withDocument: true));
+
+            var warningOnly = SolutionLoader.ReconcileLoads([a], solution,
+                [new SolutionLoader.LoadFailure(null, a, $"Msbuild failed when processing the file '{a}' with message: Feed 401 notice.")], [], null);
+            Assert.AreEqual(0, warningOnly.DegradedProjects.Count);
+            Assert.AreEqual(0, warningOnly.UnattributedFailureCount);
+
+            var withError = SolutionLoader.ReconcileLoads([a], solution,
+            [
+                new SolutionLoader.LoadFailure(null, a, $"Msbuild failed when processing the file '{a}' with message: Feed 401 notice."),
+                new SolutionLoader.LoadFailure(null, a, $"Msbuild failed when processing the file '{a}' with message: Missing package X.")
+            ], [], null);
+            StringAssert.Contains(withError.DegradedProjects.Single().Reason, "Missing package X.");
+        }
+        finally
+        {
+            Directory.Delete(Path.GetDirectoryName(a)!, recursive: true);
+        }
+    }
+
+    [TestMethod]
     public void PresentProjectWithDocuments_IsDegraded_WhenAFailureNamesIt()
     {
         var a = Abs("A", "A.csproj");

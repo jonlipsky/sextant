@@ -284,6 +284,15 @@ public static class SolutionLoader
             var projectFailures = resolvedFailures.Where(f =>
                 AttributeFailure(projectPath, [f], ambiguousFileNames, attributed) != null).ToList();
             var present = loaded.TryGetValue(NormalizePath(projectPath), out var variants);
+            if (present && projectFailures.Count > 0)
+            {
+                var restoreWarnings = ReadRestoreWarnings(projectPath);
+                var replayed = projectFailures.Where(f => IsReplayedRestoreWarning(f.Message, restoreWarnings)).ToList();
+                foreach (var warning in replayed)
+                    onDiagnostic?.Invoke(
+                        $"Restore warning replayed by the load of '{Path.GetFileName(projectPath)}' (not a load failure): {warning.Message}");
+                projectFailures = projectFailures.Except(replayed).ToList();
+            }
 
             if (!present)
             {
@@ -334,6 +343,52 @@ public static class SolutionLoader
         foreach (var project in degradedVersions)
             onDiagnostic?.Invoke($"Degraded project '{Path.GetFileName(project.ProjectPath)}' ({project.TargetFramework ?? "unknown TFM"}): {project.Reason}");
         return new LoadReconciliation(skips, degradedVersions, resolvedFailures.Count(f => !attributed.Contains(f)));
+    }
+
+    // MSBuildWorkspace reports an MSBuild WARNING raised during the design-time load as a Failure diagnostic
+    // ("Msbuild failed when processing the file '<project>' with message: <text>"). The load replays every
+    // warning NuGet recorded in the project's assets file during restore (for example an authenticated feed's
+    // first 401 before its credential provider answered, or a vulnerability notice), so a project whose
+    // packages restored and whose code loaded was reported degraded. Such a diagnostic is reclassified ONLY when
+    // its text ends with the exact message of a Warning-level entry in that project's own assets file; anything
+    // else, and any project that did not load, keeps its failure.
+    internal static bool IsReplayedRestoreWarning(string message, IReadOnlyCollection<string> restoreWarnings)
+    {
+        var text = message.TrimEnd();
+        return restoreWarnings.Any(warning => text.EndsWith(": " + warning, StringComparison.Ordinal));
+    }
+
+    // The Warning-level messages in '<project dir>/obj/project.assets.json' (the default restore output path; a
+    // repository that moves it keeps today's behavior: no reclassification).
+    internal static IReadOnlyCollection<string> ReadRestoreWarnings(string projectPath)
+    {
+        var assets = Path.Combine(Path.GetDirectoryName(projectPath) ?? ".", "obj", "project.assets.json");
+        try
+        {
+            if (!File.Exists(assets))
+                return [];
+            using var stream = File.OpenRead(assets);
+            using var document = System.Text.Json.JsonDocument.Parse(stream);
+            if (!document.RootElement.TryGetProperty("logs", out var logs) || logs.ValueKind != System.Text.Json.JsonValueKind.Array)
+                return [];
+            var warnings = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var entry in logs.EnumerateArray())
+            {
+                if (entry.ValueKind == System.Text.Json.JsonValueKind.Object
+                    && entry.TryGetProperty("level", out var level) && level.ValueKind == System.Text.Json.JsonValueKind.String
+                    && string.Equals(level.GetString(), "Warning", StringComparison.OrdinalIgnoreCase)
+                    && entry.TryGetProperty("message", out var text) && text.ValueKind == System.Text.Json.JsonValueKind.String
+                    && text.GetString()?.Trim() is { Length: > 0 } warning)
+                {
+                    warnings.Add(warning);
+                }
+            }
+            return warnings;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Text.Json.JsonException)
+        {
+            return [];
+        }
     }
 
     private static string? VariantFramework(Project project, IReadOnlyList<string> expected)
