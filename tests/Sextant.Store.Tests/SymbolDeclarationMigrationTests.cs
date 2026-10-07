@@ -40,7 +40,7 @@ public class SymbolDeclarationMigrationTests
     {
         Assert.IsFalse(IndexDatabase.IdentityNeutralMigrations.Contains(26), "026 changes what the indexer stores");
         Assert.AreEqual(26, IndexDatabase.SnapshotSchemaVersion);
-        Assert.AreEqual(26, IndexDatabase.LatestSchemaVersion);
+        Assert.AreEqual(27, IndexDatabase.LatestSchemaVersion);
     }
 
     [TestMethod]
@@ -55,14 +55,15 @@ public class SymbolDeclarationMigrationTests
             var runs = new IndexRunStore(conn);
             Assert.AreEqual(1, runs.MarkComplete(runs.BeginRun("full", 1), 2, 1));
             // Back to the schema a pre-026 build left: no column, version 25.
-            Exec(conn, "ALTER TABLE symbols DROP COLUMN declaration; DELETE FROM schema_version WHERE version = 26;");
+            Exec(conn, "DROP INDEX ix_snapshot_jobs_completed_at; ALTER TABLE symbols DROP COLUMN declaration; " +
+                "DELETE FROM schema_version WHERE version >= 26;");
             Assert.AreEqual(25, db.CurrentSchemaVersion);
         }
 
         using (var db = new IndexDatabase(_dbPath))
         {
             db.RunMigrations();
-            Assert.AreEqual(26, db.CurrentSchemaVersion);
+            Assert.AreEqual(27, db.CurrentSchemaVersion);
             Assert.IsNotNull(new IndexRunStore(db.GetConnection()).GetLastCompleteRun(), "026 keeps index_runs");
 
             var symbol = new SymbolStore(db.GetConnection()).GetById(symbolId);

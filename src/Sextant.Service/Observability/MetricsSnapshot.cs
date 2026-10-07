@@ -21,6 +21,24 @@ public sealed record JobMetrics
     public double CompletenessRate => Terminal == 0 ? 1.0 : (double)Complete / Terminal;
 }
 
+/// <summary>Terminal job outcomes completed inside an explicitly bounded rolling window.</summary>
+public sealed record RecentJobMetrics
+{
+    public long WindowStartUnixMs { get; init; }
+    public long WindowEndUnixMs { get; init; }
+    public long MinimumSamples { get; init; }
+    public long Complete { get; init; }
+    public long Partial { get; init; }
+    public long Failed { get; init; }
+    public long Unsupported { get; init; }
+    public long Cancelled { get; init; }
+
+    public long SampleCount => Complete + Partial + Failed + Unsupported + Cancelled;
+    public bool RatesAssessed => SampleCount >= Math.Max(1, MinimumSamples);
+    public double? SuccessRate => SampleCount == 0 ? null : (double)(Complete + Partial) / SampleCount;
+    public double? CompletenessRate => SampleCount == 0 ? null : (double)Complete / SampleCount;
+}
+
 /// <summary>Worker capacity signal (criterion 5): can this node index, and how many jobs are in flight.</summary>
 public sealed record WorkerCapacityMetrics
 {
@@ -86,6 +104,7 @@ public sealed record MetricsSnapshot
     public required LatencyStats QueueDelay { get; init; }
     public required LatencyStats QueryLatency { get; init; }
     public required JobMetrics Jobs { get; init; }
+    public RecentJobMetrics RecentJobs { get; init; } = new();
     public required WorkerCapacityMetrics WorkerCapacity { get; init; }
     public required StorageMetrics Storage { get; init; }
     public required CacheReuseMetrics CacheReuse { get; init; }

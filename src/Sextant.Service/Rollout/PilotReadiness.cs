@@ -52,8 +52,8 @@ public sealed record PilotReadinessInput
     /// <summary>The current alerts (a critical alert blocks pilot readiness).</summary>
     public IReadOnlyList<Alert> Alerts { get; init; } = [];
 
-    /// <summary>Observed job outcomes; null or too few terminal jobs means completeness is not assessed.</summary>
-    public JobMetrics? Jobs { get; init; }
+    /// <summary>Recent terminal outcomes; null or too few samples means completeness is not assessed.</summary>
+    public RecentJobMetrics? RecentJobs { get; init; }
 }
 
 /// <summary>One evaluated pilot exit-criterion check.</summary>
@@ -101,10 +101,10 @@ public static class PilotReadiness
         var t = thresholds ?? AlertThresholds.Default;
         var untrusted = input.WorkloadClass == PilotWorkloadClass.UntrustedMultiTenant;
         var hasCritical = input.Alerts.Any(a => a.Level == AlertLevel.Critical);
-        var completenessAssessed = input.Jobs is { Terminal: > 0 } jobs &&
-                                   jobs.Terminal >= t.SuccessRateMinSamples;
+        var completenessAssessed = input.RecentJobs is { } jobs &&
+                                   jobs.SampleCount >= Math.Max(1, t.SuccessRateMinSamples);
         var completenessPassed = completenessAssessed &&
-                                 input.Jobs!.CompletenessRate >= t.CompletenessRateWarn;
+                                 input.RecentJobs!.CompletenessRate >= t.CompletenessRateWarn;
 
         var checks = new List<PilotCheck>
         {
@@ -184,10 +184,11 @@ public static class PilotReadiness
                 Passed = completenessPassed,
                 Blocking = untrusted,
                 Message = !completenessAssessed
-                    ? $"Snapshot completeness is not assessed: need at least {Math.Max(1, t.SuccessRateMinSamples)} terminal jobs."
+                    ? $"Recent snapshot completeness is not assessed: need at least {Math.Max(1, t.SuccessRateMinSamples)} " +
+                      $"terminal jobs in the last 24 hours; observed {input.RecentJobs?.SampleCount ?? 0}."
                     : completenessPassed
-                        ? $"Job completeness rate {input.Jobs!.CompletenessRate:P0} meets threshold {t.CompletenessRateWarn:P0}."
-                        : $"Job completeness rate {input.Jobs!.CompletenessRate:P0} is below threshold {t.CompletenessRateWarn:P0}. " +
+                        ? $"Recent job completeness rate {input.RecentJobs!.CompletenessRate:P0} meets threshold {t.CompletenessRateWarn:P0}."
+                        : $"Recent job completeness rate {input.RecentJobs!.CompletenessRate:P0} is below threshold {t.CompletenessRateWarn:P0}. " +
                           "Inspect coverage.reasons and the solutions config."
             },
             new()

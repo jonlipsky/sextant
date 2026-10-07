@@ -16,25 +16,34 @@ public sealed class MetricsCollector(
     ServicePaths paths,
     string catalogDbPath,
     ServiceMetrics metrics,
-    bool hasWorkerCapacity)
+    bool hasWorkerCapacity,
+    TimeProvider? timeProvider = null)
 {
     // Bound the latency window so a very long-lived service never scans an unbounded job history.
     private const int LatencyWindow = 1000;
+    private static readonly long RecentWindowMs = (long)TimeSpan.FromHours(24).TotalMilliseconds;
+    private readonly TimeProvider _time = timeProvider ?? TimeProvider.System;
 
     public MetricsSnapshot Collect(AlertThresholds? thresholds = null)
     {
+        var collectedAt = _time.GetUtcNow();
+        var windowEnd = collectedAt.ToUnixTimeMilliseconds();
+        var windowStart = windowEnd - RecentWindowMs;
         var jobs = CollectJobs();
+        var recentJobs = CollectRecentJobs(windowStart, windowEnd, thresholds?.SuccessRateMinSamples ??
+            AlertThresholds.Default.SuccessRateMinSamples);
         var (indexing, queue) = CollectLatencies();
         var storage = CollectStorage();
         var cost = CollectCost();
 
         var snapshot = new MetricsSnapshot
         {
-            CollectedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            CollectedAt = windowEnd,
             IndexingLatency = indexing,
             QueueDelay = queue,
             QueryLatency = metrics.QueryLatency.Snapshot(),
             Jobs = jobs,
+            RecentJobs = recentJobs,
             WorkerCapacity = new WorkerCapacityMetrics
             {
                 HasCapacity = hasWorkerCapacity,
@@ -54,6 +63,41 @@ public sealed class MetricsCollector(
         };
 
         return snapshot with { Alerts = AlertEvaluator.Evaluate(snapshot, thresholds) };
+    }
+
+    private RecentJobMetrics CollectRecentJobs(long windowStart, long windowEnd, long minimumSamples)
+    {
+        var counts = new Dictionary<string, long>(StringComparer.Ordinal);
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT status, COUNT(*)
+            FROM snapshot_jobs INDEXED BY ix_snapshot_jobs_completed_at
+            WHERE completed_at >= @window_start AND completed_at < @window_end
+              AND status IN (@complete, @partial, @failed, @unsupported, @cancelled)
+            GROUP BY status;
+            """;
+        cmd.Parameters.AddWithValue("@window_start", windowStart);
+        cmd.Parameters.AddWithValue("@window_end", windowEnd);
+        cmd.Parameters.AddWithValue("@complete", SnapshotJobStatus.Complete);
+        cmd.Parameters.AddWithValue("@partial", SnapshotJobStatus.Partial);
+        cmd.Parameters.AddWithValue("@failed", SnapshotJobStatus.Failed);
+        cmd.Parameters.AddWithValue("@unsupported", SnapshotJobStatus.Unsupported);
+        cmd.Parameters.AddWithValue("@cancelled", SnapshotJobStatus.Cancelled);
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            counts[reader.GetString(0)] = reader.GetInt64(1);
+
+        return new RecentJobMetrics
+        {
+            WindowStartUnixMs = windowStart,
+            WindowEndUnixMs = windowEnd,
+            MinimumSamples = minimumSamples,
+            Complete = counts.GetValueOrDefault(SnapshotJobStatus.Complete),
+            Partial = counts.GetValueOrDefault(SnapshotJobStatus.Partial),
+            Failed = counts.GetValueOrDefault(SnapshotJobStatus.Failed),
+            Unsupported = counts.GetValueOrDefault(SnapshotJobStatus.Unsupported),
+            Cancelled = counts.GetValueOrDefault(SnapshotJobStatus.Cancelled)
+        };
     }
 
     private JobMetrics CollectJobs()

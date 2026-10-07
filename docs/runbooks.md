@@ -26,14 +26,18 @@ cross-tenant counts to a tenant (criterion-1 leakage guard).
 Alerts evaluated over the metrics snapshot: `queue_delay_high`, `low_success_rate`, `low_completeness_rate`,
 `worker_exhaustion`, `storage_pressure`.
 
-`low_completeness_rate` warns when complete / terminal jobs is below 90% and is critical below 50%,
-after at least five terminal jobs. Equality at 90% is healthy; equality at 50% is warning, not critical.
-Partial publication remains a success for `low_success_rate`, but lowers completeness. These defaults
+`low_completeness_rate` evaluates complete / terminal jobs completed in the rolling 24 hours; it warns
+below 90% and is critical below 50%, after at least five recent terminal jobs. The metrics snapshot reports
+the window as `[window_start_unix_ms, window_end_unix_ms)` and reports the sample count. Equality at 90%
+is healthy; equality at 50% is warning, not critical. Partial publication remains a success for the
+cumulative `low_success_rate`, but lowers recent completeness. These defaults
 are configurable through `AlertThresholds.CompletenessRateWarn`, `CompletenessRateCrit`, and the shared
-`SuccessRateMinSamples` programmatic settings (no environment-variable overrides). Inspect
+`SuccessRateMinSamples` programmatic settings (no environment-variable overrides). The cumulative
+`jobs` counts/rates are retained for compatibility; neither alerting nor pilot readiness substitutes its
+empty-history `1.0` rate for the recent window. Inspect
 `/control/status/{jobId}` and `/control/resolve` for `coverage.reasons`, then check the repository's
-`solutions` configuration and project-load/submodule diagnostics. With too few terminal jobs the rate
-is not assessed; the no-sample exported value of 1.0 is not proof of healthy coverage. This signal uses
+`solutions` configuration and project-load/submodule diagnostics. With too few recent terminal jobs the rate
+is not assessed; the cumulative no-sample exported value of 1.0 is not proof of healthy coverage. This signal uses
 recorded job outcomes, not a new coverage audit of legacy snapshots.
 
 ---

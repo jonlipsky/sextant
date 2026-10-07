@@ -38,7 +38,8 @@ public class SymbolNamePrefixIndexMigrationTests
             db.RunMigrations();
             var conn = db.GetConnection();
             Exec(conn, "DROP INDEX ix_symbols_project_name_nocase; DROP INDEX ix_repositories_remote_url_nocase; " +
-                "ALTER TABLE symbols DROP COLUMN declaration; DELETE FROM schema_version WHERE version >= 25;");
+                "DROP INDEX ix_snapshot_jobs_completed_at; ALTER TABLE symbols DROP COLUMN declaration; " +
+                "DELETE FROM schema_version WHERE version >= 25;");
             var runs = new IndexRunStore(conn);
             Assert.AreEqual(1, runs.MarkComplete(runs.BeginRun("full", 1), 2, 1));
             Assert.AreEqual(24, db.CurrentSchemaVersion);
@@ -61,8 +62,9 @@ public class SymbolNamePrefixIndexMigrationTests
         Assert.AreEqual(versions.Max(), IndexDatabase.LatestSchemaVersion);
         Assert.AreEqual(versions.Where(v => !IndexDatabase.IdentityNeutralMigrations.Contains(v)).Max(), IndexDatabase.SnapshotSchemaVersion);
         Assert.Contains(25, IndexDatabase.IdentityNeutralMigrations);
+        Assert.Contains(27, IndexDatabase.IdentityNeutralMigrations);
         // Adding 025 left every snapshot identity (and so every published snapshot's reuse) as it was at 24.
-        Assert.AreEqual(24, versions.Where(v => v <= 25 && !IndexDatabase.IdentityNeutralMigrations.Contains(v)).Max());
+        Assert.AreEqual(26, versions.Where(v => !IndexDatabase.IdentityNeutralMigrations.Contains(v)).Max());
     }
 
     [TestMethod]

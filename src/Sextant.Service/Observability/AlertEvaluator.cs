@@ -82,15 +82,18 @@ public static class AlertEvaluator
                 });
         }
 
-        if (snapshot.Jobs.Terminal > 0 && snapshot.Jobs.Terminal >= t.SuccessRateMinSamples)
+        var recentJobs = snapshot.RecentJobs;
+        if (recentJobs.SampleCount >= Math.Max(1, t.SuccessRateMinSamples))
         {
-            var completeness = snapshot.Jobs.CompletenessRate;
+            var completeness = recentJobs.CompletenessRate!.Value;
             if (completeness < t.CompletenessRateCrit)
                 alerts.Add(new Alert
                 {
                     Id = "low_completeness_rate",
                     Level = AlertLevel.Critical,
-                    Message = $"Job completeness rate {completeness:P0} is below critical threshold {t.CompletenessRateCrit:P0}. " +
+                    Message = $"Recent job completeness rate {completeness:P0} is below critical threshold " +
+                              $"{t.CompletenessRateCrit:P0} across {recentJobs.SampleCount} jobs " +
+                              $"completed from {recentJobs.WindowStartUnixMs} to {recentJobs.WindowEndUnixMs} Unix ms. " +
                               "Inspect coverage.reasons and the solutions config."
                 });
             else if (completeness < t.CompletenessRateWarn)
@@ -98,7 +101,9 @@ public static class AlertEvaluator
                 {
                     Id = "low_completeness_rate",
                     Level = AlertLevel.Warning,
-                    Message = $"Job completeness rate {completeness:P0} is below warning threshold {t.CompletenessRateWarn:P0}. " +
+                    Message = $"Recent job completeness rate {completeness:P0} is below warning threshold " +
+                              $"{t.CompletenessRateWarn:P0} across {recentJobs.SampleCount} jobs " +
+                              $"completed from {recentJobs.WindowStartUnixMs} to {recentJobs.WindowEndUnixMs} Unix ms. " +
                               "Inspect coverage.reasons and the solutions config."
                 });
         }

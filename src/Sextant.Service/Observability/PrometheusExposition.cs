@@ -33,6 +33,20 @@ public static class PrometheusExposition
         Gauge(sb, "sextant_jobs_unsupported", "Jobs unsupported.", s.Jobs.Unsupported);
         Gauge(sb, "sextant_job_success_rate", "Terminal-job success rate.", s.Jobs.SuccessRate);
         Gauge(sb, "sextant_job_completeness_rate", "Terminal-job completeness rate.", s.Jobs.CompletenessRate);
+        Gauge(sb, "sextant_recent_jobs_window_start_unix_ms", "Inclusive start of the recent terminal-job window (Unix ms).",
+            s.RecentJobs.WindowStartUnixMs);
+        Gauge(sb, "sextant_recent_jobs_window_end_unix_ms", "Exclusive end of the recent terminal-job window (Unix ms).",
+            s.RecentJobs.WindowEndUnixMs);
+        Gauge(sb, "sextant_recent_jobs_sample_count", "Terminal jobs completed in the recent window.",
+            s.RecentJobs.SampleCount);
+        Gauge(sb, "sextant_recent_jobs_minimum_samples", "Minimum sample count required to assess recent job rates.",
+            s.RecentJobs.MinimumSamples);
+        Gauge(sb, "sextant_recent_jobs_rates_assessed", "Whether recent terminal-job rates meet the sample minimum (1/0).",
+            s.RecentJobs.RatesAssessed ? 1 : 0);
+        if (s.RecentJobs.SuccessRate is double recentSuccessRate)
+            Gauge(sb, "sextant_recent_job_success_rate", "Recent terminal-job success rate.", recentSuccessRate);
+        if (s.RecentJobs.CompletenessRate is double recentCompletenessRate)
+            Gauge(sb, "sextant_recent_job_completeness_rate", "Recent terminal-job completeness rate.", recentCompletenessRate);
 
         Gauge(sb, "sextant_worker_capacity", "Whether this node has worker capacity (1/0).",
             s.WorkerCapacity.HasCapacity ? 1 : 0);
