@@ -299,10 +299,22 @@ public static class SolutionLoader
                 result.RemoveAll(s => string.Equals(
                     NormalizePath(s.ProjectPath), NormalizePath(projectPath), StringComparison.OrdinalIgnoreCase));
             var expected = ReadExpectedFrameworks(projectPath);
+            // A failure that only replays a restore warning is not a load failure, but only for a variant that
+            // actually loaded documents: an empty stub (presence is not success) keeps every failure as its skip.
+            var restoreWarnings = projectFailures.Count > 0 && variants!.Any(v => v.Documents.Any())
+                ? ReadRestoreWarnings(projectPath)
+                : [];
+            var replayed = projectFailures.Where(f => IsReplayedRestoreWarning(f.Message, restoreWarnings)).ToHashSet();
+            foreach (var warning in replayed)
+                onDiagnostic?.Invoke(
+                    $"Restore warning replayed by the load of '{Path.GetFileName(projectPath)}' (not a load failure): {warning.Message}");
             foreach (var variant in variants!)
             {
-                var failure = projectFailures.FirstOrDefault(f => f.ProjectId == variant.Id)
-                    ?? projectFailures.FirstOrDefault(f => f.ProjectId == null);
+                var candidates = variant.Documents.Any()
+                    ? projectFailures.Where(f => !replayed.Contains(f)).ToList()
+                    : projectFailures;
+                var failure = candidates.FirstOrDefault(f => f.ProjectId == variant.Id)
+                    ?? candidates.FirstOrDefault(f => f.ProjectId == null);
                 var reason = failure?.Message ?? thrown?.Reason;
                 if (reason == null)
                     continue;
@@ -334,6 +346,56 @@ public static class SolutionLoader
         foreach (var project in degradedVersions)
             onDiagnostic?.Invoke($"Degraded project '{Path.GetFileName(project.ProjectPath)}' ({project.TargetFramework ?? "unknown TFM"}): {project.Reason}");
         return new LoadReconciliation(skips, degradedVersions, resolvedFailures.Count(f => !attributed.Contains(f)));
+    }
+
+    // MSBuildWorkspace reports an MSBuild WARNING raised during the design-time load as a Failure diagnostic
+    // ("Msbuild failed when processing the file '<project>' with message: <text>"). The load replays every
+    // warning NuGet recorded in the project's assets file during restore (for example an authenticated feed's
+    // first 401 before its credential provider answered, or a vulnerability notice), so a project whose
+    // packages restored and whose code loaded was reported degraded. Such a diagnostic is reclassified ONLY when
+    // its text ends with the exact message of a Warning-only entry in that project's own assets file, and only
+    // for a variant that loaded documents; anything else, an empty stub and a project that did not load keep it.
+    internal static bool IsReplayedRestoreWarning(string message, IReadOnlyCollection<string> restoreWarnings)
+    {
+        var text = message.TrimEnd();
+        return restoreWarnings.Any(warning => text.EndsWith(": " + warning, StringComparison.Ordinal));
+    }
+
+    // The messages recorded ONLY at Warning level in '<project dir>/obj/project.assets.json' (the default restore
+    // output path; a repository that moves it keeps today's behavior: no reclassification).
+    internal static IReadOnlyCollection<string> ReadRestoreWarnings(string projectPath)
+    {
+        var assets = Path.Combine(Path.GetDirectoryName(projectPath) ?? ".", "obj", "project.assets.json");
+        try
+        {
+            if (!File.Exists(assets))
+                return [];
+            using var stream = File.OpenRead(assets);
+            using var document = System.Text.Json.JsonDocument.Parse(stream);
+            if (!document.RootElement.TryGetProperty("logs", out var logs) || logs.ValueKind != System.Text.Json.JsonValueKind.Array)
+                return [];
+            var warnings = new HashSet<string>(StringComparer.Ordinal);
+            var others = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var entry in logs.EnumerateArray())
+            {
+                if (entry.ValueKind == System.Text.Json.JsonValueKind.Object
+                    && entry.TryGetProperty("message", out var text) && text.ValueKind == System.Text.Json.JsonValueKind.String
+                    && text.GetString()?.Trim() is { Length: > 0 } message)
+                {
+                    var isWarning = entry.TryGetProperty("level", out var level)
+                        && level.ValueKind == System.Text.Json.JsonValueKind.String
+                        && string.Equals(level.GetString(), "Warning", StringComparison.OrdinalIgnoreCase);
+                    (isWarning ? warnings : others).Add(message);
+                }
+            }
+            // A message also recorded at another level (an error under another target graph) is never reclassified.
+            warnings.ExceptWith(others);
+            return warnings;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Text.Json.JsonException)
+        {
+            return [];
+        }
     }
 
     private static string? VariantFramework(Project project, IReadOnlyList<string> expected)

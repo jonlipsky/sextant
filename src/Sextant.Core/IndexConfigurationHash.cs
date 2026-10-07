@@ -72,8 +72,13 @@ public static class IndexConfigurationHash
     /// project. A repository previously left partially restored by repeated per-solution work must be indexed
     /// again under the new restore policy.
     /// </para>
+    /// <para>
+    /// <c>"7"</c> to <c>"8"</c>: a load diagnostic that only replays a Warning-level message from the project's own
+    /// <c>project.assets.json</c> (MSBuildWorkspace reports MSBuild warnings as failures) no longer marks a loaded
+    /// project degraded, so the same commit can now publish complete where it was partial.
+    /// </para>
     /// </remarks>
-    public const string AnalyzerVersion = "7";
+    public const string AnalyzerVersion = "8";
 
     /// <summary>
     /// Computes the configuration hash for a resolved profile. The canonical pre-image is a fixed,
