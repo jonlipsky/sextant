@@ -234,7 +234,9 @@ file-system inventory (project files on disk, excluding `obj`/`bin`/`.git`; subm
 | a discovered solution was not selected (defensive; the no-config default selects all of them since #124) | `solution_not_selected` |
 | a configured solution is missing/invalid/outside the checkout | `solution_skipped` |
 | a declared project could not load on this worker (e.g. an iOS/Android/Mac/WPF head on Linux, #90) | `project_skipped` (`sdk_resolution_failed` when its `global.json` pins an SDK this worker lacks and the pin was not overridden, #113) |
-| a selected solution declared no readable project, or nothing loaded at all | `solution_no_projects` / `no_projects_loaded` |
+| a selected solution could not be fully read, or no project loaded at all | `solution_no_projects` / `no_projects_loaded` |
+| a project/TFM evaluation failed but still exposed documents (#130/#150) | `project_evaluation_degraded` |
+| a load failure could not be attributed safely | `project_evaluation_unattributed` |
 | a declared submodule is not populated (no `.git` at its path) | `submodule_unpopulated` |
 | code in a loaded project did not bind (see [Binding health](#binding-health)) | (coverage `binding`) |
 | part of the tree could not be inspected (unreadable dir, `.gitmodules` entry escaping the checkout) | `coverage_scan_incomplete` |
@@ -251,6 +253,23 @@ and fell back to grep. Under an explicit `solutions` list the same files were al
 (submodule) snapshot still goes partial for a stray project in its subtree (#162): the parent's selection
 does not scope another repository. Per-item diagnostics are capped at 200 per code
 with a summary row; the coverage counts are never capped. Diagnostic paths are checkout-relative.
+
+**Evaluation accounting (#130/#132/#150).** A readable empty `.sln` or `.slnx` contributes zero projects
+without a coverage gap; a parse/read failure discards all declarations and increments `solutions_unreadable`.
+Per-TFM failures are never erased by a healthy sibling or by surviving documents. A typed workspace
+diagnostic belongs only to its owning variant; a path-only failure conservatively degrades every surviving
+variant of that file. Missing unconditional literal TFM declarations are gaps even without a retained stub.
+Conditional/imported properties are not re-evaluated by a second MSBuild evaluator; when a failure's TFM
+cannot be established, it stays unknown, and unattributed failures make the verdict partial rather than healthy.
+
+Project counts remain **distinct files**, not TFM counts: `projects_loaded` includes usable documents
+from degraded evaluations, `projects_skipped` counts files with a failed/missing variant, and
+`projects_partially_loaded` records their overlap (so the query warning does not double-count its denominator).
+`projects_degraded` counts files with failed evaluations that exposed documents. `evaluation_gaps` lists
+up to 200 project/TFM gaps, with `has_documents` and safe diagnostic codes, never raw MSBuild text.
+Parent and provider coverage use these same facts. `AnalyzerVersion` is now **6**, so future ensures use
+a new identity rather than reusing an immutable inaccurate verdict; this change neither migrates nor
+rewrites existing coverage, and performs no deployment or reindex itself.
 
 The coverage record is persisted in `snapshot_coverage` (migration `022`) **in the same transaction that
 publishes the snapshot**, and the job verdict is derived from it: a partial snapshot is still **published
@@ -303,8 +322,9 @@ provider's **subtree** (`SnapshotCoverageBuilder.BuildProviders`), not over the 
   nor loaded (always a gap, even under a configured parent `solutions` scope, because the parent's scope does
   not scope another repository); when the provider has its own solution files and **none** of them was
   selected (the provider was built only from the projects the parent's selection reaches, so its
-  solution-scoped view is missing) or only some of them were; when a provider solution declared no readable
-  project; when a nested submodule is unpopulated; or when any part of the checkout could not be scanned;
+  solution-scoped view is missing) or only some of them were; when a provider solution could not be fully read
+  (a readable empty solution is not a gap); when evaluation failed, with or without surviving documents;
+  when a nested submodule is unpopulated; or when any part of the checkout could not be scanned;
 - a provider with no solution files, whose on-disk projects all loaded, is `complete`;
 - `selection_source` is the parent's source when one of the provider's own solutions was selected, and
   `parent_selection` otherwise. SDK-pin overrides are kept only when the `global.json` governs the provider

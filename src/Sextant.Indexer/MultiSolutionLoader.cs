@@ -10,7 +10,7 @@ namespace Sextant.Indexer;
 /// </summary>
 /// <param name="SolutionPath">The solution this coverage describes.</param>
 /// <param name="DeclaredProjectCount">Distinct recognized projects the solution declared.</param>
-/// <param name="LoadedProjectCount">Declared projects that loaded (declared minus skipped and deferred).</param>
+/// <param name="LoadedProjectCount">Declared project files with a usable variant, including degraded documents.</param>
 /// <param name="SkippedProjects">Declared projects that failed to load, with reasons.</param>
 public sealed record SolutionCoverage(
     string SolutionPath,
@@ -20,6 +20,8 @@ public sealed record SolutionCoverage(
 {
     /// <summary>Declared projects the load did not open because its deadline passed.</summary>
     public int DeferredProjectCount { get; init; }
+
+    public bool IsReadable { get; init; } = true;
 }
 
 /// <summary>
@@ -42,8 +44,13 @@ public sealed record MultiSolutionLoadResult(
     IReadOnlyList<SkippedProject> SkippedProjects,
     IReadOnlyList<SolutionCoverage> Solutions)
 {
-    /// <summary>True when at least one declared project across the selected solutions failed to load.</summary>
-    public bool IsPartial => SkippedProjects.Count > 0;
+    /// <summary>True when a load or solution-read failure prevents proving healthy coverage.</summary>
+    public bool IsPartial => SkippedProjects.Count > 0 || DegradedProjects.Count > 0
+        || UnattributedFailureCount > 0 || Solutions.Any(s => !s.IsReadable);
+
+    public IReadOnlyList<DegradedProject> DegradedProjects { get; init; } = [];
+
+    public int UnattributedFailureCount { get; init; }
 
     /// <summary>
     /// The distinct (full-path) project files declared across ALL selected solutions, in first-appearance
@@ -103,24 +110,16 @@ public static class MultiSolutionLoader
         if (solutionPaths.Count == 0)
             throw new ArgumentException("At least one solution path is required.", nameof(solutionPaths));
 
-        // The DECLARED-project set of each solution is read STATICALLY (SolutionProjectEnumerator), never by
-        // MSBuild-evaluating the solution: the whole point of #109 is that the selected solutions frequently
-        // cannot be evaluated on this worker's platform (iOS/Android/Mac/WPF/Unity heads on Linux), so a
-        // Roslyn OpenSolutionAsync cross-check is not available as an authority here. The enumerator is
-        // therefore the coverage authority, and it is deliberately CONSERVATIVE: any parse/I/O failure (even
-        // mid-file) discards the partial read and yields an EMPTY declared list — it never emits a non-empty
-        // strict subset. An empty declared list surfaces as DeclaredProjectCount == 0 downstream, which the
-        // worker forces to Partial (never Complete), so a solution the enumerator could not fully read is
-        // reported as a coverage gap rather than silently under-covered.
+        var reads = solutionPaths.Select(SolutionProjectEnumerator.Read).ToList();
         var perSolutionDeclared = solutionPaths
-            .Select(sln => (Solution: sln, Declared: SolutionProjectEnumerator.Enumerate(sln)))
+            .Select((sln, i) => (Solution: sln, Declared: reads[i].Projects))
             .ToList();
 
         SolutionLoadResult loaded;
         var union = ComputeUnion(perSolutionDeclared);
         if (solutionPaths.Count == 1)
         {
-            // Preserve the byte-identical single-solution fast path (OpenSolutionAsync) when exactly ONE
+            // Preserve the single-solution fast path (OpenSolutionAsync) when exactly ONE
             // solution is selected (a one-solution checkout or a one-entry config), so that case — and its
             // determinism/parity test coverage — is unchanged. A multi-solution no-config checkout selects the
             // union (#124) and takes the per-project branch below.
@@ -133,14 +132,17 @@ public static class MultiSolutionLoader
                 union, onDiagnostic, deadline, onProgress, cancellationToken).ConfigureAwait(false);
         }
 
-        var coverage = BuildCoverage(perSolutionDeclared, loaded.SkippedProjects, loaded.DeferredProjects);
+        var coverage = BuildCoverage(perSolutionDeclared, loaded.SkippedProjects, loaded.DeferredProjects, loaded.Solution)
+            .Select((c, i) => c with { IsReadable = reads[i].IsReadable }).ToList();
         return new MultiSolutionLoadResult(loaded.Solution, loaded.SkippedProjects, coverage)
         {
             DeclaredProjects = union,
             Membership = perSolutionDeclared
                 .Select(p => new SolutionMembership(Path.GetFullPath(p.Solution), p.Declared))
                 .ToList(),
-            DeferredProjects = loaded.DeferredProjects
+            DeferredProjects = loaded.DeferredProjects,
+            DegradedProjects = loaded.DegradedProjects,
+            UnattributedFailureCount = loaded.UnattributedFailureCount
         };
     }
 
@@ -173,12 +175,15 @@ public static class MultiSolutionLoader
     internal static IReadOnlyList<SolutionCoverage> BuildCoverage(
         IReadOnlyList<(string Solution, IReadOnlyList<string> Declared)> perSolutionDeclared,
         IReadOnlyList<SkippedProject> skippedProjects,
-        IReadOnlyList<string>? deferredProjects = null)
+        IReadOnlyList<string>? deferredProjects = null,
+        Solution? loadedSolution = null)
     {
-        var skippedByPath = new Dictionary<string, SkippedProject>(PathComparer);
-        foreach (var skip in skippedProjects)
-            skippedByPath[Path.GetFullPath(skip.ProjectPath)] = skip;
+        var skippedByPath = skippedProjects.GroupBy(s => Path.GetFullPath(s.ProjectPath), PathComparer)
+            .ToDictionary(g => g.Key, g => g.ToList(), PathComparer);
         var deferred = new HashSet<string>((deferredProjects ?? []).Select(Path.GetFullPath), PathComparer);
+        var usable = loadedSolution?.Projects.Where(p => p.FilePath != null &&
+                (p.Documents.Any() || !skippedByPath.ContainsKey(Path.GetFullPath(p.FilePath))))
+            .Select(p => Path.GetFullPath(p.FilePath!)).ToHashSet(PathComparer);
 
         var result = new List<SolutionCoverage>(perSolutionDeclared.Count);
         foreach (var (solution, declared) in perSolutionDeclared)
@@ -190,14 +195,15 @@ public static class MultiSolutionLoader
 
             var solutionSkipped = declaredFull
                 .Where(skippedByPath.ContainsKey)
-                .Select(p => skippedByPath[p])
+                .SelectMany(p => skippedByPath[p])
                 .ToList();
             var solutionDeferred = declaredFull.Count(deferred.Contains);
 
             result.Add(new SolutionCoverage(
                 solution,
                 declaredFull.Count,
-                declaredFull.Count - solutionSkipped.Count - solutionDeferred,
+                usable != null ? declaredFull.Count(usable.Contains)
+                    : declaredFull.Count - solutionSkipped.Select(s => Path.GetFullPath(s.ProjectPath)).Distinct(PathComparer).Count() - solutionDeferred,
                 solutionSkipped)
             {
                 DeferredProjectCount = solutionDeferred

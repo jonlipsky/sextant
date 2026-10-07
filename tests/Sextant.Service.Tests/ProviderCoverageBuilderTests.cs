@@ -98,6 +98,45 @@ public class ProviderCoverageBuilderTests
     }
 
     [TestMethod]
+    public void DegradedProviderEvaluation_IsPartial_WithProviderRelativeTfmEvidence()
+    {
+        var mix = At("libs/mix/src/Mix/Mix.csproj");
+        var solution = At("libs/mix/Mix.slnx");
+        var load = Load([mix]) with
+        {
+            DegradedProjects = [new DegradedProject(mix, "net10.0", "NETSDK1100: evaluation failed")]
+        };
+        var coverage = SnapshotCoverageBuilder.BuildProviders(CheckoutDir, Resolution([solution]), load,
+            Inventory([mix], [Mix], solutions: [solution]))["libs/mix"];
+
+        Assert.IsTrue(coverage.IsPartial);
+        Assert.AreEqual(1, coverage.ProjectsDegraded);
+        var gap = coverage.EvaluationGaps!.Single();
+        Assert.AreEqual("src/Mix/Mix.csproj", gap.Project);
+        Assert.AreEqual("net10.0", gap.TargetFramework);
+        Assert.IsTrue(gap.HasDocuments);
+        Assert.IsFalse(string.Join(" ", coverage.Reasons).Contains("libs/mix", StringComparison.Ordinal));
+    }
+
+    [TestMethod]
+    [DataRow(true)]
+    [DataRow(false)]
+    public void EmptyProviderSolution_IsAGapOnlyWhenUnreadable(bool readable)
+    {
+        var mix = At("libs/mix/src/Mix/Mix.csproj");
+        var solution = At("libs/mix/Empty.slnx");
+        var load = Load([mix]) with
+        {
+            Solutions = [new SolutionCoverage(solution, 0, 0, []) { IsReadable = readable }]
+        };
+        var coverage = SnapshotCoverageBuilder.BuildProviders(CheckoutDir, Resolution([solution]), load,
+            Inventory([mix], [Mix], solutions: [solution]))["libs/mix"];
+
+        Assert.AreEqual(!readable, coverage.IsPartial);
+        Assert.AreEqual(readable ? 0 : 1, coverage.SolutionsUnreadable);
+    }
+
+    [TestMethod]
     public void ProviderProjectTheLoadDeferred_IsPartial_NamedRelativeToTheProvider()
     {
         // Issue #245: the parent's load deadline passed before the provider project was opened. The provider's

@@ -46,6 +46,28 @@ public class PartialWarningTests
     }
 
     [TestMethod]
+    public void FailedTfm_DoesNotCountItsHealthySiblingAsASecondProject()
+    {
+        var coverage = Partial(c => c with
+        {
+            ProjectsDeclared = 1, ProjectsLoaded = 1, ProjectsSkipped = 1, ProjectsPartiallyLoaded = 1
+        });
+        Assert.AreEqual("Partial index: 1 of 1 projects did not load, so results may be incomplete.",
+            RemoteResponsePresenter.PartialWarningFor(coverage));
+    }
+
+    [TestMethod]
+    public void EvaluationFailureAndUnreadableSolution_AreCountedWithoutNamingPaths()
+    {
+        var coverage = Partial(c => c with { ProjectsDegraded = 1, SolutionsUnreadable = 1 });
+        Assert.AreEqual(
+            "Partial index: 1 project has failed evaluation, 1 selected solution could not be read, so results may be incomplete.",
+            RemoteResponsePresenter.PartialWarningFor(coverage));
+        StringAssert.Contains(RemoteResponsePresenter.PartialWarningFor(Partial(c => c with { UnattributedLoadFailures = 2 })),
+            "2 unattributed load failures");
+    }
+
+    [TestMethod]
     public void OmitsTheTotal_WhenTheRecordHasNone()
     {
         var one = Partial(c => c with { Binding = new BindingHealth { ProjectsDegraded = 1 } });
