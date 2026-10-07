@@ -41,6 +41,75 @@ public class DocumentSemanticExtractorTests
         => sink.References.Any(r => r.TargetKey.Contains(targetKeyContains) && r.Kind == kind);
 
     [TestMethod]
+    public void Constructors_SameLineReferencesDeduplicate_ButCallSitesRemainDistinct()
+    {
+        var sink = Extract("""
+            namespace N
+            {
+                public class Widget { public Widget(int value) { } }
+                public class Factory
+                {
+                    public void Make() { var a = new Widget(1); Widget b = new(2); }
+                }
+            }
+            """);
+
+        var reference = sink.References.Single(r => r.TargetKey == "M:N.Widget.#ctor(System.Int32)");
+        Assert.AreEqual(ReferenceKind.ObjectCreation, reference.Kind);
+        Assert.IsFalse(reference.IsCandidate);
+        var calls = sink.Calls.Where(c => c.CalleeKey == reference.TargetKey).ToArray();
+        Assert.AreEqual(2, calls.Length);
+        Assert.AreEqual(2, calls.Select(c => c.CallSiteColumn).Distinct().Count());
+        Assert.IsTrue(calls.All(c => c.CallerKey == "M:N.Factory.Make"));
+    }
+
+    [TestMethod]
+    public void Constructors_UnboundCreationKeepsOverloadCandidates_NotAnExactCall()
+    {
+        var sink = Extract("""
+            namespace N
+            {
+                public class Widget
+                {
+                    public Widget(int value) { }
+                    public Widget(string value) { }
+                }
+                public class Factory
+                {
+                    public Widget Make() => new Widget(new object());
+                }
+            }
+            """);
+
+        var references = sink.References.Where(r => r.TargetKey.Contains("#ctor")).ToArray();
+        CollectionAssert.AreEquivalent(
+            new[] { "M:N.Widget.#ctor(System.Int32)", "M:N.Widget.#ctor(System.String)" },
+            references.Select(r => r.TargetKey).ToArray());
+        Assert.IsTrue(references.All(r => r.IsCandidate));
+        Assert.AreEqual(2, sink.Calls.Count);
+        Assert.IsTrue(sink.Calls.All(c => c.IsCandidate && c.CallerKey == "M:N.Factory.Make"));
+    }
+
+    [TestMethod]
+    public void Constructors_ImplicitAndMetadataConstructorsDoNotInventDeclarations()
+    {
+        var sink = Extract("""
+            namespace N
+            {
+                public class Widget { }
+                public class Factory
+                {
+                    public Widget Make() { var ignored = new object(); return new Widget(); }
+                }
+            }
+            """);
+
+        Assert.IsFalse(sink.References.Any(r => r.TargetKey.Contains("#ctor")));
+        Assert.AreEqual(0, sink.Calls.Count);
+        Assert.IsTrue(HasReference(sink, "T:N.Widget", ReferenceKind.ObjectCreation));
+    }
+
+    [TestMethod]
     public void Reference_ClassifiesKindsBySyntacticRole()
     {
         var source = """
@@ -393,8 +462,8 @@ public class DocumentSemanticExtractorTests
         // its usage of Foo binds to DepB's assembly. The extractor must resolve the target to DepB's
         // exact project (compilation-scoped), NOT to the lowest-id catalog pick (DepA) that key-only
         // resolution would choose. This is the multi-TFM regression the exact resolution closes.
-        const string depSource = "namespace Dep { public class Foo { } }";
-        const string consumerSource = "namespace App { public class Bar { public Dep.Foo F; } }";
+        const string depSource = "namespace Dep { public class Foo { public Foo(int value) { } } }";
+        const string consumerSource = "namespace App { public class Bar { public Dep.Foo F; public object Make() => new Dep.Foo(1); } }";
 
         var runtimeDir = System.Runtime.InteropServices.RuntimeEnvironment.GetRuntimeDirectory();
         MetadataReference[] references =
@@ -443,6 +512,10 @@ public class DocumentSemanticExtractorTests
         var fooRef = sink.References.Single(r => r.TargetKey.Contains("Foo") && r.Kind == ReferenceKind.TypeRef);
         Assert.AreEqual(2L, fooRef.TargetProjectId,
             "the reference must resolve to the exact bound TFM (DepB=2), not the lowest-id project (DepA=1)");
+        var constructorRef = sink.References.Single(r => r.TargetKey == "M:Dep.Foo.#ctor(System.Int32)");
+        Assert.AreEqual(2L, constructorRef.TargetProjectId, "constructor references bind the same exact TFM");
+        var constructorCall = sink.Calls.Single(c => c.CalleeKey == constructorRef.TargetKey);
+        Assert.AreEqual(2L, constructorCall.CalleeProjectId, "constructor call edges bind the same exact TFM");
 
         // Full chain: exact resolution through the catalog returns DepB's row and counts no ambiguity,
         // whereas key-only resolution from the consumer would have mis-picked DepA and flagged it.
@@ -494,6 +567,4 @@ public class DocumentSemanticExtractorTests
         Assert.IsNull(callWithout.Dataflow.ReturnDestination);
     }
 }
-
-
 
