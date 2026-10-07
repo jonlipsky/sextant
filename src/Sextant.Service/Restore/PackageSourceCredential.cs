@@ -8,15 +8,15 @@ namespace Sextant.Service.Restore;
 /// port (<see cref="Port"/>, or the default 443 when null), never for a source key a repository's <c>nuget.config</c>
 /// chooses. <see cref="ToString"/> never includes the password.
 /// </summary>
-public sealed record PackageSourceCredential(string Host, string Username, string Password)
+public sealed partial record PackageSourceCredential(string Host, string Username, string Password)
 {
     /// <summary>The exact port the credential is for; null means the https default (443) only.</summary>
     public int? Port { get; init; }
 
     // A plain host name (dot-separated DNS labels): no scheme, port, path, userinfo or wildcard. Matching is exact.
-    private static readonly Regex HostShape = new(
-        @"^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$",
-        RegexOptions.CultureInvariant);
+    [GeneratedRegex(@"^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$",
+        RegexOptions.CultureInvariant, matchTimeoutMilliseconds: 1000)]
+    private static partial Regex HostShape();
 
     /// <summary>
     /// True when <paramref name="uri"/> is an <c>https</c> request to <see cref="Host"/> on <see cref="Port"/> (the
@@ -76,7 +76,7 @@ public sealed record PackageSourceCredential(string Host, string Username, strin
             }
             var username = entry[(equals + 1)..colon];
             var password = entry[(colon + 1)..];
-            if (!HostShape.IsMatch(host))
+            if (!HostShape().IsMatch(host))
                 throw new FormatException($"entry #{i + 1} names a host that is not a plain host name (no scheme, path, userinfo or wildcard).");
             if (username.Length == 0 || password.Length == 0)
                 throw new FormatException($"entry #{i + 1} has an empty username or password.");
