@@ -90,8 +90,14 @@ public static class ServiceHostRunner
         // NuGet restore before the load, so packages' compile assets and the transitive ProjectReference closure
         // reach the compiler. Its toggle MUST be options.PackageRestore: it also sets the SnapshotService's request
         // identity (ServiceOptions.RestoreIdentityComponent), and the worker publishes under the runner's.
+        // Issue #231: configured package source credentials reach NuGet only through the credential provider plugin
+        // this same entry assembly serves (`dotnet Sextant.Cli.dll -Plugin`), never through the restore's environment.
         var packageRestore = new PackageRestoreRunner(
-            options.PackageRestore, options.PackageRestoreTimeout, Console.Error.WriteLine);
+            options.PackageRestore, options.PackageRestoreTimeout, Console.Error.WriteLine,
+            options.PackageSourceCredentials,
+            options.PackageSourceCredentials.Count > 0 ? CredentialPluginPath() : null);
+        if (packageRestore.CredentialHosts.Count > 0)
+            Console.Error.WriteLine($"package restore: credentials configured for {string.Join(", ", packageRestore.CredentialHosts)}.");
         // Issue #244: the worker keeps every indexed file's bytes on the artifact volume, where the query surface
         // (SnapshotService.SourceTexts, the same root) reads each snapshot's own source text back.
         var localWorker = new LocalIndexerSnapshotWorker(
@@ -168,6 +174,26 @@ public static class ServiceHostRunner
                     $"An in-flight snapshot production did not stop within {options.ShutdownDrainTimeout}; the " +
                     "writer lease was abandoned (it expires by its TTL) instead of released.");
         }
+    }
+
+    /// <summary>
+    /// Issue #231: the credential provider plugin is the entry assembly started with <c>-Plugin</c>, which only
+    /// Sextant.Cli and Sextant.Service.Host serve. Any other entry assembly (a test host, a custom launcher) refuses to
+    /// start with credentials configured rather than point NuGet at an assembly that would never answer.
+    /// </summary>
+    internal static string CredentialPluginPath()
+    {
+        var location = System.Reflection.Assembly.GetEntryAssembly()?.Location;
+        var name = Path.GetFileName(location);
+        if (string.IsNullOrEmpty(location)
+            || !(name.Equals("Sextant.Cli.dll", StringComparison.OrdinalIgnoreCase)
+                 || name.Equals("Sextant.Service.Host.dll", StringComparison.OrdinalIgnoreCase)))
+        {
+            throw new InvalidOperationException(
+                "SEXTANT_SERVICE_PACKAGE_SOURCE_CREDENTIALS is set, but the service was not started from " +
+                "Sextant.Cli or Sextant.Service.Host, which serve the restore's credential provider plugin. Refusing to start.");
+        }
+        return location;
     }
 
     /// <summary>

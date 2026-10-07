@@ -85,6 +85,12 @@ public sealed record PackageRestoreOutcome
     public bool SourceUnreachableGeneral { get; init; }
 
     /// <summary>
+    /// Package source credentials are configured but could not be handed to this restore (issue #231), so sources
+    /// that need them were restored without them.
+    /// </summary>
+    public bool CredentialsUnavailable { get; init; }
+
+    /// <summary>
     /// Solutions whose restore ran to completion within the bound but exited non-zero (the one a timeout stopped
     /// is not counted here; <see cref="TimedOut"/> reports it).
     /// </summary>
@@ -93,7 +99,8 @@ public sealed record PackageRestoreOutcome
     /// <summary>True when every attempted restore exited 0 within the bound, or restore is disabled.</summary>
     public bool Clean => !Enabled
         || (!TimedOut && SolutionsNotStarted == 0 && SolutionsSucceeded == SolutionsAttempted
-            && Projects.Count == 0 && ProjectsDropped == 0 && GeneralCodes.Count == 0 && !SourceUnreachableGeneral);
+            && Projects.Count == 0 && ProjectsDropped == 0 && GeneralCodes.Count == 0 && !SourceUnreachableGeneral
+            && !CredentialsUnavailable);
 
     /// <summary>
     /// The coverage notes describing what the restore could not do. Each names counts, package ids and codes;
@@ -105,6 +112,11 @@ public sealed record PackageRestoreOutcome
         if (!Enabled)
             return notes;
 
+        if (CredentialsUnavailable)
+        {
+            notes.Add("Package source credentials are configured but could not be provided to the package restore; " +
+                      "packages from sources that need them may not have been restored.");
+        }
         if (SolutionsNotStarted > 0)
         {
             notes.Add(UsedProjectUnion

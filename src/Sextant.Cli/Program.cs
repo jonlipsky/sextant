@@ -2,6 +2,11 @@ using System.CommandLine;
 using Microsoft.Build.Locator;
 using Sextant.Cli.Commands;
 
+// Issue #231: NuGet starts this assembly as the restore's credential provider plugin (`-Plugin`). It loads no
+// MSBuild or Roslyn type, so it answers before MSBuildLocator runs.
+if (Sextant.Service.Restore.FeedCredentialPlugin.IsPluginInvocation(args))
+    return await Sextant.Service.Restore.FeedCredentialPlugin.RunFromEnvironmentAsync();
+
 // MSBuildLocator must be called before any Roslyn types are loaded
 MSBuildLocator.RegisterDefaults();
 

@@ -108,6 +108,7 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_SDK_PIN_OVERRIDE` | Temporarily neutralize a checkout `global.json` SDK pin that no installed SDK satisfies, so the checkout still indexes with an installed SDK (issue #113; see [SDK pins](#repository-globaljson-sdk-pins-issue-113)). `false` leaves such pins alone and the job fails / goes partial with a typed `sdk_resolution_failed` diagnostic. `false` is part of the snapshot identity, so flipping the toggle re-indexes a commit instead of reusing a result built under the other policy. An unparseable value **fails startup** | `true` |
 | `SEXTANT_SERVICE_PACKAGE_RESTORE` | Restore the selected solutions' deduplicated project union before the load (see [Package restore](#package-restore-before-the-load)). `false` loads unrestored projects, which compile against their direct project references only, so calls into transitively referenced projects may not bind. `false` is part of the snapshot identity (`restore=off`). An unparseable value **fails startup** | `true` |
 | `SEXTANT_SERVICE_PACKAGE_RESTORE_TIMEOUT_SECONDS` | Bound on one job's whole project-union restore step, clamped to 3600. Under the sandbox the step also stops at a fifth of the sandbox time budget, whichever is shorter. On expiry the restore process tree is killed and the load goes ahead with whatever was restored | `300` |
+| `SEXTANT_SERVICE_PACKAGE_SOURCE_CREDENTIALS` | **Secret.** Credentials for private package source hosts, `host[:port]=username:password` entries separated by `;` (the password may contain `:` but not `;`). The restore hands each one to NuGet only for an `https` request to exactly that host and port (443 when no port is given), through the service's own credential provider plugin; a repository's `nuget.config` cannot redirect it (see [Private package feeds](#private-package-feeds-issue-231)). Not part of the snapshot identity. A malformed value **fails startup** | unset |
 
 Boolean toggles accept `1/0`, `true/false`, `yes/no`, `on/off` (case-insensitive); any other non-empty
 value **fails startup** rather than silently disabling a security-relevant control (fail-closed). The
@@ -397,7 +398,46 @@ must not make outbound requests on behalf of indexed repositories. The restore i
 environment, and never any `SEXTANT_*` variable, so a `%VAR%` in a repository's `nuget.config` cannot send the
 service's own tokens to a source it names. Do not give the service account a user-level `NuGet.Config` with
 `packageSourceCredentials`: a repository's `nuget.config` can declare a source with the same key and another
-URL, and NuGet would send those credentials to it.
+URL, and NuGet would send those credentials to it. Use `SEXTANT_SERVICE_PACKAGE_SOURCE_CREDENTIALS` instead
+(below).
+
+#### Private package feeds (issue #231)
+
+A private feed that a repository's `nuget.config` authenticates from an environment variable (for example
+`<add key="ClearTextPassword" value="%GH_PACKAGES_TOKEN%" />`) is unreachable to the restore: the variable is
+scrubbed or never set, the source answers 401, and its packages go missing. Set
+`SEXTANT_SERVICE_PACKAGE_SOURCE_CREDENTIALS` to give the restore a credential for that source's **host** (an
+explicit `:443` is the same as no port, and a host and port may be listed once):
+
+```text
+SEXTANT_SERVICE_PACKAGE_SOURCE_CREDENTIALS=nuget.pkg.github.com=x:<token with read:packages>
+```
+
+How the credential reaches NuGet, and only NuGet's request to that host:
+
+- **A credential provider plugin, keyed by the source's host.** For each restore the worker writes the
+  credentials to an owner-only file in the job's scratch directory and starts the restore with
+  `NUGET_PLUGIN_PATHS` set to the service's own entry assembly (`dotnet Sextant.Cli.dll -Plugin`, which speaks
+  NuGet's plugin protocol directly, so the service ships no NuGet assemblies). When a source answers 401, NuGet
+  (after the repository's own credential failed) asks the plugin with that package source's URL, and the plugin
+  answers only for `https`, exactly the configured host and port, and no userinfo. NuGet then uses the credential
+  for that source's requests. A repository that points its source key at another host gets nothing.
+- **Reported when it cannot be provided.** If the credentials file cannot be written, the restore runs without it
+  and the outcome says so in `coverage.notes`, making the snapshot partial, like any other restore gap.
+- **Never in an environment variable or argument.** The restore child gets the plugin path and the file path
+  (`RESTORE_FEED_CREDENTIALS_FILE`), never the credential, and still never inherits a `SEXTANT_*` variable. The
+  setting itself is scrubbed from the service's environment during the in-process evaluation like every other
+  secret-named variable. The file and its directory are deleted when the restore ends, and the plugin's claims
+  cache (`NUGET_PLUGINS_CACHE_PATH`) lives in that directory, so a host added later is asked about at once.
+- **Never logged.** The plugin writes only protocol messages, the startup line lists hosts only, and the coverage
+  keeps codes and package ids as before.
+- **Not an isolation boundary against repository code.** Restore runs the repository's MSBuild files in the same
+  account (#76), so code that knows where to look can read the credentials file while its restore runs. Give the
+  service a credential that can only read packages, and index only repositories you trust with it.
+
+The credentials are not part of the snapshot identity, so configuring them re-indexes nothing by itself: a commit
+already published partial because its feed was unreachable keeps that snapshot until it is
+[rebuilt](#rebuilding-a-published-commit-issues-235251) or a later commit is indexed.
 
 Cost: 15-60 s per job for a large repository with a warm NuGet cache. The sandbox gives each job its own
 `NUGET_PACKAGES`, so a cold job downloads every package (about 2.6 GB for a 188-project repository) into job
