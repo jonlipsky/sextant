@@ -1757,11 +1757,22 @@ rows.
   completeness rates, worker capacity, storage (catalog + artifact + cache + checkout bytes), cache reuse
   (idempotent-ensure attach rate + federation page-cache hit rate), and query latency (p50/p95/max). Add
   `?format=prometheus` for text exposition a scraper/dashboard can ingest directly. Alerts are evaluated
-  over the snapshot (`queue_delay_high`, `low_success_rate`, `worker_exhaustion`, `storage_pressure`).
+  over the snapshot (`queue_delay_high`, `low_success_rate`, `low_completeness_rate`, `worker_exhaustion`,
+  `storage_pressure`). `low_completeness_rate` uses complete jobs / all terminal jobs: partial jobs still
+  count as successful publication but not as complete. The existing `AlertThresholds` programmatic
+  configuration sets `CompletenessRateWarn` (default 0.90), `CompletenessRateCrit` (0.50), and the shared
+  `SuccessRateMinSamples` (5). Rates strictly below a threshold fire; equality does not cross that
+  threshold. With no terminal jobs or fewer than the minimum, completeness is not assessed, not proven
+  healthy. The job metric reflects recorded job outcomes, not a fresh audit of historical coverage rows.
+  The existing no-sample rate value of 1.0 is retained for wire compatibility; do not treat it as evidence.
 - **`GET /control/audit`** serves the durable [`audit_log`](../src/Sextant.Store/Migrations/020_audit_log.sql)
   (migration 020): who did what to which repository scope, with what outcome and at what worker cost.
   The actor is stored as a **non-reversible hash**, never the raw token; the raw secret never touches the DB.
-- **`GET /control/pilot`** evaluates the pilot-readiness gate (see runbooks).
+- **`GET /control/pilot`** evaluates the pilot-readiness gate (see runbooks). Its `snapshot_completeness`
+  check uses the same warning threshold and sample minimum, is advisory for trusted single-tenant
+  workloads, and blocking for untrusted multi-tenant workloads. Missing/insufficient samples fail this
+  check as "not assessed"; an active critical completeness alert still blocks either workload through
+  the existing `no_critical_alerts` check.
 - **Traces:** ensure / retention / backup emit `System.Diagnostics.Activity` spans on the
   `Sextant.Service` `ActivitySource`, so an operator can wire OpenTelemetry without any code change.
 

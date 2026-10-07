@@ -2004,6 +2004,7 @@ public sealed partial class SnapshotService : IDisposable
             RecentBackupAvailable = recentBackup,
             CatalogRecovered = RecoveryCompleted,
             WorkerCapacityAvailable = HasWorkerCapacity,
+            Jobs = metrics.Jobs,
             Alerts = metrics.Alerts
         });
     }
