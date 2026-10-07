@@ -284,15 +284,6 @@ public static class SolutionLoader
             var projectFailures = resolvedFailures.Where(f =>
                 AttributeFailure(projectPath, [f], ambiguousFileNames, attributed) != null).ToList();
             var present = loaded.TryGetValue(NormalizePath(projectPath), out var variants);
-            if (present && projectFailures.Count > 0)
-            {
-                var restoreWarnings = ReadRestoreWarnings(projectPath);
-                var replayed = projectFailures.Where(f => IsReplayedRestoreWarning(f.Message, restoreWarnings)).ToList();
-                foreach (var warning in replayed)
-                    onDiagnostic?.Invoke(
-                        $"Restore warning replayed by the load of '{Path.GetFileName(projectPath)}' (not a load failure): {warning.Message}");
-                projectFailures = projectFailures.Except(replayed).ToList();
-            }
 
             if (!present)
             {
@@ -308,10 +299,22 @@ public static class SolutionLoader
                 result.RemoveAll(s => string.Equals(
                     NormalizePath(s.ProjectPath), NormalizePath(projectPath), StringComparison.OrdinalIgnoreCase));
             var expected = ReadExpectedFrameworks(projectPath);
+            // A failure that only replays a restore warning is not a load failure, but only for a variant that
+            // actually loaded documents: an empty stub (presence is not success) keeps every failure as its skip.
+            var restoreWarnings = projectFailures.Count > 0 && variants!.Any(v => v.Documents.Any())
+                ? ReadRestoreWarnings(projectPath)
+                : [];
+            var replayed = projectFailures.Where(f => IsReplayedRestoreWarning(f.Message, restoreWarnings)).ToHashSet();
+            foreach (var warning in replayed)
+                onDiagnostic?.Invoke(
+                    $"Restore warning replayed by the load of '{Path.GetFileName(projectPath)}' (not a load failure): {warning.Message}");
             foreach (var variant in variants!)
             {
-                var failure = projectFailures.FirstOrDefault(f => f.ProjectId == variant.Id)
-                    ?? projectFailures.FirstOrDefault(f => f.ProjectId == null);
+                var candidates = variant.Documents.Any()
+                    ? projectFailures.Where(f => !replayed.Contains(f)).ToList()
+                    : projectFailures;
+                var failure = candidates.FirstOrDefault(f => f.ProjectId == variant.Id)
+                    ?? candidates.FirstOrDefault(f => f.ProjectId == null);
                 var reason = failure?.Message ?? thrown?.Reason;
                 if (reason == null)
                     continue;
@@ -350,16 +353,16 @@ public static class SolutionLoader
     // warning NuGet recorded in the project's assets file during restore (for example an authenticated feed's
     // first 401 before its credential provider answered, or a vulnerability notice), so a project whose
     // packages restored and whose code loaded was reported degraded. Such a diagnostic is reclassified ONLY when
-    // its text ends with the exact message of a Warning-level entry in that project's own assets file; anything
-    // else, and any project that did not load, keeps its failure.
+    // its text ends with the exact message of a Warning-only entry in that project's own assets file, and only
+    // for a variant that loaded documents; anything else, an empty stub and a project that did not load keep it.
     internal static bool IsReplayedRestoreWarning(string message, IReadOnlyCollection<string> restoreWarnings)
     {
         var text = message.TrimEnd();
         return restoreWarnings.Any(warning => text.EndsWith(": " + warning, StringComparison.Ordinal));
     }
 
-    // The Warning-level messages in '<project dir>/obj/project.assets.json' (the default restore output path; a
-    // repository that moves it keeps today's behavior: no reclassification).
+    // The messages recorded ONLY at Warning level in '<project dir>/obj/project.assets.json' (the default restore
+    // output path; a repository that moves it keeps today's behavior: no reclassification).
     internal static IReadOnlyCollection<string> ReadRestoreWarnings(string projectPath)
     {
         var assets = Path.Combine(Path.GetDirectoryName(projectPath) ?? ".", "obj", "project.assets.json");
@@ -372,17 +375,21 @@ public static class SolutionLoader
             if (!document.RootElement.TryGetProperty("logs", out var logs) || logs.ValueKind != System.Text.Json.JsonValueKind.Array)
                 return [];
             var warnings = new HashSet<string>(StringComparer.Ordinal);
+            var others = new HashSet<string>(StringComparer.Ordinal);
             foreach (var entry in logs.EnumerateArray())
             {
                 if (entry.ValueKind == System.Text.Json.JsonValueKind.Object
-                    && entry.TryGetProperty("level", out var level) && level.ValueKind == System.Text.Json.JsonValueKind.String
-                    && string.Equals(level.GetString(), "Warning", StringComparison.OrdinalIgnoreCase)
                     && entry.TryGetProperty("message", out var text) && text.ValueKind == System.Text.Json.JsonValueKind.String
-                    && text.GetString()?.Trim() is { Length: > 0 } warning)
+                    && text.GetString()?.Trim() is { Length: > 0 } message)
                 {
-                    warnings.Add(warning);
+                    var isWarning = entry.TryGetProperty("level", out var level)
+                        && level.ValueKind == System.Text.Json.JsonValueKind.String
+                        && string.Equals(level.GetString(), "Warning", StringComparison.OrdinalIgnoreCase);
+                    (isWarning ? warnings : others).Add(message);
                 }
             }
+            // A message also recorded at another level (an error under another target graph) is never reclassified.
+            warnings.ExceptWith(others);
             return warnings;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Text.Json.JsonException)

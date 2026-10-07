@@ -62,6 +62,68 @@ public sealed class ReconcileSkippedTests
     }
 
     [TestMethod]
+    public void AProjectThatDidNotLoad_KeepsItsSkip_EvenWhenItsOnlyFailureReplaysAWarning()
+    {
+        var stub = Abs("ReplayStub-" + Guid.NewGuid().ToString("N"), "A.csproj");
+        var absent = Abs("ReplayAbsent-" + Guid.NewGuid().ToString("N"), "B.csproj");
+        foreach (var path in new[] { stub, absent })
+        {
+            var obj = Path.Combine(Path.GetDirectoryName(path)!, "obj");
+            Directory.CreateDirectory(obj);
+            File.WriteAllText(Path.Combine(obj, "project.assets.json"),
+                """{"version":3,"logs":[{"code":"NU1801","level":"Warning","message":"Feed 401 notice."}]}""");
+        }
+        try
+        {
+            // An empty stub MSBuild kept for a project that failed (presence is not success), and a project that is
+            // not in the solution at all.
+            var solution = SolutionWith((stub, withDocument: false));
+            var replay = (string path) => new SolutionLoader.LoadFailure(
+                null, path, $"Msbuild failed when processing the file '{path}' with message: Feed 401 notice.");
+
+            var result = SolutionLoader.ReconcileLoads([stub, absent], solution, [replay(stub), replay(absent)], [], null);
+
+            Assert.AreEqual(0, result.DegradedProjects.Count);
+            CollectionAssert.AreEquivalent(new[] { "A.csproj", "B.csproj" },
+                result.SkippedProjects.Select(s => s.ProjectName).ToArray());
+        }
+        finally
+        {
+            foreach (var path in new[] { stub, absent })
+                Directory.Delete(Path.GetDirectoryName(path)!, recursive: true);
+        }
+    }
+
+    [TestMethod]
+    public void ReadRestoreWarnings_ExcludesAMessageAlsoRecordedAtAnotherLevel()
+    {
+        var a = Abs("ReplayLevels-" + Guid.NewGuid().ToString("N"), "A.csproj");
+        var obj = Path.Combine(Path.GetDirectoryName(a)!, "obj");
+        Directory.CreateDirectory(obj);
+        try
+        {
+            File.WriteAllText(Path.Combine(obj, "project.assets.json"), """
+                {"version":3,"logs":[
+                  {"code":"NU1801","level":"Warning","message":"Only a warning."},
+                  {"code":"NU1801","level":"Warning","message":"Both levels."},
+                  {"code":"NU1301","level":"Error","message":"Both levels."},
+                  {"level":"Warning"},
+                  {"message":"No level."},
+                  "not an object"
+                ]}
+                """);
+
+            CollectionAssert.AreEquivalent(new[] { "Only a warning." }, SolutionLoader.ReadRestoreWarnings(a).ToArray());
+            File.WriteAllText(Path.Combine(obj, "project.assets.json"), "{ not json");
+            Assert.AreEqual(0, SolutionLoader.ReadRestoreWarnings(a).Count, "an unreadable assets file reclassifies nothing");
+        }
+        finally
+        {
+            Directory.Delete(Path.GetDirectoryName(a)!, recursive: true);
+        }
+    }
+
+    [TestMethod]
     public void PresentProjectWithDocuments_IsDegraded_WhenAFailureNamesIt()
     {
         var a = Abs("A", "A.csproj");
