@@ -309,6 +309,21 @@ public sealed class SnapshotStore(SqliteConnection connection)
         return ((long)cmd.ExecuteScalar()!, false, SnapshotStatus.Pending);
     }
 
+    /// <summary>
+    /// Binds a rebuild (including a crashed pending attempt or provider growth) to its new owning run.
+    /// Invoke inside the staging write transaction; immutable re-selection must not call this.
+    /// </summary>
+    public void RestageForRun(long snapshotId, long runId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "UPDATE snapshots SET status = @pending, run_id = @run WHERE id = @id;";
+        cmd.Parameters.AddWithValue("@pending", SnapshotStatus.Pending);
+        cmd.Parameters.AddWithValue("@run", runId);
+        cmd.Parameters.AddWithValue("@id", snapshotId);
+        if (cmd.ExecuteNonQuery() != 1)
+            throw new InvalidOperationException($"Snapshot {snapshotId} vanished while restaging.");
+    }
+
     /// <summary>Maps a project version row into a snapshot (idempotent).</summary>
     public void MapProject(long snapshotId, long projectId)
     {
@@ -549,6 +564,8 @@ public sealed class SnapshotStore(SqliteConnection connection)
     public long AttachOrUpgradeBranchPointer(long repositoryId, string branchName, long snapshotId, long now)
     {
         var branchId = AttachBranchPointer(repositoryId, branchName, snapshotId, now);
+        if (IsRebuildPredecessor(branchId, snapshotId))
+            return branchId;
         if (GetBranchSnapshotId(branchId) is not long current || current == snapshotId)
             return branchId;
         if (GetById(snapshotId) is not { Status: SnapshotStatus.Complete } target || target.RepositoryId != repositoryId)
@@ -574,6 +591,32 @@ public sealed class SnapshotStore(SqliteConnection connection)
         && previousCommit == targetCommit
         && !previous.IsOverlay && !target.IsOverlay
         && previous.WorkingTreeDelta is null && target.WorkingTreeDelta is null;
+
+    /// <summary>
+    /// Ordinary ensures of the original identity must not undo a branch's explicit rebuild selection.
+    /// Uses immutable provenance; no catalog-dependent identity calculation.
+    /// </summary>
+    public bool IsRebuildPredecessor(long? branchId, long targetSnapshotId)
+    {
+        if (branchId is not long bid || GetBranchSnapshotId(bid) is not long current
+            || current == targetSnapshotId || GetById(current) is not { Status: SnapshotStatus.Complete } previous
+            || GetById(targetSnapshotId) is not { } target || !IsSameCommitIdentityChange(previous, target))
+            return false;
+        return new SnapshotCoverageStore(connection).Get(current)?.Rebuild?.OriginalIdentityHash == target.IdentityHash;
+    }
+
+    /// <summary>
+    /// Keeps an explicit rebuild selected on an original-identity ensure, but still records a newer head
+    /// sequence so a later delayed event cannot regress commit history. Runs in the caller's transaction.
+    /// </summary>
+    public bool PreserveRebuildSelection(long? branchId, long targetSnapshotId, long? headSequence, long now)
+    {
+        if (!IsRebuildPredecessor(branchId, targetSnapshotId))
+            return false;
+        if (branchId is long bid && headSequence is not null && GetBranchSnapshotId(bid) is long current)
+            AdvanceBranchPointerForwardOnly(bid, current, headSequence, now);
+        return true;
+    }
 
     /// <summary>True when a branch other than <paramref name="exceptBranchId"/> points at the snapshot.</summary>
     public bool IsPointedByAnotherBranch(long snapshotId, long exceptBranchId)
@@ -697,9 +740,11 @@ public sealed class SnapshotStore(SqliteConnection connection)
     /// #128 guard; a shared target must not strand the other branch on a superseded head). When the CAS fails
     /// the branch is left untouched. <c>head_sequence</c> is never written. Returns <c>true</c> when the CAS
     /// passed, so the branch now points at <paramref name="snapshotId"/>. Runs on the caller's connection
-    /// inside the caller's write transaction.
+    /// inside the caller's write transaction. <paramref name="preservePrevious"/> leaves the replaced
+    /// snapshot published for immutable-page readers during an explicit rebuild selection.
     /// </summary>
-    public bool AdvanceBranchPointerIfHeadMatches(long branchId, long snapshotId, string expectedHeadCommit, long now)
+    public bool AdvanceBranchPointerIfHeadMatches(
+        long branchId, long snapshotId, string expectedHeadCommit, long now, bool preservePrevious = false)
     {
         if (!BranchHeadMatches(branchId, expectedHeadCommit))
             return false;
@@ -709,6 +754,7 @@ public sealed class SnapshotStore(SqliteConnection connection)
             return true;
         SetBranchPointer(branchId, snapshotId, now);
         if (previousSnapshot is long prev
+            && !preservePrevious
             && GetById(prev) is { Status: SnapshotStatus.Complete }
             && !IsPointedByAnotherBranch(prev, branchId))
             MarkStatus(prev, SnapshotStatus.Superseded);

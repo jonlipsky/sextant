@@ -374,11 +374,12 @@ recognized error code; ..."). A restore problem alone does not make the snapshot
 fails to bind does (below). The process tree is killed on expiry or cancellation, stdin is closed, and
 stdout/stderr are drained concurrently with a bounded wait, so a leaked MSBuild node cannot hang the job.
 
-A restore problem is **not retried**: the job publishes with the notes above, and a later ensure of the same
+A restore problem is **not automatically retried**: the job publishes with the notes above, and a later ordinary ensure of the same
 commit attaches to that snapshot. Retrying would rarely help, because each job restores into its own cold
 `NUGET_PACKAGES` (a timed-out restore would time out again), and a credential-gated feed never becomes
 reachable. The binding-health verdict below is what tells an agent that results may be missing; the next commit
-re-indexes.
+re-indexes. After improving restore conditions, an operator can request a new immutable
+[rebuild generation](#rebuilding-a-published-commit-issues-235251).
 
 **Network and credentials.** Restore contacts nuget.org and every package source the repository's
 `nuget.config` names, from the worker host. `SEXTANT_SERVICE_SANDBOX_ALLOW_NETWORK` does **not** gate it: that
@@ -1018,7 +1019,9 @@ across requests, so a revocation takes effect on the next call. Once a request h
   only its trailing name. If several hold it, the call is `repository_required` listing only those. If none does,
   it is the `repository_required` above. A caller that can read more than 25 is not inferred and no repository is
   looked up: the decision is a count, not a choice of 25, so the call is always the `repository_required` above
-  (its first 20 repositories by name, then how many more). A `find_symbol` narrowed by `project_id`, `fuzzy` or a
+  (its first 20 repositories by name, then how many more). Fuzzy `find_symbol` uses the same scoped FTS query,
+  result limit and kind filter as the tool: one repository with matches is inferred; several require explicit
+  selection regardless of relevance ranking. A `find_symbol` narrowed by `project_id` or a
   `scope` other than `all`, and an absolute path, are not inferred. **It never widens access:** the candidates are
   only the caller's own visible repositories (`SnapshotService.ListSelectableRepositories`); each lookup is a read
   through the request's own authorizer (`DatabaseProvider.ProbeRepositories`), so a repository the caller could not
@@ -1680,9 +1683,60 @@ evaluation is never unbounded.
 
 **A partial snapshot is final for its identity.** It is published like any other snapshot, so a later ensure
 of the same identity reuses it; raising the budget does not rebuild it (the budget is not part of the identity,
-so a raise re-indexes nothing), and the next commit is indexed afresh. What fits depends on the machine and its
+so a raise re-indexes nothing). An operator can then request a new
+[rebuild generation](#rebuilding-a-published-commit-issues-235251) of that commit; the next commit is indexed afresh. What fits depends on the machine and its
 load, so a partial snapshot's content is not reproducible; the first run to publish an identity is the one
 served. Readers can still observe a run's earlier batches before it publishes, as for any run (Phase 3).
+
+### Rebuilding a published commit (issues #235/#251)
+
+An application/operator can send `POST /control/ensure` (including `?wait=false`) with an explicit
+`rebuild_generation` token after improving restore conditions or increasing the evaluation budget. This is
+not an in-place force flag: the token is folded into the immutable snapshot identity on both admission and
+publication, including submodule providers. A fresh token produces a separate job and generation; repeating
+the same token and inputs attaches to that job, even if it remains partial or failed. Omit the token for
+ordinary ensures, which retain their original identity and reuse behavior. No automatic retry, global
+budget identity component, schema bump, or mass reindex is introduced.
+
+For example, the ensure body for a branch currently at a known SHA is:
+
+```json
+{
+  "repository_remote_url": "https://github.com/org/repo.git",
+  "commit_sha": "<current-sha>",
+  "branch_name": "main",
+  "expected_head_commit": "<current-sha>",
+  "rebuild_generation": "budget-raised-20261006"
+}
+```
+
+The token must contain 1-64 ASCII letters, digits, `.`, `_`, or `-` (`400 invalid_rebuild_generation`).
+An advance requires a named branch and `expected_head_commit` equal to `commit_sha`
+(`400 rebuild_head_guard_required`); sequences cannot be combined with that CAS. Alternatively,
+`branch_update: "none"` builds without selecting any branch. The CAS is evaluated at publication: a
+branch that moved to another commit while this request waited is left alone, and `branch_advanced: false`
+reports that result. Only the named branch is selected; another branch at the same SHA keeps its existing
+snapshot. Verified `act=user` callers cannot request a rebuild (`403 rebuild_not_allowed`, after visibility
+and before any job exists); control-token-only operators and application callers can. Refusals and ensures
+are audited; a rebuild ensure's detail includes `rebuild=<token>;identity=<hash>`.
+
+The new generation records its actual coverage, never an assumed complete verdict. Its immutable
+`coverage.rebuild` contains `generation` and `original_identity_hash` (the same inputs without the token,
+not an overlay base or retention dependency). This provenance is returned by ensure/status/resolve and
+the immutable symbol-page endpoint. `/control/resolve` checks identity currency with the selected token,
+so a policy-compatible rebuild does not appear stale merely because an ordinary ensure omits it.
+
+The old snapshot's data and coverage are untouched. Rebuild selection deliberately leaves the previous
+snapshot published/servable, not superseded, under the existing retention rules. During staging, branch
+queries continue to select the old snapshot; the new pointer and coverage become visible atomically at
+publish. An in-flight reader stays on its pinned generation. An MCP cursor from before the branch changed
+gets `invalid_cursor` on that branch rather than silently resuming on different data; it still works on a
+branch selecting the old generation. Immutable HTTP symbol pages retain the old hash and row-id cursor
+space, while federation caches address the new generation with a different hash. An ordinary ensure of
+the recorded original identity can still return its old job/coverage, but cannot roll this branch back off
+the explicit rebuild (including CAS/sequence attaches). A newer sequence on such an attach is still
+consumed against the retained pointer, preventing a delayed event from regressing it. Reusing another explicit token is an operator
+selection, not an ordered generation counter.
 
 #### Retrying an aborted job
 
@@ -1724,8 +1778,55 @@ snapshot-DATA garbage collection Phase 9 deferred:
   lifetime, and a stale lease may be stolen so a crash never wedges the DB.
 - **#244 — stored source text follows the file versions.** An executed pass then deletes every blob in the
   artifact volume's `source-text/` store whose SHA-256 no `file_versions` row records any more (at most
-  100,000 per pass), and reports the count as `source_texts_deleted` (absent on a dry run). It runs under
+  256 per sweep), and reports the count as `source_texts_deleted` (absent on a dry run). It runs under
   the writer gate, so a blob an index stored ahead of its row is never swept.
+
+### Bounded retention contract (#127 / #252)
+
+`POST /control/retention?execute=false` is a **read-only, point-in-time plan** on an independent WAL
+reader: no writer gate, lease acquisition, deletes, audit writes, migration, or VACUUM. It reports eligible
+generations/snapshots/projects, API rows, and *currently* orphaned file versions. File versions newly
+orphaned by future cascades are not simulated. `reclaimed_bytes_known: false` means no physical-space
+estimate is available; `reclaimed_bytes: 0` is not a claim that nothing can be reclaimed.
+
+`?execute=true` has a **10-second per-pass work budget, including writer-queue wait**, and releases the
+service writer between transactions. Every batch recomputes eligibility inside `BEGIN IMMEDIATE`:
+at most one project cascade/one orphan snapshot, 256 run rows, 256 API rows, and 256 orphan file versions.
+SQLite's progress handler interrupts long planning/deletion statements at a **2-second batch work
+deadline**; an interrupted cascade rolls back the whole batch. Native lock waits are 100 ms per attempt
+with a one-second command retry limit. Request cancellation stops subsequent work and rolls back an
+in-progress batch; earlier committed batches remain applied and have `retention`/`complete` audit rows
+with detail `execute_batch`. A queued publish runs before the next retention batch.
+
+`more_remaining: true` means another pass may be needed. `stop_reason: time_budget` or `sqlite_busy`
+explicitly reports bounded deferral, not completion. A timed-out plan also sets these fields; its empty
+counts are **not** a complete plan. Execution's `reclaimed_bytes_known: true` reports freed pages reusable
+by SQLite, **not a smaller database file**. No full VACUUM or blocking truncate-checkpoint runs on this hot
+path; the writer's existing automatic WAL checkpoints remain in effect. A pinned reader can still grow
+the WAL. Compaction is a separate offline operator action, not an implicit retention step.
+
+Branch pointers, open PRs, pending retry snapshots, and their transitive overlay/provider closure are
+never eligible. Restaging a retry binds `snapshots.run_id` to its new publishing run in the staging
+transaction; immutable re-selection preserves ownership. For existing catalogs with a complete/superseded
+snapshot bound to an abandoned or missing run, retention **conservatively retains** the snapshot and its
+dependencies: no migration, repair, or destructive inference from a stale pointer.
+
+These are cooperative work bounds, not real-time guarantees on filesystem I/O or SQLite rollback.
+A single project cascade that cannot finish within the deadline is deferred rather than partially
+deleting a potentially servable snapshot. Repeated `more_remaining`/`time_budget` responses require
+operator investigation; do not loop blindly. An approved daily runner could submit one bounded pass
+and inspect its report, but **no schedule is enabled or approved by this change**. Production scheduling
+remains deferred pending operator validation on a representative catalog.
+
+Multi-project snapshot GC withdraws publication (`failed`, NULL run/publish pointer) atomically with
+the first project deletion, including every affected downstream consumer/overlay, transitively and
+cycle-safely. A provider cascade can remove a consumer's dependency edges and occurrences, so invalidating
+only the provider would leave damaged consumer data reusable. These tombstones remain eligible across
+batches even for a quota eviction within a retained run. An intervening ensure must **rebuild**, never
+re-select half-collected data; restaging assigns a new run and pending protection immediately stops
+further collection. Ledger rows owned by surviving snapshots (including retained providers/bases on
+expired runs) stay until those snapshots are collected, so normal GC never manufactures a legacy
+NULL ownership pointer and permanently protects healthy data.
 
 ## Snapshot source text (#244)
 
@@ -1777,11 +1878,22 @@ rows.
   completeness rates, worker capacity, storage (catalog + artifact + cache + checkout bytes), cache reuse
   (idempotent-ensure attach rate + federation page-cache hit rate), and query latency (p50/p95/max). Add
   `?format=prometheus` for text exposition a scraper/dashboard can ingest directly. Alerts are evaluated
-  over the snapshot (`queue_delay_high`, `low_success_rate`, `worker_exhaustion`, `storage_pressure`).
+  over the snapshot (`queue_delay_high`, `low_success_rate`, `low_completeness_rate`, `worker_exhaustion`,
+  `storage_pressure`). `low_completeness_rate` uses complete jobs / all terminal jobs: partial jobs still
+  count as successful publication but not as complete. The existing `AlertThresholds` programmatic
+  configuration sets `CompletenessRateWarn` (default 0.90), `CompletenessRateCrit` (0.50), and the shared
+  `SuccessRateMinSamples` (5). Rates strictly below a threshold fire; equality does not cross that
+  threshold. With no terminal jobs or fewer than the minimum, completeness is not assessed, not proven
+  healthy. The job metric reflects recorded job outcomes, not a fresh audit of historical coverage rows.
+  The existing no-sample rate value of 1.0 is retained for wire compatibility; do not treat it as evidence.
 - **`GET /control/audit`** serves the durable [`audit_log`](../src/Sextant.Store/Migrations/020_audit_log.sql)
   (migration 020): who did what to which repository scope, with what outcome and at what worker cost.
   The actor is stored as a **non-reversible hash**, never the raw token; the raw secret never touches the DB.
-- **`GET /control/pilot`** evaluates the pilot-readiness gate (see runbooks).
+- **`GET /control/pilot`** evaluates the pilot-readiness gate (see runbooks). Its `snapshot_completeness`
+  check uses the same warning threshold and sample minimum, is advisory for trusted single-tenant
+  workloads, and blocking for untrusted multi-tenant workloads. Missing/insufficient samples fail this
+  check as "not assessed"; an active critical completeness alert still blocks either workload through
+  the existing `no_critical_alerts` check.
 - **Traces:** ensure / retention / backup emit `System.Diagnostics.Activity` spans on the
   `Sextant.Service` `ActivitySource`, so an operator can wire OpenTelemetry without any code change.
 

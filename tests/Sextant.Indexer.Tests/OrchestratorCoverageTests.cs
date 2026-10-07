@@ -79,6 +79,36 @@ public class OrchestratorCoverageTests
     }
 
     [TestMethod]
+    [DataRow(SnapshotStatus.Pending)]
+    [DataRow(SnapshotStatus.Failed)]
+    [DataRow(SnapshotStatus.Partial)]
+    public async Task RebuildExistingIdentity_RebindsOwnership_WhileReselectionDoesNot(string retryStatus)
+    {
+        var orchestrator = new IndexOrchestrator(_db, useDocumentExtractor: true);
+        await orchestrator.IndexSolutionAsync(BuildSolution(), snapshotContext: Context("retry", null));
+        var conn = _db.GetConnection();
+        var snapshots = new SnapshotStore(conn);
+        var id = snapshots.GetSelectedSnapshotId()!.Value;
+        var firstRun = snapshots.GetById(id)!.RunId!.Value;
+        // Shape a committed first attempt that failed after staging this identity.
+        snapshots.MarkStatus(id, retryStatus);
+        using (var failed = conn.CreateCommand())
+        {
+            failed.CommandText = "UPDATE index_runs SET status = 'abandoned' WHERE id = @id;";
+            failed.Parameters.AddWithValue("@id", firstRun);
+            failed.ExecuteNonQuery();
+        }
+        await orchestrator.IndexSolutionAsync(BuildSolution(), snapshotContext: Context("retry", null));
+        var publishedRun = snapshots.GetById(id)!.RunId;
+        Assert.AreNotEqual(firstRun, publishedRun);
+        Assert.AreEqual(new IndexRunStore(conn).GetLastCompleteRun()!.Id, publishedRun);
+        Assert.AreEqual(SnapshotStatus.Complete, snapshots.GetById(id)!.Status);
+
+        await orchestrator.IndexSolutionAsync(BuildSolution(), snapshotContext: Context("retry", null));
+        Assert.AreEqual(publishedRun, snapshots.GetById(id)!.RunId, "immutable re-selection never rebinds ownership");
+    }
+
+    [TestMethod]
     public async Task Publish_WithoutComputedCoverage_RecordsNothing()
     {
         await new IndexOrchestrator(_db, useDocumentExtractor: true)

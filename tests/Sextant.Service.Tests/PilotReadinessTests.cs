@@ -112,6 +112,95 @@ public class PilotReadinessTests
         Assert.IsTrue(report.Blockers.Any(c => c.Id == "control_plane_secured"));
     }
 
+    [TestMethod]
+    [DataRow(PilotWorkloadClass.TrustedSingleTenant, false)]
+    [DataRow(PilotWorkloadClass.UntrustedMultiTenant, true)]
+    public void LowCompleteness_IsAdvisoryOrBlocking(PilotWorkloadClass workload, bool blocking)
+    {
+        var report = PilotReadiness.Evaluate(FullyGreen() with
+        {
+            WorkloadClass = workload,
+            HardOsIsolationAvailable = true,
+            Jobs = new JobMetrics { Complete = 8, Partial = 2 },
+            Alerts = [new Alert { Id = "low_completeness_rate", Level = AlertLevel.Warning, Message = "partial" }]
+        });
+        var check = report.Checks.Single(c => c.Id == "snapshot_completeness");
+        Assert.IsFalse(check.Passed);
+        Assert.AreEqual(blocking, check.Blocking);
+        Assert.AreEqual(!blocking, report.Ready);
+        StringAssert.Contains(check.Message, "coverage.reasons");
+        StringAssert.Contains(check.Message, "solutions");
+    }
+
+    [TestMethod]
+    [DataRow(0)]
+    [DataRow(4)]
+    public void InsufficientCompletenessSamples_AreNotHealthy(int complete)
+    {
+        var report = PilotReadiness.Evaluate(FullyGreen() with
+        {
+            WorkloadClass = PilotWorkloadClass.UntrustedMultiTenant,
+            HardOsIsolationAvailable = true,
+            Jobs = new JobMetrics { Complete = complete }
+        });
+        var check = report.Checks.Single(c => c.Id == "snapshot_completeness");
+        Assert.IsFalse(check.Passed);
+        Assert.IsFalse(report.Ready);
+        StringAssert.Contains(check.Message, "not assessed");
+    }
+
+    [TestMethod]
+    public void MissingCompletenessMetrics_AreNotHealthy()
+    {
+        var report = PilotReadiness.Evaluate(FullyGreen() with { Jobs = null });
+        var check = report.Checks.Single(c => c.Id == "snapshot_completeness");
+        Assert.IsFalse(check.Passed);
+        Assert.IsFalse(check.Blocking);
+        Assert.IsTrue(report.Ready);
+        StringAssert.Contains(check.Message, "not assessed");
+    }
+
+    [TestMethod]
+    [DataRow(9, 1, 0.9, true)]
+    [DataRow(8, 2, 0.9, false)]
+    [DataRow(8, 2, 0.8, true)]
+    public void Completeness_UsesAlertWarningThreshold(int complete, int partial, double threshold, bool passed)
+    {
+        var report = PilotReadiness.Evaluate(FullyGreen() with
+        {
+            Jobs = new JobMetrics { Complete = complete, Partial = partial }
+        }, new AlertThresholds { CompletenessRateWarn = threshold });
+        Assert.AreEqual(passed, report.Checks.Single(c => c.Id == "snapshot_completeness").Passed);
+    }
+
+    [TestMethod]
+    [DataRow(5, 5, true)]
+    [DataRow(5, 6, false)]
+    [DataRow(0, 0, false)]
+    public void Completeness_UsesSharedSampleMinimum(int complete, int minimum, bool passed)
+    {
+        var report = PilotReadiness.Evaluate(FullyGreen() with
+        {
+            Jobs = new JobMetrics { Complete = complete }
+        }, new AlertThresholds { SuccessRateMinSamples = minimum });
+        Assert.AreEqual(passed, report.Checks.Single(c => c.Id == "snapshot_completeness").Passed);
+    }
+
+    [TestMethod]
+    public void AllPartialJobs_FailCompleteness_AndCriticalAlertStillBlocksTrusted()
+    {
+        var jobs = new JobMetrics { Partial = 5 };
+        var report = PilotReadiness.Evaluate(FullyGreen() with
+        {
+            Jobs = jobs,
+            Alerts = [new Alert { Id = "low_completeness_rate", Level = AlertLevel.Critical, Message = "partial" }]
+        });
+        Assert.AreEqual(1.0, jobs.SuccessRate);
+        Assert.IsFalse(report.Checks.Single(c => c.Id == "snapshot_completeness").Passed);
+        Assert.IsFalse(report.Ready);
+        Assert.IsTrue(report.Blockers.Any(c => c.Id == "no_critical_alerts"));
+    }
+
     // A baseline input with every blocking precondition satisfied for a trusted pilot; individual tests
     // flip one field to prove that field's effect.
     private static PilotReadinessInput FullyGreen() => new()
@@ -124,6 +213,7 @@ public class PilotReadinessTests
         RecentBackupAvailable = true,
         CatalogRecovered = true,
         WorkerCapacityAvailable = true,
+        Jobs = new JobMetrics { Complete = 5 },
         Alerts = []
     };
 }

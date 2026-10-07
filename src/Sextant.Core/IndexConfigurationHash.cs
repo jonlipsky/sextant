@@ -61,6 +61,11 @@ public static class IndexConfigurationHash
     /// member's C# declaration (<c>symbols.declaration</c>, migration 026) for the tools' <c>signature</c> field,
     /// so a snapshot indexed before it has no declarations and must not be reused for the same identity.
     /// </para>
+    /// <para>
+    /// <c>"5"</c> to <c>"6"</c> (issue #253): the document extractor records the bound constructor
+    /// overload's references and call edges for object creation and explicit constructor initializers,
+    /// in addition to type usages. Old snapshots have no such edges and must not be reused as fixed.
+    /// </para>
     /// </remarks>
     public const string AnalyzerVersion = "6";
 

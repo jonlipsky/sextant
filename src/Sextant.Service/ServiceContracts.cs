@@ -22,6 +22,13 @@ public sealed record EnsureSnapshotRequest
     public string? ConfigHash { get; init; }
 
     /// <summary>
+    /// Application/operator-only idempotency token for a new immutable generation of this commit.
+    /// 1-64 ASCII letters, digits, dots, underscores or hyphens. A new token rebuilds; the same token attaches.
+    /// Advancing requires a named branch and expected_head_commit equal to CommitSha.
+    /// </summary>
+    public string? RebuildGeneration { get; init; }
+
+    /// <summary>
     /// An OPTIONAL monotonic per-branch head sequence supplied by the control plane (issue #84). The
     /// service ensures EVERY delivered commit — including out-of-order/older ones — so an unconditional
     /// branch advance could transiently REGRESS the data-plane branch pointer. When present, the service
@@ -98,6 +105,7 @@ public sealed record EnsureSnapshotRequest
     /// <c>conflicting_branch_guards</c> when both <see cref="ExpectedHeadCommit"/> and
     /// <see cref="BranchHeadSequence"/> are present. <c>branch_update: none</c> takes precedence over both
     /// guards (SVC-6/7 precedence row 0: they are ignored), so it is never a conflict.
+    /// A rebuild also validates its token and requires a named branch with a same-commit CAS for an advance.
     /// </summary>
     public string? BranchGuardProblem()
     {
@@ -107,6 +115,18 @@ public sealed record EnsureSnapshotRequest
             return BranchGuardReason.InvalidBranchUpdate;
         if (!SuppressesBranchUpdate && ExpectedHeadCommit is not null && BranchHeadSequence is not null)
             return BranchGuardReason.ConflictingBranchGuards;
+        if (RebuildGeneration is { } generation)
+        {
+            if (generation.Length is < 1 or > 64
+                || generation.Any(c => !char.IsAsciiLetterOrDigit(c) && c is not '.' and not '_' and not '-'))
+                return "invalid_rebuild_generation";
+            if (!SuppressesBranchUpdate
+                && (string.IsNullOrWhiteSpace(BranchName)
+                    || string.IsNullOrWhiteSpace(CommitSha)
+                    || SnapshotStore.IsAbsentHeadCommit(CommitSha)
+                    || !string.Equals(ExpectedHeadCommit, CommitSha, StringComparison.OrdinalIgnoreCase)))
+                return "rebuild_head_guard_required";
+        }
         return null;
     }
 
@@ -208,7 +228,8 @@ public sealed record EnsureSnapshotRequest
         ToolchainFingerprint = ToolchainFingerprint.Current,
         CapabilityFingerprint = fallbackCapability,
         SdkPinPolicy = sdkPinPolicy,
-        RestorePolicy = restorePolicy
+        RestorePolicy = restorePolicy,
+        RebuildGeneration = RebuildGeneration
     };
 }
 
