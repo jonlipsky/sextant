@@ -146,6 +146,7 @@ public class ObservabilityHttpTests
         await using var host = await Harness.StartAsync(partial);
         for (var i = 0; i < 5; i++)
             await EnsureViaControl(host, $"commit-{i}");
+        host.SetTerminalJobCompletionTime(DateTimeOffset.UtcNow.AddSeconds(-1).ToUnixTimeMilliseconds());
 
         using var metricsResponse = await Send(host, "/control/metrics", ControlToken);
         Assert.AreEqual(HttpStatusCode.OK, metricsResponse.StatusCode);
@@ -211,6 +212,23 @@ public class ObservabilityHttpTests
         private SnapshotService Service { get; init; } = null!;
         private IndexDatabase Db { get; init; } = null!;
         private string DbPath { get; init; } = "";
+
+        public void SetTerminalJobCompletionTime(long completedAt)
+        {
+            using var connection = Db.GetConnection();
+            using var command = connection.CreateCommand();
+            command.CommandText = """
+                UPDATE snapshot_jobs SET completed_at = @completed_at
+                WHERE status IN (@complete, @partial, @failed, @unsupported, @cancelled);
+                """;
+            command.Parameters.AddWithValue("@completed_at", completedAt);
+            command.Parameters.AddWithValue("@complete", SnapshotJobStatus.Complete);
+            command.Parameters.AddWithValue("@partial", SnapshotJobStatus.Partial);
+            command.Parameters.AddWithValue("@failed", SnapshotJobStatus.Failed);
+            command.Parameters.AddWithValue("@unsupported", SnapshotJobStatus.Unsupported);
+            command.Parameters.AddWithValue("@cancelled", SnapshotJobStatus.Cancelled);
+            command.ExecuteNonQuery();
+        }
 
         public static async Task<Harness> StartAsync(bool partial = false)
         {
