@@ -1,5 +1,8 @@
 using Sextant.Core;
+using Sextant.Indexer;
 using Sextant.Service.Restore;
+using Microsoft.CodeAnalysis;
+using Sextant.Store;
 
 namespace Sextant.Service.Tests;
 
@@ -372,6 +375,257 @@ public class PackageRestoreTests
         {
             try { Directory.Delete(root, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
         }
+    }
+
+    [TestMethod]
+    public async Task Runner_RestoresOverlappingSolutionsOnceWithEachProjectsFinalSolutionGlobals()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "sextant-restore-union-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            File.WriteAllText(Path.Combine(root, "nuget.config"), """
+                <?xml version="1.0" encoding="utf-8"?>
+                <configuration><packageSources><clear /></packageSources></configuration>
+                """);
+            var appDir = Path.Combine(root, "App");
+            var toolsDir = Path.Combine(root, "Tools");
+            var sharedDir = Path.Combine(root, "Shared");
+            Directory.CreateDirectory(appDir);
+            Directory.CreateDirectory(toolsDir);
+            Directory.CreateDirectory(sharedDir);
+
+            var app = Path.Combine(appDir, "App.csproj");
+            var tool = Path.Combine(toolsDir, "Tool.csproj");
+            var shared = Path.Combine(sharedDir, "Shared.csproj");
+            var tfm = $"net{Environment.Version.Major}.0";
+            WriteProject(app, "App", tfm, Path.GetRelativePath(appDir, shared));
+            WriteProject(tool, "Tools", tfm, Path.GetRelativePath(toolsDir, shared));
+            WriteProject(shared, "Tools", $"{tfm};netstandard2.1", multiTarget: true);
+
+            var appSolution = Path.Combine(appDir, "App.sln");
+            var toolsSolution = Path.Combine(toolsDir, "Tools.slnx");
+            WriteSolution(appSolution, "App.csproj", "../Shared/Shared.csproj");
+            File.WriteAllText(toolsSolution, """
+                <Solution>
+                  <Project Path="Tool.csproj" />
+                  <Project Path="../Shared/Shared.csproj" />
+                </Solution>
+                """);
+
+            var logs = new List<string>();
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromMinutes(4), log: logs.Add)
+                .RunAsync(root, [appSolution, toolsSolution], limit: null, CancellationToken.None,
+                    Path.Combine(root, "scratch"));
+
+            Assert.IsTrue(outcome.Clean, string.Join("\n", outcome.Notes()));
+            Assert.IsTrue(outcome.UsedProjectUnion);
+            Assert.AreEqual(2, outcome.SolutionsSelected);
+            Assert.AreEqual(1, outcome.SolutionsAttempted, "one MSBuild process traverses the deduplicated union");
+            Assert.AreEqual(3, outcome.ProjectsAttempted, "the shared dependency is scheduled once");
+            Assert.IsTrue(logs.Any(line => line.Contains("3 distinct project(s) from 2 selected solution(s)", StringComparison.Ordinal)));
+
+            AssertRestoreContext(app, appSolution, "App");
+            AssertRestoreContext(tool, toolsSolution, "Tools");
+            AssertRestoreContext(shared, toolsSolution, "Tools");
+            foreach (var project in new[] { app, tool, shared })
+                Assert.IsTrue(File.Exists(Path.Combine(Path.GetDirectoryName(project)!, "obj", "project.assets.json")), project);
+            var appAssets = File.ReadAllText(Path.Combine(appDir, "obj", "project.assets.json"));
+            StringAssert.Contains(appAssets, "Shared.csproj", "non-recursive restore must retain the project-reference asset entry");
+            var sharedAssets = File.ReadAllText(Path.Combine(sharedDir, "obj", "project.assets.json"));
+            StringAssert.Contains(sharedAssets, "netstandard2.1", "the union restores all target frameworks of each project");
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [TestMethod]
+    public async Task Runner_UnionRestoreFailureMakesCoveragePartialAndKeepsProjectDiagnostics()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "sextant-restore-failure-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var feed = Path.Combine(root, "feed");
+            Directory.CreateDirectory(feed);
+            File.WriteAllText(Path.Combine(root, "nuget.config"), $"""
+                <?xml version="1.0" encoding="utf-8"?>
+                <configuration><packageSources><clear /><add key="local" value="{feed}" /></packageSources></configuration>
+                """);
+            var goodDir = Path.Combine(root, "Good");
+            var badDir = Path.Combine(root, "Bad");
+            Directory.CreateDirectory(goodDir);
+            Directory.CreateDirectory(badDir);
+            var tfm = $"net{Environment.Version.Major}.0";
+            var good = Path.Combine(goodDir, "Good.csproj");
+            var bad = Path.Combine(badDir, "Bad.csproj");
+            WriteProject(good, "Good", tfm);
+            WriteProject(bad, "Bad", tfm, packageReference: """
+                <PackageReference Include="Sextant.Unavailable.Test.Package" Version="1.0.0" />
+                """);
+            var goodSolution = Path.Combine(goodDir, "Good.slnx");
+            var badSolution = Path.Combine(badDir, "Bad.slnx");
+            File.WriteAllText(goodSolution, "<Solution><Project Path=\"Good.csproj\" /></Solution>");
+            File.WriteAllText(badSolution, "<Solution><Project Path=\"Bad.csproj\" /></Solution>");
+
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromMinutes(4))
+                .RunAsync(root, [goodSolution, badSolution], limit: null, CancellationToken.None,
+                    Path.Combine(root, "scratch"));
+
+            Assert.IsFalse(outcome.Clean);
+            Assert.IsTrue(outcome.UsedProjectUnion);
+            Assert.AreEqual(2, outcome.ProjectsAttempted);
+            Assert.AreEqual("Bad/Bad.csproj", outcome.Projects.Single().Project);
+            StringAssert.Contains(string.Join("\n", outcome.Notes()), "Sextant.Unavailable.Test.Package");
+
+            var resolution = new CheckoutResolution
+            {
+                CheckoutDir = root,
+                SelectedSolutions = [goodSolution, badSolution],
+                Source = SolutionSelectionSource.DefaultUnion
+            };
+            var load = new MultiSolutionLoadResult(new AdhocWorkspace().CurrentSolution, [],
+                [new SolutionCoverage(goodSolution, 1, 1, []), new SolutionCoverage(badSolution, 1, 1, [])])
+            {
+                DeclaredProjects = [good, bad]
+            };
+            var coverage = new SnapshotCoverageBuilder.Result(
+                SnapshotCoverageBuilder.WithRestoreOutcome(
+                    new SnapshotCoverage { Verdict = SnapshotCoverageVerdict.Complete }, outcome), []);
+            var result = LocalIndexerSnapshotWorker.BuildResult(17, root, resolution, load, coverage, restore: outcome);
+
+            Assert.AreEqual(SnapshotJobStatus.Partial, result.Status);
+            Assert.IsTrue(result.Coverage!.Reasons.Any(reason => reason.Contains("package restore was incomplete", StringComparison.Ordinal)));
+            Assert.IsTrue(result.Projects.Any(project =>
+                project.Code == LocalIndexerSnapshotWorker.PackageRestoreIncompleteCode && project.ProjectPath == "Bad/Bad.csproj"));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    [TestMethod]
+    public async Task Runner_FallsBackWhenAProjectReferenceIsOutsideTheDeclaredUnion()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "sextant-restore-fallback-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            File.WriteAllText(Path.Combine(root, "nuget.config"), """
+                <?xml version="1.0" encoding="utf-8"?>
+                <configuration><packageSources><clear /></packageSources></configuration>
+                """);
+            var appDir = Path.Combine(root, "App");
+            var toolsDir = Path.Combine(root, "Tools");
+            var sharedDir = Path.Combine(root, "Shared");
+            Directory.CreateDirectory(appDir);
+            Directory.CreateDirectory(toolsDir);
+            Directory.CreateDirectory(sharedDir);
+            var tfm = $"net{Environment.Version.Major}.0";
+            var shared = Path.Combine(sharedDir, "Shared.csproj");
+            var app = Path.Combine(appDir, "App.csproj");
+            var tool = Path.Combine(toolsDir, "Tool.csproj");
+            WriteProject(shared, "Shared", tfm);
+            WriteProject(app, "App", tfm, Path.GetRelativePath(appDir, shared));
+            WriteProject(tool, "Tools", tfm, Path.GetRelativePath(toolsDir, shared));
+            var appSolution = Path.Combine(appDir, "App.slnx");
+            var toolsSolution = Path.Combine(toolsDir, "Tools.slnx");
+            File.WriteAllText(appSolution, "<Solution><Project Path=\"App.csproj\" /></Solution>");
+            File.WriteAllText(toolsSolution, "<Solution><Project Path=\"Tool.csproj\" /></Solution>");
+
+            var logs = new List<string>();
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromMinutes(4), log: logs.Add)
+                .RunAsync(root, [appSolution, toolsSolution], limit: null, CancellationToken.None,
+                    Path.Combine(root, "scratch"));
+
+            Assert.IsFalse(outcome.UsedProjectUnion);
+            Assert.AreEqual(2, outcome.SolutionsAttempted);
+            Assert.IsTrue(logs.Any(line => line.Contains("per-solution fallback", StringComparison.Ordinal)));
+            Assert.IsTrue(File.Exists(Path.Combine(sharedDir, "obj", "project.assets.json")),
+                "the fallback retains transitive restore behavior for projects outside the selected solution union");
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    private static void WriteProject(
+        string path, string expectedSolutionName, string targetFramework, string? projectReference = null,
+        string? packageReference = null, bool multiTarget = false)
+    {
+        var references = projectReference is null ? string.Empty : $"<ProjectReference Include=\"{projectReference}\" />";
+        var packages = packageReference is null ? string.Empty : packageReference;
+        var targetFrameworkProperty = multiTarget ? "TargetFrameworks" : "TargetFramework";
+        File.WriteAllText(path, $"""
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup><{targetFrameworkProperty}>{targetFramework}</{targetFrameworkProperty}></PropertyGroup>
+              <ItemGroup>{references}{packages}</ItemGroup>
+              <Target Name="CaptureRestoreContext" BeforeTargets="Restore">
+                <Error Condition="'$(SolutionName)' != '{expectedSolutionName}'" Text="Unexpected SolutionName for {Path.GetFileName(path)}: $(SolutionName)" />
+                <WriteLinesToFile File="$(MSBuildProjectDirectory)/restore-context.txt" Lines="$(SolutionDir)|$(SolutionName)|$(SolutionPath)|$(SolutionFileName)|$(SolutionExt)|$(Configuration)|$(Platform)" Overwrite="false" />
+              </Target>
+            </Project>
+            """);
+    }
+
+    private static void WriteSolution(string path, string project, string sharedProject)
+    {
+        var projectGuid = Guid.NewGuid().ToString("B").ToUpperInvariant();
+        const string sharedGuid = "{BDBA7C3E-98C1-4D8A-B8C8-2048B5CFD4BD}";
+        const string projectType = "{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}";
+        var projectPath = project.Replace('/', '\\');
+        var sharedPath = sharedProject.Replace('/', '\\');
+        File.WriteAllText(path, $"""
+            Microsoft Visual Studio Solution File, Format Version 12.00
+            # Visual Studio Version 17
+            VisualStudioVersion = 17.0.31903.59
+            MinimumVisualStudioVersion = 10.0.40219.1
+            Project("{projectType}") = "App", "{projectPath}", "{projectGuid}"
+            EndProject
+            Project("{projectType}") = "Shared", "{sharedPath}", "{sharedGuid}"
+            EndProject
+            Global
+                GlobalSection(SolutionConfigurationPlatforms) = preSolution
+                    Debug|Any CPU = Debug|Any CPU
+                    Release|Any CPU = Release|Any CPU
+                EndGlobalSection
+                GlobalSection(ProjectConfigurationPlatforms) = postSolution
+                    {projectGuid}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+                    {projectGuid}.Debug|Any CPU.Build.0 = Debug|Any CPU
+                    {projectGuid}.Release|Any CPU.ActiveCfg = Release|Any CPU
+                    {projectGuid}.Release|Any CPU.Build.0 = Release|Any CPU
+                    {sharedGuid}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+                    {sharedGuid}.Debug|Any CPU.Build.0 = Debug|Any CPU
+                    {sharedGuid}.Release|Any CPU.ActiveCfg = Release|Any CPU
+                    {sharedGuid}.Release|Any CPU.Build.0 = Release|Any CPU
+                EndGlobalSection
+            EndGlobal
+            """);
+    }
+
+    private static void AssertRestoreContext(string project, string solution, string solutionName)
+    {
+        var marker = Path.Combine(Path.GetDirectoryName(project)!, "restore-context.txt");
+        var solutionDir = Path.GetDirectoryName(Path.GetFullPath(solution))! + Path.DirectorySeparatorChar;
+        Assert.AreEqual(
+            $"{solutionDir}|{solutionName}|{Path.GetFullPath(solution)}|{Path.GetFileName(solution)}|{Path.GetExtension(solution)}|Debug|AnyCPU",
+            File.ReadAllText(marker).Trim(),
+            $"{Path.GetFileName(project)} should be evaluated with its owning solution globals, once.");
+    }
+
+    private static void TryDelete(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+                Directory.Delete(path, recursive: true);
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
     }
 
     // ==== identity ====================================================================================

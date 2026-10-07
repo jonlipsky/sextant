@@ -1,5 +1,6 @@
 using Sextant.Core;
 using Sextant.Indexer;
+using Sextant.Service.Restore;
 using Sextant.Store;
 
 namespace Sextant.Service;
@@ -314,6 +315,39 @@ public static class SnapshotCoverageBuilder
         if (notes is not { Count: > 0 })
             return coverage;
         return coverage with { Notes = [.. coverage.Notes ?? [], .. notes] };
+    }
+
+    /// <summary>
+    /// Records best-effort restore diagnostics and makes an incomplete restore an explicit coverage gap.
+    /// </summary>
+    public static SnapshotCoverage WithRestoreOutcome(SnapshotCoverage coverage, PackageRestoreOutcome restore)
+    {
+        ArgumentNullException.ThrowIfNull(coverage);
+        ArgumentNullException.ThrowIfNull(restore);
+
+        var result = WithNotes(coverage, restore.Notes());
+        if (restore.Clean)
+            return result;
+
+        var reason = restore.UsedProjectUnion
+            ? $"package restore was incomplete for the union of {restore.ProjectsAttempted} distinct project(s) " +
+              $"from {restore.SolutionsSelected} selected solution(s); code binding may be incomplete."
+            : $"package restore was incomplete for {restore.SolutionsSelected} selected solution(s); code binding may be incomplete.";
+        return WithRestoreFailure(result, reason);
+    }
+
+    /// <summary>Marks a snapshot partial for a restore gap that applies to its project set.</summary>
+    public static SnapshotCoverage WithRestoreFailure(SnapshotCoverage coverage, string reason)
+    {
+        ArgumentNullException.ThrowIfNull(coverage);
+        ArgumentException.ThrowIfNullOrWhiteSpace(reason);
+        return coverage with
+        {
+            Verdict = SnapshotCoverageVerdict.Partial,
+            Reasons = coverage.Reasons.Contains(reason, StringComparer.Ordinal)
+                ? coverage.Reasons
+                : [.. coverage.Reasons, reason]
+        };
     }
 
     /// <summary>

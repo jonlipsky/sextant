@@ -106,8 +106,8 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_SANDBOX_ALLOW_NETWORK` | Allow network during evaluation (a best-effort posture, not a network block; it does not gate package restore, see [Package restore](#package-restore-before-the-load)) | `false` |
 | `SEXTANT_SERVICE_SANDBOX_SCRUB_SECRETS` | Scrub secrets from the evaluation environment | `true` |
 | `SEXTANT_SERVICE_SDK_PIN_OVERRIDE` | Temporarily neutralize a checkout `global.json` SDK pin that no installed SDK satisfies, so the checkout still indexes with an installed SDK (issue #113; see [SDK pins](#repository-globaljson-sdk-pins-issue-113)). `false` leaves such pins alone and the job fails / goes partial with a typed `sdk_resolution_failed` diagnostic. `false` is part of the snapshot identity, so flipping the toggle re-indexes a commit instead of reusing a result built under the other policy. An unparseable value **fails startup** | `true` |
-| `SEXTANT_SERVICE_PACKAGE_RESTORE` | Run `dotnet restore` over the selected solutions before the load (see [Package restore](#package-restore-before-the-load)). `false` loads unrestored projects, which compile against their direct project references only, so calls into transitively referenced projects may not bind. `false` is part of the snapshot identity (`restore=off`). An unparseable value **fails startup** | `true` |
-| `SEXTANT_SERVICE_PACKAGE_RESTORE_TIMEOUT_SECONDS` | Bound on one job's whole restore step (all solutions), clamped to 3600. Under the sandbox the step also stops at a fifth of the sandbox time budget, whichever is shorter. On expiry the restore process tree is killed and the load goes ahead with whatever was restored | `300` |
+| `SEXTANT_SERVICE_PACKAGE_RESTORE` | Restore the selected solutions' deduplicated project union before the load (see [Package restore](#package-restore-before-the-load)). `false` loads unrestored projects, which compile against their direct project references only, so calls into transitively referenced projects may not bind. `false` is part of the snapshot identity (`restore=off`). An unparseable value **fails startup** | `true` |
+| `SEXTANT_SERVICE_PACKAGE_RESTORE_TIMEOUT_SECONDS` | Bound on one job's whole project-union restore step, clamped to 3600. Under the sandbox the step also stops at a fifth of the sandbox time budget, whichever is shorter. On expiry the restore process tree is killed and the load goes ahead with whatever was restored | `300` |
 
 Boolean toggles accept `1/0`, `true/false`, `yes/no`, `on/off` (case-insensitive); any other non-empty
 value **fails startup** rather than silently disabling a security-relevant control (fail-closed). The
@@ -346,8 +346,15 @@ recorded skipped-with-reason.
 
 #### Package restore before the load
 
-The worker runs `dotnet restore <solution> -p:DesignTimeBuild=true --ignore-failed-sources
---disable-build-servers -nodeReuse:false` over every selected solution, in order and under one deadline
+For multiple selected solutions, the worker writes a generated MSBuild traversal into job scratch and restores the
+deduplicated project union in one bounded process. Each project is scheduled once with the `SolutionDir`,
+`SolutionName`, `SolutionPath`, `SolutionFileName`, `SolutionExt`, `Configuration` and `Platform` globals from
+the last selected solution that declares it, matching which solution previously wrote its final assets file.
+The direct references are disabled for recursive restore because their declared union entries are scheduled
+explicitly. A solution with custom configurations, a project graph that cannot be statically closed, or an
+unparseable solution falls back to the original per-solution restore; no declared project is silently skipped.
+A single selected solution keeps the direct solution restore path. The worker runs
+`dotnet msbuild <generated traversal> -target:RestoreUnion` under one deadline
 (`SEXTANT_SERVICE_PACKAGE_RESTORE_TIMEOUT_SECONDS`, default 300 s, and never more than a fifth of the
 sandbox time budget, see [The time budget](#the-time-budget-publish-what-fits-abort-what-will-not-stop-issue-245)),
 inside the evaluation sandbox and while
@@ -364,20 +371,20 @@ A restore never fails the job. `--ignore-failed-sources` lets an unreachable or 
 example a private feed authenticated by an environment variable the worker does not have) leave the other
 packages restored; NuGet then reports the source as the per-project **warning** `NU1801` (not the error
 `NU1301`), and the parser records that warning as "a package source was unreachable", even when its message
-contains the word "error". `-p:DesignTimeBuild=true` keeps a missing optional workload from failing the restore,
+contains the word "error". `DesignTimeBuild=true` keeps a missing optional workload from failing the restore,
 like the load. What it could not do is recorded: per-project `package_restore_incomplete` warnings (codes and
 package ids only, never a raw message, which can name a source URL), `coverage.notes` lines such as "Package
 restore could not find 2 package(s) (Acme.Auth, Acme.Auth.UI) for 1 project(s); code that uses them may not
-bind.", and each affected project's `coverage.binding.projects[].load_issue`. A restore that exits non-zero
-without a recognizable error line still leaves a note ("Package restore failed for N solution(s) without a
-recognized error code; ..."). A restore problem alone does not make the snapshot partial; the code that then
-fails to bind does (below). The process tree is killed on expiry or cancellation, stdin is closed, and
+bind.", and each affected project's `coverage.binding.projects[].load_issue`. Any incomplete restore now makes
+the snapshot `partial` with an explicit package-restore coverage reason, even if binding-health thresholds are
+not reached. A restore that exits non-zero without a recognizable error line still leaves a note and the same
+partial verdict. The process tree is killed on expiry or cancellation, stdin is closed, and
 stdout/stderr are drained concurrently with a bounded wait, so a leaked MSBuild node cannot hang the job.
 
-A restore problem is **not automatically retried**: the job publishes with the notes above, and a later ordinary ensure of the same
+A restore problem is **not automatically retried**: the job publishes partial with the notes and reason above, and a later ordinary ensure of the same
 commit attaches to that snapshot. Retrying would rarely help, because each job restores into its own cold
 `NUGET_PACKAGES` (a timed-out restore would time out again), and a credential-gated feed never becomes
-reachable. The binding-health verdict below is what tells an agent that results may be missing; the next commit
+reachable. The restore coverage reason and binding-health verdict below tell an agent that results may be missing; the next commit
 re-indexes. After improving restore conditions, an operator can request a new immutable
 [rebuild generation](#rebuilding-a-published-commit-issues-235251).
 
@@ -394,9 +401,12 @@ URL, and NuGet would send those credentials to it.
 
 Cost: 15-60 s per job for a large repository with a warm NuGet cache. The sandbox gives each job its own
 `NUGET_PACKAGES`, so a cold job downloads every package (about 2.6 GB for a 188-project repository) into job
-scratch, which is released with the job. A repository with many overlapping solutions costs far more, because
-each solution is restored by its own `dotnet restore`: on a 61-solution, 468-project repository the step used
-its whole 300 s and reached only 19 of the 61 solutions (issue #246 tracks restoring the union once). The restore writes `obj/` files (`project.assets.json`,
+scratch, which is released with the job. Before the union traversal (issue #246), a repository with many
+overlapping solutions paid for a separate `dotnet restore` per solution: on a 61-solution, 468-project
+repository the step used its whole 300 s and reached only 19 solutions. The regression test now exercises two
+overlapping solutions, verifies one traversal schedules three distinct projects (including the shared project
+only once), and checks the solution globals on each restored project; this synthetic test is not a wall-clock
+benchmark of that large repository. The restore writes `obj/` files (`project.assets.json`,
 `*.nuget.g.props`) into the checkout, which `EvaluationFingerprint` hashes; a different commit is a fresh clone,
 so they never carry over to another commit. The toggle is part of the snapshot identity: `restore=off` is folded
 only when `SEXTANT_SERVICE_PACKAGE_RESTORE=false`, so the default leaves identities unchanged and flipping it
@@ -1645,7 +1655,7 @@ clock):
 
 | Step | May use | What the budget leaves out |
 |---|---|---|
-| Package restore | a fifth of the budget, or `PACKAGE_RESTORE_TIMEOUT_SECONDS` if shorter | packages of the solutions not reached (the existing restore notes) |
+| Package restore | a fifth of the budget, or `PACKAGE_RESTORE_TIMEOUT_SECONDS` if shorter | projects not reached by the union traversal or per-solution fallback (the existing restore notes) |
 | Load (multi-solution union only) | 45% of the time from the restore's end to the extraction deadline | declared projects not opened by then: never loaded, reported as **not loaded** (not as skipped) |
 | Symbols | 40% of the time from the load's end to the extraction deadline | later projects are registered but get **no symbols** |
 | Relationships, references, calls, comments | until 90% of the budget (the extraction deadline) | later projects get **no relationships, references, calls or comments** |

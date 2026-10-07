@@ -72,7 +72,7 @@ public sealed class PackageRestoreWorkerIntegrationTests : IDisposable
             .ProduceAsync(request, identity, scratch, CancellationToken.None);
 
         Assert.AreEqual(SnapshotJobStatus.Partial, result.Status,
-            "exactly bound surviving calls cannot override a failed MSBuild evaluation: " + result.Error);
+            "exactly bound surviving calls cannot override incomplete restore or failed MSBuild evaluation: " + result.Error);
         foreach (var project in new[] { "Abs", "Core", "App" })
         {
             Assert.IsTrue(File.Exists(Path.Combine(_checkout, "src", project, "obj", "project.assets.json")),
@@ -87,6 +87,8 @@ public sealed class PackageRestoreWorkerIntegrationTests : IDisposable
 
         var coverage = new SnapshotCoverageStore(conn).Get(result.SnapshotId!.Value)!;
         Assert.AreEqual(SnapshotCoverageVerdict.Partial, coverage.Verdict, string.Join(" ", coverage.Reasons));
+        Assert.IsTrue(coverage.Reasons.Any(reason =>
+            reason.Contains("package restore was incomplete", StringComparison.Ordinal)));
         Assert.AreEqual(1, coverage.ProjectsDegraded);
         var gap = coverage.EvaluationGaps!.Single();
         Assert.AreEqual("src/App/App.csproj", gap.Project);

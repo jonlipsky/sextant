@@ -10,7 +10,7 @@ namespace Sextant.Indexer;
 /// (<c>.csproj</c>/<c>.vbproj</c>/<c>.fsproj</c>) are returned, so solution folders and unrecognized
 /// entries are ignored. A failed read discards every project, but is distinct from a readable empty solution.
 /// </summary>
-internal static class SolutionProjectEnumerator
+public static class SolutionProjectEnumerator
 {
     internal sealed record Result(bool IsReadable, IReadOnlyList<string> Projects);
 
@@ -29,7 +29,7 @@ internal static class SolutionProjectEnumerator
     /// </summary>
     public static IReadOnlyList<string> Enumerate(string solutionPath) => Read(solutionPath).Projects;
 
-    public static Result Read(string solutionPath)
+    internal static Result Read(string solutionPath)
     {
         try
         {

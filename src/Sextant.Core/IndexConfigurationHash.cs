@@ -66,8 +66,14 @@ public static class IndexConfigurationHash
     /// overload's references and call edges for object creation and explicit constructor initializers,
     /// in addition to type usages. Old snapshots have no such edges and must not be reused as fixed.
     /// </para>
+    /// <para>
+    /// <c>"6"</c> to <c>"7"</c> (issue #246): the service worker restores the selected solutions' deduplicated
+    /// project union in one bounded MSBuild traversal, preserving the final selected-solution globals per
+    /// project. A repository previously left partially restored by repeated per-solution work must be indexed
+    /// again under the new restore policy.
+    /// </para>
     /// </remarks>
-    public const string AnalyzerVersion = "6";
+    public const string AnalyzerVersion = "7";
 
     /// <summary>
     /// Computes the configuration hash for a resolved profile. The canonical pre-image is a fixed,

@@ -264,7 +264,7 @@ public sealed class LocalIndexerSnapshotWorker(
                 // Restore BEFORE the load and while an unsatisfiable SDK pin is still neutralized, so the restore
                 // resolves the same SDK the load will. A failed or partial restore never fails the job.
                 restore = await _packageRestore.RunAsync(
-                        checkoutDir, resolution.SelectedSolutions, plan?.RestoreLimit, token)
+                        checkoutDir, resolution.SelectedSolutions, plan?.RestoreLimit, token, scratchDir)
                     .ConfigureAwait(false);
 
                 // Load the DETERMINISTIC selected solution set into ONE workspace (union of projects,
@@ -314,12 +314,15 @@ public sealed class LocalIndexerSnapshotWorker(
             var inventory = SnapshotCoverageBuilder.Inventory.Scan(checkoutDir);
             var pinOverrides = pins.Where(p => p.OverrideApplied).Select(p => p.ToCoverageOverride()).ToList();
             var coverage = SnapshotCoverageBuilder.Build(checkoutDir, resolution, load, inventory, pinOverrides);
-            coverage = coverage with { Coverage = SnapshotCoverageBuilder.WithNotes(coverage.Coverage, restore.Notes()) };
+            coverage = coverage with { Coverage = SnapshotCoverageBuilder.WithRestoreOutcome(coverage.Coverage, restore) };
+            var providerCoverage = SnapshotCoverageBuilder.BuildProviders(
+                    checkoutDir, resolution, load, inventory, pinOverrides, plan?.Budget)
+                .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
+            AddProviderRestoreGaps(providerCoverage, restore);
             var indexContext = context with
             {
                 Coverage = coverage.Coverage,
-                ProviderCoverage = SnapshotCoverageBuilder.BuildProviders(
-                    checkoutDir, resolution, load, inventory, pinOverrides, plan?.Budget),
+                ProviderCoverage = providerCoverage,
                 ProjectLoadIssues = restore.Projects.Count > 0 ? restore.ProjectLoadIssues() : null,
                 TimeBudget = plan?.ForIndexing(checkoutDir, load.DeferredProjects)
             };
@@ -446,6 +449,29 @@ public sealed class LocalIndexerSnapshotWorker(
             return [];
         var probed = _sdkPinGuard.ListInstalledSdks();
         return probed.Count > 0 ? probed : error?.InstalledSdks ?? [];
+    }
+
+    private static void AddProviderRestoreGaps(
+        IDictionary<string, SnapshotCoverage> providerCoverage, PackageRestoreOutcome restore)
+    {
+        if (restore.Clean)
+            return;
+
+        var unknownGap = restore.TimedOut || restore.SolutionsNotStarted > 0 || restore.SolutionsFailed > 0
+            || restore.ProjectsDropped > 0 || restore.GeneralCodes.Count > 0 || restore.SourceUnreachableGeneral;
+        var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        foreach (var path in providerCoverage.Keys.ToArray())
+        {
+            var prefix = path.Replace('\\', '/').TrimEnd('/') + "/";
+            var hasProjectFailure = restore.Projects.Any(project =>
+                project.Project.Replace('\\', '/').StartsWith(prefix, comparison));
+            if (unknownGap || hasProjectFailure)
+            {
+                providerCoverage[path] = SnapshotCoverageBuilder.WithRestoreFailure(
+                    providerCoverage[path],
+                    "package restore was incomplete for projects in this provider; code binding may be incomplete.");
+            }
+        }
     }
 
     /// <summary>

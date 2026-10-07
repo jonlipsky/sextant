@@ -48,6 +48,9 @@ public sealed record PackageRestoreOutcome
     /// <summary>Solutions the restore was started for.</summary>
     public int SolutionsAttempted { get; init; }
 
+    /// <summary>Solutions selected for this worker's restore.</summary>
+    public int SolutionsSelected { get; init; }
+
     /// <summary>Solutions whose restore exited 0.</summary>
     public int SolutionsSucceeded { get; init; }
 
@@ -62,6 +65,12 @@ public sealed record PackageRestoreOutcome
 
     /// <summary>Wall-clock time the restore step took.</summary>
     public TimeSpan Elapsed { get; init; }
+
+    /// <summary>Distinct projects explicitly restored by a project-union traversal.</summary>
+    public int ProjectsAttempted { get; init; }
+
+    /// <summary>True when one traversal restored a deduplicated project union.</summary>
+    public bool UsedProjectUnion { get; init; }
 
     /// <summary>Per-project failures, ordered by project path.</summary>
     public IReadOnlyList<PackageRestoreProjectIssue> Projects { get; init; } = [];
@@ -84,7 +93,7 @@ public sealed record PackageRestoreOutcome
     /// <summary>True when every attempted restore exited 0 within the bound, or restore is disabled.</summary>
     public bool Clean => !Enabled
         || (!TimedOut && SolutionsNotStarted == 0 && SolutionsSucceeded == SolutionsAttempted
-            && Projects.Count == 0 && GeneralCodes.Count == 0 && !SourceUnreachableGeneral);
+            && Projects.Count == 0 && ProjectsDropped == 0 && GeneralCodes.Count == 0 && !SourceUnreachableGeneral);
 
     /// <summary>
     /// The coverage notes describing what the restore could not do. Each names counts, package ids and codes;
@@ -98,15 +107,20 @@ public sealed record PackageRestoreOutcome
 
         if (SolutionsNotStarted > 0)
         {
-            notes.Add(
-                $"Package restore could not be started for {SolutionsNotStarted} solution(s), so their projects were " +
-                "loaded without restored packages and code that uses packages may not bind.");
+            notes.Add(UsedProjectUnion
+                ? $"The union package restore could not be started, so {ProjectsAttempted} distinct project(s) from " +
+                  $"{SolutionsSelected} selected solution(s) were loaded without restored packages and code that uses packages may not bind."
+                : $"Package restore could not be started for {SolutionsNotStarted} solution(s), so their projects were " +
+                  "loaded without restored packages and code that uses packages may not bind.");
         }
         if (TimedOut)
         {
-            notes.Add(
-                $"Package restore did not finish within {Timeout.TotalSeconds:0}s and was stopped; projects it had " +
-                "not restored were loaded without their packages, so code in them may not bind.");
+            notes.Add(UsedProjectUnion
+                ? $"The union package restore did not finish within {Timeout.TotalSeconds:0}s and was stopped; " +
+                  $"some of its {ProjectsAttempted} distinct project(s) from {SolutionsSelected} selected solution(s) " +
+                  "may have been loaded without restored packages, so code in them may not bind."
+                : $"Package restore did not finish within {Timeout.TotalSeconds:0}s and was stopped; projects it had " +
+                  "not restored were loaded without their packages, so code in them may not bind.");
         }
 
         var missing = Projects.SelectMany(p => p.MissingPackages).Distinct(StringComparer.OrdinalIgnoreCase)
@@ -150,9 +164,11 @@ public sealed record PackageRestoreOutcome
         if (SolutionsFailed > 0 && Projects.Count == 0 && ProjectsDropped == 0 && GeneralCodes.Count == 0
             && !SourceUnreachableGeneral)
         {
-            notes.Add(
-                $"Package restore failed for {SolutionsFailed} solution(s) without a recognized error code; their " +
-                "projects may have been loaded without restored packages, so code in them may not bind.");
+            notes.Add(UsedProjectUnion
+                ? $"The union package restore failed without a recognized error code; its {ProjectsAttempted} distinct " +
+                  $"project(s) from {SolutionsSelected} selected solution(s) may have been loaded without restored packages."
+                : $"Package restore failed for {SolutionsFailed} solution(s) without a recognized error code; their " +
+                  "projects may have been loaded without restored packages, so code in them may not bind.");
         }
         return notes;
     }
