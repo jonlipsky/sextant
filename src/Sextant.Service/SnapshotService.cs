@@ -1419,6 +1419,10 @@ public sealed partial class SnapshotService : IDisposable
                 snapshots.MarkConsumerRepository(consumerId);
             return;
         }
+        if (snapshots.GetRepositoryId(request.RepositoryRemoteUrl) is long selectedRepo
+            && snapshots.PreserveRebuildSelection(snapshots.GetBranchId(selectedRepo, request.BranchName ?? "main"),
+                sid, request.BranchHeadSequence, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()))
+            return;
         if (request.ExpectedHeadCommit is { } expectedHead)
         {
             ApplyHeadCommitGuard(request, sid, expectedHead, snapshots);
@@ -1467,7 +1471,8 @@ public sealed partial class SnapshotService : IDisposable
         var branchId = snapshots.EnsureBranch(repoId, branchName, ownsDefault, now);
         if (ownsDefault)
             snapshots.PromoteSoleDefaultBranch(repoId, branchId);
-        snapshots.AdvanceBranchPointerIfHeadMatches(branchId, sid, expectedHead, now);
+        snapshots.AdvanceBranchPointerIfHeadMatches(branchId, sid, expectedHead, now,
+            preservePrevious: request.RebuildGeneration is not null);
     }
 
     // True when any SVC-6/7 or #84 branch guard is present; such a request re-selects an intact superseded
@@ -1708,9 +1713,14 @@ public sealed partial class SnapshotService : IDisposable
             (requestedUrl, commitSha),
             snapshots.GetRepositoryRemoteUrl(row.RepositoryId) is { } catalogUrl ? (catalogUrl, commitSha) : null
         ];
+        var rebuildGeneration = CoverageOn(conn, row.Id)?.Rebuild?.Generation;
         foreach (var (url, commit) in spellings.OfType<(string Url, string Commit)>().Distinct())
         {
-            var hash = IdentityHashFor(new EnsureSnapshotRequest { RepositoryRemoteUrl = url, CommitSha = commit });
+            var hash = IdentityHashFor(new EnsureSnapshotRequest
+            {
+                RepositoryRemoteUrl = url, CommitSha = commit,
+                RebuildGeneration = rebuildGeneration
+            });
             if (string.Equals(hash, row.IdentityHash, StringComparison.Ordinal))
                 return hash;
         }
@@ -2227,7 +2237,8 @@ public sealed partial class SnapshotService : IDisposable
             MapOutcome(result.Status),
             actor: principal.Actor,
             repositoryScope: request.RepositoryRemoteUrl,
-            detail: principal.Detail($"job_{result.JobId}{SdkPinAuditSuffix(jobs.GetDiagnostics(result.JobId))}{ForcedAuditSuffix(request)}"),
+            detail: principal.Detail($"job_{result.JobId}{SdkPinAuditSuffix(jobs.GetDiagnostics(result.JobId))}{ForcedAuditSuffix(request)}"
+                + (request.RebuildGeneration is { } generation ? $";rebuild={generation};identity={result.IdentityHash}" : "")),
             costIndexMs: costMs);
     }
 

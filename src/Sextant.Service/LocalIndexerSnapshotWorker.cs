@@ -906,6 +906,7 @@ public sealed class LocalIndexerSnapshotWorker(
         // ValidateWorkerResult fails the job closed (published identity != requested identity).
         SdkPinPolicy = sdkPinPolicy,
         // Same contract for the package-restore toggle (ServiceOptions.RestoreIdentityComponent).
-        RestorePolicy = restorePolicy
+        RestorePolicy = restorePolicy,
+        RebuildGeneration = request.RebuildGeneration
     };
 }

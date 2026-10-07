@@ -109,6 +109,51 @@ public class OrchestratorProviderCoverageTests
     }
 
     [TestMethod]
+    public async Task ExplicitGeneration_RebuildsProviderWithoutMutatingTheOldParentOrProvider()
+    {
+        await Index("c1", new Dictionary<string, SnapshotCoverage> { [SubmodulePath] = ProviderPartial });
+        var conn = _db.GetConnection();
+        var snapshots = new SnapshotStore(conn);
+        var coverage = new SnapshotCoverageStore(conn);
+        var oldParentId = ParentSnapshotId("c1");
+        var oldProviderId = ProviderSnapshotId()!.Value;
+        var oldProvider = snapshots.GetById(oldProviderId)!;
+        var oldProjects = snapshots.GetSnapshotProjectIds(oldProviderId).ToArray();
+        var newIdentity = new SnapshotIdentity
+        {
+            RepositoryRemoteUrl = ProviderRemote, CommitSha = ProviderCommit,
+            SchemaVersion = oldProvider.SchemaVersion, AnalyzerVersion = oldProvider.AnalyzerVersion,
+            ConfigHash = oldProvider.ConfigHash, ToolchainFingerprint = oldProvider.ToolchainFingerprint!,
+            RebuildGeneration = "restore-fixed"
+        };
+
+        await Index("c1", new Dictionary<string, SnapshotCoverage> { [SubmodulePath] = ProviderComplete },
+            rebuildGeneration: "restore-fixed");
+
+        var rebuiltProvider = snapshots.GetByIdentityHash(newIdentity.Hash)!;
+        Assert.IsNotNull(rebuiltProvider);
+        Assert.AreNotEqual(oldProviderId, rebuiltProvider.Id);
+        Assert.AreEqual(SnapshotStatus.Complete, rebuiltProvider.Status);
+        Assert.AreEqual(SnapshotCoverageVerdict.Complete, coverage.Get(rebuiltProvider.Id)!.Verdict);
+        Assert.AreEqual(oldProvider.IdentityHash, coverage.Get(rebuiltProvider.Id)!.Rebuild!.OriginalIdentityHash);
+        Assert.AreEqual("restore-fixed", coverage.Get(rebuiltProvider.Id)!.Rebuild!.Generation);
+        Assert.AreEqual(oldProvider, snapshots.GetById(oldProviderId), "the old provider catalog row is untouched");
+        CollectionAssert.AreEqual(oldProjects, snapshots.GetSnapshotProjectIds(oldProviderId).ToArray());
+        Assert.AreEqual(SnapshotCoverageVerdict.Partial, coverage.Get(oldProviderId)!.Verdict);
+        Assert.IsNull(coverage.Get(oldProviderId)!.Rebuild);
+        Assert.AreEqual(SnapshotStatus.Complete, snapshots.GetById(oldParentId)!.Status);
+        Assert.IsNull(coverage.Get(oldParentId)!.Rebuild);
+        var newParent = snapshots.GetSelectedSnapshotIdForRepositoryBranch("https://github.com/org/parent", "main")!.Value;
+        Assert.AreNotEqual(oldParentId, newParent);
+        Assert.AreEqual(snapshots.GetById(oldParentId)!.IdentityHash, coverage.Get(newParent)!.Rebuild!.OriginalIdentityHash);
+
+        await Index("c1", new Dictionary<string, SnapshotCoverage> { [SubmodulePath] = ProviderPartial },
+            rebuildGeneration: "restore-fixed");
+        Assert.AreEqual(SnapshotCoverageVerdict.Complete, coverage.Get(rebuiltProvider.Id)!.Verdict,
+            "repeating the token never backfills or rewrites the newly published provider");
+    }
+
+    [TestMethod]
     public async Task ReusedCompleteProvider_KeepsItsRow_NoBackfillNoRewrite()
     {
         await Index("c1", providerCoverage: new Dictionary<string, SnapshotCoverage> { [SubmodulePath] = ProviderPartial });
@@ -194,7 +239,7 @@ public class OrchestratorProviderCoverageTests
     // ---- helpers --------------------------------------------------------------------------------
 
     private Task Index(string parentCommit, IReadOnlyDictionary<string, SnapshotCoverage>? providerCoverage,
-        bool extraProviderProject = false)
+        bool extraProviderProject = false, string? rebuildGeneration = null)
     {
         var orchestrator = new IndexOrchestrator(_db, useDocumentExtractor: true)
         {
@@ -208,6 +253,8 @@ public class OrchestratorProviderCoverageTests
             RepositoryRemoteUrl = "https://github.com/org/parent",
             CommitSha = parentCommit,
             BranchName = "main",
+            RebuildGeneration = rebuildGeneration,
+            ExpectedHeadCommit = rebuildGeneration is null ? null : parentCommit,
             Coverage = new SnapshotCoverage { Verdict = SnapshotCoverageVerdict.Partial, Reasons = ["parent gap"] },
             ProviderCoverage = providerCoverage
         };

@@ -19,7 +19,7 @@ namespace Sextant.Core;
 ///   (<see cref="Core.ToolchainFingerprint.Current"/>).</item>
 ///   <item>Optional components folded only when set: the working-tree delta + overlay discriminator,
 ///   the <see cref="CapabilityFingerprint"/>, the non-default <see cref="SdkPinPolicy"/>, and the non-default
-///   <see cref="RestorePolicy"/>.</item>
+///   <see cref="RestorePolicy"/> and an operator-selected <see cref="RebuildGeneration"/>.</item>
 /// </list>
 /// Two runs with the same tuple produce the same <see cref="Hash"/>, so a duplicate publish attaches
 /// to the existing snapshot instead of creating a second one (acceptance criterion 3). A difference in
@@ -96,6 +96,12 @@ public sealed record SnapshotIdentity
     public string? RestorePolicy { get; init; }
 
     /// <summary>
+    /// Operator-selected rebuild generation. Null preserves existing identities; a fresh token creates
+    /// a separate immutable snapshot of the same commit. Reusing a token is idempotent.
+    /// </summary>
+    public string? RebuildGeneration { get; init; }
+
+    /// <summary>
     /// The stable idempotency/compatibility hash over the identity tuple. Deterministic across
     /// machines and runs: a fixed, ordered <c>key=value;</c> pre-image hashed with SHA-256 (hex).
     /// </summary>
@@ -122,6 +128,8 @@ public sealed record SnapshotIdentity
             // Fold the restore policy ONLY when set: the default service and every local run leave it null.
             if (RestorePolicy != null)
                 canonical += $";restore={RestorePolicy}";
+            if (RebuildGeneration != null)
+                canonical += $";rebuild={RebuildGeneration}";
             var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(canonical));
             return Convert.ToHexStringLower(bytes);
         }
