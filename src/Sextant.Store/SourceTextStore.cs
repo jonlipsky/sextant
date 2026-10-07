@@ -139,7 +139,12 @@ public sealed class SourceTextStore
     /// Returns the number of blobs deleted.
     /// </summary>
     public int DeleteUnreferenced(IReadOnlySet<UInt128> referencedKeys, int maxDeletes)
+        => DeleteUnreferenced(referencedKeys, maxDeletes, () => false, out _);
+
+    public int DeleteUnreferenced(IReadOnlySet<UInt128> referencedKeys, int maxDeletes,
+        Func<bool> shouldStop, out bool moreRemaining)
     {
+        moreRemaining = false;
         if (!Directory.Exists(Root))
             return 0;
 
@@ -151,6 +156,8 @@ public sealed class SourceTextStore
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
+            _log?.Invoke($"Source text sweep could not enumerate: {ex.Message}");
+            moreRemaining = true;
             return 0;
         }
 
@@ -158,13 +165,20 @@ public sealed class SourceTextStore
         {
             foreach (var path in files)
             {
-                if (deleted >= maxDeletes)
+                if (deleted >= maxDeletes || shouldStop())
+                {
+                    moreRemaining = true;
                     break;
+                }
 
                 var name = Path.GetFileName(path);
                 if (name.EndsWith(TempExtension, StringComparison.Ordinal))
                 {
-                    TryDelete(path);
+                    if (!TryDelete(path))
+                    {
+                        moreRemaining = true;
+                        _log?.Invoke("Source text sweep could not delete a temporary blob.");
+                    }
                     continue;
                 }
 
@@ -174,11 +188,17 @@ public sealed class SourceTextStore
                     continue;
                 if (TryDelete(path))
                     deleted++;
+                else
+                {
+                    moreRemaining = true;
+                    _log?.Invoke("Source text sweep could not delete an unreferenced blob.");
+                }
             }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             _log?.Invoke($"Source text sweep stopped early: {ex.Message}");
+            moreRemaining = true;
         }
         return deleted;
     }

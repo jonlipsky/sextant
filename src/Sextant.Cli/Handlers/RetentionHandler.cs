@@ -1,3 +1,4 @@
+using Microsoft.Data.Sqlite;
 using Sextant.Core;
 using Sextant.Store;
 
@@ -17,10 +18,25 @@ internal static class RetentionHandler
             return 1;
         }
 
+        if (!execute)
+        {
+            using var reader = new SqliteConnection(new SqliteConnectionStringBuilder
+                { DataSource = dbPath, Mode = SqliteOpenMode.ReadOnly }.ToString());
+            reader.Open();
+            using var schema = reader.CreateCommand();
+            schema.CommandText = "SELECT MAX(version) FROM schema_version;";
+            if (Convert.ToInt32(schema.ExecuteScalar()) != IndexDatabase.LatestSchemaVersion)
+            {
+                Console.Error.WriteLine("Retention requires a current-schema catalog. Upgrade with the writer stopped before retrying.");
+                return 1;
+            }
+            PrintReport(dbPath, new RetentionService(reader, config.Retention).Plan());
+            return 0;
+        }
+
         using var indexDb = new Store.IndexDatabase(dbPath, Store.IndexWriteOptions.FromConfiguration(config));
 
-        // #38: retention is a WRITER. Take the single-writer lease before touching the database so a
-        // dry-run or --execute can never race a live daemon/service writer. Migrate WITHOUT recovery
+        // #38: executed retention is a WRITER. Migrate WITHOUT recovery
         // first (the writer_lease table must exist to acquire), then acquire, then recover — recovery
         // must not run while another writer owns a staging generation.
         indexDb.RunMigrations(recover: false);
@@ -39,9 +55,13 @@ internal static class RetentionHandler
 
         var conn = indexDb.GetConnection();
         var service = new RetentionService(conn, config.Retention);
-        var report = execute ? service.Execute() : service.Plan();
+        PrintReport(dbPath, service.Execute());
+        return 0;
+    }
 
-        Console.WriteLine(execute ? "Retention (executed):" : "Retention (dry-run):");
+    private static void PrintReport(string dbPath, RetentionReport report)
+    {
+        Console.WriteLine(report.DryRun ? "Retention (dry-run):" : "Retention (executed):");
         Console.WriteLine($"  Database: {Path.GetFullPath(dbPath)}");
         Console.WriteLine();
 
@@ -62,15 +82,15 @@ internal static class RetentionHandler
         Console.WriteLine($"  Snapshot project-versions GC'd:{report.SnapshotProjectVersionsDeleted}");
         Console.WriteLine($"  API-surface snapshots deleted: {report.ApiSnapshotsDeleted}");
         Console.WriteLine($"  Source blobs deleted:          {report.FileVersionsDeleted}");
-        Console.WriteLine($"  Reclaimed:                     {FormatBytes(report.ReclaimedBytes)}");
+        Console.WriteLine($"  Reusable pages:                {(report.ReclaimedBytesKnown ? FormatBytes(report.ReclaimedBytes) : "not estimated (read-only plan)")}");
+        Console.WriteLine($"  More remaining:                {report.MoreRemaining}");
+        if (report.StopReason != null) Console.WriteLine($"  Stopped:                       {report.StopReason}");
 
-        if (!execute)
+        if (report.DryRun)
         {
             Console.WriteLine();
             Console.WriteLine("  Dry-run only — re-run with --execute to apply.");
         }
-
-        return 0;
     }
 
     private static string ProfileSuffix(RetentionGeneration g)

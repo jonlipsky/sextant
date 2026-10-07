@@ -1867,55 +1867,67 @@ public sealed partial class SnapshotService : IDisposable
     }
 
     /// <summary>
-    /// Runs the service-owned retention/GC pass under the single-writer lease (issues #46/#37/#54/#38): it
-    /// GCs orphaned snapshot DATA, bounds the source-blob prune, and honors a protected set that spans every
-    /// retained consumer's providers. The service is the natural lease owner, so this can never race a live
-    /// writer.
+    /// Plans on an independent reader, or executes bounded, revalidated batches under the writer lease.
     /// </summary>
     public RetentionReport RunRetention(bool execute, AuditCaller principal = default)
-    {
-        using var activity = ServiceTelemetry.Source.StartActivity("retention");
-        activity?.SetTag("sextant.execute", execute);
-        return WithWrite(() => RunRetentionLocked(execute, principal));
-    }
+        => RunRetentionAsync(execute, principal, _lifetime.Token).GetAwaiter().GetResult();
 
     /// <summary>
-    /// <see cref="RunRetention"/> for request threads (issue #148): waits for the writer asynchronously —
-    /// never blocking a thread-pool thread behind a running index — and gives up when
-    /// <paramref name="cancellationToken"/> fires before the writer is acquired.
+    /// An executed pass counts writer-queue wait against its budget and releases the gate between batches.
+    /// Cancellation interrupts the current batch; previously committed batches stay applied.
     /// </summary>
     public async Task<RetentionReport> RunRetentionAsync(
         bool execute, AuditCaller principal = default, CancellationToken cancellationToken = default)
     {
         using var activity = ServiceTelemetry.Source.StartActivity("retention");
         activity?.SetTag("sextant.execute", execute);
-        return await WithWriteAsync(
-            () => Task.FromResult(RunRetentionLocked(execute, principal)), cancellationToken).ConfigureAwait(false);
-    }
-
-    // Bounds one retention pass's source-text deletes (the sweep stops walking there), so a large backlog is reclaimed
-    // over several passes instead of holding the writer for one long one.
-    private const int MaxSourceTextDeletesPerPass = 100_000;
-
-    private RetentionReport RunRetentionLocked(bool execute, AuditCaller principal)
-    {
-        var retention = new RetentionService(_conn, _options.Retention);
-        var report = execute ? retention.Execute() : retention.Plan();
-        // Issue #244: once the catalog GC has run, drop the stored source text no file version references any more.
-        // This runs under the write gate, which a production holds for its whole run, so no blob stored ahead of its
-        // file_versions row is mistaken for an orphan.
-        if (execute)
-            report = report with
+        using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetime.Token);
+        if (!execute)
+        {
+            // No writer admission, lease acquisition, audit write, or speculative delete.
+            using var reader = OpenReadConnection();
+            return new RetentionService(reader, _options.Retention).Plan(lifetime.Token);
+        }
+        using var pass = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+        pass.CancelAfter(RetentionService.PassTimeLimit);
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        var report = new RetentionReport { DryRun = false };
+        try
+        {
+            do
             {
-                SourceTextsDeleted = SourceTexts.DeleteUnreferenced(
-                    new FileStore(_conn).ReferencedSourceTextKeys(), MaxSourceTextDeletesPerPass)
-            };
-        // Service-wide audit row (no single repository scope). Records the operator + whether it was a
-        // dry-run plan or an executed GC pass (criterion 5, audit).
-        new AuditLogStore(_conn).Append(
-            AuditAction.Retention, AuditOutcome.Complete,
-            actor: principal.Actor,
-            detail: principal.Detail(execute ? "execute" : "plan"));
+                var batch = await WithWriteAsync(() =>
+                {
+                    pass.Token.ThrowIfCancellationRequested();
+                    var remaining = RetentionService.PassTimeLimit - System.Diagnostics.Stopwatch.GetElapsedTime(started);
+                    var limit = remaining < RetentionService.BatchTimeLimit ? remaining : RetentionService.BatchTimeLimit;
+                    return Task.FromResult(new RetentionService(_conn, _options.Retention).ExecuteBatch(pass.Token, limit, () =>
+                    {
+                        EnsureLeaseHeld();
+                        new AuditLogStore(_conn).Append(AuditAction.Retention, AuditOutcome.Complete,
+                            actor: principal.Actor, detail: principal.Detail("execute_batch"));
+                    }));
+                }, pass.Token).ConfigureAwait(false);
+                report = RetentionService.Combine(report, batch);
+                if (batch.StopReason != null) return report;
+                // WithWriteAsync releases the gate before the next admission; already-queued publishes go first.
+            } while (report.MoreRemaining);
+
+            var sweep = await WithWriteAsync(() =>
+            {
+                pass.Token.ThrowIfCancellationRequested();
+                var remaining = RetentionService.PassTimeLimit - System.Diagnostics.Stopwatch.GetElapsedTime(started);
+                var limit = remaining < RetentionService.BatchTimeLimit ? remaining : RetentionService.BatchTimeLimit;
+                return Task.FromResult(new RetentionService(_conn, _options.Retention)
+                    .SweepSourceTexts(SourceTexts, pass.Token, limit));
+            }, pass.Token).ConfigureAwait(false);
+            report = report with { SourceTextsDeleted = sweep.SourceTextsDeleted,
+                MoreRemaining = sweep.MoreRemaining, StopReason = sweep.StopReason };
+        }
+        catch (OperationCanceledException) when (!lifetime.IsCancellationRequested && pass.IsCancellationRequested)
+        {
+            return report with { MoreRemaining = true, StopReason = "time_budget" };
+        }
         return report;
     }
 
