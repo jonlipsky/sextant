@@ -379,13 +379,20 @@ public class RepositorySelectionTests
     }
 
     [TestMethod]
-    public void ProbeRepositories_ASymbolProbe_ReadsOnlyTheProbedRepository()
+    [DataRow(false)]
+    [DataRow(true)]
+    public void ProbeRepositories_ASymbolProbe_ReadsOnlyTheProbedRepository(bool fuzzy)
     {
         var deniedId = new SnapshotStore(_db.GetConnection()).GetRepositoryId(RepoB)!.Value;
         using var both = new DatabaseProvider(_dbPath, new AllowingEnforcingAuthorizer());
         using var onlyA = new DatabaseProvider(_dbPath, new DenyingRepositoryAuthorizer(deniedId));
         var probe = RepositoryInference.ProbeFor("find_symbol",
-            new Dictionary<string, JsonElement> { ["name"] = JsonDocument.Parse("\"Shared.T\"").RootElement })!;
+            new Dictionary<string, JsonElement>
+            {
+                ["name"] = JsonDocument.Parse(fuzzy ? "\"T\"" : "\"Shared.T\"").RootElement,
+                ["fuzzy"] = JsonDocument.Parse(fuzzy ? "true" : "false").RootElement
+            });
+        Assert.IsNotNull(probe);
 
         CollectionAssert.AreEqual(new[] { RepoA, RepoB },
             RepositoryInference.Holders(both.ProbeRepositories([RepoA, RepoB], probe)).ToArray());
@@ -404,7 +411,9 @@ public class RepositorySelectionTests
     }
 
     [TestMethod]
-    [DataRow("find_symbol", """{"name":"Shared.T","fuzzy":true}""")]
+    [DataRow("find_symbol", """{"name":"Shared.T","fuzzy":true,"project_id":"logical_A"}""")]
+    [DataRow("find_symbol", """{"name":"Shared.T","fuzzy":true,"scope":"file:src/P/T.cs"}""")]
+    [DataRow("find_symbol", """{"name":"Shared.T","fuzzy":true,"kind":"nonsense"}""")]
     [DataRow("find_symbol", """{"name":"Shared.T","project_id":"logical_A"}""")]
     [DataRow("find_symbol", """{"name":"Shared.T","scope":"file:src/P/T.cs"}""")]
     [DataRow("find_symbol", """{"name":"Shared.T","kind":"nonsense"}""")]

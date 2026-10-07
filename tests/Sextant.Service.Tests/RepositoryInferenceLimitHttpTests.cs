@@ -51,11 +51,13 @@ public class RepositoryInferenceLimitHttpTests
     }
 
     [TestMethod]
-    public async Task TwentyFiveReadableRepositories_AreEachProbedOnce_AndTheHolderIsInferred()
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task TwentyFiveReadableRepositories_AreEachProbedOnce_AndTheHolderIsInferred(bool fuzzy)
     {
         var before = _host.InferenceProbes();
 
-        var call = await CallAsync(AtTheLimit);
+        var call = await CallAsync(AtTheLimit, fuzzy);
 
         Assert.IsFalse(call.IsError, call.Body.ToString());
         var snapshot = call.Body.GetProperty("meta").GetProperty("snapshot");
@@ -65,12 +67,14 @@ public class RepositoryInferenceLimitHttpTests
     }
 
     [TestMethod]
-    public async Task TwentySixReadableRepositories_AreNeverProbed_AndTheCallIsTheOrdinaryRepositoryRequired()
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task TwentySixReadableRepositories_AreNeverProbed_AndTheCallIsTheOrdinaryRepositoryRequired(bool fuzzy)
     {
         var before = _host.InferenceProbes();
 
-        var call = await CallAsync(PastTheLimit);
-        var again = await CallAsync(PastTheLimit);
+        var call = await CallAsync(PastTheLimit, fuzzy);
+        var again = await CallAsync(PastTheLimit, fuzzy);
 
         Assert.AreEqual(0, _host.InferenceProbes() - before, "a caller past the limit is never probed");
         Assert.IsTrue(call.IsError, call.Body.ToString());
@@ -88,8 +92,9 @@ public class RepositoryInferenceLimitHttpTests
 
     private static string Url(int repository) => $"https://github.com/acme/repo-{repository:D2}";
 
-    private static Task<ToolCall> CallAsync(string sub) =>
-        _host.CallAsync("find_symbol", Arguments, DelegateToken, _host.UserAssertion(sub: sub));
+    private static Task<ToolCall> CallAsync(string sub, bool fuzzy) =>
+        _host.CallAsync("find_symbol", fuzzy ? """{"name":"Targ*","fuzzy":true}""" : Arguments,
+            DelegateToken, _host.UserAssertion(sub: sub));
 
     private static async Task GrantAsync(string sub, string repository)
     {

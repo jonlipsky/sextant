@@ -103,7 +103,7 @@ Cross-project usages have `target_symbol_id` in the dependency project and `in_p
 | `file_version_id` | `INTEGER NOT NULL` | FK to `file_versions.id` `ON DELETE CASCADE` (the usage location) |
 | `line` | `INTEGER NOT NULL` | 1-based line |
 | `col` | `INTEGER NOT NULL DEFAULT 0` | Disambiguates two usages on one line |
-| `kind` | `INTEGER NOT NULL` | `ReferenceKind` ordinal: `invocation`=0, `type_ref`=1, `attribute`=2, `inheritance`=3, `override`=4, `object_creation`=5. The document extractor folds `override` into the real occurrence kind (so it does not emit `override`); object-creation/attribute occurrences target the constructed type. |
+| `kind` | `INTEGER NOT NULL` | `ReferenceKind` ordinal: `invocation`=0, `type_ref`=1, `attribute`=2, `inheritance`=3, `override`=4, `object_creation`=5. The document extractor folds `override` into the real occurrence kind (so it does not emit `override`); object creations target both the type and its bound source-declared constructor overload, explicit constructor initializers target the overload as `invocation`, and attributes target the constructed type. |
 | `flags` | `INTEGER NOT NULL DEFAULT 0` | Bit-packed. Bits 0–1 = access kind: 0 none, 1 read, 2 write, 3 read/write. Bit 2 (`0b100`) = candidate: the site did not bind exactly and the target is one of the compiler's candidate symbols. |
 | `last_indexed_at` | `INTEGER NOT NULL DEFAULT 0` | Unix epoch ms |
 

@@ -31,6 +31,21 @@ public class UserEnsureBoundsHttpTests
     // ==== user bounds ==============================================================================
 
     [TestMethod]
+    public async Task UserEnsure_Rebuild_IsForbiddenAndAuditedBeforeAnyJob()
+    {
+        await using var host = await Harness.StartAsync(seed: Seed);
+        await GrantAsync(host, Widgets);
+        using var response = await host.ControlAsync(HttpMethod.Post, Ensure, ControlToken, host.UserAssertion(),
+            EnsureOf(Widgets, "commit-w1",
+                """{"branch_name":"main","expected_head_commit":"commit-w1","rebuild_generation":"operator-1"}"""));
+        await AssertRejectedAsync(response, HttpStatusCode.Forbidden, "rebuild_not_allowed");
+        Assert.AreEqual(0L, host.JobRows());
+        Assert.AreEqual(0, host.Worker.Calls);
+        Assert.AreEqual("rebuild_not_allowed" + Suffix,
+            host.Service.RecentAudit(action: AuditAction.Ensure).Single().Detail);
+    }
+
+    [TestMethod]
     [DataRow("""{"branch_name":"feature","default_branch":true,"expected_head_commit":""}""", BranchGuardReason.DefaultBranchNotAllowed)]
     [DataRow("""{"branch_name":"feature","default_branch":true,"branch_update":"none"}""", BranchGuardReason.DefaultBranchNotAllowed)]
     [DataRow("""{"default_branch":true}""", BranchGuardReason.DefaultBranchNotAllowed)]
@@ -194,6 +209,43 @@ public class UserEnsureBoundsHttpTests
     }
 
     // ==== application and assertion-less callers are unchanged =====================================
+
+    [TestMethod]
+    [DataRow(true)]
+    [DataRow(false)]
+    public async Task OperatorOrApplication_Rebuild_IsAdmittedAndAudited(bool application)
+    {
+        await using var host = await Harness.StartAsync(seed: Seed);
+        var assertion = application ? host.Sign(CallerAssertionSigner.ApplicationClaims(DateTimeOffset.UtcNow)) : null;
+        var result = await EnsureOkAsync(host, assertion, Widgets, "commit-w2",
+            """{"branch_update":"none","rebuild_generation":"operator-1"}""");
+        Assert.AreEqual(1, host.Worker.Calls);
+        Assert.AreNotEqual(ServiceTestFixtures.Request(repo: Widgets, commit: "commit-w2").ToIdentity().Hash,
+            result.GetProperty("identity_hash").GetString());
+        var repeated = await EnsureOkAsync(host, assertion, Widgets, "commit-w2",
+            """{"branch_update":"none","rebuild_generation":"operator-1"}""");
+        Assert.AreEqual(result.GetProperty("job_id").GetInt64(), repeated.GetProperty("job_id").GetInt64());
+        Assert.AreEqual(1, host.Worker.Calls);
+        Assert.IsTrue(host.Service.RecentAudit(action: AuditAction.Ensure)
+            .All(a => a.Detail!.Contains(";rebuild=operator-1;identity=")));
+    }
+
+    [TestMethod]
+    [DataRow("""{"branch_update":"none","rebuild_generation":""}""", "invalid_rebuild_generation")]
+    [DataRow("""{"branch_name":"main","rebuild_generation":"g1"}""", "rebuild_head_guard_required")]
+    [DataRow("""{"branch_name":"main","rebuild_generation":"g1","expected_head_commit":"older"}""", "rebuild_head_guard_required")]
+    [DataRow("""{"branch_name":"main","rebuild_generation":"g1","commit_sha":null,"expected_head_commit":null}""", "rebuild_head_guard_required")]
+    [DataRow("""{"branch_name":"main","rebuild_generation":"g1","commit_sha":" ","expected_head_commit":" "}""", "rebuild_head_guard_required")]
+    public async Task Operator_MalformedRebuild_IsRejectedBeforeAnyJob(string fields, string reason)
+    {
+        await using var host = await Harness.StartAsync(seed: Seed);
+        using var response = await host.ControlAsync(HttpMethod.Post, Ensure, ControlToken, null,
+            EnsureOf(Widgets, "commit-w2", fields));
+        await AssertRejectedAsync(response, HttpStatusCode.BadRequest, reason);
+        Assert.AreEqual(0L, host.JobRows());
+        Assert.AreEqual(0, host.Worker.Calls);
+        Assert.AreEqual(reason, host.Service.RecentAudit(action: AuditAction.Ensure).Single().Detail);
+    }
 
     [TestMethod]
     public async Task ApplicationEnsure_KeepsFullBranchControl()

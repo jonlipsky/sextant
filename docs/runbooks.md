@@ -36,8 +36,8 @@ are configurable through `AlertThresholds.CompletenessRateWarn`, `CompletenessRa
 `jobs` counts/rates are retained for compatibility; neither alerting nor pilot readiness substitutes its
 empty-history `1.0` rate for the recent window. Inspect
 `/control/status/{jobId}` and `/control/resolve` for `coverage.reasons`, then check the repository's
-`solutions` configuration and project-load/submodule diagnostics. With too few terminal jobs the rate
-is not assessed; the no-sample exported value of 1.0 is not proof of healthy coverage. This signal uses
+`solutions` configuration and project-load/submodule diagnostics. With too few recent terminal jobs the rate
+is not assessed; the cumulative no-sample exported value of 1.0 is not proof of healthy coverage. This signal uses
 recorded job outcomes, not a new coverage audit of legacy snapshots.
 
 ---
@@ -104,12 +104,37 @@ The standalone service runs its own retention/GC under the writer lease via `POS
 
 **Action.**
 1. Dry-run first — `sextant retention` reports the protected, retained, and deletable generations, API
-   history, and source blobs with reclaimable bytes, and changes nothing.
+   history, and currently orphaned source blobs with read-only SELECTs, and changes nothing. It needs
+   a current-schema catalog but takes no writer lease and performs no migration/recovery.
 2. Apply with `sextant retention --execute`.
 
 Retention honors the repo [`retention` policy](configuration.md#retention) (`keep_complete_generations`,
 `api_snapshot_keep_commits`, `prune_superseded_source_blobs`) and never deletes data referenced by a
 protected/default branch, an open pull request, a submodule pin, or an active overlay base.
+
+The service endpoint has the same [bounded retention contract](service.md#bounded-retention-contract-127--252):
+planning uses an independent reader and never queues behind indexing; execution yields the service writer
+between freshly revalidated batches. Each pass has a 10-second work budget (including gate wait), a
+2-second SQLite batch deadline, and a one-second lock retry limit. Inspect `more_remaining` and
+`stop_reason` (`time_budget`/`sqlite_busy`) before requesting a subsequent pass. Caller cancellation stops
+remaining work; already-committed batches stay applied. A large project cascade that cannot meet the
+deadline is rolled back and deferred, so repeated budget stops need investigation, not an unbounded retry
+loop. Local executed retention still requires exclusive writer-lease ownership; it must not run alongside
+the daemon/service.
+
+Plans report `reclaimed_bytes_known: false`: a read-only plan cannot simulate cascade freelist deltas.
+Execution measures **reusable pages**, not disk shrinkage. Retention no longer runs full `VACUUM` or a
+blocking `wal_checkpoint(TRUNCATE)`; normal automatic WAL checkpoints remain configured on the writer.
+Full compaction is a separate **offline**, explicitly approved maintenance operation requiring enough
+temporary disk space for a database rewrite. No incremental-auto-vacuum migration is introduced.
+
+Snapshots with a legacy abandoned/NULL retry-generation pointer are deliberately retained until their
+ownership can be established; this release neither migrates nor repairs them. All branch heads, pending
+retries, open PR roots, and required providers/bases remain protected.
+
+**Scheduling is deferred.** The API supports one bounded pass per future approved daily invocation, but
+this change adds no timer, workflow, production settings, or deletion approval. Validate the report and
+bounded behavior on a representative non-production catalog before approving any production schedule.
 
 ---
 

@@ -34,7 +34,7 @@ public static class RepositoryInference
     /// <summary>
     /// The probe for one call of <paramref name="tool"/> with <paramref name="arguments"/>, or null when the call cannot
     /// be inferred: another tool, a missing or blank argument, an absolute path, an unknown <c>kind</c>, or a
-    /// <c>find_symbol</c> narrowed by <c>project_id</c>, a <c>scope</c> other than <c>all</c>, or <c>fuzzy</c>.
+    /// <c>find_symbol</c> narrowed by <c>project_id</c> or a <c>scope</c> other than <c>all</c>.
     /// The probe returns <see cref="ExactRank"/> or <see cref="TrailingNameRank"/> for a repository that holds the
     /// argument (resolves it, possibly ambiguously), or null for one that does not.
     /// </summary>
@@ -49,10 +49,20 @@ public static class RepositoryInference
             case "get_file_symbols":
                 return PathPresenter.IsAbsolute(value) ? null : (db, context) => FileRank(db, context, value);
             case "find_symbol":
-                if (Text(arguments, "project_id") is not null || Flag(arguments, "fuzzy")
+                if (Text(arguments, "project_id") is not null
                     || Text(arguments, "scope") is { } scope && scope != "all"
                     || !SymbolKindNames.TryParse(Text(arguments, "kind"), out var kinds, out var description, out _))
                     return null;
+                if (Flag(arguments, "fuzzy"))
+                {
+                    var maxResults = Sextant.Core.SextantConfiguration.FromEnvironment().FtsMaxResults;
+                    return (db, context) =>
+                    {
+                        using var conn = db.OpenReadConnection();
+                        var symbols = new SymbolStore(conn) { Scope = context.Scope };
+                        return FindSymbolTool.SearchFuzzy(symbols, value, maxResults, kinds).Count > 0 ? ExactRank : null;
+                    };
+                }
                 var options = new SymbolLookupOptions { Kinds = kinds, KindsExplicit = kinds != null, KindDescription = description };
                 return (db, context) => SymbolRank(db, context, value, options);
             case "get_call_hierarchy":

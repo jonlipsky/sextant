@@ -241,9 +241,8 @@ public static class DocumentSemanticExtractor
                     break;
 
                 case ObjectCreationExpressionSyntax objectCreation:
-                    // The explicit type name is a SimpleName handled by EmitReference (classified
-                    // ObjectCreation); here we only add the Instantiates relationship.
                     EmitInstantiation(objectCreation, model, sink, resolveTargetProject);
+                    EmitConstructorUsage(objectCreation, model, filePath, text, sink, resolveTargetProject);
                     break;
 
                 case ImplicitObjectCreationExpressionSyntax implicitCreation:
@@ -251,6 +250,11 @@ public static class DocumentSemanticExtractor
                     // reference and the Instantiates relationship from the creation node itself.
                     EmitInstantiation(implicitCreation, model, sink, resolveTargetProject);
                     EmitImplicitCreationReference(implicitCreation, model, filePath, text, sink, resolveTargetProject);
+                    EmitConstructorUsage(implicitCreation, model, filePath, text, sink, resolveTargetProject);
+                    break;
+
+                case ConstructorInitializerSyntax initializer:
+                    EmitConstructorUsage(initializer, model, filePath, text, sink, resolveTargetProject);
                     break;
             }
         }
@@ -315,11 +319,8 @@ public static class DocumentSemanticExtractor
             return;
         }
 
-        // An attribute name (and any bare constructor reference) binds to the constructor, not the
-        // type. Retarget to the constructed type so type-usage/impact queries see the type as
-        // referenced. The specific constructor overload is intentionally not a stored reference
-        // target here — a documented difference from the legacy declaration-driven extractor, which
-        // recorded both the type-level and constructor-level occurrence.
+        // Keep type usages independently of the overload-specific constructor occurrences emitted
+        // from creation/initializer syntax, so type-impact queries retain their existing targets.
         var target = Canonicalize(ConstructedTypeOrSelf(symbol));
         if (!IsStoredTarget(target))
             return;
@@ -514,6 +515,45 @@ public static class DocumentSemanticExtractor
                 return null;
         }
         return only;
+    }
+
+    private static void EmitConstructorUsage(
+        SyntaxNode node, SemanticModel model, string filePath, SourceText text, DocumentContributionSet sink,
+        Func<IAssemblySymbol, long?>? resolveTargetProject)
+    {
+        var info = model.GetSymbolInfo(node);
+        var constructor = (model.GetOperation(node) as IObjectCreationOperation)?.Constructor
+            ?? info.Symbol as IMethodSymbol;
+        if (constructor != null)
+        {
+            Emit(constructor, isCandidate: false);
+            return;
+        }
+
+        foreach (var candidate in info.CandidateSymbols.OfType<IMethodSymbol>().Take(MaxCandidates))
+            Emit(candidate, isCandidate: true);
+
+        void Emit(IMethodSymbol target, bool isCandidate)
+        {
+            if (target.MethodKind != MethodKind.Constructor)
+                return;
+            var canonical = Canonicalize(target);
+            if (!IsStoredTarget(canonical))
+                return;
+
+            var key = SemanticSymbolKeyFactory.DeclarationKey(canonical);
+            var targetProject = ExactTargetProject(canonical, resolveTargetProject);
+            var position = node.GetLocation().GetLineSpan().StartLinePosition;
+            sink.AddReference(new ReferenceContribution(
+                key, filePath, position.Line + 1,
+                node is ConstructorInitializerSyntax ? ReferenceKind.Invocation : ReferenceKind.ObjectCreation,
+                null, Snippet(text, node.Span), targetProject, isCandidate));
+
+            if (EnclosingMemberKey(node, model) is { } callerKey)
+                sink.AddCall(new CallContribution(
+                    callerKey, key, filePath, position.Line + 1, position.Character,
+                    new DataflowResult(), targetProject, isCandidate));
+        }
     }
 
     private static void EmitInstantiation(

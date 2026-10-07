@@ -267,6 +267,7 @@ public sealed class IndexOrchestrator
         long? commitId = null;
         long? activeSnapshotId = null;
         var isOverlayRun = false;
+        var rebuildOriginalIdentities = new Dictionary<long, string>();
         if (effectiveCtx != null)
         {
             snapshotStore = new SnapshotStore(conn);
@@ -295,6 +296,7 @@ public sealed class IndexOrchestrator
                     // Issue #113: the service's non-default SDK-pin policy (null locally / by default).
                     SdkPinPolicy = effectiveCtx.SdkPinPolicy,
                     RestorePolicy = effectiveCtx.RestorePolicy,
+                    RebuildGeneration = effectiveCtx.RebuildGeneration,
                     // A full index is never an overlay; for a dirty fallback this keeps its identity
                     // distinct from an overlay of the same dirty tree (issue #47). Ignored when the tree
                     // is clean (delta null → discriminator not folded).
@@ -302,6 +304,7 @@ public sealed class IndexOrchestrator
                 };
                 var (snapId, existed, status) = snapshotStore.BeginPending(
                     identity, repositoryId.Value, commitId, runScope.RunId, now, fallbackReason: fallbackReason);
+                rebuildOriginalIdentities[snapId] = (identity with { RebuildGeneration = null }).Hash;
                 if (existed && (status == SnapshotStatus.Complete || status == SnapshotStatus.Superseded))
                 {
                     // A snapshot for this exact identity (commit + tree + schema + analyzer + config +
@@ -327,8 +330,8 @@ public sealed class IndexOrchestrator
                 // generation for this exact identity, or a Pending one abandoned by a crash) is about to be
                 // rebuilt from scratch below. Reset it to pending so the guarded pending→complete publish
                 // succeeds instead of tripping the "was not pending at publish" guard.
-                if (existed && status != SnapshotStatus.Pending)
-                    snapshotStore.MarkStatus(snapId, SnapshotStatus.Pending);
+                if (existed)
+                    snapshotStore.RestageForRun(snapId, runScope.RunId);
                 // Any coverage recorded for an earlier generation of this identity describes data that is
                 // about to be rebuilt; drop it so the publish records the coverage of THIS build.
                 if (existed)
@@ -358,11 +361,13 @@ public sealed class IndexOrchestrator
                         CapabilityFingerprint = effectiveCtx.CapabilityFingerprint,
                         // Issue #113 SDK-pin policy (null on every local run).
                         SdkPinPolicy = effectiveCtx.SdkPinPolicy,
-                        RestorePolicy = effectiveCtx.RestorePolicy
+                        RestorePolicy = effectiveCtx.RestorePolicy,
+                        RebuildGeneration = effectiveCtx.RebuildGeneration
                     };
                     var (overlayId, overlayExisted, overlayStatus) = snapshotStore.BeginPending(
                         overlayIdentity, repositoryId.Value, commitId, runScope.RunId, now,
                         baseSnapshotId: overlay.BaseSnapshotId);
+                    rebuildOriginalIdentities[overlayId] = (overlayIdentity with { RebuildGeneration = null }).Hash;
                     if (overlayExisted && (overlayStatus == SnapshotStatus.Complete || overlayStatus == SnapshotStatus.Superseded))
                     {
                         // This exact dirty state was already built as an overlay: re-select it without
@@ -380,8 +385,8 @@ public sealed class IndexOrchestrator
                     }
                     activeSnapshotId = overlayId;
                     isOverlayRun = true;
-                    if (overlayExisted && overlayStatus != SnapshotStatus.Pending)
-                        snapshotStore.MarkStatus(overlayId, SnapshotStatus.Pending);
+                    if (overlayExisted)
+                        snapshotStore.RestageForRun(overlayId, runScope.RunId);
                     // A baseless overlay carries its remote base's coverage (issue #119); an earlier
                     // generation's row is about to be superseded by this build's publish.
                     if (overlayExisted)
@@ -468,17 +473,19 @@ public sealed class IndexOrchestrator
                 // Issue #113: a submodule's projects load in the SAME MSBuild load, under the same SDK-pin
                 // policy, so a provider built with the override disabled is never reused once it is enabled.
                 SdkPinPolicy = effectiveCtx.SdkPinPolicy,
-                RestorePolicy = effectiveCtx.RestorePolicy
+                RestorePolicy = effectiveCtx.RestorePolicy,
+                RebuildGeneration = effectiveCtx.RebuildGeneration
             };
             var (provId, provExisted, provStatus) = snapshotStore.BeginPending(
                 providerIdentity, providerRepoId, providerCommitId, runScope.RunId, now, isProvider: true);
+            rebuildOriginalIdentities[provId] = (providerIdentity with { RebuildGeneration = null }).Hash;
             var complete = provExisted && (provStatus == SnapshotStatus.Complete || provStatus == SnapshotStatus.Superseded);
             if (!complete)
             {
                 // Newly staged, or a prior partial/failed/abandoned provider generation to rebuild: reset
                 // to pending so the guarded pending->complete publish succeeds, and publish it this run.
-                if (provExisted && provStatus != SnapshotStatus.Pending)
-                    snapshotStore.MarkStatus(provId, SnapshotStatus.Pending);
+                if (provExisted)
+                    snapshotStore.RestageForRun(provId, runScope.RunId);
                 // Coverage recorded for an earlier generation of this identity describes a build that is
                 // being redone; drop it so this run's publish records its own (issue #162), exactly like
                 // a rebuilt parent snapshot.
@@ -539,7 +546,7 @@ public sealed class IndexOrchestrator
                     // than half-grown. Adding the new project version is additive: the provider's existing
                     // (published) project rows are never touched.
                     if (providerComplete && providerSnapshotsToPublish.Add(providerSnapId))
-                        snapshotStore.MarkStatus(providerSnapId, SnapshotStatus.Pending);
+                        snapshotStore.RestageForRun(providerSnapId, runScope.RunId);
                     projectId = projectStore.UpsertSnapshotProject(identity, providerSnapId, providerLogicalId, now);
                     snapshotStore.MapProject(providerSnapId, projectId);
                     // Empty-grown-project guard (issue #58): a provider project pulled in ONLY as a late
@@ -1520,7 +1527,7 @@ public sealed class IndexOrchestrator
                 solution, solutionMembership, projectRoslynToId, budgetNotIndexed, budgetNotExtracted);
             if (publishCtx.Coverage is { TimeBudget: not null } budgeted)
                 _log?.Invoke($"  {budgeted.Reasons[0]}");
-            RecordCoverage(conn, publishId, publishCtx, completedAt);
+            RecordCoverage(conn, publishId, publishCtx, completedAt, rebuildOriginalIdentities[publishId]);
 
             AdvanceBranchToSnapshot(snapshotStore, publishRepoId, effectiveCtx, publishId, completedAt);
 
@@ -1547,7 +1554,7 @@ public sealed class IndexOrchestrator
             // the peer-reported base coverage is recorded on the overlay itself, in the publish transaction.
             // A local-base overlay reads its base's row instead and never records its own.
             if (overlay?.BaseSnapshotId is null)
-                RecordCoverage(conn, overlayPublishId, effectiveCtx, completedAt);
+                RecordCoverage(conn, overlayPublishId, effectiveCtx, completedAt, rebuildOriginalIdentities[overlayPublishId]);
 
             AdvanceBranchToOverlay(snapshotStore, overlayRepoId, effectiveCtx, overlayPublishId, completedAt);
         }
@@ -1569,7 +1576,8 @@ public sealed class IndexOrchestrator
                 _log?.Invoke($"  Published provider snapshot {providerSnapshotId} (deduplicated submodule).");
                 if (effectiveCtx != null)
                     RecordProviderCoverage(conn, providerSnapshotId,
-                        providerSubmodulePaths.GetValueOrDefault(providerSnapshotId), effectiveCtx, completedAt);
+                        providerSubmodulePaths.GetValueOrDefault(providerSnapshotId), effectiveCtx, completedAt,
+                        rebuildOriginalIdentities[providerSnapshotId]);
             }
         }
 
@@ -1791,6 +1799,9 @@ public sealed class IndexOrchestrator
         // pointer, and wins over every other guard. Null/false for every local CLI/daemon run.
         if (ctx.SuppressBranchUpdate == true)
             return;
+        if (snapshotStore.PreserveRebuildSelection(
+            snapshotStore.GetBranchId(repositoryId, ctx.BranchName), snapshotId, ctx.BranchHeadSequence, completedAt))
+            return;
 
         // SVC-6: a compare-and-swap on the pointer's current commit. A mismatch leaves the branch untouched —
         // no row is created and its default designation is not changed — so a stale push can neither move the
@@ -1804,7 +1815,8 @@ public sealed class IndexOrchestrator
             var casBranchId = snapshotStore.EnsureBranch(repositoryId, ctx.BranchName, casOwnsDefault, completedAt);
             if (casOwnsDefault)
                 snapshotStore.PromoteSoleDefaultBranch(repositoryId, casBranchId);
-            snapshotStore.AdvanceBranchPointerIfHeadMatches(casBranchId, snapshotId, expectedHead, completedAt);
+            snapshotStore.AdvanceBranchPointerIfHeadMatches(casBranchId, snapshotId, expectedHead, completedAt,
+                preservePrevious: ctx.RebuildGeneration is not null);
             return;
         }
 
@@ -1868,11 +1880,29 @@ public sealed class IndexOrchestrator
     // Persists the caller-computed coverage (issue #119) for a NEWLY published snapshot, inside the publish
     // transaction. A no-op when the caller computed none (local CLI/daemon). A fresh publish has no row yet,
     // so an existing one is an invariant violation (the snapshot id was reused under a stale row).
-    private static void RecordCoverage(SqliteConnection conn, long snapshotId, SnapshotContext ctx, long recordedAt)
+    private static void RecordCoverage(
+        SqliteConnection conn, long snapshotId, SnapshotContext ctx, long recordedAt, string originalIdentityHash)
     {
-        if (ctx.Coverage is { } coverage && !new SnapshotCoverageStore(conn).Record(snapshotId, coverage, recordedAt))
+        var coverage = WithRebuildProvenance(ctx, ctx.Coverage, originalIdentityHash);
+        if (coverage is not null && !new SnapshotCoverageStore(conn).Record(snapshotId, coverage, recordedAt))
             throw new InvalidOperationException(
                 $"Snapshot {snapshotId} already has a recorded coverage row at first publish (issue #119 invariant).");
+    }
+
+    private static SnapshotCoverage? WithRebuildProvenance(
+        SnapshotContext ctx, SnapshotCoverage? coverage, string? originalIdentityHash)
+    {
+        if (ctx.RebuildGeneration is not { } generation)
+            return coverage;
+        return (coverage ?? throw new InvalidOperationException("A rebuild must record coverage.")) with
+        {
+            Rebuild = new SnapshotRebuild
+            {
+                Generation = generation,
+                OriginalIdentityHash = originalIdentityHash
+                    ?? throw new InvalidOperationException("A rebuild must record its original identity.")
+            }
+        };
     }
 
     /// <summary>
@@ -1967,7 +1997,7 @@ public sealed class IndexOrchestrator
     /// </summary>
     internal static void RecordProviderCoverage(
         SqliteConnection conn, long providerSnapshotId, IEnumerable<string>? submodulePaths, SnapshotContext ctx,
-        long recordedAt)
+        long recordedAt, string? originalIdentityHash = null)
     {
         if (ctx.ProviderCoverage is not { } computed)
             return;
@@ -1986,7 +2016,8 @@ public sealed class IndexOrchestrator
                 Verdict = SnapshotCoverageVerdict.Partial,
                 Reasons = ["the provider's submodule path is unknown, so its coverage cannot be proven complete."]
             });
-        new SnapshotCoverageStore(conn).Record(providerSnapshotId, WorstOf(verdicts), recordedAt);
+        new SnapshotCoverageStore(conn).Record(providerSnapshotId,
+            WithRebuildProvenance(ctx, WorstOf(verdicts), originalIdentityHash)!, recordedAt);
     }
 
     // The worst of several coverage verdicts for one provider: complete only when every contributing path is

@@ -50,6 +50,9 @@ public sealed record SnapshotContext
     /// </summary>
     public string? RestorePolicy { get; init; }
 
+    /// <summary>The operator-selected immutable rebuild generation; null for ordinary/local indexing.</summary>
+    public string? RebuildGeneration { get; init; }
+
     /// <summary>
     /// Per-project load problems the producing worker observed before indexing (for example a package the
     /// restore could not resolve), keyed by the project file's checkout-relative path with <c>/</c>
