@@ -1,0 +1,13 @@
+{
+  "$comment": "Contract for the agentic-dev-kit dev-workflow skills (/implement-clean, /spec, /audit-*, /review-agent, \u2026): repo, build/test commands, review mechanism and domain skills, so the generic skills need no hardcoded values. Schema: the kit's shared/project-config.md. Created by /bootstrap-repo.",
+  "repo": "auto",
+  "build": "dotnet build Sextant.slnx",
+  "test": "MSBUILDDISABLENODEREUSE=1 DOTNET_CLI_USE_MSBUILD_SERVER=0 dotnet test Sextant.slnx --no-build --blame-hang-timeout 10m",
+  "testTargeted": "MSBUILDDISABLENODEREUSE=1 DOTNET_CLI_USE_MSBUILD_SERVER=0 dotnet test Sextant.slnx --no-build --filter \"FullyQualifiedName~{area}\"",
+  "specsDir": "specs",
+  "review": {
+    "$comment": "No AI PR reviewer is wired to this repo; CI runs Build & Test and the SonarCloud quality gate. 'none' makes the implement skills hand PRs off for human review instead of waiting for a review comment.",
+    "mechanism": "none"
+  },
+  "domainSkills": []
+}

@@ -25,4 +25,5 @@ Thumbs.db
 .sextant/
 sextant.sln
 .mcp.json
-/.claude
+/.claude/*
+!/.claude/project.json
