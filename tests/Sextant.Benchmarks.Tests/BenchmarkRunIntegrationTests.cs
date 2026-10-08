@@ -224,7 +224,8 @@ public sealed class BenchmarkRunIntegrationTests
             var load = report.Load!;
             Assert.AreEqual(SolutionLoadModes.Union, load.Mode);
             Assert.AreEqual(2, load.SolutionsSelected);
-            Assert.IsGreaterThan(0, load.ProjectsOpened);
+            Assert.AreEqual(0, load.ProjectsOpened, "issue #268: the union loads in one pass");
+            Assert.IsGreaterThan(0, load.ProjectsLoaded);
             Assert.AreEqual(load.WallMs, full.SolutionLoadMs);
             if (OperatingSystem.IsLinux())
                 Assert.IsGreaterThan(0, load.BuildHosts!.Launches);

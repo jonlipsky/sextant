@@ -93,9 +93,10 @@ public sealed record MultiSolutionLoadResult(
 /// <c>(git-remote, repo-relative path)</c> — yields the union-of-projects-by-identity the acceptance
 /// criteria require. A single selected solution (a one-solution checkout, or a one-entry config) preserves
 /// the existing fast whole-solution load path byte-for-byte. Several solutions — an explicit list, or the
-/// no-config default union of every discovered solution (issue #124) — take the per-project union path,
-/// which opens each project individually (no solution context, so <c>$(SolutionDir)</c> is not set by a
-/// solution) to isolate per-project load faults.
+/// no-config default union of every discovered solution (issue #124) — load their union with one open of a
+/// generated solution (issue #268), falling back to opening each project individually to isolate a load fault
+/// or stop at the deadline. The generated solution sits in the selected solutions' common directory, so
+/// <c>$(SolutionDir)</c> is a selected solution's own when they share one; the per-project path sets none.
 /// </summary>
 public static class MultiSolutionLoader
 {
@@ -107,10 +108,11 @@ public static class MultiSolutionLoader
     /// <summary>
     /// Loads <paramref name="solutionPaths"/> (already selected + deterministically ordered by
     /// <see cref="SolutionSelector"/>) into one workspace. A single solution takes the standard resilient
-    /// whole-solution path; multiple solutions load the union of their declared projects individually with
-    /// per-project fault isolation. When <paramref name="deadline"/> passes during a union load, the projects
-    /// not yet opened are returned in <see cref="MultiSolutionLoadResult.DeferredProjects"/>;
-    /// <paramref name="onProgress"/> receives one line per project opened.
+    /// whole-solution path; multiple solutions load the union of their declared projects with one open of a
+    /// generated solution for every project it evaluates as faithfully (<see cref="UnionSolutionWriter.Partition"/>),
+    /// then the rest project by project, with per-project fault isolation. When <paramref name="deadline"/> passes during a
+    /// project-by-project union load, the projects not yet opened are returned in
+    /// <see cref="MultiSolutionLoadResult.DeferredProjects"/>; <paramref name="onProgress"/> receives a line per open.
     /// </summary>
     public static async Task<MultiSolutionLoadResult> LoadAsync(
         IReadOnlyList<string> solutionPaths,
@@ -139,8 +141,19 @@ public static class MultiSolutionLoader
             loaded = await SolutionLoader.LoadSolutionResilientlyAsync(
                 solutionPaths[0], onDiagnostic, cancellationToken).ConfigureAwait(false);
         }
+        else if (UnionSolutionWriter.Partition(solutionPaths, union) is { Directory: not null } partition)
+        {
+            if (partition.Individually.Count > 0)
+                onDiagnostic?.Invoke(
+                    $"{partition.Individually.Count} of the union's {union.Count} project(s) are opened individually, " +
+                    $"outside the one-pass load: {partition.Reason}.");
+            loaded = await SolutionLoader.LoadUnionInOnePassAsync(
+                union, partition, onDiagnostic, deadline, onProgress, cancellationToken).ConfigureAwait(false);
+        }
         else
         {
+            onDiagnostic?.Invoke(
+                "Loading the solution union project by project: no project evaluates the same in one generated solution.");
             loaded = await SolutionLoader.LoadProjectsResilientlyAsync(
                 union, onDiagnostic, deadline, onProgress, cancellationToken).ConfigureAwait(false);
         }
@@ -149,7 +162,9 @@ public static class MultiSolutionLoader
             .Select((c, i) => c with { IsReadable = reads[i].IsReadable }).ToList();
         return new MultiSolutionLoadResult(loaded.Solution, loaded.SkippedProjects, coverage)
         {
-            LoadMode = solutionPaths.Count == 1 ? SolutionLoadModes.Solution : SolutionLoadModes.Union,
+            LoadMode = solutionPaths.Count == 1 ? SolutionLoadModes.Solution
+                : loaded.LoadedProjectByProject ? SolutionLoadModes.UnionPerProject
+                : SolutionLoadModes.Union,
             LoadMs = loadWatch.ElapsedMilliseconds,
             LoadTimings = loaded.LoadTimings,
             DeclaredProjects = union,
@@ -235,6 +250,12 @@ public static class SolutionLoadModes
     /// <summary>One whole-solution open (<c>OpenSolutionAsync</c>).</summary>
     public const string Solution = "solution";
 
-    /// <summary>The multi-solution union, each project opened individually (<c>OpenProjectAsync</c>).</summary>
+    /// <summary>The multi-solution union, loaded with one open of a generated solution (issue #268).</summary>
     public const string Union = "union";
+
+    /// <summary>
+    /// The multi-solution union, each project opened individually (<c>OpenProjectAsync</c>): the fallback when the
+    /// one-pass open aborts or runs past the load deadline.
+    /// </summary>
+    public const string UnionPerProject = "union_per_project";
 }

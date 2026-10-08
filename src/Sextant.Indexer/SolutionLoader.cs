@@ -84,6 +84,122 @@ public static class SolutionLoader
     }
 
     /// <summary>
+    /// Loads a multi-solution project union (issue #268): <see cref="UnionPartition.OnePass"/> with ONE
+    /// <see cref="MSBuildWorkspace.OpenSolutionAsync"/> over a solution generated in
+    /// <see cref="UnionPartition.Directory"/> (deleted once the open has read it), so one BuildHost evaluates them,
+    /// instead of a BuildHost started and stopped per <see cref="MSBuildWorkspace.OpenProjectAsync"/>; then each of
+    /// <see cref="UnionPartition.Individually"/> opened on its own into the same workspace, as before. Failures are
+    /// reconciled per project exactly as on the per-project path (keyed by project path). The whole union is loaded
+    /// project by project instead (<see cref="LoadProjectsResilientlyAsync"/>) when the one-pass open aborts (issue
+    /// #90), when <paramref name="deadline"/> passes before it finishes, or when it pulled in, through a project
+    /// reference, a project that must be evaluated on its own.
+    /// </summary>
+    internal static async Task<SolutionLoadResult> LoadUnionInOnePassAsync(
+        IReadOnlyList<string> projectPaths,
+        UnionPartition partition,
+        Action<string>? onDiagnostic = null,
+        IndexDeadline? deadline = null,
+        Action<string>? onProgress = null,
+        CancellationToken cancellationToken = default)
+    {
+        var generated = UnionSolutionWriter.Write(partition.Directory!, partition.OnePass);
+        onProgress?.Invoke($"Loading {partition.OnePass.Count} project(s) in one pass" +
+            (partition.Individually.Count > 0 ? $", then {partition.Individually.Count} individually" : string.Empty));
+        var failures = new ConcurrentQueue<LoadFailure>();
+        var workspace = MSBuildWorkspace.Create();
+        RegisterFailureSink(workspace, failures, onDiagnostic);
+
+        using var atDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        if (deadline is not null)
+            atDeadline.CancelAfter(Max(deadline.At - deadline.Clock.GetUtcNow(), TimeSpan.Zero));
+        string? fallback;
+        try
+        {
+            try
+            {
+                await workspace.OpenSolutionAsync(generated, cancellationToken: atDeadline.Token);
+            }
+            finally
+            {
+                // Nothing reads the generated solution after the open, and it must not stay in the checkout.
+                File.Delete(generated);
+            }
+            var opened = new MSBuildWorkspaceProjectLoader(workspace);
+            fallback = partition.Individually.FirstOrDefault(opened.IsLoaded) is { } pulledIn
+                ? $"the one-pass load pulled in '{Path.GetFileName(pulledIn)}', which must be evaluated on its own"
+                : null;
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            fallback = "the load deadline passed during the one-pass union load";
+        }
+        catch (OperationCanceledException)
+        {
+            workspace.Dispose();
+            throw;
+        }
+        catch (Exception ex) when (!IsFatal(ex))
+        {
+            // Issue #90: one project's evaluation can fault the whole open. Isolate it project by project.
+            fallback = $"the one-pass union load aborted ({ex.GetType().Name}: {ex.Message})";
+        }
+        if (fallback is not null)
+        {
+            workspace.Dispose();
+            onDiagnostic?.Invoke($"Loading the solution union project by project: {fallback}.");
+            return await LoadProjectsResilientlyAsync(projectPaths, onDiagnostic, deadline, onProgress, cancellationToken);
+        }
+
+        Solution solution;
+        List<SkippedProject> thrownSkipped = [];
+        List<string> deferred = [];
+        var openTimings = new List<ProjectTiming>();
+        try
+        {
+            var loader = new MSBuildWorkspaceProjectLoader(workspace);
+            solution = loader.CurrentSolution;
+            if (partition.Individually.Count > 0)
+                (solution, thrownSkipped, deferred) = await LoadProjectsIndividuallyAsync(
+                    partition.Individually, loader, onDiagnostic, deadline, onProgress, cancellationToken, openTimings);
+        }
+        catch
+        {
+            workspace.Dispose();
+            throw;
+        }
+
+        var deferredSet = new HashSet<string>(deferred.Select(NormalizePath), StringComparer.OrdinalIgnoreCase);
+        var attempted = deferred.Count == 0
+            ? projectPaths
+            : projectPaths.Where(p => !deferredSet.Contains(NormalizePath(p))).ToList();
+        var reconciled = ReconcileLoads(attempted, solution, failures, thrownSkipped, onDiagnostic);
+        return reconciled.ToResult(TransitiveProjectReferences.Close(
+            WithoutSkippedStubs(solution, reconciled.SkippedProjects), onDiagnostic)) with
+        {
+            DeferredProjects = deferred,
+            LoadTimings = openTimings
+        };
+    }
+
+    // A failed project stays in a whole-solution load as an empty stub (issue #90), where a failed OpenProjectAsync
+    // adds nothing. Drop each stub reconciled as skipped that no loaded project references, so the one-pass union
+    // indexes the same projects the per-project union did (a referenced stub stays, keeping that reference).
+    private static Solution WithoutSkippedStubs(Solution solution, IReadOnlyList<SkippedProject> skipped)
+    {
+        var skippedPaths = skipped.Select(s => NormalizePath(s.ProjectPath)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var stubs = solution.Projects
+            .Where(p => p.FilePath != null && !p.Documents.Any() && skippedPaths.Contains(NormalizePath(p.FilePath)))
+            .Select(p => p.Id)
+            .ToList();
+        foreach (var stub in stubs)
+            if (!solution.Projects.Any(p => p.ProjectReferences.Any(r => r.ProjectId == stub)))
+                solution = solution.RemoveProject(stub);
+        return solution;
+    }
+
+    private static TimeSpan Max(TimeSpan a, TimeSpan b) => a > b ? a : b;
+
+    /// <summary>
     /// Loads a UNION of individually-named project paths (across one or more solutions) into ONE workspace
     /// with the same per-project fault isolation + skipped-project reconciliation as the solution loader
     /// (issue #109 multi-solution aggregation). Projects already pulled in transitively by an earlier
@@ -129,7 +245,8 @@ public static class SolutionLoader
         return reconciled.ToResult(TransitiveProjectReferences.Close(solution, onDiagnostic)) with
         {
             DeferredProjects = deferred,
-            LoadTimings = openTimings
+            LoadTimings = openTimings,
+            LoadedProjectByProject = true
         };
     }
 

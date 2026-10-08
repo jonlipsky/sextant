@@ -204,9 +204,19 @@ externals). The worker chooses the set to index **explicitly and deterministical
   snapshot; only a union in which **no** project loads at all fails the job, so an empty snapshot is never
   published. A checkout whose
   discovered solutions all load is **complete**. With a single discovered solution this is just that
-  solution, loaded as before. With several, each project is opened individually (that is what isolates a
-  per-project load fault), so no solution sets `$(SolutionDir)`: a project that imports
-  `$(SolutionDir)…` with no fallback may be skipped-with-reason on this path. Each selected solution still
+  solution, loaded as before. With several, the union loads in **one pass** (issue #268): the worker
+  generates a solution listing the union's projects in the selected solutions' common directory, opens it
+  once (one MSBuild BuildHost evaluates every project, instead of one BuildHost per project), and deletes
+  it. `$(SolutionDir)` is then that common directory. A project goes in the one pass only when it
+  evaluates there exactly as it would opened alone: MSBuild resolves the .NET SDK and `msbuild-sdks` from
+  the `global.json` nearest the solution in a solution load, and nearest the project when it is opened on
+  its own (#113). So a project whose own nearest `global.json` is a different file stays in the one pass
+  only if it resolves the same SDK and uses none of the `msbuild-sdks` the two files pin differently. Every
+  other project, and every project that references one of them, is opened individually afterwards, into
+  the same workspace, as before. If the one-pass open aborts (#90), runs past the load deadline, or still
+  pulls in a project that must be opened on its own, the whole union is opened project by project as
+  before (no solution sets `$(SolutionDir)` there: a project that imports `$(SolutionDir)…` with no
+  fallback may be skipped-with-reason on that path). Each selected solution still
     gets its own `solution → project` mapping (the `solution:` query scope): the projects that solution
     declares plus everything they reference, as the single-solution path maps. A `solution:` scope over a
     selected solution none of whose projects loaded returns nothing rather than the whole repository.
@@ -1990,8 +2000,9 @@ rows.
     is not measured. Each phase has `wall_ms`, `cpu_ms` and `child_cpu_ms`; `cpu_ms / wall_ms` is the parallelism it
     achieved. The service does not count the catalog's rows after a job (the harness does), so recording timings
     adds no catalog scan.
-  - `load`: `mode` (`solution`, one `OpenSolutionAsync`; or `union`, each project opened individually),
-    `wall_ms`, `projects_loaded`, `projects_opened`, the slowest individual opens (`slowest_opens`, with the projects
+  - `load`: `mode` (`solution`, one `OpenSolutionAsync`; `union`, the multi-solution union in one pass plus any
+    project opened individually, issue #268; or `union_per_project`, every project opened individually),
+    `wall_ms`, `projects_loaded`, `projects_opened` (the individual opens), the slowest individual opens (`slowest_opens`, with the projects
     each open added to the workspace through its references), and `build_hosts`: the BuildHost processes the load
     started (descendants whose command line contains `BuildHost.dll`: `launches`, `peak_concurrent`,
     `peak_resident_bytes`), sampled from `/proc` every 250 ms. The counts are approximate: a process shorter than one

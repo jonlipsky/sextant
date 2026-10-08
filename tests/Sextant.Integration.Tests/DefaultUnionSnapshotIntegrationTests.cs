@@ -83,11 +83,16 @@ public sealed class DefaultUnionSnapshotIntegrationTests : IDisposable
                 Assert.IsGreaterThanOrEqualTo(0, phaseNames.IndexOf(earlier), $"{earlier} recorded: {string.Join(", ", phaseNames)}");
                 Assert.IsLessThan(phaseNames.IndexOf(later), phaseNames.IndexOf(earlier), $"{earlier} before {later}: {string.Join(", ", phaseNames)}");
             }
+            // Issue #268: the three solutions' union loads in ONE open of a generated solution, even with an unloadable
+            // head among them: no project is opened individually, and one BuildHost evaluates them all.
             Assert.AreEqual(SolutionLoadModes.Union, timings.Load!.Mode, "three selected solutions load as a union");
-            Assert.IsGreaterThan(0, timings.Load.ProjectsOpened);
-            Assert.IsTrue(timings.Load.SlowestOpens.All(o => o.Phase == "load" && o.ProjectsAdded >= 0));
+            Assert.AreEqual(0, timings.Load.ProjectsOpened, "the union is not opened project by project");
+            Assert.IsGreaterThan(0, timings.Load.ProjectsLoaded);
             if (OperatingSystem.IsLinux())
+            {
                 Assert.IsGreaterThan(0, timings.Load.BuildHosts!.Launches, "the union load starts BuildHost processes");
+                Assert.IsLessThanOrEqualTo(5, timings.Load.BuildHosts.Launches, "one pass, not one BuildHost per project");
+            }
             Assert.IsTrue(timings.SlowestProjects.Any(p => p.Phase == "extracting_symbols"));
             Assert.IsGreaterThanOrEqualTo(timings.Phases.Single(p => p.Name == "load").WallMs, timings.TotalMs);
 
