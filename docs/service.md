@@ -1342,6 +1342,32 @@ itself never gives up.
   Treat a `202` as "accepted, not yet durable", and keep a reconcile as the backstop. The ProcessStack app's
   nightly reconcile re-ensures watched branches and retires branches the host no longer has.
 
+### Coalesced branch advances (issue #273)
+
+Pushes to a busy branch can arrive faster than the index builds them. When an ensure is a branch advance
+guarded by `expected_head_commit` (what a repository push sends: `branch_name`, `expected_head_commit` = the
+push's `before`, no `branch_head_sequence`, `branch_update` not `none`, not a rebuild), and it is still waiting
+for its writer turn when a newer push of the **same repository and branch** arrives whose `expected_head_commit`
+is the waiting ensure's commit, the waiting ensure is **coalesced**:
+
+- When its turn comes it does not run the worker. Its job settles as `coalesced`, with no snapshot and a
+  `last_error` naming the commit that superseded it. A blocking ensure returns `200` with that result; a
+  polled job reports `"status": "coalesced"`. The ensure is audited with outcome `coalesced`.
+- The newer ensure takes over the coalesced one's compare-and-swap: it expects what the coalesced ensure
+  expected, because the coalesced commit never moved the branch head. The branch therefore ends exactly where
+  building every push in order would have left it, while only the newest commit is built. A chain of queued
+  pushes (B, then C, then D) coalesces to the newest one.
+- Only a **linked** successor supersedes. A push of the same branch that expects some other commit (an
+  out-of-order or unrelated push), a push of another branch, an unguarded ensure, `branch_update: none`, a
+  `branch_head_sequence` ensure and a rebuild are never coalesced and never supersede anything. An identity
+  that is already terminal is still attached at no cost, and an ensure that has started producing always
+  runs to completion.
+- `coalesced` is **settled but not terminal**. It is not an outcome: it counts toward neither the success
+  nor the completeness rate (`sextant_jobs_coalesced` counts these jobs). A later ensure of the same commit
+  produces it under the same job id.
+- Clients must treat `coalesced` as a settled status, not an unknown one. Deploy a service that coalesces only
+  after every client that polls jobs (the ProcessStack app) knows the status.
+
 **Forward-only branch-head advance (Phase 14, issue #84).** An ensure request may carry an optional
 monotonic `branch_head_sequence`. Because the service ensures *every* delivered commit (including
 out-of-order/older ones) to build immutable content-addressed snapshots, the control plane owns commit

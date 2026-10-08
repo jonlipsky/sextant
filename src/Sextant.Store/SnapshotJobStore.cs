@@ -26,9 +26,22 @@ public static class SnapshotJobStatus
     /// <summary>Explicitly cancelled.</summary>
     public const string Cancelled = "cancelled";
 
+    /// <summary>
+    /// Skipped while still queued, because a newer commit of the same branch was admitted behind it (issue #273): the
+    /// newer job produces the branch's snapshot instead. Settled, but NOT terminal: a later ensure of the same identity
+    /// produces it.
+    /// </summary>
+    public const string Coalesced = "coalesced";
+
     /// <summary>A job in a terminal state is never re-run for the same identity.</summary>
     public static bool IsTerminal(string status) =>
         status is Complete or Partial or Failed or Unsupported or Cancelled;
+
+    /// <summary>
+    /// A job whose ensure has finished: terminal, or <see cref="Coalesced"/>. A settled job is requeued before it is
+    /// produced again (a terminal one only when its result is no longer usable).
+    /// </summary>
+    public static bool IsSettled(string status) => IsTerminal(status) || status == Coalesced;
 }
 
 /// <summary>Severity of a per-project job diagnostic (acceptance criterion 5).</summary>

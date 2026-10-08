@@ -402,8 +402,9 @@ public static class ServiceApp
             // as a settled 200 outcome: either the ensure ran but the identity was requeued for a later
             // re-attempt (a TRANSIENT provisioning failure bounded by the attempt cap; nothing re-runs it in the
             // background, so the next attempt is the orchestrator's next ensure for the same commit), or
-            // `wait=false` returned while production is still queued/running.
-            var statusCode = SnapshotJobStatus.IsTerminal(result.Status)
+            // `wait=false` returned while production is still queued/running. A coalesced result (issue #273) is
+            // settled — a newer commit of the branch builds instead — so it is a 200 as well.
+            var statusCode = SnapshotJobStatus.IsSettled(result.Status)
                 ? StatusCodes.Status200OK
                 : StatusCodes.Status202Accepted;
             return Results.Json(result, ServiceJson.Options, statusCode: statusCode);

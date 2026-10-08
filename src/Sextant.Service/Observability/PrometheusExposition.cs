@@ -47,6 +47,7 @@ public static class PrometheusExposition
         Gauge(sb, "sextant_jobs_partial", "Jobs partial.", s.Jobs.Partial);
         Gauge(sb, "sextant_jobs_failed", "Jobs failed.", s.Jobs.Failed);
         Gauge(sb, "sextant_jobs_unsupported", "Jobs unsupported.", s.Jobs.Unsupported);
+        Gauge(sb, "sextant_jobs_coalesced", "Jobs skipped while queued because a newer commit of their branch superseded them.", s.Jobs.Coalesced);
         Gauge(sb, "sextant_job_success_rate", "Terminal-job success rate.", s.Jobs.SuccessRate);
         Gauge(sb, "sextant_job_completeness_rate", "Terminal-job completeness rate.", s.Jobs.CompletenessRate);
         Gauge(sb, "sextant_recent_jobs_window_start_unix_ms", "Inclusive start of the recent terminal-job window (Unix ms).",
