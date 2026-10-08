@@ -299,7 +299,8 @@ public sealed class LocalIndexerSnapshotWorker(
                 {
                     load = await MultiSolutionLoader.LoadAsync(
                         resolution.SelectedSolutions, log,
-                        deadline: plan?.LoadDeadline(_clock.GetUtcNow()), onProgress: log, cancellationToken: token)
+                        deadline: plan?.LoadDeadline(_clock.GetUtcNow()), onProgress: log, cancellationToken: token,
+                        scratchDirectory: scratchDir)
                         .ConfigureAwait(false);
                     timings.RecordLoad(load, buildHosts.Stop());
                 }

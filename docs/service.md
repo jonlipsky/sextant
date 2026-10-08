@@ -205,18 +205,22 @@ externals). The worker chooses the set to index **explicitly and deterministical
   published. A checkout whose
   discovered solutions all load is **complete**. With a single discovered solution this is just that
   solution, loaded as before. With several, the union loads in **one pass** (issue #268): the worker
-  generates a solution listing the union's projects in the selected solutions' common directory, opens it
-  once (one MSBuild BuildHost evaluates every project, instead of one BuildHost per project), and deletes
-  it. `$(SolutionDir)` is then that common directory. A project goes in the one pass only when it
-  evaluates there exactly as it would opened alone: MSBuild resolves the .NET SDK and `msbuild-sdks` from
-  the `global.json` nearest the solution in a solution load, and nearest the project when it is opened on
-  its own (#113). So a project whose own nearest `global.json` is a different file stays in the one pass
-  only if it resolves the same SDK and uses none of the `msbuild-sdks` the two files pin differently. Every
-  other project, and every project that references one of them, is opened individually afterwards, into
-  the same workspace, as before. If the one-pass open aborts (#90), runs past the load deadline, or still
-  pulls in a project that must be opened on its own, the whole union is opened project by project as
-  before (no solution sets `$(SolutionDir)` there: a project that imports `$(SolutionDir)…` with no
-  fallback may be skipped-with-reason on that path). Each selected solution still
+  generates a solution listing the union's projects in job scratch (never in the checkout), next to a copy
+  of the `global.json` the selected solutions' common directory resolves, opens it once (one MSBuild
+  BuildHost evaluates every project, instead of one BuildHost per project), and deletes it. A project goes
+  in the one pass only when it evaluates there exactly as it would opened alone (how the union was loaded
+  before): MSBuild resolves the .NET SDK and `msbuild-sdks` from the `global.json` nearest the solution in a
+  solution load, and nearest the project when it is opened on its own (#113). A project is held back, to
+  be opened individually into the same workspace afterwards, when its evaluation reads `$(SolutionDir)` or a
+  related property (a solution sets them, a single open does not), when it imports a file that cannot be
+  resolved statically, when its own nearest `global.json` is another file that resolves another SDK, sets
+  other `sdk` settings, or pins differently an `msbuild-sdks` entry it names, or when it references a
+  held-back project. Nothing loads in one pass when that `global.json` uses location-dependent settings
+  (such as `sdk.paths`). If the solution cannot be written, the one-pass open aborts (#90), it still pulls
+  in a held-back project, or it is still running when half the time left to the load deadline has passed,
+  the whole union is opened project by project as before, with the remaining time (no solution sets
+  `$(SolutionDir)` on that path either: a project that imports `$(SolutionDir)…` with no fallback may be
+  skipped-with-reason). Each selected solution still
     gets its own `solution → project` mapping (the `solution:` query scope): the projects that solution
     declares plus everything they reference, as the single-solution path maps. A `solution:` scope over a
     selected solution none of whose projects loaded returns nothing rather than the whole repository.

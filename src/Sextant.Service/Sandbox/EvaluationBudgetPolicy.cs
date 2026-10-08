@@ -16,9 +16,10 @@ public static partial class EvaluationBudgetPolicy
     /// <summary>
     /// The version of the budget handling. Bump it whenever the worker's degradation changes in a way that can
     /// let a previously aborted repository finish, so each recorded abort is retried once.
-    /// Version 1 was the implicit pre-token behavior: a hard abort with no phase deadlines.
+    /// Version 1 was the implicit pre-token behavior: a hard abort with no phase deadlines. Version 3: the multi-solution
+    /// union loads in one pass (issue #268), several times faster, so a union that ran out of budget may now fit.
     /// </summary>
-    public const int Version = 2;
+    public const int Version = 3;
 
     /// <summary>The error diagnostic the worker records on a job the sandbox aborted.</summary>
     public const string ExceededCode = "evaluation_budget_exceeded";

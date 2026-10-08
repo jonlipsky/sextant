@@ -95,8 +95,8 @@ public sealed record MultiSolutionLoadResult(
 /// the existing fast whole-solution load path byte-for-byte. Several solutions — an explicit list, or the
 /// no-config default union of every discovered solution (issue #124) — load their union with one open of a
 /// generated solution (issue #268), falling back to opening each project individually to isolate a load fault
-/// or stop at the deadline. The generated solution sits in the selected solutions' common directory, so
-/// <c>$(SolutionDir)</c> is a selected solution's own when they share one; the per-project path sets none.
+/// or stop at the deadline. The generated solution sits in job scratch, outside the checkout; a project whose
+/// evaluation reads <c>$(SolutionDir)</c> is opened individually, as before, so neither path sets it for one.
 /// </summary>
 public static class MultiSolutionLoader
 {
@@ -119,7 +119,8 @@ public static class MultiSolutionLoader
         Action<string>? onDiagnostic = null,
         IndexDeadline? deadline = null,
         Action<string>? onProgress = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? scratchDirectory = null)
     {
         if (solutionPaths.Count == 0)
             throw new ArgumentException("At least one solution path is required.", nameof(solutionPaths));
@@ -141,19 +142,30 @@ public static class MultiSolutionLoader
             loaded = await SolutionLoader.LoadSolutionResilientlyAsync(
                 solutionPaths[0], onDiagnostic, cancellationToken).ConfigureAwait(false);
         }
-        else if (UnionSolutionWriter.Partition(solutionPaths, union) is { Directory: not null } partition)
+        else if (UnionSolutionWriter.Partition(solutionPaths, union) is var partition && partition.CanLoadInOnePass)
         {
             if (partition.Individually.Count > 0)
                 onDiagnostic?.Invoke(
                     $"{partition.Individually.Count} of the union's {union.Count} project(s) are opened individually, " +
                     $"outside the one-pass load: {partition.Reason}.");
-            loaded = await SolutionLoader.LoadUnionInOnePassAsync(
-                union, partition, onDiagnostic, deadline, onProgress, cancellationToken).ConfigureAwait(false);
+            // The generated solution goes in job scratch, never the checkout; without scratch, in a temporary directory.
+            var generatedDirectory = scratchDirectory is null
+                ? Path.Combine(Path.GetTempPath(), $"sextant-union-{Guid.NewGuid():N}")
+                : Path.Combine(scratchDirectory, $"union-solution-{Guid.NewGuid():N}");
+            try
+            {
+                loaded = await SolutionLoader.LoadUnionInOnePassAsync(
+                    union, partition, generatedDirectory, onDiagnostic, deadline, onProgress, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            finally
+            {
+                TryDeleteDirectory(generatedDirectory);
+            }
         }
         else
         {
-            onDiagnostic?.Invoke(
-                "Loading the solution union project by project: no project evaluates the same in one generated solution.");
+            onDiagnostic?.Invoke($"Loading the solution union project by project: {partition.Reason}.");
             loaded = await SolutionLoader.LoadProjectsResilientlyAsync(
                 union, onDiagnostic, deadline, onProgress, cancellationToken).ConfigureAwait(false);
         }
@@ -175,6 +187,19 @@ public static class MultiSolutionLoader
             DegradedProjects = loaded.DegradedProjects,
             UnattributedFailureCount = loaded.UnattributedFailureCount
         };
+    }
+
+    private static void TryDeleteDirectory(string directory)
+    {
+        try
+        {
+            if (Directory.Exists(directory))
+                Directory.Delete(directory, recursive: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Outside the checkout: a leftover generated solution in scratch or temp is never read again.
+        }
     }
 
     /// <summary>
