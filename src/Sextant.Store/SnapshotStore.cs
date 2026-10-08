@@ -987,13 +987,16 @@ public sealed class SnapshotStore(SqliteConnection connection)
     // Issue #273: a branch-advance handover (SnapshotJobStore.RecordHandover) holds only until the branch head next moves
     // or the branch is retired. Consuming it with the move, on the caller's connection and transaction, keeps a
     // compare-and-swap exactly one link deep as serial processing would: a later reset of the branch can never revive it.
+    // A catalog below migration 029 has no handover table, and so no handover to consume.
     private void ConsumeHandovers(long branchId)
     {
         string remoteUrl, name;
         using (var read = connection.CreateCommand())
         {
             read.CommandText = """
-                SELECT r.remote_url, b.name FROM branches b JOIN repositories r ON r.id = b.repository_id WHERE b.id = @id;
+                SELECT r.remote_url, b.name FROM branches b JOIN repositories r ON r.id = b.repository_id
+                WHERE b.id = @id
+                  AND EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'branch_advance_handovers');
                 """;
             read.Parameters.AddWithValue("@id", branchId);
             using var reader = read.ExecuteReader();

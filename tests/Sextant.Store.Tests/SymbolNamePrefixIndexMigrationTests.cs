@@ -37,7 +37,7 @@ public class SymbolNamePrefixIndexMigrationTests
         {
             db.RunMigrations();
             var conn = db.GetConnection();
-            Exec(conn, "DROP TABLE snapshot_job_timings; " +
+            Exec(conn, "DROP TABLE branch_advance_handovers; DROP TABLE snapshot_job_timings; " +
                 "DROP INDEX ix_symbols_project_name_nocase; DROP INDEX ix_repositories_remote_url_nocase; " +
                 "DROP INDEX ix_snapshot_jobs_completed_at; ALTER TABLE symbols DROP COLUMN declaration; " +
                 "DELETE FROM schema_version WHERE version >= 25;");
