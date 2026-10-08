@@ -60,7 +60,11 @@ public sealed class BenchmarkReport
     public IndexingMetrics? FullIndex { get; set; }
     public IndexingMetrics? IncrementalIndex { get; set; }
 
-    public const string CurrentSchemaVersion = "1";
+    /// <summary>The service-path load (issue #267: <c>--service-path</c>), or null for the single-solution path.</summary>
+    public LoadReport? Load { get; set; }
+
+    /// <summary>"2" adds per-phase CPU time, per-project timings and the service-path load (issue #267).</summary>
+    public const string CurrentSchemaVersion = "2";
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -125,9 +129,32 @@ public sealed class BenchmarkReport
                           (ExtractionParallelism != null ? $" (parallelism {ExtractionParallelism})" : string.Empty));
         sb.AppendLine();
 
+        AppendLoad(sb, Load);
         AppendRun(sb, "Full index", FullIndex);
         AppendRun(sb, "Incremental index", IncrementalIndex);
         return sb.ToString();
+    }
+
+    private static void AppendLoad(StringBuilder sb, LoadReport? load)
+    {
+        if (load == null) return;
+        sb.AppendLine("## Service-path load");
+        sb.AppendLine();
+        sb.AppendLine($"- Solutions selected: {load.SolutionsSelected} → load mode **{load.Mode}**");
+        sb.AppendLine($"- Restore: {FormatMs(load.RestoreMs)}");
+        sb.AppendLine($"- Load: {FormatMs(load.WallMs)}; {load.ProjectsLoaded} projects loaded, {load.ProjectsOpened} individual opens");
+        if (load.BuildHosts is { } hosts)
+            sb.AppendLine($"- BuildHost processes: {hosts.Launches} observed, at most {hosts.PeakConcurrent} at once, " +
+                          $"peak {FormatBytes(hosts.PeakResidentBytes)} resident");
+        sb.AppendLine();
+        if (load.SlowestOpens.Count > 0)
+        {
+            sb.AppendLine("| Slowest opens | Time | Projects added |");
+            sb.AppendLine("|---|--:|--:|");
+            foreach (var t in load.SlowestOpens)
+                sb.AppendLine($"| {t.Project} | {FormatMs(t.WallMs)} | {t.ProjectsAdded} |");
+            sb.AppendLine();
+        }
     }
 
     private static void AppendRun(StringBuilder sb, string title, IndexingMetrics? m)
@@ -145,10 +172,23 @@ public sealed class BenchmarkReport
 
         if (m.Phases.Count > 0)
         {
-            sb.AppendLine("| Phase | Duration | Projects | Status |");
-            sb.AppendLine("|---|--:|--:|---|");
+            sb.AppendLine("| Phase | Duration | CPU | Cores | Child CPU | Projects | Status |");
+            sb.AppendLine("|---|--:|--:|--:|--:|--:|---|");
             foreach (var p in m.Phases)
-                sb.AppendLine($"| {p.Name} | {FormatMs(p.DurationMs)} | {p.ProjectsProcessed} | {p.Status} |");
+                sb.AppendLine($"| {p.Name} | {FormatMs(p.DurationMs)} | {FormatMs(p.CpuMs)} " +
+                              $"| {(p.DurationMs > 0 ? $"{(double)p.CpuMs / p.DurationMs:0.0}" : "-")} " +
+                              $"| {(p.ChildCpuMs is { } child ? FormatMs(child) : "-")} | {p.ProjectsProcessed} | {p.Status} |");
+            sb.AppendLine();
+        }
+
+        var slowest = m.Projects.OrderByDescending(p => p.WallMs).Take(10).ToList();
+        if (slowest.Count > 0)
+        {
+            sb.AppendLine("| Slowest projects | Phase | Time | Compile | Analyze | Persist | Rows |");
+            sb.AppendLine("|---|---|--:|--:|--:|--:|--:|");
+            foreach (var p in slowest)
+                sb.AppendLine($"| {p.Project} | {p.Phase} | {FormatMs(p.WallMs)} | {FormatMs(p.CompileMs)} " +
+                              $"| {FormatMs(p.AnalyzeMs)} | {FormatMs(p.PersistMs)} | {p.Rows:N0} |");
             sb.AppendLine();
         }
 
@@ -191,4 +231,20 @@ public sealed class BenchmarkReport
         while (value >= 1024 && unit < units.Length - 1) { value /= 1024; unit++; }
         return unit == 0 ? $"{bytes} B" : $"{value:0.##} {units[unit]}";
     }
+}
+
+/// <summary>
+/// The service-path load of a benchmark run (issue #267): solution selection, restore and the union or
+/// whole-solution load exactly as the service runs them, with the BuildHost processes observed.
+/// </summary>
+public sealed class LoadReport
+{
+    public required string Mode { get; init; }
+    public int SolutionsSelected { get; init; }
+    public long RestoreMs { get; init; }
+    public long WallMs { get; init; }
+    public int ProjectsLoaded { get; init; }
+    public int ProjectsOpened { get; init; }
+    public ChildProcessUsage? BuildHosts { get; init; }
+    public List<ProjectTiming> SlowestOpens { get; set; } = [];
 }

@@ -102,6 +102,14 @@ public sealed record MetricsSnapshot
     public required long CollectedAt { get; init; }
     public required LatencyStats IndexingLatency { get; init; }
     public required LatencyStats QueueDelay { get; init; }
+
+    /// <summary>
+    /// Wall-clock time per job phase (issue #267) over the most recent jobs that recorded timings, keyed by phase name
+    /// (<c>restore</c>, <c>load</c>, <c>extracting_symbols</c>, …) in <c>IndexPhaseNames.ExecutionOrder</c>; a phase that
+    /// list does not know comes last.
+    /// </summary>
+    public IReadOnlyDictionary<string, LatencyStats> PhaseLatency { get; init; } = new Dictionary<string, LatencyStats>();
+
     public required LatencyStats QueryLatency { get; init; }
     public required JobMetrics Jobs { get; init; }
     public RecentJobMetrics RecentJobs { get; init; } = new();

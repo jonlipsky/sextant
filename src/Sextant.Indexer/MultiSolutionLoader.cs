@@ -53,6 +53,18 @@ public sealed record MultiSolutionLoadResult(
     public int UnattributedFailureCount { get; init; }
 
     /// <summary>
+    /// How the projects were loaded (issue #267): <see cref="SolutionLoadModes.Solution"/> (one whole-solution open)
+    /// or <see cref="SolutionLoadModes.Union"/> (each project of the multi-solution union opened individually).
+    /// </summary>
+    public string LoadMode { get; init; } = SolutionLoadModes.Solution;
+
+    /// <summary>Wall-clock time of the whole load, in milliseconds (issue #267).</summary>
+    public long LoadMs { get; init; }
+
+    /// <summary>Per-open timings of a union load, in open order (issue #267); empty for a whole-solution load.</summary>
+    public IReadOnlyList<Sextant.Core.ProjectTiming> LoadTimings { get; init; } = [];
+
+    /// <summary>
     /// The distinct (full-path) project files declared across ALL selected solutions, in first-appearance
     /// order — the denominator for checkout coverage (issue #119).
     /// </summary>
@@ -117,6 +129,7 @@ public static class MultiSolutionLoader
 
         SolutionLoadResult loaded;
         var union = ComputeUnion(perSolutionDeclared);
+        var loadWatch = System.Diagnostics.Stopwatch.StartNew();
         if (solutionPaths.Count == 1)
         {
             // Preserve the single-solution fast path (OpenSolutionAsync) when exactly ONE
@@ -136,6 +149,9 @@ public static class MultiSolutionLoader
             .Select((c, i) => c with { IsReadable = reads[i].IsReadable }).ToList();
         return new MultiSolutionLoadResult(loaded.Solution, loaded.SkippedProjects, coverage)
         {
+            LoadMode = solutionPaths.Count == 1 ? SolutionLoadModes.Solution : SolutionLoadModes.Union,
+            LoadMs = loadWatch.ElapsedMilliseconds,
+            LoadTimings = loaded.LoadTimings,
             DeclaredProjects = union,
             Membership = perSolutionDeclared
                 .Select(p => new SolutionMembership(Path.GetFullPath(p.Solution), p.Declared))
@@ -211,4 +227,14 @@ public static class MultiSolutionLoader
         }
         return result;
     }
+}
+
+/// <summary>The load modes <see cref="MultiSolutionLoadResult.LoadMode"/> reports (issue #267).</summary>
+public static class SolutionLoadModes
+{
+    /// <summary>One whole-solution open (<c>OpenSolutionAsync</c>).</summary>
+    public const string Solution = "solution";
+
+    /// <summary>The multi-solution union, each project opened individually (<c>OpenProjectAsync</c>).</summary>
+    public const string Union = "union";
 }

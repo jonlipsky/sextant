@@ -37,7 +37,8 @@ public class SymbolNamePrefixIndexMigrationTests
         {
             db.RunMigrations();
             var conn = db.GetConnection();
-            Exec(conn, "DROP INDEX ix_symbols_project_name_nocase; DROP INDEX ix_repositories_remote_url_nocase; " +
+            Exec(conn, "DROP TABLE snapshot_job_timings; " +
+                "DROP INDEX ix_symbols_project_name_nocase; DROP INDEX ix_repositories_remote_url_nocase; " +
                 "DROP INDEX ix_snapshot_jobs_completed_at; ALTER TABLE symbols DROP COLUMN declaration; " +
                 "DELETE FROM schema_version WHERE version >= 25;");
             var runs = new IndexRunStore(conn);
@@ -63,15 +64,18 @@ public class SymbolNamePrefixIndexMigrationTests
         Assert.AreEqual(versions.Where(v => !IndexDatabase.IdentityNeutralMigrations.Contains(v)).Max(), IndexDatabase.SnapshotSchemaVersion);
         Assert.Contains(25, IndexDatabase.IdentityNeutralMigrations);
         Assert.Contains(27, IndexDatabase.IdentityNeutralMigrations);
+        Assert.Contains(28, IndexDatabase.IdentityNeutralMigrations);
         // Adding 025 left every snapshot identity (and so every published snapshot's reuse) as it was at 24.
         Assert.AreEqual(26, versions.Where(v => !IndexDatabase.IdentityNeutralMigrations.Contains(v)).Max());
     }
 
     [TestMethod]
-    public void IdentityNeutralMigrations_OnlyCreateOrDropIndexes()
+    public void IdentityNeutralMigrations_OnlyCreateOrDropIndexes_OrCreateJobTelemetryTables()
     {
         // An identity-neutral migration must not change a table, a row or anything the indexer writes: otherwise a
-        // snapshot reused across it would differ from one built after it.
+        // snapshot reused across it would differ from one built after it. Besides index DDL it may create a declared
+        // job-telemetry table (issue #267), which no snapshot reads.
+        var telemetry = string.Join("|", IndexDatabase.JobTelemetryTables.Select(Regex.Escape));
         var migrations = Migrations().ToDictionary(m => m.Version, m => m.Sql);
         foreach (var version in IndexDatabase.IdentityNeutralMigrations)
         {
@@ -80,8 +84,9 @@ public class SymbolNamePrefixIndexMigrationTests
                 .Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
             Assert.IsNotEmpty(statements, $"migration {version} has statements");
             foreach (var statement in statements)
-                Assert.IsTrue(Regex.IsMatch(statement, @"^(CREATE\s+(UNIQUE\s+)?INDEX|DROP\s+INDEX)\s", RegexOptions.IgnoreCase),
-                    $"migration {version} only creates or drops indexes, but has: {statement}");
+                Assert.IsTrue(Regex.IsMatch(statement, @"^(CREATE\s+(UNIQUE\s+)?INDEX|DROP\s+INDEX)\s", RegexOptions.IgnoreCase)
+                              || Regex.IsMatch(statement, $@"^CREATE\s+TABLE\s+({telemetry})\s*\(", RegexOptions.IgnoreCase),
+                    $"migration {version} only creates or drops indexes or creates a job-telemetry table, but has: {statement}");
         }
     }
 

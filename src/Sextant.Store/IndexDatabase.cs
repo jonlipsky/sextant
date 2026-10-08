@@ -214,13 +214,21 @@ public sealed class IndexDatabase : IDisposable
     public static int LatestSchemaVersion => LoadMigrations().Max(m => m.version);
 
     /// <summary>
-    /// Migrations that only create or drop indexes (issues #196 and #256). They change no
-    /// table or row and nothing the indexer writes, so snapshots remain identical and do not advance
+    /// Migrations that change nothing a snapshot contains: they only create or drop indexes (issues #196 and #256), or
+    /// create a <see cref="JobTelemetryTables">job-telemetry table</see> and its indexes (issue #267). They change no
+    /// table or row the indexer writes, so snapshots remain identical and do not advance
     /// <see cref="SnapshotSchemaVersion"/>. Before 025 every migration advanced the snapshot schema (023 is an
     /// index-only migration that did), and those identities are left as they are.
     /// </summary>
     public static IReadOnlySet<int> IdentityNeutralMigrations { get; } =
-        new HashSet<int> { 25, 27 };
+        new HashSet<int> { 25, 27, 28 };
+
+    /// <summary>
+    /// Tables that hold job telemetry only (issue #267): written by the service about its jobs, never read or written
+    /// by the indexer, and never part of a snapshot. Creating one is identity-neutral.
+    /// </summary>
+    public static IReadOnlySet<string> JobTelemetryTables { get; } =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "snapshot_job_timings" };
 
     /// <summary>
     /// The schema version folded into a snapshot's identity (<c>SnapshotIdentity.SchemaVersion</c>) and compared by

@@ -73,7 +73,7 @@ public class ObservabilityHttpTests
         // Every criterion-5 signal is present in the JSON snapshot.
         foreach (var key in new[]
         {
-            "indexing_latency", "queue_delay", "query_latency", "jobs", "success_rate",
+            "indexing_latency", "queue_delay", "phase_latency", "query_latency", "jobs", "success_rate",
             "completeness_rate", "recent_jobs", "window_start_unix_ms", "window_end_unix_ms",
             "sample_count", "worker_capacity", "storage", "cache_reuse", "alerts", "cost_by_repository"
         })

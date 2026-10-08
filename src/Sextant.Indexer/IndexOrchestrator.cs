@@ -75,6 +75,15 @@ public sealed class IndexOrchestrator
         var totalStopwatch = Stopwatch.StartNew();
         var phaseStopwatch = new Stopwatch();
         PhaseMetric? currentPhase = null;
+        // Issue #267: each phase's CPU time (this process and its exited children) beside its wall-clock time.
+        var phaseCpu = default(ProcessCpuClock);
+
+        void StampCpu(PhaseMetric phase)
+        {
+            var (self, children) = ProcessCpuClock.Now().Since(phaseCpu);
+            phase.CpuMs = self;
+            phase.ChildCpuMs = children;
+        }
 
         void StartPhase(string phaseName)
         {
@@ -84,6 +93,8 @@ public sealed class IndexOrchestrator
             ThrowIfCancelled();
             currentPhase = new PhaseMetric { Name = phaseName };
             metrics?.Phases.Add(currentPhase);
+            if (metrics != null)
+                phaseCpu = ProcessCpuClock.Now();
             phaseStopwatch.Restart();
         }
 
@@ -92,6 +103,8 @@ public sealed class IndexOrchestrator
             if (currentPhase == null) return;
             phaseStopwatch.Stop();
             currentPhase.DurationMs = phaseStopwatch.ElapsedMilliseconds;
+            if (metrics != null)
+                StampCpu(currentPhase);
             currentPhase.Status = IndexRunStatus.Completed;
             currentPhase = null;
         }
@@ -112,6 +125,8 @@ public sealed class IndexOrchestrator
             {
                 phaseStopwatch.Stop();
                 currentPhase.DurationMs = phaseStopwatch.ElapsedMilliseconds;
+                if (metrics != null)
+                    StampCpu(currentPhase);
                 currentPhase.Status = IndexRunStatus.Cancelled;
             }
             if (metrics != null)
@@ -409,7 +424,7 @@ public sealed class IndexOrchestrator
         var projectIndex = 0;
         if (metrics != null) metrics.ProjectCount = totalProjects;
 
-        StartPhase("registering_projects");
+        StartPhase(IndexPhaseNames.RegisteringProjects);
         _log?.Invoke("Registering projects...");
         progress?.Report(new IndexingProgress
         {
@@ -634,7 +649,7 @@ public sealed class IndexOrchestrator
         session.CommitBatch();
 
         // Phase 2: Extract symbols from all projects
-        StartPhase("extracting_symbols");
+        StartPhase(IndexPhaseNames.ExtractingSymbols);
         _log?.Invoke("Extracting symbols...");
         projectIndex = 0;
         // Completeness gate (criterion 3): count processed projects whose Roslyn compilation could not be
@@ -705,7 +720,7 @@ public sealed class IndexOrchestrator
             _log?.Invoke($"  {project.Name}...");
             progress?.Report(new IndexingProgress
             {
-                Phase = "extracting_symbols",
+                Phase = IndexPhaseNames.ExtractingSymbols,
                 Description = $"Extracting symbols from {project.Name}",
                 CurrentProject = project.Name,
                 ProjectIndex = projectIndex,
@@ -723,8 +738,18 @@ public sealed class IndexOrchestrator
             symbolStore.DeleteByProject(projectId);
             fileStore.DeleteByProject(projectId);
 
+            // Issue #267: time compilation apart from the symbol walk. The compilation is held until the walk ends,
+            // so the extractor's own GetCompilationAsync returns this one rather than building it again.
+            var projectWatch = Stopwatch.StartNew();
+            Compilation? timedCompilation = null;
+            if (metrics != null)
+                timedCompilation = await project.GetCompilationAsync(cancellationToken);
+            var compileMs = projectWatch.ElapsedMilliseconds;
+
             var (symbols, compilationAvailable) = await SymbolExtractor.ExtractFromProjectWithStatusAsync(
                 project, projectId, includeDocComments: _profile.Has(IndexFeature.DocumentationSearch));
+            GC.KeepAlive(timedCompilation);
+            var analyzedAt = projectWatch.ElapsedMilliseconds;
             if (!compilationAvailable)
             {
                 compilationFailures++;
@@ -756,6 +781,16 @@ public sealed class IndexOrchestrator
 
             session.CommitBatch();
 
+            metrics?.RecordProject(new ProjectTiming
+            {
+                Phase = IndexPhaseNames.ExtractingSymbols,
+                Project = project.Name,
+                WallMs = projectWatch.ElapsedMilliseconds,
+                CompileMs = compileMs,
+                AnalyzeMs = analyzedAt - compileMs,
+                PersistMs = projectWatch.ElapsedMilliseconds - analyzedAt,
+                Rows = symbols.Count
+            });
             _log?.Invoke($"    {symbols.Count} symbols extracted");
         }
 
@@ -777,7 +812,7 @@ public sealed class IndexOrchestrator
         // every cross-project call/inheritance also emits a reference edge.
         if (_useDocumentExtractor)
         {
-            StartPhase("extracting_occurrences");
+            StartPhase(IndexPhaseNames.ExtractingOccurrences);
             _log?.Invoke($"Extracting occurrences (document-oriented, parallelism={_parallelism.MaxParallelism})...");
 
             // Compilation-scoped exact resolution: map a bound occurrence target's containing assembly
@@ -872,11 +907,12 @@ public sealed class IndexOrchestrator
             Task PersistProject(ProjectContributions project, CancellationToken persistToken)
             {
                 persistToken.ThrowIfCancellationRequested();
+                var persistWatch = Stopwatch.StartNew();
                 EnterProject();
                 occurrenceProjectIndex++;
                 progress?.Report(new IndexingProgress
                 {
-                    Phase = "extracting_occurrences",
+                    Phase = IndexPhaseNames.ExtractingOccurrences,
                     Description = $"Persisting occurrences from {project.Name}",
                     CurrentProject = project.Name,
                     ProjectIndex = occurrenceProjectIndex,
@@ -997,6 +1033,18 @@ public sealed class IndexOrchestrator
                 // the uncommitted rows (rolled back on session dispose) instead of committing them.
                 persistToken.ThrowIfCancellationRequested();
                 session.CommitBatch();
+                // Issue #267: compile and analyze ran on the producer (overlapping earlier projects' persistence);
+                // persistence is this consumer's time for the project.
+                metrics?.RecordProject(new ProjectTiming
+                {
+                    Phase = IndexPhaseNames.ExtractingOccurrences,
+                    Project = project.Name,
+                    CompileMs = project.CompileMs,
+                    AnalyzeMs = project.AnalyzeMs,
+                    PersistMs = persistWatch.ElapsedMilliseconds,
+                    WallMs = project.CompileMs + project.AnalyzeMs + persistWatch.ElapsedMilliseconds,
+                    Rows = contributions.References.Count + contributions.Calls.Count + contributions.Relationships.Count
+                });
                 return Task.CompletedTask;
             }
 
@@ -1008,7 +1056,7 @@ public sealed class IndexOrchestrator
         // document-oriented extractor above has already produced relationships/references/calls)
         if (!_useDocumentExtractor)
         {
-        StartPhase("extracting_relationships");
+        StartPhase(IndexPhaseNames.ExtractingRelationships);
         _log?.Invoke("Extracting relationships...");
         projectIndex = 0;
         progress?.Report(new IndexingProgress
@@ -1074,7 +1122,7 @@ public sealed class IndexOrchestrator
         }
 
         // Phase 4: Extract references
-        StartPhase("extracting_references");
+        StartPhase(IndexPhaseNames.ExtractingReferences);
         _log?.Invoke("Extracting references...");
         projectIndex = 0;
         foreach (var project in solution.Projects)
@@ -1146,7 +1194,7 @@ public sealed class IndexOrchestrator
         // Phase 4.5: Extract tagged comments (gated: standard+ profiles only)
         if (extractComments)
         {
-        StartPhase("extracting_comments");
+        StartPhase(IndexPhaseNames.ExtractingComments);
         _log?.Invoke("Extracting tagged comments...");
         projectIndex = 0;
         var commentStore = new CommentStore(conn);
@@ -1202,7 +1250,7 @@ public sealed class IndexOrchestrator
         // extractor above has already produced call edges + dataflow)
         if (!_useDocumentExtractor)
         {
-        StartPhase("extracting_call_graph");
+        StartPhase(IndexPhaseNames.ExtractingCallGraph);
         _log?.Invoke("Extracting call graph...");
         projectIndex = 0;
         foreach (var project in solution.Projects)
@@ -1298,7 +1346,7 @@ public sealed class IndexOrchestrator
         // Phase 6: Record project dependencies
         if (repoRoot != null)
         {
-            StartPhase("recording_dependencies");
+            StartPhase(IndexPhaseNames.RecordingDependencies);
             _log?.Invoke("Recording project dependencies...");
             progress?.Report(new IndexingProgress
             {
@@ -1374,7 +1422,7 @@ public sealed class IndexOrchestrator
         }
 
         // Phase 7: Capture API surface snapshots for projects with inbound dependencies
-        StartPhase("capturing_api_surface");
+        StartPhase(IndexPhaseNames.CapturingApiSurface);
         _log?.Invoke("Capturing API surface snapshots...");
         progress?.Report(new IndexingProgress
         {
@@ -1604,7 +1652,19 @@ public sealed class IndexOrchestrator
             // (a DISTINCT scan over every reference row) never inflate total_duration_ms.
             totalStopwatch.Stop();
             metrics.TotalDurationMs = totalStopwatch.ElapsedMilliseconds;
-            metrics.Rows = new IndexMetricsStore(conn).Collect();
+            // Issue #267: the scan covers the whole catalog, so only a caller that asked for row counts (the benchmark
+            // harness) pays for it, and it never fails an index that is already published.
+            if (metrics.CollectRowCounts)
+            {
+                try
+                {
+                    metrics.Rows = new IndexMetricsStore(conn).Collect();
+                }
+                catch (SqliteException ex)
+                {
+                    _log?.Invoke($"  Row metrics could not be collected, index already published: {ex.Message}");
+                }
+            }
             metrics.Status = IndexRunStatus.Completed;
         }
 

@@ -22,6 +22,22 @@ public static class PrometheusExposition
         Gauge(sb, "sextant_indexing_latency_p95_ms", "Indexing latency p95 (ms).", s.IndexingLatency.P95Ms);
         Gauge(sb, "sextant_queue_delay_p50_ms", "Queue delay p50 (ms).", s.QueueDelay.P50Ms);
         Gauge(sb, "sextant_queue_delay_p95_ms", "Queue delay p95 (ms).", s.QueueDelay.P95Ms);
+        // Per-phase job wall time (issue #267), one series per phase.
+        if (s.PhaseLatency.Count > 0)
+        {
+            foreach (var (metric, help, pick) in new (string, string, Func<LatencyStats, double>)[]
+                     {
+                         ("sextant_job_phase_p50_ms", "Job phase wall time p50 (ms).", l => l.P50Ms),
+                         ("sextant_job_phase_p95_ms", "Job phase wall time p95 (ms).", l => l.P95Ms)
+                     })
+            {
+                sb.Append("# HELP ").Append(metric).Append(' ').Append(help).Append('\n');
+                sb.Append("# TYPE ").Append(metric).Append(" gauge\n");
+                foreach (var (phase, stats) in s.PhaseLatency)
+                    sb.Append(metric).Append("{phase=\"").Append(Escape(phase)).Append("\"} ")
+                      .Append(pick(stats).ToString(CultureInfo.InvariantCulture)).Append('\n');
+            }
+        }
         Gauge(sb, "sextant_query_latency_p50_ms", "Query latency p50 (ms).", s.QueryLatency.P50Ms);
         Gauge(sb, "sextant_query_latency_p95_ms", "Query latency p95 (ms).", s.QueryLatency.P95Ms);
 

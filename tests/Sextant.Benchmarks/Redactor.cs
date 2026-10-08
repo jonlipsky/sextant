@@ -22,8 +22,24 @@ public static class Redactor
 
         Scrub(report.FullIndex);
         Scrub(report.IncrementalIndex);
+        if (report.Load != null)
+            report.Load.SlowestOpens = Relabel(report.Load.SlowestOpens).ToList();
         return report;
     }
+
+    // Project names identify the repository's structure: keep each timing, labelled by position (issue #267).
+    private static IEnumerable<Core.ProjectTiming> Relabel(IEnumerable<Core.ProjectTiming> timings) =>
+        timings.Select((t, i) => new Core.ProjectTiming
+        {
+            Phase = t.Phase,
+            Project = $"project-{i + 1}",
+            WallMs = t.WallMs,
+            CompileMs = t.CompileMs,
+            AnalyzeMs = t.AnalyzeMs,
+            PersistMs = t.PersistMs,
+            Rows = t.Rows,
+            ProjectsAdded = t.ProjectsAdded
+        });
 
     private static void Scrub(Core.IndexingMetrics? metrics)
     {
@@ -32,6 +48,7 @@ public static class Redactor
         // Diagnostic messages can embed absolute paths, symbol names, and source text.
         // Keep the count for signal; drop the message bodies entirely.
         metrics.WorkspaceDiagnostics.Clear();
+        metrics.ReplaceProjects(Relabel(metrics.Projects));
 
         // FailureReason may contain a path or symbol; replace with a category.
         if (metrics.FailureReason != null)

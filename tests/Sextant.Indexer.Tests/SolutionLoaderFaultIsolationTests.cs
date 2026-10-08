@@ -166,6 +166,24 @@ public sealed class SolutionLoaderFaultIsolationTests
         Assert.AreEqual(0, deferred.Count);
     }
 
+    [TestMethod]
+    public async Task EachOpen_IsTimed_WithTheProjectsItAddedIncludingReferences()
+    {
+        // Issue #267: A pulls in B through a reference, so B is never opened itself; D fails and records no timing.
+        var projD = Path.Combine("repo", "D", "D.csproj");
+        var loader = new FakeProjectLoader(throwFor: [projD], alsoLoads: new() { [ProjA] = [ProjB] });
+        var timings = new List<ProjectTiming>();
+
+        await SolutionLoader.LoadProjectsIndividuallyAsync(
+            [ProjA, ProjB, ProjC, projD], loader, onDiagnostic: null, deadline: null, onProgress: null,
+            CancellationToken.None, timings);
+
+        CollectionAssert.AreEqual(new[] { "A.csproj", "C.csproj" }, timings.Select(t => t.Project).ToArray());
+        Assert.IsTrue(timings.All(t => t.Phase == "load" && t.WallMs >= 0));
+        Assert.AreEqual(2, timings[0].ProjectsAdded, "A and the reference it pulled in");
+        Assert.AreEqual(1, timings[1].ProjectsAdded);
+    }
+
     private sealed class FakeProjectLoader : SolutionLoader.IWorkspaceProjectLoader
     {
         private readonly AdhocWorkspace _workspace = new();

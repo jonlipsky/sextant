@@ -21,6 +21,8 @@
     <ProjectReference Include="..\..\src\Sextant.Core\Sextant.Core.csproj" />
     <ProjectReference Include="..\..\src\Sextant.Store\Sextant.Store.csproj" />
     <ProjectReference Include="..\..\src\Sextant.Indexer\Sextant.Indexer.csproj" />
+    <!-- Issue #267: the service-path mode restores through the service's PackageRestoreRunner. -->
+    <ProjectReference Include="..\..\src\Sextant.Service\Sextant.Service.csproj" />
   </ItemGroup>
 
   <ItemGroup>

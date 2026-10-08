@@ -49,6 +49,8 @@ inside the Sextant source tree. Generation is byte-for-byte deterministic.
 | `--document-extractor` | off | Use the Phase 5 document-oriented extractor (required to exercise the Phase 6 parallel pipeline). |
 | `--max-parallelism <n>` | `0` | Document-extractor analysis worker cap (`0` = auto: `min(cores, 8)`). Drive the parallelism sweep with `1`/`2`/`4`/`8`/`0`. |
 | `--machine <label>` | machine name | Machine label recorded in the report (cleared when redacted). |
+| `--service-path` | off | Load like the service (issue #267): `--path` is a checkout directory whose solutions are selected by `SolutionSelector`, restored by the service's `PackageRestoreRunner`, and loaded by `MultiSolutionLoader`, so several solutions take the union path. The report gains a `load` section (restore time, load mode, individual opens, BuildHost processes observed, slowest opens). |
+| `--catalog <db>` | — | Index into a copy of this existing catalog (SQLite online backup; the source is only read), so write cost against a large catalog is measurable. |
 
 ### Examples
 
@@ -62,6 +64,10 @@ dotnet run --project tests/Sextant.Benchmarks -- --corpus correctness --out ./be
 # Large synthetic solution.
 dotnet run --project tests/Sextant.Benchmarks -- --corpus large --large-projects 50 --out ./benchmark-results
 
+# The service's load path over a checkout (issue #267), into a copy of a production-sized catalog.
+dotnet run --project tests/Sextant.Benchmarks -c Release -- --corpus external --service-path \
+    --path /path/to/checkout --document-extractor --catalog /path/to/catalog.db --out ./benchmark-results
+
 # Private monorepo, redacted.
 dotnet run --project tests/Sextant.Benchmarks -- --corpus external --path /path/to/Big.sln --out ./benchmark-results
 ```
@@ -69,9 +75,15 @@ dotnet run --project tests/Sextant.Benchmarks -- --corpus external --path /path/
 ## What is measured
 
 ### Timing
+
 - `solution_load_ms` — time to load the Roslyn solution (excluded from the indexing total).
 - `total_duration_ms` — wall-clock time for indexing.
 - Per-phase `duration_ms` and `projects_processed`, in execution order, each with a terminal `status`.
+
+Every phase reports wall-clock `duration_ms`, `cpu_ms` (this process, all threads) and `child_cpu_ms` (child
+processes that exited during the phase, from `/proc/self/stat`; null elsewhere); `cpu_ms / duration_ms` is the
+parallelism the phase achieved (issue #267). `projects` lists per-project timings for the extraction phases:
+`compile_ms`, `analyze_ms`, `persist_ms` and `rows`. The Markdown report shows the ten slowest. Report schema `2`.
 
 ### Rows and duplication
 - `projects`, `symbols`, `references`, `relationships`, `call_graph_edges`, `comments`.
