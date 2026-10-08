@@ -60,6 +60,61 @@ public sealed class DefaultUnionSnapshotIntegrationTests : IDisposable
     }
 
     [TestMethod]
+    public async Task AUnionWhoseSolutionCannotBeWritten_LoadsProjectByProject()
+    {
+        var paths = new ServicePaths(ServiceVolumes.Rooted(_dataRoot));
+        var checkout = CreateCheckout(paths, includeUnloadableHead: false);
+        var notADirectory = Path.Combine(_dataRoot, "scratch-is-a-file");
+        File.WriteAllText(notADirectory, string.Empty);
+        var diagnostics = new List<string>();
+
+        var load = await MultiSolutionLoader.LoadAsync(
+            [Path.Combine(checkout, "App.slnx"), Path.Combine(checkout, "Build.Linux", "Tools-server.slnx")],
+            diagnostics.Add, scratchDirectory: notADirectory);
+
+        Assert.AreEqual(SolutionLoadModes.UnionPerProject, load.LoadMode, string.Join("\n", diagnostics));
+        Assert.IsTrue(diagnostics.Any(d => d.Contains("could not be written", StringComparison.Ordinal)),
+            string.Join("\n", diagnostics));
+        Assert.IsTrue(load.Solution.Projects.Any(p => p.Documents.Any()), "the union still loads");
+        Assert.IsEmpty(load.SkippedProjects);
+    }
+
+    [TestMethod]
+    public async Task AOnePassThatPullsInAHeldBackProject_LoadsTheUnionProjectByProject()
+    {
+        // Held reads $(SolutionDir), so it is held back. App references it through a path the partition cannot read
+        // statically, so App stays in the one pass, whose open then evaluates Held there too: the union falls back.
+        var paths = new ServicePaths(ServiceVolumes.Rooted(_dataRoot));
+        var root = Path.Combine(paths.CheckoutRoot, "pulled-in");
+        Write(root, "Held/Held.csproj", """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework><Marker>$(SolutionDir)</Marker></PropertyGroup>
+            </Project>
+            """);
+        Write(root, "Held/HeldType.cs", "namespace Pulled;\npublic class HeldType { }\n");
+        Write(root, "App/App.csproj", """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+              <ItemGroup><ProjectReference Include="$(MSBuildProjectDirectory)/../Held/Held.csproj" /></ItemGroup>
+            </Project>
+            """);
+        Write(root, "App/AppType.cs", "namespace Pulled;\npublic class AppType { public HeldType Held = new(); }\n");
+        Write(root, "A.slnx", "<Solution>\n  <Project Path=\"App/App.csproj\" />\n</Solution>\n");
+        Write(root, "B.slnx", "<Solution>\n  <Project Path=\"Held/Held.csproj\" />\n</Solution>\n");
+        Restore(Path.Combine(root, "App", "App.csproj"));
+        var diagnostics = new List<string>();
+
+        var load = await MultiSolutionLoader.LoadAsync(
+            [Path.Combine(root, "A.slnx"), Path.Combine(root, "B.slnx")], diagnostics.Add,
+            scratchDirectory: paths.AllocateScratch("job-pulled-in"));
+
+        Assert.AreEqual(SolutionLoadModes.UnionPerProject, load.LoadMode, string.Join("\n", diagnostics));
+        Assert.IsTrue(diagnostics.Any(d => d.Contains("pulled in 'Held.csproj'", StringComparison.Ordinal)),
+            string.Join("\n", diagnostics));
+        Assert.AreEqual(2, load.Solution.Projects.Count(p => p.Documents.Any()), "both projects still load");
+    }
+
+    [TestMethod]
     public async Task NoConfig_OverlappingSolutionsWithUnloadableHead_PublishesUnionOncePerTfm_PartialWithReason()
     {
         var paths = new ServicePaths(ServiceVolumes.Rooted(_dataRoot));

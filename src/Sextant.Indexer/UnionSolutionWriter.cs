@@ -196,9 +196,11 @@ internal static partial class UnionSolutionWriter
 
     /// <summary>
     /// The text of every file a project's evaluation reads statically: the project, the nearest
-    /// <c>Directory.Build.props</c> and <c>Directory.Build.targets</c> above it, and every file they import, with
-    /// <c>$(MSBuildThisFileDirectory)</c>, <c>$(MSBuildProjectDirectory)</c> and <c>GetPathOfFileAbove</c> resolved
-    /// (conditions ignored: any could apply). Null when an import cannot be resolved this way.
+    /// <c>Directory.Build.props</c>, <c>Directory.Build.targets</c> and <c>Directory.Packages.props</c> above it, and
+    /// every file they import, with <c>$(MSBuildThisFileDirectory)</c>, <c>$(MSBuildProjectDirectory)</c> and
+    /// <c>GetPathOfFileAbove</c> resolved (conditions ignored: any could apply). Null when an import cannot be resolved
+    /// this way. Not read: the build files NuGet packages contribute (through restore's <c>obj/*.nuget.g.*</c>), so a
+    /// package that reads <c>$(SolutionDir)</c> or names an <c>msbuild-sdks</c> pin is not detected.
     /// </summary>
     internal static string? EvaluationText(string projectPath)
     {
@@ -206,7 +208,7 @@ internal static partial class UnionSolutionWriter
         var projectDirectory = Path.GetDirectoryName(project)!;
         var pending = new Queue<string>();
         pending.Enqueue(project);
-        foreach (var name in new[] { "Directory.Build.props", "Directory.Build.targets" })
+        foreach (var name in new[] { "Directory.Build.props", "Directory.Build.targets", "Directory.Packages.props" })
             if (FindAbove(name, projectDirectory) is { } file)
                 pending.Enqueue(file);
 
