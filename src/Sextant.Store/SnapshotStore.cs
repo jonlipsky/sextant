@@ -637,6 +637,7 @@ public sealed class SnapshotStore(SqliteConnection connection)
     {
         using var cmd = connection.CreateCommand();
         cmd.CommandText = "UPDATE branches SET snapshot_id = @snap, updated_at = @now WHERE id = @id;";
+        ConsumeHandovers(branchId);
         cmd.Parameters.AddWithValue("@snap", (object?)snapshotId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@now", now);
         cmd.Parameters.AddWithValue("@id", branchId);
@@ -983,8 +984,34 @@ public sealed class SnapshotStore(SqliteConnection connection)
     /// Deletes a branch row (SVC-6 retire). Only the pointer row goes: the snapshots it pointed at stay in the
     /// catalog and are reclaimed by retention once nothing protects them. Returns true when a row was deleted.
     /// </summary>
+    // Issue #273: a branch-advance handover (SnapshotJobStore.RecordHandover) holds only until the branch head next moves
+    // or the branch is retired. Consuming it with the move, on the caller's connection and transaction, keeps a
+    // compare-and-swap exactly one link deep as serial processing would: a later reset of the branch can never revive it.
+    private void ConsumeHandovers(long branchId)
+    {
+        string remoteUrl, name;
+        using (var read = connection.CreateCommand())
+        {
+            read.CommandText = """
+                SELECT r.remote_url, b.name FROM branches b JOIN repositories r ON r.id = b.repository_id WHERE b.id = @id;
+                """;
+            read.Parameters.AddWithValue("@id", branchId);
+            using var reader = read.ExecuteReader();
+            if (!reader.Read())
+                return;
+            remoteUrl = reader.GetString(0);
+            name = reader.GetString(1);
+        }
+        using var delete = connection.CreateCommand();
+        delete.CommandText = "DELETE FROM branch_advance_handovers WHERE repository_key = @repo AND branch_name = @branch;";
+        delete.Parameters.AddWithValue("@repo", RemoteUrlIdentity.Normalize(remoteUrl));
+        delete.Parameters.AddWithValue("@branch", name);
+        delete.ExecuteNonQuery();
+    }
+
     public bool DeleteBranch(long branchId)
     {
+        ConsumeHandovers(branchId);
         using var cmd = connection.CreateCommand();
         cmd.CommandText = "DELETE FROM branches WHERE id = @id;";
         cmd.Parameters.AddWithValue("@id", branchId);

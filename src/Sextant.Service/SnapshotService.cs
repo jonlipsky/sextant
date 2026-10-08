@@ -520,9 +520,9 @@ public sealed partial class SnapshotService : IDisposable
     private const int MaxHandoverHops = 64;
 
     // Issue #273, under the write gate: a branch advance expecting a commit that is not the branch head but was coalesced
-    // on this branch (so it never became the head) expects what that commit's ensure expected instead, following the
-    // chain until it reaches the head or a commit that was not coalesced. Durable, so a successor retried after a
-    // requeue, a restart or a crash still advances the branch where serial processing would have.
+    // on this branch in its favour (so it never became the head, and the head has not moved since) expects what that
+    // commit's ensure expected instead. Durable, so a successor retried after a requeue, a restart or a crash still
+    // advances the branch where serial processing would have; consumed by the next head move, so nothing else can.
     private EnsureSnapshotRequest ResolveHandedOverExpectation(EnsureSnapshotRequest request)
     {
         if (!IsBranchAdvance(request))
@@ -534,10 +534,12 @@ public sealed partial class SnapshotService : IDisposable
             ? snapshots.GetBranchId(repoId, request.BranchName!)
             : null;
         var expected = request.ExpectedHeadCommit!;
+        var successor = request.CommitSha;
         for (var hop = 0; hop < MaxHandoverHops && !snapshots.BranchHeadMatches(branchId, expected); hop++)
         {
-            if (jobs.GetHandover(repositoryKey, request.BranchName!, expected) is not { } handedOver)
+            if (jobs.GetHandover(repositoryKey, request.BranchName!, expected, successor) is not { } handedOver)
                 break;
+            successor = expected;
             expected = handedOver;
         }
         return string.Equals(expected, request.ExpectedHeadCommit, StringComparison.Ordinal)
@@ -796,11 +798,22 @@ public sealed partial class SnapshotService : IDisposable
         EnsureSnapshotRequest request, SnapshotJobRow job, bool existed, AdvanceTicket supersededBy, AuditCaller principal)
     {
         var jobs = new SnapshotJobStore(_conn);
-        jobs.RecordHandover(RemoteUrlIdentity.Normalize(request.RepositoryRemoteUrl), request.BranchName!,
-            request.CommitSha, job.IdentityHash, request.ExpectedHeadCommit!, supersededBy.CommitSha);
-        jobs.MarkResult(job.Id, SnapshotJobStatus.Coalesced, snapshotId: null,
-            $"superseded while queued by commit {supersededBy.CommitSha} of branch '{request.BranchName}' " +
-            $"(identity {supersededBy.Hash}), which builds the branch's snapshot instead");
+        // One transaction (raw BEGIN IMMEDIATE so the store commands enrol): the handover never outlives a failed settle.
+        ExecRaw("BEGIN IMMEDIATE;");
+        try
+        {
+            jobs.RecordHandover(RemoteUrlIdentity.Normalize(request.RepositoryRemoteUrl), request.BranchName!,
+                request.CommitSha, request.ExpectedHeadCommit!, supersededBy.CommitSha);
+            jobs.MarkResult(job.Id, SnapshotJobStatus.Coalesced, snapshotId: null,
+                $"superseded while queued by commit {supersededBy.CommitSha} of branch '{request.BranchName}' " +
+                $"(identity {supersededBy.Hash}), which builds the branch's snapshot instead");
+            ExecRaw("COMMIT;");
+        }
+        catch
+        {
+            ExecRaw("ROLLBACK;");
+            throw;
+        }
         var result = Attach(jobs.GetJob(job.Id)!, existed);
         RecordEnsureAuditLocked(request, result, principal);
         return result;

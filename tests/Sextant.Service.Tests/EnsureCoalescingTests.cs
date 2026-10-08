@@ -153,6 +153,45 @@ public class EnsureCoalescingTests
     }
 
     [TestMethod]
+    public async Task AHandoverIsConsumedByTheNextHeadMove_SoAResetCannotReviveIt()
+    {
+        await SeedMainAt("commit-A");
+        var hold = Hold();
+        var b = Push("commit-B", expected: "commit-A");
+        var c = Push("commit-C", expected: "commit-B");
+        _release.Set();
+        await Task.WhenAll(hold, b, c);
+        Assert.AreEqual("commit-C", HeadCommit("main"));
+
+        // B stays unbuilt. main is reset to A, then C's push is redelivered (still expecting B). Serially its
+        // compare-and-swap against B fails, so main must stay at A.
+        await Push("commit-A", expected: "commit-C");
+        Assert.AreEqual("commit-A", HeadCommit("main"), "precondition: main was reset to A");
+        var redelivered = await Push("commit-C", expected: "commit-B");
+
+        Assert.IsFalse(redelivered.BranchAdvanced);
+        Assert.AreEqual("commit-A", HeadCommit("main"));
+    }
+
+    [TestMethod]
+    public async Task OnlyTheLinkedSuccessor_ResolvesAHandover()
+    {
+        await SeedMainAt("commit-A");
+        _transientFailures["commit-C"] = 1;
+        var hold = Hold();
+        var b = Push("commit-B", expected: "commit-A");
+        var c = Push("commit-C", expected: "commit-B");
+        _release.Set();
+        await Task.WhenAll(hold, b, c);
+        Assert.AreEqual(SnapshotJobStatus.Queued, (await c).Status, "precondition: C was requeued, so B's handover is unused");
+
+        var other = await Push("commit-E", expected: "commit-B");
+
+        Assert.IsFalse(other.BranchAdvanced, "a push that did not supersede B cannot take over its compare-and-swap");
+        Assert.AreEqual("commit-A", HeadCommit("main"));
+    }
+
+    [TestMethod]
     public async Task ASupersededPushSharingItsCommitWithAnotherPendingEnsure_IsProduced()
     {
         // The job row is per identity, not per branch: another branch's pending ensure of the same commit must see it built.

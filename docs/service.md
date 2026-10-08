@@ -1355,12 +1355,14 @@ is the waiting ensure's commit, the waiting ensure is **coalesced**:
   polled job reports `"status": "coalesced"`. The ensure is audited with outcome `coalesced`.
 - It records a durable **handover** (`branch_advance_handovers`, migration `029`): the coalesced commit never
   moves the branch head, so an ensure of that branch expecting it as the head expects what the coalesced ensure
-  expected instead. Every branch-advance ensure resolves handovers when its turn comes, following a chain
-  (B, then C, then D coalesce to D) until it reaches the branch head or a commit that was not coalesced. The
+  expected instead. Every branch-advance ensure resolves handovers when its turn comes, so a chain (B, then C,
+  then D) coalesces to D. The
   branch therefore ends exactly where building every push in order would have left it, while only the newest
   commit is built. Because the handover is durable, a successor that is requeued, re-sent, or re-submitted
-  after a restart still resolves it. A handover applies only while the coalesced commit's job is still
-  `coalesced` (once that commit is built it may have moved the head), and is dropped after 30 days.
+  after a restart still resolves it. Only the push that superseded the coalesced one resolves its handover,
+  and the handover is **consumed** the next time the branch head moves (or the branch is retired), so a later
+  reset of the branch can never revive it: a compare-and-swap stays exactly one link deep, as serially. An
+  unconsumed handover is dropped after 30 days.
 - Whether an ensure coalesces is decided at its turn, not at submission. A superseded ensure whose commit is
   already built still attaches at no cost and advances the branch (it records no handover); one whose commit
   another pending ensure (of another branch) also needs is produced; one that has started producing always
