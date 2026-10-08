@@ -1353,15 +1353,21 @@ is the waiting ensure's commit, the waiting ensure is **coalesced**:
 - When its turn comes it does not run the worker. Its job settles as `coalesced`, with no snapshot and a
   `last_error` naming the commit that superseded it. A blocking ensure returns `200` with that result; a
   polled job reports `"status": "coalesced"`. The ensure is audited with outcome `coalesced`.
-- The newer ensure takes over the coalesced one's compare-and-swap: it expects what the coalesced ensure
-  expected, because the coalesced commit never moved the branch head. The branch therefore ends exactly where
-  building every push in order would have left it, while only the newest commit is built. A chain of queued
-  pushes (B, then C, then D) coalesces to the newest one.
+- It records a durable **handover** (`branch_advance_handovers`, migration `029`): the coalesced commit never
+  moves the branch head, so an ensure of that branch expecting it as the head expects what the coalesced ensure
+  expected instead. Every branch-advance ensure resolves handovers when its turn comes, following a chain
+  (B, then C, then D coalesce to D) until it reaches the branch head or a commit that was not coalesced. The
+  branch therefore ends exactly where building every push in order would have left it, while only the newest
+  commit is built. Because the handover is durable, a successor that is requeued, re-sent, or re-submitted
+  after a restart still resolves it. A handover applies only while the coalesced commit's job is still
+  `coalesced` (once that commit is built it may have moved the head), and is dropped after 30 days.
+- Whether an ensure coalesces is decided at its turn, not at submission. A superseded ensure whose commit is
+  already built still attaches at no cost and advances the branch (it records no handover); one whose commit
+  another pending ensure (of another branch) also needs is produced; one that has started producing always
+  runs to completion.
 - Only a **linked** successor supersedes. A push of the same branch that expects some other commit (an
   out-of-order or unrelated push), a push of another branch, an unguarded ensure, `branch_update: none`, a
-  `branch_head_sequence` ensure and a rebuild are never coalesced and never supersede anything. An identity
-  that is already terminal is still attached at no cost, and an ensure that has started producing always
-  runs to completion.
+  `branch_head_sequence` ensure and a rebuild are never coalesced and never supersede anything.
 - `coalesced` is **settled but not terminal**. It is not an outcome: it counts toward neither the success
   nor the completeness rate (`sextant_jobs_coalesced` counts these jobs). A later ensure of the same commit
   produces it under the same job id.

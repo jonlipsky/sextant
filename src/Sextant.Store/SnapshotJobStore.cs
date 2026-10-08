@@ -342,6 +342,67 @@ public sealed class SnapshotJobStore(SqliteConnection connection)
         cmd.ExecuteNonQuery();
     }
 
+    /// <summary>How long a branch-advance handover (issue #273) is kept: a successor retried later than this no longer resolves it.</summary>
+    public static readonly TimeSpan HandoverRetention = TimeSpan.FromDays(30);
+
+    /// <summary>
+    /// Records that the ensure of <paramref name="coalescedCommit"/> on <paramref name="branchName"/> was coalesced (issue
+    /// #273): it never moves the branch head, so an ensure expecting it as the head must expect
+    /// <paramref name="expectedHeadCommit"/> instead, for as long as the job of <paramref name="coalescedIdentity"/> stays
+    /// coalesced. <paramref name="repositoryKey"/> is the normalized repository URL. Replaces an earlier record for the
+    /// same commit, and drops records older than <see cref="HandoverRetention"/>.
+    /// </summary>
+    public void RecordHandover(
+        string repositoryKey, string branchName, string coalescedCommit, string coalescedIdentity, string expectedHeadCommit,
+        string successorCommit)
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            DELETE FROM branch_advance_handovers WHERE recorded_at < @cutoff;
+            INSERT INTO branch_advance_handovers
+                (repository_key, branch_name, coalesced_commit, coalesced_identity, expected_head_commit, successor_commit,
+                 recorded_at)
+            VALUES (@repo, @branch, @commit, @identity, @expected, @successor, @now)
+            ON CONFLICT(repository_key, branch_name, coalesced_commit) DO UPDATE SET
+                coalesced_identity = excluded.coalesced_identity,
+                expected_head_commit = excluded.expected_head_commit,
+                successor_commit = excluded.successor_commit,
+                recorded_at = excluded.recorded_at;
+            """;
+        cmd.Parameters.AddWithValue("@cutoff", now - (long)HandoverRetention.TotalMilliseconds);
+        cmd.Parameters.AddWithValue("@repo", repositoryKey);
+        cmd.Parameters.AddWithValue("@branch", branchName);
+        cmd.Parameters.AddWithValue("@commit", coalescedCommit.ToLowerInvariant());
+        cmd.Parameters.AddWithValue("@identity", coalescedIdentity);
+        cmd.Parameters.AddWithValue("@expected", expectedHeadCommit);
+        cmd.Parameters.AddWithValue("@successor", successorCommit);
+        cmd.Parameters.AddWithValue("@now", now);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// The head commit an ensure expecting <paramref name="commit"/> on the branch must expect instead, because that
+    /// commit's ensure was coalesced there (issue #273); null when it was not, or when that commit's job has since left
+    /// <see cref="SnapshotJobStatus.Coalesced"/> (it was built, and may have moved the head).
+    /// </summary>
+    public string? GetHandover(string repositoryKey, string branchName, string commit)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT h.expected_head_commit
+            FROM branch_advance_handovers h
+            JOIN snapshot_jobs j ON j.identity_hash = h.coalesced_identity
+            WHERE h.repository_key = @repo AND h.branch_name = @branch AND h.coalesced_commit = @commit
+              AND j.status = @coalesced;
+            """;
+        cmd.Parameters.AddWithValue("@coalesced", SnapshotJobStatus.Coalesced);
+        cmd.Parameters.AddWithValue("@repo", repositoryKey);
+        cmd.Parameters.AddWithValue("@branch", branchName);
+        cmd.Parameters.AddWithValue("@commit", commit.ToLowerInvariant());
+        return cmd.ExecuteScalar() as string;
+    }
+
     /// <summary>A job's recorded timings JSON (issue #267), or null when none was recorded.</summary>
     public string? GetTimings(long jobId)
     {

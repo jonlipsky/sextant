@@ -20,12 +20,12 @@ public class SnapshotJobTimingsTests
     public void Migration028_IsIdentityNeutral_AndCreatesTheTelemetryTable()
     {
         Assert.Contains(28, IndexDatabase.IdentityNeutralMigrations);
-        Assert.Contains("snapshot_job_timings", IndexDatabase.JobTelemetryTables);
+        Assert.Contains("snapshot_job_timings", IndexDatabase.ServiceJobTables);
         Assert.AreEqual(26, IndexDatabase.SnapshotSchemaVersion, "adding job telemetry re-indexes nothing");
 
         using var db = new IndexDatabase(_dbPath);
         db.RunMigrations();
-        Assert.AreEqual(28, db.CurrentSchemaVersion);
+        Assert.AreEqual(IndexDatabase.LatestSchemaVersion, db.CurrentSchemaVersion);
     }
 
     [TestMethod]

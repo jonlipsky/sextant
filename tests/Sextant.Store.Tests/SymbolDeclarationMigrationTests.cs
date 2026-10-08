@@ -40,7 +40,7 @@ public class SymbolDeclarationMigrationTests
     {
         Assert.IsFalse(IndexDatabase.IdentityNeutralMigrations.Contains(26), "026 changes what the indexer stores");
         Assert.AreEqual(26, IndexDatabase.SnapshotSchemaVersion);
-        Assert.AreEqual(28, IndexDatabase.LatestSchemaVersion);
+        Assert.AreEqual(29, IndexDatabase.LatestSchemaVersion);
     }
 
     [TestMethod]
@@ -64,7 +64,7 @@ public class SymbolDeclarationMigrationTests
         using (var db = new IndexDatabase(_dbPath))
         {
             db.RunMigrations();
-            Assert.AreEqual(28, db.CurrentSchemaVersion);
+            Assert.AreEqual(29, db.CurrentSchemaVersion);
             Assert.IsNotNull(new IndexRunStore(db.GetConnection()).GetLastCompleteRun(), "026 keeps index_runs");
 
             var symbol = new SymbolStore(db.GetConnection()).GetById(symbolId);

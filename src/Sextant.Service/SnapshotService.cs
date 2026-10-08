@@ -76,8 +76,9 @@ public sealed partial class SnapshotService : IDisposable
     private PendingRetire? _pendingRetire;
 
     // Issue #273: the latest admitted branch-advance ensure per (repository, branch), guarded by _inFlightLock. When a
-    // newer one is admitted while the previous one is still waiting for its turn, the previous one is superseded: it is
-    // settled as coalesced at its turn instead of producing, and the newer one takes over its compare-and-swap.
+    // newer linked one is admitted while the previous one is still waiting for its turn, the previous one is superseded:
+    // it is settled as coalesced at its turn instead of producing, and records a durable handover of its
+    // compare-and-swap that the newer one resolves at its own turn (ResolveHandedOverExpectation).
     private readonly Dictionary<string, AdvanceTicket> _latestAdvance = new(StringComparer.Ordinal);
     private readonly JobIdReservations _jobIds;
     private readonly Dictionary<string, int> _pendingEnsures = new(StringComparer.Ordinal);
@@ -487,34 +488,61 @@ public sealed partial class SnapshotService : IDisposable
 
     // Issue #273: registers a branch-advance ensure guarded by expected_head_commit (what a repository push sends) as
     // its branch's latest, superseding the previous one when that one is still waiting for its turn and this one expects
-    // its commit as the head. The previous one's compare-and-swap is carried over (a push of Z after Y expects Y, which then never
-    // publishes, so Z must expect what Y expected), so the pointer still advances safely. Any other ensure (no branch,
-    // branch_update none, a head-sequence guard, a rebuild) is never superseded and supersedes nothing. The caller
-    // holds _inFlightLock.
+    // its commit as the head. Nothing about the newer ensure changes here: whether the previous one really coalesces is
+    // only known at its turn (it may attach an already-built identity and advance the branch instead), and only then
+    // does it record the handover. Any other ensure (no branch, branch_update none, a head-sequence guard, a rebuild)
+    // is never superseded and supersedes nothing. The caller holds _inFlightLock.
     private AdvanceTicket? AdmitAdvanceLocked(EnsureSnapshotRequest request, string hash)
     {
-        if (request.BranchName is not { Length: > 0 } branch || request.SuppressesBranchUpdate
-            || request.ExpectedHeadCommit is null || request.BranchHeadSequence is not null
-            || request.RebuildGeneration is not null)
+        if (!IsBranchAdvance(request))
             return null;
 
-        var key = RemoteUrlIdentity.Normalize(request.RepositoryRemoteUrl) + "\n" + branch;
-        var ticket = new AdvanceTicket
-        {
-            BranchKey = key, Hash = hash, CommitSha = request.CommitSha, ExpectedHeadCommit = request.ExpectedHeadCommit
-        };
+        var key = RemoteUrlIdentity.Normalize(request.RepositoryRemoteUrl) + "\n" + request.BranchName;
+        var ticket = new AdvanceTicket { BranchKey = key, Hash = hash, CommitSha = request.CommitSha };
         // Only a linked successor supersedes: one that expects exactly the waiting commit as the branch head (the push
         // of Z after Y sends before=Y). Any other expectation (an out-of-order or unrelated push) leaves both to run in
         // order, so the branch ends exactly where serial processing would leave it.
         if (_latestAdvance.TryGetValue(key, out var previous) && !previous.Started
             && !string.Equals(previous.Hash, hash, StringComparison.Ordinal)
-            && string.Equals(ticket.ExpectedHeadCommit, previous.CommitSha, StringComparison.OrdinalIgnoreCase))
-        {
+            && string.Equals(request.ExpectedHeadCommit, previous.CommitSha, StringComparison.OrdinalIgnoreCase))
             previous.SupersededBy = ticket;
-            ticket.ExpectedHeadCommit = previous.ExpectedHeadCommit;
-        }
         _latestAdvance[key] = ticket;
         return ticket;
+    }
+
+    // Issue #273: an ensure that advances its named branch under an expected_head_commit compare-and-swap, the shape a
+    // repository push sends. Only these coalesce, supersede, or resolve a handover.
+    private static bool IsBranchAdvance(EnsureSnapshotRequest request) =>
+        request.BranchName is { Length: > 0 } && !request.SuppressesBranchUpdate && request.ExpectedHeadCommit is not null
+        && request.BranchHeadSequence is null && request.RebuildGeneration is null;
+
+    // Issue #273: the most handovers one resolution follows, bounding a cycle (a branch reset back and forth).
+    private const int MaxHandoverHops = 64;
+
+    // Issue #273, under the write gate: a branch advance expecting a commit that is not the branch head but was coalesced
+    // on this branch (so it never became the head) expects what that commit's ensure expected instead, following the
+    // chain until it reaches the head or a commit that was not coalesced. Durable, so a successor retried after a
+    // requeue, a restart or a crash still advances the branch where serial processing would have.
+    private EnsureSnapshotRequest ResolveHandedOverExpectation(EnsureSnapshotRequest request)
+    {
+        if (!IsBranchAdvance(request))
+            return request;
+        var snapshots = new SnapshotStore(_conn);
+        var jobs = new SnapshotJobStore(_conn);
+        var repositoryKey = RemoteUrlIdentity.Normalize(request.RepositoryRemoteUrl);
+        var branchId = snapshots.GetRepositoryId(request.RepositoryRemoteUrl) is long repoId
+            ? snapshots.GetBranchId(repoId, request.BranchName!)
+            : null;
+        var expected = request.ExpectedHeadCommit!;
+        for (var hop = 0; hop < MaxHandoverHops && !snapshots.BranchHeadMatches(branchId, expected); hop++)
+        {
+            if (jobs.GetHandover(repositoryKey, request.BranchName!, expected) is not { } handedOver)
+                break;
+            expected = handedOver;
+        }
+        return string.Equals(expected, request.ExpectedHeadCommit, StringComparison.Ordinal)
+            ? request
+            : request with { ExpectedHeadCommit = expected };
     }
 
     // One ensure of the identity has finished (the caller holds _inFlightLock). When it was the identity's last, no
@@ -698,19 +726,21 @@ public sealed partial class SnapshotService : IDisposable
             granted = true;
             EnsureLeaseHeld();
 
-            // Issue #273: from its turn on this ensure can no longer be superseded. Take any compare-and-swap a
-            // superseded predecessor handed over, and whether a newer commit of the branch superseded this one.
+            // Issue #273: from its turn on this ensure can no longer be superseded. It coalesces only when a newer
+            // commit of the branch superseded it AND it is the only pending ensure of its identity (another branch's
+            // ensure of the same commit shares the job row and must see it produced). Then take over the
+            // compare-and-swap of any predecessor that was coalesced on this branch.
             AdvanceTicket? supersededBy = null;
             if (ticket is not null)
             {
                 lock (_inFlightLock)
                 {
                     ticket.Started = true;
-                    supersededBy = ticket.SupersededBy;
-                    if (!string.Equals(request.ExpectedHeadCommit, ticket.ExpectedHeadCommit, StringComparison.Ordinal))
-                        request = request with { ExpectedHeadCommit = ticket.ExpectedHeadCommit };
+                    if (_pendingEnsures.GetValueOrDefault(hash) == 1)
+                        supersededBy = ticket.SupersededBy;
                 }
             }
+            request = ResolveHandedOverExpectation(request);
 
             if (inFlight is not null)
             {
@@ -760,12 +790,14 @@ public sealed partial class SnapshotService : IDisposable
     }
 
     // Settles a superseded ensure as coalesced (issue #273), under the write gate: the job records the commit that
-    // superseded it, and the ensure is audited. A later ensure of the same identity produces it (coalesced is settled,
-    // not terminal).
+    // superseded it, the branch records the handover of its compare-and-swap (the successor resolves it at its turn),
+    // and the ensure is audited. A later ensure of the same identity produces it (coalesced is settled, not terminal).
     private EnsureSnapshotResult CoalesceLocked(
         EnsureSnapshotRequest request, SnapshotJobRow job, bool existed, AdvanceTicket supersededBy, AuditCaller principal)
     {
         var jobs = new SnapshotJobStore(_conn);
+        jobs.RecordHandover(RemoteUrlIdentity.Normalize(request.RepositoryRemoteUrl), request.BranchName!,
+            request.CommitSha, job.IdentityHash, request.ExpectedHeadCommit!, supersededBy.CommitSha);
         jobs.MarkResult(job.Id, SnapshotJobStatus.Coalesced, snapshotId: null,
             $"superseded while queued by commit {supersededBy.CommitSha} of branch '{request.BranchName}' " +
             $"(identity {supersededBy.Hash}), which builds the branch's snapshot instead");
@@ -2579,9 +2611,6 @@ internal sealed class AdvanceTicket
     public required string BranchKey { get; init; }
     public required string Hash { get; init; }
     public required string CommitSha { get; init; }
-
-    /// <summary>The compare-and-swap this ensure applies: its own, or one a superseded predecessor handed over.</summary>
-    public required string? ExpectedHeadCommit { get; set; }
 
     /// <summary>Set once its turn is granted: from then on it is produced (or attached), never superseded.</summary>
     public bool Started { get; set; }

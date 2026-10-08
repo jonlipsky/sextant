@@ -215,20 +215,20 @@ public sealed class IndexDatabase : IDisposable
 
     /// <summary>
     /// Migrations that change nothing a snapshot contains: they only create or drop indexes (issues #196 and #256), or
-    /// create a <see cref="JobTelemetryTables">job-telemetry table</see> and its indexes (issue #267). They change no
+    /// create a <see cref="ServiceJobTables">service job table</see> and its indexes (issues #267 and #273). They change no
     /// table or row the indexer writes, so snapshots remain identical and do not advance
     /// <see cref="SnapshotSchemaVersion"/>. Before 025 every migration advanced the snapshot schema (023 is an
     /// index-only migration that did), and those identities are left as they are.
     /// </summary>
     public static IReadOnlySet<int> IdentityNeutralMigrations { get; } =
-        new HashSet<int> { 25, 27, 28 };
+        new HashSet<int> { 25, 27, 28, 29 };
 
     /// <summary>
-    /// Tables that hold job telemetry only (issue #267): written by the service about its jobs, never read or written
-    /// by the indexer, and never part of a snapshot. Creating one is identity-neutral.
+    /// Tables the service keeps about its jobs only: job telemetry (issue #267) and branch-advance handovers (issue
+    /// #273). Never read or written by the indexer, and never part of a snapshot. Creating one is identity-neutral.
     /// </summary>
-    public static IReadOnlySet<string> JobTelemetryTables { get; } =
-        new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "snapshot_job_timings" };
+    public static IReadOnlySet<string> ServiceJobTables { get; } =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "snapshot_job_timings", "branch_advance_handovers" };
 
     /// <summary>
     /// The schema version folded into a snapshot's identity (<c>SnapshotIdentity.SchemaVersion</c>) and compared by
