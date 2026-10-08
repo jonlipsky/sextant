@@ -303,6 +303,44 @@ before it is written:
 Because every other field is an aggregate number, a redacted report contains no absolute paths,
 repository names, symbol names, or source snippets. `redacted: true` marks such reports.
 
+## Indexing-performance baseline (issue #267)
+
+The starting point for the indexing-performance initiative (#266, `specs/20261007-indexing-performance/`):
+elevenworks/ProcessStack at `3a82c57b1` (192 projects across 4 selected solutions, ~1.48 M lines including the
+MixAndMatch submodule) on cloudserver1 (Debian 13 arm64 VM, 14 vCPUs, 31 GB). The compile floor on the same host is
+`dotnet restore` 41 s + `dotnet build no-macos.slnx` 233 s.
+
+Harness, `--service-path --document-extractor`, fresh database, cold package cache. The live service kept indexing the
+nightly reconcile's queue throughout (median 1.2 cores, peaks to 17; CPU steal median 5%, max 27%):
+
+```bash
+dotnet run --project tests/Sextant.Benchmarks -c Release -- --corpus self --service-path \
+    --path /path/to/ProcessStack --document-extractor --out ./benchmark-results
+```
+
+| Phase | Wall time | Cores (CPU ÷ wall) | Production job 359, same commit |
+|---|--:|--:|--:|
+| Restore (4 solutions, per-solution fallback) | 80 s | — | 82 s |
+| Load (union: 127 individual opens, 192 projects) | **1,031 s** | ~1 (one BuildHost at a time) | 912 s |
+| `extracting_symbols` | **499 s** | **1.3** | 447 s |
+| `extracting_occurrences` | 211 s | 5.0 | 171 s |
+| Other indexer phases | 14 s | ~1 | |
+
+The harness reproduces production's union load within 13% (acceptance criterion 2 of #267), and both are far from
+the compile floor. What the per-project timings add:
+
+- **Load:** the slowest opens take 13–17 s each, whether they pull in references (`ProcessStack.Api.csproj`: 17 s, 14
+  projects added) or only themselves (most test projects: one project, 13–16 s). The cost is per open, not per
+  project evaluated. The sampler observed 254 BuildHost processes, at most one at a time; it samples every 250 ms, so
+  shorter-lived processes are missed and the true count is likely higher (a 1 s poll of production saw about 1.1
+  launches per second).
+- **Symbols:** single-threaded, and dominated by **analysis, not compilation**: `ProcessStack.WebClient.Tests`
+  compiled in 7.3 s and spent 68.8 s in the symbol walk; `ProcessStack.Api.Tests` 6.3 s and 45.0 s.
+- **Occurrences:** about five cores; persistence (the single consumer) is 5–10 s of the slowest projects' 29–35 s.
+
+The service records the same numbers for every job (`GET /control/status/{job}` → `timings`, and `phase_latency` in
+`/control/metrics`), so production can be compared directly after each phase ships.
+
 ## Correctness fixtures and CI
 
 `tests/Sextant.Benchmarks.Tests` runs under the normal test command and validates the harness
