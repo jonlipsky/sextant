@@ -201,6 +201,76 @@ public sealed class BenchmarkRunIntegrationTests
         public void Report(IndexingProgress value) => cts.Cancel();
     }
 
+    [TestMethod]
+    public async Task ServicePath_TwoSolutions_LoadAsTheServiceDoes_AndRecordTheLoad()
+    {
+        // Issue #267: --service-path selects, restores and loads like the service worker; two solutions in the
+        // checkout make the default selection a union, so projects are opened individually.
+        var root = NewTempDir("service-path");
+        var work = NewTempDir("service-path-work");
+        try
+        {
+            var slnx = CorpusGenerator.GenerateCorrectnessCorpus(root);
+            File.Copy(slnx, Path.Combine(Path.GetDirectoryName(slnx)!, "Second.slnx"));
+
+            var report = await BenchmarkRunner.RunAsync(new BenchmarkOptions
+            {
+                Corpus = "correctness", SolutionPath = Path.GetDirectoryName(slnx), WorkDir = work,
+                ServicePath = true, UseDocumentExtractor = true, SampleIntervalMs = 20
+            });
+
+            var full = report.FullIndex!;
+            Assert.AreEqual(IndexRunStatus.Completed, full.Status, full.FailureReason);
+            var load = report.Load!;
+            Assert.AreEqual(SolutionLoadModes.Union, load.Mode);
+            Assert.AreEqual(2, load.SolutionsSelected);
+            Assert.IsGreaterThan(0, load.ProjectsOpened);
+            Assert.AreEqual(load.WallMs, full.SolutionLoadMs);
+            if (OperatingSystem.IsLinux())
+                Assert.IsGreaterThan(0, load.BuildHosts!.Launches);
+            Assert.IsGreaterThan(0L, full.Phases.Single(p => p.Name == "extracting_symbols").CpuMs,
+                "the symbol phase does real work, so it has measured CPU time");
+            Assert.IsTrue(full.Projects.Any(p => p.Phase == "extracting_symbols"));
+            Assert.IsTrue(full.Projects.Any(p => p.Phase == "extracting_occurrences"));
+        }
+        finally
+        {
+            TryDelete(root);
+            TryDelete(work);
+        }
+    }
+
+    [TestMethod]
+    public async Task Catalog_IndexesIntoACopy_AndLeavesTheSourceUntouched()
+    {
+        var work = NewTempDir("catalog");
+        var source = Path.Combine(NewTempDir("catalog-source"), "catalog.db");
+        try
+        {
+            using (var seed = new IndexDatabase(source))
+            {
+                seed.RunMigrations();
+                seed.Checkpoint();
+            }
+            var before = File.ReadAllBytes(source);
+
+            var report = await BenchmarkRunner.RunAsync(new BenchmarkOptions
+            {
+                Corpus = "self", SolutionPath = _sharedSlnx, WorkDir = work, CatalogPath = source,
+                Restore = false, SampleIntervalMs = 20
+            });
+
+            Assert.AreEqual(IndexRunStatus.Completed, report.FullIndex!.Status, report.FullIndex.FailureReason);
+            Assert.IsGreaterThan(0L, report.FullIndex.Rows.Symbols, "the run wrote into the copy");
+            CollectionAssert.AreEqual(before, File.ReadAllBytes(source), "the source catalog is only read");
+        }
+        finally
+        {
+            TryDelete(work);
+            TryDelete(Path.GetDirectoryName(source)!);
+        }
+    }
+
     private static string NewTempDir(string tag)
     {
         var dir = Path.Combine(Path.GetTempPath(), $"sextant-bench-{tag}-" + Guid.NewGuid().ToString("N"));

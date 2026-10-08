@@ -200,11 +200,26 @@ public sealed class LocalIndexerSnapshotWorker(
     public async Task<SnapshotWorkResult> ProduceAsync(
         EnsureSnapshotRequest request, string identityHash, string scratchDir, CancellationToken cancellationToken)
     {
+        // Issue #267: every result the worker returns, failures included, carries where the job's time went.
+        var timings = new JobTimingsRecorder();
+        var result = await ProduceCoreAsync(request, identityHash, scratchDir, timings, cancellationToken)
+            .ConfigureAwait(false);
+        return result with { Timings = timings.Build() };
+    }
+
+    private async Task<SnapshotWorkResult> ProduceCoreAsync(
+        EnsureSnapshotRequest request, string identityHash, string scratchDir, JobTimingsRecorder timings,
+        CancellationToken cancellationToken)
+    {
         // Repair any checkout an interrupted job left with a neutralized SDK pin BEFORE the provider decides to
         // reuse a cached checkout (reuse only checks HEAD, never the working tree).
         _sdkPinGuard.RecoverAll();
 
-        if (!checkoutProvider.TryResolve(request, out var resolution))
+        bool resolved;
+        CheckoutResolution resolution;
+        using (timings.Phase(IndexPhaseNames.Checkout))
+            resolved = checkoutProvider.TryResolve(request, out resolution);
+        if (!resolved)
         {
             return SnapshotWorkResult.Unsupported(
                 $"No provisioned checkout with a solution found for '{request.RepositoryRemoteUrl}'. " +
@@ -255,7 +270,9 @@ public sealed class LocalIndexerSnapshotWorker(
             // this worker lacks) would fail the BuildHost before any project evaluates. Neutralize ONLY such
             // pins for the load, and put the committed bytes back before anything else reads the checkout —
             // coverage scan, EvaluationFingerprint, indexing — so the published checkout never diverges.
-            var pinOverlay = _sdkPinGuard.Apply(checkoutDir, resolution.SelectedSolutions);
+            SdkPinOverlay pinOverlay;
+            using (timings.Phase(IndexPhaseNames.SdkPin))
+                pinOverlay = _sdkPinGuard.Apply(checkoutDir, resolution.SelectedSolutions);
             pinState.Overlay = pinOverlay;
             MultiSolutionLoadResult load;
             PackageRestoreOutcome restore;
@@ -263,19 +280,29 @@ public sealed class LocalIndexerSnapshotWorker(
             {
                 // Restore BEFORE the load and while an unsatisfiable SDK pin is still neutralized, so the restore
                 // resolves the same SDK the load will. A failed or partial restore never fails the job.
-                restore = await _packageRestore.RunAsync(
-                        checkoutDir, resolution.SelectedSolutions, plan?.RestoreLimit, token, scratchDir)
-                    .ConfigureAwait(false);
+                using (timings.Phase(IndexPhaseNames.Restore))
+                {
+                    restore = await _packageRestore.RunAsync(
+                            checkoutDir, resolution.SelectedSolutions, plan?.RestoreLimit, token, scratchDir)
+                        .ConfigureAwait(false);
+                }
 
                 // Load the DETERMINISTIC selected solution set into ONE workspace (union of projects,
                 // de-duplicated by project path/identity). A single selected solution keeps the byte-identical
                 // whole-solution fast path; multiple solutions — an explicit list, or the no-config default
                 // union of every discovered solution (#124) — aggregate into one repository snapshot (#109).
                 // Under a time budget the union load stops opening projects at its deadline.
-                load = await MultiSolutionLoader.LoadAsync(
-                    resolution.SelectedSolutions, log,
-                    deadline: plan?.LoadDeadline(_clock.GetUtcNow()), onProgress: log, cancellationToken: token)
-                    .ConfigureAwait(false);
+                // Issue #267: count the BuildHost processes the load starts, and their memory, which the sandbox's
+                // own memory watchdog cannot see.
+                using (timings.Phase(IndexPhaseNames.Load))
+                using (var buildHosts = new ChildProcessSampler(ChildProcessSampler.BuildHostMarker))
+                {
+                    load = await MultiSolutionLoader.LoadAsync(
+                        resolution.SelectedSolutions, log,
+                        deadline: plan?.LoadDeadline(_clock.GetUtcNow()), onProgress: log, cancellationToken: token)
+                        .ConfigureAwait(false);
+                    timings.RecordLoad(load, buildHosts.Stop());
+                }
             }
             finally
             {
@@ -311,13 +338,19 @@ public sealed class LocalIndexerSnapshotWorker(
             // all known BEFORE indexing — so it rides on the snapshot context and is recorded in the SAME
             // transaction that publishes the snapshot. The same inventory yields each Phase-12 provider
             // subtree's own verdict (issue #162), recorded when the orchestrator publishes that provider.
-            var inventory = SnapshotCoverageBuilder.Inventory.Scan(checkoutDir);
-            var pinOverrides = pins.Where(p => p.OverrideApplied).Select(p => p.ToCoverageOverride()).ToList();
-            var coverage = SnapshotCoverageBuilder.Build(checkoutDir, resolution, load, inventory, pinOverrides);
-            coverage = coverage with { Coverage = SnapshotCoverageBuilder.WithRestoreOutcome(coverage.Coverage, restore) };
-            var providerCoverage = SnapshotCoverageBuilder.BuildProviders(
-                    checkoutDir, resolution, load, inventory, pinOverrides, plan?.Budget)
-                .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
+            List<Sextant.Core.SdkPinOverride> pinOverrides;
+            SnapshotCoverageBuilder.Result coverage;
+            Dictionary<string, SnapshotCoverage> providerCoverage;
+            using (timings.Phase(IndexPhaseNames.CoverageScan))
+            {
+                var inventory = SnapshotCoverageBuilder.Inventory.Scan(checkoutDir);
+                pinOverrides = pins.Where(p => p.OverrideApplied).Select(p => p.ToCoverageOverride()).ToList();
+                coverage = SnapshotCoverageBuilder.Build(checkoutDir, resolution, load, inventory, pinOverrides);
+                coverage = coverage with { Coverage = SnapshotCoverageBuilder.WithRestoreOutcome(coverage.Coverage, restore) };
+                providerCoverage = SnapshotCoverageBuilder.BuildProviders(
+                        checkoutDir, resolution, load, inventory, pinOverrides, plan?.Budget)
+                    .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
+            }
             AddProviderRestoreGaps(providerCoverage, restore);
             var indexContext = context with
             {
@@ -337,9 +370,19 @@ public sealed class LocalIndexerSnapshotWorker(
                 SourceTexts = sourceTexts
             };
 
-            await orchestrator.IndexSolutionAsync(
-                load.Solution, progress: null, metrics: null, cancellationToken: token,
-                snapshotContext: indexContext, solutionMembership: load.Membership).ConfigureAwait(false);
+            // Timings only: the catalog-wide row count after publishing is the benchmark harness's, not the service's.
+            var indexing = new IndexingMetrics { Mode = "full", CollectRowCounts = false };
+            var indexWatch = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                await orchestrator.IndexSolutionAsync(
+                    load.Solution, progress: null, metrics: indexing, cancellationToken: token,
+                    snapshotContext: indexContext, solutionMembership: load.Membership).ConfigureAwait(false);
+            }
+            finally
+            {
+                timings.RecordIndexing(indexing, indexWatch.ElapsedMilliseconds);
+            }
 
             var published = new SnapshotStore(database.GetConnection()).GetByIdentityHash(identityHash);
             if (published is not { Status: SnapshotStatus.Complete })

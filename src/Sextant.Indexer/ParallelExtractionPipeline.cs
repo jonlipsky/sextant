@@ -13,7 +13,14 @@ public sealed record ProjectExtraction<TDoc>(long OwnerProjectId, string Name, I
 /// One project's fully-merged, deterministically-ordered contribution set, ready for the single
 /// writer to resolve and persist.
 /// </summary>
-public sealed record ProjectContributions(long OwnerProjectId, string Name, DocumentContributionSet Contributions);
+public sealed record ProjectContributions(long OwnerProjectId, string Name, DocumentContributionSet Contributions)
+{
+    /// <summary>Time the producer spent materializing the project (its compilation and documents), in milliseconds.</summary>
+    public long CompileMs { get; init; }
+
+    /// <summary>Time the producer spent analyzing and merging the project's documents, in milliseconds.</summary>
+    public long AnalyzeMs { get; init; }
+}
 
 /// <summary>
 /// A bounded producer → single-consumer pipeline for the document-oriented extractor. Analysis
@@ -97,11 +104,17 @@ public static class ParallelExtractionPipeline
             foreach (var makeProject in projects)
             {
                 token.ThrowIfCancellationRequested();
+                var watch = System.Diagnostics.Stopwatch.StartNew();
                 var project = await makeProject(token).ConfigureAwait(false);
+                var compileMs = watch.ElapsedMilliseconds;
                 var merged = await ExtractProjectAsync(project, extractDocument, options, token)
                     .ConfigureAwait(false);
                 await writer.WriteAsync(
-                        new ProjectContributions(project.OwnerProjectId, project.Name, merged), token)
+                        new ProjectContributions(project.OwnerProjectId, project.Name, merged)
+                        {
+                            CompileMs = compileMs,
+                            AnalyzeMs = watch.ElapsedMilliseconds - compileMs
+                        }, token)
                     .ConfigureAwait(false);
             }
 

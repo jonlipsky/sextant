@@ -42,4 +42,10 @@ public sealed record SolutionLoadResult(Solution Solution, IReadOnlyList<Skipped
     /// passed. They are neither loaded nor skipped: nothing is known about whether they would have loaded.
     /// </summary>
     public IReadOnlyList<string> DeferredProjects { get; init; } = [];
+
+    /// <summary>
+    /// Per-open load timings (issue #267), in open order: one entry per project opened individually, with the
+    /// projects that open added to the workspace. Empty for a whole-solution load, which is one call.
+    /// </summary>
+    public IReadOnlyList<Sextant.Core.ProjectTiming> LoadTimings { get; init; } = [];
 }

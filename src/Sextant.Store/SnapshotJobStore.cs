@@ -310,6 +310,51 @@ public sealed class SnapshotJobStore(SqliteConnection connection)
         }
     }
 
+    /// <summary>
+    /// Records a job's phase timings (issue #267) as an opaque JSON document, replacing any earlier attempt's.
+    /// Job telemetry only (<c>snapshot_job_timings</c>, an identity-neutral table).
+    /// </summary>
+    public void ReplaceTimings(long jobId, string timingsJson)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(timingsJson);
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO snapshot_job_timings (job_id, recorded_at, timings_json)
+            VALUES (@job, @now, @json)
+            ON CONFLICT(job_id) DO UPDATE SET recorded_at = excluded.recorded_at, timings_json = excluded.timings_json;
+            """;
+        cmd.Parameters.AddWithValue("@job", jobId);
+        cmd.Parameters.AddWithValue("@now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        cmd.Parameters.AddWithValue("@json", timingsJson);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>A job's recorded timings JSON (issue #267), or null when none was recorded.</summary>
+    public string? GetTimings(long jobId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT timings_json FROM snapshot_job_timings WHERE job_id = @id;";
+        cmd.Parameters.AddWithValue("@id", jobId);
+        return cmd.ExecuteScalar() as string;
+    }
+
+    /// <summary>The timings JSON of the most recently recorded jobs (issue #267), newest first, at most <paramref name="limit"/>.</summary>
+    public IReadOnlyList<string> RecentTimings(int limit)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT timings_json FROM snapshot_job_timings
+            ORDER BY recorded_at DESC, job_id DESC
+            LIMIT @limit;
+            """;
+        cmd.Parameters.AddWithValue("@limit", Math.Max(0, limit));
+        var rows = new List<string>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            rows.Add(reader.GetString(0));
+        return rows;
+    }
+
     public IReadOnlyList<SnapshotJobDiagnostic> GetDiagnostics(long jobId)
     {
         using var cmd = connection.CreateCommand();

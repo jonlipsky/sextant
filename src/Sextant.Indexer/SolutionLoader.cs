@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Runtime.ExceptionServices;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.MSBuild;
@@ -106,11 +107,12 @@ public static class SolutionLoader
         Solution solution;
         List<SkippedProject> thrownSkipped;
         List<string> deferred;
+        var openTimings = new List<ProjectTiming>();
         try
         {
             var loader = new MSBuildWorkspaceProjectLoader(workspace);
             (solution, thrownSkipped, deferred) = await LoadProjectsIndividuallyAsync(
-                projectPaths, loader, onDiagnostic, deadline, onProgress, cancellationToken);
+                projectPaths, loader, onDiagnostic, deadline, onProgress, cancellationToken, openTimings);
         }
         catch
         {
@@ -126,7 +128,8 @@ public static class SolutionLoader
         var reconciled = ReconcileLoads(attempted, solution, failures, thrownSkipped, onDiagnostic);
         return reconciled.ToResult(TransitiveProjectReferences.Close(solution, onDiagnostic)) with
         {
-            DeferredProjects = deferred
+            DeferredProjects = deferred,
+            LoadTimings = openTimings
         };
     }
 
@@ -143,7 +146,8 @@ public static class SolutionLoader
         Action<string>? onDiagnostic,
         IndexDeadline? deadline,
         Action<string>? onProgress,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ICollection<ProjectTiming>? openTimings = null)
     {
         var skipped = new List<SkippedProject>();
         var deferred = new List<string>();
@@ -171,9 +175,19 @@ public static class SolutionLoader
 
             attempted++;
             onProgress?.Invoke($"Loading project {i + 1}/{projectPaths.Count}: {Path.GetFileName(projectPath)}");
+            // Issue #267: one open evaluates the project and every reference it pulls into the workspace.
+            var projectsBefore = openTimings == null ? 0 : loader.CurrentSolution.ProjectIds.Count;
+            var openWatch = Stopwatch.StartNew();
             try
             {
                 await loader.OpenProjectAsync(projectPath, cancellationToken);
+                openTimings?.Add(new ProjectTiming
+                {
+                    Phase = IndexPhaseNames.Load,
+                    Project = Path.GetFileName(projectPath),
+                    WallMs = openWatch.ElapsedMilliseconds,
+                    ProjectsAdded = loader.CurrentSolution.ProjectIds.Count - projectsBefore
+                });
             }
             catch (OperationCanceledException)
             {

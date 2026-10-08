@@ -372,6 +372,9 @@ public sealed record JobStatusResult
 
     /// <summary>The durable checkout coverage recorded for the job's snapshot (issue #119), or null.</summary>
     public SnapshotCoverage? Coverage { get; init; }
+
+    /// <summary>Where the job's time went (issue #267), or null when no timings were recorded.</summary>
+    public JobTimings? Timings { get; init; }
 }
 
 /// <summary>A single per-project outcome a worker reports back for job diagnostics.</summary>
@@ -414,6 +417,9 @@ public sealed record SnapshotWorkResult
     /// persisted in the publish transaction.
     /// </summary>
     public SnapshotCoverage? Coverage { get; init; }
+
+    /// <summary>Where the job's time went (issue #267), or null when the worker does not record timings.</summary>
+    public JobTimings? Timings { get; init; }
 
     public static SnapshotWorkResult Complete(
         long snapshotId, IReadOnlyList<ProjectOutcome>? projects = null, SnapshotCoverage? coverage = null) =>

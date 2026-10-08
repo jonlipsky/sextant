@@ -74,6 +74,23 @@ public sealed class DefaultUnionSnapshotIntegrationTests : IDisposable
             Assert.IsFalse(result.Projects.Any(p => p.Code == "solution_not_selected"));
             Assert.AreEqual(3, result.Projects.Count(p => p.Code == "solution_indexed"));
 
+            // Issue #267: the real worker reports where the job's time went, in execution order.
+            var timings = result.Timings;
+            Assert.IsNotNull(timings);
+            var phaseNames = timings.Phases.Select(p => p.Name).ToList();
+            foreach (var (earlier, later) in new[] { ("checkout", "restore"), ("restore", "load"), ("load", "coverage_scan"), ("coverage_scan", "extracting_symbols") })
+            {
+                Assert.IsGreaterThanOrEqualTo(0, phaseNames.IndexOf(earlier), $"{earlier} recorded: {string.Join(", ", phaseNames)}");
+                Assert.IsLessThan(phaseNames.IndexOf(later), phaseNames.IndexOf(earlier), $"{earlier} before {later}: {string.Join(", ", phaseNames)}");
+            }
+            Assert.AreEqual(SolutionLoadModes.Union, timings.Load!.Mode, "three selected solutions load as a union");
+            Assert.IsGreaterThan(0, timings.Load.ProjectsOpened);
+            Assert.IsTrue(timings.Load.SlowestOpens.All(o => o.Phase == "load" && o.ProjectsAdded >= 0));
+            if (OperatingSystem.IsLinux())
+                Assert.IsGreaterThan(0, timings.Load.BuildHosts!.Launches, "the union load starts BuildHost processes");
+            Assert.IsTrue(timings.SlowestProjects.Any(p => p.Phase == "extracting_symbols"));
+            Assert.IsGreaterThanOrEqualTo(timings.Phases.Single(p => p.Name == "load").WallMs, timings.TotalMs);
+
             var coverage = new SnapshotCoverageStore(db.GetConnection()).Get(result.SnapshotId!.Value);
             Assert.IsNotNull(coverage, "coverage is recorded durably with the published snapshot");
             Assert.AreEqual(SnapshotCoverageVerdict.Partial, coverage.Verdict);

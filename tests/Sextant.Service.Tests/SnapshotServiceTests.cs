@@ -39,6 +39,40 @@ public class SnapshotServiceTests
     }
 
     [TestMethod]
+    public async Task Ensure_StoresTheWorkersTimings_AndStatusReturnsThem()
+    {
+        // Issue #267: the worker's timings are recorded with the job and come back on /control/status.
+        var timings = new JobTimings
+        {
+            TotalMs = 5_000,
+            Phases = [new JobPhaseTiming("load", 3_000, 200, 2_500), new JobPhaseTiming("extracting_symbols", 1_500, 1_400, 0, 4, "completed")],
+            Load = new JobLoadTimings { Mode = "union", WallMs = 3_000, ProjectsLoaded = 4, ProjectsOpened = 4 }
+        };
+        var worker = new FakeSnapshotWorker(NewDb(), (self, request) =>
+            SnapshotWorkResult.Complete(ServiceTestFixtures.PublishComplete(self.Database, request)) with { Timings = timings });
+        var service = StartWith(worker);
+
+        var result = await service.EnsureSnapshotAsync(ServiceTestFixtures.Request());
+        var status = service.GetStatus(result.JobId)!;
+
+        Assert.IsNotNull(status.Timings);
+        Assert.AreEqual(5_000, status.Timings.TotalMs);
+        CollectionAssert.AreEqual(timings.Phases.ToArray(), status.Timings.Phases.ToArray());
+        Assert.AreEqual("union", status.Timings.Load!.Mode);
+    }
+
+    [TestMethod]
+    public async Task Ensure_WithoutTimings_HasNoTimingsOnStatus()
+    {
+        var worker = new FakeSnapshotWorker(NewDb());
+        var service = StartWith(worker);
+
+        var result = await service.EnsureSnapshotAsync(ServiceTestFixtures.Request());
+
+        Assert.IsNull(service.GetStatus(result.JobId)!.Timings);
+    }
+
+    [TestMethod]
     public async Task Ensure_ConcurrentIdenticalRequests_ProduceOnce()
     {
         var worker = new FakeSnapshotWorker(NewDb()) { UseGate = true };

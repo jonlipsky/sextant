@@ -49,6 +49,8 @@ inside the Sextant source tree. Generation is byte-for-byte deterministic.
 | `--document-extractor` | off | Use the Phase 5 document-oriented extractor (required to exercise the Phase 6 parallel pipeline). |
 | `--max-parallelism <n>` | `0` | Document-extractor analysis worker cap (`0` = auto: `min(cores, 8)`). Drive the parallelism sweep with `1`/`2`/`4`/`8`/`0`. |
 | `--machine <label>` | machine name | Machine label recorded in the report (cleared when redacted). |
+| `--service-path` | off | Load like the service (issue #267): `--path` is a checkout directory whose solutions are selected by `SolutionSelector`, restored by the service's `PackageRestoreRunner`, and loaded by `MultiSolutionLoader`, so several solutions take the union path. The report gains a `load` section (restore time, load mode, individual opens, BuildHost processes observed, slowest opens). |
+| `--catalog <db>` | — | Index into a copy of this existing catalog (SQLite online backup; the source is only read), so write cost against a large catalog is measurable. |
 
 ### Examples
 
@@ -62,6 +64,10 @@ dotnet run --project tests/Sextant.Benchmarks -- --corpus correctness --out ./be
 # Large synthetic solution.
 dotnet run --project tests/Sextant.Benchmarks -- --corpus large --large-projects 50 --out ./benchmark-results
 
+# The service's load path over a checkout (issue #267), into a copy of a production-sized catalog.
+dotnet run --project tests/Sextant.Benchmarks -c Release -- --corpus external --service-path \
+    --path /path/to/checkout --document-extractor --catalog /path/to/catalog.db --out ./benchmark-results
+
 # Private monorepo, redacted.
 dotnet run --project tests/Sextant.Benchmarks -- --corpus external --path /path/to/Big.sln --out ./benchmark-results
 ```
@@ -69,9 +75,15 @@ dotnet run --project tests/Sextant.Benchmarks -- --corpus external --path /path/
 ## What is measured
 
 ### Timing
+
 - `solution_load_ms` — time to load the Roslyn solution (excluded from the indexing total).
 - `total_duration_ms` — wall-clock time for indexing.
 - Per-phase `duration_ms` and `projects_processed`, in execution order, each with a terminal `status`.
+
+Every phase reports wall-clock `duration_ms`, `cpu_ms` (this process, all threads) and `child_cpu_ms` (child
+processes that exited during the phase, from `/proc/self/stat`; null elsewhere); `cpu_ms / duration_ms` is the
+parallelism the phase achieved (issue #267). `projects` lists per-project timings for the extraction phases:
+`compile_ms`, `analyze_ms`, `persist_ms` and `rows`. The Markdown report shows the ten slowest. Report schema `2`.
 
 ### Rows and duplication
 - `projects`, `symbols`, `references`, `relationships`, `call_graph_edges`, `comments`.
@@ -290,6 +302,44 @@ before it is written:
 
 Because every other field is an aggregate number, a redacted report contains no absolute paths,
 repository names, symbol names, or source snippets. `redacted: true` marks such reports.
+
+## Indexing-performance baseline (issue #267)
+
+The starting point for the indexing-performance initiative (#266, `specs/20261007-indexing-performance/`):
+elevenworks/ProcessStack at `3a82c57b1` (192 projects across 4 selected solutions, ~1.48 M lines including the
+MixAndMatch submodule) on cloudserver1 (Debian 13 arm64 VM, 14 vCPUs, 31 GB). The compile floor on the same host is
+`dotnet restore` 41 s + `dotnet build no-macos.slnx` 233 s.
+
+Harness, `--service-path --document-extractor`, fresh database, cold package cache. The live service kept indexing the
+nightly reconcile's queue throughout (median 1.2 cores, peaks to 17; CPU steal median 5%, max 27%):
+
+```bash
+dotnet run --project tests/Sextant.Benchmarks -c Release -- --corpus self --service-path \
+    --path /path/to/ProcessStack --document-extractor --out ./benchmark-results
+```
+
+| Phase | Wall time | Cores (CPU ÷ wall) | Production job 359, same commit |
+|---|--:|--:|--:|
+| Restore (4 solutions, per-solution fallback) | 80 s | — | 82 s |
+| Load (union: 127 individual opens, 192 projects) | **1,031 s** | ~1 (one BuildHost at a time) | 912 s |
+| `extracting_symbols` | **499 s** | **1.3** | 447 s |
+| `extracting_occurrences` | 211 s | 5.0 | 171 s |
+| Other indexer phases | 14 s | ~1 | |
+
+The harness reproduces production's union load within 13% (acceptance criterion 2 of #267), and both are far from
+the compile floor. What the per-project timings add:
+
+- **Load:** the slowest opens take 13–17 s each, whether they pull in references (`ProcessStack.Api.csproj`: 17 s, 14
+  projects added) or only themselves (most test projects: one project, 13–16 s). The cost is per open, not per
+  project evaluated. The sampler observed 254 BuildHost processes, at most one at a time; it samples every 250 ms, so
+  shorter-lived processes are missed and the true count is likely higher (a 1 s poll of production saw about 1.1
+  launches per second).
+- **Symbols:** single-threaded, and dominated by **analysis, not compilation**: `ProcessStack.WebClient.Tests`
+  compiled in 7.3 s and spent 68.8 s in the symbol walk; `ProcessStack.Api.Tests` 6.3 s and 45.0 s.
+- **Occurrences:** about five cores; persistence (the single consumer) is 5–10 s of the slowest projects' 29–35 s.
+
+The service records the same numbers for every job (`GET /control/status/{job}` → `timings`, and `phase_latency` in
+`/control/metrics`), so production can be compared directly after each phase ships.
 
 ## Correctness fixtures and CI
 

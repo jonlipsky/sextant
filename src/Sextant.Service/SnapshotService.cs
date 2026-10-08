@@ -940,6 +940,18 @@ public sealed partial class SnapshotService : IDisposable
 
         jobs.ReplaceDiagnostics(jobId, validated.Projects.Select(p => p.ToDiagnostic(jobId)));
         jobs.MarkResult(jobId, validated.Status, validated.SnapshotId, validated.Error);
+        // Issue #267: timings are telemetry, recorded after the result so they can never decide the job's outcome.
+        if (validated.Timings is { } timings)
+        {
+            try
+            {
+                jobs.ReplaceTimings(jobId, JobTimingsJson.Serialize(timings));
+            }
+            catch (Exception ex) when (ex is SqliteException or NotSupportedException or InvalidOperationException)
+            {
+                Console.Error.WriteLine($"Job {jobId}: its phase timings could not be recorded: {ex.Message}");
+            }
+        }
         bool? workerAdvanced = validated.SnapshotId is long producedId
                                && validated.Status is SnapshotJobStatus.Complete or SnapshotJobStatus.Partial
             ? BranchAdvancedTo(producedId, pointerBeforeWorker, RequestedBranchPointer(snapshots, request))
@@ -1638,7 +1650,11 @@ public sealed partial class SnapshotService : IDisposable
         var coverage = CoverageOn(conn, job.SnapshotId);
         if (job.Status == SnapshotJobStatus.Complete && coverage is { IsPartial: true })
             job = job with { Status = SnapshotJobStatus.Partial, LastError = PartialCoverageReason(coverage) };
-        return new JobStatusResult { Job = job, Diagnostics = jobs.GetDiagnostics(job.Id), Coverage = coverage };
+        return new JobStatusResult
+        {
+            Job = job, Diagnostics = jobs.GetDiagnostics(job.Id), Coverage = coverage,
+            Timings = JobTimingsJson.Parse(jobs.GetTimings(job.Id))
+        };
     }
 
     /// <summary>

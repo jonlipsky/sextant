@@ -1,4 +1,5 @@
 using Microsoft.Data.Sqlite;
+using Sextant.Core;
 using Sextant.Store;
 
 namespace Sextant.Service.Observability;
@@ -21,6 +22,9 @@ public sealed class MetricsCollector(
 {
     // Bound the latency window so a very long-lived service never scans an unbounded job history.
     private const int LatencyWindow = 1000;
+
+    // Per-phase latency parses each job's stored timings document, so it reads a smaller window (issue #267).
+    private const int PhaseLatencyWindow = 200;
     private static readonly long RecentWindowMs = (long)TimeSpan.FromHours(24).TotalMilliseconds;
     private readonly TimeProvider _time = timeProvider ?? TimeProvider.System;
 
@@ -41,6 +45,7 @@ public sealed class MetricsCollector(
             CollectedAt = windowEnd,
             IndexingLatency = indexing,
             QueueDelay = queue,
+            PhaseLatency = CollectPhaseLatency(),
             QueryLatency = metrics.QueryLatency.Snapshot(),
             Jobs = jobs,
             RecentJobs = recentJobs,
@@ -63,6 +68,29 @@ public sealed class MetricsCollector(
         };
 
         return snapshot with { Alerts = AlertEvaluator.Evaluate(snapshot, thresholds) };
+    }
+
+    private IReadOnlyDictionary<string, LatencyStats> CollectPhaseLatency()
+    {
+        var samples = new Dictionary<string, List<double>>(StringComparer.Ordinal);
+        foreach (var json in new SnapshotJobStore(connection).RecentTimings(PhaseLatencyWindow))
+        {
+            if (JobTimingsJson.Parse(json) is not { } timings)
+                continue;
+            foreach (var phase in timings.Phases)
+            {
+                if (!samples.TryGetValue(phase.Name, out var list))
+                    samples[phase.Name] = list = [];
+                list.Add(phase.WallMs);
+            }
+        }
+        // Report in the order a job runs its phases (IndexPhaseNames.ExecutionOrder); an unknown phase goes last.
+        var result = new Dictionary<string, LatencyStats>(StringComparer.Ordinal);
+        foreach (var name in samples.Keys
+                     .OrderBy(n => IndexPhaseNames.OrderOf(n) is var i and >= 0 ? i : int.MaxValue)
+                     .ThenBy(n => n, StringComparer.Ordinal))
+            result[name] = LatencyStats.FromSamples(samples[name]);
+        return result;
     }
 
     private RecentJobMetrics CollectRecentJobs(long windowStart, long windowEnd, long minimumSamples)

@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Sextant.Core;
 using Sextant.Indexer;
+using Sextant.Service.Restore;
 using Sextant.Store;
 using Sextant.TestSupport;
 
@@ -56,6 +57,21 @@ public sealed class BenchmarkOptions
 
     /// <summary>Maximum diagnostic messages retained in the report (the full count is always kept).</summary>
     public int MaxDiagnostics { get; init; } = 100;
+
+    /// <summary>
+    /// Issue #267: load like the service does. <see cref="SolutionPath"/> is a checkout directory (or a file in it);
+    /// its solutions are selected by <see cref="SolutionSelector"/>, restored by the service's
+    /// <see cref="PackageRestoreRunner"/>, and loaded by <see cref="MultiSolutionLoader"/>, so several solutions take
+    /// the union path. The report's <see cref="BenchmarkReport.Load"/> records the restore, the load mode and the
+    /// BuildHost processes observed.
+    /// </summary>
+    public bool ServicePath { get; init; }
+
+    /// <summary>
+    /// Issue #267: index into a copy of this existing catalog instead of a fresh database, so write cost against a
+    /// large catalog is measurable. The source is never modified.
+    /// </summary>
+    public string? CatalogPath { get; init; }
 }
 
 /// <summary>
@@ -77,9 +93,10 @@ public sealed class BenchmarkRunner
         Action<string> log = redact ? (_ => { }) : (options.Log ?? (_ => { }));
         Directory.CreateDirectory(options.WorkDir);
 
-        var (solutionPath, isGenerated) = ResolveSolution(options, log);
+        var (solutionPath, isGenerated) = options.ServicePath ? (CheckoutDirectory(options), false) : ResolveSolution(options, log);
 
-        if (options.Restore)
+        // The service path restores inside the timed run, through the service's own restore runner.
+        if (options.Restore && !options.ServicePath)
             Restore(solutionPath, isGenerated ? BoundedProcess.DefaultTimeout : SourceRestoreTimeout, log);
 
         var dbPath = PrepareDatabasePath(options);
@@ -99,7 +116,7 @@ public sealed class BenchmarkRunner
         using var db = new IndexDatabase(dbPath);
         db.RunMigrations();
 
-        report.FullIndex = await RunFullAsync(db, solutionPath, options, log, cancellationToken);
+        report.FullIndex = await RunFullAsync(db, solutionPath, options, log, report, cancellationToken);
 
         var incrementalAllowed = options.RunIncremental && isGenerated
             && report.FullIndex.Status == IndexRunStatus.Completed;
@@ -110,7 +127,8 @@ public sealed class BenchmarkRunner
     }
 
     private static async Task<IndexingMetrics> RunFullAsync(
-        IndexDatabase db, string solutionPath, BenchmarkOptions options, Action<string> log, CancellationToken ct)
+        IndexDatabase db, string solutionPath, BenchmarkOptions options, Action<string> log, BenchmarkReport report,
+        CancellationToken ct)
     {
         var metrics = new IndexingMetrics { Mode = "full" };
         using var sampler = new ResourceSampler(db, TimeSpan.FromMilliseconds(options.SampleIntervalMs));
@@ -120,16 +138,29 @@ public sealed class BenchmarkRunner
         {
             // Solution loading is inside the try so a cancellation (or failure) during load still
             // produces a preserved, cancelled/failed report rather than escaping the runner.
-            var loadSw = Stopwatch.StartNew();
-            var solution = await SolutionLoader.LoadSolutionAsync(
-                solutionPath, d => CaptureDiagnostic(metrics, d, options.MaxDiagnostics), ct);
-            loadSw.Stop();
-            metrics.SolutionLoadMs = loadSw.ElapsedMilliseconds;
+            Microsoft.CodeAnalysis.Solution solution;
+            IReadOnlyList<SolutionMembership>? membership = null;
+            if (options.ServicePath)
+            {
+                var load = await LoadLikeTheServiceAsync(solutionPath, options, metrics, log, ct);
+                report.Load = load.Report;
+                solution = load.Result.Solution;
+                membership = load.Result.Membership;
+            }
+            else
+            {
+                var loadSw = Stopwatch.StartNew();
+                solution = await SolutionLoader.LoadSolutionAsync(
+                    solutionPath, d => CaptureDiagnostic(metrics, d, options.MaxDiagnostics), ct);
+                loadSw.Stop();
+                metrics.SolutionLoadMs = loadSw.ElapsedMilliseconds;
+            }
 
             var orchestrator = new IndexOrchestrator(db, log, options.UseDocumentExtractor,
                 ExtractionParallelismOptions.Resolve(options.MaxParallelism, 0),
                 IndexProfileDescriptor.For(options.Profile));
-            await orchestrator.IndexSolutionAsync(solution, progress: null, metrics, ct);
+            await orchestrator.IndexSolutionAsync(
+                solution, progress: null, metrics, ct, solutionMembership: membership);
         }
         catch (OperationCanceledException)
         {
@@ -291,7 +322,74 @@ public sealed class BenchmarkRunner
         if (Directory.Exists(dbDir))
             Directory.Delete(dbDir, recursive: true);
         Directory.CreateDirectory(dbDir);
-        return Path.Combine(dbDir, "index.db");
+        var dbPath = Path.Combine(dbDir, "index.db");
+        if (options.CatalogPath != null)
+            CopyCatalog(options.CatalogPath, dbPath);
+        return dbPath;
+    }
+
+    // A consistent copy through SQLite's online backup, so a catalog in use (WAL mode) is copied whole and the
+    // source is only read.
+    private static void CopyCatalog(string source, string destination)
+    {
+        if (!File.Exists(source))
+            throw new FileNotFoundException("The --catalog database does not exist.", source);
+        using var from = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={source};Mode=ReadOnly");
+        using var to = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={destination}");
+        from.Open();
+        to.Open();
+        from.BackupDatabase(to);
+    }
+
+    private static string CheckoutDirectory(BenchmarkOptions options)
+    {
+        if (string.IsNullOrWhiteSpace(options.SolutionPath))
+            throw new InvalidOperationException("--service-path requires --path <checkout directory>.");
+        var path = Path.GetFullPath(options.SolutionPath);
+        return Directory.Exists(path) ? path : Path.GetDirectoryName(path)!;
+    }
+
+    // Issue #267: select, restore and load the checkout's solutions exactly as the service worker does.
+    private static async Task<(MultiSolutionLoadResult Result, LoadReport Report)> LoadLikeTheServiceAsync(
+        string checkoutDir, BenchmarkOptions options, IndexingMetrics metrics, Action<string> log, CancellationToken ct)
+    {
+        var selection = SolutionSelector.Select(checkoutDir, configuredSolutions: null);
+        if (!selection.HasSolutions)
+            throw new InvalidOperationException("No solution could be selected in the --path checkout.");
+
+        var restoreSw = Stopwatch.StartNew();
+        if (options.Restore)
+        {
+            var scratch = Path.Combine(options.WorkDir, "restore-scratch");
+            Directory.CreateDirectory(scratch);
+            var restore = await new PackageRestoreRunner(timeout: SourceRestoreTimeout, log: log)
+                .RunAsync(checkoutDir, selection.SolutionPaths, limit: null, ct, scratch);
+            log($"Restore: {restore.SolutionsSucceeded}/{restore.SolutionsAttempted} solution(s) clean.");
+        }
+        restoreSw.Stop();
+
+        MultiSolutionLoadResult result;
+        ChildProcessUsage? buildHosts;
+        using (var sampler = new ChildProcessSampler(ChildProcessSampler.BuildHostMarker))
+        {
+            result = await MultiSolutionLoader.LoadAsync(
+                selection.SolutionPaths, d => CaptureDiagnostic(metrics, d, options.MaxDiagnostics),
+                deadline: null, onProgress: log, cancellationToken: ct);
+            buildHosts = sampler.Stop();
+        }
+        metrics.SolutionLoadMs = result.LoadMs;
+
+        return (result, new LoadReport
+        {
+            Mode = result.LoadMode,
+            SolutionsSelected = selection.SolutionPaths.Count,
+            RestoreMs = restoreSw.ElapsedMilliseconds,
+            WallMs = result.LoadMs,
+            ProjectsLoaded = result.Solution.ProjectIds.Count,
+            ProjectsOpened = result.LoadTimings.Count,
+            BuildHosts = buildHosts,
+            SlowestOpens = result.LoadTimings.OrderByDescending(t => t.WallMs).Take(10).ToList()
+        });
     }
 
     private static void Restore(string solutionPath, TimeSpan timeout, Action<string> log)

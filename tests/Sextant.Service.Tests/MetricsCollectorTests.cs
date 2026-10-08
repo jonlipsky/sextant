@@ -113,6 +113,44 @@ public class MetricsCollectorTests
         Assert.IsFalse(snapshot.Alerts.Any(alert => alert.Id == "low_completeness_rate"));
     }
 
+    [TestMethod]
+    public void PhaseLatency_AggregatesEachPhaseOverRecordedJobTimings_InExecutionOrder()
+    {
+        // Issue #267: per-phase p50/p95 over the jobs that recorded timings; a job without timings adds nothing.
+        var jobs = new SnapshotJobStore(_db.GetConnection());
+        long[] loadMs = [100, 200, 300, 400];
+        foreach (var load in loadMs)
+        {
+            Add(Complete, 1);
+            jobs.ReplaceTimings(jobs.MaxJobId(), JobTimingsJson.Serialize(new JobTimings
+            {
+                Phases = [new JobPhaseTiming("restore", 10, 0, null), new JobPhaseTiming("load", load, 0, null)]
+            }));
+        }
+        Add(Complete, 1);
+        jobs.ReplaceTimings(jobs.MaxJobId(), "{not json");
+
+        var snapshot = Collect(DateTimeOffset.UtcNow);
+
+        CollectionAssert.AreEqual(new[] { "restore", "load" }, snapshot.PhaseLatency.Keys.ToArray());
+        Assert.AreEqual(4, snapshot.PhaseLatency["load"].Count);
+        Assert.AreEqual(200, snapshot.PhaseLatency["load"].P50Ms);
+        Assert.AreEqual(400, snapshot.PhaseLatency["load"].MaxMs);
+
+        var prometheus = PrometheusExposition.Render(snapshot);
+        StringAssert.Contains(prometheus, "sextant_job_phase_p50_ms{phase=\"load\"} 200");
+        StringAssert.Contains(prometheus, "sextant_job_phase_p95_ms{phase=\"restore\"} 10");
+    }
+
+    [TestMethod]
+    public void PhaseLatency_IsEmpty_WhenNoJobRecordedTimings()
+    {
+        Add(Complete, 1);
+        var snapshot = Collect(DateTimeOffset.UtcNow);
+        Assert.AreEqual(0, snapshot.PhaseLatency.Count);
+        Assert.IsFalse(PrometheusExposition.Render(snapshot).Contains("sextant_job_phase_", StringComparison.Ordinal));
+    }
+
     private MetricsSnapshot Collect(DateTimeOffset now, AlertThresholds? thresholds = null)
     {
         var paths = new ServicePaths(ServiceVolumes.Rooted(Path.Combine(_root, "volumes")));

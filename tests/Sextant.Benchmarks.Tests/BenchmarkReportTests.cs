@@ -113,6 +113,43 @@ public sealed class BenchmarkReportTests
         return report;
     }
 
+    [TestMethod]
+    public void ReportCarriesPhaseCpu_ProjectTimings_AndTheServicePathLoad_AndRedactionRelabelsProjects()
+    {
+        // Issue #267.
+        var report = BuildReport();
+        report.FullIndex!.Phases.Add(new PhaseMetric
+        {
+            Name = "extracting_symbols", DurationMs = 400, CpuMs = 380, ChildCpuMs = 0, Status = IndexRunStatus.Completed
+        });
+        report.FullIndex.RecordProject(new ProjectTiming
+        {
+            Phase = "extracting_symbols", Project = "Acme.Secret.Core", WallMs = 400, CompileMs = 250, AnalyzeMs = 120, PersistMs = 30, Rows = 99
+        });
+        report.Load = new LoadReport
+        {
+            Mode = "union", SolutionsSelected = 4, RestoreMs = 80_000, WallMs = 912_000, ProjectsLoaded = 187,
+            ProjectsOpened = 127, BuildHosts = new ChildProcessUsage(1090, 1, 210_000_000),
+            SlowestOpens = [new ProjectTiming { Phase = "load", Project = "Acme.Secret.Api.csproj", WallMs = 30_000, ProjectsAdded = 14 }]
+        };
+
+        var json = report.ToJson();
+        StringAssert.Contains(json, "\"cpu_ms\": 380");
+        StringAssert.Contains(json, "\"compile_ms\": 250");
+        StringAssert.Contains(json, "\"launches\": 1090");
+        StringAssert.Contains(json, "\"projects_added\": 14");
+        var markdown = report.ToMarkdown();
+        StringAssert.Contains(markdown, "Service-path load");
+        StringAssert.Contains(markdown, "load mode **union**");
+        StringAssert.Contains(markdown, "| extracting_symbols | 400 ms | 380 ms | 1.0 |");
+        StringAssert.Contains(markdown, "| Acme.Secret.Core | extracting_symbols |");
+
+        var redacted = Redactor.Apply(report).ToJson();
+        Assert.IsFalse(redacted.Contains("Acme.Secret", StringComparison.Ordinal), "project names identify the repository");
+        StringAssert.Contains(redacted, "\"project\": \"project-1\"");
+        StringAssert.Contains(redacted, "\"compile_ms\": 250", "the timings themselves survive redaction");
+    }
+
     private static BenchmarkReport BuildReport() => new()
     {
         CorpusName = "correctness",

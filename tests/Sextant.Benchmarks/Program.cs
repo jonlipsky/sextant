@@ -121,6 +121,8 @@ public static class Program
         var documentExtractor = false;
         var maxParallelism = 0;
         var profile = Core.IndexProfiles.Deep;
+        var servicePath = false;
+        string? catalog = null;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -141,6 +143,8 @@ public static class Program
                 case "--document-extractor": documentExtractor = true; break;
                 case "--max-parallelism": maxParallelism = int.Parse(RequireValue(args, ref i)); break;
                 case "--profile": profile = RequireValue(args, ref i); break;
+                case "--service-path": servicePath = true; break;
+                case "--catalog": catalog = RequireValue(args, ref i); break;
                 default: throw new ArgumentException($"unknown argument '{args[i]}'");
             }
         }
@@ -161,6 +165,8 @@ public static class Program
             UseDocumentExtractor = documentExtractor,
             MaxParallelism = maxParallelism,
             Profile = profile,
+            ServicePath = servicePath,
+            CatalogPath = catalog,
             Log = msg => Console.WriteLine($"  {msg}")
         };
         return (options, outDir);
@@ -202,6 +208,9 @@ public static class Program
               --document-extractor  use the Phase 5 document-oriented extractor (default: legacy)
               --max-parallelism <n> analysis worker cap for the document extractor (0 = auto)
               --profile <name>      core | standard | deep | all (default: deep; 'all' sweeps every profile)
+              --service-path        load like the service: --path is a checkout directory whose solutions are
+                                    selected, restored and loaded by the service's code (several → union path)
+              --catalog <db>        index into a copy of this existing catalog instead of a fresh database
               --machine <label>     machine label recorded in the report
               -h, --help            show this help
             """);

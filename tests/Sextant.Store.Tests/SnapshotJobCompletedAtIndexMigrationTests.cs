@@ -21,7 +21,7 @@ public class SnapshotJobCompletedAtIndexMigrationTests
         db.RunMigrations();
 
         Assert.AreEqual("completed_at", IndexColumns(db.GetConnection(), "ix_snapshot_jobs_completed_at"));
-        Assert.AreEqual(27, IndexDatabase.LatestSchemaVersion);
+        Assert.IsTrue(IndexDatabase.LatestSchemaVersion >= 27, "027 is applied by the migration chain");
         Assert.AreEqual(26, IndexDatabase.SnapshotSchemaVersion);
         Assert.Contains(27, IndexDatabase.IdentityNeutralMigrations);
     }

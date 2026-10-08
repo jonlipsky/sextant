@@ -835,14 +835,14 @@ The host deliberately **separates control endpoints from query endpoints**, and 
 | `GET /ready` | — | open | Worker **CAPACITY**: `503` when this node has no worker (query-only), so an operator can tell "up" from "can index". |
 | `POST /control/ensure` | control | control token | Idempotent ensure-snapshot (criterion 1). Accepts an optional monotonic `branch_head_sequence` for forward-only branch-head advance (Phase 14, issue #84), **or** an `expected_head_commit` head CAS, plus `forced` and `branch_update` (see [Branch-pointer guards](#branch-pointer-guards-head-cas-branch_update-none-retire-svc-67)); the result carries `branch_advanced`. Blocks until terminal (`200`; `202` when transient-requeued) unless `?wait=false`, which returns `202` at once with the job to poll (issue #148). When that registration is still waiting for the writer after `CONTROL_WRITE_WAIT_SECONDS` (another identity is producing), it returns `202 {"job_id":<integer>,"identity_hash":…,"status":"queued","attached":…}` with the id the job is (or will be) registered under, which `/control/status/{job_id}` resolves at once (issue #158, see [Queued control writes](#queued-control-writes-issue-158)). A caller disconnect/timeout **never** cancels production. A repository URL the [repository URL policy](#repository-url-policy-svc-5) refuses, both branch guards together (`conflicting_branch_guards`) or an unknown `branch_update` (`invalid_branch_update`) is `400 {"status":"rejected","reason":"<code>"}` before any job exists (audited `ensure`/`denied`). A user caller (`act=user` assertion) may ensure only a repository it can read: otherwise `403 {"status":"rejected","reason":"not_granted"}` (SVC-4), whatever the body asks. A user caller's ensure is then bounded (SX-6d, see [User callers on the control plane](#user-callers-on-the-control-plane-issue-193)): `default_branch: true`, any `branch_head_sequence`, or an advance with no `expected_head_commit` or no `branch_name` is `400` (`default_branch_not_allowed`, `branch_head_sequence_not_allowed`, `branch_guard_required`, `branch_required`). |
 | `POST /control/contribute` | control | control **or** contribute token | Ingest a client/CI semantic contribution (Phase 16); the least-privilege contribute token authorizes this endpoint only. |
-| `GET /control/status/{jobId}` | control | control token | Job status + per-project diagnostics (criterion 5) + checkout `coverage` (#119). For a user caller, a job on a repository it cannot read is the same `404` as an unknown id (SVC-4). |
+| `GET /control/status/{jobId}` | control | control token | Job status + per-project diagnostics (criterion 5) + checkout `coverage` (#119) + phase `timings` (#267, see [Job phase timings](#observability-criterion-5)). For a user caller, a job on a repository it cannot read is the same `404` as an unknown id (SVC-4). |
 | `GET /control/resolve` | control | control token | Resolve a repository branch (`?branch=`, else the default) to its current published snapshot (+ its `coverage`, #119), plus `commit_sha`, the resolved `branch` name, `is_default` and `head_sequence` (SVC-7; a null `commit_sha`/`head_sequence` is omitted), and `current_identity_hash` + `identity_current`: whether the snapshot is what an ensure of its commit would build on this node now (both omitted when there is no `commit_sha` or the head is a contribution; see [Identity currency](#branch-pointer-guards-head-cas-branch_update-none-retire-svc-67)). For a user caller, a repository it cannot read is the same bare `404` as an absent one (SVC-4). |
 | `POST /control/branches/retire` | control | control token | Delete a branch pointer (`{repository, branch, expected_head_commit?}`, SVC-6); its snapshots stay for retention. `200 {"retired":true}`, or `{"retired":false}` for a missing branch (idempotent). The default branch or a head-CAS mismatch is `409 {"status":"rejected","reason":"default_branch"\|"head_mismatch"}`; a refused URL or blank branch is `400`. When the retirement has not applied within `CONTROL_WRITE_WAIT_SECONDS` (a production holds the writer), the answer is `202 {"status":"accepted"}`: it applies once the writer frees, with both guards evaluated then (issue #158, see [Queued control writes](#queued-control-writes-issue-158)). `503 {"status":"unavailable"}` once shutdown began (nothing queued). Audited `retire`. A user caller is refused with `403 {"error":"caller_not_allowed"}` (issue #193, see [User callers on the control plane](#user-callers-on-the-control-plane-issue-193)). |
 | `POST /control/retention` | control | control token | Run the service-owned retention/GC pass (`?execute=true` to apply). A user caller is refused (`403 caller_not_allowed`). |
 | `PUT`/`DELETE`/`GET /control/grants/self` | control | control token + `act=user` assertion | The caller's own repository grants (see [Repository grants](#repository-grants-and-visibility-svc-4)). |
 | `PUT`/`DELETE /control/grants/tenant` | control | control token + `act=application` assertion | The tenant-wide repository grants. |
 | `GET /control/grants?scope=tenant` | control | control token + `act=application` assertion | The tenant's distinct reconcile targets, with counts and no user ids. |
-| `GET /control/metrics` | control | control token | Observability snapshot (criterion 5); `?format=prometheus` for text exposition, else JSON. A user caller is refused (`403 caller_not_allowed`). |
+| `GET /control/metrics` | control | control token | Observability snapshot (criterion 5), including per-phase `phase_latency` (#267); `?format=prometheus` for text exposition, else JSON. A user caller is refused (`403 caller_not_allowed`). |
 | `GET /control/audit` | control | control token | Durable audit log (criterion 5); optional `action`/`repository`/`limit` filters. **Operator-only**: a user caller is refused (`403 caller_not_allowed`). |
 | `GET /control/pilot` | control | control token | Pilot-readiness gate (criterion 7); `?workload=trusted\|untrusted&hard_isolation=&recent_backup=`. A user caller is refused (`403 caller_not_allowed`). |
 | `POST /control/backup` | control | control token | Write a consistent catalog + artifact backup to `?dir=` (criterion 6). A user caller is refused (`403 caller_not_allowed`). |
@@ -1941,6 +1941,36 @@ rows.
   The recent job metric reflects recorded outcomes completed in that window, not a fresh audit of
   historical coverage rows. The cumulative no-sample rate value of 1.0 remains for wire compatibility;
   it is not used as evidence of recent health.
+- **Job phase timings (issue #267).** Every job the worker produces records where its time went, in
+  [`snapshot_job_timings`](../src/Sextant.Store/Migrations/028_snapshot_job_timings.sql) (migration 028, a
+  job-telemetry table and so identity-neutral: adding it re-indexes nothing). `GET /control/status/{job}` returns
+  them as `timings`:
+  - Timings are recorded after the job's result, so failing to store them never changes a job's outcome.
+  - `total_ms`, `cpu_ms` (this process, all threads, including concurrent query traffic) and `child_cpu_ms`
+    (child processes that exited during the job, such as restore runs and MSBuild BuildHosts; read from
+    `/proc/self/stat`, so null where `/proc` is unavailable).
+  - `phases`, in execution order: the worker's `checkout`, `sdk_pin`, `restore`, `load`, `coverage_scan`, then the
+    indexer's (`registering_projects`, `extracting_symbols`, `extracting_occurrences`, …, with `projects` and
+    `status`), then `indexer_other`: the indexer's time outside its phases (setup, the publish transaction,
+    post-publish maintenance, and a phase a failure interrupted before it was stamped), with `cpu_ms` null because it
+    is not measured. Each phase has `wall_ms`, `cpu_ms` and `child_cpu_ms`; `cpu_ms / wall_ms` is the parallelism it
+    achieved. The service does not count the catalog's rows after a job (the harness does), so recording timings
+    adds no catalog scan.
+  - `load`: `mode` (`solution`, one `OpenSolutionAsync`; or `union`, each project opened individually),
+    `wall_ms`, `projects_loaded`, `projects_opened`, the slowest individual opens (`slowest_opens`, with the projects
+    each open added to the workspace through its references), and `build_hosts`: the BuildHost processes the load
+    started (descendants whose command line contains `BuildHost.dll`: `launches`, `peak_concurrent`,
+    `peak_resident_bytes`), sampled from `/proc` every 250 ms. The counts are approximate: a process shorter than one
+    sample is missed, and a child a BuildHost forks carries its command line until it execs. Null where `/proc` is
+    unavailable. The sandbox's memory watchdog sees only the
+    service process; this is where BuildHost memory shows.
+  - `slowest_projects`: the ten slowest projects of the extraction phases, each split into `compile_ms`,
+    `analyze_ms` and `persist_ms`. In `extracting_occurrences` a producer compiles and analyzes while a single
+    consumer persists, so the three overlap across projects and their sum can exceed the phase's wall time.
+
+  `GET /control/metrics` aggregates them as `phase_latency`: each phase's wall-time `count`, `p50_ms`, `p95_ms` and
+  `max_ms` over the 200 most recent jobs that recorded timings, in the order a job runs them (Prometheus: `sextant_job_phase_p50_ms{phase=…}`
+  and `sextant_job_phase_p95_ms{phase=…}`). A job that failed before a phase has no entry for it.
 - **`GET /control/audit`** serves the durable [`audit_log`](../src/Sextant.Store/Migrations/020_audit_log.sql)
   (migration 020): who did what to which repository scope, with what outcome and at what worker cost.
   The actor is stored as a **non-reversible hash**, never the raw token; the raw secret never touches the DB.
