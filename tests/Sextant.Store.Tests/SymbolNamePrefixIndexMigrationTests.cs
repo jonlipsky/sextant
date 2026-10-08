@@ -37,7 +37,7 @@ public class SymbolNamePrefixIndexMigrationTests
         {
             db.RunMigrations();
             var conn = db.GetConnection();
-            Exec(conn, "DROP TABLE snapshot_job_timings; " +
+            Exec(conn, "DROP TABLE branch_advance_handovers; DROP TABLE snapshot_job_timings; " +
                 "DROP INDEX ix_symbols_project_name_nocase; DROP INDEX ix_repositories_remote_url_nocase; " +
                 "DROP INDEX ix_snapshot_jobs_completed_at; ALTER TABLE symbols DROP COLUMN declaration; " +
                 "DELETE FROM schema_version WHERE version >= 25;");
@@ -70,12 +70,12 @@ public class SymbolNamePrefixIndexMigrationTests
     }
 
     [TestMethod]
-    public void IdentityNeutralMigrations_OnlyCreateOrDropIndexes_OrCreateJobTelemetryTables()
+    public void IdentityNeutralMigrations_OnlyCreateOrDropIndexes_OrCreateServiceJobTables()
     {
         // An identity-neutral migration must not change a table, a row or anything the indexer writes: otherwise a
         // snapshot reused across it would differ from one built after it. Besides index DDL it may create a declared
-        // job-telemetry table (issue #267), which no snapshot reads.
-        var telemetry = string.Join("|", IndexDatabase.JobTelemetryTables.Select(Regex.Escape));
+        // service job table (issues #267 and #273), which no snapshot reads.
+        var telemetry = string.Join("|", IndexDatabase.ServiceJobTables.Select(Regex.Escape));
         var migrations = Migrations().ToDictionary(m => m.Version, m => m.Sql);
         foreach (var version in IndexDatabase.IdentityNeutralMigrations)
         {
@@ -86,7 +86,7 @@ public class SymbolNamePrefixIndexMigrationTests
             foreach (var statement in statements)
                 Assert.IsTrue(Regex.IsMatch(statement, @"^(CREATE\s+(UNIQUE\s+)?INDEX|DROP\s+INDEX)\s", RegexOptions.IgnoreCase)
                               || Regex.IsMatch(statement, $@"^CREATE\s+TABLE\s+({telemetry})\s*\(", RegexOptions.IgnoreCase),
-                    $"migration {version} only creates or drops indexes or creates a job-telemetry table, but has: {statement}");
+                    $"migration {version} only creates or drops indexes or creates a service job table, but has: {statement}");
         }
     }
 

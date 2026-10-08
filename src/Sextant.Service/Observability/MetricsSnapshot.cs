@@ -11,6 +11,12 @@ public sealed record JobMetrics
     public long Unsupported { get; init; }
     public long Cancelled { get; init; }
 
+    /// <summary>
+    /// Jobs skipped while queued because a newer commit of the same branch superseded them (issue #273). Settled but not
+    /// terminal: they are not outcomes, so they count toward neither <see cref="Terminal"/> nor the rates.
+    /// </summary>
+    public long Coalesced { get; init; }
+
     /// <summary>Total jobs that reached a terminal state.</summary>
     public long Terminal => Complete + Partial + Failed + Unsupported + Cancelled;
 

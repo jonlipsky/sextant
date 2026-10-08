@@ -74,6 +74,12 @@ public sealed partial class SnapshotService : IDisposable
     // reserved id reading as queued forever.
     private long _writeAdmissions;
     private PendingRetire? _pendingRetire;
+
+    // Issue #273: the latest admitted branch-advance ensure per (repository, branch), guarded by _inFlightLock. When a
+    // newer linked one is admitted while the previous one is still waiting for its turn, the previous one is superseded:
+    // it is settled as coalesced at its turn instead of producing, and records a durable handover of its
+    // compare-and-swap that the newer one resolves at its own turn (ResolveHandedOverExpectation).
+    private readonly Dictionary<string, AdvanceTicket> _latestAdvance = new(StringComparer.Ordinal);
     private readonly JobIdReservations _jobIds;
     private readonly Dictionary<string, int> _pendingEnsures = new(StringComparer.Ordinal);
 
@@ -449,6 +455,7 @@ public sealed partial class SnapshotService : IDisposable
         var hash = IdentityHashFor(request);
         var accepted = new TaskCompletionSource<EnsureSnapshotResult>(TaskCreationOptions.RunContinuationsAsynchronously);
         Task<EnsureSnapshotResult> completion;
+        AdvanceTicket? ticket = null;
         lock (_inFlightLock)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -456,7 +463,9 @@ public sealed partial class SnapshotService : IDisposable
             // Issue #158: the ensure takes its turn on the writer now, in submission order. A user ensure that must
             // first look up the remote's default branch (issue #199) takes its turn once that lookup has finished.
             var turn = request.RestrictsImplicitDefault ? null : TakeWriteTurnLocked();
-            completion = Task.Run(() => RunEnsureAsync(request, hash, principal, accepted, turn), CancellationToken.None);
+            if (turn is not null)
+                ticket = AdmitAdvanceLocked(request, hash);
+            completion = Task.Run(() => RunEnsureAsync(request, hash, principal, accepted, turn, ticket), CancellationToken.None);
             _operations.Add(completion);
             _pendingEnsures[hash] = _pendingEnsures.GetValueOrDefault(hash) + 1;
         }
@@ -467,11 +476,75 @@ public sealed partial class SnapshotService : IDisposable
                 {
                     _operations.Remove(t);
                     EndPendingEnsureLocked(hash);
+                    if (ticket is not null
+                        && _latestAdvance.TryGetValue(ticket.BranchKey, out var latest) && ReferenceEquals(latest, ticket))
+                        _latestAdvance.Remove(ticket.BranchKey);
                 }
                 SettleAccepted(accepted, t);
             },
             CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
         return (accepted.Task, completion, hash);
+    }
+
+    // Issue #273: registers a branch-advance ensure guarded by expected_head_commit (what a repository push sends) as
+    // its branch's latest, superseding the previous one when that one is still waiting for its turn and this one expects
+    // its commit as the head. Nothing about the newer ensure changes here: whether the previous one really coalesces is
+    // only known at its turn (it may attach an already-built identity and advance the branch instead), and only then
+    // does it record the handover. Any other ensure (no branch, branch_update none, a head-sequence guard, a rebuild)
+    // is never superseded and supersedes nothing. The caller holds _inFlightLock.
+    private AdvanceTicket? AdmitAdvanceLocked(EnsureSnapshotRequest request, string hash)
+    {
+        if (!IsBranchAdvance(request))
+            return null;
+
+        var key = RemoteUrlIdentity.Normalize(request.RepositoryRemoteUrl) + "\n" + request.BranchName;
+        var ticket = new AdvanceTicket { BranchKey = key, Hash = hash, CommitSha = request.CommitSha };
+        // Only a linked successor supersedes: one that expects exactly the waiting commit as the branch head (the push
+        // of Z after Y sends before=Y). Any other expectation (an out-of-order or unrelated push) leaves both to run in
+        // order, so the branch ends exactly where serial processing would leave it.
+        if (_latestAdvance.TryGetValue(key, out var previous) && !previous.Started
+            && !string.Equals(previous.Hash, hash, StringComparison.Ordinal)
+            && string.Equals(request.ExpectedHeadCommit, previous.CommitSha, StringComparison.OrdinalIgnoreCase))
+            previous.SupersededBy = ticket;
+        _latestAdvance[key] = ticket;
+        return ticket;
+    }
+
+    // Issue #273: an ensure that advances its named branch under an expected_head_commit compare-and-swap, the shape a
+    // repository push sends. Only these coalesce, supersede, or resolve a handover.
+    private static bool IsBranchAdvance(EnsureSnapshotRequest request) =>
+        request.BranchName is { Length: > 0 } && !request.SuppressesBranchUpdate && request.ExpectedHeadCommit is not null
+        && request.BranchHeadSequence is null && request.RebuildGeneration is null;
+
+    // Issue #273: the most handovers one resolution follows, bounding a cycle (a branch reset back and forth).
+    private const int MaxHandoverHops = 64;
+
+    // Issue #273, under the write gate: a branch advance expecting a commit that is not the branch head but was coalesced
+    // on this branch in its favour (so it never became the head, and the head has not moved since) expects what that
+    // commit's ensure expected instead. Durable, so a successor retried after a requeue, a restart or a crash still
+    // advances the branch where serial processing would have; consumed by the next head move, so nothing else can.
+    private EnsureSnapshotRequest ResolveHandedOverExpectation(EnsureSnapshotRequest request)
+    {
+        if (!IsBranchAdvance(request))
+            return request;
+        var snapshots = new SnapshotStore(_conn);
+        var jobs = new SnapshotJobStore(_conn);
+        var repositoryKey = RemoteUrlIdentity.Normalize(request.RepositoryRemoteUrl);
+        var branchId = snapshots.GetRepositoryId(request.RepositoryRemoteUrl) is long repoId
+            ? snapshots.GetBranchId(repoId, request.BranchName!)
+            : null;
+        var expected = request.ExpectedHeadCommit!;
+        var successor = request.CommitSha;
+        for (var hop = 0; hop < MaxHandoverHops && !snapshots.BranchHeadMatches(branchId, expected); hop++)
+        {
+            if (jobs.GetHandover(repositoryKey, request.BranchName!, expected, successor) is not { } handedOver)
+                break;
+            successor = expected;
+            expected = handedOver;
+        }
+        return string.Equals(expected, request.ExpectedHeadCommit, StringComparison.Ordinal)
+            ? request
+            : request with { ExpectedHeadCommit = expected };
     }
 
     // One ensure of the identity has finished (the caller holds _inFlightLock). When it was the identity's last, no
@@ -578,13 +651,13 @@ public sealed partial class SnapshotService : IDisposable
 
     private async Task<EnsureSnapshotResult> RunEnsureAsync(
         EnsureSnapshotRequest request, string hash, AuditCaller principal,
-        TaskCompletionSource<EnsureSnapshotResult> accepted, Task? turn)
+        TaskCompletionSource<EnsureSnapshotResult> accepted, Task? turn, AdvanceTicket? ticket)
     {
         using var activity = ServiceTelemetry.Source.StartActivity("ensure_snapshot");
         activity?.SetTag("sextant.repository", request.RepositoryRemoteUrl);
         activity?.SetTag("sextant.commit", request.CommitSha);
 
-        var result = await EnsureSnapshotCoreAsync(request, hash, principal, accepted, turn).ConfigureAwait(false);
+        var result = await EnsureSnapshotCoreAsync(request, hash, principal, accepted, turn, ticket).ConfigureAwait(false);
 
         _metrics.RecordEnsure(result.Attached);
         activity?.SetTag("sextant.status", result.Status);
@@ -629,7 +702,7 @@ public sealed partial class SnapshotService : IDisposable
     // a shared, service-owned production per identity, which runs on the turn of the ensure that started it.
     private async Task<EnsureSnapshotResult> EnsureSnapshotCoreAsync(
         EnsureSnapshotRequest request, string hash, AuditCaller principal,
-        TaskCompletionSource<EnsureSnapshotResult> accepted, Task? turn)
+        TaskCompletionSource<EnsureSnapshotResult> accepted, Task? turn, AdvanceTicket? ticket = null)
     {
         var granted = false;
         var handedOff = false;
@@ -654,6 +727,22 @@ public sealed partial class SnapshotService : IDisposable
             await turn.ConfigureAwait(false);
             granted = true;
             EnsureLeaseHeld();
+
+            // Issue #273: from its turn on this ensure can no longer be superseded. It coalesces only when a newer
+            // commit of the branch superseded it AND it is the only pending ensure of its identity (another branch's
+            // ensure of the same commit shares the job row and must see it produced). Then take over the
+            // compare-and-swap of any predecessor that was coalesced on this branch.
+            AdvanceTicket? supersededBy = null;
+            if (ticket is not null)
+            {
+                lock (_inFlightLock)
+                {
+                    ticket.Started = true;
+                    if (_pendingEnsures.GetValueOrDefault(hash) == 1)
+                        supersededBy = ticket.SupersededBy;
+                }
+            }
+            request = ResolveHandedOverExpectation(request);
 
             if (inFlight is not null)
             {
@@ -683,6 +772,11 @@ public sealed partial class SnapshotService : IDisposable
                 return attached;
             accepted.TrySetResult(PendingResult(job, existed));
 
+            // Issue #273: a newer commit of this branch was admitted while this one waited, so it builds the branch's
+            // snapshot; this commit is not produced. (An identity already terminal was attached above at no cost.)
+            if (supersededBy is not null && inFlight is null)
+                return CoalesceLocked(request, job, existed, supersededBy, principal);
+
             // Shutdown began: the job stays durably queued for the next instance to produce.
             ThrowIfStopping();
 
@@ -695,6 +789,34 @@ public sealed partial class SnapshotService : IDisposable
             if (!handedOff && turn is not null)
                 ReleaseTurn(turn, granted);
         }
+    }
+
+    // Settles a superseded ensure as coalesced (issue #273), under the write gate: the job records the commit that
+    // superseded it, the branch records the handover of its compare-and-swap (the successor resolves it at its turn),
+    // and the ensure is audited. A later ensure of the same identity produces it (coalesced is settled, not terminal).
+    private EnsureSnapshotResult CoalesceLocked(
+        EnsureSnapshotRequest request, SnapshotJobRow job, bool existed, AdvanceTicket supersededBy, AuditCaller principal)
+    {
+        var jobs = new SnapshotJobStore(_conn);
+        // One transaction (raw BEGIN IMMEDIATE so the store commands enrol): the handover never outlives a failed settle.
+        ExecRaw("BEGIN IMMEDIATE;");
+        try
+        {
+            jobs.RecordHandover(RemoteUrlIdentity.Normalize(request.RepositoryRemoteUrl), request.BranchName!,
+                request.CommitSha, request.ExpectedHeadCommit!, supersededBy.CommitSha);
+            jobs.MarkResult(job.Id, SnapshotJobStatus.Coalesced, snapshotId: null,
+                $"superseded while queued by commit {supersededBy.CommitSha} of branch '{request.BranchName}' " +
+                $"(identity {supersededBy.Hash}), which builds the branch's snapshot instead");
+            ExecRaw("COMMIT;");
+        }
+        catch
+        {
+            ExecRaw("ROLLBACK;");
+            throw;
+        }
+        var result = Attach(jobs.GetJob(job.Id)!, existed);
+        RecordEnsureAuditLocked(request, result, principal);
+        return result;
     }
 
     // Terminal-attach step, run under the write gate: registers (or attaches to) the identity's durable job and,
@@ -849,7 +971,7 @@ public sealed partial class SnapshotService : IDisposable
         // A STALE terminal result (a complete/partial job whose published snapshot was reclaimed by
         // retention) must be reset to queued before MarkRunning, whose guard only advances a
         // queued/running job — otherwise the job would be stuck reporting a phantom-complete.
-        if (SnapshotJobStatus.IsTerminal(current.Status))
+        if (SnapshotJobStatus.IsSettled(current.Status))
             jobs.Requeue(jobId);
 
         jobs.MarkRunning(jobId, _lease.OwnerToken);
@@ -1135,7 +1257,7 @@ public sealed partial class SnapshotService : IDisposable
         // Attach to the ONE durable job for this assembly identity (criterion 1), and take it running under
         // this instance's lease. A stale terminal job is requeued first so MarkRunning's guard advances it.
         var (job, _) = RegisterJobLocked(jobs, identityHash, manifest.RepositoryRemoteUrl, manifest.CommitSha, request.BranchName);
-        if (SnapshotJobStatus.IsTerminal(job.Status))
+        if (SnapshotJobStatus.IsSettled(job.Status))
             jobs.Requeue(job.Id);
         jobs.MarkRunning(job.Id, _lease.OwnerToken);
 
@@ -2293,7 +2415,7 @@ public sealed partial class SnapshotService : IDisposable
     }
 
     // Maps a job status to an audit outcome. Non-terminal (queued/running) is recorded as accepted;
-    // cancelled is recorded as error (it carries no usable result).
+    // cancelled is recorded as error (it carries no usable result); coalesced (issue #273) as coalesced.
     private static string MapOutcome(string status) => status switch
     {
         SnapshotJobStatus.Complete => AuditOutcome.Complete,
@@ -2301,6 +2423,7 @@ public sealed partial class SnapshotService : IDisposable
         SnapshotJobStatus.Failed => AuditOutcome.Failed,
         SnapshotJobStatus.Unsupported => AuditOutcome.Unsupported,
         SnapshotJobStatus.Cancelled => AuditOutcome.Error,
+        SnapshotJobStatus.Coalesced => AuditOutcome.Coalesced,
         _ => AuditOutcome.Accepted
     };
 
@@ -2489,4 +2612,22 @@ public sealed class UnavailableSnapshotWorker : ISnapshotWorker
         EnsureSnapshotRequest request, string identityHash, string scratchDir, CancellationToken cancellationToken) =>
         Task.FromResult(SnapshotWorkResult.Unsupported(
             "no snapshot worker is configured on this node; it serves published snapshots for query only"));
+}
+
+/// <summary>
+/// One admitted branch-advance ensure (issue #273), tracked per (repository, branch) so a newer commit of the branch can
+/// supersede it while it still waits for its turn. Every field but the immutable ones is guarded by the service's
+/// in-flight lock.
+/// </summary>
+internal sealed class AdvanceTicket
+{
+    public required string BranchKey { get; init; }
+    public required string Hash { get; init; }
+    public required string CommitSha { get; init; }
+
+    /// <summary>Set once its turn is granted: from then on it is produced (or attached), never superseded.</summary>
+    public bool Started { get; set; }
+
+    /// <summary>The newer ensure of the same branch that superseded this one before its turn, if any.</summary>
+    public AdvanceTicket? SupersededBy { get; set; }
 }

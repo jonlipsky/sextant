@@ -31,6 +31,9 @@ public static class AuditAction
 /// <summary>The outcome an <see cref="AuditEntry"/> records (migration 020 <c>audit_log.outcome</c>).</summary>
 public static class AuditOutcome
 {
+    /// <summary>An ensure skipped while queued because a newer commit of the same branch superseded it (issue #273).</summary>
+    public const string Coalesced = "coalesced";
+
     /// <summary>The request passed authorization and was accepted for processing.</summary>
     public const string Accepted = "accepted";
 

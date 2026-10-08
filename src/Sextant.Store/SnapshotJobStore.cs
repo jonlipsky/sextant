@@ -26,9 +26,22 @@ public static class SnapshotJobStatus
     /// <summary>Explicitly cancelled.</summary>
     public const string Cancelled = "cancelled";
 
+    /// <summary>
+    /// Skipped while still queued, because a newer commit of the same branch was admitted behind it (issue #273): the
+    /// newer job produces the branch's snapshot instead. Settled, but NOT terminal: a later ensure of the same identity
+    /// produces it.
+    /// </summary>
+    public const string Coalesced = "coalesced";
+
     /// <summary>A job in a terminal state is never re-run for the same identity.</summary>
     public static bool IsTerminal(string status) =>
         status is Complete or Partial or Failed or Unsupported or Cancelled;
+
+    /// <summary>
+    /// A job whose ensure has finished: terminal, or <see cref="Coalesced"/>. A settled job is requeued before it is
+    /// produced again (a terminal one only when its result is no longer usable).
+    /// </summary>
+    public static bool IsSettled(string status) => IsTerminal(status) || status == Coalesced;
 }
 
 /// <summary>Severity of a per-project job diagnostic (acceptance criterion 5).</summary>
@@ -327,6 +340,65 @@ public sealed class SnapshotJobStore(SqliteConnection connection)
         cmd.Parameters.AddWithValue("@now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
         cmd.Parameters.AddWithValue("@json", timingsJson);
         cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// How long an unconsumed branch-advance handover (issue #273) is kept: a successor retried later than this no longer
+    /// resolves it. A handover is otherwise consumed when its branch's head next moves (<see cref="SnapshotStore"/>).
+    /// </summary>
+    public static readonly TimeSpan HandoverRetention = TimeSpan.FromDays(30);
+
+    /// <summary>
+    /// Records that the ensure of <paramref name="coalescedCommit"/> on <paramref name="branchName"/> was coalesced (issue
+    /// #273): it never moves the branch head, so an ensure expecting it as the head must expect
+    /// <paramref name="expectedHeadCommit"/> instead, until the branch head next moves. Only the ensure of
+    /// <paramref name="successorCommit"/>, which superseded it, resolves it. <paramref name="repositoryKey"/> is the
+    /// normalized repository URL. Replaces an earlier record for the same commit, and drops records older than
+    /// <see cref="HandoverRetention"/>.
+    /// </summary>
+    public void RecordHandover(
+        string repositoryKey, string branchName, string coalescedCommit, string expectedHeadCommit, string successorCommit)
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            DELETE FROM branch_advance_handovers WHERE recorded_at < @cutoff;
+            INSERT INTO branch_advance_handovers
+                (repository_key, branch_name, coalesced_commit, expected_head_commit, successor_commit, recorded_at)
+            VALUES (@repo, @branch, @commit, @expected, @successor, @now)
+            ON CONFLICT(repository_key, branch_name, coalesced_commit) DO UPDATE SET
+                expected_head_commit = excluded.expected_head_commit,
+                successor_commit = excluded.successor_commit,
+                recorded_at = excluded.recorded_at;
+            """;
+        cmd.Parameters.AddWithValue("@cutoff", now - (long)HandoverRetention.TotalMilliseconds);
+        cmd.Parameters.AddWithValue("@repo", repositoryKey);
+        cmd.Parameters.AddWithValue("@branch", branchName);
+        cmd.Parameters.AddWithValue("@commit", coalescedCommit.ToLowerInvariant());
+        cmd.Parameters.AddWithValue("@expected", expectedHeadCommit);
+        cmd.Parameters.AddWithValue("@successor", successorCommit.ToLowerInvariant());
+        cmd.Parameters.AddWithValue("@now", now);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// The head commit the ensure of <paramref name="successorCommit"/>, expecting <paramref name="commit"/> on the branch,
+    /// must expect instead, because <paramref name="commit"/>'s ensure was coalesced there in its favour and the head has
+    /// not moved since (issue #273); null otherwise.
+    /// </summary>
+    public string? GetHandover(string repositoryKey, string branchName, string commit, string successorCommit)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT expected_head_commit FROM branch_advance_handovers
+            WHERE repository_key = @repo AND branch_name = @branch AND coalesced_commit = @commit
+              AND successor_commit = @successor;
+            """;
+        cmd.Parameters.AddWithValue("@successor", successorCommit.ToLowerInvariant());
+        cmd.Parameters.AddWithValue("@repo", repositoryKey);
+        cmd.Parameters.AddWithValue("@branch", branchName);
+        cmd.Parameters.AddWithValue("@commit", commit.ToLowerInvariant());
+        return cmd.ExecuteScalar() as string;
     }
 
     /// <summary>A job's recorded timings JSON (issue #267), or null when none was recorded.</summary>

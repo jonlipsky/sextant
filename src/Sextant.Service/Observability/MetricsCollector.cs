@@ -146,7 +146,8 @@ public sealed class MetricsCollector(
             Partial = counts.GetValueOrDefault(SnapshotJobStatus.Partial),
             Failed = counts.GetValueOrDefault(SnapshotJobStatus.Failed),
             Unsupported = counts.GetValueOrDefault(SnapshotJobStatus.Unsupported),
-            Cancelled = counts.GetValueOrDefault(SnapshotJobStatus.Cancelled)
+            Cancelled = counts.GetValueOrDefault(SnapshotJobStatus.Cancelled),
+            Coalesced = counts.GetValueOrDefault(SnapshotJobStatus.Coalesced)
         };
     }
 
