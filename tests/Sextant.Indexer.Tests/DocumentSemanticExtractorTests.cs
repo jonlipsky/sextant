@@ -33,7 +33,7 @@ public class DocumentSemanticExtractorTests
 
         var sink = new DocumentContributionSet();
         DocumentSemanticExtractor.ExtractDocument(
-            root, model, fileName, text, sink, includeDataflow: includeDataflow);
+            root, model, fileName, sink, includeDataflow: includeDataflow);
         return sink;
     }
 
@@ -323,13 +323,13 @@ public class DocumentSemanticExtractorTests
         // Those persist different symbol_id rows, so the dedup key must keep them separate; collapsing
         // them would silently drop one exact edge.
         var sink = new DocumentContributionSet();
-        var a = new ReferenceContribution("K", "F.cs", 10, ReferenceKind.TypeRef, null, "T", TargetProjectId: 1);
+        var a = new ReferenceContribution("K", "F.cs", 10, ReferenceKind.TypeRef, null, TargetProjectId: 1);
         var b = a with { TargetProjectId = 2 };
-        var dupOfA = a with { Snippet = "different-snippet" };
+        var dupOfA = a with { };
 
         Assert.IsTrue(sink.AddReference(a), "first occurrence is accepted");
         Assert.IsTrue(sink.AddReference(b), "same key/location but a different exact target project is a distinct edge");
-        Assert.IsFalse(sink.AddReference(dupOfA), "same target project collapses regardless of snippet");
+        Assert.IsFalse(sink.AddReference(dupOfA), "the same target project collapses");
         Assert.AreEqual(2, sink.References.Count);
         CollectionAssert.AreEquivalent(new long?[] { 1, 2 }, sink.References.Select(r => r.TargetProjectId).ToArray());
     }
@@ -507,7 +507,7 @@ public class DocumentSemanticExtractorTests
         var text = await tree.GetTextAsync();
 
         var sink = new DocumentContributionSet();
-        DocumentSemanticExtractor.ExtractDocument(root, model, "Bar.cs", text, sink, ResolveTargetProject);
+        DocumentSemanticExtractor.ExtractDocument(root, model, "Bar.cs", sink, ResolveTargetProject);
 
         var fooRef = sink.References.Single(r => r.TargetKey.Contains("Foo") && r.Kind == ReferenceKind.TypeRef);
         Assert.AreEqual(2L, fooRef.TargetProjectId,

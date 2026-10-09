@@ -92,6 +92,12 @@ public static class ParallelExtractionPipeline
         }
     }
 
+    // Issue #270: up to ProjectsInFlight projects are materialized and analyzed at once, their documents sharing one
+    // MaxParallelism-wide set of workers, so a project's last (often largest) documents no longer leave the other
+    // workers idle. Each project's documents still merge by ascending ordinal, and finished projects are written in
+    // project order, so the persisted output is unchanged. ProjectsInFlight = 1 is the one-project-at-a-time pipeline.
+    // A finished project waiting behind a slower one no longer counts as in flight, so the workers move on; at most
+    // QueueCapacity such finished projects are held, which bounds their contributions in memory.
     private static async Task ProduceAsync<TDoc>(
         IReadOnlyList<Func<CancellationToken, Task<ProjectExtraction<TDoc>>>> projects,
         Func<TDoc, CancellationToken, DocumentContributionSet> extractDocument,
@@ -99,39 +105,81 @@ public static class ParallelExtractionPipeline
         ChannelWriter<ProjectContributions> writer,
         CancellationToken token)
     {
+        using var producerCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+        var producerToken = producerCts.Token;
+        using var workers = new SemaphoreSlim(Math.Max(1, options.MaxParallelism));
+        var inFlight = new Queue<Task<ProjectContributions>>();
         try
         {
-            foreach (var makeProject in projects)
+            var next = 0;
+            var analyzing = Math.Max(1, options.ProjectsInFlight);
+            var held = analyzing + Math.Max(1, options.QueueCapacity);
+            while (next < projects.Count || inFlight.Count > 0)
             {
-                token.ThrowIfCancellationRequested();
-                var watch = System.Diagnostics.Stopwatch.StartNew();
-                var project = await makeProject(token).ConfigureAwait(false);
-                var compileMs = watch.ElapsedMilliseconds;
-                var merged = await ExtractProjectAsync(project, extractDocument, options, token)
-                    .ConfigureAwait(false);
-                await writer.WriteAsync(
-                        new ProjectContributions(project.OwnerProjectId, project.Name, merged)
-                        {
-                            CompileMs = compileMs,
-                            AnalyzeMs = watch.ElapsedMilliseconds - compileMs
-                        }, token)
-                    .ConfigureAwait(false);
+                while (next < projects.Count && inFlight.Count < held
+                       && inFlight.Count(task => !task.IsCompleted) < analyzing)
+                    inFlight.Enqueue(ProduceProjectAsync(projects[next++], extractDocument, options, workers, producerToken));
+
+                // Write the head as soon as it is done; until then, wake when any project finishes, so a free
+                // analysis slot is refilled without waiting for the head.
+                var head = inFlight.Peek();
+                if (!head.IsCompleted && next < projects.Count && inFlight.Count < held)
+                {
+                    // Only unfinished projects: a finished one would wake this at once, every time (the head is unfinished).
+                    await Task.WhenAny(inFlight.Where(task => !task.IsCompleted)).ConfigureAwait(false);
+                    continue;
+                }
+
+                var contributions = await inFlight.Dequeue().ConfigureAwait(false);
+                await writer.WriteAsync(contributions, producerToken).ConfigureAwait(false);
             }
 
             writer.Complete();
         }
         catch (Exception ex)
         {
-            // Fault the channel so the consumer stops after draining and rethrows. Unwrap a single
-            // aggregated worker exception so the original fault is what surfaces.
+            // Stop the projects still in flight and observe them, so none is orphaned, then fault the channel so the
+            // consumer stops after draining and rethrows. Unwrap a single aggregated worker exception so the original
+            // fault is what surfaces.
+            await producerCts.CancelAsync().ConfigureAwait(false);
+            try
+            {
+                await Task.WhenAll(inFlight).ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                // Their cancellation (or a second fault) adds nothing to the first.
+            }
             writer.Complete(Unwrap(ex));
         }
+    }
+
+    private static async Task<ProjectContributions> ProduceProjectAsync<TDoc>(
+        Func<CancellationToken, Task<ProjectExtraction<TDoc>>> makeProject,
+        Func<TDoc, CancellationToken, DocumentContributionSet> extractDocument,
+        ExtractionParallelismOptions options,
+        SemaphoreSlim workers,
+        CancellationToken token)
+    {
+        // Off the producer's thread, so the projects in flight materialize and analyze concurrently.
+        await Task.Yield();
+        token.ThrowIfCancellationRequested();
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        var project = await makeProject(token).ConfigureAwait(false);
+        var compileMs = watch.ElapsedMilliseconds;
+        var merged = await ExtractProjectAsync(project, extractDocument, options, workers, token).ConfigureAwait(false);
+        return new ProjectContributions(project.OwnerProjectId, project.Name, merged)
+        {
+            CompileMs = compileMs,
+            AnalyzeMs = watch.ElapsedMilliseconds - compileMs
+        };
     }
 
     private static async Task<DocumentContributionSet> ExtractProjectAsync<TDoc>(
         ProjectExtraction<TDoc> project,
         Func<TDoc, CancellationToken, DocumentContributionSet> extractDocument,
         ExtractionParallelismOptions options,
+        SemaphoreSlim workers,
         CancellationToken token)
     {
         var documents = project.Documents;
@@ -142,7 +190,15 @@ public static class ParallelExtractionPipeline
             for (var i = 0; i < documents.Count; i++)
             {
                 token.ThrowIfCancellationRequested();
-                perDocument[i] = extractDocument(documents[i], token);
+                await workers.WaitAsync(token).ConfigureAwait(false);
+                try
+                {
+                    perDocument[i] = extractDocument(documents[i], token);
+                }
+                finally
+                {
+                    workers.Release();
+                }
             }
         }
         else
@@ -150,11 +206,19 @@ public static class ParallelExtractionPipeline
             await Parallel.ForEachAsync(
                 Enumerable.Range(0, documents.Count),
                 new ParallelOptions { MaxDegreeOfParallelism = options.MaxParallelism, CancellationToken = token },
-                (i, ct) =>
+                async (i, ct) =>
                 {
-                    ct.ThrowIfCancellationRequested();
-                    perDocument[i] = extractDocument(documents[i], ct);
-                    return ValueTask.CompletedTask;
+                    // One worker slot across every project in flight.
+                    await workers.WaitAsync(ct).ConfigureAwait(false);
+                    try
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        perDocument[i] = extractDocument(documents[i], ct);
+                    }
+                    finally
+                    {
+                        workers.Release();
+                    }
                 }).ConfigureAwait(false);
         }
 

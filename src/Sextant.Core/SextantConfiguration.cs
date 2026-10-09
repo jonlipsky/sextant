@@ -82,6 +82,16 @@ public sealed class SextantConfiguration
     public int ExtractionQueueCapacity { get; set; }
 
     /// <summary>
+    /// How many projects the document extractor analyzes at once (issue #270): while one project's last documents
+    /// finish, the next projects' documents keep the workers busy. Their documents share the
+    /// <see cref="MaxParallelism"/> workers, so this bounds the extracted contributions held in memory, not the CPU
+    /// used. 0 (the default) means auto-resolve; 1 analyzes one project at a time. Overridable via
+    /// <c>extraction_projects_in_flight</c> in <c>sextant.json</c> or the
+    /// <c>SEXTANT_EXTRACTION_PROJECTS_IN_FLIGHT</c> env var.
+    /// </summary>
+    public int ExtractionProjectsInFlight { get; set; }
+
+    /// <summary>
     /// How often (seconds) the daemon runs an AUTHORITATIVE Git reconciliation pass that reconstructs
     /// the working-tree state from git (independent of file-watcher events) and refreshes it as a
     /// local overlay (Phase 10). The file watcher supplies only hints; this periodic pass is the
@@ -296,6 +306,8 @@ public sealed class SextantConfiguration
                             config.MaxParallelism = fileConfig.MaxParallelism.Value;
                         if (fileConfig.ExtractionQueueCapacity.HasValue)
                             config.ExtractionQueueCapacity = fileConfig.ExtractionQueueCapacity.Value;
+                        if (fileConfig.ExtractionProjectsInFlight.HasValue)
+                            config.ExtractionProjectsInFlight = fileConfig.ExtractionProjectsInFlight.Value;
                         if (fileConfig.ReconcileIntervalSeconds.HasValue)
                             config.ReconcileIntervalSeconds = fileConfig.ReconcileIntervalSeconds.Value;
                         if (fileConfig.PlatformRouting != null)
@@ -397,6 +409,10 @@ public sealed class SextantConfiguration
         var queueCapacity = Environment.GetEnvironmentVariable("SEXTANT_EXTRACTION_QUEUE_CAPACITY");
         if (int.TryParse(queueCapacity, out var capacity))
             config.ExtractionQueueCapacity = capacity;
+
+        var projectsInFlight = Environment.GetEnvironmentVariable("SEXTANT_EXTRACTION_PROJECTS_IN_FLIGHT");
+        if (int.TryParse(projectsInFlight, out var inFlight))
+            config.ExtractionProjectsInFlight = inFlight;
 
         var reconcileInterval = Environment.GetEnvironmentVariable("SEXTANT_RECONCILE_INTERVAL");
         if (int.TryParse(reconcileInterval, out var interval))
@@ -504,6 +520,9 @@ public sealed class SextantConfiguration
 
         [JsonPropertyName("extraction_queue_capacity")]
         public int? ExtractionQueueCapacity { get; set; }
+
+        [JsonPropertyName("extraction_projects_in_flight")]
+        public int? ExtractionProjectsInFlight { get; set; }
 
         [JsonPropertyName("reconcile_interval_seconds")]
         public int? ReconcileIntervalSeconds { get; set; }

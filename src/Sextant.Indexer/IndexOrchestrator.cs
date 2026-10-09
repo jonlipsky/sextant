@@ -56,7 +56,8 @@ public sealed class IndexOrchestrator
     /// <summary>One non-generated document paired with its project's compilation, the unit of parallel
     /// per-document extraction. The semantic model is built inside the worker so each model is used on
     /// a single thread; the compilation is immutable and safely shared.</summary>
-    private readonly record struct OccurrenceDoc(Compilation Compilation, SyntaxTree Tree);
+    private readonly record struct OccurrenceDoc(
+        Compilation Compilation, SyntaxTree Tree, Func<IAssemblySymbol, long?> ResolveTargetProject);
 
     public async Task IndexSolutionAsync(
         Solution solution,
@@ -846,17 +847,19 @@ public sealed class IndexOrchestrator
             // factory — Solution.GetProject over the immutable solution plus a read-only
             // projectRoslynToId lookup — is deterministic and side-effect-free, so a benign racing
             // double-computation yields the identical value: thread-safe and determinism-preserving.
-            // It is cleared at each project boundary (below) so it only ever retains assembly symbols
-            // referenced by the current project — all of which are already rooted by that project's
-            // live compilation — keeping the "one compilation live at a time" memory bound intact
-            // (criteria 2 & 6) rather than accumulating every processed project's assemblies.
-            var assemblyProjectCache = new ConcurrentDictionary<IAssemblySymbol, long?>(SymbolEqualityComparer.Default);
-            long? ResolveTargetProject(IAssemblySymbol assembly) =>
-                assemblyProjectCache.GetOrAdd(assembly, a =>
+            // Each project gets its own cache (issue #270: several projects are analyzed at once), created
+            // when the project is produced and dropped with its documents, so it only ever retains assembly
+            // symbols referenced by that project — all already rooted by that project's compilation —
+            // rather than accumulating every processed project's assemblies.
+            Func<IAssemblySymbol, long?> NewTargetProjectResolver()
+            {
+                var assemblyProjectCache = new ConcurrentDictionary<IAssemblySymbol, long?>(SymbolEqualityComparer.Default);
+                return assembly => assemblyProjectCache.GetOrAdd(assembly, a =>
                     solution.GetProject(a) is { } targetProject
                     && projectRoslynToId.TryGetValue(targetProject.Id, out var targetPid)
                         ? targetPid
                         : null);
+            }
 
             // Pure, CPU-bound per-document extraction run in parallel. Builds the document's semantic
             // model on the calling worker thread (one model per thread) and walks it once into a
@@ -865,19 +868,25 @@ public sealed class IndexOrchestrator
             // fault cancels in-flight analysis, not just externally-requested cancellation.
             DocumentContributionSet ExtractOne(OccurrenceDoc doc, CancellationToken ct)
             {
-                var model = doc.Compilation.GetSemanticModel(doc.Tree);
+                // Issue #270: nothing the walk records depends on nullable reference types (every target is keyed by its
+                // original definition's documentation ID), and the nullable flow analysis GetSymbolInfo otherwise runs
+                // over each method body was over a third of the pass. SemanticModelOptions is experimental in Roslyn
+                // (dotnet/roslyn#70609); the Roslyn version is pinned, so a change to it surfaces as a build break on
+                // upgrade, and the canonical-output comparison in the determinism tests guards the result.
+#pragma warning disable RSEXPERIMENTAL001
+                var model = doc.Compilation.GetSemanticModel(doc.Tree, SemanticModelOptions.DisableNullableAnalysis);
+#pragma warning restore RSEXPERIMENTAL001
                 var root = doc.Tree.GetRoot(ct);
-                var text = doc.Tree.GetText(ct);
                 var set = new DocumentContributionSet();
                 DocumentSemanticExtractor.ExtractDocument(
-                    root, model, doc.Tree.FilePath, text, set, ResolveTargetProject,
+                    root, model, doc.Tree.FilePath, set, doc.ResolveTargetProject,
                     includeDataflow: persistDataflow);
                 return set;
             }
 
             // Project descriptors in deterministic solution order. Each materializes its compilation and
-            // non-generated documents just-in-time (one project at a time) so completed projects'
-            // compilations/models are released and peak memory stays bounded (criteria 2 & 6).
+            // non-generated documents just-in-time; the pipeline holds up to ProjectsInFlight of them at once
+            // (issue #270), so peak memory stays bounded (criteria 2 & 6).
             var projectDescriptors =
                 new List<Func<CancellationToken, Task<ProjectExtraction<OccurrenceDoc>>>>();
             foreach (var project in solution.Projects)
@@ -890,25 +899,20 @@ public sealed class IndexOrchestrator
                 var owner = ownerProjectId;
                 projectDescriptors.Add(async ct =>
                 {
-                    // Release the previous project's cached assembly symbols before extracting this
-                    // one. The producer invokes descriptors sequentially with no worker active (the
-                    // prior project's Parallel.ForEachAsync has completed and this project's has not
-                    // started), and the consumer never calls ResolveTargetProject (targets are already
-                    // stamped into the contribution records), so clearing here races nothing.
-                    assemblyProjectCache.Clear();
                     // Checked as each project is produced, not when the list is built, so the deadline
                     // stops the phase where it actually passes.
                     if (PastExtractionDeadline(owner))
                         return new ProjectExtraction<OccurrenceDoc>(owner, captured.Name, new List<OccurrenceDoc>());
                     var compilation = await captured.GetCompilationAsync(ct);
                     var docs = new List<OccurrenceDoc>();
+                    var resolveTargetProject = NewTargetProjectResolver();
                     if (compilation != null)
                     {
                         foreach (var syntaxTree in compilation.SyntaxTrees)
                         {
                             if (SymbolExtractor.IsGeneratedFile(syntaxTree.FilePath))
                                 continue;
-                            docs.Add(new OccurrenceDoc(compilation, syntaxTree));
+                            docs.Add(new OccurrenceDoc(compilation, syntaxTree, resolveTargetProject));
                         }
                     }
                     return new ProjectExtraction<OccurrenceDoc>(owner, captured.Name, docs);
@@ -977,7 +981,6 @@ public sealed class IndexOrchestrator
                         InProjectId = ownerProjectId,
                         FilePath = reference.FilePath,
                         Line = reference.Line,
-                        ContextSnippet = reference.Snippet,
                         ReferenceKind = reference.Kind,
                         AccessKind = reference.Access,
                         IsCandidate = reference.IsCandidate
