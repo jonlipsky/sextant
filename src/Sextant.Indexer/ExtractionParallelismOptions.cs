@@ -49,7 +49,10 @@ public sealed record ExtractionParallelismOptions
     /// <c>min(ProcessorCount, <see cref="DefaultParallelismCap"/>)</c>; a positive value is honored
     /// but still clamped to the processor count so a misconfiguration cannot oversubscribe the CPU. A
     /// non-positive <paramref name="configuredQueueCapacity"/> auto-resolves to a small multiple of
-    /// the parallelism so the writer stays fed without buffering an unbounded backlog.
+    /// the parallelism so the writer stays fed without buffering an unbounded backlog. A non-positive
+    /// <paramref name="configuredProjectsInFlight"/> (the default) auto-resolves to
+    /// <c>min(parallelism, <see cref="DefaultProjectsInFlight"/>)</c>; a positive value is honored as is (projects in
+    /// flight share the parallelism's workers, so it bounds memory, not CPU).
     /// </summary>
     public static ExtractionParallelismOptions Resolve(
         int configuredParallelism, int configuredQueueCapacity, int configuredProjectsInFlight = 0)

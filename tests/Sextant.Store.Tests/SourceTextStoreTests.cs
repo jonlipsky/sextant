@@ -88,6 +88,19 @@ public class SourceTextStoreTests
     }
 
     [TestMethod]
+    public void Put_RewritesAnEmptyBlob()
+    {
+        var store = new SourceTextStore(_root);
+        var content = Bytes("class Empty { }");
+        Directory.CreateDirectory(Path.GetDirectoryName(BlobPath(content))!);
+        File.WriteAllBytes(BlobPath(content), []);
+
+        store.Put(SHA256.HashData(content), content);
+
+        CollectionAssert.AreEqual(content, store.TryGet(SHA256.HashData(content)));
+    }
+
+    [TestMethod]
     public void ABlobThatDoesNotVerify_IsDiscardedByARead_AndStoredAgainByTheNextPut()
     {
         var store = new SourceTextStore(_root);

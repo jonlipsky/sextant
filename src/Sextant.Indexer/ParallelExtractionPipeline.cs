@@ -4,8 +4,8 @@ namespace Sextant.Indexer;
 
 /// <summary>
 /// A project's materialized per-document extraction input in deterministic order. The producer
-/// acquires it just-in-time (one project's compilation at a time) so completed projects' compilations
-/// and semantic models can be released and peak memory stays bounded.
+/// acquires it just-in-time (up to <see cref="ExtractionParallelismOptions.ProjectsInFlight"/> projects at
+/// once) so completed projects' semantic models can be released and peak memory stays bounded.
 /// </summary>
 public sealed record ProjectExtraction<TDoc>(long OwnerProjectId, string Name, IReadOnlyList<TDoc> Documents);
 
@@ -32,17 +32,20 @@ public sealed record ProjectContributions(long OwnerProjectId, string Name, Docu
 /// independent of task completion order (acceptance criterion 1).
 /// </summary>
 /// <remarks>
-/// Memory is bounded (criteria 2 &amp; 6) because the producer holds only the current project's
-/// compilation and the channel buffers at most <see cref="ExtractionParallelismOptions.QueueCapacity"/>
-/// Roslyn-free contribution sets. SQLite is never touched concurrently (criterion 3): only the
+/// Memory is bounded (criteria 2 &amp; 6): the producer analyzes at most
+/// <see cref="ExtractionParallelismOptions.ProjectsInFlight"/> projects at once and holds at most that many plus
+/// <see cref="ExtractionParallelismOptions.QueueCapacity"/> of their Roslyn-free contribution sets, and the channel
+/// buffers at most <see cref="ExtractionParallelismOptions.QueueCapacity"/> more. SQLite is never touched concurrently (criterion 3): only the
 /// consumer runs <paramref name="persist"/>. Teardown is clean (criterion 4): the producer always
 /// completes the channel in a <c>finally</c>, and a consumer failure cancels the linked token so a
 /// producer parked on a full channel is released — no stage deadlocks.
 /// </remarks>
 public static class ParallelExtractionPipeline
 {
-    /// <param name="projects">Project descriptors in deterministic order. Each is invoked once, in
-    /// order, to materialize that project's compilation and documents just before extraction.</param>
+    /// <param name="projects">Project descriptors in deterministic order. Each is invoked once, to materialize that
+    /// project's compilation and documents just before extraction; up to
+    /// <see cref="ExtractionParallelismOptions.ProjectsInFlight"/> run at once (issue #270), so a descriptor must be
+    /// safe to run concurrently with the others.</param>
     /// <param name="extractDocument">Pure, CPU-bound per-document extraction (run in parallel). Must
     /// not touch SQLite or any shared mutable state that is not itself thread-safe. Receives the
     /// pipeline's linked token so in-flight analysis observes cancellation caused by a consumer/worker
@@ -96,8 +99,10 @@ public static class ParallelExtractionPipeline
     // MaxParallelism-wide set of workers, so a project's last (often largest) documents no longer leave the other
     // workers idle. Each project's documents still merge by ascending ordinal, and finished projects are written in
     // project order, so the persisted output is unchanged. ProjectsInFlight = 1 is the one-project-at-a-time pipeline.
-    // A finished project waiting behind a slower one no longer counts as in flight, so the workers move on; at most
-    // QueueCapacity such finished projects are held, which bounds their contributions in memory.
+    // A finished project waiting behind a slower head does not hold an analysis slot, so the workers move on. The
+    // producer holds at most ProjectsInFlight + QueueCapacity projects (analyzing or finished), and the channel up to
+    // QueueCapacity more: that bounds the contribution sets in memory at about ProjectsInFlight + 2 x QueueCapacity + 2
+    // (one being written, one being persisted).
     private static async Task ProduceAsync<TDoc>(
         IReadOnlyList<Func<CancellationToken, Task<ProjectExtraction<TDoc>>>> projects,
         Func<TDoc, CancellationToken, DocumentContributionSet> extractDocument,
@@ -116,22 +121,30 @@ public static class ParallelExtractionPipeline
             var held = analyzing + Math.Max(1, options.QueueCapacity);
             while (next < projects.Count || inFlight.Count > 0)
             {
-                while (next < projects.Count && inFlight.Count < held
-                       && inFlight.Count(task => !task.IsCompleted) < analyzing)
-                    inFlight.Enqueue(ProduceProjectAsync(projects[next++], extractDocument, options, workers, producerToken));
-
-                // Write the head as soon as it is done; until then, wake when any project finishes, so a free
-                // analysis slot is refilled without waiting for the head.
-                var head = inFlight.Peek();
-                if (!head.IsCompleted && next < projects.Count && inFlight.Count < held)
+                // Write finished projects at the head, in project order, before starting another one: with one
+                // project in flight this is exactly the one-project-at-a-time pipeline.
+                if (inFlight.Count > 0 && inFlight.Peek().IsCompleted)
                 {
-                    // Only unfinished projects: a finished one would wake this at once, every time (the head is unfinished).
-                    await Task.WhenAny(inFlight.Where(task => !task.IsCompleted)).ConfigureAwait(false);
+                    var contributions = await inFlight.Dequeue().ConfigureAwait(false);
+                    await writer.WriteAsync(contributions, producerToken).ConfigureAwait(false);
                     continue;
                 }
 
-                var contributions = await inFlight.Dequeue().ConfigureAwait(false);
-                await writer.WriteAsync(contributions, producerToken).ConfigureAwait(false);
+                // A project behind the head that failed fails the run now, not when it reaches the head.
+                if (inFlight.FirstOrDefault(task => task.IsFaulted || task.IsCanceled) is { } failed)
+                    await failed.ConfigureAwait(false);
+
+                // A free analysis slot (finished projects waiting behind the head do not hold one) takes the next
+                // project, within the bound on projects held.
+                if (next < projects.Count && inFlight.Count < held && inFlight.Count(task => !task.IsCompleted) < analyzing)
+                {
+                    inFlight.Enqueue(ProduceProjectAsync(projects[next++], extractDocument, options, workers, producerToken));
+                    continue;
+                }
+
+                // Wait for a project to finish. The head is unfinished here, so the set is never empty; a finished
+                // project in it would wake this at once, every time.
+                await Task.WhenAny(inFlight.Where(task => !task.IsCompleted)).ConfigureAwait(false);
             }
 
             writer.Complete();

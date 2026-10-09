@@ -54,9 +54,10 @@ public sealed class SourceTextStore
     /// over the same buffer. Best-effort: a file over <see cref="MaxBytes"/> or an I/O failure stores nothing (the
     /// text then reads as absent), and it never throws for either. A blob already stored under the hash is kept as
     /// it is, without reading it (issue #270: re-indexing a commit stores every file again, and verifying each one
-    /// decompressed and re-hashed it). Blobs land whole through an atomic rename, so a present blob was written
-    /// completely; one that has since gone bad is discarded by the next <see cref="TryGet"/>, and the next
-    /// <see cref="Put"/> writes it again.
+    /// decompressed and re-hashed it). A blob is flushed to disk and then renamed into place, so a present one was
+    /// written completely; an empty one is written again, and one that has otherwise gone bad (damaged on disk, or
+    /// restored from a bad backup) is discarded by the next <see cref="TryGet"/>, after which <see cref="Put"/> writes
+    /// it again.
     /// </summary>
     public void Put(byte[] contentHash, byte[] content)
     {
@@ -64,7 +65,7 @@ public sealed class SourceTextStore
             return;
 
         var target = BlobPath(contentHash);
-        if (File.Exists(target))
+        if (new FileInfo(target) is { Exists: true, Length: > 0 })
             return;
 
         string? temp = null;
@@ -73,8 +74,12 @@ public sealed class SourceTextStore
             Directory.CreateDirectory(Path.GetDirectoryName(target)!);
             temp = Path.Combine(Path.GetDirectoryName(target)!, $"{Convert.ToHexStringLower(contentHash)}.{Guid.NewGuid():N}{TempExtension}");
             using (var file = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-            using (var brotli = new BrotliStream(file, new BrotliCompressionOptions { Quality = CompressionQuality }))
-                brotli.Write(content);
+            {
+                using (var brotli = new BrotliStream(file, new BrotliCompressionOptions { Quality = CompressionQuality }, leaveOpen: true))
+                    brotli.Write(content);
+                // On disk before the rename, so a blob present under its hash is whole even after a crash.
+                file.Flush(flushToDisk: true);
+            }
             File.Move(temp, target, overwrite: true);
             temp = null;
         }
@@ -130,8 +135,18 @@ public sealed class SourceTextStore
             // InvalidOperationException: the Brotli decoder ran into invalid data (a corrupt blob).
         }
 
-        // The blob is corrupt, or holds other content: discard it so the next Put stores the content again.
-        TryDelete(path);
+        // The blob is corrupt, or holds other content: discard it so the next Put stores the content again. It is moved
+        // aside first (never over another file), so a good blob a concurrent Put lands at the path is not deleted.
+        var discarded = $"{path}.{Guid.NewGuid():N}{TempExtension}";
+        try
+        {
+            File.Move(path, discarded, overwrite: false);
+            TryDelete(discarded);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Already discarded by another reader, or not ours to change: either way, the next read decides again.
+        }
         return null;
     }
 
