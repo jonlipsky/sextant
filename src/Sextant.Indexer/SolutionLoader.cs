@@ -119,14 +119,15 @@ public static class SolutionLoader
         MSBuildWorkspace? workspace = null;
         if (generated is not null)
         {
-            onProgress?.Invoke($"Loading {partition.OnePass.Count} project(s) in one pass" +
-                (partition.Individually.Count > 0 ? $", then {partition.Individually.Count} individually" : string.Empty));
-            workspace = MSBuildWorkspace.Create();
-            RegisterFailureSink(workspace, failures, onDiagnostic);
+            // The one pass's budget runs from before the progress line: time spent from here on is the open's.
             using var onePassBudget = deadline is null
                 ? new CancellationTokenSource()
                 : new CancellationTokenSource(Max((deadline.At - deadline.Clock.GetUtcNow()) / 2, TimeSpan.Zero), deadline.Clock);
             using var open = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, onePassBudget.Token);
+            onProgress?.Invoke($"Loading {partition.OnePass.Count} project(s) in one pass" +
+                (partition.Individually.Count > 0 ? $", then {partition.Individually.Count} individually" : string.Empty));
+            workspace = MSBuildWorkspace.Create();
+            RegisterFailureSink(workspace, failures, onDiagnostic);
             try
             {
                 await workspace.OpenSolutionAsync(generated, cancellationToken: open.Token);

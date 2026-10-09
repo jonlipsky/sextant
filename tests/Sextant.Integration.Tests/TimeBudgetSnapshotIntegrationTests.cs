@@ -41,12 +41,11 @@ public sealed class TimeBudgetSnapshotIntegrationTests : IDisposable
     public async Task BudgetRunsOut_DuringTheLoadAndTheSymbols_PublishesPartial_NamingTheUnfinishedSolutions()
     {
         // A 1000 s budget: no restore here, so the load may run until +405 s (45% of the 900 s before the
-        // extraction deadline). Each project load takes 150 s, so the fourth is never opened. Symbols start at
+        // extraction deadline). The one-pass load (issue #268) may use half of that, until +202.5 s; it takes
+        // 210 s, so it is cut there and the union is opened project by project with the time left. Each project
+        // open takes 80 s (P1 by +290, P2 by +370, P3 by +450), so the fourth is never opened. Symbols start at
         // +450 s with a deadline of +630 s (40% of the 450 s left); P2's symbols take 200 s, so P3 gets none.
-        var (result, db, log) = await Produce(advance: line =>
-            line.StartsWith("Loading project ", StringComparison.Ordinal) ? 150
-            : line == "  P2..." ? 200
-            : 0);
+        var (result, db, log) = await Produce(advance: BudgetRunsOutDuringTheLoad);
         using (db)
         {
             Assert.AreEqual(SnapshotJobStatus.Partial, result.Status, result.Error + "\n" + string.Join("\n", log));
@@ -78,8 +77,18 @@ public sealed class TimeBudgetSnapshotIntegrationTests : IDisposable
             Assert.AreEqual(0, SymbolCount(conn, snapshotId, "P3"), "P3 is registered but has no symbols");
             Assert.AreEqual(1, ProjectCount(conn, snapshotId, "P3"));
             Assert.AreEqual(0, ProjectCount(conn, snapshotId, "P4"), "P4 was never loaded");
+            Assert.IsTrue(log.Any(line => line.Contains("half of the time left to the load deadline", StringComparison.Ordinal)),
+                "the one-pass load was cut at half the load window, and the union opened project by project");
         }
     }
+
+    // The scenario both budget tests run: a one-pass load slower than half the load window, then 80 s per project
+    // opened individually, and 200 s of symbols for P2.
+    private static int BudgetRunsOutDuringTheLoad(string line) =>
+        line.Contains(" in one pass", StringComparison.Ordinal) ? 210
+        : line.StartsWith("Loading project ", StringComparison.Ordinal) ? 80
+        : line == "  P2..." ? 200
+        : 0;
 
     [TestMethod]
     public async Task SameCommit_RebuildAfterBudgetImprovement_PreservesOldReadersAndCursors()
@@ -88,9 +97,7 @@ public sealed class TimeBudgetSnapshotIntegrationTests : IDisposable
         {
             RepositoryRemoteUrl = RemoteUrl, CommitSha = new string('c', 40), BranchName = "main"
         };
-        var (partial, db, log) = await Produce(
-            line => line.StartsWith("Loading project ", StringComparison.Ordinal) ? 150 : line == "  P2..." ? 200 : 0,
-            request: request);
+        var (partial, db, log) = await Produce(BudgetRunsOutDuringTheLoad, request: request);
         using (db)
         {
             Assert.AreEqual(SnapshotJobStatus.Partial, partial.Status, string.Join("\n", log));
