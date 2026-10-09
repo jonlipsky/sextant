@@ -637,8 +637,11 @@ public sealed class IndexOrchestrator
             _log?.Invoke($"  Project: {project.Name} (id={projectId}, tfm={identity.TargetFramework}, test={identity.IsTestProject})");
         }
 
-        // Record solution → project mappings
-        if (solution.FilePath != null)
+        // Record solution → project mappings. A multi-solution union maps each selected solution's own projects:
+        // its workspace solution is either file-less or a generated union file (issue #268), never a real solution.
+        if (solutionMembership is { Count: > 1 })
+            RecordSolutionMembership(solution, solutionMembership, projectRoslynToId, solutionStore, now);
+        else if (solution.FilePath != null)
         {
             var solutionId = solutionStore.Upsert(solution.FilePath, Path.GetFileNameWithoutExtension(solution.FilePath), now);
             foreach (var pid in projectRoslynToId.Values)
@@ -2019,7 +2022,7 @@ public sealed class IndexOrchestrator
             : Path.GetFileName(path);
 
         var unfinished = new List<string>();
-        if (solution.FilePath != null)
+        if (solution.FilePath != null && membership is not { Count: > 1 })
             unfinished.Add(Display(solution.FilePath));
         else if (membership is { Count: > 0 })
         {

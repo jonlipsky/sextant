@@ -48,4 +48,10 @@ public sealed record SolutionLoadResult(Solution Solution, IReadOnlyList<Skipped
     /// projects that open added to the workspace. Empty for a whole-solution load, which is one call.
     /// </summary>
     public IReadOnlyList<Sextant.Core.ProjectTiming> LoadTimings { get; init; } = [];
+
+    /// <summary>
+    /// True when the projects were opened one at a time (<c>OpenProjectAsync</c>) rather than with one
+    /// <c>OpenSolutionAsync</c>: a union load that fell back from its generated solution (issue #268).
+    /// </summary>
+    public bool LoadedProjectByProject { get; init; }
 }

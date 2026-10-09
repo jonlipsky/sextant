@@ -39,6 +39,82 @@ public sealed class DefaultUnionSnapshotIntegrationTests : IDisposable
     public void Dispose() => Sextant.TestSupport.SqliteTestDatabase.DeleteDirectory(_dataRoot);
 
     [TestMethod]
+    public async Task AOnePassLoadThatHasNoTimeLeft_FallsBackToTheProjectByProjectLoad_AndOpensWhatFits()
+    {
+        // Issue #268: the one pass gets half the time left to the load deadline. With none left it is cancelled at
+        // once, and the per-project load opens the first project (always attempted) and defers the rest, as before.
+        var paths = new ServicePaths(ServiceVolumes.Rooted(_dataRoot));
+        var checkout = CreateCheckout(paths, includeUnloadableHead: false);
+        var solutions = new[] { Path.Combine(checkout, "App.slnx"), Path.Combine(checkout, "Build.Linux", "Tools-server.slnx") };
+        var diagnostics = new List<string>();
+
+        var load = await MultiSolutionLoader.LoadAsync(
+            solutions, diagnostics.Add, deadline: new IndexDeadline(TimeProvider.System, DateTimeOffset.UtcNow.AddSeconds(-1)),
+            scratchDirectory: paths.AllocateScratch("job-deadline"));
+
+        Assert.AreEqual(SolutionLoadModes.UnionPerProject, load.LoadMode, string.Join("\n", diagnostics));
+        Assert.IsTrue(diagnostics.Any(d => d.Contains("half of the time left", StringComparison.Ordinal)),
+            string.Join("\n", diagnostics));
+        Assert.IsNotEmpty(load.DeferredProjects, "what did not fit is deferred, not skipped");
+        Assert.IsTrue(load.Solution.Projects.Any(p => p.Documents.Any()), "the first project is still opened");
+    }
+
+    [TestMethod]
+    public async Task AUnionWhoseSolutionCannotBeWritten_LoadsProjectByProject()
+    {
+        var paths = new ServicePaths(ServiceVolumes.Rooted(_dataRoot));
+        var checkout = CreateCheckout(paths, includeUnloadableHead: false);
+        var notADirectory = Path.Combine(_dataRoot, "scratch-is-a-file");
+        File.WriteAllText(notADirectory, string.Empty);
+        var diagnostics = new List<string>();
+
+        var load = await MultiSolutionLoader.LoadAsync(
+            [Path.Combine(checkout, "App.slnx"), Path.Combine(checkout, "Build.Linux", "Tools-server.slnx")],
+            diagnostics.Add, scratchDirectory: notADirectory);
+
+        Assert.AreEqual(SolutionLoadModes.UnionPerProject, load.LoadMode, string.Join("\n", diagnostics));
+        Assert.IsTrue(diagnostics.Any(d => d.Contains("could not be written", StringComparison.Ordinal)),
+            string.Join("\n", diagnostics));
+        Assert.IsTrue(load.Solution.Projects.Any(p => p.Documents.Any()), "the union still loads");
+        Assert.IsEmpty(load.SkippedProjects);
+    }
+
+    [TestMethod]
+    public async Task AOnePassThatPullsInAHeldBackProject_LoadsTheUnionProjectByProject()
+    {
+        // Held reads $(SolutionDir), so it is held back. App references it through a path the partition cannot read
+        // statically, so App stays in the one pass, whose open then evaluates Held there too: the union falls back.
+        var paths = new ServicePaths(ServiceVolumes.Rooted(_dataRoot));
+        var root = Path.Combine(paths.CheckoutRoot, "pulled-in");
+        Write(root, "Held/Held.csproj", """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework><Marker>$(SolutionDir)</Marker></PropertyGroup>
+            </Project>
+            """);
+        Write(root, "Held/HeldType.cs", "namespace Pulled;\npublic class HeldType { }\n");
+        Write(root, "App/App.csproj", """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+              <ItemGroup><ProjectReference Include="$(MSBuildProjectDirectory)/../Held/Held.csproj" /></ItemGroup>
+            </Project>
+            """);
+        Write(root, "App/AppType.cs", "namespace Pulled;\npublic class AppType { public HeldType Held = new(); }\n");
+        Write(root, "A.slnx", "<Solution>\n  <Project Path=\"App/App.csproj\" />\n</Solution>\n");
+        Write(root, "B.slnx", "<Solution>\n  <Project Path=\"Held/Held.csproj\" />\n</Solution>\n");
+        Restore(Path.Combine(root, "App", "App.csproj"));
+        var diagnostics = new List<string>();
+
+        var load = await MultiSolutionLoader.LoadAsync(
+            [Path.Combine(root, "A.slnx"), Path.Combine(root, "B.slnx")], diagnostics.Add,
+            scratchDirectory: paths.AllocateScratch("job-pulled-in"));
+
+        Assert.AreEqual(SolutionLoadModes.UnionPerProject, load.LoadMode, string.Join("\n", diagnostics));
+        Assert.IsTrue(diagnostics.Any(d => d.Contains("pulled in 'Held.csproj'", StringComparison.Ordinal)),
+            string.Join("\n", diagnostics));
+        Assert.AreEqual(2, load.Solution.Projects.Count(p => p.Documents.Any()), "both projects still load");
+    }
+
+    [TestMethod]
     public async Task NoConfig_OverlappingSolutionsWithUnloadableHead_PublishesUnionOncePerTfm_PartialWithReason()
     {
         var paths = new ServicePaths(ServiceVolumes.Rooted(_dataRoot));
@@ -56,6 +132,7 @@ public sealed class DefaultUnionSnapshotIntegrationTests : IDisposable
         Assert.AreEqual(0, resolution.DiscoveredButNotSelected.Count);
 
         // --- Produce through the real worker -----------------------------------------------------------
+        var filesBefore = CheckoutFiles(checkout);
         var (db, config) = OpenCatalog();
         using (db)
         {
@@ -83,11 +160,19 @@ public sealed class DefaultUnionSnapshotIntegrationTests : IDisposable
                 Assert.IsGreaterThanOrEqualTo(0, phaseNames.IndexOf(earlier), $"{earlier} recorded: {string.Join(", ", phaseNames)}");
                 Assert.IsLessThan(phaseNames.IndexOf(later), phaseNames.IndexOf(earlier), $"{earlier} before {later}: {string.Join(", ", phaseNames)}");
             }
+            // Issue #268: the three solutions' union loads in ONE open of a generated solution, and only the head, whose
+            // project file cannot even be read, is held back and opened on its own, where it fails as before.
             Assert.AreEqual(SolutionLoadModes.Union, timings.Load!.Mode, "three selected solutions load as a union");
-            Assert.IsGreaterThan(0, timings.Load.ProjectsOpened);
-            Assert.IsTrue(timings.Load.SlowestOpens.All(o => o.Phase == "load" && o.ProjectsAdded >= 0));
+            Assert.AreEqual(1, timings.Load.ProjectsOpened, "only the unreadable head is opened individually");
+            Assert.AreEqual("Mobile.iOS.csproj", timings.Load.SlowestOpens.Single().Project);
+            Assert.IsGreaterThan(0, timings.Load.ProjectsLoaded);
+            CollectionAssert.AreEqual(filesBefore, CheckoutFiles(checkout),
+                "the generated solution is written to scratch: the checkout gains no file");
             if (OperatingSystem.IsLinux())
+            {
                 Assert.IsGreaterThan(0, timings.Load.BuildHosts!.Launches, "the union load starts BuildHost processes");
+                Assert.IsLessThanOrEqualTo(5, timings.Load.BuildHosts.Launches, "one pass, not one BuildHost per project");
+            }
             Assert.IsTrue(timings.SlowestProjects.Any(p => p.Phase == "extracting_symbols"));
             Assert.IsGreaterThanOrEqualTo(timings.Phases.Single(p => p.Name == "load").WallMs, timings.TotalMs);
 
@@ -110,6 +195,8 @@ public sealed class DefaultUnionSnapshotIntegrationTests : IDisposable
                 "an incomplete best-effort restore is an additional explicit coverage gap");
 
             AssertSharedProjectStoredOncePerTfm(db.GetConnection(), result.SnapshotId.Value);
+            Assert.AreEqual(3, ScalarInt(db.GetConnection(), "SELECT COUNT(*) FROM solutions;"),
+                "exactly the three selected solutions are recorded, never the generated one");
             // Solution scope (#124 review): the union workspace has no solution file of its own, yet each
             // selected solution keeps its OWN solution → project mapping; the shared project maps to every
             // solution that declares it (once per TFM), and no solution picks up another's projects.
@@ -238,6 +325,14 @@ public sealed class DefaultUnionSnapshotIntegrationTests : IDisposable
         db.RunMigrations();
         return (db, new SextantConfiguration());
     }
+
+    // The checkout's files outside build output (restore and the load write obj/ and bin/).
+    private static string[] CheckoutFiles(string root) =>
+        Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories)
+            .Select(f => Path.GetRelativePath(root, f).Replace('\\', '/'))
+            .Where(f => !f.Split('/').Any(part => part is "obj" or "bin"))
+            .Order(StringComparer.Ordinal)
+            .ToArray();
 
     private static string[] Relative(string root, IEnumerable<string> paths) =>
         paths.Select(p => Path.GetRelativePath(root, p).Replace('\\', '/')).ToArray();

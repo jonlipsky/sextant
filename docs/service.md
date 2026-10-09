@@ -204,9 +204,32 @@ externals). The worker chooses the set to index **explicitly and deterministical
   snapshot; only a union in which **no** project loads at all fails the job, so an empty snapshot is never
   published. A checkout whose
   discovered solutions all load is **complete**. With a single discovered solution this is just that
-  solution, loaded as before. With several, each project is opened individually (that is what isolates a
-  per-project load fault), so no solution sets `$(SolutionDir)`: a project that imports
-  `$(SolutionDir)…` with no fallback may be skipped-with-reason on this path. Each selected solution still
+  solution, loaded as before. With several, the union loads in **one pass** (issue #268): the worker
+  generates a solution listing the union's projects in job scratch (never in the checkout), next to a copy
+  of the `global.json` the selected solutions' common directory resolves, opens it once (one MSBuild
+  BuildHost evaluates every project, instead of one BuildHost per project), and deletes it. A project goes
+  in the one pass only when it resolves its SDK there as it would opened alone: MSBuild resolves the .NET SDK and `msbuild-sdks` from the `global.json` nearest the solution in a
+  solution load, and nearest the project when it is opened on its own (#113). A project is held back, to
+  be opened individually into the same workspace afterwards, when its evaluation reads `$(SolutionDir)` or a
+  related property (a solution sets them, a single open does not), when it imports a file that cannot be
+  resolved statically, when its own nearest `global.json` is another file that resolves another SDK, sets
+  other `sdk` settings, or pins differently an `msbuild-sdks` entry it names, or when it references a
+  held-back project. Nothing loads in one pass when that `global.json` uses location-dependent settings
+  (such as `sdk.paths`). If the solution cannot be written, the one-pass open aborts (#90), it still pulls
+  in a held-back project, or it is still running when half the time left to the load deadline has passed,
+  the whole union is opened project by project as before, with the remaining time (no solution sets
+  `$(SolutionDir)` on that path either: a project that imports `$(SolutionDir)…` with no fallback may be
+  skipped-with-reason).
+  - The per-project load this replaces evaluated a project another opened project referenced in that
+    project's BuildHost, under the referencer's `global.json`, so its result depended on the open order.
+    The one pass evaluates every project under its own rule, as above, and can differ from that, for a
+    reference whose own `global.json` differs from its referencer's.
+  - The one pass reads NuGet settings for `msbuild-sdks` from job scratch, not the checkout's
+    `NuGet.config`; the package restore that runs first normally fetched them already.
+  - The build files NuGet packages contribute are not read when a project is judged, so a package that
+    reads `$(SolutionDir)` or names a pinned `msbuild-sdks` entry is not detected.
+
+  Each selected solution still
     gets its own `solution → project` mapping (the `solution:` query scope): the projects that solution
     declares plus everything they reference, as the single-solution path maps. A `solution:` scope over a
     selected solution none of whose projects loaded returns nothing rather than the whole repository.
@@ -1990,8 +2013,9 @@ rows.
     is not measured. Each phase has `wall_ms`, `cpu_ms` and `child_cpu_ms`; `cpu_ms / wall_ms` is the parallelism it
     achieved. The service does not count the catalog's rows after a job (the harness does), so recording timings
     adds no catalog scan.
-  - `load`: `mode` (`solution`, one `OpenSolutionAsync`; or `union`, each project opened individually),
-    `wall_ms`, `projects_loaded`, `projects_opened`, the slowest individual opens (`slowest_opens`, with the projects
+  - `load`: `mode` (`solution`, one `OpenSolutionAsync`; `union`, the multi-solution union in one pass plus any
+    project opened individually, issue #268; or `union_per_project`, every project opened individually),
+    `wall_ms`, `projects_loaded`, `projects_opened` (the individual opens), the slowest individual opens (`slowest_opens`, with the projects
     each open added to the workspace through its references), and `build_hosts`: the BuildHost processes the load
     started (descendants whose command line contains `BuildHost.dll`: `launches`, `peak_concurrent`,
     `peak_resident_bytes`), sampled from `/proc` every 250 ms. The counts are approximate: a process shorter than one

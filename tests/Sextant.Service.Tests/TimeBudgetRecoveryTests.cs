@@ -16,7 +16,7 @@ public class TimeBudgetRecoveryTests
 {
     private const string LegacyTimeAbort = "untrusted repository evaluation exceeded its time budget and was aborted.";
     private const string LegacyMemoryAbort = "untrusted repository evaluation exceeded its memory budget and was aborted.";
-    private const string CurrentToken = "v2;time=1800;memory=8589934592";
+    private const string CurrentToken = "v3;time=1800;memory=8589934592";
 
     private string? _dbPath;
     private IndexDatabase? _db;
@@ -38,7 +38,7 @@ public class TimeBudgetRecoveryTests
     public void Token_OfTheEnforcedPolicy_NamesTheVersionAndBothBudgets()
     {
         Assert.AreEqual(CurrentToken, EvaluationBudgetPolicy.Token(SandboxPolicy.Enforced));
-        Assert.AreEqual("v2;time=600;memory=1024", EvaluationBudgetPolicy.Token(
+        Assert.AreEqual("v3;time=600;memory=1024", EvaluationBudgetPolicy.Token(
             SandboxPolicy.Enforced with { TimeBudget = TimeSpan.FromMinutes(10), MemoryBudgetBytes = 1024 }));
     }
 
@@ -55,7 +55,8 @@ public class TimeBudgetRecoveryTests
     [DataRow(false, null, null, CurrentToken, false, DisplayName = "no error is not")]
     [DataRow(true, CurrentToken, LegacyTimeAbort, CurrentToken, false, DisplayName = "an abort under the current policy is not")]
     [DataRow(true, "v1;time=1800;memory=8589934592", LegacyTimeAbort, CurrentToken, true, DisplayName = "an abort under an older version is stale")]
-    [DataRow(true, "v2;time=600;memory=8589934592", LegacyTimeAbort, CurrentToken, true, DisplayName = "an abort under another budget is stale")]
+    [DataRow(true, "v2;time=1800;memory=8589934592", LegacyTimeAbort, CurrentToken, true, DisplayName = "an abort before the one-pass union load (#268) is stale")]
+    [DataRow(true, "v3;time=600;memory=8589934592", LegacyTimeAbort, CurrentToken, true, DisplayName = "an abort under another budget is stale")]
     [DataRow(true, null, LegacyTimeAbort, CurrentToken, false, DisplayName = "an abort with no recorded token is not")]
     [DataRow(true, CurrentToken, LegacyTimeAbort, null, true, DisplayName = "an abort when the sandbox is now disabled is stale")]
     public void IsStaleAbort_RetriesOnlyAbortsUnderAnotherPolicy(
@@ -155,7 +156,7 @@ public class TimeBudgetRecoveryTests
     [TestMethod]
     public async Task Worker_Abort_RecordsTheExceededErrorAndTheAbortingPolicy()
     {
-        var result = await ProduceWith(new AbortingSandbox(exceptionToken: "v2;time=60;memory=0", sandboxToken: CurrentToken));
+        var result = await ProduceWith(new AbortingSandbox(exceptionToken: "v3;time=60;memory=0", sandboxToken: CurrentToken));
 
         Assert.AreEqual(SnapshotJobStatus.Failed, result.Status);
         Assert.AreEqual(LegacyTimeAbort, result.Error);
@@ -165,7 +166,7 @@ public class TimeBudgetRecoveryTests
         Assert.AreEqual(LegacyTimeAbort, exceeded.Message);
         var policy = result.Projects.Single(p => p.Code == EvaluationBudgetPolicy.PolicyCode);
         Assert.AreEqual(JobDiagnosticSeverity.Info, policy.Severity);
-        Assert.AreEqual("v2;time=60;memory=0", policy.Message, "the exception's own token wins: it is the policy that aborted.");
+        Assert.AreEqual("v3;time=60;memory=0", policy.Message, "the exception's own token wins: it is the policy that aborted.");
     }
 
     [TestMethod]
