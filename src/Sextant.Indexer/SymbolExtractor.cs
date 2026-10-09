@@ -62,9 +62,10 @@ public static partial class SymbolExtractor
     /// <see cref="DeclarationCandidates"/>, which never binds an executable body.
     /// </remarks>
     public static async Task<(List<Sextant.Core.SymbolInfo> Symbols, bool CompilationAvailable)> ExtractFromProjectWithStatusAsync(
-        Project project, long projectId, bool includeDocComments = true, int maxParallelism = 1)
+        Project project, long projectId, bool includeDocComments = true, int maxParallelism = 1,
+        CancellationToken cancellationToken = default)
     {
-        var compilation = await project.GetCompilationAsync();
+        var compilation = await project.GetCompilationAsync(cancellationToken);
         if (compilation == null)
             return ([], false);
 
@@ -73,11 +74,11 @@ public static partial class SymbolExtractor
         var perTree = new List<Sextant.Core.SymbolInfo>[trees.Count];
         await Parallel.ForEachAsync(
             Enumerable.Range(0, trees.Count),
-            new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, maxParallelism) },
-            async (index, cancellationToken) =>
+            new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, maxParallelism), CancellationToken = cancellationToken },
+            async (index, token) =>
             {
                 var syntaxTree = trees[index];
-                var root = await syntaxTree.GetRootAsync(cancellationToken);
+                var root = await syntaxTree.GetRootAsync(token);
                 perTree[index] = ExtractFromTree(compilation.GetSemanticModel(syntaxTree), root, projectId, includeDocComments, now);
             });
 

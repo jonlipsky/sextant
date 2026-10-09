@@ -45,7 +45,7 @@ public sealed class SymbolWalkEquivalenceTests
             {
                 var anon = new { Name = "n", Count = 1 };
                 (int A, string B) tuple = (1, "b");
-                IEnumerable<T> Local<T, U>(IEnumerable<T> items) where U : struct => items;
+                IEnumerable<TBody> Local<TBody, UBody>(IEnumerable<TBody> items) where UBody : struct => items;
                 foreach (var item in from s in source let doubled = s * 2 where doubled > 1 select doubled)
                 {
                     if (item is int matched && matched > anon.Count) { }
@@ -60,7 +60,7 @@ public sealed class SymbolWalkEquivalenceTests
             public class Inner { public const int Size = 4; public int this[string key] { get => 0; set { } } }
         }
 
-        public sealed class Square(double side) : Base<string>(1)
+        public sealed partial class Square(double side) : Base<string>(1)
         {
             public override double Area => side * side;
             public override IEnumerable<object> Query(IEnumerable<int> source) => base.Query(source);
@@ -95,10 +95,13 @@ public sealed class SymbolWalkEquivalenceTests
     {
         foreach (var project in new[]
                  {
-                     CreateProject(OutputKind.DynamicallyLinkedLibrary, ("Walk.cs", Library), ("More.cs", "namespace Walk; public partial class Square { }")),
+                     CreateProject(OutputKind.DynamicallyLinkedLibrary, ("Walk.cs", Library), ("More.cs", "namespace Walk; public sealed partial class Square { public int Extra => 1; }")),
                      CreateProject(OutputKind.ConsoleApplication, ("Program.cs", Program))
                  })
         {
+            var errors = (await project.GetCompilationAsync())!.GetDiagnostics()
+                .Where(d => d.Severity == DiagnosticSeverity.Error).Select(d => d.ToString()).ToList();
+            Assert.IsEmpty(errors, $"the {project.Name} fixture compiles cleanly:\n{string.Join("\n", errors)}");
             var expected = await FullWalkAsync(project);
             var (actual, available) = await SymbolExtractor.ExtractFromProjectWithStatusAsync(project, 1, maxParallelism: parallelism);
 
@@ -116,7 +119,7 @@ public sealed class SymbolWalkEquivalenceTests
         var (symbols, _) = await SymbolExtractor.ExtractFromProjectWithStatusAsync(project, 1);
 
         var typeParameters = symbols.Where(s => s.Kind == Sextant.Core.SymbolKind.TypeParameter).Select(s => s.DisplayName).ToList();
-        CollectionAssert.IsSubsetOf(new[] { "TLocal", "TN", "T", "U" }, typeParameters,
+        CollectionAssert.IsSubsetOf(new[] { "TLocal", "TN", "TBody", "UBody" }, typeParameters,
             "local functions' type parameters, in a field initializer, a constructor initializer and a method body");
     }
 
