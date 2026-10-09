@@ -52,8 +52,11 @@ public sealed class SourceTextStore
     /// <summary>
     /// Stores <paramref name="content"/> under <paramref name="contentHash"/>, its raw SHA-256 computed by the caller
     /// over the same buffer. Best-effort: a file over <see cref="MaxBytes"/> or an I/O failure stores nothing (the
-    /// text then reads as absent), and it never throws for either. An already-stored blob is kept when it verifies
-    /// and rewritten when it does not.
+    /// text then reads as absent), and it never throws for either. A blob already stored under the hash is kept as
+    /// it is, without reading it (issue #270: re-indexing a commit stores every file again, and verifying each one
+    /// decompressed and re-hashed it). Blobs land whole through an atomic rename, so a present blob was written
+    /// completely; one that has since gone bad is discarded by the next <see cref="TryGet"/>, and the next
+    /// <see cref="Put"/> writes it again.
     /// </summary>
     public void Put(byte[] contentHash, byte[] content)
     {
@@ -61,7 +64,7 @@ public sealed class SourceTextStore
             return;
 
         var target = BlobPath(contentHash);
-        if (TryGet(contentHash) != null)
+        if (File.Exists(target))
             return;
 
         string? temp = null;
@@ -88,7 +91,8 @@ public sealed class SourceTextStore
 
     /// <summary>
     /// The stored bytes whose raw SHA-256 is <paramref name="contentHash"/>, or null when none are stored or the
-    /// stored blob does not verify (missing, truncated, corrupt, over <see cref="MaxBytes"/>, or another file's).
+    /// stored blob does not verify (missing, truncated, corrupt, over <see cref="MaxBytes"/>, or another file's). A
+    /// blob that does not decode or hash to its key is deleted, so the next <see cref="Put"/> stores the content again.
     /// </summary>
     public byte[]? TryGet(byte[] contentHash)
     {
@@ -114,14 +118,21 @@ public sealed class SourceTextStore
             }
 
             var bytes = buffer.ToArray();
-            return CryptographicOperations.FixedTimeEquals(SHA256.HashData(bytes), contentHash) ? bytes : null;
+            if (CryptographicOperations.FixedTimeEquals(SHA256.HashData(bytes), contentHash))
+                return bytes;
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException
-                                       or InvalidOperationException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // InvalidOperationException: the Brotli decoder ran into invalid data (a corrupt blob).
             return null;
         }
+        catch (Exception ex) when (ex is InvalidDataException or InvalidOperationException)
+        {
+            // InvalidOperationException: the Brotli decoder ran into invalid data (a corrupt blob).
+        }
+
+        // The blob is corrupt, or holds other content: discard it so the next Put stores the content again.
+        TryDelete(path);
+        return null;
     }
 
     /// <summary>

@@ -1943,7 +1943,10 @@ pull-request head of the repository, and a later index moves it to another commi
 each file for its `file_versions` row it also stores the bytes, Brotli-compressed, in
 `<artifact-root>/source-text/<2 hex>/<sha-256 hex>.br` (content-addressed, so identical files share one
 blob; a file over 16 MiB is not kept). A query reads the blob for the file version's recorded hash and
-serves it only when the decompressed bytes hash to it. Only a project indexed from a checkout on this service
+serves it only when the decompressed bytes hash to it; a blob that does not is deleted, so the next index
+stores the content again. Storing a file whose blob is already present writes nothing and reads nothing
+(issue #270: a re-index stores every file again, and verifying each blob decompressed and re-hashed it).
+Only a project indexed from a checkout on this service
 reads the store: a contributed project's hashes come from the client, so a contribution naming another
 repository's file hash must not read its text. When there is no verified blob (a snapshot indexed before #244
 whose content no later index stored, a reused provider, or an overlay) or the project was contributed, it falls
