@@ -12,6 +12,12 @@ public static partial class SymbolExtractor
     [GeneratedRegex(@"[/\\]obj[/\\]", RegexOptions.IgnoreCase)]
     private static partial Regex ObjDirPattern();
 
+    [GeneratedRegex(@"<[^>]+>")]
+    private static partial Regex XmlTagPattern();
+
+    [GeneratedRegex(@"\s+")]
+    private static partial Regex WhitespacePattern();
+
     private static readonly SymbolDisplayFormat FqnFormat = SymbolDisplayFormat.FullyQualifiedFormat;
 
     /// <summary>
@@ -49,74 +55,128 @@ public static partial class SymbolExtractor
     /// empty project from a failed one and mark an incomplete generation partial (criterion 3) rather
     /// than publishing it as a complete branch head.
     /// </summary>
+    /// <remarks>
+    /// Issue #269: the project's syntax trees are extracted on up to <paramref name="maxParallelism"/> threads (a
+    /// compilation and its semantic models are safe to query concurrently), and the per-tree results are concatenated
+    /// in syntax-tree order, so the output is identical at every parallelism. Each tree is walked by
+    /// <see cref="DeclarationCandidates"/>, which never binds an executable body.
+    /// </remarks>
     public static async Task<(List<Sextant.Core.SymbolInfo> Symbols, bool CompilationAvailable)> ExtractFromProjectWithStatusAsync(
-        Project project, long projectId, bool includeDocComments = true)
+        Project project, long projectId, bool includeDocComments = true, int maxParallelism = 1)
     {
         var compilation = await project.GetCompilationAsync();
         if (compilation == null)
             return ([], false);
 
-        var symbols = new List<Sextant.Core.SymbolInfo>();
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-
-        foreach (var syntaxTree in compilation.SyntaxTrees)
-        {
-            if (IsGeneratedFile(syntaxTree.FilePath))
-                continue;
-
-            var semanticModel = compilation.GetSemanticModel(syntaxTree);
-            var root = await syntaxTree.GetRootAsync();
-
-            foreach (var node in root.DescendantNodes())
+        var trees = compilation.SyntaxTrees.Where(t => !IsGeneratedFile(t.FilePath)).ToList();
+        var perTree = new List<Sextant.Core.SymbolInfo>[trees.Count];
+        await Parallel.ForEachAsync(
+            Enumerable.Range(0, trees.Count),
+            new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, maxParallelism) },
+            async (index, cancellationToken) =>
             {
-                var declaredSymbol = semanticModel.GetDeclaredSymbol(node);
-                if (declaredSymbol == null)
-                    continue;
+                var syntaxTree = trees[index];
+                var root = await syntaxTree.GetRootAsync(cancellationToken);
+                perTree[index] = ExtractFromTree(compilation.GetSemanticModel(syntaxTree), root, projectId, includeDocComments, now);
+            });
 
-                if (declaredSymbol.IsImplicitlyDeclared)
-                    continue;
-
-                if (SemanticSymbolKeyFactory.IsExcludedArtifact(declaredSymbol))
-                    continue;
-
-                var kind = MapSymbolKind(declaredSymbol);
-                if (kind == null)
-                    continue;
-
-                var location = declaredSymbol.Locations.FirstOrDefault();
-                if (location == null || !location.IsInSource)
-                    continue;
-
-                var lineSpan = location.GetLineSpan();
-                var signature = GetSignature(declaredSymbol);
-
-                symbols.Add(new Sextant.Core.SymbolInfo
-                {
-                    ProjectId = projectId,
-                    SymbolKey = SemanticSymbolKeyFactory.DeclarationKey(declaredSymbol),
-                    FullyQualifiedName = declaredSymbol.ToDisplayString(FqnFormat),
-                    DisplayName = declaredSymbol.Name,
-                    Kind = kind.Value,
-                    Accessibility = MapAccessibility(declaredSymbol.DeclaredAccessibility),
-                    IsStatic = declaredSymbol.IsStatic,
-                    IsAbstract = declaredSymbol.IsAbstract,
-                    IsVirtual = declaredSymbol.IsVirtual,
-                    IsOverride = declaredSymbol.IsOverride,
-                    Signature = signature,
-                    SignatureHash = signature != null ? HashSignature(signature) : null,
-                    Declaration = GetDeclaration(declaredSymbol),
-                    DocComment = includeDocComments ? GetDocComment(declaredSymbol) : null,
-                    FilePath = syntaxTree.FilePath,
-                    LineStart = lineSpan.StartLinePosition.Line + 1,
-                    LineEnd = lineSpan.EndLinePosition.Line + 1,
-                    Attributes = GetAttributes(declaredSymbol),
-                    LastIndexedAt = now
-                });
-            }
-        }
-
+        var symbols = new List<Sextant.Core.SymbolInfo>(perTree.Sum(t => t.Count));
+        foreach (var treeSymbols in perTree)
+            symbols.AddRange(treeSymbols);
         return (symbols, true);
     }
+
+    private static List<Sextant.Core.SymbolInfo> ExtractFromTree(
+        SemanticModel semanticModel, SyntaxNode root, long projectId, bool includeDocComments, long now)
+    {
+        var symbols = new List<Sextant.Core.SymbolInfo>();
+        var filePath = root.SyntaxTree.FilePath;
+        foreach (var node in DeclarationCandidates(root))
+        {
+            var declaredSymbol = semanticModel.GetDeclaredSymbol(node);
+            if (declaredSymbol == null)
+                continue;
+
+            if (declaredSymbol.IsImplicitlyDeclared)
+                continue;
+
+            if (SemanticSymbolKeyFactory.IsExcludedArtifact(declaredSymbol))
+                continue;
+
+            var kind = MapSymbolKind(declaredSymbol);
+            if (kind == null)
+                continue;
+
+            var location = declaredSymbol.Locations.FirstOrDefault();
+            if (location == null || !location.IsInSource)
+                continue;
+
+            var lineSpan = location.GetLineSpan();
+            var signature = GetSignature(declaredSymbol);
+
+            symbols.Add(new Sextant.Core.SymbolInfo
+            {
+                ProjectId = projectId,
+                SymbolKey = SemanticSymbolKeyFactory.DeclarationKey(declaredSymbol),
+                FullyQualifiedName = declaredSymbol.ToDisplayString(FqnFormat),
+                DisplayName = declaredSymbol.Name,
+                Kind = kind.Value,
+                Accessibility = MapAccessibility(declaredSymbol.DeclaredAccessibility),
+                IsStatic = declaredSymbol.IsStatic,
+                IsAbstract = declaredSymbol.IsAbstract,
+                IsVirtual = declaredSymbol.IsVirtual,
+                IsOverride = declaredSymbol.IsOverride,
+                Signature = signature,
+                SignatureHash = signature != null ? HashSignature(signature) : null,
+                Declaration = GetDeclaration(declaredSymbol),
+                DocComment = includeDocComments ? GetDocComment(declaredSymbol) : null,
+                FilePath = filePath,
+                LineStart = lineSpan.StartLinePosition.Line + 1,
+                LineEnd = lineSpan.EndLinePosition.Line + 1,
+                Attributes = GetAttributes(declaredSymbol),
+                LastIndexedAt = now
+            });
+        }
+        return symbols;
+    }
+
+    /// <summary>
+    /// The nodes of <paramref name="root"/> whose declared symbol can be indexed, in the pre-order
+    /// <see cref="SyntaxNode.DescendantNodes(Func{SyntaxNode, bool}?, bool)"/> visits them (issue #269). Inside an
+    /// executable body (a block, an expression body, an initializer, a constructor initializer, a top-level statement)
+    /// every declaration is a local, a parameter, a lambda, a range variable, a local function or an anonymous-type
+    /// member, all of which <see cref="MapSymbolKind"/> or <see cref="SemanticSymbolKeyFactory.IsExcludedArtifact"/>
+    /// drop, except a local function's type parameters. So a body yields only those, and asking the semantic model
+    /// for any other declaration in it, which binds the whole body, is skipped.
+    /// </summary>
+    internal static IEnumerable<SyntaxNode> DeclarationCandidates(SyntaxNode root)
+    {
+        // Each entry is a node still to visit and whether it lies inside an executable body.
+        var pending = new Stack<(SyntaxNode Node, bool InBody)>();
+        foreach (var child in root.ChildNodes().Reverse())
+            pending.Push((child, false));
+        while (pending.Count > 0)
+        {
+            var (node, inBody) = pending.Pop();
+            var bodyHere = inBody || IsExecutableBodyRoot(node);
+            if (!bodyHere || IsLocalFunctionTypeParameter(node))
+                yield return node;
+            foreach (var child in node.ChildNodes().Reverse())
+                pending.Push((child, bodyHere));
+        }
+    }
+
+    private static bool IsExecutableBodyRoot(SyntaxNode node) => node is
+        Microsoft.CodeAnalysis.CSharp.Syntax.BlockSyntax
+        or Microsoft.CodeAnalysis.CSharp.Syntax.ArrowExpressionClauseSyntax
+        or Microsoft.CodeAnalysis.CSharp.Syntax.EqualsValueClauseSyntax
+        or Microsoft.CodeAnalysis.CSharp.Syntax.ConstructorInitializerSyntax
+        or Microsoft.CodeAnalysis.CSharp.Syntax.GlobalStatementSyntax;
+
+    private static bool IsLocalFunctionTypeParameter(SyntaxNode node) =>
+        node is Microsoft.CodeAnalysis.CSharp.Syntax.TypeParameterSyntax
+        { Parent.Parent: Microsoft.CodeAnalysis.CSharp.Syntax.LocalFunctionStatementSyntax };
 
     public static Sextant.Core.SymbolInfo? ExtractSymbolInfo(ISymbol declaredSymbol, long projectId)
     {
@@ -244,8 +304,8 @@ public static partial class SymbolExtractor
             return null;
 
         // Strip XML tags, keeping content
-        var stripped = Regex.Replace(xml, @"<[^>]+>", " ").Trim();
-        stripped = Regex.Replace(stripped, @"\s+", " ");
+        var stripped = XmlTagPattern().Replace(xml, " ").Trim();
+        stripped = WhitespacePattern().Replace(stripped, " ");
         return string.IsNullOrWhiteSpace(stripped) ? null : stripped;
     }
 

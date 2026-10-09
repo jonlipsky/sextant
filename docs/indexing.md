@@ -112,7 +112,17 @@ The `extracting_occurrences` phase runs through `ParallelExtractionPipeline`, a 
 - **Determinism.** Persistence order is `(project ordinal, document ordinal, intra-document emission order)` — independent of which worker finished first — so the canonical index is **byte-for-byte identical** to a single-threaded run. This is enforced by `ParallelDeterminismTests` (parallelism 1 vs 8) on top of the `ExtractorParityTests` gate.
 - **Cancellation & failure.** A linked cancellation token ties the stages together and is threaded into both the per-document analysis (via the worker's Roslyn calls) and the consumer's persist loop (checked before each project and before its batch commit), so a consumer/worker fault or an external cancel tears the run down promptly. The producer always completes the channel (normally, or faulted with the worker's exception), and a consumer/cancellation fault cancels the token to release a producer parked on a full channel — so no stage deadlocks. On teardown the run scope abandons its staging generation and the write session rolls back, so a cancelled or failed run **never** publishes (marks complete) a partial generation. Covered by `ParallelExtractionPipelineTests` (fast, synthetic) and `ParallelDeterminismTests.Cancellation_*` (full orchestrator).
 
-The pipeline is a **scheduling** change only — it produces exactly the same rows as sequential extraction, needs no schema/migration change, and does not alter the Phase 4 closure or deletion logic. Tuning knobs (`max_parallelism`, `extraction_queue_capacity`, both auto by default) are documented in [configuration.md](configuration.md); the parallelism sweep (throughput + peak memory) is in [benchmarks.md](benchmarks.md).
+The pipeline is a **scheduling** change only — it produces exactly the same rows as sequential extraction, needs no schema/migration change, and does not alter the Phase 4 closure or deletion logic.
+
+### The symbol pass (issue #269)
+
+`extracting_symbols` walks each project's declarations. Three things keep it fast and leave its output unchanged:
+
+- **No body is bound.** The walk (`SymbolExtractor.DeclarationCandidates`) visits nodes in the same pre-order as `DescendantNodes()`, but asks the semantic model about a node inside an executable body (a block, an expression body, an initializer, a constructor initializer, a top-level statement) only when it is a local function's type parameter. Every other declaration in a body is a local, a parameter, a lambda, a range variable, a local function or an anonymous-type member, which the index drops anyway, and asking about it bound the whole body: on ProcessStack this cut the pass's analysis from 343 s to 25 s. `SymbolWalkEquivalenceTests` compares the walk with the full walk, row for row.
+- **Trees in parallel.** A project's syntax trees are extracted on up to `max_parallelism` threads and concatenated in syntax-tree order, so the rows, their order and their ids are identical at every parallelism (`ParallelDeterminismTests` covers 1/2/4/8/auto, including the symbols table).
+- **Compilations ahead.** `CompilationPrefetcher` compiles the next projects in order, at most `max_parallelism` ahead of the one being walked; Roslyn caches each compilation on the solution, so the walk does not wait for it.
+
+Inserts stay on the indexing thread with the per-project commit boundary. On ProcessStack (192 projects) the pass takes 119 s, down from 463 s. Tuning knobs (`max_parallelism`, `extraction_queue_capacity`, both auto by default) are documented in [configuration.md](configuration.md); the parallelism sweep (throughput + peak memory) is in [benchmarks.md](benchmarks.md).
 
 ## Progress, Cancellation, and Metrics
 

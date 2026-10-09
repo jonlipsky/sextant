@@ -694,11 +694,18 @@ public sealed class IndexOrchestrator
             budgetNotIndexed.Contains(project.Id)
             || (projectRoslynToId.TryGetValue(project.Id, out var budgetProjectId) && PastExtractionDeadline(budgetProjectId));
 
+        // Issue #269: compile the projects ahead of the symbol walk, which is otherwise compile-bound on one core.
+        bool ExtractsSymbols(Project project) =>
+            project.FilePath != null && projectRoslynToId.ContainsKey(project.Id) && processSet.Contains(project.Id);
+        await using var prefetch = new CompilationPrefetcher(
+            solution.Projects.Where(ExtractsSymbols).ToList(), _parallelism.MaxParallelism, cancellationToken);
+
         foreach (var project in solution.Projects)
         {
-            if (project.FilePath == null || !projectRoslynToId.TryGetValue(project.Id, out var projectId)
-                || !processSet.Contains(project.Id))
+            if (!ExtractsSymbols(project))
                 continue;
+            var projectId = projectRoslynToId[project.Id];
+            prefetch.Reached();
 
             if (timeBudget != null && !providerProjectInfo.ContainsKey(projectId))
             {
@@ -750,7 +757,8 @@ public sealed class IndexOrchestrator
             var compileMs = projectWatch.ElapsedMilliseconds;
 
             var (symbols, compilationAvailable) = await SymbolExtractor.ExtractFromProjectWithStatusAsync(
-                project, projectId, includeDocComments: _profile.Has(IndexFeature.DocumentationSearch));
+                project, projectId, includeDocComments: _profile.Has(IndexFeature.DocumentationSearch),
+                maxParallelism: _parallelism.MaxParallelism);
             GC.KeepAlive(timedCompilation);
             var analyzedAt = projectWatch.ElapsedMilliseconds;
             if (!compilationAvailable)
