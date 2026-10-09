@@ -17,7 +17,11 @@ public sealed class ParallelDeterminismTests
     public TestContext TestContext { get; set; } = null!;
 
     [TestMethod]
-    public async Task DocumentExtractor_ParallelOutput_IsByteEquivalentToSequential()
+    [DataRow(2)]
+    [DataRow(4)]
+    [DataRow(8)]
+    [DataRow(0, DisplayName = "auto")]
+    public async Task DocumentExtractor_ParallelOutput_IsByteEquivalentToSequential(int maxParallelism)
     {
         var root = NewTempDir("determinism");
         var seqDir = NewTempDir("determinism-seq");
@@ -32,8 +36,11 @@ public sealed class ParallelDeterminismTests
                 slnx, Path.Combine(seqDir, "index.db"), ExtractionParallelismOptions.Sequential);
 
             // Parallel: force the bounded pipeline's parallel per-document path regardless of the host
-            // core count so the comparison is meaningful even on a small CI box.
-            var parallelOptions = new ExtractionParallelismOptions { MaxParallelism = 8, QueueCapacity = 4 };
+            // core count so the comparison is meaningful even on a small CI box (0 = the auto-resolved default).
+            // Issue #269: the symbol pass and its compilation prefetch run at the same parallelism.
+            var parallelOptions = maxParallelism == 0
+                ? ExtractionParallelismOptions.Default
+                : new ExtractionParallelismOptions { MaxParallelism = maxParallelism, QueueCapacity = 4 };
             var parallel = await IndexAndDumpAsync(
                 slnx, Path.Combine(parDir, "index.db"), parallelOptions);
 
@@ -134,6 +141,15 @@ public sealed class ParallelDeterminismTests
     private static string RawOrderedDump(SqliteConnection conn)
     {
         var sb = new System.Text.StringBuilder();
+
+        // Issue #269: the symbol pass extracts in parallel, so its rows, their order and their ids must match too.
+        AppendOrdered(sb, conn, "symbols", """
+            SELECT s.id, p.canonical_id, s.symbol_key, s.fully_qualified_name, s.kind, s.accessibility,
+                   COALESCE(s.signature,''), COALESCE(s.declaration,''), s.line_start, s.line_end
+            FROM symbols s
+            JOIN projects p ON s.project_id = p.id
+            ORDER BY s.rowid
+            """);
 
         AppendOrdered(sb, conn, "occurrences", """
             SELECT ip.canonical_id, tp.canonical_id, ts.symbol_key,

@@ -694,19 +694,30 @@ public sealed class IndexOrchestrator
             budgetNotIndexed.Contains(project.Id)
             || (projectRoslynToId.TryGetValue(project.Id, out var budgetProjectId) && PastExtractionDeadline(budgetProjectId));
 
+        // Issue #269: compile the projects ahead of the symbol walk, which is otherwise compile-bound on one core.
+        bool ExtractsSymbols(Project project) =>
+            project.FilePath != null && projectRoslynToId.ContainsKey(project.Id) && processSet.Contains(project.Id);
+        await using var prefetch = new CompilationPrefetcher(
+            solution.Projects.Where(ExtractsSymbols).ToList(), _parallelism.MaxParallelism, cancellationToken);
+
         foreach (var project in solution.Projects)
         {
-            if (project.FilePath == null || !projectRoslynToId.TryGetValue(project.Id, out var projectId)
-                || !processSet.Contains(project.Id))
+            if (!ExtractsSymbols(project))
                 continue;
+            var projectId = projectRoslynToId[project.Id];
+            prefetch.Reached();
 
             if (timeBudget != null && !providerProjectInfo.ContainsKey(projectId))
             {
                 if (symbolProjectsAdmitted > 0 && timeBudget.Clock.GetUtcNow() >= symbolDeadline)
                 {
                     if (budgetNotIndexed.Count == 0)
+                    {
                         _log?.Invoke($"  Time budget: the symbol phase deadline passed after {symbolProjectsAdmitted} " +
                                      "project(s); the remaining projects are registered but not indexed.");
+                        // The skipped projects need no compilation (a provider project still compiles on demand).
+                        prefetch.Stop();
+                    }
                     budgetNotIndexed.Add(project.Id);
                     // Clear whatever an earlier generation of this identity left in the row, so the project
                     // is published empty rather than with stale content.
@@ -750,7 +761,8 @@ public sealed class IndexOrchestrator
             var compileMs = projectWatch.ElapsedMilliseconds;
 
             var (symbols, compilationAvailable) = await SymbolExtractor.ExtractFromProjectWithStatusAsync(
-                project, projectId, includeDocComments: _profile.Has(IndexFeature.DocumentationSearch));
+                project, projectId, includeDocComments: _profile.Has(IndexFeature.DocumentationSearch),
+                maxParallelism: _parallelism.MaxParallelism, cancellationToken: cancellationToken);
             GC.KeepAlive(timedCompilation);
             var analyzedAt = projectWatch.ElapsedMilliseconds;
             if (!compilationAvailable)
@@ -796,6 +808,7 @@ public sealed class IndexOrchestrator
             });
             _log?.Invoke($"    {symbols.Count} symbols extracted");
         }
+        prefetch.Stop();
 
         // Phase 12: a REUSED submodule provider project version was not re-extracted this run (its
         // immutable rows are shared from a prior generation), so its symbols are absent from the in-run
