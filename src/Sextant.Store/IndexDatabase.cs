@@ -154,6 +154,8 @@ public sealed class IndexDatabase : IDisposable
     private void ConfigurePragmas(SqliteConnection connection)
     {
         using var cmd = connection.CreateCommand();
+        // A negative cache_size is a size in KiB rather than a page count, so the budget holds whatever the page size.
+        var cache = _writeOptions.CacheMib > 0 ? $"PRAGMA cache_size = {-_writeOptions.CacheMib * 1024L};" : "";
         cmd.CommandText = $"""
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
@@ -161,6 +163,9 @@ public sealed class IndexDatabase : IDisposable
             PRAGMA busy_timeout = 5000;
             PRAGMA wal_autocheckpoint = {_writeOptions.WalAutocheckpointPages};
             PRAGMA journal_size_limit = {_writeOptions.JournalSizeLimitBytes};
+            PRAGMA temp_store = MEMORY;
+            PRAGMA mmap_size = {Math.Max(0, _writeOptions.MmapMib) * 1024L * 1024};
+            {cache}
             """;
         cmd.ExecuteNonQuery();
     }

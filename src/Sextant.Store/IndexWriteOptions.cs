@@ -28,6 +28,19 @@ public sealed record IndexWriteOptions
     /// </summary>
     public long JournalSizeLimitBytes { get; init; } = 64L * 1024 * 1024;
 
+    /// <summary>
+    /// <c>PRAGMA cache_size</c> of the writer connection, in MiB. SQLite's default (about 2 MiB) is tiny beside a
+    /// multi-gigabyte catalog: every upsert walks the unique-key and secondary index B-trees, and their interior
+    /// pages fall out of a small cache. 0 or less keeps SQLite's default.
+    /// </summary>
+    public int CacheMib { get; init; } = 256;
+
+    /// <summary>
+    /// <c>PRAGMA mmap_size</c> of the writer connection, in MiB: reads of the first this-many bytes of the catalog
+    /// come straight from the operating system's file cache instead of a copy per page. 0 turns it off.
+    /// </summary>
+    public int MmapMib { get; init; } = 256;
+
     /// <summary>Maximum retries for a transient busy/locked failure on BEGIN/COMMIT.</summary>
     public int MaxRetries { get; init; } = 5;
 
@@ -44,6 +57,8 @@ public sealed record IndexWriteOptions
     {
         BatchRowThreshold = config.WriteBatchSize,
         WalAutocheckpointPages = config.WalAutocheckpointPages,
-        JournalSizeLimitBytes = config.JournalSizeLimitBytes
+        JournalSizeLimitBytes = config.JournalSizeLimitBytes,
+        CacheMib = config.WriterCacheMib,
+        MmapMib = config.WriterMmapMib
     };
 }

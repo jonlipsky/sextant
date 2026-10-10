@@ -16,16 +16,11 @@ public sealed class RelationshipStore(SqliteConnection connection)
 
     private const string InsertSql = """
         INSERT INTO relationships (from_symbol_id, to_symbol_id, kind, last_indexed_at)
-        VALUES (@from, @to, @kind, @last_indexed_at)
+        VALUES (?1, ?2, ?3, ?4)
         RETURNING id;
         """;
 
-    public SqliteCommand CreateInsertCommand()
-    {
-        var cmd = connection.CreateCommand();
-        cmd.CommandText = InsertSql;
-        return cmd;
-    }
+    public PreparedInsert CreateInsertCommand() => new(connection, InsertSql);
 
     public long Insert(RelationshipInfo relationship)
     {
@@ -33,13 +28,13 @@ public sealed class RelationshipStore(SqliteConnection connection)
         return Insert(cmd, relationship);
     }
 
-    public long Insert(SqliteCommand cmd, RelationshipInfo relationship)
+    public long Insert(PreparedInsert cmd, RelationshipInfo relationship)
     {
-        SqlParam.Set(cmd, "@from", relationship.FromSymbolId);
-        SqlParam.Set(cmd, "@to", relationship.ToSymbolId);
-        SqlParam.Set(cmd, "@kind", (int)relationship.Kind);
-        SqlParam.Set(cmd, "@last_indexed_at", relationship.LastIndexedAt);
-        return (long)cmd.ExecuteScalar()!;
+        cmd.Bind(1, relationship.FromSymbolId);
+        cmd.Bind(2, relationship.ToSymbolId);
+        cmd.Bind(3, (int)relationship.Kind);
+        cmd.Bind(4, relationship.LastIndexedAt);
+        return cmd.ExecuteReturningId();
     }
 
     public List<RelationshipInfo> GetByFromSymbol(long fromSymbolId, RelationshipKind? kind = null)

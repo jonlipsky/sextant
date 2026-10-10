@@ -53,6 +53,18 @@ public sealed class SextantConfiguration
     public long JournalSizeLimitBytes { get; set; } = 64L * 1024 * 1024;
 
     /// <summary>
+    /// The writer connection's SQLite page cache in MiB (<c>PRAGMA cache_size</c>). Counts against the process's
+    /// memory; 0 or less keeps SQLite's own default (about 2 MiB).
+    /// </summary>
+    public int WriterCacheMib { get; set; } = 256;
+
+    /// <summary>
+    /// How much of the catalog the writer connection maps into memory, in MiB (<c>PRAGMA mmap_size</c>). The mapped
+    /// pages are the operating system's file cache, not process heap; 0 turns memory mapping off.
+    /// </summary>
+    public int WriterMmapMib { get; set; } = 256;
+
+    /// <summary>
     /// Feature flag for the document-oriented semantic extractor. When true (default) the indexer uses
     /// the single-pass, per-document usage-site extractor with compilation-scoped exact target
     /// resolution. When false it falls back to the legacy declaration-driven extractor (whole-solution
@@ -300,6 +312,10 @@ public sealed class SextantConfiguration
                             config.WalAutocheckpointPages = fileConfig.WalAutocheckpointPages.Value;
                         if (fileConfig.JournalSizeLimitBytes.HasValue)
                             config.JournalSizeLimitBytes = fileConfig.JournalSizeLimitBytes.Value;
+                        if (fileConfig.WriterCacheMib.HasValue)
+                            config.WriterCacheMib = fileConfig.WriterCacheMib.Value;
+                        if (fileConfig.WriterMmapMib.HasValue)
+                            config.WriterMmapMib = fileConfig.WriterMmapMib.Value;
                         if (fileConfig.DocumentExtractor.HasValue)
                             config.DocumentExtractor = fileConfig.DocumentExtractor.Value;
                         if (fileConfig.MaxParallelism.HasValue)
@@ -397,6 +413,14 @@ public sealed class SextantConfiguration
         var journalLimit = Environment.GetEnvironmentVariable("SEXTANT_JOURNAL_SIZE_LIMIT");
         if (long.TryParse(journalLimit, out var journalBytes))
             config.JournalSizeLimitBytes = journalBytes;
+
+        var writerCache = Environment.GetEnvironmentVariable("SEXTANT_WRITER_CACHE_MIB");
+        if (int.TryParse(writerCache, out var cacheMib))
+            config.WriterCacheMib = cacheMib;
+
+        var writerMmap = Environment.GetEnvironmentVariable("SEXTANT_WRITER_MMAP_MIB");
+        if (int.TryParse(writerMmap, out var mmapMib))
+            config.WriterMmapMib = mmapMib;
 
         var documentExtractor = Environment.GetEnvironmentVariable("SEXTANT_DOCUMENT_EXTRACTOR");
         if (!string.IsNullOrEmpty(documentExtractor))
@@ -511,6 +535,12 @@ public sealed class SextantConfiguration
 
         [JsonPropertyName("journal_size_limit_bytes")]
         public long? JournalSizeLimitBytes { get; set; }
+
+        [JsonPropertyName("writer_cache_mib")]
+        public int? WriterCacheMib { get; set; }
+
+        [JsonPropertyName("writer_mmap_mib")]
+        public int? WriterMmapMib { get; set; }
 
         [JsonPropertyName("document_extractor")]
         public bool? DocumentExtractor { get; set; }

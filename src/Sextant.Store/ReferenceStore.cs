@@ -33,7 +33,7 @@ public sealed class ReferenceStore(SqliteConnection connection)
 
     private const string InsertSql = """
         INSERT INTO occurrences (in_project_id, target_symbol_id, source_symbol_id, file_version_id, line, col, kind, flags, last_indexed_at)
-        VALUES (@in_project_id, @target_symbol_id, NULL, @file_version_id, @line, 0, @kind, @flags, @last_indexed_at)
+        VALUES (?1, ?2, NULL, ?3, ?4, 0, ?5, ?6, ?7)
         RETURNING id;
         """;
 
@@ -56,12 +56,7 @@ public sealed class ReferenceStore(SqliteConnection connection)
     // project versions (criteria 6/7). Unscoped, it is exactly SelectBase.
     private string SelectPrefix => SelectBase + Scope.Join("o.in_project_id");
 
-    public SqliteCommand CreateInsertCommand()
-    {
-        var cmd = connection.CreateCommand();
-        cmd.CommandText = InsertSql;
-        return cmd;
-    }
+    public PreparedInsert CreateInsertCommand() => new(connection, InsertSql);
 
     public long Insert(ReferenceInfo reference)
     {
@@ -69,18 +64,18 @@ public sealed class ReferenceStore(SqliteConnection connection)
         return Insert(cmd, reference);
     }
 
-    public long Insert(SqliteCommand cmd, ReferenceInfo reference)
+    public long Insert(PreparedInsert cmd, ReferenceInfo reference)
     {
         var fileVersionId = FilesOrDefault.ResolveFileVersionId(
             reference.InProjectId, reference.FilePath, contentHash: null, lastIndexedAt: reference.LastIndexedAt);
-        SqlParam.Set(cmd, "@in_project_id", reference.InProjectId);
-        SqlParam.Set(cmd, "@target_symbol_id", reference.SymbolId);
-        SqlParam.Set(cmd, "@file_version_id", fileVersionId);
-        SqlParam.Set(cmd, "@line", reference.Line);
-        SqlParam.Set(cmd, "@kind", (int)reference.ReferenceKind);
-        SqlParam.Set(cmd, "@flags", ToFlags(reference.AccessKind, reference.IsCandidate));
-        SqlParam.Set(cmd, "@last_indexed_at", reference.LastIndexedAt);
-        return (long)cmd.ExecuteScalar()!;
+        cmd.Bind(1, reference.InProjectId);
+        cmd.Bind(2, reference.SymbolId);
+        cmd.Bind(3, fileVersionId);
+        cmd.Bind(4, reference.Line);
+        cmd.Bind(5, (int)reference.ReferenceKind);
+        cmd.Bind(6, ToFlags(reference.AccessKind, reference.IsCandidate));
+        cmd.Bind(7, reference.LastIndexedAt);
+        return cmd.ExecuteReturningId();
     }
 
     public List<ReferenceInfo> GetBySymbolId(long symbolId)

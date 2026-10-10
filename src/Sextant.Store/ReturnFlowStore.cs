@@ -8,16 +8,11 @@ public sealed class ReturnFlowStore(SqliteConnection connection)
     private const string InsertSql = """
         INSERT INTO return_flow (occurrence_id, destination_kind, destination_variable,
             destination_symbol_fqn, last_indexed_at)
-        VALUES (@occurrence_id, @kind, @variable, @symbol_fqn, @last_indexed_at)
+        VALUES (?1, ?2, ?3, ?4, ?5)
         RETURNING id;
         """;
 
-    public SqliteCommand CreateInsertCommand()
-    {
-        var cmd = connection.CreateCommand();
-        cmd.CommandText = InsertSql;
-        return cmd;
-    }
+    public PreparedInsert CreateInsertCommand() => new(connection, InsertSql);
 
     public long Insert(long callGraphId, string destinationKind, string? destinationVariable,
                        string? destinationSymbolFqn, long lastIndexedAt)
@@ -26,15 +21,15 @@ public sealed class ReturnFlowStore(SqliteConnection connection)
         return Insert(cmd, callGraphId, destinationKind, destinationVariable, destinationSymbolFqn, lastIndexedAt);
     }
 
-    public long Insert(SqliteCommand cmd, long callGraphId, string destinationKind, string? destinationVariable,
+    public long Insert(PreparedInsert cmd, long callGraphId, string destinationKind, string? destinationVariable,
                        string? destinationSymbolFqn, long lastIndexedAt)
     {
-        SqlParam.Set(cmd, "@occurrence_id", callGraphId);
-        SqlParam.Set(cmd, "@kind", destinationKind);
-        SqlParam.Set(cmd, "@variable", destinationVariable);
-        SqlParam.Set(cmd, "@symbol_fqn", destinationSymbolFqn);
-        SqlParam.Set(cmd, "@last_indexed_at", lastIndexedAt);
-        return (long)cmd.ExecuteScalar()!;
+        cmd.Bind(1, callGraphId);
+        cmd.Bind(2, destinationKind);
+        cmd.Bind(3, destinationVariable);
+        cmd.Bind(4, destinationSymbolFqn);
+        cmd.Bind(5, lastIndexedAt);
+        return cmd.ExecuteReturningId();
     }
 
     public List<ReturnFlowInfo> GetByCallGraphId(long callGraphId)

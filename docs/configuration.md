@@ -43,6 +43,8 @@ All fields are optional — Sextant uses sensible defaults.
 | `write_batch_size` | int | `10000` | Row count that forces a mid-project commit, bounding transaction/WAL growth (Phase 3). |
 | `wal_autocheckpoint_pages` | int | `1000` | `PRAGMA wal_autocheckpoint` in pages — bounds the WAL during a run (Phase 3). |
 | `journal_size_limit_bytes` | int | `67108864` (64 MiB) | `PRAGMA journal_size_limit` — caps the WAL left on disk after a checkpoint (Phase 3). |
+| `writer_cache_mib` | int | `256` | Page cache of the writer connection in MiB (`PRAGMA cache_size`); `0` or less keeps SQLite's ~2 MiB default (issue #271). Counts against the process's memory. |
+| `writer_mmap_mib` | int | `256` | Bytes of the catalog the writer maps into memory, in MiB (`PRAGMA mmap_size`); `0` turns it off (issue #271). Mapped pages are OS file cache, not heap. |
 | `reconcile_interval_seconds` | int | `30` | How often the daemon runs an authoritative git reconciliation pass that refreshes the working-tree overlay (Phase 10); `0` disables the periodic pass (startup reconciliation still runs). |
 | `indexing_profile` | string | `standard` | Semantic-depth profile: `core`, `standard`, or `deep` (see [Index Profiles](#index-profiles)). |
 | `generated_source_policy` | string | `exclude` | Generated-source handling; currently always `exclude` (Phase 8). |
@@ -78,6 +80,8 @@ Environment variables take precedence over `sextant.json`:
 | `SEXTANT_WRITE_BATCH_SIZE` | Rows before a forced mid-project commit (Phase 3) | `10000` |
 | `SEXTANT_WAL_AUTOCHECKPOINT` | `PRAGMA wal_autocheckpoint` pages (Phase 3) | `1000` |
 | `SEXTANT_JOURNAL_SIZE_LIMIT` | `PRAGMA journal_size_limit` bytes (Phase 3) | `67108864` (64 MiB) |
+| `SEXTANT_WRITER_CACHE_MIB` | Writer page cache in MiB (`PRAGMA cache_size`; issue #271) | `256` |
+| `SEXTANT_WRITER_MMAP_MIB` | Writer memory-mapped window in MiB (`PRAGMA mmap_size`; issue #271) | `256` |
 | `SEXTANT_RECONCILE_INTERVAL` | Daemon git-reconciliation interval, seconds (Phase 10) | `30` |
 | `SEXTANT_INDEXING_PROFILE` | Semantic-depth profile: `core`/`standard`/`deep` (Phase 8) | `standard` |
 | `SEXTANT_GENERATED_SOURCE_POLICY` | Generated-source policy (Phase 8) | `exclude` |

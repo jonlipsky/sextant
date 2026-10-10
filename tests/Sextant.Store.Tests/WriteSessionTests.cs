@@ -300,6 +300,78 @@ public class WriteSessionTests
         Assert.AreEqual(IndexWriteOptions.Default.JournalSizeLimitBytes, (long)cmd.ExecuteScalar()!);
     }
 
+    [TestMethod]
+    public void WriterCachePragmas_ReflectWriteOptions()
+    {
+        var conn = _db.GetConnection();
+        Assert.AreEqual(-IndexWriteOptions.Default.CacheMib * 1024L, Pragma(conn, "cache_size"), "cache_size is a KiB budget");
+        Assert.AreEqual(IndexWriteOptions.Default.MmapMib * 1024L * 1024, Pragma(conn, "mmap_size"));
+        Assert.AreEqual(2L, Pragma(conn, "temp_store"), "temp_store = MEMORY");
+    }
+
+    [TestMethod]
+    public void WriteOptionsFromEnvironment_ReachTheWriterConnection()
+    {
+        var variables = new Dictionary<string, string>
+        {
+            ["SEXTANT_WRITER_CACHE_MIB"] = "48",
+            ["SEXTANT_WRITER_MMAP_MIB"] = "0",
+            ["SEXTANT_WAL_AUTOCHECKPOINT"] = "4321",
+            ["SEXTANT_JOURNAL_SIZE_LIMIT"] = "1048576"
+        };
+        foreach (var (name, value) in variables)
+            Environment.SetEnvironmentVariable(name, value);
+        IndexWriteOptions options;
+        try
+        {
+            options = IndexWriteOptions.FromConfiguration(SextantConfiguration.FromEnvironment());
+        }
+        finally
+        {
+            foreach (var name in variables.Keys)
+                Environment.SetEnvironmentVariable(name, null);
+        }
+
+        var path = Path.Combine(Path.GetTempPath(), $"sextant_ws_env_{Guid.NewGuid():N}.db");
+        var db = new IndexDatabase(path, options);
+        try
+        {
+            var conn = db.GetConnection();
+            Assert.AreEqual(-48L * 1024, Pragma(conn, "cache_size"));
+            Assert.AreEqual(0L, Pragma(conn, "mmap_size"));
+            Assert.AreEqual(4321L, Pragma(conn, "wal_autocheckpoint"));
+            Assert.AreEqual(1048576L, Pragma(conn, "journal_size_limit"));
+        }
+        finally
+        {
+            SqliteTestDatabase.Delete(path, db);
+        }
+    }
+
+    [TestMethod]
+    public void NonPositiveCacheBudget_KeepsTheSqliteDefault()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"sextant_ws_nocache_{Guid.NewGuid():N}.db");
+        var db = new IndexDatabase(path, IndexWriteOptions.Default with { CacheMib = 0 });
+        try
+        {
+            using var fresh = new SqliteConnection($"Data Source={path}");
+            fresh.Open();
+            Assert.AreEqual(Pragma(fresh, "cache_size"), Pragma(db.GetConnection(), "cache_size"));
+        }
+        finally
+        {
+            SqliteTestDatabase.Delete(path, db);
+        }
+    }
+
+    private static long Pragma(SqliteConnection conn, string name)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = $"PRAGMA {name};";
+        return (long)cmd.ExecuteScalar()!;
+    }
+
     // ---- Concurrent reads during a staging generation ----
 
     [TestMethod]

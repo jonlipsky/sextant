@@ -22,7 +22,7 @@ public sealed class CommentStore(SqliteConnection connection)
 
     private const string InsertSql = """
         INSERT INTO comments (project_id, file_version_id, line, tag, text, enclosing_symbol_id, last_indexed_at)
-        VALUES (@project_id, @file_version_id, @line, @tag, @text, @enclosing_symbol_id, @last_indexed_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
         RETURNING id;
         """;
 
@@ -40,12 +40,7 @@ public sealed class CommentStore(SqliteConnection connection)
     // project versions (criteria 6/7). Unscoped, it is exactly SelectBase.
     private string SelectPrefix => SelectBase + Scope.Join("c.project_id");
 
-    public SqliteCommand CreateInsertCommand()
-    {
-        var cmd = connection.CreateCommand();
-        cmd.CommandText = InsertSql;
-        return cmd;
-    }
+    public PreparedInsert CreateInsertCommand() => new(connection, InsertSql);
 
     public long Insert(long projectId, string filePath, int line, string tag,
                        string text, long? enclosingSymbolId, long lastIndexedAt)
@@ -54,18 +49,18 @@ public sealed class CommentStore(SqliteConnection connection)
         return Insert(cmd, projectId, filePath, line, tag, text, enclosingSymbolId, lastIndexedAt);
     }
 
-    public long Insert(SqliteCommand cmd, long projectId, string filePath, int line, string tag,
+    public long Insert(PreparedInsert cmd, long projectId, string filePath, int line, string tag,
                        string text, long? enclosingSymbolId, long lastIndexedAt)
     {
         var fileVersionId = FilesOrDefault.ResolveFileVersionId(projectId, filePath, contentHash: null, lastIndexedAt: lastIndexedAt);
-        SqlParam.Set(cmd, "@project_id", projectId);
-        SqlParam.Set(cmd, "@file_version_id", fileVersionId);
-        SqlParam.Set(cmd, "@line", line);
-        SqlParam.Set(cmd, "@tag", tag);
-        SqlParam.Set(cmd, "@text", text);
-        SqlParam.Set(cmd, "@enclosing_symbol_id", enclosingSymbolId.HasValue ? enclosingSymbolId.Value : (object?)null);
-        SqlParam.Set(cmd, "@last_indexed_at", lastIndexedAt);
-        return (long)cmd.ExecuteScalar()!;
+        cmd.Bind(1, projectId);
+        cmd.Bind(2, fileVersionId);
+        cmd.Bind(3, line);
+        cmd.Bind(4, tag);
+        cmd.Bind(5, text);
+        cmd.Bind(6, enclosingSymbolId);
+        cmd.Bind(7, lastIndexedAt);
+        return cmd.ExecuteReturningId();
     }
 
     public List<CommentInfo> GetByTag(string tag, long? projectId = null)

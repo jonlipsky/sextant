@@ -117,47 +117,62 @@ public sealed class FileStore(SqliteConnection connection)
         return hash;
     }
 
+    // The three statements a new file version runs, prepared once per store and reused: preparing them again for every
+    // file measured as most of ResolveFileVersionId's cost on the single writer (issue #271). The connection disposes
+    // a command's prepared statements when it closes.
+    private SqliteCommand? _findExisting;
+    private SqliteCommand? _upsertFile;
+    private SqliteCommand? _upsertFileVersion;
+
+    private SqliteCommand Reusable(ref SqliteCommand? cache, string sql, params string[] parameters)
+    {
+        if (cache is not null)
+            return cache;
+        var cmd = connection.CreateCommand();
+        cmd.CommandText = sql;
+        foreach (var name in parameters)
+            cmd.Parameters.Add(new SqliteParameter { ParameterName = name });
+        return cache = cmd;
+    }
+
     private long? FindExistingFileVersion(long projectId, string repoRelative)
     {
-        using var cmd = connection.CreateCommand();
-        cmd.CommandText = """
+        var cmd = Reusable(ref _findExisting, """
             SELECT fv.id
             FROM files f JOIN file_versions fv ON fv.file_id = f.id
             WHERE f.project_id = @project_id AND f.repo_relative_path = @path
             LIMIT 1;
-            """;
-        cmd.Parameters.AddWithValue("@project_id", projectId);
-        cmd.Parameters.AddWithValue("@path", repoRelative);
+            """, "@project_id", "@path");
+        cmd.Parameters[0].Value = projectId;
+        cmd.Parameters[1].Value = repoRelative;
         var result = cmd.ExecuteScalar();
         return result is long id ? id : null;
     }
 
     private long UpsertFile(long projectId, string repoRelative)
     {
-        using var cmd = connection.CreateCommand();
-        cmd.CommandText = """
+        var cmd = Reusable(ref _upsertFile, """
             INSERT INTO files (project_id, repo_relative_path)
             VALUES (@project_id, @path)
             ON CONFLICT(project_id, repo_relative_path) DO UPDATE SET repo_relative_path = excluded.repo_relative_path
             RETURNING id;
-            """;
-        cmd.Parameters.AddWithValue("@project_id", projectId);
-        cmd.Parameters.AddWithValue("@path", repoRelative);
+            """, "@project_id", "@path");
+        cmd.Parameters[0].Value = projectId;
+        cmd.Parameters[1].Value = repoRelative;
         return (long)cmd.ExecuteScalar()!;
     }
 
     private long UpsertFileVersion(long fileId, byte[] contentHash, long lastIndexedAt)
     {
-        using var cmd = connection.CreateCommand();
-        cmd.CommandText = """
+        var cmd = Reusable(ref _upsertFileVersion, """
             INSERT INTO file_versions (file_id, content_hash, last_indexed_at)
             VALUES (@file_id, @hash, @last_indexed_at)
             ON CONFLICT(file_id, content_hash) DO UPDATE SET last_indexed_at = excluded.last_indexed_at
             RETURNING id;
-            """;
-        cmd.Parameters.AddWithValue("@file_id", fileId);
-        cmd.Parameters.AddWithValue("@hash", contentHash);
-        cmd.Parameters.AddWithValue("@last_indexed_at", lastIndexedAt);
+            """, "@file_id", "@hash", "@last_indexed_at");
+        cmd.Parameters[0].Value = fileId;
+        cmd.Parameters[1].Value = contentHash;
+        cmd.Parameters[2].Value = lastIndexedAt;
         return (long)cmd.ExecuteScalar()!;
     }
 
