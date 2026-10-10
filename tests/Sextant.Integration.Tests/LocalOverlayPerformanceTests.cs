@@ -146,7 +146,7 @@ public class LocalOverlayPerformanceTests : IDisposable
         Git(repoRoot, "config commit.gpgsign false");
         Git(repoRoot, "add -A");
         Git(repoRoot, "commit -m initial");
-        RestoreSolution(slnPath);
+        GeneratedCorpusRestore.Restore(slnPath);
         return (repoRoot, slnPath, files);
     }
 
@@ -166,22 +166,5 @@ public class LocalOverlayPerformanceTests : IDisposable
         process.WaitForExit();
         if (process.ExitCode != 0)
             Assert.Inconclusive($"git {args} failed (exit {process.ExitCode}): {stderr}");
-    }
-
-    private static void RestoreSolution(string solutionPath)
-    {
-        var psi = new ProcessStartInfo("dotnet", $"restore \"{solutionPath}\"")
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
-        using var process = Process.Start(psi)!;
-        var stderr = process.StandardError.ReadToEnd();
-        process.StandardOutput.ReadToEnd();
-        process.WaitForExit();
-        if (process.ExitCode != 0)
-            Assert.Inconclusive($"restore of the generated solution failed (exit {process.ExitCode}): {stderr}");
     }
 }

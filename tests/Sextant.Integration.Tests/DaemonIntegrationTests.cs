@@ -231,7 +231,7 @@ public class DaemonIntegrationTests : IDisposable
         var slnx = Path.Combine(root, "Sln.slnx");
         await File.WriteAllTextAsync(slnx,
             "<Solution>\n  <Project Path=\"ProjA/ProjA.csproj\" />\n</Solution>\n");
-        RestoreSolution(slnx);
+        GeneratedCorpusRestore.Restore(slnx);
 
         var dbPath = Path.Combine(_tempDir, "catchup.db");
 
@@ -248,7 +248,7 @@ public class DaemonIntegrationTests : IDisposable
         WriteSdkProject(root, "ProjB", "namespace ProjB;\npublic class TypeB { public int B() => 2; }\n");
         await File.WriteAllTextAsync(slnx,
             "<Solution>\n  <Project Path=\"ProjA/ProjA.csproj\" />\n  <Project Path=\"ProjB/ProjB.csproj\" />\n</Solution>\n");
-        RestoreSolution(slnx);
+        GeneratedCorpusRestore.Restore(slnx);
 
         // Second run: the non-empty DB routes through incremental catch-up (not a full index). Catch-up
         // must still index the newly-added project even though it has no prior fingerprint rows.
@@ -282,23 +282,6 @@ public class DaemonIntegrationTests : IDisposable
             </Project>
             """);
         File.WriteAllText(Path.Combine(dir, $"{name}.cs"), classBody);
-    }
-
-    private static void RestoreSolution(string solutionPath)
-    {
-        var psi = new System.Diagnostics.ProcessStartInfo("dotnet", $"restore \"{solutionPath}\"")
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
-        using var process = System.Diagnostics.Process.Start(psi)!;
-        var stderr = process.StandardError.ReadToEnd();
-        process.StandardOutput.ReadToEnd();
-        process.WaitForExit();
-        if (process.ExitCode != 0)
-            Assert.Inconclusive($"restore of the generated solution failed (exit {process.ExitCode}): {stderr}");
     }
 
     private static bool SymbolDisplayNameExists(Microsoft.Data.Sqlite.SqliteConnection conn, string displayName)

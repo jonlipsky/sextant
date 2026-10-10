@@ -101,7 +101,7 @@ public sealed class DefaultUnionSnapshotIntegrationTests : IDisposable
         Write(root, "App/AppType.cs", "namespace Pulled;\npublic class AppType { public HeldType Held = new(); }\n");
         Write(root, "A.slnx", "<Solution>\n  <Project Path=\"App/App.csproj\" />\n</Solution>\n");
         Write(root, "B.slnx", "<Solution>\n  <Project Path=\"Held/Held.csproj\" />\n</Solution>\n");
-        Restore(Path.Combine(root, "App", "App.csproj"));
+        GeneratedCorpusRestore.Restore(Path.Combine(root, "App", "App.csproj"));
         var diagnostics = new List<string>();
 
         var load = await MultiSolutionLoader.LoadAsync(
@@ -384,8 +384,8 @@ public sealed class DefaultUnionSnapshotIntegrationTests : IDisposable
 
         // Restore only the loadable projects (the head cannot evaluate — that is the point). App and Tool
         // pull in Core (both TFMs) through their project references.
-        Restore(Path.Combine(root, "App", "App.csproj"));
-        Restore(Path.Combine(root, "Tools", "Tool.csproj"));
+        GeneratedCorpusRestore.Restore(Path.Combine(root, "App", "App.csproj"));
+        GeneratedCorpusRestore.Restore(Path.Combine(root, "Tools", "Tool.csproj"));
         return root;
     }
 
@@ -412,34 +412,5 @@ public sealed class DefaultUnionSnapshotIntegrationTests : IDisposable
         var full = Path.Combine(root, relative.Replace('/', Path.DirectorySeparatorChar));
         Directory.CreateDirectory(Path.GetDirectoryName(full)!);
         File.WriteAllText(full, content);
-    }
-
-    private static void Restore(string projectPath)
-    {
-        var psi = new System.Diagnostics.ProcessStartInfo("dotnet", $"restore \"{projectPath}\"")
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
-        using var process = System.Diagnostics.Process.Start(psi)!;
-        var stdoutTask = process.StandardOutput.ReadToEndAsync();
-        var stderrTask = process.StandardError.ReadToEndAsync();
-        // Bounded (review): a hung restore must not stall the whole Integration run. Kill only THIS process
-        // (and its children) — never dotnet/MSBuild by name, other sessions share the machine.
-        if (!process.WaitForExit(TimeSpan.FromMinutes(5)))
-        {
-            try { process.Kill(entireProcessTree: true); } catch (InvalidOperationException) { /* already exited */ }
-            Assert.Inconclusive($"restore of '{Path.GetFileName(projectPath)}' did not finish within 5 minutes");
-        }
-        var stdout = stdoutTask.GetAwaiter().GetResult();
-        var stderr = stderrTask.GetAwaiter().GetResult();
-        // Inconclusive (not failed) on a restore failure, matching every other generated-corpus integration
-        // test in this repo (e.g. MultiSolutionIndexingIntegrationTests): an offline machine without the
-        // netstandard2.0 reference pack cached cannot restore, which is not a product regression.
-        if (process.ExitCode != 0)
-            Assert.Inconclusive(
-                $"restore of '{Path.GetFileName(projectPath)}' failed (exit {process.ExitCode}): {stderr}{stdout}");
     }
 }
