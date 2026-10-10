@@ -29,6 +29,34 @@ public sealed class ServicePaths
     /// </summary>
     public string SourceTextRoot => Path.Combine(_artifactRoot, Sextant.Store.SourceTextStore.DirectoryName);
 
+    /// <summary>
+    /// The per-repository NuGet package folders on the cache volume (issue #272): one
+    /// <see cref="RepoDirectoryName"/> directory per repository, so a package one repository's feeds served is never
+    /// resolved by another repository's restore. Everything under it is rebuildable.
+    /// </summary>
+    public string PackageCacheRoot => Path.Combine(_cacheRoot, "nuget-packages");
+
+    /// <summary>
+    /// The per-repository git object stores on the cache volume (issue #272): one <see cref="RepoDirectoryName"/>
+    /// directory per repository, holding the bare store a new commit is fetched into incrementally. Everything under
+    /// it is rebuildable.
+    /// </summary>
+    public string GitObjectStoreRoot => Path.Combine(_cacheRoot, "git-objects");
+
+    /// <summary>
+    /// True when <paramref name="path"/> is exactly one repository's package folder: a direct child of
+    /// <see cref="PackageCacheRoot"/>. The evaluation sandbox refuses to point <c>NUGET_PACKAGES</c> anywhere else.
+    /// </summary>
+    public bool IsPackageCacheDirectory(string path)
+    {
+        var full = NormalizeFull(path);
+        var parent = Path.GetDirectoryName(full);
+        return parent is not null
+            && string.Equals(NormalizeFull(parent), NormalizeFull(PackageCacheRoot), PathComparison)
+            && Path.GetFileName(full) is { Length: > 0 } name
+            && name[0] != '.';
+    }
+
     public ServicePaths(ServiceVolumes volumes)
     {
         _checkoutRoot = NormalizeFull(volumes.CheckoutRoot);

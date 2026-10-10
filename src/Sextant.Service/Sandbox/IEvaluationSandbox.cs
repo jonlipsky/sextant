@@ -11,9 +11,13 @@ public interface IEvaluationSandbox
     /// Runs <paramref name="evaluate"/> under the sandbox's resource + secret isolation. The passed token is
     /// linked to the sandbox's time/memory budget, so a well-behaved evaluation that honors cancellation is
     /// aborted when a budget is exceeded (surfaced as <see cref="SandboxLimitExceededException"/>).
+    /// <paramref name="packagesDir"/> is the repository's persistent package folder (issue #272,
+    /// <see cref="Restore.PackageCache"/>) the evaluation's <c>NUGET_PACKAGES</c> points at, or null for a folder in
+    /// job scratch; anything but one repository's folder under <see cref="ServicePaths.PackageCacheRoot"/> is refused.
     /// </summary>
     Task<T> RunAsync<T>(
-        string checkoutDir, string scratchDir, Func<CancellationToken, Task<T>> evaluate, CancellationToken cancellationToken);
+        string checkoutDir, string scratchDir, string? packagesDir, Func<CancellationToken, Task<T>> evaluate,
+        CancellationToken cancellationToken);
 
     /// <summary>
     /// The wall-clock budget <see cref="RunAsync"/> enforces, or null when it enforces none. The worker plans its

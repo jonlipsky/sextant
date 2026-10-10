@@ -142,7 +142,7 @@ public class TimeBudgetRecoveryTests
         var sandbox = new EvaluationSandbox(policy, paths);
 
         var ex = await Assert.ThrowsExactlyAsync<SandboxLimitExceededException>(async () =>
-            await sandbox.RunAsync(paths.CheckoutRoot, paths.AllocateScratch("job"),
+            await sandbox.RunAsync(paths.CheckoutRoot, paths.AllocateScratch("job"), null,
                 async token => { await Task.Delay(TimeSpan.FromSeconds(30), token); return 0; },
                 CancellationToken.None));
 
@@ -349,7 +349,7 @@ public class TimeBudgetRecoveryTests
         public string? BudgetPolicyToken => sandboxToken;
 
         public Task<T> RunAsync<T>(
-            string checkoutDir, string scratchDir, Func<CancellationToken, Task<T>> evaluate, CancellationToken cancellationToken) =>
+            string checkoutDir, string scratchDir, string? packagesDir, Func<CancellationToken, Task<T>> evaluate, CancellationToken cancellationToken) =>
             throw new SandboxLimitExceededException(LegacyTimeAbort) { Kind = "time", PolicyToken = exceptionToken };
     }
 

@@ -5,7 +5,8 @@ namespace Sextant.Service.Sandbox;
 /// (Phase 17, criterion 2 — secret + filesystem isolation). It (a) SCRUBS secret-bearing environment
 /// variables so untrusted MSBuild evaluation cannot read tokens/keys/credentials out of the service's
 /// environment, (b) REDIRECTS the toolchain's scratch/cache/temp locations into the per-job scratch
-/// directory so evaluation writes land on the freely-deletable scratch volume (never a persistent volume),
+/// directory so evaluation writes land on the freely-deletable scratch volume (the one exception: the
+/// repository's own persistent NuGet package folder, issue #272),
 /// and (c) forces OFFLINE/no-telemetry toolchain behavior when network is denied.
 ///
 /// The mutation is process-global (there is no per-async-context environment), so this is SAFE ONLY because
@@ -31,14 +32,18 @@ internal sealed class SandboxedEnvironmentScope : IDisposable
 
     private readonly Dictionary<string, string?> _saved = new(StringComparer.Ordinal);
 
-    public SandboxedEnvironmentScope(SandboxPolicy policy, string scratchDir)
+    /// <param name="policy">The sandbox policy.</param>
+    /// <param name="scratchDir">The per-job scratch directory temp/home locations are redirected into.</param>
+    /// <param name="packagesDir">The repository's persistent package folder (issue #272), or null to give the job a
+    /// cold folder in scratch.</param>
+    public SandboxedEnvironmentScope(SandboxPolicy policy, string scratchDir, string? packagesDir = null)
     {
         // Create/validate the per-job scratch subdirectories BEFORE mutating ANY environment variable. If a
         // directory operation fails after secrets were already scrubbed, construction would throw and no
         // scope would be alive to restore them — leaving the service process permanently missing its
         // secrets. Doing all fallible filesystem work first closes that window.
         var temp = Path.Combine(scratchDir, "tmp");
-        var nuget = Path.Combine(scratchDir, "nuget");
+        var nuget = packagesDir ?? Path.Combine(scratchDir, "nuget");
         var dotnetHome = Path.Combine(scratchDir, "dotnet");
         Directory.CreateDirectory(temp);
         Directory.CreateDirectory(nuget);
@@ -49,7 +54,8 @@ internal sealed class SandboxedEnvironmentScope : IDisposable
             if (policy.ScrubSecrets)
                 ScrubSecrets();
 
-            // Redirect toolchain scratch/cache/temp into the per-job scratch directory.
+            // Redirect toolchain scratch/cache/temp into the per-job scratch directory, and the package folder into
+            // the repository's own persistent one when the caller has one (issue #272).
             Override("TMP", temp);
             Override("TEMP", temp);
             Override("TMPDIR", temp);

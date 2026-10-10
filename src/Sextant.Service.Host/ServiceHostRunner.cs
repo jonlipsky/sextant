@@ -71,7 +71,11 @@ public static class ServiceHostRunner
         if (options.CheckoutMode == ServiceCheckoutMode.Clone)
             checkoutProvider = new CloningCheckoutProvider(
                 checkoutProvider, paths, options.CheckoutToken, log: Console.Error.WriteLine,
-                submoduleHosts: options.SubmoduleHosts);
+                submoduleHosts: options.SubmoduleHosts)
+            {
+                // Issue #272: fetch each new commit incrementally into a per-repository object store.
+                UseObjectStore = options.GitObjectStore
+            };
         // Criterion 2: the service worker evaluates UNTRUSTED checkouts, so wrap its MSBuild evaluation in
         // the enforced sandbox (time/memory/secret/filesystem isolation) — applied to private and public
         // repos alike. The local CLI/daemon path does not construct this worker, so it stays byte-identical.
@@ -100,9 +104,13 @@ public static class ServiceHostRunner
             Console.Error.WriteLine($"package restore: credentials configured for {string.Join(", ", packageRestore.CredentialHosts)}.");
         // Issue #244: the worker keeps every indexed file's bytes on the artifact volume, where the query surface
         // (SnapshotService.SourceTexts, the same root) reads each snapshot's own source text back.
+        // Issue #272: each repository restores into its own package folder on the cache volume, kept between its
+        // jobs and bounded as a whole by PACKAGE_CACHE_MAX_MB (never one shared folder: see PackageCache).
+        var packageCache = new PackageCache(paths, options.PackageCacheMaxBytes, Console.Error.WriteLine);
         var localWorker = new LocalIndexerSnapshotWorker(
             database, config, checkoutProvider, Console.Error.WriteLine, nodeCapability, sandbox, sdkPinGuard,
-            packageRestore, new SourceTextStore(paths.SourceTextRoot, Console.Error.WriteLine));
+            packageRestore, new SourceTextStore(paths.SourceTextRoot, Console.Error.WriteLine),
+            packageCache: packageCache);
         var defaultPlacement = new LocalPlacement(nodeCapability, localWorker);
         var worker = new CapabilityRoutingSnapshotWorker(
             defaultPlacement,

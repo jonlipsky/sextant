@@ -363,7 +363,7 @@ public sealed class TimeBudgetSnapshotIntegrationTests : IDisposable
         public string? BudgetPolicyToken => null;
 
         public Task<T> RunAsync<T>(
-            string checkoutDir, string scratchDir, Func<CancellationToken, Task<T>> evaluate, CancellationToken cancellationToken) =>
+            string checkoutDir, string scratchDir, string? packagesDir, Func<CancellationToken, Task<T>> evaluate, CancellationToken cancellationToken) =>
             evaluate(cancellationToken);
     }
 }

@@ -44,7 +44,7 @@ public class EvaluationSandboxTests
         {
             var sandbox = new EvaluationSandbox(SandboxPolicy.Disabled, _paths);
             string? seen = "unset";
-            var result = await sandbox.RunAsync(_dataRoot, _scratch, _ =>
+            var result = await sandbox.RunAsync(_dataRoot, _scratch, null, _ =>
             {
                 seen = Environment.GetEnvironmentVariable("SEXTANT_TEST_SECRET_TOKEN");
                 return Task.FromResult(42);
@@ -67,7 +67,7 @@ public class EvaluationSandboxTests
         {
             var sandbox = new EvaluationSandbox(SandboxPolicy.Enforced with { TimeBudget = TimeSpan.Zero }, _paths);
             string? insideSecret = "unset";
-            await sandbox.RunAsync(_dataRoot, _scratch, _ =>
+            await sandbox.RunAsync(_dataRoot, _scratch, null, _ =>
             {
                 insideSecret = Environment.GetEnvironmentVariable("SEXTANT_TEST_SECRET_TOKEN");
                 return Task.FromResult(0);
@@ -88,7 +88,7 @@ public class EvaluationSandboxTests
     {
         var sandbox = new EvaluationSandbox(SandboxPolicy.Enforced with { TimeBudget = TimeSpan.Zero }, _paths);
         string? temp = null, nuget = null;
-        await sandbox.RunAsync(_dataRoot, _scratch, _ =>
+        await sandbox.RunAsync(_dataRoot, _scratch, null, _ =>
         {
             temp = Environment.GetEnvironmentVariable("TEMP");
             nuget = Environment.GetEnvironmentVariable("NUGET_PACKAGES");
@@ -102,6 +102,47 @@ public class EvaluationSandboxTests
     }
 
     [TestMethod]
+    public async Task Enforced_PointsNuGetPackagesAtTheRepositoryFolder_AndRestoresAfter()
+    {
+        // Issue #272: a repository's persistent package folder replaces the cold one in scratch for its evaluation.
+        var packages = new Sextant.Service.Restore.PackageCache(_paths, 1024 * 1024)
+            .Acquire("https://github.com/acme/widgets")!;
+        var before = Environment.GetEnvironmentVariable("NUGET_PACKAGES");
+        var sandbox = new EvaluationSandbox(SandboxPolicy.Enforced with { TimeBudget = TimeSpan.Zero }, _paths);
+        string? nuget = null;
+        await sandbox.RunAsync(_dataRoot, _scratch, packages, _ =>
+        {
+            nuget = Environment.GetEnvironmentVariable("NUGET_PACKAGES");
+            return Task.FromResult(0);
+        }, CancellationToken.None);
+
+        Assert.AreEqual(packages, nuget);
+        Assert.AreEqual(before, Environment.GetEnvironmentVariable("NUGET_PACKAGES"), "restored after the scope");
+    }
+
+    [TestMethod]
+    public async Task Enforced_PackageFolderOutsideTheCacheRoot_IsRefusedFailClosed()
+    {
+        var sandbox = new EvaluationSandbox(SandboxPolicy.Enforced with { TimeBudget = TimeSpan.Zero }, _paths);
+        string[] refused =
+        [
+            _paths.ArtifactRoot,                                  // a persistent volume holding published data
+            _paths.PackageCacheRoot,                              // the root itself (every repository's folders)
+            Path.Combine(_paths.PackageCacheRoot, "a", "b"),      // nested below a repository folder
+            Path.Combine(_paths.PackageCacheRoot, ".evicting-x"), // a folder being evicted
+            Path.Combine(_paths.PackageCacheRoot, "..", "git-objects"),
+        ];
+        foreach (var dir in refused)
+        {
+            var invoked = false;
+            await Assert.ThrowsExactlyAsync<SandboxViolationException>(async () =>
+                await sandbox.RunAsync(_dataRoot, _scratch, dir, _ => { invoked = true; return Task.FromResult(0); },
+                    CancellationToken.None), dir);
+            Assert.IsFalse(invoked, $"evaluation must not run with NUGET_PACKAGES at '{dir}'");
+        }
+    }
+
+    [TestMethod]
     public async Task Enforced_TimeBudgetExceeded_AbortsWithLimitException()
     {
         var policy = SandboxPolicy.Enforced with
@@ -112,7 +153,7 @@ public class EvaluationSandboxTests
         var sandbox = new EvaluationSandbox(policy, _paths);
 
         await Assert.ThrowsExactlyAsync<SandboxLimitExceededException>(async () =>
-            await sandbox.RunAsync(_dataRoot, _scratch,
+            await sandbox.RunAsync(_dataRoot, _scratch, null,
                 async token => { await Task.Delay(TimeSpan.FromSeconds(30), token); return 0; },
                 CancellationToken.None));
     }
@@ -131,7 +172,7 @@ public class EvaluationSandboxTests
         var sandbox = new EvaluationSandbox(policy, _paths);
 
         var ex = await Assert.ThrowsExactlyAsync<SandboxLimitExceededException>(async () =>
-            await sandbox.RunAsync(_dataRoot, _scratch,
+            await sandbox.RunAsync(_dataRoot, _scratch, null,
                 async token => { await Task.Delay(TimeSpan.FromSeconds(30), token); return 0; },
                 CancellationToken.None));
         StringAssert.Contains(ex.Message, "memory");
@@ -144,7 +185,7 @@ public class EvaluationSandboxTests
         var outside = Path.Combine(_paths.CheckoutRoot, "not-scratch"); // a persistent volume, not scratch
 
         await Assert.ThrowsExactlyAsync<SandboxViolationException>(async () =>
-            await sandbox.RunAsync(_dataRoot, outside, _ => Task.FromResult(0), CancellationToken.None));
+            await sandbox.RunAsync(_dataRoot, outside, null, _ => Task.FromResult(0), CancellationToken.None));
     }
 
     [TestMethod]
@@ -155,7 +196,7 @@ public class EvaluationSandboxTests
         cts.Cancel();
 
         await Assert.ThrowsExactlyAsync<TaskCanceledException>(async () =>
-            await sandbox.RunAsync(_dataRoot, _scratch,
+            await sandbox.RunAsync(_dataRoot, _scratch, null,
                 async token => { await Task.Delay(TimeSpan.FromSeconds(30), token); return 0; },
                 cts.Token));
     }
@@ -186,18 +227,46 @@ public class EvaluationSandboxTests
         StringAssert.Contains(result.Error ?? string.Empty, "sandbox-intercepted");
     }
 
+    [TestMethod]
+    public async Task Worker_HandsTheSandboxTheRepositorysPackageFolder_AndRecordsItsUse()
+    {
+        // Issue #272: the worker restores into the requesting repository's persistent folder, not job scratch.
+        var spy = new SpySandbox();
+        using var db = new IndexDatabase(Path.Combine(_dataRoot, "catalog.db"), IndexWriteOptions.Default);
+        db.RunMigrations();
+        var cache = new Sextant.Service.Restore.PackageCache(_paths, Sextant.Service.Restore.PackageCache.DefaultMaxBytes);
+        var worker = new LocalIndexerSnapshotWorker(
+            db, new SextantConfiguration(), new StubCheckoutProvider(_scratch), capability: null, sandbox: spy,
+            packageCache: cache);
+        var request = new EnsureSnapshotRequest
+        {
+            RepositoryRemoteUrl = "https://example/repo",
+            CommitSha = new string('a', 40),
+            TreeSha = new string('b', 40)
+        };
+
+        await worker.ProduceAsync(request, "identity-hash", _scratch, CancellationToken.None);
+
+        Assert.AreEqual(
+            Path.Combine(_paths.PackageCacheRoot, ServicePaths.RepoDirectoryName("https://example/repo")), spy.PackagesDir);
+        Assert.IsTrue(File.Exists(spy.PackagesDir + ".usage"), "the job's use is recorded for eviction");
+    }
+
     private sealed class SpySandbox : IEvaluationSandbox
     {
         public bool WasInvoked { get; private set; }
+
+        public string? PackagesDir { get; private set; }
 
         public TimeSpan? TimeBudget => null;
 
         public string? BudgetPolicyToken => null;
 
         public Task<T> RunAsync<T>(
-            string checkoutDir, string scratchDir, Func<CancellationToken, Task<T>> evaluate, CancellationToken cancellationToken)
+            string checkoutDir, string scratchDir, string? packagesDir, Func<CancellationToken, Task<T>> evaluate, CancellationToken cancellationToken)
         {
             WasInvoked = true;
+            PackagesDir = packagesDir;
             // Do NOT invoke evaluate — proving the untrusted work is inside the sandbox boundary.
             object result = SnapshotWorkResult.Failed("sandbox-intercepted");
             return Task.FromResult((T)result);
