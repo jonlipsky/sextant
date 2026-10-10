@@ -8,16 +8,11 @@ public sealed class ArgumentFlowStore(SqliteConnection connection)
     private const string InsertSql = """
         INSERT INTO argument_flow (occurrence_id, parameter_ordinal, parameter_name,
             argument_expression, argument_kind, source_symbol_fqn, last_indexed_at)
-        VALUES (@occurrence_id, @ordinal, @name, @expression, @kind, @source_fqn, @last_indexed_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
         RETURNING id;
         """;
 
-    public SqliteCommand CreateInsertCommand()
-    {
-        var cmd = connection.CreateCommand();
-        cmd.CommandText = InsertSql;
-        return cmd;
-    }
+    public PreparedInsert CreateInsertCommand() => new(connection, InsertSql);
 
     public long Insert(long callGraphId, int parameterOrdinal, string parameterName,
                        string argumentExpression, string argumentKind, string? sourceSymbolFqn,
@@ -28,18 +23,18 @@ public sealed class ArgumentFlowStore(SqliteConnection connection)
             argumentKind, sourceSymbolFqn, lastIndexedAt);
     }
 
-    public long Insert(SqliteCommand cmd, long callGraphId, int parameterOrdinal, string parameterName,
+    public long Insert(PreparedInsert cmd, long callGraphId, int parameterOrdinal, string parameterName,
                        string argumentExpression, string argumentKind, string? sourceSymbolFqn,
                        long lastIndexedAt)
     {
-        SqlParam.Set(cmd, "@occurrence_id", callGraphId);
-        SqlParam.Set(cmd, "@ordinal", parameterOrdinal);
-        SqlParam.Set(cmd, "@name", parameterName);
-        SqlParam.Set(cmd, "@expression", argumentExpression);
-        SqlParam.Set(cmd, "@kind", argumentKind);
-        SqlParam.Set(cmd, "@source_fqn", sourceSymbolFqn);
-        SqlParam.Set(cmd, "@last_indexed_at", lastIndexedAt);
-        return (long)cmd.ExecuteScalar()!;
+        cmd.Bind(1, callGraphId);
+        cmd.Bind(2, parameterOrdinal);
+        cmd.Bind(3, parameterName);
+        cmd.Bind(4, argumentExpression);
+        cmd.Bind(5, argumentKind);
+        cmd.Bind(6, sourceSymbolFqn);
+        cmd.Bind(7, lastIndexedAt);
+        return cmd.ExecuteReturningId();
     }
 
     public List<ArgumentFlowInfo> GetByCallGraphId(long callGraphId)

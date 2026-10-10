@@ -31,7 +31,7 @@ public sealed class CallGraphStore(SqliteConnection connection)
 
     private const string InsertSql = """
         INSERT INTO occurrences (in_project_id, target_symbol_id, source_symbol_id, file_version_id, line, col, kind, flags, last_indexed_at)
-        VALUES (@in_project_id, @callee, @caller, @file_version_id, @line, @col, @kind, @flags, @last_indexed_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
         RETURNING id;
         """;
 
@@ -53,12 +53,7 @@ public sealed class CallGraphStore(SqliteConnection connection)
     // project versions (criteria 6/7). Unscoped, it is exactly SelectBase.
     private string SelectPrefix => SelectBase + Scope.Join("o.in_project_id");
 
-    public SqliteCommand CreateInsertCommand()
-    {
-        var cmd = connection.CreateCommand();
-        cmd.CommandText = InsertSql;
-        return cmd;
-    }
+    public PreparedInsert CreateInsertCommand() => new(connection, InsertSql);
 
     public long Insert(CallGraphEdge edge)
     {
@@ -67,7 +62,7 @@ public sealed class CallGraphStore(SqliteConnection connection)
     }
 
     /// <summary>Convenience overload that derives the call's project from the caller symbol.</summary>
-    public long Insert(SqliteCommand cmd, CallGraphEdge edge)
+    public long Insert(PreparedInsert cmd, CallGraphEdge edge)
         => Insert(cmd, edge, ResolveCallerProject(edge.CallerSymbolId));
 
     public long Insert(CallGraphEdge edge, long inProjectId)
@@ -76,20 +71,20 @@ public sealed class CallGraphStore(SqliteConnection connection)
         return Insert(cmd, edge, inProjectId);
     }
 
-    public long Insert(SqliteCommand cmd, CallGraphEdge edge, long inProjectId)
+    public long Insert(PreparedInsert cmd, CallGraphEdge edge, long inProjectId)
     {
         var fileVersionId = FilesOrDefault.ResolveFileVersionId(
             inProjectId, edge.CallSiteFile, contentHash: null, lastIndexedAt: edge.LastIndexedAt);
-        SqlParam.Set(cmd, "@in_project_id", inProjectId);
-        SqlParam.Set(cmd, "@callee", edge.CalleeSymbolId);
-        SqlParam.Set(cmd, "@caller", edge.CallerSymbolId);
-        SqlParam.Set(cmd, "@file_version_id", fileVersionId);
-        SqlParam.Set(cmd, "@line", edge.CallSiteLine);
-        SqlParam.Set(cmd, "@col", edge.CallSiteColumn);
-        SqlParam.Set(cmd, "@kind", (int)ReferenceKind.Invocation);
-        SqlParam.Set(cmd, "@flags", ReferenceStore.ToFlags(access: null, edge.IsCandidate));
-        SqlParam.Set(cmd, "@last_indexed_at", edge.LastIndexedAt);
-        return (long)cmd.ExecuteScalar()!;
+        cmd.Bind(1, inProjectId);
+        cmd.Bind(2, edge.CalleeSymbolId);
+        cmd.Bind(3, edge.CallerSymbolId);
+        cmd.Bind(4, fileVersionId);
+        cmd.Bind(5, edge.CallSiteLine);
+        cmd.Bind(6, edge.CallSiteColumn);
+        cmd.Bind(7, (int)ReferenceKind.Invocation);
+        cmd.Bind(8, ReferenceStore.ToFlags(access: null, edge.IsCandidate));
+        cmd.Bind(9, edge.LastIndexedAt);
+        return cmd.ExecuteReturningId();
     }
 
     public List<CallGraphEdge> GetByCaller(long callerSymbolId)

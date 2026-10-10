@@ -51,9 +51,9 @@ public sealed class SymbolStore(SqliteConnection connection)
         INSERT INTO symbols (project_id, symbol_key, fully_qualified_name, display_name, kind, accessibility,
             is_static, is_abstract, is_virtual, is_override, signature, signature_hash, declaration,
             doc_comment, file_version_id, line_start, line_end, attributes, last_indexed_at)
-        VALUES (@project_id, @symbol_key, @fqn, @display_name, @kind, @accessibility,
-            @is_static, @is_abstract, @is_virtual, @is_override, @signature, @signature_hash, @declaration,
-            @doc_comment, @file_version_id, @line_start, @line_end, @attributes, @last_indexed_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+            ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+            ?14, ?15, ?16, ?17, ?18, ?19)
         ON CONFLICT(project_id, symbol_key) DO UPDATE SET
             fully_qualified_name = excluded.fully_qualified_name,
             display_name = excluded.display_name,
@@ -77,15 +77,10 @@ public sealed class SymbolStore(SqliteConnection connection)
 
     /// <summary>
     /// Creates a reusable insert command for batched writes. The caller executes it many times via
-    /// <see cref="Insert(SqliteCommand, SymbolInfo)"/> so SQLite keeps one compiled statement, and
+    /// <see cref="Insert(PreparedInsert, SymbolInfo)"/> so SQLite keeps one compiled statement, and
     /// disposes it when the batch is done.
     /// </summary>
-    public SqliteCommand CreateInsertCommand()
-    {
-        var cmd = connection.CreateCommand();
-        cmd.CommandText = InsertSql;
-        return cmd;
-    }
+    public PreparedInsert CreateInsertCommand() => new(connection, InsertSql);
 
     public long Insert(SymbolInfo symbol)
     {
@@ -93,35 +88,35 @@ public sealed class SymbolStore(SqliteConnection connection)
         return Insert(cmd, symbol);
     }
 
-    public long Insert(SqliteCommand cmd, SymbolInfo symbol)
+    public long Insert(PreparedInsert cmd, SymbolInfo symbol)
     {
         var fileVersionId = FilesOrDefault.ResolveFileVersionId(
             symbol.ProjectId, symbol.FilePath, contentHash: null, lastIndexedAt: symbol.LastIndexedAt);
         Bind(cmd, symbol, fileVersionId);
-        return (long)cmd.ExecuteScalar()!;
+        return cmd.ExecuteReturningId();
     }
 
-    private static void Bind(SqliteCommand cmd, SymbolInfo symbol, long fileVersionId)
+    private static void Bind(PreparedInsert cmd, SymbolInfo symbol, long fileVersionId)
     {
-        SqlParam.Set(cmd, "@project_id", symbol.ProjectId);
-        SqlParam.Set(cmd, "@symbol_key", symbol.SymbolKey);
-        SqlParam.Set(cmd, "@fqn", symbol.FullyQualifiedName);
-        SqlParam.Set(cmd, "@display_name", symbol.DisplayName);
-        SqlParam.Set(cmd, "@kind", (int)symbol.Kind);
-        SqlParam.Set(cmd, "@accessibility", (int)symbol.Accessibility);
-        SqlParam.Set(cmd, "@is_static", symbol.IsStatic ? 1 : 0);
-        SqlParam.Set(cmd, "@is_abstract", symbol.IsAbstract ? 1 : 0);
-        SqlParam.Set(cmd, "@is_virtual", symbol.IsVirtual ? 1 : 0);
-        SqlParam.Set(cmd, "@is_override", symbol.IsOverride ? 1 : 0);
-        SqlParam.Set(cmd, "@signature", symbol.Signature);
-        SqlParam.Set(cmd, "@signature_hash", symbol.SignatureHash);
-        SqlParam.Set(cmd, "@declaration", symbol.Declaration);
-        SqlParam.Set(cmd, "@doc_comment", symbol.DocComment);
-        SqlParam.Set(cmd, "@file_version_id", fileVersionId);
-        SqlParam.Set(cmd, "@line_start", symbol.LineStart);
-        SqlParam.Set(cmd, "@line_end", symbol.LineEnd);
-        SqlParam.Set(cmd, "@attributes", symbol.Attributes);
-        SqlParam.Set(cmd, "@last_indexed_at", symbol.LastIndexedAt);
+        cmd.Bind(1, symbol.ProjectId);
+        cmd.Bind(2, symbol.SymbolKey);
+        cmd.Bind(3, symbol.FullyQualifiedName);
+        cmd.Bind(4, symbol.DisplayName);
+        cmd.Bind(5, (int)symbol.Kind);
+        cmd.Bind(6, (int)symbol.Accessibility);
+        cmd.Bind(7, symbol.IsStatic ? 1 : 0);
+        cmd.Bind(8, symbol.IsAbstract ? 1 : 0);
+        cmd.Bind(9, symbol.IsVirtual ? 1 : 0);
+        cmd.Bind(10, symbol.IsOverride ? 1 : 0);
+        cmd.Bind(11, symbol.Signature);
+        cmd.Bind(12, symbol.SignatureHash);
+        cmd.Bind(13, symbol.Declaration);
+        cmd.Bind(14, symbol.DocComment);
+        cmd.Bind(15, fileVersionId);
+        cmd.Bind(16, symbol.LineStart);
+        cmd.Bind(17, symbol.LineEnd);
+        cmd.Bind(18, symbol.Attributes);
+        cmd.Bind(19, symbol.LastIndexedAt);
     }
 
     public SymbolInfo? GetById(long id)

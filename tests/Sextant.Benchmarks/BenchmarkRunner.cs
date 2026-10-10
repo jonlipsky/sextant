@@ -113,7 +113,8 @@ public sealed class BenchmarkRunner
                 : null
         };
 
-        using var db = new IndexDatabase(dbPath);
+        // The writer's tuning comes from the environment, as the service's does (issue #271).
+        using var db = new IndexDatabase(dbPath, IndexWriteOptions.FromConfiguration(SextantConfiguration.FromEnvironment()));
         db.RunMigrations();
 
         report.FullIndex = await RunFullAsync(db, solutionPath, options, log, report, cancellationToken);
