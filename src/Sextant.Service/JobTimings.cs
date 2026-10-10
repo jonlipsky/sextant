@@ -28,6 +28,9 @@ public sealed record JobTimings
     /// </summary>
     public IReadOnlyList<JobPhaseTiming> Phases { get; init; } = [];
 
+    /// <summary>The package restore, or null when the job ended before restoring.</summary>
+    public JobRestoreTimings? Restore { get; init; }
+
     /// <summary>The solution load, or null when the job ended before loading.</summary>
     public JobLoadTimings? Load { get; init; }
 
@@ -45,6 +48,28 @@ public sealed record JobTimings
 /// <param name="Status">An indexer phase's outcome (<c>completed</c>, <c>cancelled</c>, …); null for worker phases.</param>
 public sealed record JobPhaseTiming(
     string Name, long WallMs, long? CpuMs, long? ChildCpuMs, int? Projects = null, string? Status = null);
+
+/// <summary>The package restore of a job (issue #272).</summary>
+public sealed record JobRestoreTimings
+{
+    /// <summary>
+    /// <c>off</c> (restore disabled), <c>solution</c> (one selected solution), <c>union</c> (one traversal over the
+    /// selected solutions' project union) or <c>per_solution</c> (the fallback: one restore per selected solution).
+    /// </summary>
+    public required string Mode { get; init; }
+
+    /// <summary>Why the union could not be used (<see cref="Restore.PackageRestoreOutcome.UnionFallbackReason"/>).</summary>
+    public string? FallbackReason { get; init; }
+
+    /// <summary>
+    /// <c>persistent</c> when the restore used the repository's own package folder kept between its jobs, or
+    /// <c>scratch</c> when it used a cold folder in job scratch.
+    /// </summary>
+    public required string PackageFolder { get; init; }
+
+    /// <summary>Wall-clock time of the restore, in milliseconds.</summary>
+    public long WallMs { get; init; }
+}
 
 /// <summary>The solution load of a job (issue #267).</summary>
 public sealed record JobLoadTimings
@@ -83,6 +108,7 @@ public sealed class JobTimingsRecorder
     private readonly ProcessCpuClock _start = ProcessCpuClock.Now();
     private readonly List<JobPhaseTiming> _phases = [];
     private JobLoadTimings? _load;
+    private JobRestoreTimings? _restore;
     private IndexingMetrics? _indexing;
     private long _indexWallMs;
 
@@ -103,6 +129,23 @@ public sealed class JobTimingsRecorder
             SlowestOpens = load.LoadTimings.OrderByDescending(t => t.WallMs).Take(Top).ToList()
         };
         lock (_gate) _load = timings;
+    }
+
+    /// <summary>Records how the package restore ran and which package folder it used (issue #272).</summary>
+    public void RecordRestore(Restore.PackageRestoreOutcome restore, bool persistentPackageFolder)
+    {
+        ArgumentNullException.ThrowIfNull(restore);
+        var timings = new JobRestoreTimings
+        {
+            Mode = !restore.Enabled ? "off"
+                : restore.UsedProjectUnion ? "union"
+                : restore.SolutionsSelected > 1 ? "per_solution"
+                : "solution",
+            FallbackReason = restore.UnionFallbackReason,
+            PackageFolder = persistentPackageFolder ? "persistent" : "scratch",
+            WallMs = (long)restore.Elapsed.TotalMilliseconds
+        };
+        lock (_gate) _restore = timings;
     }
 
     /// <summary>Records the indexer run: its phases, and its wall time (what its phases do not cover is <c>indexer_other</c>).</summary>
@@ -144,6 +187,7 @@ public sealed class JobTimingsRecorder
                 CpuMs = cpu,
                 ChildCpuMs = children,
                 Phases = phases,
+                Restore = _restore,
                 Load = _load,
                 SlowestProjects = slowest
             };

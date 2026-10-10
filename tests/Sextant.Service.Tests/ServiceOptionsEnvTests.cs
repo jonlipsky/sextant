@@ -28,6 +28,50 @@ public class ServiceOptionsEnvTests
     private static SextantConfiguration Config() => new() { DbPath = ServiceTestFixtures.NewDbPath() };
 
     [TestMethod]
+    public void PackageCacheBound_DefaultsTo10GiB_IsGivenInMiB_ZeroDisables_AndAMalformedValueFailsStartup()
+    {
+        // Issue #272: the bound on the per-repository package folders.
+        const string name = "SEXTANT_SERVICE_PACKAGE_CACHE_MAX_MB";
+        try
+        {
+            Environment.SetEnvironmentVariable(name, null);
+            Assert.AreEqual(10L * 1024 * 1024 * 1024, ServiceOptions.FromEnvironment(Config()).PackageCacheMaxBytes);
+            Environment.SetEnvironmentVariable(name, "512");
+            Assert.AreEqual(512L * 1024 * 1024, ServiceOptions.FromEnvironment(Config()).PackageCacheMaxBytes);
+            Environment.SetEnvironmentVariable(name, "0");
+            Assert.AreEqual(0, ServiceOptions.FromEnvironment(Config()).PackageCacheMaxBytes);
+            foreach (var bad in new[] { "-1", "10GB", "1.5", "99999999999999999999" })
+            {
+                Environment.SetEnvironmentVariable(name, bad);
+                Assert.ThrowsExactly<InvalidOperationException>(() => ServiceOptions.FromEnvironment(Config()), bad);
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(name, null);
+        }
+    }
+
+    [TestMethod]
+    public void GitObjectStore_IsOnByDefault_AndFailsClosedOnATypo()
+    {
+        const string name = "SEXTANT_SERVICE_GIT_OBJECT_STORE";
+        try
+        {
+            Environment.SetEnvironmentVariable(name, null);
+            Assert.IsTrue(ServiceOptions.FromEnvironment(Config()).GitObjectStore);
+            Environment.SetEnvironmentVariable(name, "false");
+            Assert.IsFalse(ServiceOptions.FromEnvironment(Config()).GitObjectStore);
+            Environment.SetEnvironmentVariable(name, "nope");
+            Assert.ThrowsExactly<InvalidOperationException>(() => ServiceOptions.FromEnvironment(Config()));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(name, null);
+        }
+    }
+
+    [TestMethod]
     public void MalformedSecurityToggle_FailsClosed_Throws()
     {
         Environment.SetEnvironmentVariable(SandboxEnabled, "tru");

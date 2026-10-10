@@ -136,6 +136,7 @@ public sealed class PackageRestoreRunner(
             [.. EvaluationGlobalProperties.For(solutions.SelectMany(SolutionProjectEnumerator.Enumerate)), .. RestoreOnlyProperties];
         try
         {
+            string? unionFallbackReason = null;
             if (solutions.Count > 1)
             {
                 if (TryCreateProjectUnion(checkoutDir, solutions, cancellationToken, out var projects, out var fallbackReason))
@@ -151,12 +152,17 @@ public sealed class PackageRestoreRunner(
                 }
 
                 log?.Invoke($"package restore: using per-solution fallback ({fallbackReason}).");
+                unionFallbackReason = fallbackReason;
             }
 
             var fallback = await RunPerSolutionAsync(
                     checkoutDir, solutions, globals, Remaining(deadline, stopwatch), cancellationToken, environment, scratchDir)
                 .ConfigureAwait(false);
-            return fallback with { Timeout = deadline, Elapsed = stopwatch.Elapsed, CredentialsUnavailable = credentialsUnavailable };
+            return fallback with
+            {
+                Timeout = deadline, Elapsed = stopwatch.Elapsed, CredentialsUnavailable = credentialsUnavailable,
+                UnionFallbackReason = unionFallbackReason
+            };
         }
         finally
         {
