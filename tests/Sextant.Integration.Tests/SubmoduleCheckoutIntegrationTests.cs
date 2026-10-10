@@ -57,7 +57,7 @@ public partial class SubmoduleCheckoutIntegrationTests : IDisposable
         Assert.IsTrue(submodule.IsPopulated, $"{submodule.Status}: {submodule.Reason}");
         Assert.AreEqual("libs/mix", submodule.Path);
         Assert.AreEqual(providerCommit, submodule.Commit);
-        RestoreSolution(Path.Combine(resolution.CheckoutDir, "App.slnx"));
+        GeneratedCorpusRestore.Restore(Path.Combine(resolution.CheckoutDir, "App.slnx"));
 
         var config = new SextantConfiguration();
         using var db = new IndexDatabase(Path.Combine(_tempDir, "catalog.db"), IndexWriteOptions.Default);
@@ -227,22 +227,5 @@ public partial class SubmoduleCheckoutIntegrationTests : IDisposable
                 Assert.Inconclusive($"git {string.Join(' ', args)} failed (exit {process.ExitCode}): {stderr.Result}");
             return stdout;
         }
-    }
-
-    private static void RestoreSolution(string solutionPath)
-    {
-        var psi = new ProcessStartInfo("dotnet", $"restore \"{solutionPath}\"")
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
-        using var process = Process.Start(psi)!;
-        var stderr = process.StandardError.ReadToEndAsync();
-        process.StandardOutput.ReadToEnd();
-        process.WaitForExit();
-        if (process.ExitCode != 0)
-            Assert.Inconclusive($"restore of the provisioned checkout failed (exit {process.ExitCode}): {stderr.Result}");
     }
 }

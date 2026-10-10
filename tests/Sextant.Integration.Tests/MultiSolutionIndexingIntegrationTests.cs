@@ -210,8 +210,8 @@ public sealed class MultiSolutionIndexingIntegrationTests : IDisposable
 
         // Restore only the loadable projects (Broken cannot restore — that is the point). Core-A pulls in
         // Core + A; B pulls in B + Core via its project reference. Broken is left unrestored/unresolvable.
-        RestoreProject(Path.Combine(repoRoot, "Core-A.slnx"));
-        RestoreProject(Path.Combine(repoRoot, "B", "B.csproj"));
+        GeneratedCorpusRestore.Restore(Path.Combine(repoRoot, "Core-A.slnx"));
+        GeneratedCorpusRestore.Restore(Path.Combine(repoRoot, "B", "B.csproj"));
 
         return new MultiSolutionRepo(repoRoot);
     }
@@ -233,22 +233,5 @@ public sealed class MultiSolutionIndexingIntegrationTests : IDisposable
             </Project>
             """);
         File.WriteAllText(Path.Combine(projDir, $"{name}Source.cs"), source);
-    }
-
-    private static void RestoreProject(string path)
-    {
-        var psi = new System.Diagnostics.ProcessStartInfo("dotnet", $"restore \"{path}\"")
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
-        using var process = System.Diagnostics.Process.Start(psi)!;
-        var stderr = process.StandardError.ReadToEnd();
-        process.StandardOutput.ReadToEnd();
-        process.WaitForExit();
-        if (process.ExitCode != 0)
-            Assert.Inconclusive($"restore of '{Path.GetFileName(path)}' failed (exit {process.ExitCode}): {stderr}");
     }
 }

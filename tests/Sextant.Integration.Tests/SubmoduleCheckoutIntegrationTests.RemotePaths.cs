@@ -44,7 +44,7 @@ public partial class SubmoduleCheckoutIntegrationTests
             IsDefaultBranch = true
         };
         Assert.IsTrue(checkouts.TryResolve(request, out var resolution), string.Join("\n", _log));
-        RestoreSolution(Path.Combine(resolution.CheckoutDir, "App.slnx"));
+        GeneratedCorpusRestore.Restore(Path.Combine(resolution.CheckoutDir, "App.slnx"));
 
         var dbPath = Path.Combine(_tempDir, "catalog.db");
         var db = new IndexDatabase(dbPath, IndexWriteOptions.Default);
