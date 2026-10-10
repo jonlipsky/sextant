@@ -369,6 +369,207 @@ public sealed class ParallelExtractionPipelineTests
         }
     }
 
+    // ---- RunOrderedAsync: the ordered core the symbol pass uses directly (issue #282) ----------------------------
+
+    // A factory whose synchronous part records its start (in the order the producer invokes it) and whose
+    // asynchronous part takes delayMs, as the symbol pass's admission (synchronous) and analysis (after the yield) do.
+    private static Func<CancellationToken, Task<int>> Item(
+        int index, int delayMs, List<int> started, Action? onAnalyze = null, bool fail = false)
+        => token =>
+        {
+            lock (started)
+                started.Add(index);
+            return Analyze();
+
+            async Task<int> Analyze()
+            {
+                await Task.Yield();
+                onAnalyze?.Invoke();
+                if (delayMs > 0)
+                    await Task.Delay(delayMs, token);
+                if (fail)
+                    throw new InvalidOperationException($"analysis fault {index}");
+                return index;
+            }
+        };
+
+    [TestMethod]
+    [DataRow(1, 1)]
+    [DataRow(2, 1)]
+    [DataRow(4, 2)]
+    [DataRow(8, 4)]
+    public async Task Ordered_StartsAndPersistsInProjectOrder_WhateverFinishesFirst(int projectsInFlight, int queueCapacity)
+    {
+        // Earlier items are slower, so with several in flight the later ones finish first.
+        const int count = 12;
+        var started = new List<int>();
+        var persisted = new List<int>();
+        var produce = Enumerable.Range(0, count).Select(i => Item(i, (count - i) * 3, started)).ToList();
+
+        await WithTimeout(ParallelExtractionPipeline.RunOrderedAsync(produce,
+            (item, _) => { persisted.Add(item); return Task.CompletedTask; },
+            new ExtractionParallelismOptions { MaxParallelism = 4, QueueCapacity = queueCapacity, ProjectsInFlight = projectsInFlight },
+            CancellationToken.None));
+
+        CollectionAssert.AreEqual(Enumerable.Range(0, count).ToList(), started, "factories are invoked in project order");
+        CollectionAssert.AreEqual(Enumerable.Range(0, count).ToList(), persisted, "items are persisted in project order");
+    }
+
+    [TestMethod]
+    public async Task Ordered_PersistingOneProjectOverlapsAnalysisOfTheNext()
+    {
+        // The persist of item 0 waits until item 1's analysis has begun: it completes only if the producer keeps
+        // analyzing while the writer persists, even with one project in flight and a one-slot queue.
+        var started = new List<int>();
+        var nextAnalyzing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var produce = new List<Func<CancellationToken, Task<int>>>
+        {
+            Item(0, 0, started),
+            Item(1, 0, started, onAnalyze: () => nextAnalyzing.TrySetResult()),
+            Item(2, 0, started),
+        };
+        var persisted = new List<int>();
+
+        async Task Persist(int item, CancellationToken token)
+        {
+            if (item == 0)
+                await nextAnalyzing.Task.WaitAsync(TimeSpan.FromSeconds(10), token);
+            persisted.Add(item);
+        }
+
+        await WithTimeout(ParallelExtractionPipeline.RunOrderedAsync(produce, Persist,
+            ExtractionParallelismOptions.Sequential, CancellationToken.None));
+
+        CollectionAssert.AreEqual(new[] { 0, 1, 2 }, persisted);
+    }
+
+    [TestMethod]
+    [DataRow(1)]
+    [DataRow(3)]
+    public async Task Ordered_ProjectsInFlightAndHeldResults_StayBounded(int projectsInFlight)
+    {
+        const int capacity = 2;
+        var started = new List<int>();
+        var analyzing = 0;
+        var maxAnalyzing = 0;
+        var persistedCount = 0;
+        var maxLead = 0;
+        var produce = Enumerable.Range(0, 30).Select(i => (Func<CancellationToken, Task<int>>)(async token =>
+        {
+            lock (started)
+                started.Add(i);
+            await Task.Yield();
+            InterlockedMax(ref maxAnalyzing, Interlocked.Increment(ref analyzing));
+            try
+            {
+                await Task.Delay(2, token);
+                return i;
+            }
+            finally
+            {
+                Interlocked.Decrement(ref analyzing);
+            }
+        })).ToList();
+
+        Task Persist(int item, CancellationToken _)
+        {
+            int startedCount;
+            lock (started)
+                startedCount = started.Count;
+            InterlockedMax(ref maxLead, startedCount - persistedCount);
+            Thread.Sleep(10);
+            persistedCount++;
+            return Task.CompletedTask;
+        }
+
+        await WithTimeout(ParallelExtractionPipeline.RunOrderedAsync(produce, Persist,
+            new ExtractionParallelismOptions { MaxParallelism = 4, QueueCapacity = capacity, ProjectsInFlight = projectsInFlight },
+            CancellationToken.None));
+
+        Assert.AreEqual(30, persistedCount);
+        Assert.IsLessThanOrEqualTo(projectsInFlight, maxAnalyzing, "at most ProjectsInFlight items analyze at once");
+        // Started but not yet persisted: held by the producer (in flight + finished behind the head), the channel, and
+        // the item in the writer's hand.
+        Assert.IsLessThanOrEqualTo(projectsInFlight + 2 * capacity + 2, maxLead,
+            "the producer's run-ahead of the writer is bounded");
+    }
+
+    [TestMethod]
+    public async Task Ordered_AnalysisFault_FailsTheRun_WithoutPersistingLaterProjects()
+    {
+        var started = new List<int>();
+        var persisted = new List<int>();
+        // Item 0 (the head) is slow and item 1 behind it faults: the run fails at once, nothing is persisted, and no
+        // further project is started.
+        var produce = Enumerable.Range(0, 8).Select(i => Item(i, i == 0 ? 400 : 0, started, fail: i == 1)).ToList();
+
+        var run = ParallelExtractionPipeline.RunOrderedAsync(produce,
+            (item, _) => { persisted.Add(item); return Task.CompletedTask; },
+            new ExtractionParallelismOptions { MaxParallelism = 4, QueueCapacity = 2, ProjectsInFlight = 2 },
+            CancellationToken.None);
+
+        var fault = await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => WithTimeout(run));
+        StringAssert.Contains(fault.Message, "analysis fault 1");
+        Assert.AreEqual(0, persisted.Count, "nothing is persisted: the head was still analyzing when the run failed");
+        Assert.IsLessThanOrEqualTo(2, started.Count, "no project is started after the fault");
+    }
+
+    [TestMethod]
+    public async Task Ordered_SynchronousFactoryFault_FailsTheRun()
+    {
+        // A factory that throws in its synchronous part (as the symbol pass's admission could) fails the run cleanly.
+        var started = new List<int>();
+        var produce = new List<Func<CancellationToken, Task<int>>>
+        {
+            Item(0, 0, started),
+            _ => throw new InvalidOperationException("admission fault"),
+            Item(2, 0, started),
+        };
+
+        var fault = await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => WithTimeout(
+            ParallelExtractionPipeline.RunOrderedAsync(produce, (_, _) => Task.CompletedTask,
+                ExtractionParallelismOptions.Sequential, CancellationToken.None)));
+        Assert.AreEqual("admission fault", fault.Message);
+        CollectionAssert.AreEqual(new[] { 0 }, started);
+    }
+
+    [TestMethod]
+    public async Task Ordered_PersistFault_StopsTheProducer()
+    {
+        var started = new List<int>();
+        var produce = Enumerable.Range(0, 50).Select(i => Item(i, 5, started)).ToList();
+
+        var fault = await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => WithTimeout(
+            ParallelExtractionPipeline.RunOrderedAsync(produce,
+                (item, _) => item == 1 ? throw new InvalidOperationException("writer fault") : Task.CompletedTask,
+                new ExtractionParallelismOptions { MaxParallelism = 4, QueueCapacity = 2, ProjectsInFlight = 2 },
+                CancellationToken.None)));
+        Assert.AreEqual("writer fault", fault.Message);
+        Assert.IsLessThan(50, started.Count, "the producer stops once the writer fails");
+    }
+
+    [TestMethod]
+    public async Task Ordered_Cancellation_TearsDownWithoutDeadlock()
+    {
+        using var cts = new CancellationTokenSource();
+        var started = new List<int>();
+        var persisted = 0;
+        var produce = Enumerable.Range(0, 50).Select(i => Item(i, 10, started)).ToList();
+
+        var run = ParallelExtractionPipeline.RunOrderedAsync(produce,
+            (_, _) =>
+            {
+                if (++persisted == 2)
+                    cts.Cancel();
+                return Task.CompletedTask;
+            },
+            new ExtractionParallelismOptions { MaxParallelism = 4, QueueCapacity = 1, ProjectsInFlight = 2 },
+            cts.Token);
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() => WithTimeout(run));
+        Assert.IsLessThan(50, persisted);
+    }
+
     private static void InterlockedMax(ref int target, int value)
     {
         int current;

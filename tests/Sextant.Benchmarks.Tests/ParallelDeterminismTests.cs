@@ -17,11 +17,13 @@ public sealed class ParallelDeterminismTests
     public TestContext TestContext { get; set; } = null!;
 
     [TestMethod]
-    [DataRow(2)]
-    [DataRow(4)]
-    [DataRow(8)]
-    [DataRow(0, DisplayName = "auto")]
-    public async Task DocumentExtractor_ParallelOutput_IsByteEquivalentToSequential(int maxParallelism)
+    [DataRow(2, 1)]
+    [DataRow(4, 1)]
+    [DataRow(4, 4)]
+    [DataRow(8, 1)]
+    [DataRow(8, 3)]
+    [DataRow(0, 0, DisplayName = "auto")]
+    public async Task DocumentExtractor_ParallelOutput_IsByteEquivalentToSequential(int maxParallelism, int projectsInFlight)
     {
         var root = NewTempDir("determinism");
         var seqDir = NewTempDir("determinism-seq");
@@ -37,10 +39,14 @@ public sealed class ParallelDeterminismTests
 
             // Parallel: force the bounded pipeline's parallel per-document path regardless of the host
             // core count so the comparison is meaningful even on a small CI box (0 = the auto-resolved default).
-            // Issue #269: the symbol pass and its compilation prefetch run at the same parallelism.
+            // Issue #269: the symbol pass and its compilation prefetch run at the same parallelism. Issue #282: both
+            // passes analyze projectsInFlight projects at once while their single writer persists earlier ones.
             var parallelOptions = maxParallelism == 0
                 ? ExtractionParallelismOptions.Default
-                : new ExtractionParallelismOptions { MaxParallelism = maxParallelism, QueueCapacity = 4 };
+                : new ExtractionParallelismOptions
+                {
+                    MaxParallelism = maxParallelism, QueueCapacity = 4, ProjectsInFlight = projectsInFlight
+                };
             var parallel = await IndexAndDumpAsync(
                 slnx, Path.Combine(parDir, "index.db"), parallelOptions);
 

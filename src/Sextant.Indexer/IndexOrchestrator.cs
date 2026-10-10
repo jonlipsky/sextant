@@ -698,34 +698,41 @@ public sealed class IndexOrchestrator
         // Issue #269: compile the projects ahead of the symbol walk, which is otherwise compile-bound on one core.
         bool ExtractsSymbols(Project project) =>
             project.FilePath != null && projectRoslynToId.ContainsKey(project.Id) && processSet.Contains(project.Id);
-        await using var prefetch = new CompilationPrefetcher(
-            solution.Projects.Where(ExtractsSymbols).ToList(), _parallelism.MaxParallelism, cancellationToken);
+        var symbolProjects = solution.Projects.Where(ExtractsSymbols).ToList();
+        await using var prefetch = new CompilationPrefetcher(symbolProjects, _parallelism.MaxParallelism, cancellationToken);
 
-        foreach (var project in solution.Projects)
+        // Issue #282: the symbol pass runs through the ordered pipeline the occurrence pass uses. The producer compiles
+        // and walks up to ProjectsInFlight projects at once (their tree walks sharing one MaxParallelism-wide set of
+        // workers), while the single writer persists the finished projects in project order, so persisting one project
+        // overlaps the analysis of the next ones. Everything that touches SQLite (deletes, hash capture, inserts,
+        // catalog adds, file seeding, the evaluation fingerprint, the batch commit) stays on the writer.
+        using var symbolWorkers = new SemaphoreSlim(Math.Max(1, _parallelism.MaxParallelism));
+        var symbolDeadlinePassed = false;
+        var includeDocComments = _profile.Has(IndexFeature.DocumentationSearch);
+
+        // Invoked by the producer one project at a time, in project order: this synchronous part admits the project
+        // (the time budget's symbol deadline), and only ExtractProjectSymbolsAsync runs concurrently with other projects.
+        Task<SymbolProjectResult> ProduceSymbols(Project project, CancellationToken token)
         {
-            if (!ExtractsSymbols(project))
-                continue;
             var projectId = projectRoslynToId[project.Id];
             prefetch.Reached();
 
             if (timeBudget != null && !providerProjectInfo.ContainsKey(projectId))
             {
+                // Admission runs on the producer, which may be up to ProjectsInFlight + 2 x QueueCapacity + 2
+                // projects ahead of the writer (issue #282): projects admitted before the deadline are still
+                // persisted after it, so the pass can overrun its deadline by that backlog's persistence.
                 if (symbolProjectsAdmitted > 0 && timeBudget.Clock.GetUtcNow() >= symbolDeadline)
                 {
-                    if (budgetNotIndexed.Count == 0)
+                    if (!symbolDeadlinePassed)
                     {
+                        symbolDeadlinePassed = true;
                         _log?.Invoke($"  Time budget: the symbol phase deadline passed after {symbolProjectsAdmitted} " +
                                      "project(s); the remaining projects are registered but not indexed.");
                         // The skipped projects need no compilation (a provider project still compiles on demand).
                         prefetch.Stop();
                     }
-                    budgetNotIndexed.Add(project.Id);
-                    // Clear whatever an earlier generation of this identity left in the row, so the project
-                    // is published empty rather than with stale content.
-                    symbolStore.DeleteByProject(projectId);
-                    fileStore.DeleteByProject(projectId);
-                    session.CommitBatch();
-                    continue;
+                    return Task.FromResult(SymbolProjectResult.NotIndexed(project, projectId));
                 }
                 symbolProjectsAdmitted++;
             }
@@ -741,6 +748,33 @@ public sealed class IndexOrchestrator
                 ProjectIndex = projectIndex,
                 ProjectCount = totalProjects
             });
+            return ExtractProjectSymbolsAsync(
+                project, projectId, includeDocComments, _parallelism.MaxParallelism, symbolWorkers, token);
+        }
+
+        // The single writer, in project order.
+        Task PersistSymbols(SymbolProjectResult result, CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+            var project = result.Project;
+            var projectId = result.ProjectId;
+            if (result.LeftOutByTimeBudget)
+            {
+                budgetNotIndexed.Add(project.Id);
+                // Clear whatever an earlier generation of this identity left in the row, so the project
+                // is published empty rather than with stale content.
+                symbolStore.DeleteByProject(projectId);
+                fileStore.DeleteByProject(projectId);
+                session.CommitBatch();
+                return Task.CompletedTask;
+            }
+
+            var persistWatch = Stopwatch.StartNew();
+            if (!result.CompilationAvailable)
+            {
+                compilationFailures++;
+                _log?.Invoke($"    WARNING: {project.Name} produced no compilation; generation will be marked partial.");
+            }
 
             // Reset this logical (per-TFM) project's contributions before re-extracting. Deleting the
             // project's symbols cascades its relationships, its outbound call occurrences, and every
@@ -753,28 +787,11 @@ public sealed class IndexOrchestrator
             symbolStore.DeleteByProject(projectId);
             fileStore.DeleteByProject(projectId);
 
-            // Issue #267: time compilation apart from the symbol walk. The compilation is held until the walk ends,
-            // so the extractor's own GetCompilationAsync returns this one rather than building it again.
-            var projectWatch = Stopwatch.StartNew();
-            Compilation? timedCompilation = null;
-            if (metrics != null)
-                timedCompilation = await project.GetCompilationAsync(cancellationToken);
-            var compileMs = projectWatch.ElapsedMilliseconds;
-
-            var (symbols, compilationAvailable) = await SymbolExtractor.ExtractFromProjectWithStatusAsync(
-                project, projectId, includeDocComments: _profile.Has(IndexFeature.DocumentationSearch),
-                maxParallelism: _parallelism.MaxParallelism, cancellationToken: cancellationToken);
-            GC.KeepAlive(timedCompilation);
-            var analyzedAt = projectWatch.ElapsedMilliseconds;
-            if (!compilationAvailable)
-            {
-                compilationFailures++;
-                _log?.Invoke($"    WARNING: {project.Name} produced no compilation; generation will be marked partial.");
-            }
-
             // Issue #35 (TOCTOU): capture each analyzed on-disk source file's raw-disk hash NOW, before
             // any symbol/occurrence resolves its file_version row, so the persisted content hash is the
-            // bytes analyzed rather than whatever is on disk later at persist time.
+            // bytes analyzed rather than whatever is on disk later at persist time. Since issue #282 this
+            // runs on the writer, which lags the producer's walk by up to the queue depth: the accepted
+            // load->capture window (see FileStore) grows by that lag, the persist-time window stays closed.
             foreach (var document in project.Documents)
             {
                 var docPath = document.FilePath;
@@ -782,7 +799,7 @@ public sealed class IndexOrchestrator
                     fileStore.CaptureAnalyzedHash(projectId, docPath);
             }
 
-            foreach (var symbol in symbols)
+            foreach (var symbol in result.Symbols)
             {
                 var id = symbolStore.Insert(symbolInsert, symbol);
                 catalog.Add(projectId, symbol.SymbolKey, id);
@@ -792,22 +809,43 @@ public sealed class IndexOrchestrator
             // Fingerprint every indexed (non-generated, on-disk) file so an unchanged daemon restart
             // short-circuits to zero work, and record the project's evaluation fingerprint so a later
             // catch-up can detect config/props/global.json/assets changes.
-            await SeedFileIndexAsync(project, projectId, fileStore, session, now, cancellationToken);
+            SeedFileIndex(result.SourceFiles, projectId, fileStore, session, now);
             projectStore.SetEvaluationFingerprint(projectId, EvaluationFingerprint.Compute(project.FilePath, repoRoot));
 
+            // Honour cancellation before publishing this project's batch so a mid-run cancel drops the uncommitted rows.
+            token.ThrowIfCancellationRequested();
             session.CommitBatch();
 
+            // Issue #267: compile and analyze ran on the producer (overlapping earlier projects' persistence);
+            // persistence is this writer's time for the project.
+            var persistMs = persistWatch.ElapsedMilliseconds;
             metrics?.RecordProject(new ProjectTiming
             {
                 Phase = IndexPhaseNames.ExtractingSymbols,
                 Project = project.Name,
-                WallMs = projectWatch.ElapsedMilliseconds,
-                CompileMs = compileMs,
-                AnalyzeMs = analyzedAt - compileMs,
-                PersistMs = projectWatch.ElapsedMilliseconds - analyzedAt,
-                Rows = symbols.Count
+                CompileMs = result.CompileMs,
+                AnalyzeMs = result.AnalyzeMs,
+                PersistMs = persistMs,
+                WallMs = result.CompileMs + result.AnalyzeMs + persistMs,
+                Rows = result.Symbols.Count
             });
-            _log?.Invoke($"    {symbols.Count} symbols extracted");
+            _log?.Invoke($"    {project.Name}: {result.Symbols.Count} symbols extracted");
+            return Task.CompletedTask;
+        }
+
+        try
+        {
+            await ParallelExtractionPipeline.RunOrderedAsync(
+                symbolProjects
+                    .Select(project => (Func<CancellationToken, Task<SymbolProjectResult>>)(token => ProduceSymbols(project, token)))
+                    .ToList(),
+                PersistSymbols, _parallelism, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Record the interrupted phase as cancelled, as a cancellation observed between projects would.
+            ThrowIfCancelled();
+            throw;
         }
         prefetch.Stop();
 
@@ -1711,18 +1749,34 @@ public sealed class IndexOrchestrator
     /// daemon restart short-circuit unchanged files to zero work, and gives the incremental path a
     /// per-file baseline to diff against. Files that are not present on disk (e.g. an in-memory
     /// ad-hoc workspace used in tests) are skipped — no stable content hash can be taken for them.
+    /// <paramref name="sourceFiles"/> comes from <see cref="SeedableSourceFiles"/>, taken on the producer.
     /// </summary>
-    private static async Task SeedFileIndexAsync(
-        Project project,
+    private static void SeedFileIndex(
+        IReadOnlyList<string> sourceFiles,
         long projectId,
         FileStore fileStore,
         IndexWriteSession session,
-        long now,
-        CancellationToken cancellationToken)
+        long now)
     {
-        var compilation = await project.GetCompilationAsync(cancellationToken);
-        if (compilation == null) return;
+        foreach (var filePath in sourceFiles)
+        {
+            // Ensure a file_version exists for every on-disk source file, including those with no
+            // top-level symbols. The symbol phase already seeded versions for files it touched;
+            // select-existing-first reuses those rows (no re-hash), so this only adds the gaps and the
+            // fingerprint hash is a raw SHA-256 taken from disk — the same bytes the daemon compares.
+            fileStore.ResolveFileVersionId(projectId, filePath, contentHash: null, lastIndexedAt: now);
+            session.RowsWritten();
+        }
+    }
 
+    /// <summary>
+    /// The compilation's non-generated, on-disk source files, once each, in syntax-tree order: the files
+    /// <see cref="SeedFileIndex"/> fingerprints. Taken on the symbol pass's producer (issue #282) so the writer
+    /// needs no compilation.
+    /// </summary>
+    private static List<string> SeedableSourceFiles(Compilation compilation)
+    {
+        var files = new List<string>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var syntaxTree in compilation.SyntaxTrees)
         {
@@ -1731,14 +1785,50 @@ public sealed class IndexOrchestrator
                 continue;
             if (!File.Exists(filePath) || !seen.Add(filePath))
                 continue;
-
-            // Ensure a file_version exists for every on-disk source file, including those with no
-            // top-level symbols. The symbol phase already seeded versions for files it touched;
-            // select-existing-first reuses those rows (no re-hash), so this only adds the gaps and the
-            // fingerprint hash is a raw SHA-256 taken from disk — the same bytes the daemon compares.
-            fileStore.ResolveFileVersionId(projectId, filePath, contentHash: null, lastIndexedAt: now);
-            session.RowsWritten();
+            files.Add(filePath);
         }
+        return files;
+    }
+
+    /// <summary>One project's symbol-pass result, from the producer to the writer (issue #282). Holds no compilation.</summary>
+    private sealed record SymbolProjectResult(
+        Project Project,
+        long ProjectId,
+        bool LeftOutByTimeBudget,
+        List<Sextant.Core.SymbolInfo> Symbols,
+        bool CompilationAvailable,
+        IReadOnlyList<string> SourceFiles,
+        long CompileMs,
+        long AnalyzeMs)
+    {
+        public static SymbolProjectResult NotIndexed(Project project, long projectId) =>
+            new(project, projectId, LeftOutByTimeBudget: true, [], CompilationAvailable: true, [], 0, 0);
+    }
+
+    /// <summary>
+    /// The symbol pass's producer work for one project (issue #282): compile it (usually already prefetched), walk
+    /// its declarations, and list the source files the writer will seed. Off the producer's thread, so the projects
+    /// in flight analyze concurrently; it touches no SQLite state.
+    /// </summary>
+    private static async Task<SymbolProjectResult> ExtractProjectSymbolsAsync(
+        Project project, long projectId, bool includeDocComments, int maxParallelism, SemaphoreSlim workers,
+        CancellationToken token)
+    {
+        await Task.Yield();
+        token.ThrowIfCancellationRequested();
+        // Issue #267: time compilation apart from the symbol walk. The compilation is held until the walk ends,
+        // so the extractor's own GetCompilationAsync returns this one rather than building it again.
+        var watch = Stopwatch.StartNew();
+        var compilation = await project.GetCompilationAsync(token).ConfigureAwait(false);
+        var compileMs = watch.ElapsedMilliseconds;
+        var (symbols, compilationAvailable) = await SymbolExtractor.ExtractFromProjectWithStatusAsync(
+            project, projectId, includeDocComments, maxParallelism,
+            workers, token).ConfigureAwait(false);
+        var sourceFiles = compilation == null ? [] : SeedableSourceFiles(compilation);
+        GC.KeepAlive(compilation);
+        return new SymbolProjectResult(
+            project, projectId, LeftOutByTimeBudget: false, symbols, compilationAvailable, sourceFiles,
+            compileMs, watch.ElapsedMilliseconds - compileMs);
     }
 
     /// <summary>

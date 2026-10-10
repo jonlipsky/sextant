@@ -60,25 +60,52 @@ public static class ParallelExtractionPipeline
         ExtractionParallelismOptions options,
         CancellationToken cancellationToken)
     {
+        // One MaxParallelism-wide set of document workers, shared by every project in flight (issue #270).
+        using var workers = new SemaphoreSlim(Math.Max(1, options.MaxParallelism));
+        var produce = projects
+            .Select(project => (Func<CancellationToken, Task<ProjectContributions>>)(token =>
+                ProduceProjectAsync(project, extractDocument, options, workers, token)))
+            .ToList();
+        await RunOrderedAsync(produce, persist, options, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The pipeline's ordered core, for any per-project result: up to
+    /// <see cref="ExtractionParallelismOptions.ProjectsInFlight"/> projects are produced at once, and a single consumer
+    /// persists them strictly in list order through a channel of capacity
+    /// <see cref="ExtractionParallelismOptions.QueueCapacity"/>. The symbol pass (issue #282) uses it directly, so its
+    /// persistence of one project overlaps the analysis of the next ones.
+    /// </summary>
+    /// <param name="produce">One factory per project, in deterministic order. The producer invokes them one at a time,
+    /// in order, so a factory's synchronous part (before its first <c>await</c>) runs in project order and never
+    /// concurrently with another's; it must therefore return promptly, yielding before any heavy work, and the work
+    /// after its first <c>await</c> must be safe to run concurrently with the other projects in flight.</param>
+    /// <param name="persist">Persists one project's result on the single consumer, in project order: the only stage
+    /// permitted to touch the SQLite writer. Receives the linked token and should honour it.</param>
+    public static async Task RunOrderedAsync<T>(
+        IReadOnlyList<Func<CancellationToken, Task<T>>> produce,
+        Func<T, CancellationToken, Task> persist,
+        ExtractionParallelismOptions options,
+        CancellationToken cancellationToken)
+    {
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var token = linkedCts.Token;
 
-        var channel = Channel.CreateBounded<ProjectContributions>(
-            new BoundedChannelOptions(options.QueueCapacity)
+        var channel = Channel.CreateBounded<T>(
+            new BoundedChannelOptions(Math.Max(1, options.QueueCapacity))
             {
                 SingleReader = true,
                 SingleWriter = true,
                 FullMode = BoundedChannelFullMode.Wait,
             });
 
-        var producer = Task.Run(
-            () => ProduceAsync(projects, extractDocument, options, channel.Writer, token), token);
+        var producer = Task.Run(() => ProduceAsync(produce, options, channel.Writer, token), token);
 
         try
         {
             // Drain in enqueue order (== project order) and persist on this single thread.
-            await foreach (var contributions in channel.Reader.ReadAllAsync(token).ConfigureAwait(false))
-                await persist(contributions, token).ConfigureAwait(false);
+            await foreach (var item in channel.Reader.ReadAllAsync(token).ConfigureAwait(false))
+                await persist(item, token).ConfigureAwait(false);
         }
         catch
         {
@@ -103,30 +130,28 @@ public static class ParallelExtractionPipeline
     // producer holds at most ProjectsInFlight + QueueCapacity projects (analyzing or finished), and the channel up to
     // QueueCapacity more: that bounds the contribution sets in memory at about ProjectsInFlight + 2 x QueueCapacity + 2
     // (one being written, one being persisted).
-    private static async Task ProduceAsync<TDoc>(
-        IReadOnlyList<Func<CancellationToken, Task<ProjectExtraction<TDoc>>>> projects,
-        Func<TDoc, CancellationToken, DocumentContributionSet> extractDocument,
+    private static async Task ProduceAsync<T>(
+        IReadOnlyList<Func<CancellationToken, Task<T>>> produce,
         ExtractionParallelismOptions options,
-        ChannelWriter<ProjectContributions> writer,
+        ChannelWriter<T> writer,
         CancellationToken token)
     {
         using var producerCts = CancellationTokenSource.CreateLinkedTokenSource(token);
         var producerToken = producerCts.Token;
-        using var workers = new SemaphoreSlim(Math.Max(1, options.MaxParallelism));
-        var inFlight = new Queue<Task<ProjectContributions>>();
+        var inFlight = new Queue<Task<T>>();
         try
         {
             var next = 0;
             var analyzing = Math.Max(1, options.ProjectsInFlight);
             var held = analyzing + Math.Max(1, options.QueueCapacity);
-            while (next < projects.Count || inFlight.Count > 0)
+            while (next < produce.Count || inFlight.Count > 0)
             {
                 // Write finished projects at the head, in project order, before starting another one: with one
                 // project in flight this is exactly the one-project-at-a-time pipeline.
                 if (inFlight.Count > 0 && inFlight.Peek().IsCompleted)
                 {
-                    var contributions = await inFlight.Dequeue().ConfigureAwait(false);
-                    await writer.WriteAsync(contributions, producerToken).ConfigureAwait(false);
+                    var item = await inFlight.Dequeue().ConfigureAwait(false);
+                    await writer.WriteAsync(item, producerToken).ConfigureAwait(false);
                     continue;
                 }
 
@@ -136,9 +161,10 @@ public static class ParallelExtractionPipeline
 
                 // A free analysis slot (finished projects waiting behind the head do not hold one) takes the next
                 // project, within the bound on projects held.
-                if (next < projects.Count && inFlight.Count < held && inFlight.Count(task => !task.IsCompleted) < analyzing)
+                if (next < produce.Count && inFlight.Count < held && inFlight.Count(task => !task.IsCompleted) < analyzing)
                 {
-                    inFlight.Enqueue(ProduceProjectAsync(projects[next++], extractDocument, options, workers, producerToken));
+                    producerToken.ThrowIfCancellationRequested();
+                    inFlight.Enqueue(produce[next++](producerToken));
                     continue;
                 }
 

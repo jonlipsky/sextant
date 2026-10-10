@@ -59,11 +59,13 @@ public static partial class SymbolExtractor
     /// Issue #269: the project's syntax trees are extracted on up to <paramref name="maxParallelism"/> threads (a
     /// compilation and its semantic models are safe to query concurrently), and the per-tree results are concatenated
     /// in syntax-tree order, so the output is identical at every parallelism. Each tree is walked by
-    /// <see cref="DeclarationCandidates"/>, which never binds an executable body.
+    /// <see cref="DeclarationCandidates"/>, which never binds an executable body. Issue #282: when several projects are
+    /// extracted at once they pass one shared <paramref name="workers"/> semaphore, which each tree's walk holds, so the
+    /// walks of every project in flight together stay within the one parallelism.
     /// </remarks>
     public static async Task<(List<Sextant.Core.SymbolInfo> Symbols, bool CompilationAvailable)> ExtractFromProjectWithStatusAsync(
         Project project, long projectId, bool includeDocComments = true, int maxParallelism = 1,
-        CancellationToken cancellationToken = default)
+        SemaphoreSlim? workers = null, CancellationToken cancellationToken = default)
     {
         var compilation = await project.GetCompilationAsync(cancellationToken);
         if (compilation == null)
@@ -77,9 +79,18 @@ public static partial class SymbolExtractor
             new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, maxParallelism), CancellationToken = cancellationToken },
             async (index, token) =>
             {
-                var syntaxTree = trees[index];
-                var root = await syntaxTree.GetRootAsync(token);
-                perTree[index] = ExtractFromTree(compilation.GetSemanticModel(syntaxTree), root, projectId, includeDocComments, now);
+                if (workers != null)
+                    await workers.WaitAsync(token);
+                try
+                {
+                    var syntaxTree = trees[index];
+                    var root = await syntaxTree.GetRootAsync(token);
+                    perTree[index] = ExtractFromTree(compilation.GetSemanticModel(syntaxTree), root, projectId, includeDocComments, now);
+                }
+                finally
+                {
+                    workers?.Release();
+                }
             });
 
         var symbols = new List<Sextant.Core.SymbolInfo>(perTree.Sum(t => t.Count));
