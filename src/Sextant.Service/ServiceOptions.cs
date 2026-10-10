@@ -378,6 +378,20 @@ public sealed record ServiceOptions
     public IReadOnlyList<PackageSourceCredential> PackageSourceCredentials { get; init; } = [];
 
     /// <summary>
+    /// The bound on all per-repository NuGet package folders together (issue #272,
+    /// <c>SEXTANT_SERVICE_PACKAGE_CACHE_MAX_MB</c>, default 10240 MiB). Over it, whole folders are evicted least
+    /// recently used first. Zero disables the cache: each job restores into its own scratch folder again.
+    /// </summary>
+    public long PackageCacheMaxBytes { get; init; } = PackageCache.DefaultMaxBytes;
+
+    /// <summary>
+    /// In <c>clone</c> mode, fetch each new commit into a per-repository bare object store on the cache volume and
+    /// copy the checkout from it, so only objects the store lacks cross the network (issue #272,
+    /// <c>SEXTANT_SERVICE_GIT_OBJECT_STORE</c>, default true). False fetches every commit from the remote afresh.
+    /// </summary>
+    public bool GitObjectStore { get; init; } = true;
+
+    /// <summary>
     /// The <see cref="SnapshotIdentity.RestorePolicy"/> component folded into every ensure request's identity:
     /// null for the default restore-on policy and <c>off</c> when <see cref="PackageRestore"/> is disabled, so
     /// flipping the toggle rebuilds a commit instead of reusing a snapshot produced under the other policy.
@@ -476,10 +490,28 @@ public sealed record ServiceOptions
             PackageRestore = EnvBool("PACKAGE_RESTORE") ?? true,
             PackageRestoreTimeout = EnvInt("PACKAGE_RESTORE_TIMEOUT_SECONDS") is int restoreSeconds and > 0
                 ? TimeSpan.FromSeconds(restoreSeconds) : PackageRestoreRunner.DefaultTimeout,
-            PackageSourceCredentials = ParsePackageSourceCredentials(Env("PACKAGE_SOURCE_CREDENTIALS"))
+            PackageSourceCredentials = ParsePackageSourceCredentials(Env("PACKAGE_SOURCE_CREDENTIALS")),
+            PackageCacheMaxBytes = ParsePackageCacheMaxBytes(Env("PACKAGE_CACHE_MAX_MB")),
+            GitObjectStore = EnvBool("GIT_OBJECT_STORE") ?? true
         };
         options.ValidateCallerIdentity();
         return options;
+    }
+
+    /// <summary>
+    /// Parses <c>SEXTANT_SERVICE_PACKAGE_CACHE_MAX_MB</c> (MiB). Unset → <see cref="PackageCache.DefaultMaxBytes"/>;
+    /// <c>0</c> → disabled; anything that is not a non-negative whole number THROWS, since the setting bounds disk use.
+    /// </summary>
+    internal static long ParsePackageCacheMaxBytes(string? value)
+    {
+        if (value is null)
+            return PackageCache.DefaultMaxBytes;
+        if (!long.TryParse(value.Trim(), System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out var mib) || mib > long.MaxValue / (1024 * 1024))
+            throw new InvalidOperationException(
+                $"Environment variable {EnvPrefix}PACKAGE_CACHE_MAX_MB has an invalid value '{value}'. Use a whole number " +
+                "of MiB (0 disables the package cache). Refusing to start with an unbounded or ambiguous cache size.");
+        return mib * 1024 * 1024;
     }
 
     /// <summary>

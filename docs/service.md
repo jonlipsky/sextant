@@ -66,7 +66,7 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_DATA_ROOT` | Root for the persistent volumes | `<db-dir>/service` |
 | `SEXTANT_SERVICE_CHECKOUT_ROOT` | Persistent base-branch checkouts | `<data-root>/checkouts` |
 | `SEXTANT_SERVICE_ARTIFACT_ROOT` | Persistent published artifacts | `<data-root>/artifacts` |
-| `SEXTANT_SERVICE_CACHE_ROOT` | Bounded local caches (federation pages) | `<data-root>/cache` |
+| `SEXTANT_SERVICE_CACHE_ROOT` | Rebuildable local caches: federation pages, the per-repository NuGet package folders (`nuget-packages/`) and git object stores (`git-objects/`) of [issue #272](#package-and-git-caches-between-jobs-issue-272) | `<data-root>/cache` |
 | `SEXTANT_SERVICE_SCRATCH_ROOT` | **Ephemeral** per-job worker scratch | `<data-root>/scratch` |
 | `SEXTANT_SERVICE_CHECKOUT_MODE` | How a checkout is obtained: `locate` (index only an already-provisioned checkout) or `clone` (provision it by cloning the requested commit) | `locate` |
 | `SEXTANT_SERVICE_CHECKOUT_TOKEN` | Access token for cloning a **private** `https` repo in `clone` mode (sent transiently as an env-scoped `Authorization` header to the repository's own host and same-host submodules only; public repos need none) | none |
@@ -108,6 +108,8 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_SDK_PIN_OVERRIDE` | Temporarily neutralize a checkout `global.json` SDK pin that no installed SDK satisfies, so the checkout still indexes with an installed SDK (issue #113; see [SDK pins](#repository-globaljson-sdk-pins-issue-113)). `false` leaves such pins alone and the job fails / goes partial with a typed `sdk_resolution_failed` diagnostic. `false` is part of the snapshot identity, so flipping the toggle re-indexes a commit instead of reusing a result built under the other policy. An unparseable value **fails startup** | `true` |
 | `SEXTANT_SERVICE_PACKAGE_RESTORE` | Restore the selected solutions' deduplicated project union before the load (see [Package restore](#package-restore-before-the-load)). `false` loads unrestored projects, which compile against their direct project references only, so calls into transitively referenced projects may not bind. `false` is part of the snapshot identity (`restore=off`). An unparseable value **fails startup** | `true` |
 | `SEXTANT_SERVICE_PACKAGE_RESTORE_TIMEOUT_SECONDS` | Bound on one job's whole project-union restore step, clamped to 3600. Under the sandbox the step also stops at a fifth of the sandbox time budget, whichever is shorter. On expiry the restore process tree is killed and the load goes ahead with whatever was restored | `300` |
+| `SEXTANT_SERVICE_PACKAGE_CACHE_MAX_MB` | Bound, in MiB, on all per-repository NuGet package folders together (see [Package and git caches between jobs](#package-and-git-caches-between-jobs-issue-272)). Over it, whole folders are evicted least recently used first. `0` disables the cache: each job restores into a cold folder in its scratch again. Anything but a non-negative whole number **fails startup** | `10240` |
+| `SEXTANT_SERVICE_GIT_OBJECT_STORE` | In `clone` mode, fetch each new commit through a per-repository bare object store on the cache volume, so only objects the store lacks cross the network (see [Package and git caches between jobs](#package-and-git-caches-between-jobs-issue-272)). `false` fetches every commit from the remote afresh. An unparseable value **fails startup** | `true` |
 | `SEXTANT_SERVICE_PACKAGE_SOURCE_CREDENTIALS` | **Secret.** Credentials for private package source hosts, `host[:port]=username:password` entries separated by `;` (the password may contain `:` but not `;`). The restore hands each one to NuGet only for an `https` request to exactly that host and port (443 when no port is given), through the service's own credential provider plugin; a repository's `nuget.config` cannot redirect it (see [Private package feeds](#private-package-feeds-issue-231)). Not part of the snapshot identity. A malformed value **fails startup** | unset |
 
 Boolean toggles accept `1/0`, `true/false`, `yes/no`, `on/off` (case-insensitive); any other non-empty
@@ -406,9 +408,8 @@ partial verdict. The process tree is killed on expiry or cancellation, stdin is 
 stdout/stderr are drained concurrently with a bounded wait, so a leaked MSBuild node cannot hang the job.
 
 A restore problem is **not automatically retried**: the job publishes partial with the notes and reason above, and a later ordinary ensure of the same
-commit attaches to that snapshot. Retrying would rarely help, because each job restores into its own cold
-`NUGET_PACKAGES` (a timed-out restore would time out again), and a credential-gated feed never becomes
-reachable. The restore coverage reason and binding-health verdict below tell an agent that results may be missing; the next commit
+commit attaches to that snapshot. Retrying would rarely help: a timed-out restore would time out again, and a
+credential-gated feed never becomes reachable. The restore coverage reason and binding-health verdict below tell an agent that results may be missing; the next commit
 re-indexes. After improving restore conditions, an operator can request a new immutable
 [rebuild generation](#rebuilding-a-published-commit-issues-235251).
 
@@ -423,6 +424,76 @@ service's own tokens to a source it names. Do not give the service account a use
 `packageSourceCredentials`: a repository's `nuget.config` can declare a source with the same key and another
 URL, and NuGet would send those credentials to it. Use `SEXTANT_SERVICE_PACKAGE_SOURCE_CREDENTIALS` instead
 (below).
+
+#### Package and git caches between jobs (issue #272)
+
+Two caches on the cache volume (`SEXTANT_SERVICE_CACHE_ROOT`) make a later commit of the same repository cheap to
+check out and restore. Both are rebuildable: deleting either directory (with the service stopped) only costs the
+next job of each repository its head start. Neither is backed up, and neither changes what a snapshot contains.
+
+**NuGet package folders, one per repository** (`nuget-packages/<repository>/`, the same
+`<name>-<url hash>` directory name as the repository's checkout). The sandbox points the evaluation's
+`NUGET_PACKAGES` at the requesting repository's folder instead of a cold one in job scratch, so the restore finds
+every package it already restored for an earlier commit and downloads only new ones. **Why per repository, never
+one global folder:** a repository's own `nuget.config` decides which feed serves a package id, and NuGet trusts a
+package folder by id and version alone. With one shared folder, a repository whose feed published
+`Acme.Core 1.0.0` with other contents would plant it for every other repository that restores `Acme.Core 1.0.0`
+(`PackageCacheTests` restores two repositories whose feeds publish the same id and version with different
+contents, and checks each gets its own, and that a shared folder would have been poisoned). Two spellings of one
+remote share a folder, exactly as they share a checkout. The sandbox refuses (fail closed) to point
+`NUGET_PACKAGES` at anything but one repository's folder under `nuget-packages/`.
+
+- **Bounded.** After each job the folder it used is measured and recorded next to it
+  (`<repository>.usage`, written only by the service). While all folders together exceed
+  `SEXTANT_SERVICE_PACKAGE_CACHE_MAX_MB` (default 10 GiB), the least recently used folder is evicted **whole**:
+  other repositories first, the folder the job used last (a repository whose packages alone exceed the bound
+  therefore restores cold every time; the log says so — raise the bound). An evicted folder is renamed aside before
+  it is deleted, so NuGet never sees a half-deleted package as installed; an eviction a crash interrupted is swept
+  at startup. Size the bound to at least the largest repository's packages (about 2.7 GB for ProcessStack).
+- **Only restore writes packages.** The in-process load reads the folder through the assets files; it does not
+  restore. Like the rest of the sandbox this is defense in depth: repository code running in the service account
+  could write to its folder (or anywhere the account can reach, #76) — but only its own repository resolves from
+  that folder. A repository that bloats its folder can make others' folders be evicted (a cold restore, never a
+  wrong package).
+- **Credentials.** A folder holds extracted packages only; the per-restore feed credentials file and the plugin
+  claims cache stay in job scratch and are deleted with it (issue #231). A package restored from a credentialed
+  feed stays usable to its own repository after the credential is removed.
+- **What it saves.** The download, not the evaluation: NuGet still evaluates every project of every restored
+  solution, even when nothing changed. Measured on ProcessStack (130 projects, `ProcessStack.slnx` +
+  `no-macos.slnx`, restored per solution because both declare platforms) on a loaded 14-core host, fresh checkout
+  each time: 72 s with an empty package folder and HTTP cache, 48-52 s from a warm package folder. A job's `timings.restore` (`GET /control/status`) records the restore `mode` (`solution`,
+  `union`, `per_solution`, `off`), the `fallback_reason` when several solutions could not be restored as one
+  union, and whether the `package_folder` was `persistent` or `scratch`.
+
+**Git object stores, one per repository** (`git-objects/<repository>/repository.git`, and
+`git-objects/<repository>/submodules/<submodule>.git` for each submodule, keyed by the submodule's clean URL under
+its superproject's directory), in `clone` mode with `SEXTANT_SERVICE_GIT_OBJECT_STORE=true` (the default). A new
+commit is first fetched into the repository's bare store (`fetch --depth 1 <url> <sha>`, the same full-fetch
+fallback as before) whose one ref, `refs/sextant/head`, holds the commit fetched last, so git offers it to the
+server as a `have` and only objects the store lacks cross the network; the staged checkout then copies the commit
+from the store with a local depth-1 fetch, and checkout, verification, submodule provisioning, the scrub and the
+atomic publish are unchanged. The published checkout never refers to the store (no alternates). Each fetch logs
+what it transferred (`Object store for '<url>': fetched N new object(s) (K KiB) for <sha>`); on a commit that adds
+one file that is 3 objects, and an unchanged submodule transfers nothing.
+
+- **Credentials.** The store is fetched by URL with exactly the environment the direct fetch used: the token, when
+  sent, only as the env-scoped host header with redirects off. No remote, URL or token is written into its config.
+  After each fetch its `FETCH_HEAD` is deleted and, with a token configured, every non-object file is scanned for
+  it in raw, base64 and Basic form; a hit discards the store (fail closed). The copy into the checkout carries no
+  token and allows only the `file` transport. Because a store persists between jobs, its config is rewritten to the
+  service's own minimal bare config and any `objects/info/alternates`, `http-alternates`, `commondir` or `gitdir`
+  file is deleted before every use, so nothing planted in it (a proxy, an ssh command, TLS settings, an include,
+  another repository's objects) reaches the next fetch. Hooks (`core.hooksPath=/dev/null`) and fsmonitor are
+  disabled for every store command, and git's automatic maintenance never runs (or detaches) during a fetch.
+- **Self-healing.** A failed store step discards the store (renamed aside, then deleted) and fetches the commit
+  directly, so a store problem never fails a job by itself. A remote timeout or an unambiguous remote refusal
+  (repository not found, authentication failed) keeps the store and is classified exactly as before, without a
+  second fetch. The package folder is optional the same way: one that cannot be prepared (a full or read-only
+  cache volume) is logged and the job restores into its scratch.
+- **Bounded.** After each fetch the store runs `git gc --auto` in the foreground with immediate pruning and at most
+  10 incremental packs, so it holds about one shallow commit's objects plus the deltas of the last few fetches —
+  comparable to the checkout's own `.git`. Stores are not evicted by size; like checkouts, a repository's store
+  stays until it is deleted.
 
 #### Private package feeds (issue #231)
 
@@ -462,9 +533,11 @@ The credentials are not part of the snapshot identity, so configuring them re-in
 already published partial because its feed was unreachable keeps that snapshot until it is
 [rebuilt](#rebuilding-a-published-commit-issues-235251) or a later commit is indexed.
 
-Cost: 15-60 s per job for a large repository with a warm NuGet cache. The sandbox gives each job its own
-`NUGET_PACKAGES`, so a cold job downloads every package (about 2.6 GB for a 188-project repository) into job
-scratch, which is released with the job. Before the union traversal (issue #246), a repository with many
+Cost: 15-60 s per job for a large repository with a warm NuGet cache. The sandbox points `NUGET_PACKAGES` at the
+repository's own package folder, kept between its jobs (see
+[Package and git caches between jobs](#package-and-git-caches-between-jobs-issue-272)), so only a repository's
+first job (or its first after an eviction) downloads every package (about 2.6 GB for a 188-project repository).
+Before the union traversal (issue #246), a repository with many
 overlapping solutions paid for a separate `dotnet restore` per solution: on a 61-solution, 468-project
 repository the step used its whole 300 s and reached only 19 solutions. The regression test now exercises two
 overlapping solutions, verifies one traversal schedules three distinct projects (including the shared project
@@ -1720,7 +1793,8 @@ targets, SDK resolvers, inline `UsingTask`/`Exec` tasks run arbitrary code). Eve
 of a checkout therefore runs through `EvaluationSandbox`, which enforces a wall-clock **time budget**, a
 watchdog **memory ceiling**, **secret scrubbing** + an **offline/no-telemetry** environment, and
 **fail-closed scratch confinement** (it refuses to run if the per-job scratch is not under the scratch root,
-so evaluation can never write into a persistent volume).
+so evaluation never writes into a persistent volume — except the requesting repository's own NuGet package
+folder on the cache volume, issue #272, which it refuses to point anywhere else).
 
 > ⚠️ **Defense in depth, NOT a hard security boundary.** The untrusted work runs **in-process**, so a
 > hostile project can still read/write arbitrary filesystem paths the worker user can reach, spawn child
@@ -2054,8 +2128,8 @@ A backup captures the two durable, non-reconstructable stores and **nothing else
   consistent point-in-time image even while the writer is active (no torn WAL); and
 - the immutable **artifact** volume (published snapshot outputs).
 
-Worker scratch (ephemeral) and the checkout/cache volumes (reconstructable from Git / federation) are not
-backed up, and **secrets are never written** into a backup — the `manifest.json` records a *credentials
+Worker scratch (ephemeral) and the checkout/cache volumes (reconstructable from Git / federation / package
+feeds) are not backed up, and **secrets are never written** into a backup — the `manifest.json` records a *credentials
 boundary* listing the environment variables an operator re-provides on restore.
 
 ```bash

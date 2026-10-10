@@ -72,6 +72,13 @@ public sealed record PackageRestoreOutcome
     /// <summary>True when one traversal restored a deduplicated project union.</summary>
     public bool UsedProjectUnion { get; init; }
 
+    /// <summary>
+    /// Why several selected solutions were restored one by one instead of as one project union (issue #272), e.g.
+    /// "'All.slnx' declares solution-specific configuration"; null when the union was used or only one solution was
+    /// selected. Names only solution and project file names, never a path outside them or a source URL.
+    /// </summary>
+    public string? UnionFallbackReason { get; init; }
+
     /// <summary>Per-project failures, ordered by project path.</summary>
     public IReadOnlyList<PackageRestoreProjectIssue> Projects { get; init; } = [];
 

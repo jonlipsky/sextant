@@ -420,6 +420,7 @@ public class PackageRestoreTests
 
             Assert.IsTrue(outcome.Clean, string.Join("\n", outcome.Notes()));
             Assert.IsTrue(outcome.UsedProjectUnion);
+            Assert.IsNull(outcome.UnionFallbackReason);
             Assert.AreEqual(2, outcome.SolutionsSelected);
             Assert.AreEqual(1, outcome.SolutionsAttempted, "one MSBuild process traverses the deduplicated union");
             Assert.AreEqual(3, outcome.ProjectsAttempted, "the shared dependency is scheduled once");
@@ -543,6 +544,14 @@ public class PackageRestoreTests
 
             Assert.IsFalse(outcome.UsedProjectUnion);
             Assert.AreEqual(2, outcome.SolutionsAttempted);
+            // Issue #272: why the union could not be used is recorded on the outcome (and the job's timings).
+            Assert.AreEqual("'App.csproj' references a project outside the selected solution union", outcome.UnionFallbackReason);
+            var recorder = new JobTimingsRecorder();
+            recorder.RecordRestore(outcome, persistentPackageFolder: true);
+            var restore = recorder.Build().Restore!;
+            Assert.AreEqual("per_solution", restore.Mode);
+            Assert.AreEqual(outcome.UnionFallbackReason, restore.FallbackReason);
+            Assert.AreEqual("persistent", restore.PackageFolder);
             Assert.IsTrue(logs.Any(line => line.Contains("per-solution fallback", StringComparison.Ordinal)));
             Assert.IsTrue(File.Exists(Path.Combine(sharedDir, "obj", "project.assets.json")),
                 "the fallback retains transitive restore behavior for projects outside the selected solution union");

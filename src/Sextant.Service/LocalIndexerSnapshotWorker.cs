@@ -185,7 +185,8 @@ public sealed class LocalIndexerSnapshotWorker(
     SdkPinGuard? sdkPinGuard = null,
     PackageRestoreRunner? packageRestore = null,
     SourceTextStore? sourceTexts = null,
-    TimeProvider? clock = null) : ISnapshotWorker
+    TimeProvider? clock = null,
+    PackageCache? packageCache = null) : ISnapshotWorker
 {
     // Issue #113: neutralizes an unsatisfiable global.json SDK pin for the duration of the MSBuild load only.
     private readonly SdkPinGuard _sdkPinGuard = sdkPinGuard ?? new SdkPinGuard(log: log);
@@ -248,6 +249,12 @@ public sealed class LocalIndexerSnapshotWorker(
                 BuildConfigErrorDiagnostics(checkoutDir, resolution));
         }
 
+        // Issue #272: the evaluation restores into the repository's own package folder, kept between its jobs, so a
+        // later commit restores from it instead of downloading every package again. Only under the sandbox, which
+        // redirects NUGET_PACKAGES at all (without it the toolchain uses the account's own folder, as before).
+        var packagesDir = sandbox is not null && _packageRestore.Enabled
+            ? packageCache?.Acquire(request.RepositoryRemoteUrl)
+            : null;
         var context = CreateSnapshotContext(
             request, capability, _sdkPinGuard.IdentityComponent, _packageRestore.IdentityComponent);
         var pinState = new SdkPinLoadState();
@@ -286,6 +293,7 @@ public sealed class LocalIndexerSnapshotWorker(
                             checkoutDir, resolution.SelectedSolutions, plan?.RestoreLimit, token, scratchDir)
                         .ConfigureAwait(false);
                 }
+                timings.RecordRestore(restore, persistentPackageFolder: packagesDir is not null);
 
                 // Load the DETERMINISTIC selected solution set into ONE workspace (union of projects,
                 // de-duplicated by project path/identity). A single selected solution keeps the byte-identical
@@ -412,7 +420,7 @@ public sealed class LocalIndexerSnapshotWorker(
         try
         {
             return sandbox is not null
-                ? await sandbox.RunAsync(checkoutDir, scratchDir, EvaluateAsync, cancellationToken).ConfigureAwait(false)
+                ? await sandbox.RunAsync(checkoutDir, scratchDir, packagesDir, EvaluateAsync, cancellationToken).ConfigureAwait(false)
                 : await EvaluateAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (SandboxLimitExceededException ex)
@@ -468,6 +476,11 @@ public sealed class LocalIndexerSnapshotWorker(
         catch (Exception ex)
         {
             return Fail(ex.Message);
+        }
+        finally
+        {
+            // Record what the folder now holds and keep the cache under its bound.
+            packageCache?.Release(packagesDir);
         }
     }
 

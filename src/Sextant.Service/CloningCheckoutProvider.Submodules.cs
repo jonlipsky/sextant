@@ -72,6 +72,9 @@ public sealed partial class CloningCheckoutProvider
 
         /// <summary>The service's LAST provisioning attempt: degrade a transient submodule failure (see ProvisionLevel).</summary>
         public bool DegradeTransientFailures { get; init; }
+
+        /// <summary>The superproject's object store (issue #272); each submodule's store lives under it.</summary>
+        public string? RepositoryStore { get; init; }
     }
 
     private readonly record struct GitmodulesEntry(string Name, string? Path, string? Url);
@@ -83,9 +86,10 @@ public sealed partial class CloningCheckoutProvider
     /// still fails TRANSIENTLY is left unpopulated with its reason rather than failing the whole checkout.
     /// </summary>
     private IReadOnlyList<SubmoduleProvisioningOutcome> ProvisionSubmodules(
-        string checkoutRoot, string topCleanUrl, string? repositoryAuthority, bool degradeTransientFailures)
+        string checkoutRoot, string topCleanUrl, string? repositoryAuthority, bool degradeTransientFailures,
+        string? repositoryStore)
     {
-        var walk = new SubmoduleWalk { DegradeTransientFailures = degradeTransientFailures };
+        var walk = new SubmoduleWalk { DegradeTransientFailures = degradeTransientFailures, RepositoryStore = repositoryStore };
         ProvisionLevel(checkoutRoot, checkoutRoot, topCleanUrl, repositoryAuthority, depth: 1, walk);
         if (walk.PopulatedDirectories.Count > 0)
         {
@@ -256,7 +260,7 @@ public sealed partial class CloningCheckoutProvider
     {
         try
         {
-            return ProvisionOne(root, repoDir, entry, parentCleanUrl, repositoryAuthority);
+            return ProvisionOne(root, repoDir, entry, parentCleanUrl, repositoryAuthority, walk.RepositoryStore);
         }
         catch (TransientProvisioningException ex)
             when (walk.DegradeTransientFailures && TryResetSubmoduleDirectory(root, repoDir, entry.Path!))
@@ -309,7 +313,8 @@ public sealed partial class CloningCheckoutProvider
     /// outcome (after removing any partial git dir); transient failures throw.
     /// </summary>
     private SubmoduleProvisioningOutcome ProvisionOne(
-        string root, string repoDir, GitmodulesEntry entry, string parentCleanUrl, string? repositoryAuthority)
+        string root, string repoDir, GitmodulesEntry entry, string parentCleanUrl, string? repositoryAuthority,
+        string? repositoryStore)
     {
         var path = entry.Path!;
         var display = CheckoutRelativeDisplay(root, repoDir, path);
@@ -361,10 +366,11 @@ public sealed partial class CloningCheckoutProvider
 
         // Same shape as the top-level: shallow fetch of the EXACT pinned commit, falling back to a full
         // branch fetch when the server rejects fetch-by-sha; deterministic only if BOTH attempts are.
-        var shallow = RunGit(subDir, env, "fetch", "--depth", "1", "--no-tags", "--end-of-options", "origin", gitlink);
+        // Issue #272: through this submodule's own store under the superproject's, when there is one.
+        var (shallow, full) = FetchCommit(
+            subDir, env, cleanUrl, gitlink, submodule: true, SubmoduleStore(repositoryStore, cleanUrl));
         if (!shallow.Ok)
         {
-            var full = RunGit(subDir, env, "fetch", "--no-tags", "--end-of-options", "origin");
             if (!full.Ok)
             {
                 var shallowTransient = IsTransientGitFailure(GitStage.Fetch, shallow.Kind, shallow.Stderr);

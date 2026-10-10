@@ -112,6 +112,7 @@ public sealed class PackageRestoreRunner(
         var credentialsUnavailable = _sourceCredentials.Count > 0 && credentialsDir is null;
         try
         {
+            string? unionFallbackReason = null;
             if (solutions.Count > 1)
             {
                 if (TryCreateProjectUnion(checkoutDir, solutions, cancellationToken, out var projects, out var fallbackReason))
@@ -127,12 +128,17 @@ public sealed class PackageRestoreRunner(
                 }
 
                 log?.Invoke($"package restore: using per-solution fallback ({fallbackReason}).");
+                unionFallbackReason = fallbackReason;
             }
 
             var fallback = await RunPerSolutionAsync(
                     checkoutDir, solutions, Remaining(deadline, stopwatch), cancellationToken, environment)
                 .ConfigureAwait(false);
-            return fallback with { Timeout = deadline, Elapsed = stopwatch.Elapsed, CredentialsUnavailable = credentialsUnavailable };
+            return fallback with
+            {
+                Timeout = deadline, Elapsed = stopwatch.Elapsed, CredentialsUnavailable = credentialsUnavailable,
+                UnionFallbackReason = unionFallbackReason
+            };
         }
         finally
         {
