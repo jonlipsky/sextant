@@ -352,6 +352,23 @@ public sealed class ParallelExtractionPipelineTests
         Assert.IsLessThanOrEqualTo(2, Volatile.Read(ref materialized), "only the two projects in flight were started");
     }
 
+    [TestMethod]
+    public async Task ManyInstantProjectsInFlight_NeverWaitOnAnEmptySet()
+    {
+        // The head can finish between the check that it is unfinished and the wait on the unfinished projects;
+        // waiting on an empty set threw ("The tasks argument contains no tasks") and failed the run.
+        for (var round = 0; round < 30; round++)
+        {
+            var persisted = 0;
+            var projects = Enumerable.Range(0, 200).Select(p => Project(p, 1, _ => 0)).ToList();
+            await WithTimeout(ParallelExtractionPipeline.RunAsync(projects, Extract,
+                (_, _) => { Interlocked.Increment(ref persisted); return Task.CompletedTask; },
+                new ExtractionParallelismOptions { MaxParallelism = 4, QueueCapacity = 2, ProjectsInFlight = 4 },
+                CancellationToken.None));
+            Assert.AreEqual(200, persisted);
+        }
+    }
+
     private static void InterlockedMax(ref int target, int value)
     {
         int current;

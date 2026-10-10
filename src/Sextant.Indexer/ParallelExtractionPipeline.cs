@@ -142,9 +142,12 @@ public static class ParallelExtractionPipeline
                     continue;
                 }
 
-                // Wait for a project to finish. The head is unfinished here, so the set is never empty; a finished
-                // project in it would wake this at once, every time.
-                await Task.WhenAny(inFlight.Where(task => !task.IsCompleted)).ConfigureAwait(false);
+                // Wait for a project to finish, among the unfinished ones only (a finished project would wake this at
+                // once, every time). The head was unfinished a moment ago but may have just finished: then none are
+                // left to wait for, and the next pass writes it.
+                var unfinished = inFlight.Where(task => !task.IsCompleted).ToList();
+                if (unfinished.Count > 0)
+                    await Task.WhenAny(unfinished).ConfigureAwait(false);
             }
 
             writer.Complete();
