@@ -72,15 +72,69 @@ public class SourceTextStoreTests
     }
 
     [TestMethod]
-    public void Put_RewritesABlobThatDoesNotVerify()
+    public void Put_KeepsAStoredBlobWithoutReadingIt()
+    {
+        // Issue #270: re-indexing stores every file again; a blob already present is not decompressed and re-hashed.
+        var store = new SourceTextStore(_root);
+        var content = Bytes("class Kept { }");
+        var stand = Bytes("class Wrong { }");
+        WriteBlob(BlobPath(content), stand);
+        var written = File.GetLastWriteTimeUtc(BlobPath(content));
+
+        store.Put(SHA256.HashData(content), content);
+
+        Assert.AreEqual(written, File.GetLastWriteTimeUtc(BlobPath(content)), "Put left the present blob alone");
+        CollectionAssert.AreEqual(stand, Unbrotli(File.ReadAllBytes(BlobPath(content))));
+    }
+
+    [TestMethod]
+    public void Put_RewritesAnEmptyBlob()
+    {
+        var store = new SourceTextStore(_root);
+        var content = Bytes("class Empty { }");
+        Directory.CreateDirectory(Path.GetDirectoryName(BlobPath(content))!);
+        File.WriteAllBytes(BlobPath(content), []);
+
+        store.Put(SHA256.HashData(content), content);
+
+        CollectionAssert.AreEqual(content, store.TryGet(SHA256.HashData(content)));
+    }
+
+    [TestMethod]
+    public void ABlobThatDoesNotVerify_IsDiscardedByARead_AndStoredAgainByTheNextPut()
     {
         var store = new SourceTextStore(_root);
         var content = Bytes("class Healed { }");
         WriteBlob(BlobPath(content), Bytes("class Wrong { }"));
 
+        Assert.IsNull(store.TryGet(SHA256.HashData(content)));
+        Assert.IsFalse(File.Exists(BlobPath(content)), "the read discarded the blob that does not verify");
         store.Put(SHA256.HashData(content), content);
 
         CollectionAssert.AreEqual(content, store.TryGet(SHA256.HashData(content)));
+    }
+
+    [TestMethod]
+    public void ACorruptBlob_IsDiscardedByARead_AndStoredAgainByTheNextPut()
+    {
+        var store = new SourceTextStore(_root);
+        var content = Bytes("class Corrupt { }");
+        store.Put(SHA256.HashData(content), content);
+        File.WriteAllBytes(BlobPath(content), [0xFF, 0x00, 0x13, 0x37, 0x42]);
+
+        Assert.IsNull(store.TryGet(SHA256.HashData(content)));
+        store.Put(SHA256.HashData(content), content);
+
+        CollectionAssert.AreEqual(content, store.TryGet(SHA256.HashData(content)));
+    }
+
+    private static byte[] Unbrotli(byte[] compressed)
+    {
+        using var input = new MemoryStream(compressed);
+        using var brotli = new System.IO.Compression.BrotliStream(input, System.IO.Compression.CompressionMode.Decompress);
+        using var output = new MemoryStream();
+        brotli.CopyTo(output);
+        return output.ToArray();
     }
 
     [TestMethod]

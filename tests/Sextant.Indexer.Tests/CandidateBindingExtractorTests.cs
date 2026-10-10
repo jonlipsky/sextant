@@ -91,7 +91,7 @@ public class CandidateBindingExtractorTests
         var tree = app.SyntaxTrees.Single();
         var sink = new DocumentContributionSet();
         DocumentSemanticExtractor.ExtractDocument(
-            tree.GetRoot(), app.GetSemanticModel(tree), "App.cs", tree.GetText(), sink);
+            tree.GetRoot(), app.GetSemanticModel(tree), "App.cs", sink);
         return (sink, app);
     }
 
@@ -155,7 +155,7 @@ public class CandidateBindingExtractorTests
     public void ExactOccurrence_WinsOverACandidateAtTheSameSite()
     {
         var set = new DocumentContributionSet();
-        var candidate = new ReferenceContribution("T:N.A", "A.cs", 3, ReferenceKind.TypeRef, null, "a", IsCandidate: true);
+        var candidate = new ReferenceContribution("T:N.A", "A.cs", 3, ReferenceKind.TypeRef, null, IsCandidate: true);
         var exact = candidate with { IsCandidate = false };
 
         set.AddReference(candidate);

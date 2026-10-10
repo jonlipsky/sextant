@@ -25,7 +25,6 @@ public sealed record ReferenceContribution(
     int Line,
     ReferenceKind Kind,
     AccessKind? Access,
-    string? Snippet,
     long? TargetProjectId = null,
     bool IsCandidate = false);
 
@@ -76,9 +75,9 @@ public sealed class DocumentContributionSet
     private readonly List<CallContribution> _calls = [];
     private readonly List<RelationshipContribution> _relationships = [];
 
-    // Occurrence keys exclude the derived snippet text: two mentions with the same target/location/
-    // kind/access/target-project are the same occurrence and coalesce (the snippet is display data,
-    // not identity). The key includes the resolved target project because compilation-scoped exact
+    // Two mentions with the same target/location/kind/access/target-project are the same occurrence and
+    // coalesce. (No snippet is extracted: the store keeps none, and query time reads context from the file,
+    // issue #270.) The key includes the resolved target project because compilation-scoped exact
     // resolution can bind two same-line mentions of the *same declaration key* to different projects
     // (a multi-TFM dependency, or an `extern alias`-duplicated assembly), which persist different
     // `symbol_id` rows — so they are distinct occurrences and must not collapse. Two same-line
@@ -199,12 +198,10 @@ public sealed class DocumentContributionSet
 /// </remarks>
 public static class DocumentSemanticExtractor
 {
-    private static readonly Regex Whitespace = new(@"\s+", RegexOptions.Compiled);
-
     /// <summary>
     /// Walks one document once and appends its contributions to <paramref name="sink"/>. The caller
     /// supplies the cached <paramref name="root"/> + <paramref name="model"/> (one per document per run,
-    /// acceptance criterion 2) and the document's <paramref name="text"/> for snippet extraction.
+    /// acceptance criterion 2).
     /// <paramref name="resolveTargetProject"/> maps a bound target's containing assembly to its exact
     /// indexed project id (compilation-scoped resolution); pass null to skip it (the orchestrator then
     /// falls back to key-only resolution, and unit tests that don't exercise cross-project identity omit
@@ -218,7 +215,6 @@ public static class DocumentSemanticExtractor
         SyntaxNode root,
         SemanticModel model,
         string filePath,
-        SourceText text,
         DocumentContributionSet sink,
         Func<IAssemblySymbol, long?>? resolveTargetProject = null,
         bool includeDataflow = true)
@@ -233,7 +229,7 @@ public static class DocumentSemanticExtractor
                     break;
 
                 case SimpleNameSyntax name:
-                    EmitReference(name, model, filePath, text, sink, resolveTargetProject);
+                    EmitReference(name, model, filePath, sink, resolveTargetProject);
                     break;
 
                 case InvocationExpressionSyntax invocation:
@@ -242,19 +238,19 @@ public static class DocumentSemanticExtractor
 
                 case ObjectCreationExpressionSyntax objectCreation:
                     EmitInstantiation(objectCreation, model, sink, resolveTargetProject);
-                    EmitConstructorUsage(objectCreation, model, filePath, text, sink, resolveTargetProject);
+                    EmitConstructorUsage(objectCreation, model, filePath, sink, resolveTargetProject);
                     break;
 
                 case ImplicitObjectCreationExpressionSyntax implicitCreation:
                     // Target-typed `new()` has no type-name syntax, so emit both the ObjectCreation
                     // reference and the Instantiates relationship from the creation node itself.
                     EmitInstantiation(implicitCreation, model, sink, resolveTargetProject);
-                    EmitImplicitCreationReference(implicitCreation, model, filePath, text, sink, resolveTargetProject);
-                    EmitConstructorUsage(implicitCreation, model, filePath, text, sink, resolveTargetProject);
+                    EmitImplicitCreationReference(implicitCreation, model, filePath, sink, resolveTargetProject);
+                    EmitConstructorUsage(implicitCreation, model, filePath, sink, resolveTargetProject);
                     break;
 
                 case ConstructorInitializerSyntax initializer:
-                    EmitConstructorUsage(initializer, model, filePath, text, sink, resolveTargetProject);
+                    EmitConstructorUsage(initializer, model, filePath, sink, resolveTargetProject);
                     break;
             }
         }
@@ -286,7 +282,6 @@ public static class DocumentSemanticExtractor
         SimpleNameSyntax name,
         SemanticModel model,
         string filePath,
-        SourceText text,
         DocumentContributionSet sink,
         Func<IAssemblySymbol, long?>? resolveTargetProject)
     {
@@ -315,7 +310,7 @@ public static class DocumentSemanticExtractor
             if (IsBindingFailure(name, model, info.CandidateReason))
                 sink.UnboundNames++;
             foreach (var candidate in StoredCandidates(info.CandidateSymbols))
-                EmitReferenceTo(candidate, isCandidate: true, name, model, filePath, text, sink, resolveTargetProject);
+                EmitReferenceTo(candidate, isCandidate: true, name, model, filePath, sink, resolveTargetProject);
             return;
         }
 
@@ -325,7 +320,7 @@ public static class DocumentSemanticExtractor
         if (!IsStoredTarget(target))
             return;
 
-        EmitReferenceTo(target, isCandidate: false, name, model, filePath, text, sink, resolveTargetProject);
+        EmitReferenceTo(target, isCandidate: false, name, model, filePath, sink, resolveTargetProject);
     }
 
     private static void EmitReferenceTo(
@@ -334,7 +329,6 @@ public static class DocumentSemanticExtractor
         SimpleNameSyntax name,
         SemanticModel model,
         string filePath,
-        SourceText text,
         DocumentContributionSet sink,
         Func<IAssemblySymbol, long?>? resolveTargetProject)
     {
@@ -350,7 +344,6 @@ public static class DocumentSemanticExtractor
             line,
             kind,
             access,
-            Snippet(text, name.Span),
             ExactTargetProject(target, resolveTargetProject),
             isCandidate));
     }
@@ -518,7 +511,7 @@ public static class DocumentSemanticExtractor
     }
 
     private static void EmitConstructorUsage(
-        SyntaxNode node, SemanticModel model, string filePath, SourceText text, DocumentContributionSet sink,
+        SyntaxNode node, SemanticModel model, string filePath, DocumentContributionSet sink,
         Func<IAssemblySymbol, long?>? resolveTargetProject)
     {
         var info = model.GetSymbolInfo(node);
@@ -547,7 +540,7 @@ public static class DocumentSemanticExtractor
             sink.AddReference(new ReferenceContribution(
                 key, filePath, position.Line + 1,
                 node is ConstructorInitializerSyntax ? ReferenceKind.Invocation : ReferenceKind.ObjectCreation,
-                null, Snippet(text, node.Span), targetProject, isCandidate));
+                null, targetProject, isCandidate));
 
             if (EnclosingMemberKey(node, model) is { } callerKey)
                 sink.AddCall(new CallContribution(
@@ -586,7 +579,6 @@ public static class DocumentSemanticExtractor
         ImplicitObjectCreationExpressionSyntax creation,
         SemanticModel model,
         string filePath,
-        SourceText text,
         DocumentContributionSet sink,
         Func<IAssemblySymbol, long?>? resolveTargetProject)
     {
@@ -605,7 +597,6 @@ public static class DocumentSemanticExtractor
             line,
             ReferenceKind.ObjectCreation,
             null,
-            Snippet(text, creation.Span),
             ExactTargetProject(createdType, resolveTargetProject)));
     }
 
@@ -737,12 +728,4 @@ public static class DocumentSemanticExtractor
            && SymbolExtractor.MapSymbolKind(symbol) != null
            && !SemanticSymbolKeyFactory.IsExcludedArtifact(symbol);
 
-    private static string Snippet(SourceText text, TextSpan span)
-    {
-        var start = Math.Max(0, span.Start - 60);
-        var end = Math.Min(text.Length, span.End + 60);
-        var snippet = text.GetSubText(TextSpan.FromBounds(start, end)).ToString();
-        snippet = Whitespace.Replace(snippet, " ").Trim();
-        return snippet.Length > 120 ? snippet[..120] : snippet;
-    }
 }

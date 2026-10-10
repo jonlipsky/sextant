@@ -13,7 +13,8 @@ Create a `sextant.json` file at your repository root to customize behavior:
   "auto_spawn_daemon": true,
   "document_extractor": true,
   "max_parallelism": 0,
-  "extraction_queue_capacity": 0
+  "extraction_queue_capacity": 0,
+  "extraction_projects_in_flight": 0
 }
 ```
 
@@ -21,7 +22,7 @@ All fields are optional — Sextant uses sensible defaults.
 
 `document_extractor` (default `true`) selects the extraction engine. When `true` (the default), indexing uses the Phase 5 **document-oriented** extractor (a single usage-site pass per document) instead of the legacy declaration-driven `FindReferencesAsync` path. Set it to `false` to fall back to the legacy extractor, which is retained as an emergency fallback; see [indexing.md](indexing.md#document-oriented-extractor-phase-5-feature-flagged).
 
-`max_parallelism` and `extraction_queue_capacity` (Phase 6) tune the document extractor's bounded parallel pipeline. Per-document analysis runs across up to `max_parallelism` workers; the completed per-project contribution sets flow to the single SQLite writer through a bounded channel of capacity `extraction_queue_capacity`, which applies backpressure and bounds outstanding contribution memory. Both default to `0` (auto): `max_parallelism` resolves to `min(processorCount, 8)` and the queue capacity to a small multiple of the resolved parallelism. A positive `max_parallelism` is honored but clamped to the processor count so a misconfiguration cannot oversubscribe the CPU. The pipeline preserves deterministic output — the canonical index is byte-for-byte identical to a single-threaded run regardless of the parallelism level. `max_parallelism` also caps the symbol pass (issue #269), with or without the document extractor: how many of a project's syntax trees are walked at once, and how many projects are compiled ahead of the one being walked. The walk and the compilation prefetch run together, so the symbol pass can use about twice `max_parallelism` threads at its peak. `extraction_queue_capacity` only affects the document extractor; the legacy occurrence phases are unaffected by both.
+`max_parallelism` and `extraction_queue_capacity` (Phase 6) tune the document extractor's bounded parallel pipeline. Per-document analysis runs across up to `max_parallelism` workers; the completed per-project contribution sets flow to the single SQLite writer through a bounded channel of capacity `extraction_queue_capacity`, which applies backpressure and bounds outstanding contribution memory. Both default to `0` (auto): `max_parallelism` resolves to `min(processorCount, 8)` and the queue capacity to a small multiple of the resolved parallelism. A positive `max_parallelism` is honored but clamped to the processor count so a misconfiguration cannot oversubscribe the CPU. The pipeline preserves deterministic output — the canonical index is byte-for-byte identical to a single-threaded run regardless of the parallelism level. `max_parallelism` also caps the symbol pass (issue #269), with or without the document extractor: how many of a project's syntax trees are walked at once, and how many projects are compiled ahead of the one being walked. The walk and the compilation prefetch run together, so the symbol pass can use about twice `max_parallelism` threads at its peak. `extraction_projects_in_flight` (issue #270) is how many projects the document extractor analyzes at once; their documents share the `max_parallelism` workers, so it bounds the extracted contributions held in memory rather than the CPU used. `0` (auto) resolves to `min(max_parallelism, 4)`, and `1` analyzes one project at a time. `extraction_queue_capacity` and `extraction_projects_in_flight` only affect the document extractor; the legacy occurrence phases are unaffected by them.
 
 ### Full `sextant.json` field reference
 
@@ -38,6 +39,7 @@ All fields are optional — Sextant uses sensible defaults.
 | `document_extractor` | bool | `true` | Phase 5 document-oriented extractor (see above). |
 | `max_parallelism` | int | `0` (auto) | Phase 6 extraction worker cap. |
 | `extraction_queue_capacity` | int | `0` (auto) | Phase 6 bounded writer-channel capacity. |
+| `extraction_projects_in_flight` | int | `0` (auto) | Projects the document extractor analyzes at once (issue #270). |
 | `write_batch_size` | int | `10000` | Row count that forces a mid-project commit, bounding transaction/WAL growth (Phase 3). |
 | `wal_autocheckpoint_pages` | int | `1000` | `PRAGMA wal_autocheckpoint` in pages — bounds the WAL during a run (Phase 3). |
 | `journal_size_limit_bytes` | int | `67108864` (64 MiB) | `PRAGMA journal_size_limit` — caps the WAL left on disk after a checkpoint (Phase 3). |

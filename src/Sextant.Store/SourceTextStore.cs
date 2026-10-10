@@ -52,8 +52,12 @@ public sealed class SourceTextStore
     /// <summary>
     /// Stores <paramref name="content"/> under <paramref name="contentHash"/>, its raw SHA-256 computed by the caller
     /// over the same buffer. Best-effort: a file over <see cref="MaxBytes"/> or an I/O failure stores nothing (the
-    /// text then reads as absent), and it never throws for either. An already-stored blob is kept when it verifies
-    /// and rewritten when it does not.
+    /// text then reads as absent), and it never throws for either. A blob already stored under the hash is kept as
+    /// it is, without reading it (issue #270: re-indexing a commit stores every file again, and verifying each one
+    /// decompressed and re-hashed it). A blob is flushed to disk and then renamed into place, so a present one was
+    /// written completely; an empty one is written again, and one that has otherwise gone bad (damaged on disk, or
+    /// restored from a bad backup) is discarded by the next <see cref="TryGet"/>, after which <see cref="Put"/> writes
+    /// it again.
     /// </summary>
     public void Put(byte[] contentHash, byte[] content)
     {
@@ -61,7 +65,7 @@ public sealed class SourceTextStore
             return;
 
         var target = BlobPath(contentHash);
-        if (TryGet(contentHash) != null)
+        if (new FileInfo(target) is { Exists: true, Length: > 0 })
             return;
 
         string? temp = null;
@@ -70,8 +74,12 @@ public sealed class SourceTextStore
             Directory.CreateDirectory(Path.GetDirectoryName(target)!);
             temp = Path.Combine(Path.GetDirectoryName(target)!, $"{Convert.ToHexStringLower(contentHash)}.{Guid.NewGuid():N}{TempExtension}");
             using (var file = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-            using (var brotli = new BrotliStream(file, new BrotliCompressionOptions { Quality = CompressionQuality }))
-                brotli.Write(content);
+            {
+                using (var brotli = new BrotliStream(file, new BrotliCompressionOptions { Quality = CompressionQuality }, leaveOpen: true))
+                    brotli.Write(content);
+                // On disk before the rename, so a blob present under its hash is whole even after a crash.
+                file.Flush(flushToDisk: true);
+            }
             File.Move(temp, target, overwrite: true);
             temp = null;
         }
@@ -88,7 +96,8 @@ public sealed class SourceTextStore
 
     /// <summary>
     /// The stored bytes whose raw SHA-256 is <paramref name="contentHash"/>, or null when none are stored or the
-    /// stored blob does not verify (missing, truncated, corrupt, over <see cref="MaxBytes"/>, or another file's).
+    /// stored blob does not verify (missing, truncated, corrupt, over <see cref="MaxBytes"/>, or another file's). A
+    /// blob that does not decode or hash to its key is deleted, so the next <see cref="Put"/> stores the content again.
     /// </summary>
     public byte[]? TryGet(byte[] contentHash)
     {
@@ -114,14 +123,31 @@ public sealed class SourceTextStore
             }
 
             var bytes = buffer.ToArray();
-            return CryptographicOperations.FixedTimeEquals(SHA256.HashData(bytes), contentHash) ? bytes : null;
+            if (CryptographicOperations.FixedTimeEquals(SHA256.HashData(bytes), contentHash))
+                return bytes;
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException
-                                       or InvalidOperationException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // InvalidOperationException: the Brotli decoder ran into invalid data (a corrupt blob).
             return null;
         }
+        catch (Exception ex) when (ex is InvalidDataException or InvalidOperationException)
+        {
+            // InvalidOperationException: the Brotli decoder ran into invalid data (a corrupt blob).
+        }
+
+        // The blob is corrupt, or holds other content: discard it so the next Put stores the content again. It is moved
+        // aside first (never over another file), so a good blob a concurrent Put lands at the path is not deleted.
+        var discarded = $"{path}.{Guid.NewGuid():N}{TempExtension}";
+        try
+        {
+            File.Move(path, discarded, overwrite: false);
+            TryDelete(discarded);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Already discarded by another reader, or not ours to change: either way, the next read decides again.
+        }
+        return null;
     }
 
     /// <summary>

@@ -28,8 +28,17 @@ public sealed record ExtractionParallelismOptions
     /// </summary>
     public int QueueCapacity { get; init; } = 1;
 
+    /// <summary>
+    /// How many projects are analyzed at once, their documents sharing the <see cref="MaxParallelism"/> workers
+    /// (issue #270). Always >= 1; 1 analyzes one project at a time.
+    /// </summary>
+    public int ProjectsInFlight { get; init; } = 1;
+
+    /// <summary>The projects-in-flight an auto-resolved configuration uses (at most the parallelism).</summary>
+    public const int DefaultProjectsInFlight = 4;
+
     /// <summary>Single-threaded options (no parallel analysis), used as a safe fallback and by tests.</summary>
-    public static ExtractionParallelismOptions Sequential { get; } = new() { MaxParallelism = 1, QueueCapacity = 1 };
+    public static ExtractionParallelismOptions Sequential { get; } = new() { MaxParallelism = 1, QueueCapacity = 1, ProjectsInFlight = 1 };
 
     /// <summary>Auto-resolved options for the current machine.</summary>
     public static ExtractionParallelismOptions Default { get; } = Resolve(0, 0);
@@ -40,9 +49,13 @@ public sealed record ExtractionParallelismOptions
     /// <c>min(ProcessorCount, <see cref="DefaultParallelismCap"/>)</c>; a positive value is honored
     /// but still clamped to the processor count so a misconfiguration cannot oversubscribe the CPU. A
     /// non-positive <paramref name="configuredQueueCapacity"/> auto-resolves to a small multiple of
-    /// the parallelism so the writer stays fed without buffering an unbounded backlog.
+    /// the parallelism so the writer stays fed without buffering an unbounded backlog. A non-positive
+    /// <paramref name="configuredProjectsInFlight"/> (the default) auto-resolves to
+    /// <c>min(parallelism, <see cref="DefaultProjectsInFlight"/>)</c>; a positive value is honored as is (projects in
+    /// flight share the parallelism's workers, so it bounds memory, not CPU).
     /// </summary>
-    public static ExtractionParallelismOptions Resolve(int configuredParallelism, int configuredQueueCapacity)
+    public static ExtractionParallelismOptions Resolve(
+        int configuredParallelism, int configuredQueueCapacity, int configuredProjectsInFlight = 0)
     {
         var processors = Math.Max(1, Environment.ProcessorCount);
         var parallelism = configuredParallelism > 0
@@ -53,10 +66,17 @@ public sealed record ExtractionParallelismOptions
             ? configuredQueueCapacity
             : Math.Max(2, parallelism);
 
-        return new ExtractionParallelismOptions { MaxParallelism = parallelism, QueueCapacity = capacity };
+        var projectsInFlight = configuredProjectsInFlight > 0
+            ? configuredProjectsInFlight
+            : Math.Min(parallelism, DefaultProjectsInFlight);
+
+        return new ExtractionParallelismOptions
+        {
+            MaxParallelism = parallelism, QueueCapacity = capacity, ProjectsInFlight = projectsInFlight
+        };
     }
 
     /// <summary>Builds resolved options from the repo <see cref="SextantConfiguration"/>.</summary>
     public static ExtractionParallelismOptions FromConfiguration(SextantConfiguration config)
-        => Resolve(config.MaxParallelism, config.ExtractionQueueCapacity);
+        => Resolve(config.MaxParallelism, config.ExtractionQueueCapacity, config.ExtractionProjectsInFlight);
 }

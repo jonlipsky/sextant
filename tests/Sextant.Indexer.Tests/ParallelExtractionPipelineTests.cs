@@ -263,6 +263,112 @@ public sealed class ParallelExtractionPipelineTests
             $"at most capacity+2 ({capacity + 2}), far below the {projectCount} total projects");
     }
 
+    [TestMethod]
+    [DataRow(2)]
+    [DataRow(4)]
+    public async Task SeveralProjectsInFlight_PersistInProjectOrder_WhenLaterProjectsFinishFirst(int projectsInFlight)
+    {
+        // Issue #270: project 0 is slow and the rest are fast, so they finish first; they are still persisted in order,
+        // and their analysis overlapped project 0's (they were materialized before project 0 was persisted).
+        const int projectCount = 6;
+        var materialized = 0;
+        var materializedWhenFirstPersisted = -1;
+        var recorded = new List<string>();
+        var projects = Enumerable.Range(0, projectCount)
+            .Select(p => Project(p, 3, _ => p == 0 ? 120 : 5, onMaterialize: () => Interlocked.Increment(ref materialized)))
+            .ToList();
+
+        Task Persist(ProjectContributions project, CancellationToken _)
+        {
+            if (materializedWhenFirstPersisted < 0)
+                materializedWhenFirstPersisted = Volatile.Read(ref materialized);
+            recorded.AddRange(project.Contributions.Relationships.Select(r => r.FromKey));
+            return Task.CompletedTask;
+        }
+
+        await WithTimeout(ParallelExtractionPipeline.RunAsync(projects, Extract, Persist,
+            new ExtractionParallelismOptions { MaxParallelism = 4, QueueCapacity = 2, ProjectsInFlight = projectsInFlight },
+            CancellationToken.None));
+
+        CollectionAssert.AreEqual(
+            (from p in Enumerable.Range(0, projectCount) from d in Enumerable.Range(0, 3) select $"{p}:{d}").ToList(),
+            recorded, "projects are persisted in project order, each in document order");
+        Assert.IsGreaterThanOrEqualTo(projectsInFlight, materializedWhenFirstPersisted,
+            "the projects behind the slow head were analyzed while it ran");
+    }
+
+    [TestMethod]
+    public async Task ProjectsAnalyzing_NeverExceedProjectsInFlight_AndDocumentsNeverExceedTheWorkers()
+    {
+        const int projectsInFlight = 3;
+        const int workers = 4;
+        var activeByProject = new ConcurrentDictionary<int, int>();
+        var activeDocuments = 0;
+        var maxProjects = 0;
+        var maxDocuments = 0;
+
+        DocumentContributionSet Tracked(TestDoc doc, CancellationToken token)
+        {
+            activeByProject.AddOrUpdate(doc.Project, 1, (_, n) => n + 1);
+            InterlockedMax(ref maxProjects, activeByProject.Count(e => e.Value > 0));
+            InterlockedMax(ref maxDocuments, Interlocked.Increment(ref activeDocuments));
+            try
+            {
+                return Extract(doc, token);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref activeDocuments);
+                activeByProject.AddOrUpdate(doc.Project, 0, (_, n) => n - 1);
+            }
+        }
+
+        var projects = Enumerable.Range(0, 10).Select(p => Project(p, 4, d => 3 + (p * 7 + d * 5) % 11)).ToList();
+        await WithTimeout(ParallelExtractionPipeline.RunAsync(projects, Tracked, (_, _) => Task.CompletedTask,
+            new ExtractionParallelismOptions { MaxParallelism = workers, QueueCapacity = 2, ProjectsInFlight = projectsInFlight },
+            CancellationToken.None));
+
+        Assert.IsLessThanOrEqualTo(projectsInFlight, maxProjects);
+        Assert.IsLessThanOrEqualTo(workers, maxDocuments, "the projects in flight share one set of workers");
+    }
+
+    [TestMethod]
+    public async Task AFaultBehindASlowHead_FailsTheRunWithoutStartingMoreProjects()
+    {
+        // Project 0 is slow; project 1 faults at once. The run fails, and no further project is started while the
+        // head is still running (before #270's fail-fast, freed slots kept admitting projects until the head ended).
+        var materialized = 0;
+        var projects = Enumerable.Range(0, 12)
+            .Select(p => Project(p, 1, _ => p == 0 ? 400 : 0, throwOnDoc: p == 1 ? 0 : -1,
+                onMaterialize: () => Interlocked.Increment(ref materialized)))
+            .ToList();
+
+        var run = ParallelExtractionPipeline.RunAsync(projects, Extract, (_, _) => Task.CompletedTask,
+            new ExtractionParallelismOptions { MaxParallelism = 4, QueueCapacity = 6, ProjectsInFlight = 2 },
+            CancellationToken.None);
+
+        var fault = await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => WithTimeout(run));
+        StringAssert.Contains(fault.Message, "worker fault 1:0");
+        Assert.IsLessThanOrEqualTo(2, Volatile.Read(ref materialized), "only the two projects in flight were started");
+    }
+
+    [TestMethod]
+    public async Task ManyInstantProjectsInFlight_NeverWaitOnAnEmptySet()
+    {
+        // The head can finish between the check that it is unfinished and the wait on the unfinished projects;
+        // waiting on an empty set threw ("The tasks argument contains no tasks") and failed the run.
+        for (var round = 0; round < 30; round++)
+        {
+            var persisted = 0;
+            var projects = Enumerable.Range(0, 200).Select(p => Project(p, 1, _ => 0)).ToList();
+            await WithTimeout(ParallelExtractionPipeline.RunAsync(projects, Extract,
+                (_, _) => { Interlocked.Increment(ref persisted); return Task.CompletedTask; },
+                new ExtractionParallelismOptions { MaxParallelism = 4, QueueCapacity = 2, ProjectsInFlight = 4 },
+                CancellationToken.None));
+            Assert.AreEqual(200, persisted);
+        }
+    }
+
     private static void InterlockedMax(ref int target, int value)
     {
         int current;
