@@ -172,11 +172,11 @@ snapshots become reclaimable (issue #299). Both run from its maintenance loop:
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `SEXTANT_SERVICE_MAINTENANCE_INTERVAL_MINUTES` | `60` | Maintenance loop tick interval; `0` turns the loop (and both rules below) off. |
-| `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_DAYS` | `7` | Retire a non-default branch pointer that has not moved for more than this many days; `0` disables. The default branch is never retired. |
+| `SEXTANT_SERVICE_MAINTENANCE_INTERVAL_MINUTES` | `60` | Maintenance loop tick interval (clamped to 7 days); `0` turns the loop (and both rules below) off. |
+| `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_DAYS` | `7` | Retire a non-default branch pointer that has not moved for more than this many days (clamped to 3650); `0` disables. The default branch is never retired, and the branch's next push re-creates it. |
 | `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_MAX_PER_PASS` | `20` | Most idle branches retired per tick (clamped to `1000`). |
 | `SEXTANT_SERVICE_RETENTION_SCHEDULE` | `true` | Run the bounded retention pass once a day (never a `VACUUM`). |
-| `SEXTANT_SERVICE_RETENTION_SCHEDULE_HOUR_UTC` | `3` | UTC hour from which the daily pass runs; skipped and retried next tick while indexing holds the writer. |
+| `SEXTANT_SERVICE_RETENTION_SCHEDULE_HOUR_UTC` | `3` | UTC hour from which the daily pass runs; it does not start while indexing holds the writer (retried next tick). |
 
 See [service.md](service.md#maintenance-loop-idle-branch-retirement--scheduled-retention-issue-299).
 

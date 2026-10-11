@@ -175,10 +175,17 @@ public sealed partial class SnapshotService
     {
         var policy = _options.Maintenance;
         if (policy.BranchIdleRetireDays <= 0)
-            return new IdleBranchRetireReport { Enabled = false };
+        {
+            // Records the rule wrote while it was on still expire on schedule.
+            return new IdleBranchRetireReport
+            {
+                Enabled = false, RetiredHeadsPruned = await PruneRetiredHeadsAsync(cancellationToken).ConfigureAwait(false)
+            };
+        }
 
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
-        var cutoff = _timeProvider.GetUtcNow().AddDays(-policy.BranchIdleRetireDays).ToUnixTimeMilliseconds();
+        var idleDays = Math.Min(policy.BranchIdleRetireDays, MaintenancePolicy.MaxBranchIdleRetireDays);
+        var cutoff = _timeProvider.GetUtcNow().AddDays(-idleDays).ToUnixTimeMilliseconds();
         IReadOnlyList<IdleBranchCandidate> idle;
         HashSet<(string RepositoryKey, string Branch)> pending;
         using (var reader = OpenReadConnection())
@@ -248,7 +255,8 @@ public sealed partial class SnapshotService
 
     // The tick's scheduled retention (issue #299): once per UTC day, on the first tick at or after the configured hour,
     // the same bounded pass as POST /control/retention?execute=true, audited as retention_schedule. While a production
-    // holds (or waits for) the writer the pass is skipped and retried next tick, so it never queues indexing behind it.
+    // holds (or waits for) the writer the pass does not start and is retried next tick. Once started, a production
+    // admitted meanwhile waits at most one bounded batch (RetentionService.BatchTimeLimit) for its turn.
     private async Task<MaintenanceTickReport> RunScheduledRetentionIfDueAsync(
         IdleBranchRetireReport idle, CancellationToken cancellationToken)
     {

@@ -576,7 +576,8 @@ public sealed record ServiceOptions
     /// <summary>
     /// Builds the maintenance policy (issue #299) from its environment values. An unset, unparseable or out-of-range
     /// number keeps its default (the interval and the idle days accept <c>0</c>, which disables them); the interval is
-    /// clamped to <see cref="MaintenancePolicy.MaxIntervalMinutes"/> and the per-pass cap to
+    /// clamped to <see cref="MaintenancePolicy.MaxIntervalMinutes"/>, the idle days to
+    /// <see cref="MaintenancePolicy.MaxBranchIdleRetireDays"/> and the per-pass cap to
     /// <see cref="MaintenancePolicy.MaxBranchIdleRetireMaxPerPass"/>.
     /// </summary>
     internal static MaintenancePolicy ParseMaintenance(
@@ -585,7 +586,7 @@ public sealed record ServiceOptions
             Interval = TimeSpan.FromMinutes(int.TryParse(intervalMinutes, out var minutes) && minutes >= 0
                 ? Math.Min(minutes, MaintenancePolicy.MaxIntervalMinutes) : MaintenancePolicy.DefaultIntervalMinutes),
             BranchIdleRetireDays = int.TryParse(idleDays, out var days) && days >= 0
-                ? days : MaintenancePolicy.DefaultBranchIdleRetireDays,
+                ? Math.Min(days, MaintenancePolicy.MaxBranchIdleRetireDays) : MaintenancePolicy.DefaultBranchIdleRetireDays,
             BranchIdleRetireMaxPerPass = int.TryParse(maxPerPass, out var cap) && cap > 0
                 ? Math.Min(cap, MaintenancePolicy.MaxBranchIdleRetireMaxPerPass) : MaintenancePolicy.DefaultBranchIdleRetireMaxPerPass,
             ScheduledRetention = scheduledRetention ?? true,

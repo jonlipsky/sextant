@@ -95,8 +95,8 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_QUERY_PORT` | Optional dedicated query port (shares the control port when unset) | none (shared) |
 | `SEXTANT_SERVICE_LEASE_TTL_SECONDS` | Single-writer lease TTL | `30` |
 | `SEXTANT_SERVICE_CONTROL_WRITE_WAIT_SECONDS` | How long a `POST /control/ensure?wait=false` registration or a `POST /control/branches/retire` waits for the single writer before answering `202` with the write still queued (issue #158; see [Queued control writes](#queued-control-writes-issue-158)). Keep it well under the client's timeout. A value above `25` is clamped to `25`; a missing, non-numeric or non-positive value uses the default | `5` |
-| `SEXTANT_SERVICE_MAINTENANCE_INTERVAL_MINUTES` | How often the service-owned maintenance loop ticks (issue #299; see [Maintenance loop](#maintenance-loop-idle-branch-retirement--scheduled-retention-issue-299)). `0` turns the loop off: no idle-branch retirement and no scheduled retention. A non-numeric or negative value uses the default | `60` |
-| `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_DAYS` | Retire a NON-DEFAULT branch pointer that has not moved for more than this many days (issue #299). `0` disables the rule. A non-numeric or negative value uses the default | `7` |
+| `SEXTANT_SERVICE_MAINTENANCE_INTERVAL_MINUTES` | How often the service-owned maintenance loop ticks (issue #299; see [Maintenance loop](#maintenance-loop-idle-branch-retirement--scheduled-retention-issue-299)). `0` turns the loop off: no idle-branch retirement, no retired-head pruning and no scheduled retention. Clamped to `10080` (7 days); a non-numeric or negative value uses the default | `60` |
+| `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_DAYS` | Retire a NON-DEFAULT branch pointer that has not moved for more than this many days (issue #299). `0` disables the rule. Clamped to `3650`; a non-numeric or negative value uses the default | `7` |
 | `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_MAX_PER_PASS` | The most idle branch pointers one tick retires (least recently moved first; the rest wait for the next tick). Clamped to `1000`; a non-numeric or non-positive value uses the default | `20` |
 | `SEXTANT_SERVICE_RETENTION_SCHEDULE` | Run the bounded retention pass once a day from the maintenance loop (issue #299). A malformed boolean **fails startup** | `true` |
 | `SEXTANT_SERVICE_RETENTION_SCHEDULE_HOUR_UTC` | The UTC hour (`0`–`23`) from which the day's scheduled retention runs: the first tick at or after it runs the pass, once per UTC day. Any other value uses the default | `3` |
@@ -1936,16 +1936,17 @@ their snapshots forever. A service-owned loop cleans them up.
   `expected_head_commit` is that head or absent (audit detail `absent;retired_head_cleared`). A later stale push
   or reconcile expecting the old head therefore cannot resurrect it. Only idle-policy retirements record a head: a
   manual or delete-push retire means the branch is gone from git too, and recording one would let a redelivered
-  stale push re-create a deleted branch. The loop prunes records older than 90 days
-  (`retired_heads_pruned` in the tick log). After that, an idle-retired branch that was never pushed comes back
-  only as a new branch.
+  stale push re-create a deleted branch. While the loop runs, every tick prunes records older than 90 days,
+  even with the idle rule turned off (`retired_heads_pruned` in the tick log). After that, an idle-retired branch
+  that was never pushed comes back only as a new branch.
 - **Scheduled retention (once a day).** After the tick's idle-branch pass, the first tick at or after
   `SEXTANT_SERVICE_RETENTION_SCHEDULE_HOUR_UTC` (default 3) each UTC day runs the same bounded
   `execute=true` pass as `POST /control/retention?execute=true`. The audit actor is `retention_schedule` and the
   detail is `execute_batch;source=retention_schedule`. It runs at most once per UTC day, and a restart reads
   today's `retention` rows from the audit log, so it does not run twice. While indexing holds the writer (a
-  production is in flight, or a write is waiting for its turn), the due pass is **skipped and retried on the
-  next tick**, so it never queues indexing behind it (`maintenance.scheduled_retention_skipped_busy`).
+  production is in flight, or a write is waiting for its turn), the due pass **does not start and is retried on
+  the next tick** (`maintenance.scheduled_retention_skipped_busy`). Once it has started, a production admitted
+  meanwhile waits at most one bounded batch (2 s) for its turn, exactly as behind a manual pass.
   `SEXTANT_SERVICE_RETENTION_SCHEDULE=false` turns it off. Like a manual pass, it never runs `VACUUM` (#252).
   Compaction stays an offline operator action.
 - **Observability.** Each tick logs one line for the idle-branch pass (retired / idle / busy / attempted /

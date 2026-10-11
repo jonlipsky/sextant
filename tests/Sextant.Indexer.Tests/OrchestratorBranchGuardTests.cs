@@ -123,6 +123,27 @@ public class OrchestratorBranchGuardTests
     }
 
     [TestMethod]
+    public async Task Cas_OnABranchRetiredAsIdle_PassesOnlyForItsRetiredHead_AndConsumesIt()
+    {
+        // Issue #299: the service retired "feature" as idle while commit-F was its head; the branch still exists in
+        // git, so its next push expects commit-F.
+        await Index("commit-A");
+        await Index("commit-F", branch: "feature", expected: "");
+        var store = Store();
+        Assert.IsTrue(store.DeleteBranch(store.GetBranchId(RepoId(), "feature")!.Value));
+        store.RecordRetiredHead(RepoId(), "feature", "commit-F", now: 1, SnapshotStore.RetiredHeadCauseIdle);
+
+        await Index("commit-G", branch: "feature", expected: "commit-X");
+        Assert.IsFalse(BranchExists("feature"), "a push expecting another commit is still refused");
+        Assert.AreEqual("commit-f", Store().GetRetiredHead(RepoId(), "feature"));
+
+        await Index("commit-H", branch: "feature", expected: "commit-F");
+        Assert.AreEqual("commit-H", HeadCommit("feature"), "the publish re-creates the branch at the pushed commit");
+        Assert.IsNull(Store().GetRetiredHead(RepoId(), "feature"), "re-creating the branch consumes the retired head");
+        Assert.AreEqual("commit-A", HeadCommit("main"));
+    }
+
+    [TestMethod]
     public async Task LocalPath_NullGuards_KeepsTheUnconditionalAdvance()
     {
         // The local CLI/daemon path leaves both SVC-6/7 fields null: every index advances the ONE default

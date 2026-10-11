@@ -258,6 +258,24 @@ public class IdleBranchMaintenanceTests
     }
 
     [TestMethod]
+    public async Task RetiredHeads_ArePruned_EvenAfterTheRuleIsTurnedOff()
+    {
+        await using var h = Harness.Create(maintenance: NoLoop());
+        h.Seed("main", isDefault: true, "commit-main", idleFor: TimeSpan.FromDays(1));
+        h.Seed("feature", isDefault: false, "commit-feature", idleFor: TimeSpan.FromDays(10));
+        h.Start();
+        Assert.AreEqual(1, (await h.Service.RetireIdleBranchesAsync()).Retired);
+
+        h.Restart(NoLoop() with { BranchIdleRetireDays = 0 });
+        h.Clock.Advance(MaintenancePolicy.RetiredHeadRetention + TimeSpan.FromMinutes(1));
+        var report = await h.Service.RetireIdleBranchesAsync();
+
+        Assert.IsFalse(report.Enabled);
+        Assert.AreEqual(1, report.RetiredHeadsPruned);
+        Assert.IsNull(h.RetiredHead("feature"));
+    }
+
+    [TestMethod]
     public async Task BranchWithNoKnownHeadCommit_IsNeverRetired()
     {
         await using var h = Harness.Create(maintenance: NoLoop());
@@ -440,6 +458,8 @@ public class IdleBranchMaintenanceTests
         Assert.AreEqual(20, bad.BranchIdleRetireMaxPerPass);
         Assert.AreEqual(3, bad.RetentionHourUtc);
 
+        Assert.AreEqual(MaintenancePolicy.MaxBranchIdleRetireDays,
+            ServiceOptions.ParseMaintenance(null, "999999999", null, null, null).BranchIdleRetireDays, "a cutoff DateTimeOffset can hold");
         Assert.AreEqual(TimeSpan.FromMinutes(MaintenancePolicy.MaxIntervalMinutes),
             ServiceOptions.ParseMaintenance("100000", null, null, null, null).Interval, "a period PeriodicTimer accepts");
         Assert.AreEqual(MaintenancePolicy.MaxBranchIdleRetireMaxPerPass,
@@ -525,9 +545,11 @@ public class IdleBranchMaintenanceTests
             configure?.Invoke(Service);
         }
 
-        public void Restart()
+        public void Restart(MaintenancePolicy? maintenance = null)
         {
             Service.Dispose();
+            if (maintenance is not null)
+                _options = _options with { Maintenance = maintenance };
             Start();
         }
 

@@ -22,6 +22,9 @@ public sealed record MaintenancePolicy
     /// </summary>
     public static readonly TimeSpan RetiredHeadRetention = TimeSpan.FromDays(90);
 
+    /// <summary>The largest idle threshold, in days (about ten years); a larger value is clamped to it.</summary>
+    public const int MaxBranchIdleRetireDays = 3650;
+
     /// <summary>The largest per-tick retire cap the environment can set.</summary>
     public const int MaxBranchIdleRetireMaxPerPass = 1000;
 
@@ -33,7 +36,7 @@ public sealed record MaintenancePolicy
 
     /// <summary>
     /// A non-default branch whose pointer has not moved for more than this many days is retired. <c>0</c> disables the
-    /// rule. <c>SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_DAYS</c> (default 7).
+    /// rule. <c>SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_DAYS</c> (default 7; clamped to <see cref="MaxBranchIdleRetireDays"/>).
     /// </summary>
     public int BranchIdleRetireDays { get; init; } = DefaultBranchIdleRetireDays;
 
