@@ -85,7 +85,11 @@ internal static class BoundedProcess
         new("DOTNET_NOLOGO", "1"),
     ];
 
-    /// <summary>Runs <c>dotnet restore</c> on a project or solution with build servers and node reuse off.</summary>
+    /// <summary>
+    /// Runs <c>dotnet restore</c> on a project or solution with build servers and node reuse off, and with the
+    /// workspace load's <see cref="Sextant.Indexer.EvaluationGlobalProperties"/>, so restore and load evaluate the same
+    /// graph (issue #293).
+    /// </summary>
     public static BoundedProcessResult DotnetRestore(
         string projectOrSolutionPath, TimeSpan? timeout = null, string? workingDirectory = null)
         => Run(CreateDotnetRestoreStartInfo(projectOrSolutionPath, workingDirectory), timeout);
@@ -98,7 +102,8 @@ internal static class BoundedProcess
     {
         var psi = CreateStartInfo(
             "dotnet",
-            ["restore", projectOrSolutionPath, "--disable-build-servers", "-nodeReuse:false"],
+            ["restore", projectOrSolutionPath, "--disable-build-servers", "-nodeReuse:false",
+                .. Sextant.Indexer.EvaluationGlobalProperties.ForSolutionOrProject(projectOrSolutionPath).Select(p => $"-p:{p.Key}={p.Value}")],
             workingDirectory);
         foreach (var (key, value) in DotnetEnvironment)
             psi.Environment[key] = value;

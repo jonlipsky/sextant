@@ -269,7 +269,7 @@ public class PackageSourceCredentialTests
         Environment.SetEnvironmentVariable(FeedCredentialPlugin.CredentialsFileVariable, "/somewhere/else.json");
         try
         {
-            var startInfo = new PackageRestoreRunner().CreateStartInfo(Path.Combine(Path.GetTempPath(), "All.slnx"));
+            var startInfo = new PackageRestoreRunner().CreateStartInfo(Path.Combine(Path.GetTempPath(), "All.slnx"), []);
             Assert.IsFalse(startInfo.Environment.ContainsKey(FeedCredentialPlugin.CredentialsFileVariable));
         }
         finally

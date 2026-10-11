@@ -6,9 +6,37 @@ The index builder loads .NET solutions via Roslyn's `MSBuildWorkspace`, extracts
 
 ```
 MSBuildLocator.RegisterDefaults();  // Must be called before any Roslyn type loads
-var workspace = MSBuildWorkspace.Create();
+var workspace = MSBuildWorkspace.Create(EvaluationGlobalProperties.For(projectPaths));  // as a dictionary
 var solution = await workspace.OpenSolutionAsync(solutionPath);
 ```
+
+Every workspace `SolutionLoader` creates evaluates with the global properties `EvaluationGlobalProperties.For` returns
+for the projects it loads, and the service's package restore applies the same decision for its selection.
+
+**Windows targets (issue #293).** On a Linux or macOS host the .NET SDK fails to evaluate or restore a project targeting
+`net*-windows*` (WPF, WPF-UI, WinUI) with `NETSDK1100` unless `EnableWindowsTargeting=true`, and the project is indexed
+from its surviving documents only, with incomplete references and calls. With it, restore downloads the Windows
+reference packs (`Microsoft.WindowsDesktop.App.Ref`, and `Microsoft.Windows.SDK.NET.Ref` for a `-windows10.0.x` TFM) as
+ordinary packages, and the project's code binds. But the property also makes every other project's restore download
+`Microsoft.WindowsDesktop.App.Ref` as a transitive targeting pack, which fails (`NU1101`) on a repository whose feeds do
+not serve it. So it is set ONLY when a cheap static scan finds a Windows target among the projects:
+
+- a project file, or the nearest `Directory.Build.props`/`Directory.Build.targets` MSBuild would import for it (searching
+  upward), names a Windows TFM (`net*-windows*`, or a property-built `$(...)-windows*`), or sets `UseWPF`, `UseWinUI` or
+  `UseWindowsForms` to `true` (case-insensitive; XML comments ignored);
+- limits: a marker only in a file those import, or in a package's `.props`, is not seen (such a project loads degraded
+  off Windows, as before); a marker in a false condition still counts (that repository then needs the pack from its
+  feeds); unreadable files count as no marker.
+
+A repository without a Windows target evaluates and restores exactly as before. The decision depends only on the
+checkout's files, never on the host. The service worker image pre-installs `Microsoft.WindowsDesktop.App.Ref` into
+`dotnet/packs`, so a Windows repository's jobs do not download it each time.
+
+Apple targets are not fixed by a property: they need their workload. The service worker image installs the `macos`
+workload, so `net*-macos` projects evaluate, restore and bind on the Linux worker. The iOS and Mac Catalyst workloads
+cannot be installed on Linux, so `net*-ios`/`net*-maccatalyst` projects still load degraded there (issue #89). A local
+CLI or daemon user on Linux gets the same macOS result by running `dotnet workload install macos`. Both changes ship
+under one `AnalyzerVersion` bump (`"9"`), so existing snapshots are rebuilt once.
 
 `MSBuildLocator.RegisterDefaults()` must be initialized exactly once, before any `Microsoft.CodeAnalysis` types are loaded. This is a hard Roslyn constraint and is the first call in `Program.cs`.
 

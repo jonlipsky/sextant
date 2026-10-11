@@ -396,7 +396,16 @@ example a private feed authenticated by an environment variable the worker does 
 packages restored; NuGet then reports the source as the per-project **warning** `NU1801` (not the error
 `NU1301`), and the parser records that warning as "a package source was unreachable", even when its message
 contains the word "error". `DesignTimeBuild=true` keeps a missing optional workload from failing the restore,
-like the load. What it could not do is recorded: per-project `package_restore_incomplete` warnings (codes and
+like the load. The restore also applies the load's global properties (`EvaluationGlobalProperties`, see
+[docs/indexing.md](indexing.md#workspace-loading)), decided once over the selected solutions' declared projects: when a
+static scan finds a Windows target (`net*-windows*`, `UseWPF`/`UseWinUI`/`UseWindowsForms`), `EnableWindowsTargeting=true`
+(issue #293, `AnalyzerVersion` 9) lets the WPF/WinUI projects restore their Windows reference packs on the Linux worker,
+through the same feeds, sandbox and per-job package cache as any other package, where they failed with `NETSDK1100` and
+loaded degraded. A selection without one restores exactly as before (the property would make every project download
+`Microsoft.WindowsDesktop.App.Ref`, which a private-only feed does not serve). The worker image pre-installs
+`Microsoft.WindowsDesktop.App.Ref` into `dotnet/packs`, so Windows repositories do not download it per job. It also
+installs the `macos` workload, so `net*-macos` projects restore and bind too; iOS and Mac Catalyst workloads are not
+installable on Linux. Local CLI/daemon users on Linux can run `dotnet workload install macos` for the same effect. The same `AnalyzerVersion` bump covers both platform-targeting changes. What it could not do is recorded: per-project `package_restore_incomplete` warnings (codes and
 package ids only, never a raw message, which can name a source URL), `coverage.notes` lines such as "Package
 restore could not find 2 package(s) (Acme.Auth, Acme.Auth.UI) for 1 project(s); code that uses them may not
 bind.", and each affected project's `coverage.binding.projects[].load_issue`. Any incomplete restore now makes
