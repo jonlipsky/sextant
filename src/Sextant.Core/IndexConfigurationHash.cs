@@ -78,10 +78,15 @@ public static class IndexConfigurationHash
     /// project degraded, so the same commit can now publish complete where it was partial.
     /// </para>
     /// <para>
-    /// <c>"8"</c> to <c>"9"</c> (issue #294): the indexer's Roslyn moved from 5.0 to 5.9, so the .NET SDK's Razor
-    /// source generator (built against the SDK's newer compiler) loads, and the loader drops duplicate additional
-    /// files that made the generator fail. Razor components and the code using them now bind, so the same commit
-    /// yields more references and call edges, and fewer candidate occurrences.
+    /// <c>"8"</c> to <c>"9"</c> (issues #294 and #293, one bump for one deploy). #294: the indexer's Roslyn moved from
+    /// 5.0 to 5.9, so the .NET SDK's Razor source generator (built against the SDK's newer compiler) loads, and the loader
+    /// drops duplicate additional files that made the generator fail; Razor components and the code using them now bind.
+    /// #293: platform-targeting evaluation changes. The workspace load and the service's restore evaluate with
+    /// <c>EnableWindowsTargeting=true</c> when the selection has a Windows target, so a project targeting
+    /// <c>net*-windows*</c> (WPF, WinUI) restores its reference packs and loads on a non-Windows host where it failed with
+    /// <c>NETSDK1100</c>; and the service worker image, deployed with this change, installs the <c>macos</c> workload, so
+    /// a <c>net*-macos</c> project evaluates, restores and binds on the Linux worker. The same commit now yields more
+    /// references and call edges, fewer candidate occurrences, and can publish complete where it was partial.
     /// </para>
     /// </remarks>
     public const string AnalyzerVersion = "9";

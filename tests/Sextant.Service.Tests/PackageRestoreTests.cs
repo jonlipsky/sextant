@@ -288,7 +288,11 @@ public class PackageRestoreTests
     {
         CollectionAssert.AreEqual(
             new[] { "restore", "All.slnx", "-p:DesignTimeBuild=true", "--ignore-failed-sources", "--disable-build-servers", "-nodeReuse:false", "-nologo" },
-            PackageRestoreRunner.Arguments("All.slnx").ToArray());
+            PackageRestoreRunner.Arguments("All.slnx", []).ToArray(),
+            "a selection without a Windows target restores exactly as before #293");
+        CollectionAssert.AreEqual(
+            new[] { "restore", "All.slnx", "-p:DesignTimeBuild=true", "-p:EnableWindowsTargeting=true", "--ignore-failed-sources", "--disable-build-servers", "-nodeReuse:false", "-nologo" },
+            PackageRestoreRunner.Arguments("All.slnx", [new(EvaluationGlobalProperties.EnableWindowsTargeting, "true")]).ToArray());
         Assert.AreEqual(PackageRestoreRunner.DefaultTimeout, new PackageRestoreRunner(timeout: TimeSpan.Zero).Timeout);
         Assert.AreEqual(TimeSpan.FromSeconds(7), new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(7)).Timeout);
         Assert.AreEqual(PackageRestoreRunner.MaxTimeout, new PackageRestoreRunner(timeout: TimeSpan.FromDays(400)).Timeout,
@@ -305,7 +309,7 @@ public class PackageRestoreTests
         Environment.SetEnvironmentVariable(lower, "peer-token-value");
         try
         {
-            var startInfo = new PackageRestoreRunner().CreateStartInfo(Path.Combine(Checkout, "All.slnx"));
+            var startInfo = new PackageRestoreRunner().CreateStartInfo(Path.Combine(Checkout, "All.slnx"), []);
 
             Assert.IsFalse(startInfo.Environment.Keys.Any(k => k.StartsWith("SEXTANT_", StringComparison.OrdinalIgnoreCase)),
                 string.Join(", ", startInfo.Environment.Keys.Where(k => k.Contains("SEXTANT", StringComparison.OrdinalIgnoreCase))));
@@ -374,6 +378,52 @@ public class PackageRestoreTests
         finally
         {
             try { Directory.Delete(root, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+        }
+    }
+
+    [TestMethod]
+    public async Task Runner_AWindowsTargetInOneSelectedSolution_EnablesWindowsTargetingForEveryUnionProject()
+    {
+        // Issue #293: one decision for the whole selection, so the union restores every project, including the other
+        // solution's plain one, with the same EnableWindowsTargeting the union load evaluates with.
+        var root = Path.Combine(Path.GetTempPath(), "sextant-restore-windows-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            File.WriteAllText(Path.Combine(root, "nuget.config"), """
+                <?xml version="1.0" encoding="utf-8"?>
+                <configuration><packageSources><clear /></packageSources></configuration>
+                """);
+            var appDir = Path.Combine(root, "App");
+            var winDir = Path.Combine(root, "Win");
+            Directory.CreateDirectory(appDir);
+            Directory.CreateDirectory(winDir);
+            var tfm = $"net{Environment.Version.Major}.0";
+            var app = Path.Combine(appDir, "App.csproj");
+            var win = Path.Combine(winDir, "Win.csproj");
+            WriteProject(app, "App", tfm);
+            WriteProject(win, "Win", $"{tfm}-windows");
+            var appSolution = Path.Combine(appDir, "App.slnx");
+            var winSolution = Path.Combine(winDir, "Win.slnx");
+            File.WriteAllText(appSolution, "<Solution><Project Path=\"App.csproj\" /></Solution>");
+            File.WriteAllText(winSolution, "<Solution><Project Path=\"Win.csproj\" /></Solution>");
+
+            // Offline: the reference pack cannot be fetched, so the restore itself is incomplete; what matters is the
+            // property each project was restored with, which the fixture records before the Restore target.
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromMinutes(4))
+                .RunAsync(root, [appSolution, winSolution], limit: null, CancellationToken.None,
+                    Path.Combine(root, "scratch"));
+
+            Assert.IsTrue(outcome.UsedProjectUnion);
+            foreach (var project in new[] { app, win })
+            {
+                var context = File.ReadAllText(Path.Combine(Path.GetDirectoryName(project)!, "restore-context.txt")).Trim();
+                StringAssert.EndsWith(context, "|true", $"{Path.GetFileName(project)} restores with EnableWindowsTargeting");
+            }
+        }
+        finally
+        {
+            TryDelete(root);
         }
     }
 
@@ -566,7 +616,7 @@ public class PackageRestoreTests
               <ItemGroup>{references}{packages}</ItemGroup>
               <Target Name="CaptureRestoreContext" BeforeTargets="Restore">
                 <Error Condition="'$(SolutionName)' != '{expectedSolutionName}'" Text="Unexpected SolutionName for {Path.GetFileName(path)}: $(SolutionName)" />
-                <WriteLinesToFile File="$(MSBuildProjectDirectory)/restore-context.txt" Lines="$(SolutionDir)|$(SolutionName)|$(SolutionPath)|$(SolutionFileName)|$(SolutionExt)|$(Configuration)|$(Platform)" Overwrite="false" />
+                <WriteLinesToFile File="$(MSBuildProjectDirectory)/restore-context.txt" Lines="$(SolutionDir)|$(SolutionName)|$(SolutionPath)|$(SolutionFileName)|$(SolutionExt)|$(Configuration)|$(Platform)|$(EnableWindowsTargeting)" Overwrite="false" />
               </Target>
             </Project>
             """);
@@ -612,9 +662,9 @@ public class PackageRestoreTests
         var marker = Path.Combine(Path.GetDirectoryName(project)!, "restore-context.txt");
         var solutionDir = Path.GetDirectoryName(Path.GetFullPath(solution))! + Path.DirectorySeparatorChar;
         Assert.AreEqual(
-            $"{solutionDir}|{solutionName}|{Path.GetFullPath(solution)}|{Path.GetFileName(solution)}|{Path.GetExtension(solution)}|Debug|AnyCPU",
+            $"{solutionDir}|{solutionName}|{Path.GetFullPath(solution)}|{Path.GetFileName(solution)}|{Path.GetExtension(solution)}|Debug|AnyCPU|",
             File.ReadAllText(marker).Trim(),
-            $"{Path.GetFileName(project)} should be evaluated with its owning solution globals, once.");
+            $"{Path.GetFileName(project)} should be evaluated with its owning solution globals, without EnableWindowsTargeting (no Windows target, #293), once.");
     }
 
     private static void TryDelete(string path)

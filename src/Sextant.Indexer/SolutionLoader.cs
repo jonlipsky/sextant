@@ -38,7 +38,8 @@ public static class SolutionLoader
         CancellationToken cancellationToken = default)
     {
         var failures = new ConcurrentQueue<LoadFailure>();
-        var workspace = MSBuildWorkspace.Create();
+        var declared = SolutionProjectEnumerator.Enumerate(solutionPath);
+        var workspace = CreateWorkspace(declared);
         RegisterFailureSink(workspace, failures, onDiagnostic);
 
         Solution solution;
@@ -63,7 +64,6 @@ public static class SolutionLoader
             return await LoadPerProjectAsync(solutionPath, ex, onDiagnostic, cancellationToken);
         }
 
-        var declared = SolutionProjectEnumerator.Enumerate(solutionPath);
         var reconciled = ReconcileLoads(declared, solution, failures, [], onDiagnostic);
         var skipped = reconciled.SkippedProjects;
 
@@ -126,7 +126,7 @@ public static class SolutionLoader
             using var open = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, onePassBudget.Token);
             onProgress?.Invoke($"Loading {partition.OnePass.Count} project(s) in one pass" +
                 (partition.Individually.Count > 0 ? $", then {partition.Individually.Count} individually" : string.Empty));
-            workspace = MSBuildWorkspace.Create();
+            workspace = CreateWorkspace(projectPaths);
             RegisterFailureSink(workspace, failures, onDiagnostic);
             try
             {
@@ -213,6 +213,11 @@ public static class SolutionLoader
 
     private static TimeSpan Max(TimeSpan a, TimeSpan b) => a > b ? a : b;
 
+    // Every load evaluates its project set with the same global properties as the service's restore (issue #293).
+    internal static MSBuildWorkspace CreateWorkspace(IEnumerable<string> projectPaths) =>
+        MSBuildWorkspace.Create(EvaluationGlobalProperties.For(projectPaths)
+            .ToDictionary(p => p.Key, p => p.Value, StringComparer.OrdinalIgnoreCase));
+
     /// <summary>
     /// Loads a UNION of individually-named project paths (across one or more solutions) into ONE workspace
     /// with the same per-project fault isolation + skipped-project reconciliation as the solution loader
@@ -231,7 +236,7 @@ public static class SolutionLoader
         CancellationToken cancellationToken = default)
     {
         var failures = new ConcurrentQueue<LoadFailure>();
-        var workspace = MSBuildWorkspace.Create();
+        var workspace = CreateWorkspace(projectPaths);
         RegisterFailureSink(workspace, failures, onDiagnostic);
 
         Solution solution;
@@ -351,7 +356,7 @@ public static class SolutionLoader
         }
 
         var failures = new ConcurrentQueue<LoadFailure>();
-        var workspace = MSBuildWorkspace.Create();
+        var workspace = CreateWorkspace(projectPaths);
         RegisterFailureSink(workspace, failures, onDiagnostic);
 
         Solution loadedSolution;

@@ -23,7 +23,9 @@ namespace Sextant.Service.Restore;
 /// The restore is best effort and never fails the job. It runs with <c>--ignore-failed-sources</c>, so an
 /// unreachable or credential-gated source does not stop the other packages from being restored (the assets
 /// file is still written), and with <c>DesignTimeBuild=true</c>, like the workspace load, so a missing optional
-/// workload does not fail it. Whatever it could not do is reported in the returned
+/// workload does not fail it. It also applies the workspace load's <see cref="EvaluationGlobalProperties"/>, decided once over
+/// the selected solutions' declared projects, so a Windows-targeting project restores its reference packs on a
+/// non-Windows host, and a selection without one restores as before (issue #293). Whatever it could not do is reported in the returned
 /// <see cref="PackageRestoreOutcome"/>. The process tree is bounded by one deadline across all solutions, is
 /// killed on expiry or cancellation, and is never waited on for pipe EOF (a reused MSBuild node can inherit
 /// the pipes). Restore evaluates the repository's MSBuild files exactly as the in-process load does, so it runs
@@ -110,6 +112,8 @@ public sealed class PackageRestoreRunner(
         var stopwatch = Stopwatch.StartNew();
         var credentialsDir = PrepareCredentials(scratchDir, out var environment);
         var credentialsUnavailable = _sourceCredentials.Count > 0 && credentialsDir is null;
+        // One decision for the whole selection, from the same declared projects the union load evaluates (#293).
+        var globals = EvaluationGlobalProperties.For(solutions.SelectMany(SolutionProjectEnumerator.Enumerate));
         try
         {
             if (solutions.Count > 1)
@@ -117,7 +121,7 @@ public sealed class PackageRestoreRunner(
                 if (TryCreateProjectUnion(checkoutDir, solutions, cancellationToken, out var projects, out var fallbackReason))
                 {
                     var union = await RunProjectUnionAsync(
-                            checkoutDir, solutions.Count, projects, Remaining(deadline, stopwatch), cancellationToken,
+                            checkoutDir, solutions.Count, projects, globals, Remaining(deadline, stopwatch), cancellationToken,
                             scratchDir, environment)
                         .ConfigureAwait(false);
                     if (union is not null)
@@ -130,7 +134,7 @@ public sealed class PackageRestoreRunner(
             }
 
             var fallback = await RunPerSolutionAsync(
-                    checkoutDir, solutions, Remaining(deadline, stopwatch), cancellationToken, environment)
+                    checkoutDir, solutions, globals, Remaining(deadline, stopwatch), cancellationToken, environment)
                 .ConfigureAwait(false);
             return fallback with { Timeout = deadline, Elapsed = stopwatch.Elapsed, CredentialsUnavailable = credentialsUnavailable };
         }
@@ -195,7 +199,8 @@ public sealed class PackageRestoreRunner(
         => deadline > stopwatch.Elapsed ? deadline - stopwatch.Elapsed : TimeSpan.Zero;
 
     private async Task<PackageRestoreOutcome> RunPerSolutionAsync(
-        string checkoutDir, IReadOnlyList<string> solutions, TimeSpan deadline, CancellationToken cancellationToken,
+        string checkoutDir, IReadOnlyList<string> solutions, IReadOnlyList<KeyValuePair<string, string>> globals,
+        TimeSpan deadline, CancellationToken cancellationToken,
         IReadOnlyDictionary<string, string> environment)
     {
         var parser = new RestoreOutputParser(checkoutDir);
@@ -213,7 +218,7 @@ public sealed class PackageRestoreRunner(
             }
 
             attempted++;
-            var result = await RunOneAsync(solution, remaining, parser, cancellationToken, environment).ConfigureAwait(false);
+            var result = await RunOneAsync(solution, globals, remaining, parser, cancellationToken, environment).ConfigureAwait(false);
             switch (result)
             {
                 case RunResult.Succeeded:
@@ -253,7 +258,7 @@ public sealed class PackageRestoreRunner(
 
     private async Task<PackageRestoreOutcome?> RunProjectUnionAsync(
         string checkoutDir, int solutionCount, IReadOnlyList<UnionProject> projects,
-        TimeSpan deadline, CancellationToken cancellationToken, string? scratchDir,
+        IReadOnlyList<KeyValuePair<string, string>> globals, TimeSpan deadline, CancellationToken cancellationToken, string? scratchDir,
         IReadOnlyDictionary<string, string> environment)
     {
         var stopwatch = Stopwatch.StartNew();
@@ -263,7 +268,7 @@ public sealed class PackageRestoreRunner(
         {
             Directory.CreateDirectory(stagingDir);
             var traversal = Path.Combine(stagingDir, "RestoreUnion.proj");
-            await File.WriteAllTextAsync(traversal, BuildUnionProject(projects), cancellationToken).ConfigureAwait(false);
+            await File.WriteAllTextAsync(traversal, BuildUnionProject(projects, globals), cancellationToken).ConfigureAwait(false);
 
             var parser = new RestoreOutputParser(checkoutDir);
             RunResult result;
@@ -330,10 +335,10 @@ public sealed class PackageRestoreRunner(
     private enum RunResult { Succeeded, Failed, NotStarted, TimedOut }
 
     private async Task<RunResult> RunOneAsync(
-        string solution, TimeSpan timeLimit, RestoreOutputParser parser, CancellationToken cancellationToken,
+        string solution, IReadOnlyList<KeyValuePair<string, string>> globals, TimeSpan timeLimit, RestoreOutputParser parser, CancellationToken cancellationToken,
         IReadOnlyDictionary<string, string> environment)
     {
-        return await RunProcessAsync(CreateStartInfo(solution, environment), solution, timeLimit, parser, cancellationToken)
+        return await RunProcessAsync(CreateStartInfo(solution, globals, environment), solution, timeLimit, parser, cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -698,7 +703,7 @@ public sealed class PackageRestoreRunner(
     private static bool SafeForMsBuildProperty(string value) =>
         !value.Contains(';') && !value.Contains('$') && !value.Contains('%');
 
-    private static string BuildUnionProject(IReadOnlyList<UnionProject> projects)
+    private static string BuildUnionProject(IReadOnlyList<UnionProject> projects, IReadOnlyList<KeyValuePair<string, string>> globals)
     {
         var xml = new StringBuilder();
         xml.AppendLine("<Project>");
@@ -707,7 +712,8 @@ public sealed class PackageRestoreRunner(
         {
             var solutionDir = Path.GetDirectoryName(project.SolutionPath) ?? ".";
             solutionDir = Path.EndsInDirectorySeparator(solutionDir) ? solutionDir : solutionDir + Path.DirectorySeparatorChar;
-            var properties = string.Join(';',
+            string[] properties =
+            [
                 "Configuration=Debug",
                 "Platform=AnyCPU",
                 "DesignTimeBuild=true",
@@ -719,10 +725,12 @@ public sealed class PackageRestoreRunner(
                 $"SolutionName={Path.GetFileNameWithoutExtension(project.SolutionPath)}",
                 $"SolutionPath={project.SolutionPath}",
                 $"SolutionFileName={Path.GetFileName(project.SolutionPath)}",
-                $"SolutionExt={Path.GetExtension(project.SolutionPath)}");
+                $"SolutionExt={Path.GetExtension(project.SolutionPath)}",
+                .. globals.Select(p => $"{p.Key}={p.Value}")
+            ];
             xml.AppendLine(
                 $"    <MSBuild Projects=\"{Xml(project.ProjectPath)}\" Targets=\"Restore\" BuildInParallel=\"false\" " +
-                $"ContinueOnError=\"ErrorAndContinue\" Properties=\"{Xml(properties)}\" />");
+                $"ContinueOnError=\"ErrorAndContinue\" Properties=\"{Xml(string.Join(';', properties))}\" />");
         }
         xml.AppendLine("  </Target>");
         xml.AppendLine("</Project>");
@@ -733,8 +741,9 @@ public sealed class PackageRestoreRunner(
 
     private sealed record UnionProject(string ProjectPath, string SolutionPath);
 
-    internal ProcessStartInfo CreateStartInfo(string solution, IReadOnlyDictionary<string, string>? environment = null)
-        => CreateStartInfo(Arguments(solution), Path.GetDirectoryName(Path.GetFullPath(solution)) ?? Environment.CurrentDirectory,
+    internal ProcessStartInfo CreateStartInfo(
+        string solution, IReadOnlyList<KeyValuePair<string, string>> globals, IReadOnlyDictionary<string, string>? environment = null)
+        => CreateStartInfo(Arguments(solution, globals), Path.GetDirectoryName(Path.GetFullPath(solution)) ?? Environment.CurrentDirectory,
             environment);
 
     private ProcessStartInfo CreateUnionStartInfo(string project, string checkoutDir, IReadOnlyDictionary<string, string> environment)
@@ -784,11 +793,14 @@ public sealed class PackageRestoreRunner(
         return startInfo;
     }
 
-    /// <summary>The <c>dotnet restore</c> arguments for one solution.</summary>
-    internal static IReadOnlyList<string> Arguments(string solution) =>
+    /// <summary>
+    /// The <c>dotnet restore</c> arguments for one solution, with the selection's <see cref="EvaluationGlobalProperties"/>.
+    /// </summary>
+    internal static IReadOnlyList<string> Arguments(string solution, IReadOnlyList<KeyValuePair<string, string>> globals) =>
     [
         "restore", solution,
         "-p:DesignTimeBuild=true",
+        .. globals.Select(p => $"-p:{p.Key}={p.Value}"),
         "--ignore-failed-sources",
         "--disable-build-servers",
         "-nodeReuse:false",
