@@ -77,8 +77,14 @@ public static class IndexConfigurationHash
     /// <c>project.assets.json</c> (MSBuildWorkspace reports MSBuild warnings as failures) no longer marks a loaded
     /// project degraded, so the same commit can now publish complete where it was partial.
     /// </para>
+    /// <para>
+    /// <c>"8"</c> to <c>"9"</c> (issue #294): the indexer's Roslyn moved from 5.0 to 5.9, so the .NET SDK's Razor
+    /// source generator (built against the SDK's newer compiler) loads, and the loader drops duplicate additional
+    /// files that made the generator fail. Razor components and the code using them now bind, so the same commit
+    /// yields more references and call edges, and fewer candidate occurrences.
+    /// </para>
     /// </remarks>
-    public const string AnalyzerVersion = "8";
+    public const string AnalyzerVersion = "9";
 
     /// <summary>
     /// Computes the configuration hash for a resolved profile. The canonical pre-image is a fixed,

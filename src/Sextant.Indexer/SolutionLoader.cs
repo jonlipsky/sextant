@@ -80,7 +80,7 @@ public static class SolutionLoader
                 "the per-project failures.");
         }
 
-        return reconciled.ToResult(TransitiveProjectReferences.Close(solution, onDiagnostic));
+        return reconciled.ToResult(TransitiveProjectReferences.Close(CompilerInputs.Normalize(solution, onDiagnostic), onDiagnostic));
     }
 
     /// <summary>
@@ -181,7 +181,7 @@ public static class SolutionLoader
             : projectPaths.Where(p => !deferredSet.Contains(NormalizePath(p))).ToList();
         var reconciled = ReconcileLoads(attempted, solution, failures, thrownSkipped, onDiagnostic);
         return reconciled.ToResult(TransitiveProjectReferences.Close(
-            WithoutSkippedStubs(solution, reconciled.SkippedProjects), onDiagnostic)) with
+            CompilerInputs.Normalize(WithoutSkippedStubs(solution, reconciled.SkippedProjects), onDiagnostic), onDiagnostic)) with
         {
             DeferredProjects = deferred,
             LoadTimings = openTimings
@@ -256,7 +256,7 @@ public static class SolutionLoader
             ? projectPaths
             : projectPaths.Where(p => !deferredSet.Contains(NormalizePath(p))).ToList();
         var reconciled = ReconcileLoads(attempted, solution, failures, thrownSkipped, onDiagnostic);
-        return reconciled.ToResult(TransitiveProjectReferences.Close(solution, onDiagnostic)) with
+        return reconciled.ToResult(TransitiveProjectReferences.Close(CompilerInputs.Normalize(solution, onDiagnostic), onDiagnostic)) with
         {
             DeferredProjects = deferred,
             LoadTimings = openTimings,
@@ -386,7 +386,7 @@ public static class SolutionLoader
             ExceptionDispatchInfo.Throw(originalException);
         }
 
-        return reconciled.ToResult(TransitiveProjectReferences.Close(loadedSolution, onDiagnostic));
+        return reconciled.ToResult(TransitiveProjectReferences.Close(CompilerInputs.Normalize(loadedSolution, onDiagnostic), onDiagnostic));
     }
 
     internal sealed record LoadReconciliation(
