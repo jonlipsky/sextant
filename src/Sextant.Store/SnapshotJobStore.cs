@@ -1,4 +1,5 @@
 using Microsoft.Data.Sqlite;
+using Sextant.Core;
 
 namespace Sextant.Store;
 
@@ -399,6 +400,38 @@ public sealed class SnapshotJobStore(SqliteConnection connection)
         cmd.Parameters.AddWithValue("@branch", branchName);
         cmd.Parameters.AddWithValue("@commit", commit.ToLowerInvariant());
         return cmd.ExecuteScalar() as string;
+    }
+
+    /// <summary>
+    /// The branches with work still pending against them (issue #299), as (normalized repository URL, branch name): a
+    /// queued or running job that names the branch, or an unconsumed branch-advance handover (issue #273). The idle-branch
+    /// rule never retires one of them. Read-only; repository URLs are normalized with <see cref="RemoteUrlIdentity"/>.
+    /// </summary>
+    public HashSet<(string RepositoryKey, string Branch)> BranchesWithPendingWork()
+    {
+        var result = new HashSet<(string, string)>();
+        using (var jobs = connection.CreateCommand())
+        {
+            jobs.CommandText = """
+                SELECT repository_url, branch_name FROM snapshot_jobs
+                WHERE branch_name IS NOT NULL AND status IN (@queued, @running);
+                """;
+            jobs.Parameters.AddWithValue("@queued", SnapshotJobStatus.Queued);
+            jobs.Parameters.AddWithValue("@running", SnapshotJobStatus.Running);
+            using var reader = jobs.ExecuteReader();
+            while (reader.Read())
+                result.Add((RemoteUrlIdentity.Normalize(reader.GetString(0)), reader.GetString(1)));
+        }
+        using (var handovers = connection.CreateCommand())
+        {
+            handovers.CommandText = """
+                SELECT repository_key, branch_name FROM branch_advance_handovers;
+                """;
+            using var reader = handovers.ExecuteReader();
+            while (reader.Read())
+                result.Add((reader.GetString(0), reader.GetString(1)));
+        }
+        return result;
     }
 
     /// <summary>A job's recorded timings JSON (issue #267), or null when none was recorded.</summary>

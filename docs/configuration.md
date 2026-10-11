@@ -167,6 +167,19 @@ default; add `--execute` to apply) — see [runbooks.md](runbooks.md). The stand
 service-owned retention/GC over the same policy via `POST /control/retention`; see
 [service.md](service.md#retention--gc--the-service-is-the-lease-owner-46--37--54--38).
 
+The service also runs this pass itself once a day, and it retires idle non-default branch pointers so their
+snapshots become reclaimable (issue #299). Both run from its maintenance loop:
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `SEXTANT_SERVICE_MAINTENANCE_INTERVAL_MINUTES` | `60` | Maintenance loop tick interval; `0` turns the loop (and both rules below) off. |
+| `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_DAYS` | `7` | Retire a non-default branch pointer that has not moved for more than this many days; `0` disables. The default branch is never retired. |
+| `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_MAX_PER_PASS` | `20` | Most idle branches retired per tick (clamped to `1000`). |
+| `SEXTANT_SERVICE_RETENTION_SCHEDULE` | `true` | Run the bounded retention pass once a day (never a `VACUUM`). |
+| `SEXTANT_SERVICE_RETENTION_SCHEDULE_HOUR_UTC` | `3` | UTC hour from which the daily pass runs; skipped and retried next tick while indexing holds the writer. |
+
+See [service.md](service.md#maintenance-loop-idle-branch-retirement--scheduled-retention-issue-299).
+
 ## Platform Routing
 
 `platform_routing` (`SEXTANT_PLATFORM_ROUTING`, default `auto`) is a **service-side** orchestration choice

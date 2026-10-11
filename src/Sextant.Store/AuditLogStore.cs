@@ -212,17 +212,34 @@ public sealed class AuditLogStore(SqliteConnection connection)
     /// </summary>
     public bool HasAction(string action, string? outcome = null, long? sinceTs = null)
     {
+        return HasAction(action, outcome, sinceTs, untilTs: null, actor: null);
+    }
+
+    /// <summary>
+    /// True when an <paramref name="action"/> row exists in <c>[sinceTs, untilTs)</c> attributed to
+    /// <paramref name="actor"/> (an already-hashed actor, <see cref="HashActor"/>) — filtered in SQL, so no number of
+    /// other rows can hide it (issue #299).
+    /// </summary>
+    public bool HasActionByActor(string action, string actor, long sinceTs, long untilTs) =>
+        HasAction(action, outcome: null, sinceTs, untilTs, actor);
+
+    private bool HasAction(string action, string? outcome, long? sinceTs, long? untilTs, string? actor)
+    {
         using var cmd = connection.CreateCommand();
         cmd.CommandText = """
             SELECT EXISTS(
                 SELECT 1 FROM audit_log
                 WHERE action = @action
                   AND (@outcome IS NULL OR outcome = @outcome)
-                  AND (@since IS NULL OR ts >= @since));
+                  AND (@since IS NULL OR ts >= @since)
+                  AND (@until IS NULL OR ts < @until)
+                  AND (@actor IS NULL OR actor = @actor));
             """;
         cmd.Parameters.AddWithValue("@action", action);
         cmd.Parameters.AddWithValue("@outcome", (object?)outcome ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@since", (object?)sinceTs ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@until", (object?)untilTs ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@actor", (object?)actor ?? DBNull.Value);
         return Convert.ToInt64(cmd.ExecuteScalar()) != 0;
     }
 

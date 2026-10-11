@@ -80,6 +80,36 @@ public sealed record CacheReuseMetrics
         PageCacheHits + PageCacheMisses == 0 ? 0.0 : (double)PageCacheHits / (PageCacheHits + PageCacheMisses);
 }
 
+/// <summary>
+/// The service-owned maintenance loop (issue #299): idle-branch retirement per tick and the daily scheduled retention
+/// pass. Counters are since this service instance started; the <c>Last*</c> fields describe the latest pass (0/null
+/// before the first).
+/// </summary>
+public sealed record MaintenanceMetrics
+{
+    /// <summary>Ticks whose idle-branch pass completed (including passes with the rule disabled).</summary>
+    public long Ticks { get; init; }
+
+    /// <summary>Ticks that failed with an exception (logged; the loop continues).</summary>
+    public long Failures { get; init; }
+
+    public long IdleBranchesRetiredTotal { get; init; }
+    public long LastIdleBranchesRetired { get; init; }
+    public long LastIdlePassAtUnixMs { get; init; }
+    public double LastIdlePassDurationMs { get; init; }
+
+    public long ScheduledRetentionRuns { get; init; }
+
+    /// <summary>Due scheduled retention passes skipped because indexing held the writer (retried next tick).</summary>
+    public long ScheduledRetentionSkippedBusy { get; init; }
+
+    public long LastScheduledRetentionAtUnixMs { get; init; }
+    public double LastScheduledRetentionDurationMs { get; init; }
+    public long LastScheduledRetentionSnapshotsDeleted { get; init; }
+    public bool LastScheduledRetentionMoreRemaining { get; init; }
+    public string? LastScheduledRetentionStopReason { get; init; }
+}
+
 /// <summary>An alert severity level.</summary>
 public enum AlertLevel
 {
@@ -123,6 +153,10 @@ public sealed record MetricsSnapshot
     public required StorageMetrics Storage { get; init; }
     public required CacheReuseMetrics CacheReuse { get; init; }
     public long QueryErrors { get; init; }
+
+    /// <summary>The maintenance loop's idle-branch and scheduled-retention record (issue #299).</summary>
+    public MaintenanceMetrics Maintenance { get; init; } = new();
+
     public IReadOnlyList<Alert> Alerts { get; init; } = [];
     public IReadOnlyList<Sextant.Store.AuditCostAttribution> CostByRepository { get; init; } = [];
 }

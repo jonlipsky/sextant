@@ -29,6 +29,22 @@ public class AuditLogStoreTests
     public void TestCleanup() => SqliteTestDatabase.Delete(_dbPath, _db);
 
     [TestMethod]
+    public void HasActionByActor_FiltersInSql_SoOtherRowsCannotHideIt()
+    {
+        var scheduled = AuditLogStore.HashActor("retention_schedule")!;
+        _store.Append(AuditAction.Retention, AuditOutcome.Complete, actor: scheduled);
+        for (var i = 0; i < 1100; i++)
+            _store.Append(AuditAction.Retention, AuditOutcome.Complete, actor: AuditLogStore.HashActor("op"));
+        var tomorrow = DateTimeOffset.UtcNow.AddDays(1).ToUnixTimeMilliseconds();
+
+        Assert.IsFalse(_store.Recent(1000, AuditAction.Retention).Any(e => e.Actor == scheduled),
+            "the scheduled row is past the newest 1000");
+        Assert.IsTrue(_store.HasActionByActor(AuditAction.Retention, scheduled, 0, tomorrow));
+        Assert.IsFalse(_store.HasActionByActor(AuditAction.Retention, scheduled, tomorrow, long.MaxValue), "outside the window");
+        Assert.IsFalse(_store.HasActionByActor(AuditAction.Backup, scheduled, 0, tomorrow), "another action");
+    }
+
+    [TestMethod]
     public void Append_And_Recent_RoundTripsWithFilters()
     {
         _store.Append(AuditAction.Ensure, AuditOutcome.Complete,
