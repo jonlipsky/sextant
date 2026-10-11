@@ -92,7 +92,18 @@ public sealed record BranchRow
 
     /// <summary>The control-plane head sequence the pointer has advanced to (issue #84), or null.</summary>
     public long? HeadSequence { get; init; }
+
+    /// <summary>When the pointer row was created or last moved (Unix ms, <c>branches.updated_at</c>).</summary>
+    public long UpdatedAt { get; init; }
 }
+
+/// <summary>
+/// A non-default branch whose pointer has not moved since a cutoff (issue #299): what the service's idle-branch rule
+/// may retire. <see cref="SnapshotId"/> and <see cref="UpdatedAt"/> are the pointer as read, the compare-and-swap the
+/// retirement applies under; <see cref="HeadCommit"/> is the commit it points at.
+/// </summary>
+public sealed record IdleBranchCandidate(
+    long BranchId, string RepositoryRemoteUrl, string Name, long SnapshotId, long UpdatedAt, string HeadCommit);
 
 /// <summary>
 /// Reads and writes the Phase-9 immutable-snapshot tables (<c>repositories</c>, <c>commits</c>,
@@ -250,7 +261,10 @@ public sealed class SnapshotStore(SqliteConnection connection)
         cmd.Parameters.AddWithValue("@name", name);
         cmd.Parameters.AddWithValue("@is_default", isDefault ? 1 : 0);
         cmd.Parameters.AddWithValue("@now", now);
-        return (long)cmd.ExecuteScalar()!;
+        var branchId = (long)cmd.ExecuteScalar()!;
+        // Issue #299: a branch that exists has no retired head; re-creating an idle-retired branch consumes it.
+        ConsumeRetiredHead(repositoryId, name);
+        return branchId;
     }
 
     // ---- snapshots -----------------------------------------------------------------------------
@@ -534,6 +548,7 @@ public sealed class SnapshotStore(SqliteConnection connection)
             insert.Parameters.AddWithValue("@now", now);
             insert.ExecuteNonQuery();
         }
+        ConsumeRetiredHead(repositoryId, branchName);
 
         var branchId = GetBranchId(repositoryId, branchName)!.Value;
         if (GetBranchSnapshotId(branchId) is null)
@@ -711,6 +726,10 @@ public sealed class SnapshotStore(SqliteConnection connection)
     /// <item>the branch row does not exist (<paramref name="branchId"/> is null) and
     /// <paramref name="expectedHeadCommit"/> is empty or all zeros (<see cref="IsAbsentHeadCommit"/>), a
     /// branch create;</item>
+    /// <item>the branch row does not exist and <paramref name="expectedHeadCommit"/> is the head the service's
+    /// idle-branch rule retired it at (<see cref="GetRetiredHead"/>, issue #299; case-insensitive), when the caller
+    /// names the branch (<paramref name="repositoryId"/> and <paramref name="branchName"/>): the next push of a branch
+    /// that still exists in git;</item>
     /// <item>the branch row exists but its pointer is NULL. Every advance writes the pointer in the same
     /// transaction that creates the row, so a NULL pointer only remains after retention reclaimed the target
     /// (<c>ON DELETE SET NULL</c>): an unusable target;</item>
@@ -720,10 +739,14 @@ public sealed class SnapshotStore(SqliteConnection connection)
     /// </list>
     /// Pure read on the caller's connection, so a caller evaluates it inside its own write transaction.
     /// </summary>
-    public bool BranchHeadMatches(long? branchId, string expectedHeadCommit)
+    public bool BranchHeadMatches(
+        long? branchId, string expectedHeadCommit, long? repositoryId = null, string? branchName = null)
     {
         if (branchId is not long id)
-            return IsAbsentHeadCommit(expectedHeadCommit);
+            return IsAbsentHeadCommit(expectedHeadCommit)
+                || (repositoryId is long repoId && branchName is not null
+                    && GetRetiredHead(repoId, branchName) is { } retired
+                    && string.Equals(retired, expectedHeadCommit, StringComparison.OrdinalIgnoreCase));
         if (GetBranchSnapshotId(id) is not long current)
             return true;
         if (GetById(current) is not { Status: SnapshotStatus.Complete } target)
@@ -944,7 +967,7 @@ public sealed class SnapshotStore(SqliteConnection connection)
     {
         using var cmd = connection.CreateCommand();
         cmd.CommandText = """
-            SELECT id, repository_id, name, snapshot_id, is_default, head_sequence
+            SELECT id, repository_id, name, snapshot_id, is_default, head_sequence, updated_at
             FROM branches WHERE repository_id = @repo AND name = @name LIMIT 1;
             """;
         cmd.Parameters.AddWithValue("@repo", repositoryId);
@@ -957,7 +980,7 @@ public sealed class SnapshotStore(SqliteConnection connection)
     {
         using var cmd = connection.CreateCommand();
         cmd.CommandText = """
-            SELECT id, repository_id, name, snapshot_id, is_default, head_sequence
+            SELECT id, repository_id, name, snapshot_id, is_default, head_sequence, updated_at
             FROM branches WHERE id = @id;
             """;
         cmd.Parameters.AddWithValue("@id", branchId);
@@ -976,7 +999,8 @@ public sealed class SnapshotStore(SqliteConnection connection)
             Name = reader.GetString(2),
             SnapshotId = reader.IsDBNull(3) ? null : reader.GetInt64(3),
             IsDefault = reader.GetInt64(4) != 0,
-            HeadSequence = reader.IsDBNull(5) ? null : reader.GetInt64(5)
+            HeadSequence = reader.IsDBNull(5) ? null : reader.GetInt64(5),
+            UpdatedAt = reader.GetInt64(6)
         };
     }
 
@@ -1010,6 +1034,113 @@ public sealed class SnapshotStore(SqliteConnection connection)
         delete.Parameters.AddWithValue("@repo", RemoteUrlIdentity.Normalize(remoteUrl));
         delete.Parameters.AddWithValue("@branch", name);
         delete.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// The non-default branches whose pointer has not moved since <paramref name="cutoffMs"/> (<c>updated_at</c>
+    /// strictly before it) and points at a snapshot with a recorded commit, least recently moved first (issue #299).
+    /// A branch whose head commit is unknown (a NULL pointer, or a commit-less snapshot) is never listed: its next push
+    /// could not be matched to a retired head, so retiring it would lose the branch for good. Read-only.
+    /// </summary>
+    public IReadOnlyList<IdleBranchCandidate> ListIdleNonDefaultBranches(long cutoffMs)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT b.id, r.remote_url, b.name, b.snapshot_id, b.updated_at, c.commit_sha
+            FROM branches b
+            JOIN repositories r ON r.id = b.repository_id
+            JOIN snapshots s ON s.id = b.snapshot_id
+            JOIN commits c ON c.id = s.commit_id
+            WHERE b.is_default = 0 AND b.updated_at < @cutoff
+            ORDER BY b.updated_at, b.id;
+            """;
+        cmd.Parameters.AddWithValue("@cutoff", cutoffMs);
+        using var reader = cmd.ExecuteReader();
+        var result = new List<IdleBranchCandidate>();
+        while (reader.Read())
+            result.Add(new IdleBranchCandidate(
+                reader.GetInt64(0), reader.GetString(1), reader.GetString(2),
+                reader.GetInt64(3), reader.GetInt64(4), reader.GetString(5)));
+        return result;
+    }
+
+    /// <summary>The commit a branch's pointer resolves to, or null (no pointer, or a commit-less snapshot).</summary>
+    public string? GetBranchHeadCommit(long branchId) =>
+        GetBranchSnapshotId(branchId) is long snapshotId && GetById(snapshotId) is { } target
+            ? GetCommitSha(target.CommitId)
+            : null;
+
+    // ---- retired branch heads (issue #299, migration 030) ----------------------------------------------------------
+
+    /// <summary>The <c>retired_branch_heads.cause</c> of a retirement by the service's idle-branch rule.</summary>
+    public const string RetiredHeadCauseIdle = "idle_policy";
+
+    /// <summary>
+    /// Records that the branch was retired while <paramref name="commitSha"/> was its head (issue #299), so a later
+    /// advance expecting exactly that commit re-creates it (<see cref="BranchHeadMatches"/>). Replaces an earlier
+    /// record for the same branch. Runs on the caller's connection, inside the retirement's transaction.
+    /// </summary>
+    public void RecordRetiredHead(long repositoryId, string branchName, string commitSha, long now, string cause)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO retired_branch_heads (repository_id, branch_name, commit_sha, retired_at, cause)
+            VALUES (@repo, @branch, @sha, @now, @cause)
+            ON CONFLICT(repository_id, branch_name) DO UPDATE SET
+                commit_sha = excluded.commit_sha, retired_at = excluded.retired_at, cause = excluded.cause;
+            """;
+        cmd.Parameters.AddWithValue("@repo", repositoryId);
+        cmd.Parameters.AddWithValue("@branch", branchName);
+        cmd.Parameters.AddWithValue("@sha", commitSha.ToLowerInvariant());
+        cmd.Parameters.AddWithValue("@now", now);
+        cmd.Parameters.AddWithValue("@cause", cause);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>The recorded retired head of a missing branch (issue #299), or null.</summary>
+    public string? GetRetiredHead(long repositoryId, string branchName)
+    {
+        if (!HasRetiredHeadsTable())
+            return null;
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT commit_sha FROM retired_branch_heads WHERE repository_id = @repo AND branch_name = @branch;";
+        cmd.Parameters.AddWithValue("@repo", repositoryId);
+        cmd.Parameters.AddWithValue("@branch", branchName);
+        return cmd.ExecuteScalar() as string;
+    }
+
+    /// <summary>
+    /// Deletes the branch's retired-head record (issue #299): the branch was re-created, or deleted upstream. Returns
+    /// true when one was deleted. Runs on the caller's connection and transaction.
+    /// </summary>
+    public bool ConsumeRetiredHead(long repositoryId, string branchName)
+    {
+        if (!HasRetiredHeadsTable())
+            return false;
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "DELETE FROM retired_branch_heads WHERE repository_id = @repo AND branch_name = @branch;";
+        cmd.Parameters.AddWithValue("@repo", repositoryId);
+        cmd.Parameters.AddWithValue("@branch", branchName);
+        return cmd.ExecuteNonQuery() > 0;
+    }
+
+    /// <summary>Deletes the retired-head records older than <paramref name="cutoffMs"/> (issue #299). Returns how many.</summary>
+    public int PruneRetiredHeads(long cutoffMs)
+    {
+        if (!HasRetiredHeadsTable())
+            return 0;
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "DELETE FROM retired_branch_heads WHERE retired_at < @cutoff;";
+        cmd.Parameters.AddWithValue("@cutoff", cutoffMs);
+        return cmd.ExecuteNonQuery();
+    }
+
+    // A catalog below migration 030 (a local index not yet migrated) has no retired heads.
+    private bool HasRetiredHeadsTable()
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'retired_branch_heads');";
+        return cmd.ExecuteScalar() is long v && v == 1;
     }
 
     public bool DeleteBranch(long branchId)

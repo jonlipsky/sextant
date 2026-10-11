@@ -211,6 +211,35 @@ public class EnsureCoalescingTests
     }
 
     [TestMethod]
+    public async Task CoalescedPushes_OfABranchRetiredAsIdle_ReCreateItAtTheNewest()
+    {
+        // Issue #299: the idle rule retired "feature" at commit-A. Its next two pushes queue (A→B, then B→C); B is
+        // coalesced, and C's handover hop back to A matches the retired head, so C re-creates the branch.
+        await SeedMainAt("commit-M");
+        Assert.IsTrue((await Push("commit-A", expected: "", branch: "feature")).BranchAdvanced);
+        using (var idle = _db.GetConnection().CreateCommand())
+        {
+            idle.CommandText = "UPDATE branches SET updated_at = 0 WHERE name = 'feature';";
+            await idle.ExecuteNonQueryAsync();
+        }
+        Assert.AreEqual(1, (await _service.RetireIdleBranchesAsync()).Retired);
+        Assert.IsNull(HeadCommit("feature"));
+
+        var hold = Hold();
+        var b = Push("commit-B", expected: "commit-A", branch: "feature");
+        var c = Push("commit-C", expected: "commit-B", branch: "feature");
+        _release.Set();
+        await Task.WhenAll(hold, b, c);
+
+        Assert.AreEqual(SnapshotJobStatus.Coalesced, (await b).Status);
+        Assert.IsTrue((await c).BranchAdvanced);
+        Assert.AreEqual("commit-C", HeadCommit("feature"), "as serial processing of B then C would leave it");
+        var store = new SnapshotStore(_db.GetConnection());
+        Assert.IsTrue(store.GetRepositoryId(Repo) is long repoId && store.GetRetiredHead(repoId, "feature") is null,
+            "consumed by the re-create");
+    }
+
+    [TestMethod]
     public async Task PushesOfDifferentBranches_AreNotCoalesced()
     {
         var hold = Hold();
@@ -325,7 +354,7 @@ public class EnsureCoalescingTests
         {
             var store = new SnapshotStore(self.Database.GetConnection());
             var repoId = store.GetRepositoryId(Repo)!.Value;
-            if (store.BranchHeadMatches(store.GetBranchId(repoId, branch), expected))
+            if (store.BranchHeadMatches(store.GetBranchId(repoId, branch), expected, repoId, branch))
             {
                 var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                 var branchId = store.EnsureBranch(repoId, branch, isDefault: branch == "main", now);

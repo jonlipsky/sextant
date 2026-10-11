@@ -50,6 +50,63 @@ public sealed class ServiceMetrics
             Interlocked.Increment(ref _pageCacheMisses);
     }
 
+    // Issue #299: the maintenance loop's per-tick record, replaced whole under _maintenanceLock.
+    private readonly Lock _maintenanceLock = new();
+    private MaintenanceMetrics _maintenance = new();
+
+    /// <summary>Records one maintenance tick's idle-branch retire pass (issue #299).</summary>
+    public void RecordIdleBranchRetirePass(int retired, long atUnixMs, double durationMs)
+    {
+        lock (_maintenanceLock)
+            _maintenance = _maintenance with
+            {
+                Ticks = _maintenance.Ticks + 1,
+                IdleBranchesRetiredTotal = _maintenance.IdleBranchesRetiredTotal + retired,
+                LastIdleBranchesRetired = retired,
+                LastIdlePassAtUnixMs = atUnixMs,
+                LastIdlePassDurationMs = durationMs
+            };
+    }
+
+    /// <summary>Records a scheduled retention pass that ran (issue #299).</summary>
+    public void RecordScheduledRetention(Sextant.Store.RetentionReport report, long atUnixMs, double durationMs)
+    {
+        lock (_maintenanceLock)
+            _maintenance = _maintenance with
+            {
+                ScheduledRetentionRuns = _maintenance.ScheduledRetentionRuns + 1,
+                LastScheduledRetentionAtUnixMs = atUnixMs,
+                LastScheduledRetentionDurationMs = durationMs,
+                LastScheduledRetentionSnapshotsDeleted = report.SnapshotsDeleted,
+                LastScheduledRetentionMoreRemaining = report.MoreRemaining,
+                LastScheduledRetentionStopReason = report.StopReason
+            };
+    }
+
+    /// <summary>Records a due scheduled retention pass skipped because indexing held the writer (issue #299).</summary>
+    public void RecordScheduledRetentionSkippedBusy()
+    {
+        lock (_maintenanceLock)
+            _maintenance = _maintenance with { ScheduledRetentionSkippedBusy = _maintenance.ScheduledRetentionSkippedBusy + 1 };
+    }
+
+    /// <summary>Records a maintenance tick that failed with an exception (issue #299); the loop carries on.</summary>
+    public void RecordMaintenanceFailure()
+    {
+        lock (_maintenanceLock)
+            _maintenance = _maintenance with { Failures = _maintenance.Failures + 1 };
+    }
+
+    /// <summary>The maintenance loop's counters and last-pass record (issue #299).</summary>
+    public MaintenanceMetrics Maintenance
+    {
+        get
+        {
+            lock (_maintenanceLock)
+                return _maintenance;
+        }
+    }
+
     public long EnsureTotal => Interlocked.Read(ref _ensureTotal);
     public long EnsureAttached => Interlocked.Read(ref _ensureAttached);
     public long PageCacheHits => Interlocked.Read(ref _pageCacheHits);

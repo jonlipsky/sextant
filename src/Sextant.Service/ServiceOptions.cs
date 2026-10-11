@@ -288,6 +288,14 @@ public sealed record ServiceOptions
     /// <summary>Retention policy applied by the service-owned retention/GC pass (issues #46/#37/#54).</summary>
     public RetentionPolicy Retention { get; init; } = new();
 
+    /// <summary>
+    /// The service-owned maintenance loop (issue #299): idle-branch retirement every tick and the daily scheduled
+    /// retention pass. Bound from <c>SEXTANT_SERVICE_MAINTENANCE_INTERVAL_MINUTES</c>,
+    /// <c>SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_DAYS</c>, <c>SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_MAX_PER_PASS</c>,
+    /// <c>SEXTANT_SERVICE_RETENTION_SCHEDULE</c> and <c>SEXTANT_SERVICE_RETENTION_SCHEDULE_HOUR_UTC</c>.
+    /// </summary>
+    public MaintenancePolicy Maintenance { get; init; } = new();
+
     /// <summary>A human-readable identifier for this service instance (lease holder + logs).</summary>
     public string Holder { get; init; } = $"sextant-service@{Environment.MachineName}#{Environment.ProcessId}";
 
@@ -441,6 +449,10 @@ public sealed record ServiceOptions
                 : [],
             RemoteFetchTimeout = EnvInt("REMOTE_TIMEOUT_SECONDS") is int t and > 0 ? TimeSpan.FromSeconds(t) : TimeSpan.FromSeconds(10),
             Retention = config.Retention,
+            Maintenance = ParseMaintenance(
+                Env("MAINTENANCE_INTERVAL_MINUTES"), Env("BRANCH_IDLE_RETIRE_DAYS"),
+                Env("BRANCH_IDLE_RETIRE_MAX_PER_PASS"), EnvBool("RETENTION_SCHEDULE"),
+                Env("RETENTION_SCHEDULE_HOUR_UTC")),
             // Fold the node's own profile hash into request identities by default, so an ensure request that
             // omits ConfigHash resolves to the SAME identity_hash the local worker's orchestrator publishes
             // under (IndexProfileDescriptor.ConfigurationHash) — without it the idempotency lookup misses.
@@ -560,6 +572,27 @@ public sealed record ServiceOptions
         }
         return entries.ToHashSet(StringComparer.Ordinal);
     }
+
+    /// <summary>
+    /// Builds the maintenance policy (issue #299) from its environment values. An unset, unparseable or out-of-range
+    /// number keeps its default (the interval and the idle days accept <c>0</c>, which disables them); the interval is
+    /// clamped to <see cref="MaintenancePolicy.MaxIntervalMinutes"/>, the idle days to
+    /// <see cref="MaintenancePolicy.MaxBranchIdleRetireDays"/> and the per-pass cap to
+    /// <see cref="MaintenancePolicy.MaxBranchIdleRetireMaxPerPass"/>.
+    /// </summary>
+    internal static MaintenancePolicy ParseMaintenance(
+        string? intervalMinutes, string? idleDays, string? maxPerPass, bool? scheduledRetention, string? retentionHourUtc) => new()
+        {
+            Interval = TimeSpan.FromMinutes(int.TryParse(intervalMinutes, out var minutes) && minutes >= 0
+                ? Math.Min(minutes, MaintenancePolicy.MaxIntervalMinutes) : MaintenancePolicy.DefaultIntervalMinutes),
+            BranchIdleRetireDays = int.TryParse(idleDays, out var days) && days >= 0
+                ? Math.Min(days, MaintenancePolicy.MaxBranchIdleRetireDays) : MaintenancePolicy.DefaultBranchIdleRetireDays,
+            BranchIdleRetireMaxPerPass = int.TryParse(maxPerPass, out var cap) && cap > 0
+                ? Math.Min(cap, MaintenancePolicy.MaxBranchIdleRetireMaxPerPass) : MaintenancePolicy.DefaultBranchIdleRetireMaxPerPass,
+            ScheduledRetention = scheduledRetention ?? true,
+            RetentionHourUtc = int.TryParse(retentionHourUtc, out var hour) && hour is >= 0 and <= 23
+                ? hour : MaintenancePolicy.DefaultRetentionHourUtc
+        };
 
     private static string? Env(string name) =>
         Environment.GetEnvironmentVariable(EnvPrefix + name) is { Length: > 0 } v ? v : null;

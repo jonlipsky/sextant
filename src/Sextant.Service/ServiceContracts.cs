@@ -283,6 +283,15 @@ public static class BranchGuardReason
     public const string HeadMismatch = "head_mismatch";
     public const string DefaultBranch = "default_branch";
 
+    /// <summary>The idle-branch rule skipped a branch whose pointer moved after it was selected (issue #299).</summary>
+    public const string PointerMoved = "pointer_moved";
+
+    /// <summary>The idle-branch rule skipped a branch with a queued/running job or a pending handover (issue #299).</summary>
+    public const string BranchBusy = "branch_busy";
+
+    /// <summary>The idle-branch rule skipped a branch whose head commit is unknown (issue #299).</summary>
+    public const string NoHeadCommit = "no_head_commit";
+
     /// <summary>A user caller's ensure sent <c>default_branch: true</c> (SX-6d).</summary>
     public const string DefaultBranchNotAllowed = "default_branch_not_allowed";
 

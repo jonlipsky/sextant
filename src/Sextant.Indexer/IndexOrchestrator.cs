@@ -1887,7 +1887,9 @@ public sealed class IndexOrchestrator
         // head nor re-create a retired branch. Null for every local CLI/daemon run.
         if (ctx.ExpectedHeadCommit is { } expectedHead)
         {
-            if (!snapshotStore.BranchHeadMatches(snapshotStore.GetBranchId(repositoryId, ctx.BranchName), expectedHead))
+            // Issue #299: a branch the service retired as idle is re-created by an advance expecting its retired head.
+            if (!snapshotStore.BranchHeadMatches(
+                    snapshotStore.GetBranchId(repositoryId, ctx.BranchName), expectedHead, repositoryId, ctx.BranchName))
                 return;
             var casOwnsDefault = snapshotStore.ShouldOwnDefault(
                 repositoryId, ctx.BranchName, ctx.IsDefaultBranch, ctx.AllowImplicitDefault ?? true);

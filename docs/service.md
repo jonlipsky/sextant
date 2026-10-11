@@ -95,6 +95,11 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_QUERY_PORT` | Optional dedicated query port (shares the control port when unset) | none (shared) |
 | `SEXTANT_SERVICE_LEASE_TTL_SECONDS` | Single-writer lease TTL | `30` |
 | `SEXTANT_SERVICE_CONTROL_WRITE_WAIT_SECONDS` | How long a `POST /control/ensure?wait=false` registration or a `POST /control/branches/retire` waits for the single writer before answering `202` with the write still queued (issue #158; see [Queued control writes](#queued-control-writes-issue-158)). Keep it well under the client's timeout. A value above `25` is clamped to `25`; a missing, non-numeric or non-positive value uses the default | `5` |
+| `SEXTANT_SERVICE_MAINTENANCE_INTERVAL_MINUTES` | How often the service-owned maintenance loop ticks (issue #299; see [Maintenance loop](#maintenance-loop-idle-branch-retirement--scheduled-retention-issue-299)). `0` turns the loop off: no idle-branch retirement, no retired-head pruning and no scheduled retention. Clamped to `10080` (7 days); a non-numeric or negative value uses the default | `60` |
+| `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_DAYS` | Retire a NON-DEFAULT branch pointer that has not moved for more than this many days (issue #299). `0` disables the rule. Clamped to `3650`; a non-numeric or negative value uses the default | `7` |
+| `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_MAX_PER_PASS` | The most idle branch pointers one tick retires (least recently moved first; the rest wait for the next tick). Clamped to `1000`; a non-numeric or non-positive value uses the default | `20` |
+| `SEXTANT_SERVICE_RETENTION_SCHEDULE` | Run the bounded retention pass once a day from the maintenance loop (issue #299). A malformed boolean **fails startup** | `true` |
+| `SEXTANT_SERVICE_RETENTION_SCHEDULE_HOUR_UTC` | The UTC hour (`0`–`23`) from which the day's scheduled retention runs: the first tick at or after it runs the pass, once per UTC day. Any other value uses the default | `3` |
 | `SEXTANT_SERVICE_PEERS` | Comma-separated peer base URLs for federation | none |
 | `SEXTANT_SERVICE_REMOTE_TIMEOUT_SECONDS` | Per-request remote-fetch timeout | `10` |
 | `SEXTANT_SERVICE_CONTRIB_REQUIRE_AUTH` | Require contribution authorization (Phase 16) | `false` (dev-open) |
@@ -869,7 +874,7 @@ The host deliberately **separates control endpoints from query endpoints**, and 
 | `POST /control/contribute` | control | control **or** contribute token | Ingest a client/CI semantic contribution (Phase 16); the least-privilege contribute token authorizes this endpoint only. |
 | `GET /control/status/{jobId}` | control | control token | Job status + per-project diagnostics (criterion 5) + checkout `coverage` (#119) + phase `timings` (#267, see [Job phase timings](#observability-criterion-5)). For a user caller, a job on a repository it cannot read is the same `404` as an unknown id (SVC-4). |
 | `GET /control/resolve` | control | control token | Resolve a repository branch (`?branch=`, else the default) to its current published snapshot (+ its `coverage`, #119), plus `commit_sha`, the resolved `branch` name, `is_default` and `head_sequence` (SVC-7; a null `commit_sha`/`head_sequence` is omitted), and `current_identity_hash` + `identity_current`: whether the snapshot is what an ensure of its commit would build on this node now (both omitted when there is no `commit_sha` or the head is a contribution; see [Identity currency](#branch-pointer-guards-head-cas-branch_update-none-retire-svc-67)). For a user caller, a repository it cannot read is the same bare `404` as an absent one (SVC-4). |
-| `POST /control/branches/retire` | control | control token | Delete a branch pointer (`{repository, branch, expected_head_commit?}`, SVC-6); its snapshots stay for retention. `200 {"retired":true}`, or `{"retired":false}` for a missing branch (idempotent). The default branch or a head-CAS mismatch is `409 {"status":"rejected","reason":"default_branch"\|"head_mismatch"}`; a refused URL or blank branch is `400`. When the retirement has not applied within `CONTROL_WRITE_WAIT_SECONDS` (a production holds the writer), the answer is `202 {"status":"accepted"}`: it applies once the writer frees, with both guards evaluated then (issue #158, see [Queued control writes](#queued-control-writes-issue-158)). `503 {"status":"unavailable"}` once shutdown began (nothing queued). Audited `retire`. A user caller is refused with `403 {"error":"caller_not_allowed"}` (issue #193, see [User callers on the control plane](#user-callers-on-the-control-plane-issue-193)). |
+| `POST /control/branches/retire` | control | control token | Delete a branch pointer (`{repository, branch, expected_head_commit?}`, SVC-6); its snapshots stay for retention. The service's idle-branch rule retires idle non-default branches through the same path (issue #299, see [Maintenance loop](#maintenance-loop-idle-branch-retirement--scheduled-retention-issue-299)). `200 {"retired":true}`, or `{"retired":false}` for a missing branch (idempotent). The default branch or a head-CAS mismatch is `409 {"status":"rejected","reason":"default_branch"\|"head_mismatch"}`; a refused URL or blank branch is `400`. When the retirement has not applied within `CONTROL_WRITE_WAIT_SECONDS` (a production holds the writer), the answer is `202 {"status":"accepted"}`: it applies once the writer frees, with both guards evaluated then (issue #158, see [Queued control writes](#queued-control-writes-issue-158)). `503 {"status":"unavailable"}` once shutdown began (nothing queued). Audited `retire`. A user caller is refused with `403 {"error":"caller_not_allowed"}` (issue #193, see [User callers on the control plane](#user-callers-on-the-control-plane-issue-193)). |
 | `POST /control/retention` | control | control token | Run the service-owned retention/GC pass (`?execute=true` to apply). A user caller is refused (`403 caller_not_allowed`). |
 | `PUT`/`DELETE`/`GET /control/grants/self` | control | control token + `act=user` assertion | The caller's own repository grants (see [Repository grants](#repository-grants-and-visibility-svc-4)). |
 | `PUT`/`DELETE /control/grants/tenant` | control | control token + `act=application` assertion | The tenant-wide repository grants. |
@@ -1897,6 +1902,62 @@ snapshot-DATA garbage collection Phase 9 deferred:
   256 per sweep), and reports the count as `source_texts_deleted` (absent on a dry run). It runs under
   the writer gate, so a blob an index stored ahead of its row is never swept.
 
+### Maintenance loop: idle-branch retirement & scheduled retention (issue #299)
+
+The service keeps every branch pointer it was ever asked to index, and a branch pointer protects its snapshots
+from retention. Short-lived branches (agent branches created by push events, for example) would otherwise keep
+their snapshots forever. A service-owned loop cleans them up.
+
+- **The loop.** `SnapshotService` starts it in `Start` and stops it with the service lifetime (shutdown drains
+  it like any other service-owned operation). It ticks every `SEXTANT_SERVICE_MAINTENANCE_INTERVAL_MINUTES`
+  (default 60, `0` = off) on the service's `TimeProvider`, the first tick one interval after start. Ticks never
+  overlap. A tick that throws is logged and counted (`maintenance.failures`), and the loop carries on.
+- **Idle-branch retirement (every tick).** A NON-DEFAULT branch whose pointer has not moved
+  (`branches.updated_at`) for more than `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_DAYS` (default 7, `0` = off) is
+  retired, least recently moved first, at most `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_MAX_PER_PASS` (default 20) per
+  tick. Candidates are read on an independent reader. A branch with a `queued`/`running` job that names it, an
+  unconsumed branch-advance handover (#273), or an admitted branch-advance ensure is left alone. Each
+  retirement then goes through the same path as `POST /control/branches/retire`: a queued writer turn in
+  submission order (#158), and one `BEGIN IMMEDIATE` transaction with its `retire` audit row. The audit actor is
+  `idle_policy` and the detail carries `;source=idle_policy`. When the retirement applies, it re-checks
+  everything: the default-branch guard, a compare-and-swap on the pointer it read (snapshot id **and**
+  `updated_at`, else `retire`/`denied` `pointer_moved`), and the pending-work check (else `branch_busy`). A push
+  that lands first therefore keeps the branch. Only branches whose head commit is known are retired. Only the
+  pointer row goes. Retention's protected set still keeps every snapshot another branch, an open PR or a retained
+  consumer reaches.
+- **Re-created by its next push (retired heads, migration 030).** The branch still exists in git, so its next push
+  sends `expected_head_commit` = its `before`, the head the rule retired. In the same transaction as the
+  retirement, the rule records that head in `retired_branch_heads` (repository, branch, commit, time, cause
+  `idle_policy`). The `expected_head_commit` compare-and-swap of a **missing** branch then also passes when the
+  expected commit is exactly that retired head, on every ensure path (worker publish, reuse, handover
+  resolution). The push re-creates the branch and the record is consumed: creating a branch row deletes it. A push
+  expecting any other commit is still refused, as before. When the branch is then deleted upstream, the delete
+  push's retire finds the branch already absent and clears its retired head, provided its
+  `expected_head_commit` is that head or absent (audit detail `absent;retired_head_cleared`). A later stale push
+  or reconcile expecting the old head therefore cannot resurrect it. Only idle-policy retirements record a head: a
+  manual or delete-push retire means the branch is gone from git too, and recording one would let a redelivered
+  stale push re-create a deleted branch. While the loop runs, every tick prunes records older than 90 days,
+  even with the idle rule turned off (`retired_heads_pruned` in the tick log). After that, an idle-retired branch
+  that was never pushed comes back only as a new branch.
+- **Scheduled retention (once a day).** After the tick's idle-branch pass, the first tick at or after
+  `SEXTANT_SERVICE_RETENTION_SCHEDULE_HOUR_UTC` (default 3) each UTC day runs the same bounded
+  `execute=true` pass as `POST /control/retention?execute=true`. The audit actor is `retention_schedule` and the
+  detail is `execute_batch;source=retention_schedule`. It runs at most once per UTC day, and a restart reads
+  today's `retention` rows from the audit log, so it does not run twice. While indexing holds the writer (a
+  production is in flight, or a write is waiting for its turn), the due pass **does not start and is retried on
+  the next tick** (`maintenance.scheduled_retention_skipped_busy`). Once it has started, a production admitted
+  meanwhile waits at most one bounded batch (2 s) for its turn, exactly as behind a manual pass.
+  `SEXTANT_SERVICE_RETENTION_SCHEDULE=false` turns it off. Like a manual pass, it never runs `VACUUM` (#252).
+  Compaction stays an offline operator action.
+- **Observability.** Each tick logs one line for the idle-branch pass (retired / idle / busy / attempted /
+  skipped, duration) and one for a scheduled retention pass (deleted snapshots, file versions and source texts,
+  duration, `more_remaining`). `GET /control/metrics` reports a `maintenance` block: `ticks`, `failures`,
+  `idle_branches_retired_total`, `last_idle_branches_retired`, `last_idle_pass_at_unix_ms`,
+  `last_idle_pass_duration_ms`, `scheduled_retention_runs`, `scheduled_retention_skipped_busy` and the latest
+  scheduled pass (`last_scheduled_retention_*`). The Prometheus text adds the `sextant_maintenance_*`,
+  `sextant_idle_branches_retired_*` and `sextant_scheduled_retention_*` gauges. The counters are per service
+  instance. The startup log prints the effective policy.
+
 ### Bounded retention contract (#127 / #252)
 
 `POST /control/retention?execute=false` is a **read-only, point-in-time plan** on an independent WAL
@@ -1930,9 +1991,10 @@ dependencies: no migration, repair, or destructive inference from a stale pointe
 These are cooperative work bounds, not real-time guarantees on filesystem I/O or SQLite rollback.
 A single project cascade that cannot finish within the deadline is deferred rather than partially
 deleting a potentially servable snapshot. Repeated `more_remaining`/`time_budget` responses require
-operator investigation; do not loop blindly. An approved daily runner could submit one bounded pass
-and inspect its report, but **no schedule is enabled or approved by this change**. Production scheduling
-remains deferred pending operator validation on a representative catalog.
+operator investigation; do not loop blindly. Since issue #299 the service's own [maintenance loop](#maintenance-loop-idle-branch-retirement--scheduled-retention-issue-299)
+submits **one** bounded `execute=true` pass a day (from `SEXTANT_SERVICE_RETENTION_SCHEDULE_HOUR_UTC`, default
+03:00 UTC; `SEXTANT_SERVICE_RETENTION_SCHEDULE=false` turns it off) and records its report in the logs and
+`/control/metrics`. It never loops on `more_remaining`.
 
 Multi-project snapshot GC withdraws publication (`failed`, NULL run/publish pointer) atomically with
 the first project deletion, including every affected downstream consumer/overlay, transitively and

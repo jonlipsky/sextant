@@ -133,6 +133,7 @@ public static class ServiceHostRunner
             database.Dispose();
             return 1;
         }
+        await Console.Error.WriteLineAsync(options.Maintenance.Describe());
 
         try
         {

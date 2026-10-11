@@ -64,6 +64,7 @@ public sealed class MetricsCollector(
                 PageCacheMisses = metrics.PageCacheMisses
             },
             QueryErrors = metrics.QueryErrors,
+            Maintenance = metrics.Maintenance,
             CostByRepository = cost
         };
 

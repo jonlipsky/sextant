@@ -199,6 +199,7 @@ public sealed partial class SnapshotService : IDisposable
                     effectiveAuthorizer, effectiveGitContent, effectivePolicy, remoteDefaults, timeProvider);
                 service._jobIds.Load();
                 service.ReconcileOnStartup();
+                service.StartMaintenanceLoop();
                 return service;
             }
             catch
@@ -530,12 +531,13 @@ public sealed partial class SnapshotService : IDisposable
         var snapshots = new SnapshotStore(_conn);
         var jobs = new SnapshotJobStore(_conn);
         var repositoryKey = RemoteUrlIdentity.Normalize(request.RepositoryRemoteUrl);
-        var branchId = snapshots.GetRepositoryId(request.RepositoryRemoteUrl) is long repoId
-            ? snapshots.GetBranchId(repoId, request.BranchName!)
-            : null;
+        var repositoryId = snapshots.GetRepositoryId(request.RepositoryRemoteUrl);
+        var branchId = repositoryId is long repoId ? snapshots.GetBranchId(repoId, request.BranchName!) : null;
         var expected = request.ExpectedHeadCommit!;
         var successor = request.CommitSha;
-        for (var hop = 0; hop < MaxHandoverHops && !snapshots.BranchHeadMatches(branchId, expected); hop++)
+        for (var hop = 0;
+             hop < MaxHandoverHops && !snapshots.BranchHeadMatches(branchId, expected, repositoryId, request.BranchName);
+             hop++)
         {
             if (jobs.GetHandover(repositoryKey, request.BranchName!, expected, successor) is not { } handedOver)
                 break;
@@ -1600,7 +1602,7 @@ public sealed partial class SnapshotService : IDisposable
             return;
         snapshots.MarkConsumerRepository(repoId);
         var branchName = request.BranchName ?? "main";
-        if (!snapshots.BranchHeadMatches(snapshots.GetBranchId(repoId, branchName), expectedHead))
+        if (!snapshots.BranchHeadMatches(snapshots.GetBranchId(repoId, branchName), expectedHead, repoId, branchName))
             return;
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var ownsDefault = snapshots.ShouldOwnDefault(
@@ -1919,12 +1921,15 @@ public sealed partial class SnapshotService : IDisposable
     // Admits one retirement as a service-owned operation on its own write-gate turn (issue #158), or coalesces it into
     // the identical retirement still waiting when no other write was admitted after it (applying both would change
     // nothing more, so it shares that one's result and audit row). Admission is atomic with Dispose's drain snapshot.
-    private Task<RetireBranchResult> StartRetire(RetireBranchRequest request, AuditCaller principal)
+    // An idle-branch retirement (issue #299) passes the pointer it selected as `idle`, so the retirement applies only while
+    // the pointer is unchanged and no work is pending against the branch.
+    private Task<RetireBranchResult> StartRetire(
+        RetireBranchRequest request, AuditCaller principal, IdleRetireGuard? idle = null)
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentException.ThrowIfNullOrEmpty(request.Repository);
         ArgumentException.ThrowIfNullOrEmpty(request.Branch);
-        var key = new RetireKey(request.Repository, request.Branch, request.ExpectedHeadCommit, principal.Principal);
+        var key = new RetireKey(request.Repository, request.Branch, request.ExpectedHeadCommit, principal.Principal, idle);
         PendingRetire entry;
         lock (_inFlightLock)
         {
@@ -1936,7 +1941,7 @@ public sealed partial class SnapshotService : IDisposable
             var turn = TakeWriteTurnLocked(out var admission);
             entry = new PendingRetire(key, admission);
             // Published under the lock BEFORE the retirement can clear it (it takes the same lock).
-            entry.Retire = Task.Run(() => ApplyRetireAsync(request, principal, entry, turn), CancellationToken.None);
+            entry.Retire = Task.Run(() => ApplyRetireAsync(request, principal, entry, turn, idle), CancellationToken.None);
             _pendingRetire = entry;
             _operations.Add(entry.Retire);
         }
@@ -1952,7 +1957,7 @@ public sealed partial class SnapshotService : IDisposable
     }
 
     private async Task<RetireBranchResult> ApplyRetireAsync(
-        RetireBranchRequest request, AuditCaller principal, PendingRetire entry, Task turn)
+        RetireBranchRequest request, AuditCaller principal, PendingRetire entry, Task turn, IdleRetireGuard? idle)
     {
         await turn.ConfigureAwait(false);
         try
@@ -1964,7 +1969,7 @@ public sealed partial class SnapshotService : IDisposable
             }
             using var activity = ServiceTelemetry.Source.StartActivity("retire_branch");
             EnsureLeaseHeld();
-            return RetireBranchLocked(request, principal);
+            return RetireBranchLocked(request, principal, idle);
         }
         finally
         {
@@ -1972,22 +1977,51 @@ public sealed partial class SnapshotService : IDisposable
         }
     }
 
-    private RetireBranchResult RetireBranchLocked(RetireBranchRequest request, AuditCaller principal)
+    private RetireBranchResult RetireBranchLocked(RetireBranchRequest request, AuditCaller principal, IdleRetireGuard? idle)
     {
         var snapshots = new SnapshotStore(_conn);
         ExecRaw("BEGIN IMMEDIATE;");
         try
         {
-            var branch = snapshots.GetRepositoryId(request.Repository) is long repoId
-                ? snapshots.GetBranch(repoId, request.Branch)
-                : null;
+            var repositoryId = snapshots.GetRepositoryId(request.Repository);
+            var branch = repositoryId is long repoId ? snapshots.GetBranch(repoId, request.Branch) : null;
             RetireBranchResult result;
+            var detail = (string?)null;
             if (branch is null)
+            {
                 result = new RetireBranchResult { Retired = false };
+                // Issue #299: a branch the idle rule retired is gone from the catalog but still in git. When it is then
+                // deleted upstream (a manual/delete-push retire whose CAS names the retired head, or no CAS), its
+                // retired head is cleared, so no later push expecting that head can resurrect it.
+                if (idle is null && repositoryId is long absentRepo
+                    && snapshots.GetRetiredHead(absentRepo, request.Branch) is { } retiredHead
+                    && (request.ExpectedHeadCommit is null
+                        || string.Equals(retiredHead, request.ExpectedHeadCommit, StringComparison.OrdinalIgnoreCase))
+                    && snapshots.ConsumeRetiredHead(absentRepo, request.Branch))
+                    detail = "absent;retired_head_cleared";
+            }
             else if (branch.IsDefault)
                 result = new RetireBranchResult { Retired = false, Reason = BranchGuardReason.DefaultBranch };
+            else if (idle is { } selected && (branch.SnapshotId != selected.SnapshotId || branch.UpdatedAt != selected.UpdatedAt))
+                result = new RetireBranchResult { Retired = false, Reason = BranchGuardReason.PointerMoved };
+            else if (idle is not null && new SnapshotJobStore(_conn).BranchesWithPendingWork()
+                         .Contains((RemoteUrlIdentity.Normalize(request.Repository), branch.Name)))
+                result = new RetireBranchResult { Retired = false, Reason = BranchGuardReason.BranchBusy };
             else if (request.ExpectedHeadCommit is { } expected && !snapshots.BranchHeadMatches(branch.Id, expected))
                 result = new RetireBranchResult { Retired = false, Reason = BranchGuardReason.HeadMismatch };
+            else if (idle is not null)
+            {
+                // Issue #299: the branch still exists in git, so its next push expects this head; record it so that push
+                // re-creates the branch. A branch with no known head commit is never retired by the idle rule.
+                if (snapshots.GetBranchHeadCommit(branch.Id) is not { } head)
+                    result = new RetireBranchResult { Retired = false, Reason = BranchGuardReason.NoHeadCommit };
+                else
+                {
+                    result = new RetireBranchResult { Retired = snapshots.DeleteBranch(branch.Id) };
+                    snapshots.RecordRetiredHead(branch.RepositoryId, branch.Name, head,
+                        _timeProvider.GetUtcNow().ToUnixTimeMilliseconds(), SnapshotStore.RetiredHeadCauseIdle);
+                }
+            }
             else
                 result = new RetireBranchResult { Retired = snapshots.DeleteBranch(branch.Id) };
 
@@ -1996,7 +2030,7 @@ public sealed partial class SnapshotService : IDisposable
                 result.Reason is null ? AuditOutcome.Complete : AuditOutcome.Denied,
                 actor: principal.Actor,
                 repositoryScope: request.Repository,
-                detail: principal.Detail(result.Reason ?? (result.Retired ? "retired" : "absent")));
+                detail: principal.Detail(result.Reason ?? detail ?? (result.Retired ? "retired" : "absent")));
             ExecRaw("COMMIT;");
             return result;
         }
@@ -2555,6 +2589,9 @@ public sealed partial class SnapshotService : IDisposable
         _lease.Dispose();
         if (_ownsDatabase)
             _db.Dispose();
+        _maintenanceTimer?.Dispose();
+        _maintenanceTick.Dispose();
+        _maintenanceTicked.Dispose();
         _writeGate.Dispose();
         _lifetime.Dispose();
     }
@@ -2587,7 +2624,11 @@ public sealed partial class SnapshotService : IDisposable
 
     // What makes two retirements identical (issue #158): same repository and branch spelling, same CAS guard, same
     // audit actor. Spellings are compared exactly, so two spellings of one repository simply are not coalesced.
-    private readonly record struct RetireKey(string Repository, string Branch, string? ExpectedHeadCommit, string? Actor);
+    private readonly record struct RetireKey(
+        string Repository, string Branch, string? ExpectedHeadCommit, string? Actor, IdleRetireGuard? Idle);
+
+    // The pointer an idle-branch retirement selected (issue #299): it applies only while the branch still has exactly it.
+    private readonly record struct IdleRetireGuard(long? SnapshotId, long UpdatedAt);
 
     // A retirement waiting for (or holding) its write-gate turn (issue #158). Admission is the write-admission count
     // its own turn produced; Retire is assigned under _inFlightLock before the entry is published.

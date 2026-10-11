@@ -85,6 +85,20 @@ public static class PrometheusExposition
         Gauge(sb, "sextant_alerts_critical", "Active critical alerts.",
             s.Alerts.Count(a => a.Level == AlertLevel.Critical));
 
+        // Issue #299: the maintenance loop (idle-branch retirement + scheduled retention).
+        Gauge(sb, "sextant_maintenance_ticks", "Maintenance ticks completed since start.", s.Maintenance.Ticks);
+        Gauge(sb, "sextant_maintenance_failures", "Maintenance ticks that failed since start.", s.Maintenance.Failures);
+        Gauge(sb, "sextant_idle_branches_retired_total", "Idle non-default branch pointers retired since start.",
+            s.Maintenance.IdleBranchesRetiredTotal);
+        Gauge(sb, "sextant_idle_branches_retired_last_pass", "Idle branch pointers retired by the latest pass.",
+            s.Maintenance.LastIdleBranchesRetired);
+        Gauge(sb, "sextant_scheduled_retention_runs", "Scheduled retention passes run since start.",
+            s.Maintenance.ScheduledRetentionRuns);
+        Gauge(sb, "sextant_scheduled_retention_skipped_busy", "Due scheduled retention passes skipped while indexing held the writer.",
+            s.Maintenance.ScheduledRetentionSkippedBusy);
+        Gauge(sb, "sextant_scheduled_retention_last_duration_ms", "Duration of the latest scheduled retention pass (ms).",
+            s.Maintenance.LastScheduledRetentionDurationMs);
+
         // Per-repository cost attribution (operator-only; control-plane gated).
         if (s.CostByRepository.Count > 0)
         {
