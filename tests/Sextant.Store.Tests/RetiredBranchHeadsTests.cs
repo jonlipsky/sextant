@@ -8,7 +8,7 @@ namespace Sextant.Store.Tests;
 /// branch, creating the branch consumes the record, and old records are pruned. Every other CAS outcome is unchanged.
 /// </summary>
 [TestClass]
-public class RetiredBranchHeadsTests
+public sealed class RetiredBranchHeadsTests : IDisposable
 {
     private const string Repo = "https://github.com/acme/retired";
     private string _dbPath = null!;
@@ -26,8 +26,8 @@ public class RetiredBranchHeadsTests
         _repoId = _store.EnsureRepository(Repo, 1);
     }
 
-    [TestCleanup]
-    public void TestCleanup() => SqliteTestDatabase.Delete(_dbPath, _db);
+    // MSTest disposes the test class instance after each test.
+    public void Dispose() => SqliteTestDatabase.Delete(_dbPath, _db);
 
     [TestMethod]
     public void Migration030_IsIdentityNeutral_AndCreatesAServiceJobTable()
