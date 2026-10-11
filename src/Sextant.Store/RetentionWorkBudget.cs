@@ -10,7 +10,8 @@ internal sealed class RetentionWorkBudget : IDisposable
     private readonly SqliteConnection _connection;
     private readonly CancellationToken _cancellationToken;
     private readonly long _started = Stopwatch.GetTimestamp();
-    private readonly TimeSpan _duration;
+    private TimeSpan _duration;
+    private TimeSpan? _unitEnd;
     private readonly int _previousTimeout;
     private readonly int _previousBusyTimeout;
 
@@ -30,7 +31,23 @@ internal sealed class RetentionWorkBudget : IDisposable
         raw.sqlite3_progress_handler(connection.Handle, 1000, _ => ShouldStop ? 1 : 0, null);
     }
 
-    internal bool ShouldStop => _cancellationToken.IsCancellationRequested || Stopwatch.GetElapsedTime(_started) >= _duration;
+    internal bool ShouldStop => _cancellationToken.IsCancellationRequested ||
+        Stopwatch.GetElapsedTime(_started) >= (_unitEnd ?? _duration);
+
+    /// <summary>True while a unit runs and its own cap has passed (cancellation is not an expired unit).</summary>
+    internal bool UnitExpired => _unitEnd is { } end && !_cancellationToken.IsCancellationRequested &&
+        Stopwatch.GetElapsedTime(_started) >= end;
+
+    /// <summary>The unit runs under its own cap instead of the batch limit: one unit always gets to finish.</summary>
+    internal void BeginUnit(TimeSpan cap) => _unitEnd = Stopwatch.GetElapsedTime(_started) + cap;
+
+    /// <summary>Ends the unit; the batch keeps a short grace after it so the commit is not cut by the batch limit.</summary>
+    internal void EndUnit()
+    {
+        _unitEnd = null;
+        var grace = Stopwatch.GetElapsedTime(_started) + TimeSpan.FromSeconds(1);
+        if (grace > _duration) _duration = grace;
+    }
 
     internal void Check()
     {

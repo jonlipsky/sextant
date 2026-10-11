@@ -281,7 +281,9 @@ public sealed partial class SnapshotService
         }
 
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
-        var report = await RunRetentionAsync(execute: true, RetentionScheduleCaller, cancellationToken).ConfigureAwait(false);
+        var report = await RunRetentionAsync(
+            execute: true, RetentionScheduleCaller, cancellationToken,
+            TimeSpan.FromSeconds(Math.Clamp(policy.RetentionPassSeconds, 1, MaintenancePolicy.MaxRetentionPassSeconds))).ConfigureAwait(false);
         var durationMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
         _lastScheduledRetentionDay = today;
         _metrics.RecordScheduledRetention(report, now.ToUnixTimeMilliseconds(), durationMs);

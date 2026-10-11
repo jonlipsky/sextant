@@ -2048,35 +2048,79 @@ public sealed partial class SnapshotService : IDisposable
         => RunRetentionAsync(execute, principal, _lifetime.Token).GetAwaiter().GetResult();
 
     /// <summary>
-    /// An executed pass counts writer-queue wait against its budget and releases the gate between batches.
-    /// Cancellation interrupts the current batch; previously committed batches stay applied.
+    /// The budget of an interactive retention run (issue #303): <c>seconds</c> when given, else
+    /// <see cref="RetentionService.PassTimeLimit"/>, never above the configured pass seconds
+    /// (<c>SEXTANT_SERVICE_RETENTION_PASS_SECONDS</c>, itself capped at 3600) and at least one second.
+    /// </summary>
+    public TimeSpan InteractiveRetentionLimit(int? seconds)
+        => ClampInteractiveRetention(seconds, _options.Maintenance.RetentionPassSeconds);
+
+    internal static TimeSpan ClampInteractiveRetention(int? seconds, int configuredSeconds)
+    {
+        var ceiling = Math.Clamp(configuredSeconds, 1, MaintenancePolicy.MaxRetentionPassSeconds);
+        var asked = seconds ?? (int)RetentionService.PassTimeLimit.TotalSeconds;
+        return TimeSpan.FromSeconds(Math.Clamp(asked, 1, ceiling));
+    }
+
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<long, DateTime> _oversizedToday = new();
+
+    private HashSet<long> OversizedToDeferToday()
+    {
+        var today = _timeProvider.GetUtcNow().UtcDateTime.Date;
+        var ids = new HashSet<long>();
+        foreach (var (id, day) in _oversizedToday)
+        {
+            if (day == today) ids.Add(id);
+            else _oversizedToday.TryRemove(id, out _);
+        }
+        return ids;
+    }
+
+    /// <summary>
+    /// A dry run plans on an independent reader. An executed pass computes its plan on a reader too (no writer held),
+    /// then runs short batches under the writer, each re-verifying its candidates; the gate is released between batches
+    /// so publishes interleave. The whole pass, writer-queue waits included, is bounded by <paramref name="passLimit"/>
+    /// (default <see cref="RetentionService.PassTimeLimit"/>). A pass that runs out of time reports what it computed and
+    /// deleted so far; cancellation interrupts the current batch, and committed batches stay applied.
     /// </summary>
     public async Task<RetentionReport> RunRetentionAsync(
-        bool execute, AuditCaller principal = default, CancellationToken cancellationToken = default)
+        bool execute, AuditCaller principal = default, CancellationToken cancellationToken = default,
+        TimeSpan? passLimit = null)
     {
         using var activity = ServiceTelemetry.Source.StartActivity("retention");
         activity?.SetTag("sextant.execute", execute);
+        var limit = passLimit ?? RetentionService.PassTimeLimit;
         using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetime.Token);
-        if (!execute)
-        {
-            // No writer admission, lease acquisition, audit write, or speculative delete.
-            using var reader = OpenReadConnection();
-            return new RetentionService(reader, _options.Retention).Plan(lifetime.Token);
-        }
         using var pass = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
-        pass.CancelAfter(RetentionService.PassTimeLimit);
+        pass.CancelAfter(limit);
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
-        var report = new RetentionReport { DryRun = false };
+        var report = new RetentionReport { DryRun = !execute };
         try
         {
+            if (!execute)
+            {
+                // No writer admission, lease acquisition, audit write, or speculative delete.
+                using var dryReader = OpenReadConnection();
+                return new RetentionService(dryReader, _options.Retention).Plan(pass.Token, limit);
+            }
+
+            RetentionPlan plan;
+            using (var reader = OpenReadConnection())
+                plan = new RetentionService(reader, _options.Retention).CreatePlan(pass.Token, limit);
+            if (plan.StopReason != null)
+                return new RetentionReport { DryRun = false, MoreRemaining = true, StopReason = plan.StopReason };
+            var deferred = OversizedToDeferToday();
+            var deferredNow = deferred.Count == 0 ? [] : plan.ExcludeSnapshots(deferred);
+            report = plan.Report with { OversizedDeferredSnapshotIds = deferredNow };
+
             do
             {
                 var batch = await WithWriteAsync(() =>
                 {
                     pass.Token.ThrowIfCancellationRequested();
-                    var remaining = RetentionService.PassTimeLimit - System.Diagnostics.Stopwatch.GetElapsedTime(started);
-                    var limit = remaining < RetentionService.BatchTimeLimit ? remaining : RetentionService.BatchTimeLimit;
-                    return Task.FromResult(new RetentionService(_conn, _options.Retention).ExecuteBatch(pass.Token, limit, () =>
+                    var remaining = limit - System.Diagnostics.Stopwatch.GetElapsedTime(started);
+                    var batchLimit = remaining < RetentionService.BatchTimeLimit ? remaining : RetentionService.BatchTimeLimit;
+                    return Task.FromResult(new RetentionService(_conn, _options.Retention).ExecuteBatch(plan, pass.Token, batchLimit, () =>
                     {
                         EnsureLeaseHeld();
                         new AuditLogStore(_conn).Append(AuditAction.Retention, AuditOutcome.Complete,
@@ -2084,6 +2128,12 @@ public sealed partial class SnapshotService : IDisposable
                     }));
                 }, pass.Token).ConfigureAwait(false);
                 report = RetentionService.Combine(report, batch);
+                foreach (var oversizedId in batch.OversizedSnapshotIds)
+                {
+                    _oversizedToday[oversizedId] = _timeProvider.GetUtcNow().UtcDateTime.Date;
+                    Console.Error.WriteLine(
+                        $"Retention rolled back the deletion unit of snapshot {oversizedId}: it ran past {_options.Retention.Normalized().UnitMaxSeconds}s. It is skipped for the rest of the UTC day.");
+                }
                 if (batch.StopReason != null) return report;
                 // WithWriteAsync releases the gate before the next admission; already-queued publishes go first.
             } while (report.MoreRemaining);
@@ -2091,13 +2141,14 @@ public sealed partial class SnapshotService : IDisposable
             var sweep = await WithWriteAsync(() =>
             {
                 pass.Token.ThrowIfCancellationRequested();
-                var remaining = RetentionService.PassTimeLimit - System.Diagnostics.Stopwatch.GetElapsedTime(started);
-                var limit = remaining < RetentionService.BatchTimeLimit ? remaining : RetentionService.BatchTimeLimit;
+                var remaining = limit - System.Diagnostics.Stopwatch.GetElapsedTime(started);
+                var sweepLimit = remaining < RetentionService.BatchTimeLimit ? remaining : RetentionService.BatchTimeLimit;
                 return Task.FromResult(new RetentionService(_conn, _options.Retention)
-                    .SweepSourceTexts(SourceTexts, pass.Token, limit));
+                    .SweepSourceTexts(SourceTexts, pass.Token, sweepLimit));
             }, pass.Token).ConfigureAwait(false);
             report = report with { SourceTextsDeleted = sweep.SourceTextsDeleted,
-                MoreRemaining = sweep.MoreRemaining, StopReason = sweep.StopReason };
+                MoreRemaining = sweep.MoreRemaining || plan.ApiDeferred,
+                StopReason = sweep.StopReason ?? (plan.ApiDeferred ? "time_budget" : null) };
         }
         catch (OperationCanceledException) when (!lifetime.IsCancellationRequested && pass.IsCancellationRequested)
         {

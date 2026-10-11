@@ -504,9 +504,10 @@ public static class ServiceApp
 
         // Issue #193: retention, backup and the observability routes below are operator-only. A user caller is
         // refused with 403 caller_not_allowed (retention and backup audit the refusal); see ControlCallerRules.
-        control.MapPost("/retention", async (bool? execute, HttpRequest req, SnapshotService service, CancellationToken ct) =>
+        control.MapPost("/retention", async (bool? execute, int? seconds, HttpRequest req, SnapshotService service, CancellationToken ct) =>
         {
-            var report = await service.RunRetentionAsync(execute ?? false, AuditActor(req), ct);
+            var report = await service.RunRetentionAsync(execute ?? false, AuditActor(req), ct,
+                service.InteractiveRetentionLimit(seconds));
             return Results.Json(report, ServiceJson.Options);
         }).AuditsRefusedUserCallsAs(AuditAction.Retention);
 

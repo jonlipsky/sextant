@@ -448,11 +448,11 @@ public sealed record ServiceOptions
                 ? peers.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                 : [],
             RemoteFetchTimeout = EnvInt("REMOTE_TIMEOUT_SECONDS") is int t and > 0 ? TimeSpan.FromSeconds(t) : TimeSpan.FromSeconds(10),
-            Retention = config.Retention,
+            Retention = WithUnitMax(config.Retention, EnvInt("RETENTION_UNIT_MAX_SECONDS")),
             Maintenance = ParseMaintenance(
                 Env("MAINTENANCE_INTERVAL_MINUTES"), Env("BRANCH_IDLE_RETIRE_DAYS"),
                 Env("BRANCH_IDLE_RETIRE_MAX_PER_PASS"), EnvBool("RETENTION_SCHEDULE"),
-                Env("RETENTION_SCHEDULE_HOUR_UTC")),
+                Env("RETENTION_SCHEDULE_HOUR_UTC"), Env("RETENTION_PASS_SECONDS")),
             // Fold the node's own profile hash into request identities by default, so an ensure request that
             // omits ConfigHash resolves to the SAME identity_hash the local worker's orchestrator publishes
             // under (IndexProfileDescriptor.ConfigurationHash) — without it the idempotency lookup misses.
@@ -581,7 +581,8 @@ public sealed record ServiceOptions
     /// <see cref="MaintenancePolicy.MaxBranchIdleRetireMaxPerPass"/>.
     /// </summary>
     internal static MaintenancePolicy ParseMaintenance(
-        string? intervalMinutes, string? idleDays, string? maxPerPass, bool? scheduledRetention, string? retentionHourUtc) => new()
+        string? intervalMinutes, string? idleDays, string? maxPerPass, bool? scheduledRetention, string? retentionHourUtc,
+        string? retentionPassSeconds = null) => new()
         {
             Interval = TimeSpan.FromMinutes(int.TryParse(intervalMinutes, out var minutes) && minutes >= 0
                 ? Math.Min(minutes, MaintenancePolicy.MaxIntervalMinutes) : MaintenancePolicy.DefaultIntervalMinutes),
@@ -591,8 +592,20 @@ public sealed record ServiceOptions
                 ? Math.Min(cap, MaintenancePolicy.MaxBranchIdleRetireMaxPerPass) : MaintenancePolicy.DefaultBranchIdleRetireMaxPerPass,
             ScheduledRetention = scheduledRetention ?? true,
             RetentionHourUtc = int.TryParse(retentionHourUtc, out var hour) && hour is >= 0 and <= 23
-                ? hour : MaintenancePolicy.DefaultRetentionHourUtc
+                ? hour : MaintenancePolicy.DefaultRetentionHourUtc,
+            RetentionPassSeconds = int.TryParse(retentionPassSeconds, out var pass) && pass > 0
+                ? Math.Min(pass, MaintenancePolicy.MaxRetentionPassSeconds) : MaintenancePolicy.DefaultRetentionPassSeconds
         };
+
+    internal static RetentionPolicy WithUnitMaxForTesting(RetentionPolicy policy) =>
+        WithUnitMax(policy, EnvInt("RETENTION_UNIT_MAX_SECONDS"));
+
+    private static RetentionPolicy WithUnitMax(RetentionPolicy policy, int? seconds)
+    {
+        var normalized = policy.Normalized();
+        if (seconds is > 0) normalized.UnitMaxSeconds = Math.Min(seconds.Value, RetentionPolicy.MaxUnitMaxSeconds);
+        return normalized;
+    }
 
     private static string? Env(string name) =>
         Environment.GetEnvironmentVariable(EnvPrefix + name) is { Length: > 0 } v ? v : null;
