@@ -128,7 +128,8 @@ public sealed partial class SnapshotService
     /// the service's <see cref="TimeProvider"/>, so a test advances its clock and then waits here.
     /// </summary>
     internal async Task<bool> WaitForMaintenanceTickAsync(TimeSpan timeout) =>
-        await _maintenanceTicked.WaitAsync(timeout).ConfigureAwait(false);
+        // A test's bounded wait: not tied to the service lifetime, so a tick completing during shutdown is still seen.
+        await _maintenanceTicked.WaitAsync(timeout, CancellationToken.None).ConfigureAwait(false);
 
     /// <summary>
     /// Runs one maintenance tick (issue #299): the idle-branch retire pass, then the scheduled retention pass when it is
