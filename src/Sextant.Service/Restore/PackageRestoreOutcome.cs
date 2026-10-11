@@ -66,6 +66,15 @@ public sealed record PackageRestoreOutcome
     /// <summary>Wall-clock time the restore step took.</summary>
     public TimeSpan Elapsed { get; init; }
 
+    /// <summary>
+    /// Solutions whose restore failed as a whole and were retried project by project (issue #296), so one project's
+    /// restore-graph error does not leave the others unrestored.
+    /// </summary>
+    public int SolutionsRetriedPerProject { get; init; }
+
+    /// <summary>Projects the per-project retries restored one by one.</summary>
+    public int ProjectsRetried { get; init; }
+
     /// <summary>Distinct projects explicitly restored by a project-union traversal.</summary>
     public int ProjectsAttempted { get; init; }
 
@@ -116,6 +125,12 @@ public sealed record PackageRestoreOutcome
         {
             notes.Add("Package source credentials are configured but could not be provided to the package restore; " +
                       "packages from sources that need them may not have been restored.");
+        }
+        if (SolutionsRetriedPerProject > 0)
+        {
+            notes.Add(
+                $"Package restore failed as a whole for {SolutionsRetriedPerProject} solution(s) and was retried for their " +
+                $"{ProjectsRetried} project(s) one by one, so a project that cannot restore does not leave the others unrestored.");
         }
         if (SolutionsNotStarted > 0)
         {

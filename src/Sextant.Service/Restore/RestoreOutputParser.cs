@@ -86,11 +86,53 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
         var generalMatch = GeneralError().Match(line);
         if (generalMatch.Success)
         {
+            // An MSBuild error that carries no project prefix still names the project in its trailing "[<project>]"
+            // (issue #296: a retried project's evaluation error, for example NETSDK1013).
+            var trailing = TrailingProject().Match(line);
+            if (trailing.Success)
+            {
+                Record(Relativize(trailing.Groups["path"].Value), generalMatch.Groups["code"].Value.ToUpperInvariant(), null);
+                return;
+            }
             lock (_gate)
             {
                 if (_generalCodes.Count < MaxGeneralCodes)
                     _generalCodes.Add(generalMatch.Groups["code"].Value.ToUpperInvariant());
             }
+        }
+    }
+
+    /// <summary>Adds everything <paramref name="other"/> recorded (issue #296: a failed attempt's findings, kept when its retry could not run).</summary>
+    public void MergeFrom(RestoreOutputParser other)
+    {
+        var projects = other.Projects();
+        var general = other.GeneralCodes();
+        var dropped = other.ProjectsDropped;
+        var unreachable = other.SourceUnreachableGeneral;
+        lock (_gate)
+        {
+            foreach (var issue in projects)
+            {
+                if (!_projects.TryGetValue(issue.Project, out var accumulator))
+                {
+                    if (_projects.Count >= MaxProjects)
+                    {
+                        _projectsDropped++;
+                        continue;
+                    }
+                    accumulator = new Accumulator();
+                    _projects[issue.Project] = accumulator;
+                }
+                foreach (var code in issue.Codes)
+                    accumulator.Codes.Add(code);
+                foreach (var package in issue.MissingPackages)
+                    accumulator.MissingPackages.Add(package);
+            }
+            foreach (var code in general)
+                if (_generalCodes.Count < MaxGeneralCodes)
+                    _generalCodes.Add(code);
+            _projectsDropped += dropped;
+            _sourceUnreachable |= unreachable;
         }
     }
 
@@ -190,6 +232,11 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
     [GeneratedRegex(@"(?:^|[\s:])error\s+(?<code>[A-Za-z]{2,8}\d{3,5})\s*:",
         RegexOptions.CultureInvariant, matchTimeoutMilliseconds: 1000)]
     private static partial Regex GeneralError();
+
+    // The "[<project path>]" an MSBuild error line ends with.
+    [GeneratedRegex(@"\[(?<path>[^\[\]\r\n]+?\.(?:cs|vb|fs)proj)\]\s*$",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, matchTimeoutMilliseconds: 1000)]
+    private static partial Regex TrailingProject();
 
     // "<project path> : warning NU1801: Unable to load the service index for source ... [<solution path>]".
     [GeneratedRegex(@"^\s*(?<path>[^\r\n]+?\.(?:cs|vb|fs)proj)\s*:\s*warning\s+(?<code>NU1801)\s*:",
