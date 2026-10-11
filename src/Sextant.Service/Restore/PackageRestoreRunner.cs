@@ -32,6 +32,14 @@ namespace Sextant.Service.Restore;
 /// inside the same evaluation sandbox and inherits its scrubbed environment.
 /// </para>
 /// <para>
+/// Issue #296: a restore is an index input, not a build gate. It passes <see cref="RestoreOnlyProperties"/>, so a
+/// repository's <c>TreatWarningsAsErrors</c> (for example inherited from a superproject's <c>Directory.Build.props</c>)
+/// cannot turn a restore warning such as <c>NU1505</c> into an error, and a per-solution restore that still exits
+/// non-zero (an error raised while NuGet builds the restore graph leaves NO project of that solution restored) is retried
+/// project by project through the traversal the union uses, so every restorable project gets its assets file and only the
+/// failing ones are reported. A timeout or cancellation is never retried.
+/// </para>
+/// <para>
 /// Issue #231: with <paramref name="sourceCredentials"/> configured, each restore writes them to an owner-only file in
 /// its scratch directory, points the child at <see cref="FeedCredentialPlugin"/> (<paramref name="credentialPluginPath"/>)
 /// through <c>NUGET_PLUGIN_PATHS</c> and at the file through <see cref="FeedCredentialPlugin.CredentialsFileVariable"/>,
@@ -53,6 +61,17 @@ public sealed class PackageRestoreRunner(
 
     /// <summary>The identity component a node with restore disabled publishes under.</summary>
     public const string DisabledIdentityComponent = "off";
+
+    /// <summary>
+    /// Global properties only the restore passes (never the workspace load, whose <see cref="EvaluationGlobalProperties"/>
+    /// stay as they are): they keep a restore warning from failing the restore (issue #296). <c>MSBuildTreatWarningsAsErrors</c>
+    /// is deliberately absent: NuGet's restore task does not read it, and measured with it set the warning is still an error.
+    /// </summary>
+    internal static readonly IReadOnlyList<KeyValuePair<string, string>> RestoreOnlyProperties =
+    [
+        new("TreatWarningsAsErrors", "false"),
+        new("WarningsAsErrors", string.Empty)
+    ];
 
     private static readonly TimeSpan KillGrace = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan DrainGrace = TimeSpan.FromSeconds(10);
@@ -113,7 +132,8 @@ public sealed class PackageRestoreRunner(
         var credentialsDir = PrepareCredentials(scratchDir, out var environment);
         var credentialsUnavailable = _sourceCredentials.Count > 0 && credentialsDir is null;
         // One decision for the whole selection, from the same declared projects the union load evaluates (#293).
-        var globals = EvaluationGlobalProperties.For(solutions.SelectMany(SolutionProjectEnumerator.Enumerate));
+        IReadOnlyList<KeyValuePair<string, string>> globals =
+            [.. EvaluationGlobalProperties.For(solutions.SelectMany(SolutionProjectEnumerator.Enumerate)), .. RestoreOnlyProperties];
         try
         {
             if (solutions.Count > 1)
@@ -134,7 +154,7 @@ public sealed class PackageRestoreRunner(
             }
 
             var fallback = await RunPerSolutionAsync(
-                    checkoutDir, solutions, globals, Remaining(deadline, stopwatch), cancellationToken, environment)
+                    checkoutDir, solutions, globals, Remaining(deadline, stopwatch), cancellationToken, environment, scratchDir)
                 .ConfigureAwait(false);
             return fallback with { Timeout = deadline, Elapsed = stopwatch.Elapsed, CredentialsUnavailable = credentialsUnavailable };
         }
@@ -201,11 +221,11 @@ public sealed class PackageRestoreRunner(
     private async Task<PackageRestoreOutcome> RunPerSolutionAsync(
         string checkoutDir, IReadOnlyList<string> solutions, IReadOnlyList<KeyValuePair<string, string>> globals,
         TimeSpan deadline, CancellationToken cancellationToken,
-        IReadOnlyDictionary<string, string> environment)
+        IReadOnlyDictionary<string, string> environment, string? scratchDir)
     {
         var parser = new RestoreOutputParser(checkoutDir);
         var stopwatch = Stopwatch.StartNew();
-        int attempted = 0, succeeded = 0, notStarted = 0;
+        int attempted = 0, succeeded = 0, notStarted = 0, retried = 0, retriedProjects = 0;
         var timedOut = false;
 
         foreach (var solution in solutions)
@@ -218,7 +238,27 @@ public sealed class PackageRestoreRunner(
             }
 
             attempted++;
-            var result = await RunOneAsync(solution, globals, remaining, parser, cancellationToken, environment).ConfigureAwait(false);
+            var attempt = new RestoreOutputParser(checkoutDir);
+            var result = await RunOneAsync(solution, globals, remaining, attempt, cancellationToken, environment).ConfigureAwait(false);
+            var retrySucceeded = false;
+            if (result == RunResult.Failed && AnyProjectWithoutAssets(solution))
+            {
+                // Issue #296: a graph-level error leaves projects of the solution without assets. Restore its
+                // projects one by one so only the ones that really cannot restore stay unrestored. A failure that
+                // left every project its assets file (an ordinary per-project error) is reported as it is.
+                var retry = await RetryPerProjectAsync(
+                        solution, globals, deadline - stopwatch.Elapsed, parser, cancellationToken, scratchDir, environment)
+                    .ConfigureAwait(false);
+                if (retry is { Result: not RunResult.NotStarted } done)
+                {
+                    retried++;
+                    retriedProjects += done.Projects;
+                    result = done.Result;
+                    retrySucceeded = result == RunResult.Succeeded;
+                }
+            }
+            if (!retrySucceeded)
+                parser.MergeFrom(attempt);
             switch (result)
             {
                 case RunResult.Succeeded:
@@ -241,6 +281,8 @@ public sealed class PackageRestoreRunner(
             SolutionsSelected = solutions.Count,
             SolutionsSucceeded = succeeded,
             SolutionsNotStarted = notStarted,
+            SolutionsRetriedPerProject = retried,
+            ProjectsRetried = retriedProjects,
             TimedOut = timedOut,
             Timeout = deadline,
             Elapsed = stopwatch.Elapsed,
@@ -251,9 +293,20 @@ public sealed class PackageRestoreRunner(
         };
         log?.Invoke(
             $"package restore: {succeeded}/{attempted} solution(s) restored cleanly in {outcome.Elapsed.TotalSeconds:0.#}s" +
+            (retried > 0 ? $"; {retried} solution(s) retried per project ({retriedProjects} project(s))" : string.Empty) +
             (timedOut ? " (timed out)" : string.Empty) +
             (outcome.Projects.Count > 0 ? $"; {outcome.Projects.Count} project(s) reported restore errors" : string.Empty) + ".");
         return outcome;
+    }
+
+    // True when a declared project of the solution has no assets file. Only the default obj/ location is checked (a
+    // custom BaseIntermediateOutputPath/MSBuildProjectExtensionsPath is not resolved here, so such a project reads as
+    // missing and a failed restore of it is retried, which is harmless). An unreadable solution counts as missing.
+    private static bool AnyProjectWithoutAssets(string solution)
+    {
+        var declared = SolutionProjectEnumerator.Enumerate(solution);
+        return declared.Any(project =>
+            !File.Exists(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(project)) ?? ".", "obj", "project.assets.json")));
     }
 
     private async Task<PackageRestoreOutcome?> RunProjectUnionAsync(
@@ -262,52 +315,93 @@ public sealed class PackageRestoreRunner(
         IReadOnlyDictionary<string, string> environment)
     {
         var stopwatch = Stopwatch.StartNew();
+        var parser = new RestoreOutputParser(checkoutDir);
+        var traversal = await RunTraversalAsync(
+                checkoutDir, projects, globals, recursive: false, deadline, parser, cancellationToken, scratchDir, environment)
+            .ConfigureAwait(false);
+        if (traversal is not { } result)
+            return null;
+
+        var timedOut = result == RunResult.TimedOut;
+        var outcome = new PackageRestoreOutcome
+        {
+            SolutionsAttempted = 1,
+            SolutionsSelected = solutionCount,
+            SolutionsSucceeded = result == RunResult.Succeeded ? 1 : 0,
+            SolutionsNotStarted = result == RunResult.NotStarted ? 1 : 0,
+            TimedOut = timedOut,
+            Timeout = deadline,
+            Elapsed = stopwatch.Elapsed,
+            ProjectsAttempted = projects.Count,
+            UsedProjectUnion = true,
+            Projects = parser.Projects(),
+            ProjectsDropped = parser.ProjectsDropped,
+            GeneralCodes = parser.GeneralCodes(),
+            SourceUnreachableGeneral = parser.SourceUnreachableGeneral
+        };
+        log?.Invoke(
+            $"package restore: {projects.Count} distinct project(s) from {solutionCount} selected solution(s) " +
+            $"in {outcome.Elapsed.TotalSeconds:0.#}s" +
+            (timedOut ? " (timed out)" : string.Empty) +
+            (outcome.Projects.Count > 0 ? $"; {outcome.Projects.Count} project(s) reported restore errors" : string.Empty) +
+            ".");
+        return outcome;
+    }
+
+    // Issue #296: the per-project retry of one solution whose restore failed. Null means no retry was possible (the
+    // time is spent, a project path is unsafe in an MSBuild property, the solution lists no project, or the traversal
+    // could not be staged), so the caller keeps the failed attempt's findings.
+    private async Task<(RunResult Result, int Projects)?> RetryPerProjectAsync(
+        string solution, IReadOnlyList<KeyValuePair<string, string>> globals, TimeSpan deadline,
+        RestoreOutputParser parser, CancellationToken cancellationToken, string? scratchDir,
+        IReadOnlyDictionary<string, string> environment)
+    {
+        if (deadline <= TimeSpan.Zero)
+            return null;
+        var solutionPath = Path.GetFullPath(solution);
+        var declared = SolutionProjectEnumerator.Enumerate(solution);
+        if (declared.Count == 0 || !SafeForMsBuildProperty(solutionPath))
+            return null;
+        var projects = new List<UnionProject>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var project in declared)
+        {
+            var projectPath = Path.GetFullPath(project);
+            if (!SafeForMsBuildProperty(projectPath))
+                return null;
+            if (seen.Add(projectPath))
+                projects.Add(new UnionProject(projectPath, solutionPath));
+        }
+
+        log?.Invoke(
+            $"package restore of '{Path.GetFileName(solution)}' failed as a whole; retrying its {projects.Count} project(s) one by one.");
+        var workingDirectory = Path.GetDirectoryName(solutionPath) ?? Environment.CurrentDirectory;
+        var result = await RunTraversalAsync(
+                workingDirectory, projects, globals, recursive: true, deadline, parser, cancellationToken, scratchDir, environment)
+            .ConfigureAwait(false);
+        return result is { } ran ? (ran, projects.Count) : null;
+    }
+
+    // Stages the generated MSBuild traversal in scratch, runs it and removes it. Null when it could not be staged.
+    private async Task<RunResult?> RunTraversalAsync(
+        string workingDirectory, IReadOnlyList<UnionProject> projects, IReadOnlyList<KeyValuePair<string, string>> globals,
+        bool recursive, TimeSpan deadline, RestoreOutputParser parser, CancellationToken cancellationToken, string? scratchDir,
+        IReadOnlyDictionary<string, string> environment)
+    {
         var stagingRoot = Path.GetFullPath(scratchDir ?? Path.GetTempPath());
         var stagingDir = Path.Combine(stagingRoot, $"package-restore-{Guid.NewGuid():N}");
         try
         {
             Directory.CreateDirectory(stagingDir);
             var traversal = Path.Combine(stagingDir, "RestoreUnion.proj");
-            await File.WriteAllTextAsync(traversal, BuildUnionProject(projects, globals), cancellationToken).ConfigureAwait(false);
+            await File.WriteAllTextAsync(traversal, BuildUnionProject(projects, globals, recursive), cancellationToken)
+                .ConfigureAwait(false);
 
-            var parser = new RestoreOutputParser(checkoutDir);
-            RunResult result;
             if (deadline <= TimeSpan.Zero)
-            {
-                result = RunResult.TimedOut;
-            }
-            else
-            {
-                result = await RunProcessAsync(
-                        CreateUnionStartInfo(traversal, checkoutDir, environment), traversal, deadline, parser, cancellationToken)
-                    .ConfigureAwait(false);
-            }
-
-            var timedOut = result == RunResult.TimedOut;
-            var succeeded = result == RunResult.Succeeded ? 1 : 0;
-            var outcome = new PackageRestoreOutcome
-            {
-                SolutionsAttempted = 1,
-                SolutionsSelected = solutionCount,
-                SolutionsSucceeded = succeeded,
-                SolutionsNotStarted = result == RunResult.NotStarted ? 1 : 0,
-                TimedOut = timedOut,
-                Timeout = deadline,
-                Elapsed = stopwatch.Elapsed,
-                ProjectsAttempted = projects.Count,
-                UsedProjectUnion = true,
-                Projects = parser.Projects(),
-                ProjectsDropped = parser.ProjectsDropped,
-                GeneralCodes = parser.GeneralCodes(),
-                SourceUnreachableGeneral = parser.SourceUnreachableGeneral
-            };
-            log?.Invoke(
-                $"package restore: {projects.Count} distinct project(s) from {solutionCount} selected solution(s) " +
-                $"in {outcome.Elapsed.TotalSeconds:0.#}s" +
-                (timedOut ? " (timed out)" : string.Empty) +
-                (outcome.Projects.Count > 0 ? $"; {outcome.Projects.Count} project(s) reported restore errors" : string.Empty) +
-                ".");
-            return outcome;
+                return RunResult.TimedOut;
+            return await RunProcessAsync(
+                    CreateUnionStartInfo(traversal, workingDirectory, environment), traversal, deadline, parser, cancellationToken)
+                .ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -315,7 +409,7 @@ public sealed class PackageRestoreRunner(
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
         {
-            log?.Invoke($"package restore could not prepare its project union: {ex.GetType().Name}.");
+            log?.Invoke($"package restore could not prepare its project traversal: {ex.GetType().Name}.");
             return null;
         }
         finally
@@ -703,7 +797,8 @@ public sealed class PackageRestoreRunner(
     private static bool SafeForMsBuildProperty(string value) =>
         !value.Contains(';') && !value.Contains('$') && !value.Contains('%');
 
-    private static string BuildUnionProject(IReadOnlyList<UnionProject> projects, IReadOnlyList<KeyValuePair<string, string>> globals)
+    private static string BuildUnionProject(
+        IReadOnlyList<UnionProject> projects, IReadOnlyList<KeyValuePair<string, string>> globals, bool recursive)
     {
         var xml = new StringBuilder();
         xml.AppendLine("<Project>");
@@ -718,8 +813,9 @@ public sealed class PackageRestoreRunner(
                 "Platform=AnyCPU",
                 "DesignTimeBuild=true",
                 "RestoreIgnoreFailedSources=true",
-                "RestoreProjectReferences=false",
-                "RestoreRecursive=false",
+                // The union schedules every project itself. A per-project retry (#296) restores each project's
+                // references too, so a referenced project outside the solution still gets its assets.
+                .. recursive ? Array.Empty<string>() : ["RestoreProjectReferences=false", "RestoreRecursive=false"],
                 "BuildingSolutionFile=true",
                 $"SolutionDir={solutionDir}",
                 $"SolutionName={Path.GetFileNameWithoutExtension(project.SolutionPath)}",

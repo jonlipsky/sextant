@@ -88,8 +88,15 @@ public static class IndexConfigurationHash
     /// a <c>net*-macos</c> project evaluates, restores and binds on the Linux worker. The same commit now yields more
     /// references and call edges, fewer candidate occurrences, and can publish complete where it was partial.
     /// </para>
+    /// <para>
+    /// <c>"9"</c> to <c>"10"</c> (issue #296): the service's package restore no longer fails on a restore warning
+    /// (<c>TreatWarningsAsErrors=false</c> and an empty <c>WarningsAsErrors</c> as restore-only globals), and a per-solution
+    /// restore that fails as a whole (an error raised while NuGet builds the restore graph leaves every project of the
+    /// solution without <c>project.assets.json</c>) is retried project by project. Projects that were left unrestored now
+    /// restore and bind, so the same commit yields more references and call edges and can publish complete where it was partial.
+    /// </para>
     /// </remarks>
-    public const string AnalyzerVersion = "9";
+    public const string AnalyzerVersion = "10";
 
     /// <summary>
     /// Computes the configuration hash for a resolved profile. The canonical pre-image is a fixed,

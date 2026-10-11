@@ -32,6 +32,10 @@ A repository without a Windows target evaluates and restores exactly as before. 
 checkout's files, never on the host. The service worker image pre-installs `Microsoft.WindowsDesktop.App.Ref` into
 `dotnet/packs`, so a Windows repository's jobs do not download it each time.
 
+The service's restore additionally passes `TreatWarningsAsErrors=false` and an empty `WarningsAsErrors` (issue #296). These
+are restore-only and are not part of `EvaluationGlobalProperties`: the workspace load keeps the repository's own warning
+settings. See [Package restore before the load](service.md#package-restore-before-the-load).
+
 Apple targets are not fixed by a property: they need their workload. The service worker image installs the `macos`
 workload, so `net*-macos` projects evaluate, restore and bind on the Linux worker. The iOS and Mac Catalyst workloads
 cannot be installed on Linux, so `net*-ios`/`net*-maccatalyst` projects still load degraded there (issue #89). A local

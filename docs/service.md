@@ -419,7 +419,16 @@ not reached. A restore that exits non-zero without a recognizable error line sti
 partial verdict. The process tree is killed on expiry or cancellation, stdin is closed, and
 stdout/stderr are drained concurrently with a bounded wait, so a leaked MSBuild node cannot hang the job.
 
-A restore problem is **not automatically retried**: the job publishes partial with the notes and reason above, and a later ordinary ensure of the same
+A restore warning cannot fail the restore (issue #296, `AnalyzerVersion` 10): the restore, and only the restore, passes
+`TreatWarningsAsErrors=false` and an empty `WarningsAsErrors`, so a repository that promotes warnings to errors (for
+example through a superproject's `Directory.Build.props`) does not turn `NU1505` (duplicate `PackageDownload`) into a
+failure. And one project's restore-graph error does not leave the rest of a solution unrestored: when a per-solution
+`dotnet restore` exits non-zero (not on a timeout or cancellation), the worker retries that solution's projects one by
+one through the same per-project MSBuild traversal, so every restorable project gets its `project.assets.json` and only
+the projects that still fail are reported (`package_restore_incomplete`). The retry applies only to the per-solution restore path (the multi-solution union already restores each project in isolation) and only when the failure left a project without `obj/project.assets.json`. The retry is logged and leaves a
+`coverage.notes` line; it runs within the restore step's remaining time.
+
+A restore problem is **not automatically retried across jobs**: the job publishes partial with the notes and reason above, and a later ordinary ensure of the same
 commit attaches to that snapshot. Retrying would rarely help, because each job restores into its own cold
 `NUGET_PACKAGES` (a timed-out restore would time out again), and a credential-gated feed never becomes
 reachable. The restore coverage reason and binding-health verdict below tell an agent that results may be missing; the next commit
