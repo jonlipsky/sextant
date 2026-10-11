@@ -100,6 +100,8 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_MAX_PER_PASS` | The most idle branch pointers one tick retires (least recently moved first; the rest wait for the next tick). Clamped to `1000`; a non-numeric or non-positive value uses the default | `20` |
 | `SEXTANT_SERVICE_RETENTION_SCHEDULE` | Run the bounded retention pass once a day from the maintenance loop (issue #299). A malformed boolean **fails startup** | `true` |
 | `SEXTANT_SERVICE_RETENTION_SCHEDULE_HOUR_UTC` | The UTC hour (`0`–`23`) from which the day's scheduled retention runs: the first tick at or after it runs the pass, once per UTC day. Any other value uses the default | `3` |
+| `SEXTANT_SERVICE_RETENTION_UNIT_MAX_SECONDS` | Hard cap on one retention deletion unit (a snapshot project cascade). A unit over it is rolled back, reported as oversized and retried on a later pass (issue #303). `0` or less and invalid values use the default; larger values are capped at `600` | `60` |
+| `SEXTANT_SERVICE_RETENTION_PASS_SECONDS` | Work budget of the scheduled retention pass, and the ceiling for `?seconds=` on `POST /control/retention` (issue #303). Clamped to `3600`; a non-numeric or non-positive value uses the default | `600` |
 | `SEXTANT_SERVICE_PEERS` | Comma-separated peer base URLs for federation | none |
 | `SEXTANT_SERVICE_REMOTE_TIMEOUT_SECONDS` | Per-request remote-fetch timeout | `10` |
 | `SEXTANT_SERVICE_CONTRIB_REQUIRE_AUTH` | Require contribution authorization (Phase 16) | `false` (dev-open) |
@@ -884,7 +886,7 @@ The host deliberately **separates control endpoints from query endpoints**, and 
 | `GET /control/status/{jobId}` | control | control token | Job status + per-project diagnostics (criterion 5) + checkout `coverage` (#119) + phase `timings` (#267, see [Job phase timings](#observability-criterion-5)). For a user caller, a job on a repository it cannot read is the same `404` as an unknown id (SVC-4). |
 | `GET /control/resolve` | control | control token | Resolve a repository branch (`?branch=`, else the default) to its current published snapshot (+ its `coverage`, #119), plus `commit_sha`, the resolved `branch` name, `is_default` and `head_sequence` (SVC-7; a null `commit_sha`/`head_sequence` is omitted), and `current_identity_hash` + `identity_current`: whether the snapshot is what an ensure of its commit would build on this node now (both omitted when there is no `commit_sha` or the head is a contribution; see [Identity currency](#branch-pointer-guards-head-cas-branch_update-none-retire-svc-67)). For a user caller, a repository it cannot read is the same bare `404` as an absent one (SVC-4). |
 | `POST /control/branches/retire` | control | control token | Delete a branch pointer (`{repository, branch, expected_head_commit?}`, SVC-6); its snapshots stay for retention. The service's idle-branch rule retires idle non-default branches through the same path (issue #299, see [Maintenance loop](#maintenance-loop-idle-branch-retirement--scheduled-retention-issue-299)). `200 {"retired":true}`, or `{"retired":false}` for a missing branch (idempotent). The default branch or a head-CAS mismatch is `409 {"status":"rejected","reason":"default_branch"\|"head_mismatch"}`; a refused URL or blank branch is `400`. When the retirement has not applied within `CONTROL_WRITE_WAIT_SECONDS` (a production holds the writer), the answer is `202 {"status":"accepted"}`: it applies once the writer frees, with both guards evaluated then (issue #158, see [Queued control writes](#queued-control-writes-issue-158)). `503 {"status":"unavailable"}` once shutdown began (nothing queued). Audited `retire`. A user caller is refused with `403 {"error":"caller_not_allowed"}` (issue #193, see [User callers on the control plane](#user-callers-on-the-control-plane-issue-193)). |
-| `POST /control/retention` | control | control token | Run the service-owned retention/GC pass (`?execute=true` to apply). A user caller is refused (`403 caller_not_allowed`). |
+| `POST /control/retention` | control | control token | Run the service-owned retention/GC pass (`?execute=true` to apply, `?seconds=N` for a longer budget up to `SEXTANT_SERVICE_RETENTION_PASS_SECONDS`, default 10 s). A user caller is refused (`403 caller_not_allowed`). |
 | `PUT`/`DELETE`/`GET /control/grants/self` | control | control token + `act=user` assertion | The caller's own repository grants (see [Repository grants](#repository-grants-and-visibility-svc-4)). |
 | `PUT`/`DELETE /control/grants/tenant` | control | control token + `act=application` assertion | The tenant-wide repository grants. |
 | `GET /control/grants?scope=tenant` | control | control token + `act=application` assertion | The tenant's distinct reconcile targets, with counts and no user ids. |
@@ -1975,11 +1977,39 @@ generations/snapshots/projects, API rows, and *currently* orphaned file versions
 orphaned by future cascades are not simulated. `reclaimed_bytes_known: false` means no physical-space
 estimate is available; `reclaimed_bytes: 0` is not a claim that nothing can be reclaimed.
 
-`?execute=true` has a **10-second per-pass work budget, including writer-queue wait**, and releases the
-service writer between transactions. Every batch recomputes eligibility inside `BEGIN IMMEDIATE`:
-at most one project cascade/one orphan snapshot, 256 run rows, 256 API rows, and 256 orphan file versions.
+`?execute=true` has a **per-pass work budget, including writer-queue wait**, and releases the
+service writer between transactions. The budget is 10 s by default for the interactive call; `?seconds=N`
+raises it up to `SEXTANT_SERVICE_RETENTION_PASS_SECONDS` (default 600, capped at 3600), which is also the budget
+of the scheduled daily pass (issue #303).
+
+**Plan, then batch (issue #303).** The pass first computes its plan on a read connection, with no writer held: the
+protected set (pending snapshots, branch pointers, open PRs, uncertain ownership, and everything they reach over
+`base_snapshot_id` and `snapshot_dependencies`, plus every provider a retained consumer reads) is two recursive-CTE
+closures over a temp edge table, not managed fixpoint loops, so it scales to a catalog of tens of thousands of
+snapshots. Each batch then runs under `BEGIN IMMEDIATE` and **re-verifies every candidate with direct checks**:
+still not pending, still on the generation it was planned on, and that generation is not staging, not the servable one
+and not provider-protected (a snapshot on a deleted generation only), not pointed at by any branch or open PR, and
+neither it nor any snapshot that reads it (base or provider) is outside the candidate set. An API-history commit is
+re-checked against the protection set and the keep window (newest `api_snapshot_keep_commits` by latest capture).
+A candidate that fails is skipped (`snapshots_skipped`), never deleted, and a snapshot created after the plan is never
+a candidate. At most one project cascade/one orphan snapshot, 256 run rows, 256 API rows, and 256 orphan file
+versions go in one batch. The report carries `batches` and `max_batch_writer_hold_ms`. A pass that stops on its
+budget reports what it computed and deleted so far (the counts are not zeroed); the next pass recomputes the plan and
+continues. API-history discovery gets at most half of what is left of the budget and is deferred to the next pass if
+it does not fit, so it can never keep snapshot GC from progressing.
 SQLite's progress handler interrupts long planning/deletion statements at a **2-second batch work
-deadline**; an interrupted cascade rolls back the whole batch. Native lock waits are 100 ms per attempt
+deadline**; an interrupted batch rolls back whole.
+
+**Oversized units (issue #303).** The 2-second batch deadline does not apply to the batch's one deletion unit (a
+single snapshot project cascade): a batch always completes at least one unit, so an unusually large cascade cannot
+stall retention, but a unit is bounded by a hard cap, `SEXTANT_SERVICE_RETENTION_UNIT_MAX_SECONDS` (default 60,
+`0` or less = default, capped at 600). A unit that runs past the cap is **rolled back whole** (a snapshot's deletion is never split
+across transactions, since a half-deleted snapshot could be re-selected by a branch advance), reported in the pass
+report as `oversized_snapshot_ids` / `oversized`, logged to stderr, and the pass continues with the next unit. The
+oversized snapshot stays; the service remembers it in memory and skips it for the rest of the UTC day (reported as
+`oversized_deferred`), then retries it. `max_batch_writer_hold_ms` shows the longest writer hold,
+which for a large cascade can approach the cap. Cancellation (including the end of the pass budget) still
+interrupts a unit and rolls the batch back as `time_budget`. Native lock waits are 100 ms per attempt
 with a one-second command retry limit. Request cancellation stops subsequent work and rolls back an
 in-progress batch; earlier committed batches remain applied and have `retention`/`complete` audit rows
 with detail `execute_batch`. A queued publish runs before the next retention batch.
@@ -2001,7 +2031,7 @@ These are cooperative work bounds, not real-time guarantees on filesystem I/O or
 A single project cascade that cannot finish within the deadline is deferred rather than partially
 deleting a potentially servable snapshot. Repeated `more_remaining`/`time_budget` responses require
 operator investigation; do not loop blindly. Since issue #299 the service's own [maintenance loop](#maintenance-loop-idle-branch-retirement--scheduled-retention-issue-299)
-submits **one** bounded `execute=true` pass a day (from `SEXTANT_SERVICE_RETENTION_SCHEDULE_HOUR_UTC`, default
+submits **one** bounded `execute=true` pass a day (budget `SEXTANT_SERVICE_RETENTION_PASS_SECONDS`, default 600) (from `SEXTANT_SERVICE_RETENTION_SCHEDULE_HOUR_UTC`, default
 03:00 UTC; `SEXTANT_SERVICE_RETENTION_SCHEDULE=false` turns it off) and records its report in the logs and
 `/control/metrics`. It never loops on `more_remaining`.
 

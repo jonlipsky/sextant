@@ -12,6 +12,10 @@ public sealed record MaintenancePolicy
     internal const int DefaultBranchIdleRetireDays = 7;
     internal const int DefaultBranchIdleRetireMaxPerPass = 20;
     internal const int DefaultRetentionHourUtc = 3;
+    internal const int DefaultRetentionPassSeconds = 600;
+
+    /// <summary>The longest retention pass, in seconds (1 hour); a longer value is clamped to it.</summary>
+    public const int MaxRetentionPassSeconds = 3600;
 
     /// <summary>The longest tick interval, in minutes (7 days); a longer value is clamped to it.</summary>
     public const int MaxIntervalMinutes = 7 * 24 * 60;
@@ -57,6 +61,13 @@ public sealed record MaintenancePolicy
     /// once per UTC day. <c>SEXTANT_SERVICE_RETENTION_SCHEDULE_HOUR_UTC</c> (default 3).
     /// </summary>
     public int RetentionHourUtc { get; init; } = DefaultRetentionHourUtc;
+
+    /// <summary>
+    /// The time budget, in seconds, of one scheduled retention pass; also the ceiling of the <c>seconds</c> an interactive
+    /// <c>POST /control/retention</c> may ask for (its default stays 10). <c>SEXTANT_SERVICE_RETENTION_PASS_SECONDS</c>
+    /// (default 600; clamped to <see cref="MaxRetentionPassSeconds"/>).
+    /// </summary>
+    public int RetentionPassSeconds { get; init; } = DefaultRetentionPassSeconds;
 
     /// <summary>A one-line description of the effective policy for the startup log.</summary>
     public string Describe()

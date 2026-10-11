@@ -65,6 +65,7 @@ public class SymbolNamePrefixIndexMigrationTests
         Assert.Contains(25, IndexDatabase.IdentityNeutralMigrations);
         Assert.Contains(27, IndexDatabase.IdentityNeutralMigrations);
         Assert.Contains(28, IndexDatabase.IdentityNeutralMigrations);
+        Assert.Contains(31, IndexDatabase.IdentityNeutralMigrations);
         // Adding 025 left every snapshot identity (and so every published snapshot's reuse) as it was at 24.
         Assert.AreEqual(26, versions.Where(v => !IndexDatabase.IdentityNeutralMigrations.Contains(v)).Max());
     }

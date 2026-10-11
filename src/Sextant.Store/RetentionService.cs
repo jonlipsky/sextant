@@ -37,17 +37,112 @@ public sealed record RetentionReport
     /// <summary>Project-version rows (and their cascaded symbols/occurrences/comments/api rows) reclaimed by snapshot-data GC (issue #46).</summary>
     public int SnapshotProjectVersionsDeleted { get; init; }
 
+    /// <summary>
+    /// Snapshots the pass computed as collectable but did not delete because the in-batch re-check found them
+    /// protected by then (issue #303). The next pass recomputes them.
+    /// </summary>
+    public int SnapshotsSkipped { get; init; }
+
+    /// <summary>
+    /// Snapshots whose deletion unit ran past <c>UnitMaxSeconds</c> and was rolled back whole (issue #303); the pass
+    /// went on with the next one and a later pass retries it.
+    /// </summary>
+    public IReadOnlyList<long> OversizedSnapshotIds { get; init; } = [];
+
+    public int Oversized => OversizedSnapshotIds.Count;
+
+    /// <summary>
+    /// Snapshots the service left out of this pass's plan because an earlier pass rolled their unit back as oversized
+    /// (issue #303); they stay out for the rest of the UTC day. Reported as <c>oversized_deferred</c>.
+    /// </summary>
+    public IReadOnlyList<long> OversizedDeferredSnapshotIds { get; init; } = [];
+
+    public int OversizedDeferred => OversizedDeferredSnapshotIds.Count;
+
     public long ReclaimedBytes { get; init; }
     /// <summary>Space estimates are unavailable on a read-only plan; execution measures reusable pages, not disk shrinkage.</summary>
     public bool ReclaimedBytesKnown { get; init; }
     public bool MoreRemaining { get; init; }
     public string? StopReason { get; init; }
 
+    /// <summary>Write batches an executed pass ran (issue #303).</summary>
+    public int Batches { get; init; }
+
+    /// <summary>The longest time one batch held the writer, in milliseconds (issue #303). Zero on a dry run.</summary>
+    public double MaxBatchWriterHoldMs { get; init; }
+
     /// <summary>
     /// Stored source-text blobs (issue #244) the pass deleted because no file version references them any more.
     /// Null on a dry run and where no source-text store is kept.
     /// </summary>
     public int? SourceTextsDeleted { get; init; }
+}
+
+/// <summary>
+/// What an executed pass computed on a read connection (issue #303): the generation classification and the
+/// candidates the write batches then delete. A candidate is only a candidate: every batch re-verifies it under the
+/// writer, so anything that became protected since the plan was computed is skipped.
+/// </summary>
+public sealed class RetentionPlan
+{
+    private readonly List<long> _snapshots;
+    private readonly List<RetentionGeneration> _runs;
+    private readonly List<string> _commits;
+    private int _snapshotCursor;
+    private int _runCursor;
+    private int _commitCursor;
+
+    internal RetentionPlan(RetentionReport report, List<long> snapshots, List<RetentionGeneration> runs,
+        List<string> commits, bool apiDeferred, string? stopReason = null, HashSet<long>? deletableRunIds = null,
+        Dictionary<long, long?>? planRunIds = null)
+    {
+        PlanRunIds = planRunIds ?? [];
+        DeletableRunIds = deletableRunIds ?? [];
+        Report = report;
+        _snapshots = snapshots;
+        SnapshotSet = snapshots.ToHashSet();
+        _runs = runs;
+        _commits = commits;
+        ApiDeferred = apiDeferred;
+        StopReason = stopReason;
+    }
+
+    /// <summary>The classification (protected/retained counts) with nothing deleted yet.</summary>
+    public RetentionReport Report { get; }
+
+    /// <summary>Set when the plan could not be computed within its budget; there is nothing to execute.</summary>
+    public string? StopReason { get; }
+
+    /// <summary>The API-history candidates could not be computed in time; the next pass does them.</summary>
+    public bool ApiDeferred { get; }
+
+    internal HashSet<long> SnapshotSet { get; }
+
+    /// <summary>The generation each candidate was on when planned; a candidate that moved is no longer one.</summary>
+    internal Dictionary<long, long?> PlanRunIds { get; }
+
+    /// <summary>Generations the plan may delete; a candidate on any other generation is a quota eviction.</summary>
+    internal HashSet<long> DeletableRunIds { get; }
+    public int SnapshotCandidates => _snapshots.Count;
+
+    /// <summary>Drops candidates from the work list (before any batch ran); returns those that were in it.</summary>
+    public IReadOnlyList<long> ExcludeSnapshots(IReadOnlyCollection<long> ids)
+    {
+        var excluded = _snapshots.Where(ids.Contains).ToList();
+        if (excluded.Count > 0) _snapshots.RemoveAll(ids.Contains);
+        return excluded;
+    }
+
+    internal long? PeekSnapshot() => _snapshotCursor < _snapshots.Count ? _snapshots[_snapshotCursor] : null;
+    internal void AdvanceSnapshot() => _snapshotCursor++;
+    internal RetentionGeneration? PeekRun() => _runCursor < _runs.Count ? _runs[_runCursor] : null;
+    internal void AdvanceRun() => _runCursor++;
+    internal string? PeekCommit() => _commitCursor < _commits.Count ? _commits[_commitCursor] : null;
+    internal void AdvanceCommit() => _commitCursor++;
+    internal bool HasWork => PeekSnapshot() != null || PeekRun() != null || PeekCommit() != null;
+
+    internal (int, int, int) Mark() => (_snapshotCursor, _runCursor, _commitCursor);
+    internal void Restore((int, int, int) mark) => (_snapshotCursor, _runCursor, _commitCursor) = mark;
 }
 
 /// <summary>
@@ -60,8 +155,12 @@ public sealed record RetentionReport
 /// Two invariants are absolute: the currently-servable last-complete generation is NEVER deleted (a
 /// hard guard independent of the provider set, so retention can never trip the Phase-7 rebuild gate),
 /// and anything a provider protects — branch/PR snapshots, submodule pins, active overlays once those
-/// land — is spared even if it falls outside a keep window. Plans use a consistent read transaction.
-/// Each execution batch reclassifies eligibility under BEGIN IMMEDIATE before deleting any data.
+/// land — is spared even if it falls outside a keep window.
+///
+/// A pass is two-phase (issue #303). The plan (<see cref="CreatePlan"/>) classifies everything with set-based SQL on
+/// any connection (the service uses an independent reader, never holding the writer). The batches
+/// (<see cref="ExecuteBatch(RetentionPlan, CancellationToken, TimeSpan?, Action?)"/>) then delete a few candidates each under
+/// <c>BEGIN IMMEDIATE</c>, re-verifying with cheap direct checks that each is still unprotected before touching it.
 /// </summary>
 public sealed class RetentionService
 {
@@ -70,9 +169,15 @@ public sealed class RetentionService
     private readonly IReadOnlyList<IRetentionProtectionProvider> _providers;
     private RetentionWorkBudget? _budget;
 
+    /// <summary>The default pass budget (an interactive run); the service passes its own.</summary>
     public static TimeSpan PassTimeLimit { get; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>The longest one write batch may run, which bounds how long it holds the writer.</summary>
     public static TimeSpan BatchTimeLimit { get; } = TimeSpan.FromSeconds(2);
     public const int BatchRowLimit = 256;
+
+    /// <summary>Test seam: runs inside a batch's transaction right before a snapshot unit is deleted.</summary>
+    internal Action<long>? BeforeUnitDelete { get; set; }
 
     public RetentionService(
         SqliteConnection connection,
@@ -89,15 +194,16 @@ public sealed class RetentionService
         [new LastCompleteRunProtection(), new BranchPointerProtection(), new OverlayBaseProtection(), new SubmoduleProviderProtection(), new PullRequestSnapshotProtection()];
 
     /// <summary>Reports what retention would do without modifying the database.</summary>
-    public RetentionReport Plan(CancellationToken cancellationToken = default)
+    public RetentionReport Plan(CancellationToken cancellationToken = default, TimeSpan? timeLimit = null)
     {
-        using var budget = new RetentionWorkBudget(_connection, PassTimeLimit, cancellationToken);
+        using var budget = new RetentionWorkBudget(_connection, timeLimit ?? PassTimeLimit, cancellationToken);
         _budget = budget;
         try
         {
             budget.Check();
             Exec("BEGIN;");
-            var (report, snapshots, commits, protections) = Classify();
+            var (report, snapshots, _, protections) = ClassifyCore();
+            var commits = DeletableApiCommits(protections);
             var projects = snapshots.Sum(id => CountRows(RetentionCount.ProjectVersions, id));
             var apiRows = commits.Sum(commit => CountRows(RetentionCount.ApiRows, commit));
             var files = _policy.PruneSupersededSourceBlobs ? OrphanFileVersionIds(protections).Count : 0;
@@ -123,84 +229,247 @@ public sealed class RetentionService
         }
     }
 
-    /// <summary>Applies bounded batches. Service callers acquire/release their writer gate around ExecuteBatch instead.</summary>
-    public RetentionReport Execute(CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Computes the protected set and the candidates in one read transaction (no write). The generation/snapshot
+    /// classification is bounded by <paramref name="timeLimit"/>; the API-history discovery gets at most half of what
+    /// is left, and is deferred to the next pass when it does not fit, so a huge <c>api_surface_snapshots</c> table
+    /// can never keep snapshot GC from progressing.
+    /// </summary>
+    public RetentionPlan CreatePlan(CancellationToken cancellationToken = default, TimeSpan? timeLimit = null)
     {
+        var limit = timeLimit ?? PassTimeLimit;
         var started = Stopwatch.GetTimestamp();
-        var report = new RetentionReport { DryRun = false };
+        RetentionReport report;
+        List<long> snapshots;
+        HashSet<long> deletableRuns;
+        Dictionary<long, long?> planRunIds;
+        using (var budget = new RetentionWorkBudget(_connection, limit, cancellationToken))
+        {
+            _budget = budget;
+            try
+            {
+                budget.Check();
+                Exec("BEGIN;");
+                (report, snapshots, deletableRuns, _) = ClassifyCore();
+                planRunIds = RunIdsOf(snapshots);
+            }
+            catch (Exception ex) when (IsBudgetOrBusy(ex, budget))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                return new RetentionPlan(new RetentionReport { DryRun = false, MoreRemaining = true },
+                    [], [], [], false, StopReason(ex));
+            }
+            finally
+            {
+                budget.Dispose();
+                _budget = null;
+                if (SQLitePCL.raw.sqlite3_get_autocommit(_connection.Handle) == 0) Exec("ROLLBACK;");
+            }
+        }
+
+        var runs = report.Deleted.ToList();
+        var commits = new List<string>();
+        var apiDeferred = false;
+        var remaining = limit - Stopwatch.GetElapsedTime(started);
+        if (remaining <= TimeSpan.Zero)
+            apiDeferred = true;
+        else
+        {
+            using var budget = new RetentionWorkBudget(_connection, remaining / 2, cancellationToken);
+            _budget = budget;
+            try
+            {
+                budget.Check();
+                Exec("BEGIN;");
+                commits = DeletableApiCommits(BuildProtections());
+            }
+            catch (Exception ex) when (IsBudgetOrBusy(ex, budget))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                commits = [];
+                apiDeferred = true;
+            }
+            finally
+            {
+                budget.Dispose();
+                _budget = null;
+                if (SQLitePCL.raw.sqlite3_get_autocommit(_connection.Handle) == 0) Exec("ROLLBACK;");
+            }
+        }
+
+        return new RetentionPlan(report with { DryRun = false, Deleted = [] }, snapshots, runs, commits, apiDeferred,
+            deletableRunIds: deletableRuns, planRunIds: planRunIds);
+    }
+
+    /// <summary>Applies bounded batches. Service callers acquire/release their writer gate around ExecuteBatch instead.</summary>
+    public RetentionReport Execute(CancellationToken cancellationToken = default, TimeSpan? timeLimit = null)
+    {
+        var limit = timeLimit ?? PassTimeLimit;
+        var started = Stopwatch.GetTimestamp();
+        var plan = CreatePlan(cancellationToken, limit);
+        if (plan.StopReason != null)
+            return plan.Report with { StopReason = plan.StopReason };
+        var report = plan.Report;
         do
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var remaining = PassTimeLimit - Stopwatch.GetElapsedTime(started);
+            var remaining = limit - Stopwatch.GetElapsedTime(started);
             if (remaining <= TimeSpan.Zero)
                 return report with { MoreRemaining = true, StopReason = "time_budget" };
-            var batch = ExecuteBatch(cancellationToken, remaining < BatchTimeLimit ? remaining : BatchTimeLimit);
+            var batch = ExecuteBatch(plan, cancellationToken, remaining < BatchTimeLimit ? remaining : BatchTimeLimit);
             report = Combine(report, batch);
             if (batch.StopReason != null) return report;
         } while (report.MoreRemaining);
-        return report;
+        return plan.ApiDeferred ? report with { MoreRemaining = true, StopReason = "time_budget" } : report;
     }
 
-    /// <summary>One atomic batch, including fresh eligibility checks. Interrupted cascades roll back the entire batch.</summary>
+    /// <summary>One atomic batch computed from a fresh plan. Interrupted cascades roll back the entire batch.</summary>
     public RetentionReport ExecuteBatch(CancellationToken cancellationToken = default, TimeSpan? timeLimit = null,
         Action? beforeCommit = null)
     {
+        var limit = timeLimit ?? BatchTimeLimit;
+        var plan = CreatePlan(cancellationToken, limit);
+        if (plan.StopReason != null)
+            return plan.Report with { StopReason = plan.StopReason };
+        return ExecuteBatch(plan, cancellationToken, limit, beforeCommit);
+    }
+
+    /// <summary>
+    /// One atomic batch of <paramref name="plan"/>: under <c>BEGIN IMMEDIATE</c> it re-verifies each candidate with
+    /// direct checks (still not pending, on the servable generation, pointed at by a branch or open pull request, and
+    /// nothing outside the candidate set reads it through a base or provider edge), skips any that fail, and deletes one
+    /// project cascade of the first that passes. Interrupted cascades roll back the whole batch and the plan's position.
+    /// </summary>
+    public RetentionReport ExecuteBatch(RetentionPlan plan, CancellationToken cancellationToken = default,
+        TimeSpan? timeLimit = null, Action? beforeCommit = null)
+    {
         using var budget = new RetentionWorkBudget(_connection, timeLimit ?? BatchTimeLimit, cancellationToken);
         _budget = budget;
+        var held = Stopwatch.StartNew();
+        var mark = plan.Mark();
         try
         {
             budget.Check();
             Exec("BEGIN IMMEDIATE;");
-            var (report, snapshots, commits, protections) = Classify();
+            held.Restart();
+            var protections = BuildProtections();
+            var runStore = new IndexRunStore(_connection);
+            var servableId = runStore.GetLastCompleteRun()?.Id;
+            var openPullRequests = TableExists("pull_request_snapshots");
             var pageSize = ScalarLong("PRAGMA page_size;");
             var freeBefore = ScalarLong("PRAGMA freelist_count;");
             var projectsDeleted = 0;
             var snapshotsDeleted = 0;
+            var skipped = 0;
+
             // One project cascade at a time, never a whole multi-project snapshot in one transaction.
-            if (snapshots.Count > 0)
-            {
-                var id = snapshots[0];
-                WithdrawAffectedPublication(id, snapshots.ToHashSet());
-                using var cmd = _connection.CreateCommand();
-                cmd.CommandText = "DELETE FROM projects WHERE id IN (SELECT id FROM projects WHERE snapshot_id = @id ORDER BY id LIMIT 1);";
-                cmd.Parameters.AddWithValue("@id", id);
-                projectsDeleted = cmd.ExecuteNonQuery();
-                if (CountRows(RetentionCount.ProjectVersions, id) == 0)
-                    snapshotsDeleted = DeleteEmptySnapshot(id);
-            }
-            // Do not remove ledger rows ahead of snapshot GC's classification.
-            var deletedRuns = snapshots.Count == 0 ? report.Deleted.Take(BatchRowLimit).ToList() : [];
-            var runStore = new IndexRunStore(_connection);
-            foreach (var run in deletedRuns)
+            while (plan.PeekSnapshot() is long id)
             {
                 budget.Check();
-                runStore.DeleteRun(run.Id);
+                var verdict = VerifySnapshotDeletable(id, plan, servableId, openPullRequests, protections, out var affected);
+                if (verdict != SnapshotVerdict.Deletable)
+                {
+                    if (verdict == SnapshotVerdict.Protected) skipped++;
+                    plan.AdvanceSnapshot();
+                    continue;
+                }
+                // One unit always gets to finish, up to its own hard cap; a unit over the cap rolls back whole.
+                var unitMark = plan.Mark();
+                budget.BeginUnit(TimeSpan.FromSeconds(_policy.UnitMaxSeconds));
+                try
+                {
+                    BeforeUnitDelete?.Invoke(id);
+                    WithdrawAffectedPublication(affected);
+                    using var cmd = _connection.CreateCommand();
+                    cmd.CommandText = "DELETE FROM projects WHERE id IN (SELECT id FROM projects WHERE snapshot_id = @id ORDER BY id LIMIT 1);";
+                    cmd.Parameters.AddWithValue("@id", id);
+                    projectsDeleted = cmd.ExecuteNonQuery();
+                    if (CountRows(RetentionCount.ProjectVersions, id) == 0)
+                    {
+                        snapshotsDeleted = DeleteEmptySnapshot(id);
+                        plan.AdvanceSnapshot();
+                    }
+                    budget.Check();
+                }
+                catch (Exception ex) when (budget.UnitExpired && (ex is TimeoutException || ex is SqliteException { SqliteErrorCode: 9 }))
+                {
+                    if (SQLitePCL.raw.sqlite3_get_autocommit(_connection.Handle) == 0) Exec("ROLLBACK;");
+                    held.Stop();
+                    plan.Restore(unitMark);
+                    plan.AdvanceSnapshot();
+                    return plan.Report with
+                    {
+                        DryRun = false,
+                        OversizedSnapshotIds = [id],
+                        SnapshotsSkipped = skipped,
+                        Batches = 1,
+                        MaxBatchWriterHoldMs = held.Elapsed.TotalMilliseconds,
+                        MoreRemaining = plan.HasWork
+                    };
+                }
+                budget.EndUnit();
+                break;
             }
-            var apiDeleted = DeleteApiCommits(commits.Take(1).ToList());
+
+            // Do not remove ledger rows ahead of snapshot GC: they go once no snapshot data was touched in this batch.
+            var deletedRuns = new List<RetentionGeneration>();
+            if (plan.PeekSnapshot() is null && projectsDeleted == 0 && snapshotsDeleted == 0)
+            {
+                while (plan.PeekRun() is { } run && deletedRuns.Count < BatchRowLimit)
+                {
+                    budget.Check();
+                    plan.AdvanceRun();
+                    if (!VerifyRunDeletable(run.Id, servableId, protections)) continue;
+                    runStore.DeleteRun(run.Id);
+                    deletedRuns.Add(run);
+                }
+            }
+
+            var apiDeleted = 0;
+            if (plan.PeekCommit() is { } commit)
+            {
+                budget.Check();
+                if (protections.IsCommitProtected(commit) || IsInApiKeepWindow(commit))
+                    plan.AdvanceCommit();
+                else
+                {
+                    apiDeleted = DeleteApiCommits([commit]);
+                    if (apiDeleted < BatchRowLimit) plan.AdvanceCommit();
+                }
+            }
             var fileDeleted = _policy.PruneSupersededSourceBlobs ? PruneOrphanFileVersions(protections) : 0;
             var reclaimed = Math.Max(0, ScalarLong("PRAGMA freelist_count;") - freeBefore) * pageSize;
             budget.Check();
             beforeCommit?.Invoke();
             budget.Check();
             Exec("COMMIT;");
-            return report with
+            held.Stop();
+            return plan.Report with
             {
                 DryRun = false,
                 Deleted = deletedRuns,
                 SnapshotsDeleted = snapshotsDeleted,
                 SnapshotProjectVersionsDeleted = projectsDeleted,
+                SnapshotsSkipped = skipped,
                 ApiSnapshotsDeleted = apiDeleted,
                 FileVersionsDeleted = fileDeleted,
                 ReclaimedBytes = reclaimed,
                 ReclaimedBytesKnown = true,
-                MoreRemaining = snapshots.Count > 0 || report.Deleted.Count > deletedRuns.Count ||
-                    apiDeleted > 0 || fileDeleted > 0
+                Batches = 1,
+                MaxBatchWriterHoldMs = held.Elapsed.TotalMilliseconds,
+                MoreRemaining = plan.HasWork || fileDeleted > 0 || apiDeleted > 0
             };
         }
         catch (Exception ex) when (IsBudgetOrBusy(ex, budget))
         {
+            plan.Restore(mark);
             cancellationToken.ThrowIfCancellationRequested();
-            return new RetentionReport { DryRun = false, MoreRemaining = true, StopReason = StopReason(ex) };
+            return plan.Report with { DryRun = false, MoreRemaining = true, StopReason = StopReason(ex) };
+        }
+        catch
+        {
+            plan.Restore(mark);
+            throw;
         }
         finally
         {
@@ -248,13 +517,19 @@ public sealed class RetentionService
         Deleted = total.Deleted.Concat(batch.Deleted).ToList(),
         SnapshotsDeleted = total.SnapshotsDeleted + batch.SnapshotsDeleted,
         SnapshotProjectVersionsDeleted = total.SnapshotProjectVersionsDeleted + batch.SnapshotProjectVersionsDeleted,
+        SnapshotsSkipped = total.SnapshotsSkipped + batch.SnapshotsSkipped,
+        OversizedSnapshotIds = total.OversizedSnapshotIds.Concat(batch.OversizedSnapshotIds).ToList(),
+        OversizedDeferredSnapshotIds = total.OversizedDeferredSnapshotIds.Concat(batch.OversizedDeferredSnapshotIds).ToList(),
         ApiSnapshotsDeleted = total.ApiSnapshotsDeleted + batch.ApiSnapshotsDeleted,
         FileVersionsDeleted = total.FileVersionsDeleted + batch.FileVersionsDeleted,
         ReclaimedBytes = total.ReclaimedBytes + batch.ReclaimedBytes,
-        ReclaimedBytesKnown = total.ReclaimedBytesKnown || batch.ReclaimedBytesKnown
+        ReclaimedBytesKnown = total.ReclaimedBytesKnown || batch.ReclaimedBytesKnown,
+        Batches = total.Batches + batch.Batches,
+        MaxBatchWriterHoldMs = Math.Max(total.MaxBatchWriterHoldMs, batch.MaxBatchWriterHoldMs)
     };
 
-    private (RetentionReport report, List<long> snapshots, List<string> commits, RetentionProtectionSet protections) Classify()
+    /// <summary>The generation classification and the orphaned-snapshot candidates (everything but API history).</summary>
+    private (RetentionReport report, List<long> snapshots, HashSet<long> deletableRuns, RetentionProtectionSet protections) ClassifyCore()
     {
         var runStore = new IndexRunStore(_connection);
         var servable = runStore.GetLastCompleteRun();
@@ -309,18 +584,13 @@ public sealed class RetentionService
             }
         }
 
-        var deletableCommits = DeletableApiCommits(protections);
-
         // Snapshot-data GC (issue #46): reclaim the semantic rows owned by snapshots that no retained
         // generation, branch pointer, overlay base, or retained consumer still references (issue #54).
-        var orphanedSnapshotIds = OrphanedSnapshotIds(deletableRunIds);
+        var orphanedSnapshotIds = ComputeOrphanedSnapshotIds(deletableRunIds);
         // A retained provider/base may own an expired run. Keep that ledger row until its last
         // surviving snapshot is collected; otherwise ON DELETE SET NULL manufactures legacy-unknown
         // ownership and makes healthy data permanently protected on the following pass.
-        var orphaned = orphanedSnapshotIds.ToHashSet();
-        var retainedRunIds = new SnapshotStore(_connection).GetSnapshotsForRetention()
-            .Where(s => !orphaned.Contains(s.id) && s.runId.HasValue)
-            .Select(s => s.runId!.Value).ToHashSet();
+        var retainedRunIds = RunIdsOfSnapshotsOutside(orphanedSnapshotIds);
         foreach (var generation in deletedGenerations.Where(g => retainedRunIds.Contains(g.Id)))
             protectedGenerations.Add(generation with { Reason = "generation owns retained snapshot data" });
         deletedGenerations.RemoveAll(g => retainedRunIds.Contains(g.Id));
@@ -331,7 +601,38 @@ public sealed class RetentionService
             Protected = protectedGenerations,
             Retained = retainedGenerations,
             Deleted = deletedGenerations
-        }, orphanedSnapshotIds, deletableCommits, protections);
+        }, orphanedSnapshotIds, deletableRunIds.ToHashSet(), protections);
+    }
+
+    private Dictionary<long, long?> RunIdsOf(List<long> snapshots)
+    {
+        var wanted = snapshots.ToHashSet();
+        var runIds = new Dictionary<long, long?>();
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "SELECT id, run_id FROM snapshots;";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            _budget?.Check();
+            var id = reader.GetInt64(0);
+            if (wanted.Contains(id)) runIds[id] = reader.IsDBNull(1) ? null : reader.GetInt64(1);
+        }
+        return runIds;
+    }
+
+    private HashSet<long> RunIdsOfSnapshotsOutside(List<long> orphaned)
+    {
+        var excluded = orphaned.ToHashSet();
+        var runIds = new HashSet<long>();
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "SELECT id, run_id FROM snapshots WHERE run_id IS NOT NULL;";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            _budget?.Check();
+            if (!excluded.Contains(reader.GetInt64(0))) runIds.Add(reader.GetInt64(1));
+        }
+        return runIds;
     }
 
     private RetentionProtectionSet BuildProtections()
@@ -342,43 +643,139 @@ public sealed class RetentionService
         return builder.Build();
     }
 
-    private void WithdrawAffectedPublication(long snapshotId, HashSet<long> eligible)
-    {
-        var store = new SnapshotStore(_connection);
-        var dependents = new Dictionary<long, List<long>>();
-        foreach (var (consumer, provider) in store.GetSnapshotDependencyEdges())
-        {
-            _budget?.Check();
-            (dependents.TryGetValue(provider, out var list) ? list : dependents[provider] = []).Add(consumer);
-        }
-        foreach (var snapshot in store.GetSnapshotsForRetention())
-        {
-            _budget?.Check();
-            if (snapshot.baseSnapshotId is long baseId)
-                (dependents.TryGetValue(baseId, out var list) ? list : dependents[baseId] = []).Add(snapshot.id);
-        }
+    private enum SnapshotVerdict { Deletable, Protected, Gone }
 
-        // A provider cascade removes consumers' dependency edges AND target occurrences. Withdraw
-        // every affected consumer before yielding, transitively and cycle-safely, not just the owner.
-        // NULL ownership keeps these tombstones GC-eligible even inside a retained run/quota window.
+    /// <summary>
+    /// The in-batch re-check (issue #303), by direct lookups only. The candidate and everything that reads it through
+    /// a base or provider edge (transitively; they are withdrawn with it) must still be in the plan's candidate set
+    /// and still be neither pending, nor (when its generation is being deleted) on the servable generation, nor pointed at by a branch or an
+    /// open pull request. A snapshot created after the plan was computed is in no candidate set, so it blocks.
+    /// </summary>
+    private SnapshotVerdict VerifySnapshotDeletable(long id, RetentionPlan plan, long? servableId, bool openPullRequests,
+        RetentionProtectionSet protections, out List<long> affected)
+    {
+        affected = [];
+        if (!SnapshotExists(id)) return SnapshotVerdict.Gone;
+
         var visited = new HashSet<long>();
         var frontier = new Queue<long>();
-        frontier.Enqueue(snapshotId);
-        using var invalidate = _connection.CreateCommand();
-        invalidate.CommandText = "UPDATE snapshots SET status = @failed, run_id = NULL, published_at = NULL WHERE id = @id;";
-        invalidate.Parameters.AddWithValue("@failed", SnapshotStatus.Failed);
-        var id = invalidate.Parameters.Add("@id", SqliteType.Integer);
+        frontier.Enqueue(id);
         while (frontier.Count > 0)
         {
             _budget?.Check();
             var current = frontier.Dequeue();
             if (!visited.Add(current)) continue;
-            if (!eligible.Contains(current))
-                throw new InvalidOperationException("Retention cannot collect data required by an ineligible snapshot.");
+            if (!plan.SnapshotSet.Contains(current) || !IsUnprotectedNow(current, plan, servableId, openPullRequests, protections))
+                return SnapshotVerdict.Protected;
+            affected.Add(current);
+            foreach (var consumer in ConsumersOf(current)) frontier.Enqueue(consumer);
+        }
+        return SnapshotVerdict.Deletable;
+    }
+
+    private bool SnapshotExists(long id)
+    {
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "SELECT 1 FROM snapshots WHERE id = @id;";
+        cmd.Parameters.AddWithValue("@id", id);
+        return cmd.ExecuteScalar() is not null;
+    }
+
+    private bool IsUnprotectedNow(long id, RetentionPlan plan, long? servableId, bool openPullRequests,
+        RetentionProtectionSet protections)
+    {
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = $"""
+            SELECT s.status, s.run_id,
+                   EXISTS (SELECT 1 FROM branches b WHERE b.snapshot_id = s.id),
+                   {(openPullRequests
+                       ? "EXISTS (SELECT 1 FROM pull_request_snapshots p WHERE p.snapshot_id = s.id AND p.state = 'open')"
+                       : "0")},
+                   (SELECT r.status FROM index_runs r WHERE r.id = s.run_id)
+            FROM snapshots s WHERE s.id = @id;
+            """;
+        cmd.Parameters.AddWithValue("@id", id);
+        using var reader = cmd.ExecuteReader();
+        if (!reader.Read()) return true;
+        if (reader.GetString(0) == SnapshotStatus.Pending) return false;
+        long? runId = reader.IsDBNull(1) ? null : reader.GetInt64(1);
+        // A candidate that changed generation since planning is no longer the candidate that was classified.
+        if (!plan.PlanRunIds.TryGetValue(id, out var plannedRun)) return false;
+        if (runId is null)
+        {
+            // Only a tombstone this pass withdrew (failed, ownership cleared) may lose its run; anything else has uncertain ownership.
+            if (plannedRun is not null && reader.GetString(0) is SnapshotStatus.Complete or SnapshotStatus.Superseded) return false;
+        }
+        else if (plannedRun != runId) return false;
+        if (runId is long run)
+        {
+            if (!reader.IsDBNull(4) && reader.GetString(4) == IndexRunState.Staging) return false;
+            // A quota eviction is on a retained generation by design; a candidate on a deleted generation is not.
+            if (plan.DeletableRunIds.Contains(run) && (servableId == run || protections.IsGenerationProtected(run)))
+                return false;
+        }
+        return reader.GetInt64(2) == 0 && reader.GetInt64(3) == 0;
+    }
+
+    private List<long> ConsumersOf(long snapshotId)
+    {
+        var consumers = new List<long>();
+        using (var cmd = _connection.CreateCommand())
+        {
+            cmd.CommandText = "SELECT id FROM snapshots WHERE base_snapshot_id = @id;";
+            cmd.Parameters.AddWithValue("@id", snapshotId);
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read()) consumers.Add(reader.GetInt64(0));
+        }
+        if (TableExists("snapshot_dependencies"))
+        {
+            using var cmd = _connection.CreateCommand();
+            cmd.CommandText = "SELECT consumer_snapshot_id FROM snapshot_dependencies WHERE provider_snapshot_id = @id;";
+            cmd.Parameters.AddWithValue("@id", snapshotId);
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read()) consumers.Add(reader.GetInt64(0));
+        }
+        return consumers;
+    }
+
+    private bool VerifyRunDeletable(long runId, long? servableId, RetentionProtectionSet protections)
+    {
+        if (runId == servableId || protections.IsGenerationProtected(runId)) return false;
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT (SELECT status FROM index_runs WHERE id = @id),
+                   EXISTS (SELECT 1 FROM snapshots WHERE run_id = @id);
+            """;
+        cmd.Parameters.AddWithValue("@id", runId);
+        using var reader = cmd.ExecuteReader();
+        if (!reader.Read() || reader.IsDBNull(0)) return false;
+        return reader.GetString(0) != IndexRunState.Staging && reader.GetInt64(1) == 0;
+    }
+
+    private bool TableExists(string table)
+    {
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = @name LIMIT 1;";
+        cmd.Parameters.AddWithValue("@name", table);
+        return cmd.ExecuteScalar() is not null;
+    }
+
+    /// <summary>
+    /// A provider cascade removes consumers' dependency edges AND target occurrences. Withdraw every affected
+    /// consumer before yielding (the verified closure, so each is a candidate that stays unprotected).
+    /// NULL ownership keeps these tombstones GC-eligible even inside a retained run/quota window.
+    /// </summary>
+    private void WithdrawAffectedPublication(List<long> affected)
+    {
+        using var invalidate = _connection.CreateCommand();
+        invalidate.CommandText = "UPDATE snapshots SET status = @failed, run_id = NULL, published_at = NULL WHERE id = @id;";
+        invalidate.Parameters.AddWithValue("@failed", SnapshotStatus.Failed);
+        var id = invalidate.Parameters.Add("@id", SqliteType.Integer);
+        foreach (var current in affected)
+        {
+            _budget?.Check();
             id.Value = current;
             invalidate.ExecuteNonQuery();
-            if (dependents.TryGetValue(current, out var consumers))
-                foreach (var consumer in consumers) frontier.Enqueue(consumer);
         }
     }
 
@@ -422,6 +819,21 @@ public sealed class RetentionService
         return deletable;
     }
 
+    private bool IsInApiKeepWindow(string commit)
+    {
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT 1 FROM (
+                SELECT git_commit FROM api_surface_snapshots
+                GROUP BY git_commit
+                ORDER BY MAX(captured_at) DESC, git_commit DESC
+                LIMIT @keep) WHERE git_commit = @c;
+            """;
+        cmd.Parameters.AddWithValue("@keep", _policy.ApiSnapshotKeepCommits);
+        cmd.Parameters.AddWithValue("@c", commit);
+        return cmd.ExecuteScalar() is not null;
+    }
+
     private int DeleteApiCommits(List<string> commits)
     {
         var deleted = 0;
@@ -438,117 +850,145 @@ public sealed class RetentionService
 
     /// <summary>
     /// The immutable snapshots whose semantic DATA a retention pass may reclaim (issue #46): every
-    /// snapshot NOT kept alive by a retained generation, a branch pointer, an overlay base it is layered
-    /// on, or a submodule provider a retained consumer still references (issue #54). Computed as the
+    /// snapshot NOT kept alive by a retained generation, a branch pointer, an open pull request, an overlay base
+    /// it is layered on, or a submodule provider a retained consumer still references (issue #54). Computed as the
     /// complement of the RETAINED-snapshot closure so a shared provider/base is never orphaned while any
     /// retained snapshot still reads it. Pending snapshots are excluded (a live writer may own them).
+    ///
+    /// Issue #303: the two closures (hard-protected, then retained) are recursive-CTE set operations over a
+    /// temp edge table (<c>base_snapshot_id</c> and <c>snapshot_dependencies</c>, consumer to what it reads), not
+    /// managed fixpoint loops over rows read into memory. Same rules, same result.
     /// </summary>
-    private List<long> OrphanedSnapshotIds(List<long> deletableRunIds)
+    public List<long> ComputeOrphanedSnapshotIds(IReadOnlyCollection<long> deletableRunIds)
     {
-        var snapshotStore = new SnapshotStore(_connection);
-        var snapshots = snapshotStore.GetSnapshotsForRetention();
-        if (snapshots.Count == 0) return [];
-
-        var deletableRuns = deletableRunIds.ToHashSet();
-        var rootPinned = snapshotStore.GetBranchPointedSnapshotIds()
-            .Concat(snapshotStore.GetOpenPullRequestSnapshotIds())
-            .ToHashSet();
-        var edges = snapshotStore.GetSnapshotDependencyEdges();
-
-        // Dependency maps shared by the retained-closure expansion and the quota safety check.
-        var baseOf = new Dictionary<long, long>();
-        foreach (var s in snapshots)
+        DropClosureTables();
+        try
         {
+            Exec("""
+                CREATE TEMP TABLE ret_edges (f INTEGER NOT NULL, t INTEGER NOT NULL, PRIMARY KEY (f, t)) WITHOUT ROWID;
+                CREATE TEMP TABLE ret_runs (id INTEGER PRIMARY KEY);
+                CREATE TEMP TABLE ret_hard (id INTEGER PRIMARY KEY);
+                CREATE TEMP TABLE ret_kept (id INTEGER PRIMARY KEY);
+                """);
+            Exec("INSERT OR IGNORE INTO ret_edges SELECT id, base_snapshot_id FROM snapshots WHERE base_snapshot_id IS NOT NULL;");
+            if (TableExists("snapshot_dependencies"))
+                Exec("INSERT OR IGNORE INTO ret_edges SELECT consumer_snapshot_id, provider_snapshot_id FROM snapshot_dependencies;");
             _budget?.Check();
-            if (s.baseSnapshotId is long b)
-                baseOf[s.id] = b;
-        }
 
-        var providersOf = new Dictionary<long, List<long>>();
-        foreach (var (consumer, provider) in edges)
-        {
-            _budget?.Check();
-            (providersOf.TryGetValue(consumer, out var list) ? list : providersOf[consumer] = []).Add(provider);
-        }
-
-        // Expands a seed set across base + provider edges to a fixpoint (a retained snapshot pins the
-        // base it overlays and every provider it consumes — issues #44/#54).
-        HashSet<long> ExpandClosure(IEnumerable<long> seed)
-        {
-            var set = new HashSet<long>(seed);
-            var frontier = new Queue<long>(set);
-            while (frontier.Count > 0)
+            using (var insert = _connection.CreateCommand())
             {
-                _budget?.Check();
-                var id = frontier.Dequeue();
-                if (baseOf.TryGetValue(id, out var baseId) && set.Add(baseId))
-                    frontier.Enqueue(baseId);
-                if (providersOf.TryGetValue(id, out var provs))
-                    foreach (var p in provs)
-                        if (set.Add(p))
-                            frontier.Enqueue(p);
+                insert.CommandText = "INSERT OR IGNORE INTO ret_runs (id) VALUES (@id);";
+                var p = insert.Parameters.Add("@id", SqliteType.Integer);
+                foreach (var runId in deletableRunIds)
+                {
+                    _budget?.Check();
+                    p.Value = runId;
+                    insert.ExecuteNonQuery();
+                }
             }
-            return set;
+
+            // HARD protected closure (criterion 4): pending snapshots (a live writer may own them) plus every
+            // snapshot pinned by a branch pointer or an open pull request, plus catalogs written before #127 may still
+            // bind a published retry to an abandoned run (or NULL after its ledger row was GC'd): no reliable age can
+            // be inferred from that pointer, so fail closed. Expanded across the base/provider chains.
+            var openPullRequests = TableExists("pull_request_snapshots")
+                ? "UNION SELECT snapshot_id FROM pull_request_snapshots WHERE state = 'open' AND snapshot_id IS NOT NULL"
+                : "";
+            RunClosure("ret_hard", $"""
+                SELECT id FROM snapshots WHERE status = @pending
+                UNION SELECT snapshot_id FROM branches WHERE snapshot_id IS NOT NULL
+                {openPullRequests}
+                UNION SELECT s.id FROM snapshots s LEFT JOIN index_runs r ON r.id = s.run_id
+                      WHERE s.status IN (@complete, @superseded)
+                        AND (s.run_id IS NULL OR r.id IS NULL OR r.status = @abandoned)
+                """);
+
+            // Retained: the hard-protected set plus everything on a generation this pass is NOT deleting, expanded.
+            RunClosure("ret_kept", """
+                SELECT id FROM ret_hard
+                UNION SELECT id FROM snapshots WHERE run_id IS NOT NULL AND run_id NOT IN (SELECT id FROM ret_runs)
+                """);
+
+            if (_policy.MaxSnapshotsPerRepository <= 0)
+                return ReadIds("""
+                    SELECT id FROM snapshots WHERE status <> @pending AND id NOT IN (SELECT id FROM ret_kept) ORDER BY id
+                    """);
+
+            var evictions = ComputeQuotaEvictions();
+            var orphaned = ReadIds("""
+                SELECT id FROM snapshots WHERE status <> @pending AND id NOT IN (SELECT id FROM ret_kept) ORDER BY id
+                """);
+            orphaned.AddRange(evictions);
+            return orphaned.Distinct().Order().ToList();
         }
+        finally
+        {
+            DropClosureTables();
+        }
+    }
 
-        // HARD protected closure (criterion 4): pending snapshots (a live writer may own them) plus every
-        // snapshot pinned by a branch pointer or an open pull request, transitively expanded across the
-        // base/provider chains. Quota eviction may NEVER cross this set.
-        var pending = snapshots.Where(s => s.status == SnapshotStatus.Pending).Select(s => s.id);
-        // Catalogs written before #127 may still bind a published retry to an abandoned run (or NULL
-        // after its ledger row was GC'd). No reliable age can be inferred from that pointer: fail closed.
-        var runs = new IndexRunStore(_connection).GetAllRuns().ToDictionary(r => r.Id);
-        var uncertainOwnership = snapshots.Where(s =>
-            s.status is SnapshotStatus.Complete or SnapshotStatus.Superseded &&
-            (s.runId == null || !runs.TryGetValue(s.runId.Value, out var run) || run.Status == IndexRunState.Abandoned))
-            .Select(s => s.id);
-        var hardProtected = ExpandClosure(pending.Concat(rootPinned).Concat(uncertainOwnership));
+    private void RunClosure(string target, string seed)
+    {
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = $"""
+            WITH RECURSIVE c(id) AS (
+                {seed}
+                UNION SELECT e.t FROM c JOIN ret_edges e ON e.f = c.id
+            )
+            INSERT OR IGNORE INTO {target} (id) SELECT id FROM c;
+            """;
+        BindStatuses(cmd);
+        cmd.ExecuteNonQuery();
+    }
 
-        // Seed the retained set with everything the generation keep-window keeps (a snapshot on a
-        // generation this pass is NOT deleting), plus the hard-protected set, then expand to a fixpoint.
-        var windowSeed = new HashSet<long>(hardProtected);
-        foreach (var s in snapshots)
+    private static void BindStatuses(SqliteCommand cmd)
+    {
+        cmd.Parameters.AddWithValue("@pending", SnapshotStatus.Pending);
+        cmd.Parameters.AddWithValue("@complete", SnapshotStatus.Complete);
+        cmd.Parameters.AddWithValue("@superseded", SnapshotStatus.Superseded);
+        cmd.Parameters.AddWithValue("@abandoned", IndexRunState.Abandoned);
+    }
+
+    private List<long> ReadIds(string sql)
+    {
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = sql;
+        BindStatuses(cmd);
+        var ids = new List<long>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
         {
             _budget?.Check();
-            if (s.runId is long rid && !deletableRuns.Contains(rid))
-                windowSeed.Add(s.id);
+            ids.Add(reader.GetInt64(0));
         }
-        var retained = ExpandClosure(windowSeed);
+        return ids;
+    }
 
-        // Per-repository quota (Phase 17): cap retained COMPLETE snapshots per repository, evicting oldest
-        // first — but only snapshots that are neither hard-protected nor depended on by a still-retained
-        // snapshot, so quota GC is provably protected-set-aware and never deletes shared base/provider data.
-        if (_policy.MaxSnapshotsPerRepository > 0)
+    private void DropClosureTables()
+    {
+        try
         {
-            var evictions = ComputeQuotaEvictions(snapshots, retained, hardProtected, baseOf, providersOf);
-            retained.ExceptWith(evictions);
+            Exec("DROP TABLE IF EXISTS temp.ret_edges; DROP TABLE IF EXISTS temp.ret_runs; DROP TABLE IF EXISTS temp.ret_hard; DROP TABLE IF EXISTS temp.ret_kept;");
         }
-
-        var orphaned = new List<long>();
-        foreach (var s in snapshots)
+        catch (SqliteException)
         {
-            _budget?.Check();
-            if (s.status != SnapshotStatus.Pending && !retained.Contains(s.id))
-                orphaned.Add(s.id);
+            // An interrupted budget can refuse even a drop; the next call drops first, and a reader is disposed anyway.
         }
-        return orphaned.Order().ToList();
     }
 
     /// <summary>
     /// Selects the oldest-over-cap complete snapshots per repository that are safe to evict for the quota:
     /// never a hard-protected (branch/open-PR/overlay/provider) snapshot, and never one a still-retained
-    /// snapshot depends on (its base or a provider it consumes). The dependency guard runs to a fixpoint so
-    /// evicting a snapshot can never strand a kept snapshot's shared rows.
+    /// snapshot depends on (its base or a provider it consumes). Evicting a snapshot can never strand a kept
+    /// snapshot's shared rows: everything reachable from a kept snapshot is un-evicted (a worklist over the edges).
     /// </summary>
-    private List<long> ComputeQuotaEvictions(
-        IReadOnlyList<(long id, long repositoryId, long? runId, string status, long? baseSnapshotId, bool isProvider, long createdAt)> snapshots,
-        HashSet<long> retained,
-        HashSet<long> hardProtected,
-        Dictionary<long, long> baseOf,
-        Dictionary<long, List<long>> providersOf)
+    private List<long> ComputeQuotaEvictions()
     {
         _budget?.Check();
         var cap = _policy.MaxSnapshotsPerRepository;
+        var retained = ReadIds("SELECT id FROM ret_kept").ToHashSet();
+        var hardProtected = ReadIds("SELECT id FROM ret_hard").ToHashSet();
+        var snapshots = new SnapshotStore(_connection).GetSnapshotsForRetention();
         var evict = new HashSet<long>();
 
         foreach (var repoGroup in snapshots
@@ -559,34 +999,37 @@ public sealed class RetentionService
             // Newest first (created_at desc, id desc as a stable tiebreak); keep the cap newest, evict the rest.
             var ranked = repoGroup.OrderByDescending(s => s.createdAt).ThenByDescending(s => s.id).ToList();
             for (var i = cap; i < ranked.Count; i++)
-            {
-                _budget?.Check();
                 evict.Add(ranked[i].id);
-            }
         }
 
         if (evict.Count == 0) return [];
 
-        // Safety fixpoint: never evict a snapshot that a KEPT (retained-and-not-evicted) snapshot still
-        // depends on. Un-evict any base/provider referenced by a kept snapshot until stable.
-        bool changed;
-        do
+        var adjacency = new Dictionary<long, List<long>>();
+        using (var cmd = _connection.CreateCommand())
         {
-            changed = false;
-            foreach (var kept in retained)
+            cmd.CommandText = "SELECT f, t FROM ret_edges;";
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
             {
                 _budget?.Check();
-                if (evict.Contains(kept)) continue;
-                if (baseOf.TryGetValue(kept, out var baseId) && evict.Remove(baseId))
-                    changed = true;
-                if (providersOf.TryGetValue(kept, out var provs))
-                    foreach (var p in provs)
-                        if (evict.Remove(p))
-                            changed = true;
+                var from = reader.GetInt64(0);
+                (adjacency.TryGetValue(from, out var list) ? list : adjacency[from] = []).Add(reader.GetInt64(1));
             }
         }
-        while (changed);
 
+        var frontier = new Queue<long>(retained.Where(r => !evict.Contains(r)));
+        var seen = new HashSet<long>(frontier);
+        while (frontier.Count > 0)
+        {
+            _budget?.Check();
+            var current = frontier.Dequeue();
+            if (!adjacency.TryGetValue(current, out var next)) continue;
+            foreach (var n in next)
+            {
+                evict.Remove(n);
+                if (seen.Add(n)) frontier.Enqueue(n);
+            }
+        }
         return evict.ToList();
     }
 

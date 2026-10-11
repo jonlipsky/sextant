@@ -357,16 +357,38 @@ public class RetentionServiceTests
             => builder.ProtectCommit(commit, "protected by test provider");
     }
 
+    private static readonly string[] DeletableTables =
+    [
+        "snapshots", "projects", "snapshot_projects", "symbols", "occurrences", "relationships", "files", "file_versions",
+        "comments", "api_surface_snapshots", "snapshot_dependencies", "index_runs", "branches", "pull_request_snapshots",
+        "snapshot_coverage"
+    ];
+
+    private Dictionary<string, long> RowCounts() =>
+        DeletableTables.ToDictionary(t => t, t => ScalarLong($"SELECT COUNT(*) FROM {t};"));
+
     [TestMethod]
     public void Plan_OnReadOnlyConnection_DoesNotWritePagesOrTakeWriterLock()
     {
+        var before = RowCounts();
+        var walBefore = _db.WalBytes;
         using var reader = new SqliteConnection(new SqliteConnectionStringBuilder
             { DataSource = _dbPath, Mode = SqliteOpenMode.ReadOnly }.ToString());
         reader.Open();
-        var walBefore = _db.WalBytes;
+
+        // A write to the main database through this connection must throw: that is what makes the plan's success proof.
+        using (var probe = reader.CreateCommand())
+        {
+            probe.CommandText = "DELETE FROM index_runs;";
+            Assert.ThrowsExactly<SqliteException>(() => probe.ExecuteNonQuery());
+        }
+
         var plain = new RetentionService(reader, new RetentionPolicy()).Plan();
         Assert.IsFalse(plain.MoreRemaining);
         Assert.AreEqual(walBefore, _db.WalBytes, "planning writes no WAL pages");
+        CollectionAssert.AreEquivalent(before, RowCounts(), "planning deleted nothing");
+
+        var publishedDuringPlan = false;
         var admissions = new ActionProtection(() =>
         {
             // A separate writer can publish while planning owns its read transaction.
@@ -375,13 +397,14 @@ public class RetentionServiceTests
             var run = runs.BeginRun("full", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
             runs.MarkComplete(run, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), 1);
             Exec("COMMIT;");
+            publishedDuringPlan = true;
         });
         var report = new RetentionService(reader, new RetentionPolicy(), [admissions]).Plan();
         Assert.IsFalse(report.MoreRemaining);
-        Assert.AreEqual(7L, ScalarLong("SELECT COUNT(*) FROM index_runs;"), "index publish committed during the plan");
-        using var changes = reader.CreateCommand();
-        changes.CommandText = "SELECT total_changes();";
-        Assert.AreEqual(0L, Convert.ToInt64(changes.ExecuteScalar()));
+        Assert.IsTrue(publishedDuringPlan);
+
+        var expected = new Dictionary<string, long>(before) { ["index_runs"] = before["index_runs"] + 1 };
+        CollectionAssert.AreEquivalent(expected, RowCounts(), "only the concurrent publish changed any row");
     }
 
     [TestMethod]

@@ -44,6 +44,19 @@ public sealed class RetentionPolicy
     /// </summary>
     public int MaxSnapshotsPerRepository { get; set; }
 
+    /// <summary>Default value of <see cref="UnitMaxSeconds"/>.</summary>
+    public const int DefaultUnitMaxSeconds = 60;
+
+    /// <summary>Largest accepted <see cref="UnitMaxSeconds"/>.</summary>
+    public const int MaxUnitMaxSeconds = 600;
+
+    /// <summary>
+    /// The hard cap, in seconds, on one snapshot-deletion unit (one project cascade). A batch always completes at
+    /// least one unit even past its time limit, but a unit running longer than this is rolled back, reported as
+    /// oversized and retried by a later pass. A value of 0 or less is the default (60); larger values are capped at 600.
+    /// </summary>
+    public int UnitMaxSeconds { get; set; } = DefaultUnitMaxSeconds;
+
     /// <summary>
     /// Defends against a misconfigured negative keep-count. A negative value is treated as "unset"
     /// and falls back to the safe default rather than collapsing to <c>0</c> — which is itself a
@@ -57,6 +70,7 @@ public sealed class RetentionPolicy
         ApiSnapshotKeepCommits =
             ApiSnapshotKeepCommits < 0 ? DefaultApiSnapshotKeepCommits : ApiSnapshotKeepCommits,
         PruneSupersededSourceBlobs = PruneSupersededSourceBlobs,
-        MaxSnapshotsPerRepository = MaxSnapshotsPerRepository < 0 ? 0 : MaxSnapshotsPerRepository
+        MaxSnapshotsPerRepository = MaxSnapshotsPerRepository < 0 ? 0 : MaxSnapshotsPerRepository,
+        UnitMaxSeconds = UnitMaxSeconds <= 0 ? DefaultUnitMaxSeconds : Math.Min(UnitMaxSeconds, MaxUnitMaxSeconds)
     };
 }
