@@ -244,7 +244,7 @@ public sealed partial class SnapshotService
             using var probe = reader.CreateCommand();
             probe.CommandText = "SELECT EXISTS (SELECT 1 FROM retired_branch_heads WHERE retired_at < @cutoff);";
             probe.Parameters.AddWithValue("@cutoff", cutoff);
-            if (probe.ExecuteScalar() is not long found || found == 0)
+            if (await probe.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not long found || found == 0)
                 return 0;
         }
         return await WithWriteAsync(

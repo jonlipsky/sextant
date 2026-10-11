@@ -220,7 +220,7 @@ public class EnsureCoalescingTests
         using (var idle = _db.GetConnection().CreateCommand())
         {
             idle.CommandText = "UPDATE branches SET updated_at = 0 WHERE name = 'feature';";
-            idle.ExecuteNonQuery();
+            await idle.ExecuteNonQueryAsync();
         }
         Assert.AreEqual(1, (await _service.RetireIdleBranchesAsync()).Retired);
         Assert.IsNull(HeadCommit("feature"));
