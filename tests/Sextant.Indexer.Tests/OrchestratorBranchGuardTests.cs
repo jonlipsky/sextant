@@ -130,7 +130,9 @@ public class OrchestratorBranchGuardTests
         await Index("commit-A");
         await Index("commit-F", branch: "feature", expected: "");
         var store = Store();
-        Assert.IsTrue(store.DeleteBranch(store.GetBranchId(RepoId(), "feature")!.Value));
+        if (store.GetBranchId(RepoId(), "feature") is not long featureId)
+            throw new AssertFailedException("precondition: feature exists");
+        Assert.IsTrue(store.DeleteBranch(featureId));
         store.RecordRetiredHead(RepoId(), "feature", "commit-F", now: 1, SnapshotStore.RetiredHeadCauseIdle);
 
         await Index("commit-G", branch: "feature", expected: "commit-X");

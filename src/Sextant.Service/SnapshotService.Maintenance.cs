@@ -59,7 +59,10 @@ public sealed partial class SnapshotService
     // Issue #299: one maintenance tick at a time (the loop's own, or a direct call).
     private readonly SemaphoreSlim _maintenanceTick = new(1, 1);
     private readonly SemaphoreSlim _maintenanceTicked = new(0, int.MaxValue);
-    private Task? _maintenanceLoop;
+
+    // The loop's timer, created in Start on the service's clock (so the first tick is exactly one interval later) and
+    // disposed by Dispose once the loop has drained. Null when the loop is off.
+    private PeriodicTimer? _maintenanceTimer;
 
     // The UTC day the scheduled retention last ran on, so it runs once a day; read from the audit log on the first due
     // tick so a restart does not run it twice the same day. Only the (serialized) tick reads and writes it.
@@ -82,18 +85,13 @@ public sealed partial class SnapshotService
         var longest = TimeSpan.FromMinutes(MaintenancePolicy.MaxIntervalMinutes);
         if (interval > longest)
             interval = longest;
-        // The timer starts now, on the service's clock, so the first tick is exactly one interval after start.
-        var timer = new PeriodicTimer(interval, _timeProvider);
+        _maintenanceTimer = new PeriodicTimer(interval, _timeProvider);
         lock (_inFlightLock)
-        {
-            _maintenanceLoop = Task.Run(() => RunMaintenanceLoopAsync(timer), CancellationToken.None);
-            _operations.Add(_maintenanceLoop);
-        }
+            _operations.Add(Task.Run(() => RunMaintenanceLoopAsync(_maintenanceTimer), CancellationToken.None));
     }
 
     private async Task RunMaintenanceLoopAsync(PeriodicTimer timer)
     {
-        using var owned = timer;
         var lifetime = _lifetime.Token;
         try
         {

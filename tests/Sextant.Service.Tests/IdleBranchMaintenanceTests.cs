@@ -374,8 +374,11 @@ public class IdleBranchMaintenanceTests
         Assert.AreEqual("not_due", h.Service.LastMaintenanceTick!.Retention);
 
         await h.TickAsync(); // 03:30
-        Assert.AreEqual("ran", h.Service.LastMaintenanceTick!.Retention);
-        Assert.IsFalse(h.Service.LastMaintenanceTick.RetentionReport!.DryRun);
+        var ran = h.Service.LastMaintenanceTick;
+        Assert.IsNotNull(ran);
+        Assert.AreEqual("ran", ran.Retention);
+        Assert.IsNotNull(ran.RetentionReport);
+        Assert.IsFalse(ran.RetentionReport.DryRun);
         Assert.AreEqual(1, h.Service.CollectMetrics().Maintenance.ScheduledRetentionRuns);
 
         for (var i = 0; i < 23; i++) // 04:30 … 02:30 next day: already ran today, then not yet due.

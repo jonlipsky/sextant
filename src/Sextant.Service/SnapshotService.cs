@@ -2589,6 +2589,9 @@ public sealed partial class SnapshotService : IDisposable
         _lease.Dispose();
         if (_ownsDatabase)
             _db.Dispose();
+        _maintenanceTimer?.Dispose();
+        _maintenanceTick.Dispose();
+        _maintenanceTicked.Dispose();
         _writeGate.Dispose();
         _lifetime.Dispose();
     }

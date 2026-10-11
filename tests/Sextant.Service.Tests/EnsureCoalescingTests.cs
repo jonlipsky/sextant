@@ -235,7 +235,8 @@ public class EnsureCoalescingTests
         Assert.IsTrue((await c).BranchAdvanced);
         Assert.AreEqual("commit-C", HeadCommit("feature"), "as serial processing of B then C would leave it");
         var store = new SnapshotStore(_db.GetConnection());
-        Assert.IsNull(store.GetRetiredHead(store.GetRepositoryId(Repo)!.Value, "feature"), "consumed by the re-create");
+        Assert.IsTrue(store.GetRepositoryId(Repo) is long repoId && store.GetRetiredHead(repoId, "feature") is null,
+            "consumed by the re-create");
     }
 
     [TestMethod]
