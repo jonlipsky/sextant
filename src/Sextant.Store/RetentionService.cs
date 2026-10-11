@@ -681,19 +681,63 @@ public sealed class RetentionService
         return cmd.ExecuteScalar() is not null;
     }
 
+    private const string UnprotectedNowWithPullRequestsSql = """
+        SELECT s.status, s.run_id,
+               EXISTS (SELECT 1 FROM branches b WHERE b.snapshot_id = s.id),
+               EXISTS (SELECT 1 FROM pull_request_snapshots p WHERE p.snapshot_id = s.id AND p.state = 'open'),
+               (SELECT r.status FROM index_runs r WHERE r.id = s.run_id)
+        FROM snapshots s WHERE s.id = @id;
+        """;
+
+    private const string UnprotectedNowSql = """
+        SELECT s.status, s.run_id,
+               EXISTS (SELECT 1 FROM branches b WHERE b.snapshot_id = s.id),
+               0,
+               (SELECT r.status FROM index_runs r WHERE r.id = s.run_id)
+        FROM snapshots s WHERE s.id = @id;
+        """;
+
+    private const string HardClosureWithPullRequestsSql = """
+        WITH RECURSIVE c(id) AS (
+            SELECT id FROM snapshots WHERE status = @pending
+            UNION SELECT snapshot_id FROM branches WHERE snapshot_id IS NOT NULL
+            UNION SELECT snapshot_id FROM pull_request_snapshots WHERE state = 'open' AND snapshot_id IS NOT NULL
+            UNION SELECT s.id FROM snapshots s LEFT JOIN index_runs r ON r.id = s.run_id
+                  WHERE s.status IN (@complete, @superseded)
+                    AND (s.run_id IS NULL OR r.id IS NULL OR r.status = @abandoned)
+            UNION SELECT e.t FROM c JOIN ret_edges e ON e.f = c.id
+        )
+        INSERT OR IGNORE INTO ret_hard (id) SELECT id FROM c;
+        """;
+
+    private const string HardClosureSql = """
+        WITH RECURSIVE c(id) AS (
+            SELECT id FROM snapshots WHERE status = @pending
+            UNION SELECT snapshot_id FROM branches WHERE snapshot_id IS NOT NULL
+            UNION SELECT s.id FROM snapshots s LEFT JOIN index_runs r ON r.id = s.run_id
+                  WHERE s.status IN (@complete, @superseded)
+                    AND (s.run_id IS NULL OR r.id IS NULL OR r.status = @abandoned)
+            UNION SELECT e.t FROM c JOIN ret_edges e ON e.f = c.id
+        )
+        INSERT OR IGNORE INTO ret_hard (id) SELECT id FROM c;
+        """;
+
+    private const string KeptClosureSql = """
+        WITH RECURSIVE c(id) AS (
+            SELECT id FROM ret_hard
+            UNION SELECT id FROM snapshots WHERE run_id IS NOT NULL AND run_id NOT IN (SELECT id FROM ret_runs)
+            UNION SELECT e.t FROM c JOIN ret_edges e ON e.f = c.id
+        )
+        INSERT OR IGNORE INTO ret_kept (id) SELECT id FROM c;
+        """;
+
+    private enum ClosureKind { HardWithPullRequests, Hard, Kept }
+
     private bool IsUnprotectedNow(long id, RetentionPlan plan, long? servableId, bool openPullRequests,
         RetentionProtectionSet protections)
     {
         using var cmd = _connection.CreateCommand();
-        cmd.CommandText = $"""
-            SELECT s.status, s.run_id,
-                   EXISTS (SELECT 1 FROM branches b WHERE b.snapshot_id = s.id),
-                   {(openPullRequests
-                       ? "EXISTS (SELECT 1 FROM pull_request_snapshots p WHERE p.snapshot_id = s.id AND p.state = 'open')"
-                       : "0")},
-                   (SELECT r.status FROM index_runs r WHERE r.id = s.run_id)
-            FROM snapshots s WHERE s.id = @id;
-            """;
+        cmd.CommandText = openPullRequests ? UnprotectedNowWithPullRequestsSql : UnprotectedNowSql;
         cmd.Parameters.AddWithValue("@id", id);
         using var reader = cmd.ExecuteReader();
         if (!reader.Read()) return true;
@@ -891,23 +935,10 @@ public sealed class RetentionService
             // snapshot pinned by a branch pointer or an open pull request, plus catalogs written before #127 may still
             // bind a published retry to an abandoned run (or NULL after its ledger row was GC'd): no reliable age can
             // be inferred from that pointer, so fail closed. Expanded across the base/provider chains.
-            var openPullRequests = TableExists("pull_request_snapshots")
-                ? "UNION SELECT snapshot_id FROM pull_request_snapshots WHERE state = 'open' AND snapshot_id IS NOT NULL"
-                : "";
-            RunClosure("ret_hard", $"""
-                SELECT id FROM snapshots WHERE status = @pending
-                UNION SELECT snapshot_id FROM branches WHERE snapshot_id IS NOT NULL
-                {openPullRequests}
-                UNION SELECT s.id FROM snapshots s LEFT JOIN index_runs r ON r.id = s.run_id
-                      WHERE s.status IN (@complete, @superseded)
-                        AND (s.run_id IS NULL OR r.id IS NULL OR r.status = @abandoned)
-                """);
+            RunClosure(TableExists("pull_request_snapshots") ? ClosureKind.HardWithPullRequests : ClosureKind.Hard);
 
             // Retained: the hard-protected set plus everything on a generation this pass is NOT deleting, expanded.
-            RunClosure("ret_kept", """
-                SELECT id FROM ret_hard
-                UNION SELECT id FROM snapshots WHERE run_id IS NOT NULL AND run_id NOT IN (SELECT id FROM ret_runs)
-                """);
+            RunClosure(ClosureKind.Kept);
 
             if (_policy.MaxSnapshotsPerRepository <= 0)
                 return ReadIds("""
@@ -927,16 +958,16 @@ public sealed class RetentionService
         }
     }
 
-    private void RunClosure(string target, string seed)
+    private void RunClosure(ClosureKind kind)
     {
         using var cmd = _connection.CreateCommand();
-        cmd.CommandText = $"""
-            WITH RECURSIVE c(id) AS (
-                {seed}
-                UNION SELECT e.t FROM c JOIN ret_edges e ON e.f = c.id
-            )
-            INSERT OR IGNORE INTO {target} (id) SELECT id FROM c;
-            """;
+        cmd.CommandText = kind switch
+        {
+            ClosureKind.HardWithPullRequests => HardClosureWithPullRequestsSql,
+            ClosureKind.Hard => HardClosureSql,
+            ClosureKind.Kept => KeptClosureSql,
+            _ => throw new ArgumentOutOfRangeException(nameof(kind))
+        };
         BindStatuses(cmd);
         cmd.ExecuteNonQuery();
     }
@@ -1059,7 +1090,8 @@ public sealed class RetentionService
         foreach (var chunk in Chunk(ids, 256))
         {
             using var cmd = _connection.CreateCommand();
-            cmd.CommandText = $"DELETE FROM file_versions WHERE id IN ({string.Join(",", chunk)});";
+            cmd.CommandText = "DELETE FROM file_versions WHERE id IN (SELECT value FROM json_each(@ids));";
+            cmd.Parameters.AddWithValue("@ids", "[" + string.Join(",", chunk) + "]");
             deleted += cmd.ExecuteNonQuery();
         }
         return deleted;
