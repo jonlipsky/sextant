@@ -90,18 +90,32 @@ public class DaemonDiscoveryTests
     }
 
     [TestMethod]
-    public void SpawnDaemon_ReturnsNonNull()
+    public void SpawnDaemon_DoesNotThrow()
     {
-        // This tests that SpawnDaemon can construct and attempt to start a process
-        // without throwing. The process may fail to start if sextant isn't built,
-        // but the method itself should handle that gracefully.
-        var process = DaemonDiscovery.SpawnDaemon(
-            dbPath: Path.Combine(_tempDir, ".sextant", "sextant.db"),
-            repoRoot: _tempDir);
-
-        // Process may or may not start successfully depending on environment,
-        // but the method should not throw
-        process?.Dispose();
+        // The process may or may not start depending on environment; the method must not throw.
+        System.Diagnostics.Process? process = null;
+        try
+        {
+            process = DaemonDiscovery.SpawnDaemon(
+                dbPath: Path.Combine(_tempDir, ".sextant", "sextant.db"),
+                repoRoot: _tempDir);
+            Assert.IsTrue(process is null || process.Id > 0);
+        }
+        finally
+        {
+            if (process is not null)
+            {
+                try
+                {
+                    if (!process.HasExited)
+                        process.Kill(entireProcessTree: true);
+                }
+                catch (InvalidOperationException)
+                {
+                }
+                process.Dispose();
+            }
+        }
     }
 
     [TestMethod]

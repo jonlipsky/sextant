@@ -34,7 +34,7 @@ public static class Program
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"error: {ex.Message}");
+            await Console.Error.WriteLineAsync($"error: {ex.Message}").ConfigureAwait(false);
             PrintUsage();
             return 2;
         }
@@ -59,9 +59,9 @@ public static class Program
             catch (Exception ex)
             {
                 var redactErrors = options.Redact || options.Corpus == "external";
-                Console.Error.WriteLine(redactErrors
+                await Console.Error.WriteLineAsync(redactErrors
                     ? $"benchmark failed: {ex.GetType().Name}"
-                    : $"benchmark failed: {ex}");
+                    : $"benchmark failed: {ex}").ConfigureAwait(false);
                 return 1;
             }
 

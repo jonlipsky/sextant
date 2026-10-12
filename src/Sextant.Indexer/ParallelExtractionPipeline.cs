@@ -84,7 +84,7 @@ public static class ParallelExtractionPipeline
         {
             // Cancellation or a persist failure observed here: release a producer that may be parked
             // on a full channel so the pipeline cannot deadlock, then rethrow after it unwinds.
-            linkedCts.Cancel();
+            await linkedCts.CancelAsync().ConfigureAwait(false);
             throw;
         }
         finally

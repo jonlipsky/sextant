@@ -85,7 +85,8 @@ internal sealed class CompilationPrefetcher : IAsyncDisposable
         compile ??= static async (project, token) => _ = await project.GetCompilationAsync(token).ConfigureAwait(false);
         _running = window < 2 || projects.Count == 0
             ? Task.CompletedTask
-            : Task.Run(() => RunAsync(projects, compile, _cts.Token));
+            // None on purpose: RunAsync observes the token itself and must always complete so Dispose can await it.
+            : Task.Run(() => RunAsync(projects, compile, _cts.Token), CancellationToken.None);
     }
 
     /// <summary>The phase has reached the next project in order: one more may compile ahead.</summary>

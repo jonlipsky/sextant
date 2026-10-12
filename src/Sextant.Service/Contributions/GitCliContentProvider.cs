@@ -43,10 +43,10 @@ public sealed class GitCliContentProvider : IGitContentProvider
     /// Maps a repository remote URL to its local checkout directory, or null when none is provisioned.
     /// </param>
     /// <param name="gitExecutable">The git executable (overridable for tests); defaults to <c>git</c> on PATH.</param>
-    public GitCliContentProvider(Func<string, string?> checkoutResolver, string gitExecutable = "git")
+    public GitCliContentProvider(Func<string, string?> checkoutResolver, string? gitExecutable = null)
     {
         _checkoutResolver = checkoutResolver;
-        _gitExecutable = gitExecutable;
+        _gitExecutable = gitExecutable ?? Sextant.Core.GitExecutable.Path;
     }
 
     /// <summary>

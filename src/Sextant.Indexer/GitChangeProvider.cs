@@ -248,7 +248,7 @@ public static class GitChangeProvider
     {
         try
         {
-            var psi = new ProcessStartInfo("git", args)
+            var psi = new ProcessStartInfo(Sextant.Core.GitExecutable.Path, args)
             {
                 WorkingDirectory = repoRoot,
                 RedirectStandardOutput = true,

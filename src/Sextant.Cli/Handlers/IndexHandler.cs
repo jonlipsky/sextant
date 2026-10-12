@@ -8,7 +8,7 @@ internal static class IndexHandler
     {
         if (!File.Exists(solutionPath))
         {
-            Console.Error.WriteLine($"Solution file not found: {solutionPath}");
+            await Console.Error.WriteLineAsync($"Solution file not found: {solutionPath}").ConfigureAwait(false);
             return 1;
         }
 
@@ -149,9 +149,9 @@ internal static class IndexHandler
 
             if (!published)
             {
-                Console.Error.WriteLine(
+                await Console.Error.WriteLineAsync(
                     "Repository kept changing during indexing (HEAD or working tree moved); nothing was " +
-                    "published. Re-run 'sextant index' once the working tree is stable.");
+                    "published. Re-run 'sextant index' once the working tree is stable.").ConfigureAwait(false);
                 return 1;
             }
 
@@ -164,7 +164,7 @@ internal static class IndexHandler
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"Failed to index solution: {ex.Message}");
+            await Console.Error.WriteLineAsync($"Failed to index solution: {ex.Message}").ConfigureAwait(false);
             return 1;
         }
     }

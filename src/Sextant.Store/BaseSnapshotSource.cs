@@ -150,22 +150,23 @@ public sealed class LocalBaseSnapshotSource(SqliteConnection connection) : IBase
             });
 
         var limit = Math.Clamp(request.Limit, 1, 5000);
-        var inList = string.Join(",", projectIds);
+        var projectIdsJson = System.Text.Json.JsonSerializer.Serialize(projectIds);
         using var cmd = connection.CreateCommand();
         // The logical (commit-invariant) canonical id is carried per symbol so a federated read planner can
         // shadow the overlay's touched project-versions across the remote boundary (issue #108). It lives on
         // logical_projects for a snapshot-tagged project row, falling back to the mutable row's own
         // canonical_id for a legacy row — the same COALESCE ProjectStore surfaces to clients.
-        cmd.CommandText = $"""
+        cmd.CommandText = """
             SELECT s.id, s.symbol_key, s.fully_qualified_name, s.display_name, s.kind, s.accessibility,
                    COALESCE(lp.canonical_id, p.canonical_id) AS project_canonical_id
             FROM symbols s
             JOIN projects p ON p.id = s.project_id
             LEFT JOIN logical_projects lp ON lp.id = p.logical_project_id
-            WHERE s.project_id IN ({inList}) AND s.id > @cursor
+            WHERE s.project_id IN (SELECT value FROM json_each(@projects)) AND s.id > @cursor
             ORDER BY s.id
             LIMIT @limit;
             """;
+        cmd.Parameters.AddWithValue("@projects", projectIdsJson);
         cmd.Parameters.AddWithValue("@cursor", request.CursorId);
         cmd.Parameters.AddWithValue("@limit", limit);
 

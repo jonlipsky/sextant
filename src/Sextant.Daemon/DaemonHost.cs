@@ -135,12 +135,12 @@ public sealed class DaemonHost : IDisposable
 
             if (needsFullIndex)
             {
-                await PerformFullIndexAsync();
+                await PerformFullIndexAsync(_cts.Token);
             }
             else
             {
                 _log?.Invoke("Existing index found — checking for changed files...");
-                await PerformIncrementalCatchUpAsync();
+                await PerformIncrementalCatchUpAsync(_cts.Token);
             }
         }
 
@@ -165,7 +165,7 @@ public sealed class DaemonHost : IDisposable
 
         _fileWatcher?.Stop();
         _queue?.Complete();
-        _cts?.Cancel();
+        if (_cts != null) await _cts.CancelAsync();
 
         if (_periodicTask != null)
         {
@@ -183,7 +183,7 @@ public sealed class DaemonHost : IDisposable
         _log?.Invoke("Daemon stopped.");
     }
 
-    private async Task PerformFullIndexAsync()
+    private async Task PerformFullIndexAsync(CancellationToken ct)
     {
         _state = "indexing";
         _indexingStartedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -201,7 +201,7 @@ public sealed class DaemonHost : IDisposable
                     ProjectIndex = 0,
                     ProjectCount = 0
                 };
-                var solution = await SolutionLoader.LoadSolutionAsync(solutionPath, _log);
+                var solution = await SolutionLoader.LoadSolutionAsync(solutionPath, _log, ct);
                 _currentSolution = solution;
 
                 var orchestrator = new IndexOrchestrator(_db!, _log, _useDocumentExtractor, _parallelism, _profile);
@@ -211,7 +211,7 @@ public sealed class DaemonHost : IDisposable
                 // multi-solution→one-snapshot aggregation lands (tracked follow-up), a multi-solution repo
                 // stays on the legacy mutable-row path; a single-solution repo gets full Phase-9 snapshots.
                 await orchestrator.IndexSolutionAsync(
-                    solution, progressReporter, enableSnapshots: _solutionPaths.Length == 1);
+                    solution, progressReporter, cancellationToken: ct, enableSnapshots: _solutionPaths.Length == 1);
             }
             _lastIndexedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         }
@@ -223,7 +223,7 @@ public sealed class DaemonHost : IDisposable
         }
     }
 
-    private async Task PerformIncrementalCatchUpAsync()
+    private async Task PerformIncrementalCatchUpAsync(CancellationToken ct)
     {
         _state = "indexing";
         _indexingStartedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -239,7 +239,7 @@ public sealed class DaemonHost : IDisposable
 
             foreach (var solutionPath in _solutionPaths)
             {
-                var solution = await SolutionLoader.LoadSolutionAsync(solutionPath, _log);
+                var solution = await SolutionLoader.LoadSolutionAsync(solutionPath, _log, ct);
                 _currentSolution = solution;
 
                 var changedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -271,7 +271,7 @@ public sealed class DaemonHost : IDisposable
                     var projectId = existing.Value.id;
 
                     // Changed / new source files: on-disk hash differs from the recorded fingerprint.
-                    var compilation = await project.GetCompilationAsync();
+                    var compilation = await project.GetCompilationAsync(ct);
                     if (compilation != null)
                     {
                         foreach (var tree in compilation.SyntaxTrees)
@@ -314,7 +314,7 @@ public sealed class DaemonHost : IDisposable
             foreach (var (solution, changedPaths) in loaded)
             {
                 var incremental = new IncrementalIndexer(_db!, _log, _useDocumentExtractor, _parallelism, _profile);
-                await incremental.IndexChangedFilesAsync(solution, changedPaths);
+                await incremental.IndexChangedFilesAsync(solution, changedPaths, ct);
             }
 
             _lastIndexedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -385,7 +385,7 @@ public sealed class DaemonHost : IDisposable
             OverlayReconcileResult? result = null;
             for (var attempt = 1; attempt <= maxAttempts; attempt++)
             {
-                var solution = await SolutionLoader.LoadSolutionAsync(solutionPath, _log);
+                var solution = await SolutionLoader.LoadSolutionAsync(solutionPath, _log, ct);
                 _currentSolution = solution;
 
                 var reconciler = new LocalOverlayReconciler(_db!, _log, _useDocumentExtractor, _parallelism, _profile, gitStateProbe: null, remoteBaseSource: _remoteBaseSource);
@@ -504,9 +504,13 @@ public sealed class DaemonHost : IDisposable
                     // is no signature-changed follow-up set to re-enqueue: every dependent in the
                     // closure was already rebuilt in the same pass.
                     var incremental = new IncrementalIndexer(_db!, _log, _useDocumentExtractor, _parallelism, _profile);
-                    await incremental.IndexChangedFilesAsync(_currentSolution, item.FilePaths);
+                    await incremental.IndexChangedFilesAsync(_currentSolution, item.FilePaths, ct);
                 }
                 _lastIndexedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                break;
             }
             catch (Exception ex)
             {

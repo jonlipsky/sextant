@@ -76,7 +76,7 @@ public static class ContributionCapture
             using (var db = new IndexDatabase(payloadDbPath, IndexWriteOptions.FromConfiguration(configuration)))
             {
                 db.RunMigrations();
-                var solution = await SolutionLoader.LoadSolutionAsync(request.SolutionPath).ConfigureAwait(false);
+                var solution = await SolutionLoader.LoadSolutionAsync(request.SolutionPath, cancellationToken: cancellationToken).ConfigureAwait(false);
                 var orchestrator = new IndexOrchestrator(
                     db, log, configuration.DocumentExtractor,
                     ExtractionParallelismOptions.FromConfiguration(configuration),

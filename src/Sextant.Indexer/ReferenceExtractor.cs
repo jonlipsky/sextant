@@ -100,7 +100,7 @@ public static class ReferenceExtractor
         var snippet = text.GetSubText(Microsoft.CodeAnalysis.Text.TextSpan.FromBounds(start, end)).ToString();
 
         // Collapse whitespace
-        snippet = System.Text.RegularExpressions.Regex.Replace(snippet, @"\s+", " ").Trim();
+        snippet = System.Text.RegularExpressions.Regex.Replace(snippet, @"\s+", " ", System.Text.RegularExpressions.RegexOptions.None, TimeSpan.FromSeconds(1)).Trim();
 
         return snippet.Length > 120 ? snippet[..120] : snippet;
     }

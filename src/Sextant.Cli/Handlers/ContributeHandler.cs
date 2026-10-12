@@ -105,7 +105,7 @@ internal static class ContributeHandler
         var solutionPath = Path.GetFullPath(options.SolutionPath);
         if (!File.Exists(solutionPath))
         {
-            Console.Error.WriteLine($"Solution file not found: {solutionPath}");
+            await Console.Error.WriteLineAsync($"Solution file not found: {solutionPath}").ConfigureAwait(false);
             return 1;
         }
 
@@ -118,7 +118,7 @@ internal static class ContributeHandler
         var decision = ContributionCliPlan.Decide(gitRoot is not null, isDirtyKnown, options);
         if (decision.Destination == ContributionDestination.Error)
         {
-            Console.Error.WriteLine(decision.Error);
+            await Console.Error.WriteLineAsync(decision.Error).ConfigureAwait(false);
             return 1;
         }
 
@@ -126,7 +126,7 @@ internal static class ContributeHandler
 
         if (!TryResolveGitFacts(gitRoot!, out var commitSha, out var treeSha, out var currentBranch, out var gitError))
         {
-            Console.Error.WriteLine(gitError);
+            await Console.Error.WriteLineAsync(gitError).ConfigureAwait(false);
             return 1;
         }
 
@@ -175,7 +175,7 @@ internal static class ContributeHandler
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"Capture failed: {ex.Message}");
+            await Console.Error.WriteLineAsync($"Capture failed: {ex.Message}").ConfigureAwait(false);
             return 1;
         }
 
@@ -202,7 +202,7 @@ internal static class ContributeHandler
     {
         if (!Uri.TryCreate(options.ServiceUrl, UriKind.Absolute, out var serviceUri))
         {
-            Console.Error.WriteLine($"Invalid --service URL: {options.ServiceUrl}");
+            await Console.Error.WriteLineAsync($"Invalid --service URL: {options.ServiceUrl}").ConfigureAwait(false);
             return 1;
         }
 
@@ -222,7 +222,7 @@ internal static class ContributeHandler
             // opt-in) is set (acceptance criterion 5).
             if (options.Require)
             {
-                Console.Error.WriteLine($"Service unavailable and --require was set: {outcome.Message}");
+                await Console.Error.WriteLineAsync($"Service unavailable and --require was set: {outcome.Message}").ConfigureAwait(false);
                 return 1;
             }
             Console.WriteLine($"  Service unavailable (non-blocking): {outcome.Message}");
@@ -231,9 +231,9 @@ internal static class ContributeHandler
 
         if (!outcome.Accepted)
         {
-            Console.Error.WriteLine($"  Contribution rejected: {outcome.Result?.RejectionCode}: {outcome.Message}");
+            await Console.Error.WriteLineAsync($"  Contribution rejected: {outcome.Result?.RejectionCode}: {outcome.Message}").ConfigureAwait(false);
             foreach (var diagnostic in outcome.Result?.Diagnostics ?? [])
-                Console.Error.WriteLine($"    - [{diagnostic.Code}] {diagnostic.ProjectPath}: {diagnostic.Message}");
+                await Console.Error.WriteLineAsync($"    - [{diagnostic.Code}] {diagnostic.ProjectPath}: {diagnostic.Message}").ConfigureAwait(false);
             return 1;
         }
 
@@ -280,7 +280,7 @@ internal static class ContributeHandler
     {
         try
         {
-            var psi = new System.Diagnostics.ProcessStartInfo("git", args)
+            var psi = new System.Diagnostics.ProcessStartInfo(Sextant.Core.GitExecutable.Path, args)
             {
                 WorkingDirectory = workingDirectory,
                 RedirectStandardOutput = true,

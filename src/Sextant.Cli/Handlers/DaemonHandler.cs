@@ -21,7 +21,7 @@ internal static class DaemonHandler
 
         if (solutions.Count == 0)
         {
-            Console.Error.WriteLine("No solutions found. Specify solutions in sextant.json or place .sln files in the repo root.");
+            await Console.Error.WriteLineAsync("No solutions found. Specify solutions in sextant.json or place .sln files in the repo root.").ConfigureAwait(false);
             return 1;
         }
 
@@ -47,14 +47,14 @@ internal static class DaemonHandler
         using var daemon = new Daemon.DaemonHost(
             repoRoot, dbPath, solutions.ToArray(), logCallback);
 
-        await daemon.StartAsync(cts.Token);
-
-        Console.WriteLine("Daemon running. Press Ctrl+C to stop.");
         try
         {
+            await daemon.StartAsync(cts.Token);
+
+            Console.WriteLine("Daemon running. Press Ctrl+C to stop.");
             await Task.Delay(Timeout.Infinite, cts.Token);
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException) when (cts.IsCancellationRequested) { }
 
         await daemon.StopAsync();
         Console.WriteLine("Daemon stopped.");

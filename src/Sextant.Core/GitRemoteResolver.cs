@@ -30,7 +30,7 @@ public static class GitRemoteResolver
     {
         try
         {
-            var psi = new ProcessStartInfo("git", "remote get-url origin")
+            var psi = new ProcessStartInfo(GitExecutable.Path, "remote get-url origin")
             {
                 WorkingDirectory = gitRoot,
                 RedirectStandardOutput = true,
