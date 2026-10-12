@@ -188,6 +188,22 @@ public static class SnapshotCoverageBuilder
             }, "project_evaluation_degraded", "project versions failed evaluation");
         }
 
+        if (load.PlatformPackBindings.Count > 0)
+        {
+            reasons.Add(
+                $"{load.PlatformPackBindings.Count} Apple-platform project version(s) were compiled against the platform " +
+                $"reference pack without the workload ({NameSample(load.PlatformPackBindings.Select(b => VersionName(ReasonPath(checkoutDir, b.ProjectPath), b.TargetFramework)).ToList())}); " +
+                "their package references may still be missing; see the `platform_reference_pack` diagnostics.");
+            AddCapped(diagnostics, load.PlatformPackBindings, b => new ProjectOutcome
+            {
+                Severity = JobDiagnosticSeverity.Warning,
+                Code = "platform_reference_pack",
+                ProjectPath = ReasonPath(checkoutDir, b.ProjectPath),
+                Message = $"{VersionName(ReasonPath(checkoutDir, b.ProjectPath), b.TargetFramework)} was compiled against the " +
+                    $"{b.PackId} {b.PackVersion} reference pack without the platform workload; package references may still be missing."
+            }, "platform_reference_pack", "project versions compiled against a platform reference pack");
+        }
+
         if (load.UnattributedFailureCount > 0)
         {
             reasons.Add($"{load.UnattributedFailureCount} load failure(s) could not be attributed to a project; healthy evaluation cannot be proven.");
@@ -424,6 +440,11 @@ public static class SnapshotCoverageBuilder
                 reasons.Add(
                     $"{degraded.Count} project version(s) failed evaluation but exposed documents " +
                     $"({NameSample(degraded.Select(p => VersionName(Rel(Path.GetFullPath(p.ProjectPath)), p.TargetFramework)).ToList())}); their references may be incomplete.");
+            var packBound = load.PlatformPackBindings.Where(b => InSubtree(Path.GetFullPath(b.ProjectPath))).ToList();
+            if (packBound.Count > 0)
+                reasons.Add(
+                    $"{packBound.Count} Apple-platform project version(s) were compiled against the platform reference pack " +
+                    $"without the workload ({NameSample(packBound.Select(b => VersionName(Rel(Path.GetFullPath(b.ProjectPath)), b.TargetFramework)).ToList())}); their package references may still be missing.");
             if (load.UnattributedFailureCount > 0)
                 reasons.Add($"{load.UnattributedFailureCount} load failure(s) could not be attributed; healthy evaluation of this repository cannot be proven.");
             if (deferred.Count > 0)

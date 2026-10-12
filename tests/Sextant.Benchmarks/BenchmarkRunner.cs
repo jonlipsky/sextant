@@ -358,11 +358,11 @@ public sealed class BenchmarkRunner
         if (!selection.HasSolutions)
             throw new InvalidOperationException("No solution could be selected in the --path checkout.");
 
+        var scratch = Path.Combine(options.WorkDir, "restore-scratch");
+        Directory.CreateDirectory(scratch);
         var restoreSw = Stopwatch.StartNew();
         if (options.Restore)
         {
-            var scratch = Path.Combine(options.WorkDir, "restore-scratch");
-            Directory.CreateDirectory(scratch);
             var restore = await new PackageRestoreRunner(timeout: SourceRestoreTimeout, log: log)
                 .RunAsync(checkoutDir, selection.SolutionPaths, limit: null, ct, scratch);
             log($"Restore: {restore.SolutionsSucceeded}/{restore.SolutionsAttempted} solution(s) clean.");
@@ -373,9 +373,17 @@ public sealed class BenchmarkRunner
         ChildProcessUsage? buildHosts;
         using (var sampler = new ChildProcessSampler(ChildProcessSampler.BuildHostMarker))
         {
+            // The worker passes platform reference pack options (#295); the pack lines also go to the run log.
             result = await MultiSolutionLoader.LoadAsync(
-                selection.SolutionPaths, d => CaptureDiagnostic(metrics, d, options.MaxDiagnostics),
-                deadline: null, onProgress: log, cancellationToken: ct);
+                selection.SolutionPaths,
+                d =>
+                {
+                    CaptureDiagnostic(metrics, d, options.MaxDiagnostics);
+                    if (d.Contains("eference pack", StringComparison.Ordinal))
+                        log(d);
+                },
+                deadline: null, onProgress: log, cancellationToken: ct, scratchDirectory: scratch,
+                platformPacks: PlatformPackOptions.ForJob(null, scratch, null, null));
             buildHosts = sampler.Stop();
         }
         metrics.SolutionLoadMs = result.LoadMs;

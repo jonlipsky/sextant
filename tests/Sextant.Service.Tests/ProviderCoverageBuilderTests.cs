@@ -266,6 +266,38 @@ public class ProviderCoverageBuilderTests
 
     // ---- helpers --------------------------------------------------------------------------------
 
+    [TestMethod]
+    public void PlatformPackBinding_IsPartial_WithAReasonAndDiagnostic_ForRootAndProviderSubtree()
+    {
+        var resolution = Resolution([At("App.slnx"), At("libs/mix/Mix.slnx")]);
+        var projects = new[] { At("src/App/App.csproj"), At("libs/mix/src/Mix/Mix.csproj") };
+        var load = Load(projects) with
+        {
+            PlatformPackBindings =
+            [
+                new PlatformPackBinding(At("src/App/App.csproj"), "net10.0-ios", "Microsoft.iOS.Ref.net10.0_27.0", "27.0.1", "nuget.org", 5),
+                new PlatformPackBinding(At("libs/mix/src/Mix/Mix.csproj"), "net10.0-tvos", "Microsoft.tvOS.Ref.net10.0_27.0", "27.0.1", "packs", 5)
+            ]
+        };
+        var inventory = Inventory(projects, [Mix], solutions: [At("libs/mix/Mix.slnx")]);
+
+        var root = SnapshotCoverageBuilder.Build(CheckoutDir, resolution, load, inventory);
+        var provider = SnapshotCoverageBuilder.BuildProviders(CheckoutDir, resolution, load, inventory)["libs/mix"];
+
+        Assert.AreEqual(SnapshotCoverageVerdict.Partial, root.Coverage.Verdict);
+        var rootReason = root.Coverage.Reasons.Single(r => r.Contains("platform reference pack", StringComparison.Ordinal));
+        StringAssert.StartsWith(rootReason, "2 Apple-platform project version(s)");
+        StringAssert.Contains(rootReason, "src/App/App.csproj");
+        Assert.AreEqual(2, root.Diagnostics.Count(d => d.Code == "platform_reference_pack"));
+
+        Assert.AreEqual(SnapshotCoverageVerdict.Partial, provider.Verdict);
+        var providerReason = provider.Reasons.Single(r => r.Contains("platform reference pack", StringComparison.Ordinal));
+        StringAssert.StartsWith(providerReason, "1 Apple-platform project version(s)");
+        StringAssert.Contains(providerReason, "src/Mix/Mix.csproj", "provider-relative");
+        Assert.IsFalse(providerReason.Contains("libs/mix", StringComparison.Ordinal));
+        Assert.IsFalse(providerReason.Contains("src/App", StringComparison.Ordinal));
+    }
+
     private static CheckoutResolution Resolution(
         IReadOnlyList<string> selected, SolutionSelectionSource source = SolutionSelectionSource.DefaultUnion) => new()
         {

@@ -466,11 +466,15 @@ public static class SolutionLoader
                 var failure = candidates.FirstOrDefault(f => f.ProjectId == variant.Id)
                     ?? candidates.FirstOrDefault(f => f.ProjectId == null);
                 var reason = failure?.Message ?? thrown?.Reason;
+                // The first failure is not always the workload one: keep the workload failure when the variant has several.
+                if (candidates.Where(f => f.ProjectId == variant.Id || f.ProjectId == null)
+                        .FirstOrDefault(f => PlatformReferencePacks.IsWorkloadFailure(f.Message)) is { } workloadFailure)
+                    reason = workloadFailure.Message;
                 if (reason == null)
                     continue;
                 var tfm = VariantFramework(variant, expected);
                 if (variant.Documents.Any())
-                    degraded.Add(new DegradedProject(projectPath, tfm, reason));
+                    degraded.Add(new DegradedProject(projectPath, tfm, reason) { ProjectId = variant.Id });
                 else
                     result.Add(new SkippedProject(projectPath, reason) { TargetFramework = tfm });
             }
