@@ -58,4 +58,7 @@ public sealed record SolutionLoadResult(Solution Solution, IReadOnlyList<Skipped
     /// <c>OpenSolutionAsync</c>: a union load that fell back from its generated solution (issue #268).
     /// </summary>
     public bool LoadedProjectByProject { get; init; }
+
+    /// <summary>Projects bound against a platform reference pack after the load (issue #309); empty unless that opt-in ran.</summary>
+    public IReadOnlyList<PlatformPackBinding> PlatformPackBindings { get; init; } = [];
 }

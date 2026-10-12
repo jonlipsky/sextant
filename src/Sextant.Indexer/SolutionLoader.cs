@@ -560,7 +560,7 @@ public static class SolutionLoader
         return expected.Count == 1 ? expected[0] : null;
     }
 
-    private static IReadOnlyList<string> ReadExpectedFrameworks(string? path)
+    internal static IReadOnlyList<string> ReadExpectedFrameworks(string? path)
     {
         if (path == null) return [];
         try

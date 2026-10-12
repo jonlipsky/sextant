@@ -34,8 +34,8 @@ internal static class IndexHandler
                 Directory.CreateDirectory(dbDir);
 
             Console.WriteLine("Loading solution...");
-            var loadResult = await Indexer.SolutionLoader.LoadSolutionResilientlyAsync(
-                solutionPath, fileLogger.CreateCallback());
+            var loadResult = await Indexer.LocalPlatformPacks.LoadAsync(
+                solutionPath, config.PlatformReferencePacks, fileLogger.CreateCallback());
             var solution = loadResult.Solution;
             Console.WriteLine($"  Loaded {solution.ProjectIds.Count} projects");
 
@@ -136,8 +136,8 @@ internal static class IndexHandler
                         // Reassign the WHOLE result, not just the Solution: the reloaded solution may have
                         // a different skipped-project set (the on-disk state changed), and we must report
                         // the completeness of the generation we actually publish (issue #90 accuracy).
-                        loadResult = await Indexer.SolutionLoader.LoadSolutionResilientlyAsync(
-                            solutionPath, fileLogger.CreateCallback());
+                        loadResult = await Indexer.LocalPlatformPacks.LoadAsync(
+                            solutionPath, config.PlatformReferencePacks, fileLogger.CreateCallback());
                         solution = loadResult.Solution;
                         lastPhase = "";
                     }
@@ -171,19 +171,37 @@ internal static class IndexHandler
 
     private static void ReportSkippedProjects(Indexer.SolutionLoadResult loadResult)
     {
+        if (loadResult.PlatformPackBindings.Count > 0)
+        {
+            Console.WriteLine();
+            Console.WriteLine($"  NOTE: {Indexer.LocalPlatformPacks.BindingSummary(loadResult.PlatformPackBindings)}");
+        }
+
         if (!loadResult.IsPartial)
             return;
 
+        var bound = loadResult.DegradedProjects.Count(d => FindBinding(loadResult, d) is not null);
+        var degraded = loadResult.DegradedProjects.Count - bound;
         Console.WriteLine();
         Console.WriteLine(
             $"  WARNING: {loadResult.SkippedProjects.Count} project version(s) skipped, " +
-            $"{loadResult.DegradedProjects.Count} degraded, {loadResult.UnattributedFailureCount} unattributed load failure(s). " +
+            $"{degraded} degraded, {bound} bound to a reference pack, {loadResult.UnattributedFailureCount} unattributed load failure(s). " +
             "The index is PARTIAL; symbols or references may be missing:");
         foreach (var skipped in loadResult.SkippedProjects)
             Console.WriteLine($"    - {skipped.ProjectName} (TFM {skipped.TargetFramework ?? "unknown"}): {skipped.Reason}");
-        foreach (var degraded in loadResult.DegradedProjects)
-            Console.WriteLine($"    - {Path.GetFileName(degraded.ProjectPath)} (TFM {degraded.TargetFramework ?? "unknown"}, degraded): {degraded.Reason}");
+        foreach (var project in loadResult.DegradedProjects)
+        {
+            var name = Path.GetFileName(project.ProjectPath);
+            var tfm = project.TargetFramework ?? "unknown";
+            if (FindBinding(loadResult, project) is { } binding)
+                Console.WriteLine($"    - {name} (TFM {tfm}, compiled against {binding.PackId} {binding.PackVersion} reference pack): {project.Reason}");
+            else
+                Console.WriteLine($"    - {name} (TFM {tfm}, degraded): {project.Reason}");
+        }
     }
+
+    private static Indexer.PlatformPackBinding? FindBinding(Indexer.SolutionLoadResult loadResult, Indexer.DegradedProject degraded) =>
+        loadResult.PlatformPackBindings.FirstOrDefault(b => b.ProjectPath == degraded.ProjectPath && b.TargetFramework == degraded.TargetFramework);
 
     private static void ClearLine()
     {

@@ -25,6 +25,7 @@ public sealed class DaemonHost : IDisposable
     private volatile IndexingProgress? _currentProgress;
     private Solution? _currentSolution;
     private bool _useDocumentExtractor;
+    private bool _platformReferencePacks;
     private Indexer.ExtractionParallelismOptions _parallelism = Indexer.ExtractionParallelismOptions.Default;
     private IndexProfileDescriptor _profile = IndexProfileDescriptor.Full;
 
@@ -65,6 +66,7 @@ public sealed class DaemonHost : IDisposable
         var config = SextantConfiguration.Load(_repoRoot);
         _db = new IndexDatabase(_dbPath, IndexWriteOptions.FromConfiguration(config));
         _useDocumentExtractor = config.DocumentExtractor;
+        _platformReferencePacks = config.PlatformReferencePacks;
         _parallelism = Indexer.ExtractionParallelismOptions.FromConfiguration(config);
         _profile = IndexProfileDescriptor.FromConfiguration(config);
         _reconcileIntervalSeconds = config.ReconcileIntervalSeconds;
@@ -201,7 +203,7 @@ public sealed class DaemonHost : IDisposable
                     ProjectIndex = 0,
                     ProjectCount = 0
                 };
-                var solution = await SolutionLoader.LoadSolutionAsync(solutionPath, _log, ct);
+                var solution = await LoadSolutionAsync(solutionPath, ct);
                 _currentSolution = solution;
 
                 var orchestrator = new IndexOrchestrator(_db!, _log, _useDocumentExtractor, _parallelism, _profile);
@@ -239,7 +241,7 @@ public sealed class DaemonHost : IDisposable
 
             foreach (var solutionPath in _solutionPaths)
             {
-                var solution = await SolutionLoader.LoadSolutionAsync(solutionPath, _log, ct);
+                var solution = await LoadSolutionAsync(solutionPath, ct);
                 _currentSolution = solution;
 
                 var changedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -337,6 +339,14 @@ public sealed class DaemonHost : IDisposable
         });
     }
 
+    private async Task<Solution> LoadSolutionAsync(string solutionPath, CancellationToken ct)
+    {
+        var result = await Indexer.LocalPlatformPacks.LoadAsync(solutionPath, _platformReferencePacks, _log, ct);
+        if (result.PlatformPackBindings.Count > 0)
+            _log?.Invoke(Indexer.LocalPlatformPacks.BindingSummary(result.PlatformPackBindings));
+        return result.Solution;
+    }
+
     /// <summary>
     /// Issue #28: re-reads <c>sextant.json</c> so a live config edit (extractor toggle, parallelism,
     /// profile, reconcile interval) is picked up on the authoritative pass — not only when the daemon
@@ -347,6 +357,7 @@ public sealed class DaemonHost : IDisposable
     {
         var config = SextantConfiguration.Load(_repoRoot);
         _useDocumentExtractor = config.DocumentExtractor;
+        _platformReferencePacks = config.PlatformReferencePacks;
         _parallelism = Indexer.ExtractionParallelismOptions.FromConfiguration(config);
         _profile = IndexProfileDescriptor.FromConfiguration(config);
         _reconcileIntervalSeconds = config.ReconcileIntervalSeconds;
@@ -385,7 +396,7 @@ public sealed class DaemonHost : IDisposable
             OverlayReconcileResult? result = null;
             for (var attempt = 1; attempt <= maxAttempts; attempt++)
             {
-                var solution = await SolutionLoader.LoadSolutionAsync(solutionPath, _log, ct);
+                var solution = await LoadSolutionAsync(solutionPath, ct);
                 _currentSolution = solution;
 
                 var reconciler = new LocalOverlayReconciler(_db!, _log, _useDocumentExtractor, _parallelism, _profile, gitStateProbe: null, remoteBaseSource: _remoteBaseSource);

@@ -53,7 +53,23 @@ through a generated throwaway project with a `nuget.config` that clears every so
 `Microsoft.MacCatalyst.Ref.*` and `Microsoft.tvOS.Ref.*` are ever resolved. Its assemblies are added to the project as metadata
 references (and `Microsoft.NETCore.App.Ref` when no framework reference is present); a pack that cannot be obtained leaves
 the project as before. Each bound project gets a `platform_reference_pack` diagnostic and a partial-coverage reason,
-because package references may still be missing. Other projects are untouched; the local CLI/daemon does not apply this.
+because package references may still be missing. Other projects are untouched.
+
+The local CLI and daemon apply the same mechanism only when opted in (issue #309: `platform_reference_packs` /
+`SEXTANT_PLATFORM_REFERENCE_PACKS=true|1`; any other env value is off). The workload failure is only reported by a load
+that follows a restore (the service restores first; a project with no `obj/project.assets.json` loads without any
+failure and so is never classified), so with the opt-in on, `LocalPlatformPacks` first runs `dotnet restore` (the
+service's flags) on each declared project that statically targets an Apple platform (or, when its target frameworks are conditional or use `$(...)`, whose file text mentions an `-ios`/`-maccatalyst`/`-tvos` TFM or sets `UseMaui`) and has no assets file, then loads
+and binds with the same `PlatformReferencePacks.ApplyAsync`. The CLI prints the coverage line for bound projects (and no
+longer lists them as merely degraded); the daemon logs it. The pack is looked up in `<dotnet root>/packs`, then the NuGet
+global packages folder (`NUGET_PACKAGES`, else `~/.nuget/packages`; a `globalPackagesFolder` in `NuGet.config` is not
+read), and a pack is only trusted there when NuGet's `.nupkg.metadata` completion marker is present.
+
+That restore writes `obj/` outputs (`project.assets.json`, `nuget.g.props`/`nuget.g.targets`, dgspec) for those projects and
+the projects they reference, and it uses the user's own NuGet feeds, config and environment; only the pack download is the
+isolated nuget.org one. A restore is attempted once per project path and project-file write time for the life of the
+process (a project with a custom `obj` layout is not restored again on every daemon reload), and the whole pass has a 5
+minute budget; remaining projects are then skipped with one diagnostic.
 
 `MSBuildLocator.RegisterDefaults()` must be initialized exactly once, before any `Microsoft.CodeAnalysis` types are loaded. This is a hard Roslyn constraint and is the first call in `Program.cs`.
 

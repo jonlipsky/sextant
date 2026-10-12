@@ -37,6 +37,7 @@ All fields are optional — Sextant uses sensible defaults.
 | `auto_spawn_daemon` | bool | `true` | Auto-spawn the daemon from the MCP server. |
 | `daemon_socket` | string | (auto) | Override the daemon IPC socket/pipe path. |
 | `document_extractor` | bool | `true` | Phase 5 document-oriented extractor (see above). |
+| `platform_reference_packs` | bool | `false` | Opt-in: `sextant index` and the daemon bind iOS, Mac Catalyst and tvOS projects whose workload is not installed against the platform reference pack. **Downloads the pack from nuget.org** (isolated, nuget.org only) into the NuGet global packages folder (`NUGET_PACKAGES`, else `~/.nuget/packages`; `globalPackagesFolder` in `NuGet.config` is not read) when it is not already there, and first runs `dotnet restore` on Apple-targeting projects that have no `obj/project.assets.json` (also MAUI-style projects whose target frameworks are conditional or use `$(...)`) so the missing workload is reported. That restore writes `obj/` outputs (assets file, `nuget.g.props`/`.targets`, dgspec) for those projects and the projects they reference, and it uses your own NuGet feeds, config and environment; only the pack download is the isolated nuget.org one. A restore is attempted once per project file version per process and the whole pass is capped at 5 minutes. The CLI prints, and the daemon logs, a coverage line naming the bound projects. |
 | `max_parallelism` | int | `0` (auto) | Phase 6 extraction worker cap. |
 | `extraction_queue_capacity` | int | `0` (auto) | Phase 6 bounded writer-channel capacity. |
 | `extraction_projects_in_flight` | int | `0` (auto) | Projects the document extractor analyzes at once (issue #270). |
@@ -76,6 +77,7 @@ Environment variables take precedence over `sextant.json`:
 | `SEXTANT_DAEMON_SOCKET` | Daemon IPC socket/pipe path | (auto) |
 | `SEXTANT_AUTO_SPAWN_DAEMON` | Auto-spawn daemon from MCP server | `true` (set `false` or `0` to disable) |
 | `SEXTANT_DOCUMENT_EXTRACTOR` | Use the Phase 5 document-oriented extractor | `true` (set `false`/`0` for the legacy fallback) |
+| `SEXTANT_PLATFORM_REFERENCE_PACKS` | Opt in to platform reference pack binding for the local CLI and daemon; downloads from nuget.org (see `platform_reference_packs`) | `false` (overrides the config key; only `true`/`1`, case-insensitive, enable it; anything else is off) |
 | `SEXTANT_MAX_PARALLELISM` | Document-extractor analysis worker cap | `0` (auto: `min(cores, 8)`) |
 | `SEXTANT_EXTRACTION_QUEUE_CAPACITY` | Bounded writer-channel capacity (contribution sets) | `0` (auto: small multiple of parallelism) |
 | `SEXTANT_WRITE_BATCH_SIZE` | Rows before a forced mid-project commit (Phase 3) | `10000` |

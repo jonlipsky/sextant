@@ -75,6 +75,13 @@ public sealed class SextantConfiguration
     public bool DocumentExtractor { get; set; } = true;
 
     /// <summary>
+    /// Opt-in (default off): the local CLI and daemon bind iOS, Mac Catalyst and tvOS projects whose workload is not
+    /// installed against the platform reference pack, downloaded from nuget.org (issue #309). Overridable via
+    /// <c>platform_reference_packs</c> in <c>sextant.json</c> or the <c>SEXTANT_PLATFORM_REFERENCE_PACKS</c> env var.
+    /// </summary>
+    public bool PlatformReferencePacks { get; set; }
+
+    /// <summary>
     /// Maximum degree of parallelism for the document-oriented extractor's per-document analysis. 0
     /// (the default) means auto-resolve to the smaller of the processor count and an experimentally
     /// chosen cap. Analysis workers never touch SQLite — a single batched writer consumes their
@@ -318,6 +325,8 @@ public sealed class SextantConfiguration
                             config.WriterMmapMib = fileConfig.WriterMmapMib.Value;
                         if (fileConfig.DocumentExtractor.HasValue)
                             config.DocumentExtractor = fileConfig.DocumentExtractor.Value;
+                        if (fileConfig.PlatformReferencePacks.HasValue)
+                            config.PlatformReferencePacks = fileConfig.PlatformReferencePacks.Value;
                         if (fileConfig.MaxParallelism.HasValue)
                             config.MaxParallelism = fileConfig.MaxParallelism.Value;
                         if (fileConfig.ExtractionQueueCapacity.HasValue)
@@ -425,6 +434,10 @@ public sealed class SextantConfiguration
         var documentExtractor = Environment.GetEnvironmentVariable("SEXTANT_DOCUMENT_EXTRACTOR");
         if (!string.IsNullOrEmpty(documentExtractor))
             config.DocumentExtractor = !(documentExtractor == "false" || documentExtractor == "0");
+
+        var platformPacks = Environment.GetEnvironmentVariable("SEXTANT_PLATFORM_REFERENCE_PACKS");
+        if (!string.IsNullOrEmpty(platformPacks))
+            config.PlatformReferencePacks = platformPacks == "1" || platformPacks.Equals("true", StringComparison.OrdinalIgnoreCase);
 
         var maxParallelism = Environment.GetEnvironmentVariable("SEXTANT_MAX_PARALLELISM");
         if (int.TryParse(maxParallelism, out var parallelism))
@@ -544,6 +557,9 @@ public sealed class SextantConfiguration
 
         [JsonPropertyName("document_extractor")]
         public bool? DocumentExtractor { get; set; }
+
+        [JsonPropertyName("platform_reference_packs")]
+        public bool? PlatformReferencePacks { get; set; }
 
         [JsonPropertyName("max_parallelism")]
         public int? MaxParallelism { get; set; }
