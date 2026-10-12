@@ -49,7 +49,8 @@ namespace Sextant.Service.Restore;
 /// </summary>
 public sealed class PackageRestoreRunner(
     bool enabled = true, TimeSpan? timeout = null, Action<string>? log = null,
-    IReadOnlyList<PackageSourceCredential>? sourceCredentials = null, string? credentialPluginPath = null)
+    IReadOnlyList<PackageSourceCredential>? sourceCredentials = null, string? credentialPluginPath = null,
+    bool staticGraphRestore = PackageRestoreRunner.DefaultStaticGraphRestore)
 {
     private readonly IReadOnlyList<PackageSourceCredential> _sourceCredentials = ValidateCredentials(sourceCredentials, credentialPluginPath);
 
@@ -58,6 +59,9 @@ public sealed class PackageRestoreRunner(
 
     /// <summary>The largest accepted bound; a larger configured value is clamped to it.</summary>
     public static readonly TimeSpan MaxTimeout = TimeSpan.FromHours(1);
+
+    /// <summary>The one default of static-graph restore (issue #272): the constructor, <see cref="ServiceOptions.RestoreStaticGraph"/> and the benchmark share it.</summary>
+    public const bool DefaultStaticGraphRestore = true;
 
     /// <summary>The identity component a node with restore disabled publishes under.</summary>
     public const string DisabledIdentityComponent = "off";
@@ -86,6 +90,14 @@ public sealed class PackageRestoreRunner(
 
     /// <summary>Restore runs on this node.</summary>
     public bool Enabled => enabled;
+
+    /// <summary>
+    /// Per-solution <c>dotnet restore</c> passes add <c>-p:RestoreUseStaticGraphEvaluation=true</c> (issue #272), and a
+    /// pass that fails as a whole is run once more without it. The generated project traversals (the union and the
+    /// per-project retries) are unchanged: their MSBuild task would start one NuGet static-graph process per project
+    /// instead of one for the whole graph.
+    /// </summary>
+    public bool StaticGraphRestore => staticGraphRestore;
 
     /// <summary>The bound on one job's restore step, clamped to <see cref="MaxTimeout"/>.</summary>
     public TimeSpan Timeout { get; } = timeout is { } t && t > TimeSpan.Zero
@@ -232,6 +244,7 @@ public sealed class PackageRestoreRunner(
         var parser = new RestoreOutputParser(checkoutDir);
         var stopwatch = Stopwatch.StartNew();
         int attempted = 0, succeeded = 0, notStarted = 0, retried = 0, retriedProjects = 0;
+        int staticPasses = 0, staticFallbacks = 0;
         var timedOut = false;
         var startedUtc = DateTime.UtcNow;
 
@@ -372,7 +385,35 @@ public sealed class PackageRestoreRunner(
             foreach (var project in declared)
                 lastAttemptDir[project] = solutionDir;
             var attempt = new RestoreOutputParser(checkoutDir);
-            var result = await RunOneAsync(solution, globals, remaining, attempt, cancellationToken, environment).ConfigureAwait(false);
+            var memoKey = (Path.GetFullPath(solution), File.GetLastWriteTimeUtc(solution).Ticks);
+            var useStaticGraph = staticGraphRestore && !FellBackSolutions.ContainsKey(memoKey);
+            var result = await RunOneAsync(solution, globals, remaining, attempt, cancellationToken, environment, useStaticGraph)
+                .ConfigureAwait(false);
+            if (useStaticGraph)
+            {
+                staticPasses++;
+                // A static pass that failed as a whole (failed, no project named) is re-run once without it, since
+                // static-graph evaluation runs no targets and can fail where the default restore succeeds. A pass
+                // that names failing projects is not re-run: any project it left without assets already gets the
+                // #296 per-project retry below, which never uses static graph. The fallback's result is the one reported.
+                // A timeout or cancellation is not re-run either (the default restore would hit it too).
+                if (result == RunResult.Failed && attempt.Projects().Count == 0)
+                {
+                    staticFallbacks++;
+                    FellBackSolutions[memoKey] = 0;
+                    log?.Invoke(
+                        $"package restore of '{Path.GetFileName(solution)}' failed with static-graph evaluation; re-running it once without, and restoring it without for the rest of this process.");
+                    var fallbackRemaining = deadline - stopwatch.Elapsed;
+                    if (fallbackRemaining <= TimeSpan.Zero)
+                        result = RunResult.TimedOut;
+                    else
+                    {
+                        attempt = new RestoreOutputParser(checkoutDir);
+                        result = await RunOneAsync(solution, globals, fallbackRemaining, attempt, cancellationToken, environment)
+                            .ConfigureAwait(false);
+                    }
+                }
+            }
             var retrySucceeded = false;
             var outcomeParser = attempt;
             if (result == RunResult.Failed && AnyProjectWithoutAssets(solution))
@@ -434,6 +475,8 @@ public sealed class PackageRestoreRunner(
             SolutionsNotStarted = notStarted,
             SolutionsRetriedPerProject = retried,
             ProjectsRetried = retriedProjects,
+            StaticGraphPasses = staticPasses,
+            StaticGraphFallbacks = staticFallbacks,
             SolutionsSkippedRedundant = skippedNames.Count,
             SkippedSolutionNames = skippedNames,
             SolutionsPartiallySkipped = partialSkipped,
@@ -450,6 +493,7 @@ public sealed class PackageRestoreRunner(
         log?.Invoke(
             $"package restore: {succeeded}/{attempted} solution(s) restored cleanly in {outcome.Elapsed.TotalSeconds:0.#}s" +
             (retried > 0 ? $"; {retried} solution(s) retried per project ({retriedProjects} project(s))" : string.Empty) +
+            (staticPasses > 0 ? $"; static-graph evaluation on {staticPasses} pass(es), {staticFallbacks} fell back" : string.Empty) +
             (skippedNames.Count > 0
                 ? $"; {skippedNames.Count} solution(s) skipped as already restored ({string.Join(", ", skippedNames)})"
                 : string.Empty) +
@@ -698,13 +742,18 @@ public sealed class PackageRestoreRunner(
         }
     }
 
+    // Solutions whose static-graph pass failed, remembered for the life of the process (keyed by path + last write time).
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(string Path, long LastWriteTicks), byte> FellBackSolutions = new();
+
+    internal static void ResetStaticGraphMemo() => FellBackSolutions.Clear();
+
     private enum RunResult { Succeeded, Failed, NotStarted, TimedOut }
 
     private async Task<RunResult> RunOneAsync(
         string solution, IReadOnlyList<KeyValuePair<string, string>> globals, TimeSpan timeLimit, RestoreOutputParser parser, CancellationToken cancellationToken,
-        IReadOnlyDictionary<string, string> environment)
+        IReadOnlyDictionary<string, string> environment, bool staticGraph = false)
     {
-        return await RunProcessAsync(CreateStartInfo(solution, globals, environment), solution, timeLimit, parser, cancellationToken)
+        return await RunProcessAsync(CreateStartInfo(solution, globals, environment, staticGraph), solution, timeLimit, parser, cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -1114,8 +1163,9 @@ public sealed class PackageRestoreRunner(
     private sealed record UnionProject(string ProjectPath, string SolutionPath);
 
     internal ProcessStartInfo CreateStartInfo(
-        string solution, IReadOnlyList<KeyValuePair<string, string>> globals, IReadOnlyDictionary<string, string>? environment = null)
-        => CreateStartInfo(Arguments(solution, globals), Path.GetDirectoryName(Path.GetFullPath(solution)) ?? Environment.CurrentDirectory,
+        string solution, IReadOnlyList<KeyValuePair<string, string>> globals, IReadOnlyDictionary<string, string>? environment = null,
+        bool staticGraph = false)
+        => CreateStartInfo(Arguments(solution, globals, staticGraph), Path.GetDirectoryName(Path.GetFullPath(solution)) ?? Environment.CurrentDirectory,
             environment);
 
     private ProcessStartInfo CreateUnionStartInfo(string project, string checkoutDir, IReadOnlyDictionary<string, string> environment)
@@ -1166,13 +1216,16 @@ public sealed class PackageRestoreRunner(
     }
 
     /// <summary>
-    /// The <c>dotnet restore</c> arguments for one solution, with the selection's <see cref="EvaluationGlobalProperties"/>.
+    /// The <c>dotnet restore</c> arguments for one solution, with the selection's <see cref="EvaluationGlobalProperties"/>
+    /// and, when <paramref name="staticGraph"/> is set, static-graph evaluation (issue #272).
     /// </summary>
-    internal static IReadOnlyList<string> Arguments(string solution, IReadOnlyList<KeyValuePair<string, string>> globals) =>
+    internal static IReadOnlyList<string> Arguments(
+        string solution, IReadOnlyList<KeyValuePair<string, string>> globals, bool staticGraph = false) =>
     [
         "restore", solution,
         "-p:DesignTimeBuild=true",
         .. globals.Select(p => $"-p:{p.Key}={p.Value}"),
+        .. staticGraph ? new[] { "-p:RestoreUseStaticGraphEvaluation=true" } : [],
         "--ignore-failed-sources",
         "--disable-build-servers",
         "-nodeReuse:false",

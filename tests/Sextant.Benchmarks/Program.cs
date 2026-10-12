@@ -1,4 +1,5 @@
 using Microsoft.Build.Locator;
+using Sextant.Service.Restore;
 
 namespace Sextant.Benchmarks;
 
@@ -104,13 +105,14 @@ public static class Program
         return allOk ? 0 : 1;
     }
 
-    private static (BenchmarkOptions, string outDir) ParseArgs(string[] args)
+    internal static (BenchmarkOptions, string outDir) ParseArgs(string[] args)
     {
         var corpus = "correctness";
         string? path = null;
         string? work = null;
         var outDir = Path.Combine(Directory.GetCurrentDirectory(), "benchmark-results");
         var restore = true;
+        var staticGraphRestore = PackageRestoreRunner.DefaultStaticGraphRestore;
         var incremental = true;
         var redact = false;
         var intervalMs = 50;
@@ -134,6 +136,7 @@ public static class Program
                 case "--out": outDir = RequireValue(args, ref i); break;
                 case "--work": work = RequireValue(args, ref i); break;
                 case "--no-restore": restore = false; break;
+                case "--no-static-graph-restore": staticGraphRestore = false; break;
                 case "--no-incremental": incremental = false; break;
                 case "--redact": redact = true; break;
                 case "--interval-ms": intervalMs = int.Parse(RequireValue(args, ref i)); break;
@@ -157,6 +160,7 @@ public static class Program
             SolutionPath = path,
             WorkDir = work ?? Path.Combine(Path.GetTempPath(), "sextant-benchmarks"),
             Restore = restore,
+            StaticGraphRestore = staticGraphRestore,
             RunIncremental = incremental,
             Redact = redact,
             SampleIntervalMs = intervalMs,
@@ -204,6 +208,8 @@ public static class Program
               --out <dir>           report output directory (default: ./benchmark-results)
               --work <dir>          scratch dir for generated corpora + databases
               --no-restore          skip 'dotnet restore' before loading
+              --no-static-graph-restore
+                                    with --service-path: restore without static-graph evaluation (default: on, like the service)
               --no-incremental      skip the incremental pass (generated corpora only)
               --redact              strip identifying data (implied for external)
               --interval-ms <n>     resource sampling interval (default: 50)

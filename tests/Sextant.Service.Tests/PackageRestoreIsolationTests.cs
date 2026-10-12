@@ -122,7 +122,7 @@ public class PackageRestoreIsolationTests
             var fake = CreateFakeDotnet(System.IO.Path.Combine(root, "fake"), "exit 0", "exit 0");
             var solution = WriteSolution(root, "All.slnx", "A");
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [solution], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             Assert.IsTrue(outcome.Clean);
@@ -144,7 +144,7 @@ public class PackageRestoreIsolationTests
             var first = WriteSolution(System.IO.Path.Combine(Directory.CreateDirectory(System.IO.Path.Combine(root, "one")).FullName), "One.slnx", "A");
             var second = WriteSolution(System.IO.Path.Combine(Directory.CreateDirectory(System.IO.Path.Combine(root, "two")).FullName), "Two.slnx", "B");
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [first, second], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             Assert.IsTrue(outcome.UsedProjectUnion);
@@ -168,7 +168,7 @@ public class PackageRestoreIsolationTests
             var solution = WriteSolution(root, "All.slnx", "A", "B");
             var logs = new List<string>();
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), log: logs.Add) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), log: logs.Add, staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [solution], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             CollectionAssert.AreEqual(new[] { "restore", "msbuild" }, fake.Calls.Select(c => c.Split(' ')[0]).ToArray());
@@ -209,7 +209,7 @@ public class PackageRestoreIsolationTests
             var credentials = new[] { new PackageSourceCredential("feed.example.test", "user", "not-a-real-secret") };
 
             var outcome = await new PackageRestoreRunner(
-                    timeout: TimeSpan.FromSeconds(60), sourceCredentials: credentials, credentialPluginPath: plugin)
+                    timeout: TimeSpan.FromSeconds(60), sourceCredentials: credentials, credentialPluginPath: plugin, staticGraphRestore: false)
                 { DotnetPath = fake.Path }
                 .RunAsync(root, [solution], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
@@ -246,7 +246,7 @@ public class PackageRestoreIsolationTests
                 $"echo '{bad} : error NU1105: Invalid target framework x.' ; exit 1");
             var solution = WriteSolution(root, "All.slnx", "A", "B");
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [solution], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             Assert.AreEqual(1, outcome.SolutionsRetriedPerProject);
@@ -268,7 +268,7 @@ public class PackageRestoreIsolationTests
             var fake = CreateFakeDotnet(System.IO.Path.Combine(root, "fake"), "exec sleep 60", "exit 0");
             var solution = WriteSolution(root, "All.slnx", "A");
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(1)) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(1), staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [solution], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             Assert.IsTrue(outcome.TimedOut);
@@ -290,7 +290,7 @@ public class PackageRestoreIsolationTests
             using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
 
             await Assert.ThrowsAsync<OperationCanceledException>(() =>
-                new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+                new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), staticGraphRestore: false) { DotnetPath = fake.Path }
                     .RunAsync(root, [solution], limit: null, cts.Token, System.IO.Path.Combine(root, "scratch")));
 
             CollectionAssert.AreEqual(new[] { "restore" }, fake.Calls.Select(c => c.Split(' ')[0]).ToArray());
@@ -313,7 +313,7 @@ public class PackageRestoreIsolationTests
             var scratch = System.IO.Path.Combine(root, "scratch-file");
             File.WriteAllText(scratch, string.Empty);
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [solution], limit: null, CancellationToken.None, scratch);
 
             Assert.AreEqual(0, outcome.SolutionsRetriedPerProject);
@@ -333,7 +333,7 @@ public class PackageRestoreIsolationTests
             var fake = CreateFakeDotnet(System.IO.Path.Combine(root, "fake"), "exit 0", "exit 0");
             var solution = WriteSolution(root, "All.slnx", "A");
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [solution], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             Assert.AreEqual(0, outcome.SolutionsRetriedPerProject);
@@ -360,7 +360,7 @@ public class PackageRestoreIsolationTests
                 File.WriteAllText(System.IO.Path.Combine(root, project, "obj", "project.assets.json"), "{}");
             }
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [solution], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             CollectionAssert.AreEqual(new[] { "restore" }, fake.Calls.Select(c => c.Split(' ')[0]).ToArray());
@@ -384,7 +384,7 @@ public class PackageRestoreIsolationTests
                 $"echo '{a} : error NU1101: Unable to find package Acme.X. No packages exist' ; exit 1", "exec sleep 60");
             var solution = WriteSolution(root, "All.slnx", "A");
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(3)) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(3), staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [solution], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             Assert.IsTrue(outcome.TimedOut);
@@ -413,7 +413,7 @@ public class PackageRestoreIsolationTests
                 "restore) ", $"restore) chmod 600 \"{fake.Path}\"; ", StringComparison.Ordinal));
             var solution = WriteSolution(root, "All.slnx", "A");
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [solution], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             Assert.AreEqual(0, outcome.SolutionsRetriedPerProject);
@@ -436,7 +436,7 @@ public class PackageRestoreIsolationTests
             var first = WriteSolution(Directory.CreateDirectory(System.IO.Path.Combine(root, "one")).FullName, "One.slnx", "A");
             var second = WriteSolution(Directory.CreateDirectory(System.IO.Path.Combine(root, "two")).FullName, "Two.slnx", "B");
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [first, second], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             Assert.IsTrue(outcome.UsedProjectUnion);
@@ -505,7 +505,7 @@ public class PackageRestoreIsolationTests
                 """);
 
             var logs = new List<string>();
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromMinutes(4), log: logs.Add)
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromMinutes(4), log: logs.Add, staticGraphRestore: false)
                 .RunAsync(root, [solution], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             Assert.AreEqual(0, outcome.SolutionsRetriedPerProject, string.Join("\n", logs));
@@ -530,7 +530,7 @@ public class PackageRestoreIsolationTests
                 "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>bogus</TargetFramework></PropertyGroup></Project>");
 
             var logs = new List<string>();
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromMinutes(4), log: logs.Add)
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromMinutes(4), log: logs.Add, staticGraphRestore: false)
                 .RunAsync(root, [solution], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             Assert.AreEqual(1, outcome.SolutionsRetriedPerProject, string.Join("\n", logs));
@@ -587,7 +587,7 @@ public class PackageRestoreIsolationTests
             ForcePerSolutionFallback(root);
             var logs = new List<string>();
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), log: logs.Add) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), log: logs.Add, staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             Assert.IsFalse(outcome.UsedProjectUnion);
@@ -628,7 +628,7 @@ public class PackageRestoreIsolationTests
             File.WriteAllText(System.IO.Path.Combine(root, "sub", "D", "global.json"), "{\"sdk\":{\"version\":\"8.0.100\",\"rollForward\":\"latestMajor\"}}");
 
             var logs = new List<string>();
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), log: logs.Add) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), log: logs.Add, staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             CollectionAssert.AreEqual(new[] { "Big.slnx" }, RestoredSolutions(fake).ToArray(), string.Join("\n", logs));
@@ -674,7 +674,7 @@ public class PackageRestoreIsolationTests
             var big = WriteSolution(root, "Big.slnx", "A", "B", "C", "D");
             ForcePerSolutionFallback(root);
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [small, big], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             CollectionAssert.AreEqual(new[] { "Small.slnx", "Big.slnx" }, RestoredSolutions(fake).ToArray());
@@ -698,7 +698,7 @@ public class PackageRestoreIsolationTests
             var small = WriteSolution(one, "Small.slnx", "A", "B");
             ForcePerSolutionFallback(one);
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [big, other, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             CollectionAssert.AreEqual(new[] { "Big.slnx", "Other.slnx", "Small.slnx" }, RestoredSolutions(fake).ToArray(),
@@ -721,7 +721,7 @@ public class PackageRestoreIsolationTests
             var big = WriteSolution(root, "Big.slnx", "A", "B");
             ForcePerSolutionFallback(root, "<Marker>$(SolutionDir)</Marker>");
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             CollectionAssert.AreEqual(new[] { "Big.slnx", "Small.slnx" }, RestoredSolutions(fake).ToArray());
@@ -829,7 +829,7 @@ public class PackageRestoreIsolationTests
             var small = SlnxWith(root, "Small.slnx", string.Empty, "<Platform Solution=\"*|*\" Project=\"x64\" />", "A");
             ForcePerSolutionFallback(root);
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             CollectionAssert.AreEqual(new[] { "Big.slnx", "Small.slnx" }, RestoredSolutions(fake).ToArray());
@@ -855,7 +855,7 @@ public class PackageRestoreIsolationTests
             var big = WriteSolution(root, "Big.slnx", "A", "B", "C");
             ForcePerSolutionFallback(root);
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             CollectionAssert.AreEqual(new[] { "Big.slnx" }, RestoredSolutions(fake).ToArray());
@@ -879,7 +879,7 @@ public class PackageRestoreIsolationTests
             var big = WriteSolution(root, "Big.slnx", "A", "B", "C");
             ForcePerSolutionFallback(root);
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             CollectionAssert.AreEqual(new[] { "Big.slnx", "Small.slnx" }, RestoredSolutions(fake).ToArray());
@@ -903,7 +903,7 @@ public class PackageRestoreIsolationTests
             var big = WriteSolution(root, "Big.slnx", "A", "B", "C");
             ForcePerSolutionFallback(root);
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             Assert.AreEqual(0, outcome.SolutionsSkippedRedundant);
@@ -923,7 +923,7 @@ public class PackageRestoreIsolationTests
             var big = WriteSolution(root, "Big.slnx", "A", "B");
             ForcePerSolutionFallback(root);
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             CollectionAssert.AreEqual(new[] { "Big.slnx", "Small.slnx" }, RestoredSolutions(fake).ToArray());
@@ -954,7 +954,7 @@ public class PackageRestoreIsolationTests
             ForcePerSolutionFallback(System.IO.Path.Combine(root, "one"));
             var small = WriteSolutionRefs(System.IO.Path.Combine(root, "two"), "Small.slnx", "../one/A/A.csproj", "../one/B/B.csproj");
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             Assert.IsFalse(outcome.UsedProjectUnion);
@@ -981,7 +981,7 @@ public class PackageRestoreIsolationTests
                 File.WriteAllText(System.IO.Path.Combine(root, project, "obj", "project.assets.json"), "{}");
             }
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             CollectionAssert.AreEqual(new[] { "Big.slnx", "Small.slnx" }, RestoredSolutions(fake).ToArray());
@@ -1003,7 +1003,7 @@ public class PackageRestoreIsolationTests
             var big = WriteSolution(root, "Big.slnx", "A", "B", "C");
             ForcePerSolutionFallback(root);
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             Assert.AreEqual(1, outcome.SolutionsRetriedPerProject);
@@ -1035,7 +1035,7 @@ public class PackageRestoreIsolationTests
             var big = WriteSolution(root, "Big.slnx", "A", "B", "C", "D");
             ForcePerSolutionFallback(root);
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             Assert.AreEqual(1, outcome.SolutionsRetriedPerProject);
@@ -1062,7 +1062,7 @@ public class PackageRestoreIsolationTests
             var big = WriteSolution(root, "Big.slnx", "A", "B", "C");
             ForcePerSolutionFallback(root);
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             CollectionAssert.AreEqual(new[] { "Big.slnx", "Small.slnx" }, RestoredSolutions(fake).ToArray());
@@ -1096,7 +1096,7 @@ public class PackageRestoreIsolationTests
                     </Project>
                     """);
 
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), staticGraphRestore: false) { DotnetPath = fake.Path }
                 .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             Assert.IsFalse(outcome.UsedProjectUnion);
@@ -1118,7 +1118,7 @@ public class PackageRestoreIsolationTests
             ForcePerSolutionFallback(root);
 
             var logs = new List<string>();
-            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromMinutes(4), log: logs.Add)
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromMinutes(4), log: logs.Add, staticGraphRestore: false)
                 .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
 
             Assert.IsFalse(outcome.UsedProjectUnion, string.Join("\n", logs));
@@ -1163,14 +1163,14 @@ public class PackageRestoreIsolationTests
         {
             SetUpSmallInBig(wholeRoot, out _, out var wholeBig);
             var wholeLogs = new List<string>();
-            var whole = await new PackageRestoreRunner(timeout: TimeSpan.FromMinutes(4), log: wholeLogs.Add)
+            var whole = await new PackageRestoreRunner(timeout: TimeSpan.FromMinutes(4), log: wholeLogs.Add, staticGraphRestore: false)
                 .RunAsync(wholeRoot, [wholeBig], limit: null, CancellationToken.None, System.IO.Path.Combine(wholeRoot, "scratch"));
             Assert.IsTrue(whole.Clean, string.Join("\n", wholeLogs));
             Assert.AreEqual(0, whole.SolutionsPartiallySkipped);
 
             SetUpSmallInBig(partialRoot, out var small, out var big);
             var logs = new List<string>();
-            var partial = await new PackageRestoreRunner(timeout: TimeSpan.FromMinutes(4), log: logs.Add)
+            var partial = await new PackageRestoreRunner(timeout: TimeSpan.FromMinutes(4), log: logs.Add, staticGraphRestore: false)
                 .RunAsync(partialRoot, [small, big], limit: null, CancellationToken.None, System.IO.Path.Combine(partialRoot, "scratch"));
             Assert.IsTrue(partial.Clean, string.Join("\n", logs));
             Assert.AreEqual(1, partial.SolutionsPartiallySkipped, string.Join("\n", logs));
@@ -1223,7 +1223,7 @@ public class PackageRestoreIsolationTests
         var big = superset();
         ForcePerSolutionFallback(root);
         var logs = new List<string>();
-        var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), log: logs.Add) { DotnetPath = fake.Path }
+        var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), log: logs.Add, staticGraphRestore: false) { DotnetPath = fake.Path }
             .RunAsync(checkout, [small, big], limit: null, CancellationToken.None, System.IO.Path.Combine(checkout, "scratch"));
         return (outcome, fake, logs);
     }
@@ -1238,7 +1238,7 @@ public class PackageRestoreIsolationTests
         var big = superset();
         ForcePerSolutionFallback(root, extraProperty ?? string.Empty);
         var logs = new List<string>();
-        var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), log: logs.Add) { DotnetPath = fake.Path }
+        var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), log: logs.Add, staticGraphRestore: false) { DotnetPath = fake.Path }
             .RunAsync(root, [small, big], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
         return (outcome, fake, logs);
     }

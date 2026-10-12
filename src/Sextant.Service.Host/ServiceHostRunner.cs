@@ -99,7 +99,8 @@ public static class ServiceHostRunner
         var packageRestore = new PackageRestoreRunner(
             options.PackageRestore, options.PackageRestoreTimeout, Console.Error.WriteLine,
             options.PackageSourceCredentials,
-            options.PackageSourceCredentials.Count > 0 ? CredentialPluginPath() : null);
+            options.PackageSourceCredentials.Count > 0 ? CredentialPluginPath() : null,
+            options.RestoreStaticGraph);
         if (packageRestore.CredentialHosts.Count > 0)
             await Console.Error.WriteLineAsync($"package restore: credentials configured for {string.Join(", ", packageRestore.CredentialHosts)}.").ConfigureAwait(false);
         // Issue #244: the worker keeps every indexed file's bytes on the artifact volume, where the query surface

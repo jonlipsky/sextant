@@ -141,7 +141,7 @@ public sealed class BenchmarkReport
         sb.AppendLine("## Service-path load");
         sb.AppendLine();
         sb.AppendLine($"- Solutions selected: {load.SolutionsSelected} → load mode **{load.Mode}**");
-        sb.AppendLine($"- Restore: {FormatMs(load.RestoreMs)}");
+        sb.AppendLine($"- Restore: {FormatMs(load.RestoreMs)}; static graph {(load.StaticGraphRestore ? $"on ({load.StaticGraphPasses} passes, {load.StaticGraphFallbacks} fallbacks)" : "off")}");
         sb.AppendLine($"- Load: {FormatMs(load.WallMs)}; {load.ProjectsLoaded} projects loaded, {load.ProjectsOpened} individual opens");
         if (load.BuildHosts is { } hosts)
             sb.AppendLine($"- BuildHost processes: {hosts.Launches} observed, at most {hosts.PeakConcurrent} at once, " +
@@ -245,6 +245,9 @@ public sealed class LoadReport
     public required string Mode { get; init; }
     public int SolutionsSelected { get; init; }
     public long RestoreMs { get; init; }
+    public bool StaticGraphRestore { get; init; }
+    public int StaticGraphPasses { get; init; }
+    public int StaticGraphFallbacks { get; init; }
     public long WallMs { get; init; }
     public int ProjectsLoaded { get; init; }
     public int ProjectsOpened { get; init; }

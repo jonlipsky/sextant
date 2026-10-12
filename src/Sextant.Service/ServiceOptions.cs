@@ -371,6 +371,14 @@ public sealed record ServiceOptions
     public bool PackageRestore { get; init; } = true;
 
     /// <summary>
+    /// When true (the default) each per-solution <c>dotnet restore</c> runs with
+    /// <c>-p:RestoreUseStaticGraphEvaluation=true</c> (faster), and a pass that fails as a whole is re-run once without
+    /// it (issue #272). Turn it off for a service whose repositories inject package or project references from MSBuild
+    /// targets. Not part of the snapshot identity. <c>SEXTANT_SERVICE_RESTORE_STATIC_GRAPH</c>.
+    /// </summary>
+    public bool RestoreStaticGraph { get; init; } = PackageRestoreRunner.DefaultStaticGraphRestore;
+
+    /// <summary>
     /// The wall-clock bound on the restore step of one job, across every selected solution
     /// (<c>SEXTANT_SERVICE_PACKAGE_RESTORE_TIMEOUT_SECONDS</c>, default 300). On expiry the restore process tree
     /// is killed and the load proceeds with whatever was restored.
@@ -502,6 +510,7 @@ public sealed record ServiceOptions
             },
             SdkPinOverride = EnvBool("SDK_PIN_OVERRIDE") ?? true,
             PackageRestore = EnvBool("PACKAGE_RESTORE") ?? true,
+            RestoreStaticGraph = EnvBool("RESTORE_STATIC_GRAPH") ?? PackageRestoreRunner.DefaultStaticGraphRestore,
             PackageRestoreTimeout = EnvInt("PACKAGE_RESTORE_TIMEOUT_SECONDS") is int restoreSeconds and > 0
                 ? TimeSpan.FromSeconds(restoreSeconds) : PackageRestoreRunner.DefaultTimeout,
             PackageSourceCredentials = ParsePackageSourceCredentials(Env("PACKAGE_SOURCE_CREDENTIALS")),

@@ -116,6 +116,7 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_SANDBOX_SCRUB_SECRETS` | Scrub secrets from the evaluation environment | `true` |
 | `SEXTANT_SERVICE_SDK_PIN_OVERRIDE` | Temporarily neutralize a checkout `global.json` SDK pin that no installed SDK satisfies, so the checkout still indexes with an installed SDK (issue #113; see [SDK pins](#repository-globaljson-sdk-pins-issue-113)). `false` leaves such pins alone and the job fails / goes partial with a typed `sdk_resolution_failed` diagnostic. `false` is part of the snapshot identity, so flipping the toggle re-indexes a commit instead of reusing a result built under the other policy. An unparseable value **fails startup** | `true` |
 | `SEXTANT_SERVICE_PACKAGE_RESTORE` | Restore the selected solutions' deduplicated project union before the load (see [Package restore](#package-restore-before-the-load)). `false` loads unrestored projects, which compile against their direct project references only, so calls into transitively referenced projects may not bind. `false` is part of the snapshot identity (`restore=off`). An unparseable value **fails startup** | `true` |
+| `SEXTANT_SERVICE_RESTORE_STATIC_GRAPH` | Run each per-solution `dotnet restore` with `-p:RestoreUseStaticGraphEvaluation=true` and re-run a pass that fails as a whole once without it (see [Static-graph restore](#static-graph-restore-issue-272)). `false` = the previous arguments exactly. Not part of the snapshot identity | `true` |
 | `SEXTANT_SERVICE_PACKAGE_RESTORE_TIMEOUT_SECONDS` | Bound on one job's whole project-union restore step, clamped to 3600. Under the sandbox the step also stops at a fifth of the sandbox time budget, whichever is shorter. On expiry the restore process tree is killed and the load goes ahead with whatever was restored | `300` |
 | `SEXTANT_SERVICE_PACKAGE_CACHE_MAX_MB` | Bound, in MiB, on all per-repository NuGet package folders together (see [Package and git caches between jobs](#package-and-git-caches-between-jobs-issue-272)). Over it, whole folders are evicted least recently used first. `0` disables the cache: each job restores into a cold folder in its scratch again. Anything but a non-negative whole number **fails startup** | `10240` |
 | `SEXTANT_SERVICE_GIT_OBJECT_STORE` | In `clone` mode, fetch each new commit through a per-repository bare object store on the cache volume, so only objects the store lacks cross the network (see [Package and git caches between jobs](#package-and-git-caches-between-jobs-issue-272)). `false` fetches every commit from the remote afresh. An unparseable value **fails startup** | `true` |
@@ -524,6 +525,29 @@ never embed credentials (use `SEXTANT_SERVICE_PACKAGE_SOURCE_CREDENTIALS` instea
   each time: 72 s with an empty package folder and HTTP cache, 48-52 s from a warm package folder. A job's `timings.restore` (`GET /control/status`) records the restore `mode` (`solution`,
   `union`, `per_solution`, `off`), the `fallback_reason` when several solutions could not be restored as one
   union, and whether the `package_folder` was `persistent` or `scratch`.
+
+#### Static-graph restore (issue #272)
+
+Each per-solution `dotnet restore` (the single-solution path, the multi-solution per-solution fallback) adds
+`-p:RestoreUseStaticGraphEvaluation=true` unless `SEXTANT_SERVICE_RESTORE_STATIC_GRAPH=false`. On ProcessStack a warm
+single `no-macos.slnx` restore took 12.0 s instead of 18.4 s, and a full job's restore (4 solutions, per-solution path)
+41.7/43.4 s instead of 47.8/51.8 s, with identical rows; the written assets differed only in the string form of three
+projects' `project.restore.outputPath`. **Fallback:** a static-graph pass that fails as a whole (failed, with no project named in its output; a timeout or
+cancellation is never re-run) is re-run once without the property under the same deadline (one log line), and the re-run's
+result is the one reported; if the deadline is spent before it can run, the solution is accounted for like a timed-out one.
+A pass that names failing projects is not re-run: a project it left without assets already gets the #296 per-project retry,
+which never uses static graph (a solution with permanent per-project errors, like MixAndMatch.sln, would otherwise fall back on
+every job and lose the gain). **Residual limitation:** a project that already has a (stale) assets file and fails only under
+static graph is reported failed rather than re-restored; `SEXTANT_SERVICE_RESTORE_STATIC_GRAPH=false` turns static graph off. A solution that fell back
+(full path + last-write time) is remembered for the life of the process and restored without static graph directly the next
+time. On ProcessStack, `MixAndMatch.Xamarin.sln` fails as a whole under static graph ("package restore of 'MixAndMatch.Xamarin.sln'
+failed as a whole with static-graph evaluation; re-running it once without."), so it falls back once per job; within one service
+process the memo makes later jobs restore that solution without static graph directly. The generated MSBuild traversals (the multi-solution union, the per-project retry
+and the partial skip) are unchanged: a `Restore` run through the MSBuild task honours the property but starts one
+NuGet static-graph process per project, so it would not batch the graph. `timings.restore` gains `static_graph`
+(true when any pass used it) and `static_graph_fallbacks`. **Known limitation:** static-graph evaluation runs no
+targets, so a repository whose targets inject `PackageReference` or `ProjectReference` items may restore differently
+(and without a whole-pass failure to trigger the fallback); turn the switch off for such a service.
 
 **Git object stores, one per repository** (`git-objects/<repository>/repository.git`, and
 `git-objects/<repository>/submodules/<submodule>.git` for each submodule, keyed by the submodule's clean URL under
