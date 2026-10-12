@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using Sextant.TestSupport;
 
 namespace Sextant.Integration.Tests;
 
@@ -8,6 +9,9 @@ public class CliSubprocessTests : IDisposable
 {
     private readonly string _tempDir;
     private readonly string _repoRoot;
+    // Generous because `index Sextant.slnx` loads and indexes the whole solution (minutes on a cold CI runner);
+    // it only has to turn a genuine hang into a failure.
+    private static readonly TimeSpan CliTimeout = TimeSpan.FromMinutes(10);
 
     public CliSubprocessTests()
     {
@@ -98,6 +102,7 @@ public class CliSubprocessTests : IDisposable
             CreateNoWindow = true,
             WorkingDirectory = _repoRoot
         };
+        BoundedProcess.ApplyDotnetEnvironment(psi);
 
         using var process = Process.Start(psi)!;
         try
@@ -127,8 +132,11 @@ public class CliSubprocessTests : IDisposable
         {
             if (!process.HasExited)
             {
-                process.Kill(true);
-                await process.WaitForExitAsync();
+                try { process.Kill(true); }
+                catch (InvalidOperationException) { }
+                using var killWait = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                try { await process.WaitForExitAsync(killWait.Token); }
+                catch (OperationCanceledException) { }
             }
         }
     }
@@ -140,19 +148,15 @@ public class CliSubprocessTests : IDisposable
         {
             FileName = "dotnet",
             Arguments = $"run --no-build --project {cliProject} -- {arguments}",
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
             WorkingDirectory = workingDir ?? _repoRoot
         };
+        BoundedProcess.ApplyDotnetEnvironment(psi);
 
-        using var process = Process.Start(psi)!;
-        var stdout = await process.StandardOutput.ReadToEndAsync();
-        var stderr = await process.StandardError.ReadToEndAsync();
-        await process.WaitForExitAsync();
+        var result = await Task.Run(() => BoundedProcess.Run(psi, CliTimeout));
+        if (result.TimedOut)
+            Assert.Fail($"CLI did not finish: {result.Describe()}");
 
-        return new CliResult(process.ExitCode, stdout, stderr);
+        return new CliResult(result.ExitCode ?? -1, result.StandardOutput, result.StandardError);
     }
 
     private static async Task<string?> ReadLineWithTimeoutAsync(StreamReader reader, CancellationToken ct)

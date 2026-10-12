@@ -105,9 +105,15 @@ internal static class BoundedProcess
             ["restore", projectOrSolutionPath, "--disable-build-servers", "-nodeReuse:false",
                 .. Sextant.Indexer.EvaluationGlobalProperties.ForSolutionOrProject(projectOrSolutionPath).Select(p => $"-p:{p.Key}={p.Value}")],
             workingDirectory);
-        foreach (var (key, value) in DotnetEnvironment)
-            psi.Environment[key] = value;
+        ApplyDotnetEnvironment(psi);
         return psi;
+    }
+
+    /// <summary>Applies the shared <c>dotnet</c> child environment (no node reuse, build servers or compiler server).</summary>
+    public static void ApplyDotnetEnvironment(ProcessStartInfo startInfo)
+    {
+        foreach (var (key, value) in DotnetEnvironment)
+            startInfo.Environment[key] = value;
     }
 
     /// <summary>Runs <paramref name="fileName"/> with <paramref name="arguments"/> (each passed verbatim).</summary>
