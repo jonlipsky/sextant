@@ -50,7 +50,8 @@ public static class LocalPlatformPacks
 
     private static readonly System.Text.RegularExpressions.Regex AppleTfmText = new(
         @"-(ios|maccatalyst|tvos)|<UseMaui>\s*true\s*</UseMaui>",
-        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant,
+        TimeSpan.FromSeconds(1));
 
     // The static read is empty for a conditional or $(...) TargetFramework(s) (MAUI-style), so fall back to a looser text test.
     private static bool IsAppleCandidate(string project)
@@ -62,7 +63,8 @@ public static class LocalPlatformPacks
         {
             return AppleTfmText.IsMatch(File.ReadAllText(project));
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+            or System.Text.RegularExpressions.RegexMatchTimeoutException)
         {
             return false;
         }
