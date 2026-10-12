@@ -432,6 +432,31 @@ one through the same per-project MSBuild traversal, so every restorable project 
 the projects that still fail are reported (`package_restore_incomplete`). The retry applies only to the per-solution restore path (the multi-solution union already restores each project in isolation) and only when the failure left a project without `obj/project.assets.json`. The retry is logged and leaves a
 `coverage.notes` line; it runs within the restore step's remaining time.
 
+The per-solution fallback restores the solutions in input order (nothing is reordered) and skips a
+later solution only when every project it declares was already restored cleanly in this job (its
+`obj/project.assets.json` exists) by a solution in the same directory (same `global.json`, NuGet.config and
+`Directory.Solution.*` chain; a solution in a sibling directory never counts), unless one of those projects is solution-sensitive: it reads `$(SolutionDir)` and
+related properties, or resolves another SDK or `msbuild-sdks` pin through a different `global.json` (the same
+detection as the union load, `SolutionSensitivity`) or two solutions map it to a different project Configuration|Platform for
+their default solution configuration (read from the `.sln` `ProjectConfigurationPlatforms` section or the `.slnx` `<Configurations>`/
+`<BuildType>`/`<Platform>` elements; unreadable or uncertain counts as different). Such a solution restores as before. The skip is output-neutral for the skipped solution
+(its assets files would be rewritten with the same content), and it is exactly output-neutral: a solution is skipped only when the
+most recent attempt at every one of its declared projects (any outcome, any directory) was by a solution of its own directory, so
+skipping never changes which solution restored a project last. Solutions restore in the input order (the selector's stable
+ordinal order); nothing is reordered, so the change needs no `AnalyzerVersion` bump (issue #290).
+Skipped solutions are logged and recorded as `timings.restore.solutions_skipped_redundant` / `skipped_solution_names`.
+
+**Partial skip.** When a solution has some uncovered projects (a superset restored after its subset) but fewer than half of its
+declared projects are uncovered, the runner restores only those projects through the per-project traversal (same global properties,
+package cache and credentials; recursive like a solution restore) and not the solution itself. It does so only when no project of the
+solution is solution-sensitive and the solution maps every project to its own default configuration (`Debug|Any CPU`), so the
+standalone restore writes exactly what the whole-solution restore would have, also for the covered projects it recurses into; an
+unreadable mapping, a sensitive project, a `Directory.Solution.props` or `Directory.Solution.targets` in the solution's directory or any ancestor up to the checkout root (the traversal never evaluates the solution metaproject that imports them; the log line says the partial skip was declined), half or more uncovered, or a traversal that cannot be staged restores the whole solution.
+Failures of the uncovered projects are reported as for any traversal (`package_restore_incomplete`, once). Recorded as
+`timings.restore.solutions_partially_skipped` / `projects_restored_partially` / `partially_skipped_solution_names` and in the log line.
+
+Limitation: a project counts as covered only when its `obj/project.assets.json` exists after a clean restore (or a retry sentinel records it). A project with a custom `ArtifactsPath` / `BaseIntermediateOutputPath` outside `obj/` has no such file on the success path, so it is covered only through sentinels in a per-project retry; otherwise it is treated as uncovered and restored again. A clean restore counts as covered even when NU1801 (unreachable source) warnings were emitted; that equals restoring again only while the source stays unreachable.
+
 A restore problem is **not automatically retried**: the job publishes partial with the notes and reason above, and a later ordinary ensure of the same
 commit attaches to that snapshot. Retrying would rarely help, because a timed-out restore would time out again, and a credential-gated feed never becomes
 reachable. The restore coverage reason and binding-health verdict below tell an agent that results may be missing; the next commit

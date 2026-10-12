@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using Sextant.Indexer;
 
 namespace Sextant.Service.Restore;
 
@@ -34,6 +35,7 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
     private readonly object _gate = new();
     private readonly Dictionary<string, Accumulator> _projects = new(StringComparer.Ordinal);
     private readonly SortedSet<string> _generalCodes = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _restored = new(CheckoutInventory.PathComparer);
     private int _projectsDropped;
     private bool _sourceUnreachable;
 
@@ -57,11 +59,25 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
         }
     }
 
+    /// <summary>The line the generated per-project traversal prints after a project's restore task succeeded.</summary>
+    internal const string RestoredSentinel = "sextant-restore-ok: ";
+
     /// <summary>Feeds one line of restore output.</summary>
     public void Accept(string? line)
     {
         if (string.IsNullOrWhiteSpace(line))
             return;
+        var trimmed = line.TrimStart();
+        if (trimmed.StartsWith(RestoredSentinel, StringComparison.Ordinal))
+        {
+            var path = trimmed[RestoredSentinel.Length..].Trim();
+            if (path.Length > 0 && Path.IsPathRooted(path))
+            {
+                lock (_gate)
+                    _restored.Add(Path.GetFullPath(path));
+            }
+            return;
+        }
         // Checked first: an NU1801 message can itself contain "error" ("An error occurred while sending ...").
         if (line.Contains("NU1801", StringComparison.OrdinalIgnoreCase) && TryAcceptSourceWarning(line))
             return;
@@ -102,6 +118,13 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
         }
     }
 
+    /// <summary>True when the traversal positively reported that this project's restore task succeeded (issue #290).</summary>
+    public bool WasRestored(string projectPath)
+    {
+        lock (_gate)
+            return _restored.Contains(Path.GetFullPath(projectPath));
+    }
+
     /// <summary>Adds everything <paramref name="other"/> recorded (issue #296: a failed attempt's findings, kept when its retry could not run).</summary>
     public void MergeFrom(RestoreOutputParser other)
     {
@@ -109,8 +132,10 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
         var general = other.GeneralCodes();
         var dropped = other.ProjectsDropped;
         var unreachable = other.SourceUnreachableGeneral;
+        var restored = other.RestoredProjects();
         lock (_gate)
         {
+            _restored.UnionWith(restored);
             foreach (var issue in projects)
             {
                 if (!_projects.TryGetValue(issue.Project, out var accumulator))
@@ -152,6 +177,12 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
                 })
                 .ToList();
         }
+    }
+
+    private string[] RestoredProjects()
+    {
+        lock (_gate)
+            return [.. _restored];
     }
 
     /// <summary>Error codes that named no project, ordered.</summary>
@@ -198,6 +229,9 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
                 accumulator.MissingPackages.Add(packageId);
         }
     }
+
+    /// <summary>The key <see cref="Projects"/> uses for a project file (issue #290).</summary>
+    internal string ProjectKey(string projectPath) => Relativize(projectPath);
 
     private string Relativize(string path)
     {
