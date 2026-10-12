@@ -305,10 +305,12 @@ public sealed class LocalIndexerSnapshotWorker(
                 using (timings.Phase(IndexPhaseNames.Load))
                 using (var buildHosts = new ChildProcessSampler(ChildProcessSampler.BuildHostMarker))
                 {
+                    var loadDeadline = plan?.LoadDeadline(_clock.GetUtcNow());
                     load = await MultiSolutionLoader.LoadAsync(
                         resolution.SelectedSolutions, log,
-                        deadline: plan?.LoadDeadline(_clock.GetUtcNow()), onProgress: log, cancellationToken: token,
-                        scratchDirectory: scratchDir)
+                        deadline: loadDeadline, onProgress: log, cancellationToken: token,
+                        scratchDirectory: scratchDir,
+                        platformPacks: PlatformPackOptions.ForJob(packagesDir, scratchDir, plan?.RestoreLimit, loadDeadline))
                         .ConfigureAwait(false);
                     timings.RecordLoad(load, buildHosts.Stop());
                 }

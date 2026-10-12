@@ -42,6 +42,19 @@ cannot be installed on Linux, so `net*-ios`/`net*-maccatalyst` projects still lo
 CLI or daemon user on Linux gets the same macOS result by running `dotnet workload install macos`. Both changes ship
 under one `AnalyzerVersion` bump (`"9"`), so existing snapshots are rebuilt once.
 
+**iOS, Mac Catalyst and tvOS reference packs (issue #295, `AnalyzerVersion` `"11"`).** The service worker binds a
+`net*-ios`/`-maccatalyst`/`-tvos` project that loaded degraded because its workload is missing (`NETSDK1147`/`1139`/`1178`,
+"isn't supported on this platform", or "Platform version is not present"; not `NETSDK1004`, a missing assets file) against the platform reference pack
+(`PlatformReferencePacks`). The pack id and version come from the active SDK band's workload manifests
+(`sdk-manifests/*/microsoft.net.sdk.<platform>/*/WorkloadManifest.json`, preferring the platform version in the TFM, else the
+highest). The pack is found in `<dotnet root>/packs`, then the job's package folder (or `NUGET_PACKAGES`), then downloaded
+through a generated throwaway project with a `nuget.config` that clears every source and uses only
+`https://api.nuget.org/v3/index.json` (never the repository's feeds or credentials). Only `Microsoft.iOS.Ref.*`,
+`Microsoft.MacCatalyst.Ref.*` and `Microsoft.tvOS.Ref.*` are ever resolved. Its assemblies are added to the project as metadata
+references (and `Microsoft.NETCore.App.Ref` when no framework reference is present); a pack that cannot be obtained leaves
+the project as before. Each bound project gets a `platform_reference_pack` diagnostic and a partial-coverage reason,
+because package references may still be missing. Other projects are untouched; the local CLI/daemon does not apply this.
+
 `MSBuildLocator.RegisterDefaults()` must be initialized exactly once, before any `Microsoft.CodeAnalysis` types are loaded. This is a hard Roslyn constraint and is the first call in `Program.cs`.
 
 Full solution loading (not per-project) is required so that a symbol defined in Project A and referenced in Project B resolves to the same `ISymbol` instance.

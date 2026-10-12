@@ -416,7 +416,10 @@ loaded degraded. A selection without one restores exactly as before (the propert
 `Microsoft.WindowsDesktop.App.Ref`, which a private-only feed does not serve). The worker image pre-installs
 `Microsoft.WindowsDesktop.App.Ref` into `dotnet/packs`, so Windows repositories do not download it per job. It also
 installs the `macos` workload, so `net*-macos` projects restore and bind too; iOS and Mac Catalyst workloads are not
-installable on Linux. Local CLI/daemon users on Linux can run `dotnet workload install macos` for the same effect. The same `AnalyzerVersion` bump covers both platform-targeting changes. What it could not do is recorded: per-project `package_restore_incomplete` warnings (codes and
+installable on Linux, so a degraded iOS/Mac Catalyst/tvOS project is bound against its platform reference pack instead
+(issue #295, `AnalyzerVersion` 11: pack from the SDK workload manifests, found in `dotnet/packs`, the package folder or a
+nuget.org-only download, recorded as a `platform_reference_pack` diagnostic and a partial reason; see
+[docs/indexing.md](indexing.md#workspace-loading)). Local CLI/daemon users on Linux can run `dotnet workload install macos` for the same effect. Version 9 covered #293 and version 11 covers #295; iOS/Mac Catalyst/tvOS binding applies in the service worker only. What it could not do is recorded: per-project `package_restore_incomplete` warnings (codes and
 package ids only, never a raw message, which can name a source URL), `coverage.notes` lines such as "Package
 restore could not find 2 package(s) (Acme.Auth, Acme.Auth.UI) for 1 project(s); code that uses them may not
 bind.", and each affected project's `coverage.binding.projects[].load_issue`. Any incomplete restore now makes

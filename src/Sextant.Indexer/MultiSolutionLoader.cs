@@ -53,6 +53,12 @@ public sealed record MultiSolutionLoadResult(
     public int UnattributedFailureCount { get; init; }
 
     /// <summary>
+    /// Degraded Apple-platform projects compiled against their platform reference pack because the workload is missing
+    /// (issue #295). They remain in <see cref="DegradedProjects"/>: the index is still partial.
+    /// </summary>
+    public IReadOnlyList<PlatformPackBinding> PlatformPackBindings { get; init; } = [];
+
+    /// <summary>
     /// How the projects were loaded (issue #267): <see cref="SolutionLoadModes.Solution"/> (one whole-solution open)
     /// or <see cref="SolutionLoadModes.Union"/> (each project of the multi-solution union opened individually).
     /// </summary>
@@ -120,7 +126,8 @@ public static class MultiSolutionLoader
         IndexDeadline? deadline = null,
         Action<string>? onProgress = null,
         CancellationToken cancellationToken = default,
-        string? scratchDirectory = null)
+        string? scratchDirectory = null,
+        PlatformPackOptions? platformPacks = null)
     {
         if (solutionPaths.Count == 0)
             throw new ArgumentException("At least one solution path is required.", nameof(solutionPaths));
@@ -170,6 +177,17 @@ public static class MultiSolutionLoader
                 union, onDiagnostic, deadline, onProgress, cancellationToken).ConfigureAwait(false);
         }
 
+        IReadOnlyList<PlatformPackBinding> packBindings = [];
+        if (platformPacks is not null)
+            onDiagnostic?.Invoke($"Platform reference pack: {loaded.DegradedProjects.Count} degraded project version(s) considered.");
+        if (platformPacks is not null && loaded.DegradedProjects.Count > 0)
+        {
+            var (withPacks, bindings) = await PlatformReferencePacks.ApplyAsync(
+                loaded.Solution, loaded.DegradedProjects, platformPacks, onDiagnostic, cancellationToken).ConfigureAwait(false);
+            loaded = loaded with { Solution = withPacks };
+            packBindings = bindings;
+        }
+
         var coverage = BuildCoverage(perSolutionDeclared, loaded.SkippedProjects, loaded.DeferredProjects, loaded.Solution)
             .Select((c, i) => c with { IsReadable = reads[i].IsReadable }).ToList();
         return new MultiSolutionLoadResult(loaded.Solution, loaded.SkippedProjects, coverage)
@@ -185,6 +203,7 @@ public static class MultiSolutionLoader
                 .ToList(),
             DeferredProjects = loaded.DeferredProjects,
             DegradedProjects = loaded.DegradedProjects,
+            PlatformPackBindings = packBindings,
             UnattributedFailureCount = loaded.UnattributedFailureCount
         };
     }

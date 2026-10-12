@@ -18,7 +18,11 @@ public sealed record SkippedProject(string ProjectPath, string Reason)
 }
 
 /// <summary>A failed evaluation that still exposed documents usable for a partial index.</summary>
-public sealed record DegradedProject(string ProjectPath, string? TargetFramework, string Reason);
+public sealed record DegradedProject(string ProjectPath, string? TargetFramework, string Reason)
+{
+    /// <summary>The workspace project of the degraded version, when known (the platform reference pack is added to it, issue #295).</summary>
+    public ProjectId? ProjectId { get; init; }
+}
 
 /// <summary>
 /// The outcome of a resilient solution load: the (possibly partial) <see cref="Solution"/> plus any

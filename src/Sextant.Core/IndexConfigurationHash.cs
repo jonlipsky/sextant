@@ -95,8 +95,14 @@ public static class IndexConfigurationHash
     /// solution without <c>project.assets.json</c>) is retried project by project. Projects that were left unrestored now
     /// restore and bind, so the same commit yields more references and call edges and can publish complete where it was partial.
     /// </para>
+    /// <para>
+    /// <c>"10"</c> to <c>"11"</c> (issue #295): the service worker binds an iOS, Mac Catalyst or tvOS project that loaded
+    /// degraded because its platform workload is missing (not installable on Linux) against the platform reference pack,
+    /// and records a distinct coverage reason for it. Such projects now yield platform-typed references and call edges, and
+    /// their repositories publish partial with that reason.
+    /// </para>
     /// </remarks>
-    public const string AnalyzerVersion = "10";
+    public const string AnalyzerVersion = "11";
 
     /// <summary>
     /// Computes the configuration hash for a resolved profile. The canonical pre-image is a fixed,
