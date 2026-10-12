@@ -174,7 +174,7 @@ public static partial class SubmoduleDiscovery
 
         var psi = new ProcessStartInfo
         {
-            FileName = "git",
+            FileName = GitExecutable.Path,
             Arguments = arguments,
             WorkingDirectory = workingDirectory,
             RedirectStandardOutput = true,

@@ -71,6 +71,7 @@ Environment variables take precedence over `sextant.json`:
 | `SEXTANT_PROFILE` | Index slot name (selects `.sextant/profiles/<name>/sextant.db`) | `default` |
 | `SEXTANT_MAX_DEPTH` | Max call hierarchy depth | `5` |
 | `SEXTANT_FTS_MAX` | Max FTS search results | `20` |
+| `SEXTANT_GIT_PATH` | Absolute path of the git executable (else the first `git` on `PATH`) | (auto) |
 | `SEXTANT_MAX_RESPONSE_CHARS` | Character budget of one MCP tool result | `20000` (at least `1000`) |
 | `SEXTANT_DAEMON_SOCKET` | Daemon IPC socket/pipe path | (auto) |
 | `SEXTANT_AUTO_SPAWN_DAEMON` | Auto-spawn daemon from MCP server | `true` (set `false` or `0` to disable) |

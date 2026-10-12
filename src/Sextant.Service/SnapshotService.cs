@@ -1073,7 +1073,7 @@ public sealed partial class SnapshotService : IDisposable
             }
             catch (Exception ex) when (ex is SqliteException or NotSupportedException or InvalidOperationException)
             {
-                Console.Error.WriteLine($"Job {jobId}: its phase timings could not be recorded: {ex.Message}");
+                await Console.Error.WriteLineAsync($"Job {jobId}: its phase timings could not be recorded: {ex.Message}").ConfigureAwait(false);
             }
         }
         bool? workerAdvanced = validated.SnapshotId is long producedId
@@ -1196,7 +1196,7 @@ public sealed partial class SnapshotService : IDisposable
         }
         finally
         {
-            payloadConn?.Dispose();
+            if (payloadConn != null) await payloadConn.DisposeAsync().ConfigureAwait(false);
             _paths.ReleaseScratch(scratch);
         }
     }
@@ -2131,8 +2131,8 @@ public sealed partial class SnapshotService : IDisposable
                 foreach (var oversizedId in batch.OversizedSnapshotIds)
                 {
                     _oversizedToday[oversizedId] = _timeProvider.GetUtcNow().UtcDateTime.Date;
-                    Console.Error.WriteLine(
-                        $"Retention rolled back the deletion unit of snapshot {oversizedId}: it ran past {_options.Retention.Normalized().UnitMaxSeconds}s. It is skipped for the rest of the UTC day.");
+                    await Console.Error.WriteLineAsync(
+                        $"Retention rolled back the deletion unit of snapshot {oversizedId}: it ran past {_options.Retention.Normalized().UnitMaxSeconds}s. It is skipped for the rest of the UTC day.").ConfigureAwait(false);
                 }
                 if (batch.StopReason != null) return report;
                 // WithWriteAsync releases the gate before the next admission; already-queued publishes go first.

@@ -885,7 +885,7 @@ public static class ServiceApp
     {
         context.Response.StatusCode = StatusCodes.Status401Unauthorized;
         context.Response.Headers.WWWAuthenticate = "Bearer";
-        return context.Response.WriteAsync("Unauthorized");
+        return context.Response.WriteAsync("Unauthorized", context.RequestAborted);
     }
 
     /// <summary>

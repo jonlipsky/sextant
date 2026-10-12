@@ -101,7 +101,7 @@ public static class ServiceHostRunner
             options.PackageSourceCredentials,
             options.PackageSourceCredentials.Count > 0 ? CredentialPluginPath() : null);
         if (packageRestore.CredentialHosts.Count > 0)
-            Console.Error.WriteLine($"package restore: credentials configured for {string.Join(", ", packageRestore.CredentialHosts)}.");
+            await Console.Error.WriteLineAsync($"package restore: credentials configured for {string.Join(", ", packageRestore.CredentialHosts)}.").ConfigureAwait(false);
         // Issue #244: the worker keeps every indexed file's bytes on the artifact volume, where the query surface
         // (SnapshotService.SourceTexts, the same root) reads each snapshot's own source text back.
         // Issue #272: each repository restores into its own package folder on the cache volume, kept between its
@@ -137,7 +137,7 @@ public static class ServiceHostRunner
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"Failed to start Sextant index service: {ex.Message}");
+            await Console.Error.WriteLineAsync($"Failed to start Sextant index service: {ex.Message}").ConfigureAwait(false);
             database.Dispose();
             return 1;
         }
@@ -214,9 +214,9 @@ public static class ServiceHostRunner
     internal static IReadOnlyList<string> BuildListenUrls(ServiceOptions options)
     {
         var host = FormatHostForUrl(options.BindAddress);
-        var urls = new List<string> { $"http://{host}:{options.ControlPort}" };
+        var urls = new List<string> { $"http://{host}:{options.ControlPort}" }; // NOSONAR S5332: Kestrel listener bind URL (TLS is terminated by the fronting gateway), not an outbound request
         if (options.QueryPort is int queryPort && queryPort != options.ControlPort)
-            urls.Add($"http://{host}:{queryPort}");
+            urls.Add($"http://{host}:{queryPort}"); // NOSONAR S5332: Kestrel listener bind URL (TLS is terminated by the fronting gateway), not an outbound request
         return urls;
     }
 

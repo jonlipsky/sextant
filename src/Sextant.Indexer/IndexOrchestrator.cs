@@ -870,7 +870,7 @@ public sealed class IndexOrchestrator
             {
                 var assemblyProjectCache = new ConcurrentDictionary<IAssemblySymbol, long?>(SymbolEqualityComparer.Default);
                 return assembly => assemblyProjectCache.GetOrAdd(assembly, a =>
-                    solution.GetProject(a) is { } targetProject
+                    solution.GetProject(a, cancellationToken) is { } targetProject
                     && projectRoslynToId.TryGetValue(targetProject.Id, out var targetPid)
                         ? targetPid
                         : null);
@@ -1128,7 +1128,7 @@ public sealed class IndexOrchestrator
 
                 foreach (var node in root.DescendantNodes())
                 {
-                    if (semanticModel.GetDeclaredSymbol(node) is INamedTypeSymbol typeSymbol &&
+                    if (semanticModel.GetDeclaredSymbol(node, cancellationToken) is INamedTypeSymbol typeSymbol &&
                         !typeSymbol.IsImplicitlyDeclared &&
                         !SemanticSymbolKeyFactory.IsExcludedArtifact(typeSymbol))
                     {
@@ -1196,7 +1196,7 @@ public sealed class IndexOrchestrator
 
                 foreach (var node in root.DescendantNodes())
                 {
-                    var declaredSymbol = semanticModel.GetDeclaredSymbol(node);
+                    var declaredSymbol = semanticModel.GetDeclaredSymbol(node, cancellationToken);
                     if (declaredSymbol == null || declaredSymbol.IsImplicitlyDeclared)
                         continue;
 
@@ -1322,7 +1322,7 @@ public sealed class IndexOrchestrator
 
                 foreach (var node in root.DescendantNodes())
                 {
-                    var declaredSymbol = semanticModel.GetDeclaredSymbol(node);
+                    var declaredSymbol = semanticModel.GetDeclaredSymbol(node, cancellationToken);
                     if (declaredSymbol is not IMethodSymbol methodSymbol || declaredSymbol.IsImplicitlyDeclared)
                         continue;
 
@@ -1835,7 +1835,7 @@ public sealed class IndexOrchestrator
         if (repoRoot == null) return null;
         try
         {
-            var psi = new ProcessStartInfo("git", "rev-parse HEAD")
+            var psi = new ProcessStartInfo(Sextant.Core.GitExecutable.Path, "rev-parse HEAD")
             {
                 WorkingDirectory = repoRoot,
                 RedirectStandardOutput = true,
@@ -1856,7 +1856,7 @@ public sealed class IndexOrchestrator
     {
         try
         {
-            var psi = new ProcessStartInfo("git", args)
+            var psi = new ProcessStartInfo(Sextant.Core.GitExecutable.Path, args)
             {
                 WorkingDirectory = repoRoot,
                 RedirectStandardOutput = true,

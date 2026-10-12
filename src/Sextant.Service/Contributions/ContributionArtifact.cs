@@ -121,7 +121,7 @@ public sealed class ContributionArtifact
         {
             if (buffer.Length + read > maxBytes)
                 throw new ContributionTooLargeException(buffer.Length + read, maxBytes);
-            buffer.Write(chunk, 0, read);
+            await buffer.WriteAsync(chunk.AsMemory(0, read), ct).ConfigureAwait(false);
         }
         return ReadFrom(buffer.GetBuffer().AsSpan(0, (int)buffer.Length), maxBytes);
     }

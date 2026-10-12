@@ -51,9 +51,9 @@ public sealed class GitCheckoutContentVerifier : ICheckoutContentVerifier
 
     /// <param name="gitExecutable">The git executable (overridable for tests); defaults to <c>git</c> on PATH.</param>
     /// <param name="timeout">Upper bound on each git invocation; defaults to one minute.</param>
-    public GitCheckoutContentVerifier(string gitExecutable = "git", TimeSpan? timeout = null)
+    public GitCheckoutContentVerifier(string? gitExecutable = null, TimeSpan? timeout = null)
     {
-        _gitExecutable = gitExecutable;
+        _gitExecutable = gitExecutable ?? Sextant.Core.GitExecutable.Path;
         _timeout = timeout ?? TimeSpan.FromMinutes(1);
     }
 

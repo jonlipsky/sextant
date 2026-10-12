@@ -108,7 +108,7 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
         ICheckoutProvider inner,
         ServicePaths paths,
         string? token = null,
-        string gitExecutable = "git",
+        string? gitExecutable = null,
         Action<string>? log = null,
         IReadOnlyCollection<string>? submoduleHosts = null)
     {
@@ -125,7 +125,7 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
             hosts.Add(SubmoduleUrlPolicy.NormalizeAuthority(host)
                 ?? throw new ArgumentException($"'{host}' is not a valid https host[:port] authority.", nameof(submoduleHosts)));
         _submoduleHosts = hosts;
-        _gitExecutable = gitExecutable;
+        _gitExecutable = gitExecutable ?? Sextant.Core.GitExecutable.Path;
         _log = log;
 
         // Reclaim any temp-clone directories a previous run leaked (a crash, or a delete blocked by a

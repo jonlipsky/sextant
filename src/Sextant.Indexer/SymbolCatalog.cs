@@ -61,10 +61,7 @@ public sealed class SymbolCatalog
             return new Resolution(sameProjectId, true, false);
 
         if (perProject.Count == 1)
-        {
-            foreach (var only in perProject)
-                return new Resolution(only.Value, true, false);
-        }
+            return new Resolution(perProject.First().Value, true, false);
 
         long chosenProject = long.MaxValue;
         long chosenSymbol = 0;
