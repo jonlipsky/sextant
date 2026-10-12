@@ -98,6 +98,20 @@ public sealed record MaintenanceMetrics
     public long LastIdlePassAtUnixMs { get; init; }
     public double LastIdlePassDurationMs { get; init; }
 
+    /// <summary>Inactive repositories whose checkout and caches were deleted since start (issue #291).</summary>
+    public long RepositoriesReclaimedTotal { get; init; }
+
+    /// <summary>Bytes freed by those deletions since start (measured before deleting).</summary>
+    public long RepositoryBytesReclaimedTotal { get; init; }
+
+    /// <summary>Repository reclaims that failed (logged; retried by a later tick) since start.</summary>
+    public long RepositoryReclaimFailuresTotal { get; init; }
+
+    public long LastRepositoriesReclaimed { get; init; }
+    public long LastRepositoryBytesReclaimed { get; init; }
+    public long LastReclaimPassAtUnixMs { get; init; }
+    public double LastReclaimPassDurationMs { get; init; }
+
     public long ScheduledRetentionRuns { get; init; }
 
     /// <summary>Due scheduled retention passes skipped because indexing held the writer (retried next tick).</summary>

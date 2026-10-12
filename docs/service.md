@@ -98,6 +98,8 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_MAINTENANCE_INTERVAL_MINUTES` | How often the service-owned maintenance loop ticks (issue #299; see [Maintenance loop](#maintenance-loop-idle-branch-retirement--scheduled-retention-issue-299)). `0` turns the loop off: no idle-branch retirement, no retired-head pruning and no scheduled retention. Clamped to `10080` (7 days); a non-numeric or negative value uses the default | `60` |
 | `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_DAYS` | Retire a NON-DEFAULT branch pointer that has not moved for more than this many days (issue #299). `0` disables the rule. Clamped to `3650`; a non-numeric or negative value uses the default | `7` |
 | `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_MAX_PER_PASS` | The most idle branch pointers one tick retires (least recently moved first; the rest wait for the next tick). Clamped to `1000`; a non-numeric or non-positive value uses the default | `20` |
+| `SEXTANT_SERVICE_REPOSITORY_RECLAIM_DAYS` | Reclaim the checkout, git object store and NuGet package folder of a repository with no branch pointer, no pending work and no activity for more than this many days (issue #291). `0` disables the rule. Clamped to `3650`; a non-numeric or negative value uses the default | `14` |
+| `SEXTANT_SERVICE_REPOSITORY_RECLAIM_MAX_PER_PASS` | The most inactive repositories one tick reclaims (least active first). Clamped to `1000`; a non-numeric or non-positive value uses the default | `5` |
 | `SEXTANT_SERVICE_RETENTION_SCHEDULE` | Run the bounded retention pass once a day from the maintenance loop (issue #299). A malformed boolean **fails startup** | `true` |
 | `SEXTANT_SERVICE_RETENTION_SCHEDULE_HOUR_UTC` | The UTC hour (`0`–`23`) from which the day's scheduled retention runs: the first tick at or after it runs the pass, once per UTC day. Any other value uses the default | `3` |
 | `SEXTANT_SERVICE_RETENTION_UNIT_MAX_SECONDS` | Hard cap on one retention deletion unit (a snapshot project cascade). A unit over it is rolled back, reported as oversized and retried on a later pass (issue #303). `0` or less and invalid values use the default; larger values are capped at `600` | `60` |
@@ -480,6 +482,9 @@ URL, and NuGet would send those credentials to it. Use `SEXTANT_SERVICE_PACKAGE_
 Two caches on the cache volume (`SEXTANT_SERVICE_CACHE_ROOT`) make a later commit of the same repository cheap to
 check out and restore. Both are rebuildable: deleting either directory (with the service stopped) only costs the
 next job of each repository its head start. Neither is backed up, and neither changes what a snapshot contains.
+The maintenance loop also reclaims a repository's package folder, object store and persistent checkout once the
+repository has been inactive for `SEXTANT_SERVICE_REPOSITORY_RECLAIM_DAYS` (see the maintenance section); its next
+ensure starts cold.
 
 **NuGet package folders, one per repository** (`nuget-packages/<repository>/`, the same
 `<name>-<url hash>` directory name as the repository's checkout). The sandbox points the evaluation's
@@ -2051,7 +2056,40 @@ their snapshots forever. A service-owned loop cleans them up.
   stale push re-create a deleted branch. While the loop runs, every tick prunes records older than 90 days,
   even with the idle rule turned off (`retired_heads_pruned` in the tick log). After that, an idle-retired branch
   that was never pushed comes back only as a new branch.
-- **Scheduled retention (once a day).** After the tick's idle-branch pass, the first tick at or after
+- **Inactive-repository reclaim (every tick, issue #291).** A repository is inactive when it has no branch pointer
+  row, no `queued`/`running` job and no unconsumed branch-advance handover, and its most recent activity is more
+  than `SEXTANT_SERVICE_REPOSITORY_RECLAIM_DAYS` (default 14, `0` = off) old. Activity is the latest of: the
+  repository row's `created_at`, any `branches.updated_at`, any snapshot `created_at`/`published_at`, any job
+  `created_at`/`updated_at`/`started_at`/`completed_at`, a handover `recorded_at` and a `retired_branch_heads`
+  `retired_at`. The last one means a repository whose final branch the idle rule just retired waits the full
+  period before it is reclaimed. At most `SEXTANT_SERVICE_REPOSITORY_RECLAIM_MAX_PER_PASS` (default 5) are
+  reclaimed per tick, least active first. For each one the pass deletes, when present, its persistent checkout
+  (submodule checkouts live inside it), its git object store directory (the submodule stores under it go too)
+  and its per-repository NuGet package folder with its `.usage` record. Each directory is a direct child of its
+  volume root named by `ServicePaths.RepoDirectoryName`; a name that is not one plain segment, a symlink or
+  reparse point, or a plain file is refused (logged, never deleted, never followed). Directories are renamed to
+  a hidden `.reclaiming-*` sibling inside the writer's turn, and deleted after the gate is released; a
+  `.reclaiming-*` left by a crash is swept at the start of the next pass. The pass takes the write gate per
+  repository and re-checks inactivity (including an admitted branch-advance ensure) inside it, so it never races
+  an ensure or index of that repository; like scheduled retention it does not start while indexing holds the
+  writer and is retried on the next tick. **Catalog rows are never deleted** (retention owns them): a later
+  ensure re-clones cold and re-restores packages. The audit actor is `reclaim_policy`, the action `reclaim`, the
+  scope the repository URL. The audit row is written after the delete, from what was actually removed: outcome
+  `complete` with detail `reclaimed;<checkout,git_object_store,package_folder>;source=reclaim_policy`, or outcome
+  `failed` with `reclaim_incomplete;<the kinds deleted>` when a move or delete failed; `cost_bytes` is the bytes
+  of the directories that were deleted (measured outside the write gate). Bytes and repositories count as
+  reclaimed only for a delete that succeeded. A failure on one repository is logged and counted
+  (`repository_reclaim_failures_total`) and the loop carries on, and a leftover `.reclaiming-*` is retried by the
+  next pass's sweep. A repository refused by a path guard is logged at most once per UTC day and does not count
+  against the per-pass cap. The pass metrics are recorded only when the rule is enabled and the pass ran (not
+  while indexing holds the writer).
+  **Any branch row keeps a repository.** A repository that still has a branch pointer (for example a watched
+  default branch, which the idle rule never retires) is never reclaimed, however quiet: reclaiming it would only
+  force a cold re-clone and re-restore on its next push. Only a repository whose branches are all gone is
+  reclaimed. A repository whose directory name is shared with a repository that is not inactive is also left
+  alone. A contribution verification that reads a checkout reclaimed at that moment fails soft
+  (`Unavailable`).
+- **Scheduled retention (once a day).** After the tick's idle-branch and reclaim passes, the first tick at or after
   `SEXTANT_SERVICE_RETENTION_SCHEDULE_HOUR_UTC` (default 3) each UTC day runs the same bounded
   `execute=true` pass as `POST /control/retention?execute=true`. The audit actor is `retention_schedule` and the
   detail is `execute_batch;source=retention_schedule`. It runs at most once per UTC day, and a restart reads
@@ -2062,12 +2100,16 @@ their snapshots forever. A service-owned loop cleans them up.
   `SEXTANT_SERVICE_RETENTION_SCHEDULE=false` turns it off. Like a manual pass, it never runs `VACUUM` (#252).
   Compaction stays an offline operator action.
 - **Observability.** Each tick logs one line for the idle-branch pass (retired / idle / busy / attempted /
-  skipped, duration) and one for a scheduled retention pass (deleted snapshots, file versions and source texts,
+  skipped, duration), one for the reclaim pass (repositories, bytes freed, inactive, skipped, failed, duration)
+  and one for a scheduled retention pass (deleted snapshots, file versions and source texts,
   duration, `more_remaining`). `GET /control/metrics` reports a `maintenance` block: `ticks`, `failures`,
   `idle_branches_retired_total`, `last_idle_branches_retired`, `last_idle_pass_at_unix_ms`,
-  `last_idle_pass_duration_ms`, `scheduled_retention_runs`, `scheduled_retention_skipped_busy` and the latest
+  `last_idle_pass_duration_ms`, `repositories_reclaimed_total`, `repository_bytes_reclaimed_total`,
+  `repository_reclaim_failures_total`, `last_repositories_reclaimed`, `last_repository_bytes_reclaimed`,
+  `last_reclaim_pass_at_unix_ms`, `last_reclaim_pass_duration_ms`, `scheduled_retention_runs`, `scheduled_retention_skipped_busy` and the latest
   scheduled pass (`last_scheduled_retention_*`). The Prometheus text adds the `sextant_maintenance_*`,
-  `sextant_idle_branches_retired_*` and `sextant_scheduled_retention_*` gauges. The counters are per service
+  `sextant_idle_branches_retired_*`, `sextant_repositories_reclaimed_total`,
+  `sextant_repository_bytes_reclaimed_total`, `sextant_repository_reclaim_failures_total` and `sextant_scheduled_retention_*` gauges. The counters are per service
   instance. The startup log prints the effective policy.
 
 ### Bounded retention contract (#127 / #252)

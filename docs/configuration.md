@@ -175,6 +175,8 @@ snapshots become reclaimable (issue #299). Both run from its maintenance loop:
 | `SEXTANT_SERVICE_MAINTENANCE_INTERVAL_MINUTES` | `60` | Maintenance loop tick interval (clamped to 7 days); `0` turns the loop (and both rules below) off. |
 | `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_DAYS` | `7` | Retire a non-default branch pointer that has not moved for more than this many days (clamped to 3650); `0` disables. The default branch is never retired, and the branch's next push re-creates it. |
 | `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_MAX_PER_PASS` | `20` | Most idle branches retired per tick (clamped to `1000`). |
+| `SEXTANT_SERVICE_REPOSITORY_RECLAIM_DAYS` | `14` | Delete the checkout, git object store and NuGet package folder of a repository with no branch pointer, no pending work and no activity for more than this many days (clamped to 3650); `0` disables. Catalog rows stay; the next ensure re-clones cold. |
+| `SEXTANT_SERVICE_REPOSITORY_RECLAIM_MAX_PER_PASS` | `5` | Most inactive repositories reclaimed per tick (clamped to `1000`). |
 | `SEXTANT_SERVICE_RETENTION_SCHEDULE` | `true` | Run the bounded retention pass once a day (never a `VACUUM`). |
 | `SEXTANT_SERVICE_RETENTION_UNIT_MAX_SECONDS` | `60` | Hard cap on one retention deletion unit (a snapshot project cascade). A batch always completes one unit past its 2 s limit; a unit over this cap is rolled back whole, reported as `oversized`, and retried on a later pass. `0` or less (or invalid) uses the default; larger values are capped at `600`. |
 | `SEXTANT_SERVICE_RETENTION_PASS_SECONDS` | `600` | Work budget of the scheduled retention pass and the ceiling for `?seconds=` on `POST /control/retention` (clamped to `3600`; the interactive default stays 10 s). |

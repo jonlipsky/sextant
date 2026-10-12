@@ -292,7 +292,8 @@ public sealed record ServiceOptions
     /// The service-owned maintenance loop (issue #299): idle-branch retirement every tick and the daily scheduled
     /// retention pass. Bound from <c>SEXTANT_SERVICE_MAINTENANCE_INTERVAL_MINUTES</c>,
     /// <c>SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_DAYS</c>, <c>SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_MAX_PER_PASS</c>,
-    /// <c>SEXTANT_SERVICE_RETENTION_SCHEDULE</c> and <c>SEXTANT_SERVICE_RETENTION_SCHEDULE_HOUR_UTC</c>.
+    /// <c>SEXTANT_SERVICE_RETENTION_SCHEDULE</c>, <c>SEXTANT_SERVICE_RETENTION_SCHEDULE_HOUR_UTC</c>,
+    /// <c>SEXTANT_SERVICE_REPOSITORY_RECLAIM_DAYS</c> and <c>SEXTANT_SERVICE_REPOSITORY_RECLAIM_MAX_PER_PASS</c>.
     /// </summary>
     public MaintenancePolicy Maintenance { get; init; } = new();
 
@@ -466,7 +467,8 @@ public sealed record ServiceOptions
             Maintenance = ParseMaintenance(
                 Env("MAINTENANCE_INTERVAL_MINUTES"), Env("BRANCH_IDLE_RETIRE_DAYS"),
                 Env("BRANCH_IDLE_RETIRE_MAX_PER_PASS"), EnvBool("RETENTION_SCHEDULE"),
-                Env("RETENTION_SCHEDULE_HOUR_UTC"), Env("RETENTION_PASS_SECONDS")),
+                Env("RETENTION_SCHEDULE_HOUR_UTC"), Env("RETENTION_PASS_SECONDS"),
+                Env("REPOSITORY_RECLAIM_DAYS"), Env("REPOSITORY_RECLAIM_MAX_PER_PASS")),
             // Fold the node's own profile hash into request identities by default, so an ensure request that
             // omits ConfigHash resolves to the SAME identity_hash the local worker's orchestrator publishes
             // under (IndexProfileDescriptor.ConfigurationHash) — without it the idempotency lookup misses.
@@ -614,7 +616,7 @@ public sealed record ServiceOptions
     /// </summary>
     internal static MaintenancePolicy ParseMaintenance(
         string? intervalMinutes, string? idleDays, string? maxPerPass, bool? scheduledRetention, string? retentionHourUtc,
-        string? retentionPassSeconds = null) => new()
+        string? retentionPassSeconds = null, string? repositoryReclaimDays = null, string? repositoryReclaimMaxPerPass = null) => new()
         {
             Interval = TimeSpan.FromMinutes(int.TryParse(intervalMinutes, out var minutes) && minutes >= 0
                 ? Math.Min(minutes, MaintenancePolicy.MaxIntervalMinutes) : MaintenancePolicy.DefaultIntervalMinutes),
@@ -626,7 +628,11 @@ public sealed record ServiceOptions
             RetentionHourUtc = int.TryParse(retentionHourUtc, out var hour) && hour is >= 0 and <= 23
                 ? hour : MaintenancePolicy.DefaultRetentionHourUtc,
             RetentionPassSeconds = int.TryParse(retentionPassSeconds, out var pass) && pass > 0
-                ? Math.Min(pass, MaintenancePolicy.MaxRetentionPassSeconds) : MaintenancePolicy.DefaultRetentionPassSeconds
+                ? Math.Min(pass, MaintenancePolicy.MaxRetentionPassSeconds) : MaintenancePolicy.DefaultRetentionPassSeconds,
+            RepositoryReclaimDays = int.TryParse(repositoryReclaimDays, out var reclaimDays) && reclaimDays >= 0
+                ? Math.Min(reclaimDays, MaintenancePolicy.MaxRepositoryReclaimDays) : MaintenancePolicy.DefaultRepositoryReclaimDays,
+            RepositoryReclaimMaxPerPass = int.TryParse(repositoryReclaimMaxPerPass, out var reclaimCap) && reclaimCap > 0
+                ? Math.Min(reclaimCap, MaintenancePolicy.MaxRepositoryReclaimMaxPerPass) : MaintenancePolicy.DefaultRepositoryReclaimMaxPerPass
         };
 
     internal static RetentionPolicy WithUnitMaxForTesting(RetentionPolicy policy) =>

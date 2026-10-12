@@ -31,6 +31,33 @@ public sealed record IdleBranchRetireReport
     public double DurationMs { get; init; }
 }
 
+/// <summary>The outcome of one inactive-repository reclaim pass (issue #291).</summary>
+public sealed record RepositoryReclaimReport
+{
+    /// <summary>False when the rule is disabled (<see cref="MaintenancePolicy.RepositoryReclaimDays"/> is 0).</summary>
+    public required bool Enabled { get; init; }
+
+    /// <summary>True when indexing held the writer, so the pass did not run (retried next tick).</summary>
+    public bool Busy { get; init; }
+
+    /// <summary>Inactive repositories found, before the on-disk filter and the per-pass cap.</summary>
+    public int Inactive { get; init; }
+
+    /// <summary>Repositories whose checkout and caches were (at least partly) deleted this pass.</summary>
+    public int Reclaimed { get; init; }
+
+    /// <summary>Bytes freed, measured before deleting.</summary>
+    public long BytesFreed { get; init; }
+
+    /// <summary>Candidates left alone because work or activity appeared before their turn at the writer.</summary>
+    public int Skipped { get; init; }
+
+    /// <summary>Repositories whose reclaim failed (logged; a later pass retries).</summary>
+    public int Failed { get; init; }
+
+    public double DurationMs { get; init; }
+}
+
 /// <summary>What one maintenance tick did (issue #299).</summary>
 public sealed record MaintenanceTickReport
 {
@@ -46,6 +73,9 @@ public sealed record MaintenanceTickReport
     public RetentionReport? RetentionReport { get; init; }
 
     public double RetentionDurationMs { get; init; }
+
+    /// <summary>The tick's inactive-repository reclaim pass (issue #291).</summary>
+    public RepositoryReclaimReport? RepositoryReclaim { get; init; }
 }
 
 public sealed partial class SnapshotService
@@ -55,6 +85,9 @@ public sealed partial class SnapshotService
 
     /// <summary>The audit caller of the scheduled retention pass (issue #299).</summary>
     public static readonly AuditCaller RetentionScheduleCaller = new("retention_schedule", ";source=retention_schedule");
+
+    /// <summary>The audit caller of the inactive-repository reclaim (issue #291).</summary>
+    public static readonly AuditCaller ReclaimPolicyCaller = new("reclaim_policy", ";source=reclaim_policy");
 
     // Issue #299: one maintenance tick at a time (the loop's own, or a direct call).
     private readonly SemaphoreSlim _maintenanceTick = new(1, 1);
@@ -152,7 +185,18 @@ public sealed partial class SnapshotService
                     $"retired heads pruned {idle.RetiredHeadsPruned}) " +
                     $"in {idle.DurationMs:F0} ms.");
 
-            return await RunScheduledRetentionIfDueAsync(idle, cancellationToken).ConfigureAwait(false);
+            var reclaim = await ReclaimInactiveRepositoriesAsync(cancellationToken).ConfigureAwait(false);
+            if (reclaim.Enabled && !reclaim.Busy)
+            {
+                _metrics.RecordRepositoryReclaimPass(
+                    reclaim.Reclaimed, reclaim.BytesFreed, reclaim.Failed, _timeProvider.GetUtcNow().ToUnixTimeMilliseconds(), reclaim.DurationMs);
+                Log($"maintenance: repository reclaim freed {reclaim.BytesFreed / (1024 * 1024)} MiB ({reclaim.BytesFreed} bytes) " +
+                    $"from {reclaim.Reclaimed} repository(ies) (inactive {reclaim.Inactive}, skipped {reclaim.Skipped}, " +
+                    $"failed {reclaim.Failed}) in {reclaim.DurationMs:F0} ms.");
+            }
+
+            var report = await RunScheduledRetentionIfDueAsync(idle, cancellationToken).ConfigureAwait(false);
+            return report with { RepositoryReclaim = reclaim };
         }
         finally
         {
@@ -232,6 +276,181 @@ public sealed partial class SnapshotService
             RetiredHeadsPruned = pruned,
             DurationMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds
         };
+    }
+
+    /// <summary>
+    /// Deletes the checkout, git object store (submodule stores included) and package folder of repositories the service
+    /// no longer indexes (issue #291), least recently active first, at most
+    /// <see cref="MaintenancePolicy.RepositoryReclaimMaxPerPass"/> per pass. A repository is inactive when it has no
+    /// branch pointer, no queued/running job and no pending handover (or admitted branch advance), and its latest
+    /// catalog activity is at least <see cref="MaintenancePolicy.RepositoryReclaimDays"/> days old. Activity is the most
+    /// recent of its row's creation, branch <c>updated_at</c>, snapshot <c>created_at</c>/<c>published_at</c>, job
+    /// <c>created_at</c>/<c>updated_at</c>/<c>started_at</c>/<c>completed_at</c>, handover <c>recorded_at</c> and
+    /// retired-head <c>retired_at</c>, so a repository whose last branch was just retired waits the full period. The
+    /// candidate is re-checked and its directories renamed aside inside the write gate, so it never races an ensure or
+    /// an index of that repository; the delete runs after the gate is released. Catalog rows stay (retention owns them):
+    /// a later ensure re-clones cold. While indexing holds the writer the pass does not run (retried next tick).
+    /// </summary>
+    public async Task<RepositoryReclaimReport> ReclaimInactiveRepositoriesAsync(CancellationToken cancellationToken = default)
+    {
+        var policy = _options.Maintenance;
+        if (policy.RepositoryReclaimDays <= 0)
+            return new RepositoryReclaimReport { Enabled = false };
+        if (IndexingHoldsWriter())
+            return new RepositoryReclaimReport { Enabled = true, Busy = true };
+
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        var cutoff = _timeProvider.GetUtcNow()
+            .AddDays(-Math.Min(policy.RepositoryReclaimDays, MaintenancePolicy.MaxRepositoryReclaimDays)).ToUnixTimeMilliseconds();
+        var reclaimer = new RepositoryReclaimer(_paths, Log);
+        reclaimer.SweepInterrupted();
+
+        IReadOnlyList<RepositoryActivity> activity;
+        using (var reader = OpenReadConnection())
+            activity = new RepositoryActivityStore(reader).List();
+        var inactive = activity.Where(a => IsInactive(a, cutoff)).ToList();
+        var activeNames = ActiveDirectoryNames(activity, cutoff);
+
+        int reclaimed = 0, skipped = 0, failed = 0;
+        long bytes = 0;
+        foreach (var candidate in inactive)
+        {
+            if (reclaimed >= policy.RepositoryReclaimMaxPerPass)
+                break;
+            cancellationToken.ThrowIfCancellationRequested();
+            if (activeNames.Contains(ServicePaths.RepoDirectoryName(candidate.RemoteUrl)))
+            {
+                skipped++;
+                continue;
+            }
+            var plan = reclaimer.Find(candidate.RemoteUrl);
+            if (plan.Refused.Count > 0)
+                LogRefusedOncePerDay(candidate.RepositoryId, plan.Refused);
+            if (plan.Targets.Count == 0)
+                continue;
+            try
+            {
+                if (BeforeReclaimWriterTurn is { } hook)
+                    await hook().ConfigureAwait(false);
+                var outcome = await WithWriteAsync(() => Task.FromResult(ReclaimUnderWriter(reclaimer, candidate, cutoff)), cancellationToken)
+                    .ConfigureAwait(false);
+                if (outcome is null)
+                {
+                    skipped++;
+                    continue;
+                }
+                // Measured and deleted outside the write gate; only a directory that is really gone counts as freed.
+                long freed = 0;
+                var deleted = new List<string>();
+                foreach (var aside in outcome.Asides)
+                {
+                    var size = RepositoryReclaimer.Measure(aside.Path);
+                    if (!reclaimer.Delete(aside))
+                        continue;
+                    freed += size;
+                    deleted.Add(aside.Target.Kind.Replace(' ', '_'));
+                }
+                var clean = outcome.MoveFailures == 0 && deleted.Count == outcome.Asides.Count;
+                await AuditReclaimAsync(outcome.RemoteUrl, clean, deleted, freed, cancellationToken).ConfigureAwait(false);
+                bytes += freed;
+                if (clean)
+                    reclaimed++;
+                else
+                    failed++;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                failed++;
+                Log($"maintenance: repository reclaim failed for repository {candidate.RepositoryId}: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+        return new RepositoryReclaimReport
+        {
+            Enabled = true, Inactive = inactive.Count, Reclaimed = reclaimed, BytesFreed = bytes, Skipped = skipped, Failed = failed,
+            DurationMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds
+        };
+    }
+
+    private static bool IsInactive(RepositoryActivity a, long cutoffMs) =>
+        !a.HasBranches && !a.HasPendingWork && a.LastActivityMs < cutoffMs;
+
+    private bool HasAdmittedAdvance(string remoteUrl)
+    {
+        var prefix = RemoteUrlIdentity.Normalize(remoteUrl) + "\n";
+        lock (_inFlightLock)
+            return _latestAdvance.Keys.Any(k => k.StartsWith(prefix, StringComparison.Ordinal));
+    }
+
+    // Test seam: runs after a candidate is selected and before it takes its writer turn.
+    internal Func<Task>? BeforeReclaimWriterTurn { get; set; }
+
+    private readonly Dictionary<long, DateOnly> _reclaimRefusedLogged = [];
+
+    private void LogRefusedOncePerDay(long repositoryId, IReadOnlyList<string> refused)
+    {
+        var today = DateOnly.FromDateTime(_timeProvider.GetUtcNow().UtcDateTime);
+        lock (_reclaimRefusedLogged)
+        {
+            if (_reclaimRefusedLogged.TryGetValue(repositoryId, out var day) && day == today)
+                return;
+            _reclaimRefusedLogged[repositoryId] = today;
+        }
+        Log($"maintenance: repository reclaim refused for repository {repositoryId}: {string.Join("; ", refused)}.");
+    }
+
+    // Directory names of repositories that are NOT inactive: an inactive repository sharing one is never reclaimed.
+    private static HashSet<string> ActiveDirectoryNames(IEnumerable<RepositoryActivity> activity, long cutoff) =>
+        activity.Where(a => !IsInactive(a, cutoff)).Select(a => ServicePaths.RepoDirectoryName(a.RemoteUrl)).ToHashSet(StringComparer.Ordinal);
+
+    private async Task AuditReclaimAsync(string remoteUrl, bool clean, List<string> kinds, long bytes, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await WithWriteAsync(() =>
+            {
+                EnsureLeaseHeld();
+                new AuditLogStore(_conn).Append(
+                    AuditAction.Reclaim, clean ? AuditOutcome.Complete : AuditOutcome.Failed, actor: ReclaimPolicyCaller.Actor,
+                    repositoryScope: remoteUrl,
+                    detail: ReclaimPolicyCaller.Detail((clean ? "reclaimed;" : "reclaim_incomplete;") + string.Join(',', kinds)),
+                    costBytes: bytes);
+                return Task.FromResult(0);
+            }, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Log($"maintenance: repository reclaim audit failed: {ex.GetType().Name}.");
+        }
+    }
+
+    private sealed record ReclaimOutcome(List<RepositoryReclaimer.Aside> Asides, string RemoteUrl, int MoveFailures);
+
+    // Runs inside the write gate: re-checks that the repository is still inactive on the writer's own view of the
+    // catalog, renames its directories aside. Null when it is no longer inactive.
+    private ReclaimOutcome? ReclaimUnderWriter(RepositoryReclaimer reclaimer, RepositoryActivity candidate, long cutoff)
+    {
+        var all = new RepositoryActivityStore(_conn).List();
+        var current = all.FirstOrDefault(a => a.RepositoryId == candidate.RepositoryId);
+        if (current is null || !IsInactive(current, cutoff) || HasAdmittedAdvance(current.RemoteUrl)
+            || ActiveDirectoryNames(all, cutoff).Contains(ServicePaths.RepoDirectoryName(current.RemoteUrl)))
+            return null;
+        var plan = reclaimer.Find(current.RemoteUrl);
+        var asides = new List<RepositoryReclaimer.Aside>();
+        var moveFailures = 0;
+        foreach (var target in plan.Targets)
+        {
+            if (reclaimer.MoveAside(target) is { } aside)
+                asides.Add(aside);
+            else
+                moveFailures++;
+        }
+        foreach (var aside in asides.Where(a => a.Target.Kind == "package folder"))
+            RepositoryReclaimer.DeleteUsageRecord(aside.Target);
+        return new ReclaimOutcome(asides, current.RemoteUrl, moveFailures);
     }
 
     // Deletes the retired-head records older than MaintenancePolicy.RetiredHeadRetention: a branch idle-retired that long

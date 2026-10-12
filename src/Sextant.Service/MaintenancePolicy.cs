@@ -12,6 +12,8 @@ public sealed record MaintenancePolicy
     internal const int DefaultBranchIdleRetireDays = 7;
     internal const int DefaultBranchIdleRetireMaxPerPass = 20;
     internal const int DefaultRetentionHourUtc = 3;
+    internal const int DefaultRepositoryReclaimDays = 14;
+    internal const int DefaultRepositoryReclaimMaxPerPass = 5;
     internal const int DefaultRetentionPassSeconds = 600;
 
     /// <summary>The longest retention pass, in seconds (1 hour); a longer value is clamped to it.</summary>
@@ -32,6 +34,12 @@ public sealed record MaintenancePolicy
     /// <summary>The largest per-tick retire cap the environment can set.</summary>
     public const int MaxBranchIdleRetireMaxPerPass = 1000;
 
+    /// <summary>The largest repository-reclaim threshold, in days (about ten years); a larger value is clamped to it.</summary>
+    public const int MaxRepositoryReclaimDays = 3650;
+
+    /// <summary>The largest per-tick repository-reclaim cap the environment can set.</summary>
+    public const int MaxRepositoryReclaimMaxPerPass = 1000;
+
     /// <summary>
     /// How often the loop ticks. <see cref="TimeSpan.Zero"/> disables the loop: no idle-branch retirement and no
     /// scheduled retention. <c>SEXTANT_SERVICE_MAINTENANCE_INTERVAL_MINUTES</c> (default 60; <c>0</c> disables; clamped to <see cref="MaxIntervalMinutes"/>).
@@ -49,6 +57,19 @@ public sealed record MaintenancePolicy
     /// <c>SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_MAX_PER_PASS</c> (default 20).
     /// </summary>
     public int BranchIdleRetireMaxPerPass { get; init; } = DefaultBranchIdleRetireMaxPerPass;
+
+    /// <summary>
+    /// A repository with no branch pointer, no pending work and no catalog activity (branch, job, snapshot) for at least
+    /// this many days has its checkout, git object store and package folder deleted (issue #291). <c>0</c> disables the
+    /// rule. <c>SEXTANT_SERVICE_REPOSITORY_RECLAIM_DAYS</c> (default 14; clamped to <see cref="MaxRepositoryReclaimDays"/>).
+    /// </summary>
+    public int RepositoryReclaimDays { get; init; } = DefaultRepositoryReclaimDays;
+
+    /// <summary>
+    /// The most repositories one tick reclaims (the longest inactive first); the rest wait for the next tick.
+    /// <c>SEXTANT_SERVICE_REPOSITORY_RECLAIM_MAX_PER_PASS</c> (default 5).
+    /// </summary>
+    public int RepositoryReclaimMaxPerPass { get; init; } = DefaultRepositoryReclaimMaxPerPass;
 
     /// <summary>
     /// Whether the loop runs the bounded retention pass once a day. <c>SEXTANT_SERVICE_RETENTION_SCHEDULE</c>
@@ -77,10 +98,13 @@ public sealed record MaintenancePolicy
         var idle = BranchIdleRetireDays > 0
             ? $"retires non-default branches idle > {BranchIdleRetireDays} day(s), at most {BranchIdleRetireMaxPerPass} per tick"
             : "idle-branch retirement disabled";
+        var reclaim = RepositoryReclaimDays > 0
+            ? $"reclaims disk of repositories inactive >= {RepositoryReclaimDays} day(s), at most {RepositoryReclaimMaxPerPass} per tick"
+            : "repository reclaim disabled";
         var retention = ScheduledRetention
             ? $"scheduled retention daily from {RetentionHourUtc:D2}:00 UTC"
             : "scheduled retention disabled";
-        return $"maintenance: every {Interval.TotalMinutes:0.##} min; {idle}; {retention}.";
+        return $"maintenance: every {Interval.TotalMinutes:0.##} min; {idle}; {reclaim}; {retention}.";
     }
 
     /// <summary>The policy with the loop off (no ticks at all).</summary>
