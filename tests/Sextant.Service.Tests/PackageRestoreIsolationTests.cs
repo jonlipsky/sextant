@@ -190,6 +190,48 @@ public class PackageRestoreIsolationTests
     }
 
     [TestMethod]
+    public async Task APerProjectRetry_SeesTheSamePackageFolderAndCredentials_AsTheFirstAttempt()
+    {
+        RequireUnix();
+        var root = NewRoot("retry-env");
+        var previous = Environment.GetEnvironmentVariable("NUGET_PACKAGES");
+        try
+        {
+            var packages = System.IO.Path.Combine(root, "packages", "repo-a");
+            Environment.SetEnvironmentVariable("NUGET_PACKAGES", packages);
+            var envLog = System.IO.Path.Combine(root, "env.txt");
+            var record = $"echo \"$NUGET_PACKAGES|$NUGET_PLUGIN_PATHS|$RESTORE_FEED_CREDENTIALS_FILE\" >> \"{envLog}\"";
+            var fake = CreateFakeDotnet(System.IO.Path.Combine(root, "fake"), $"{record}; exit 1", $"{record}; exit 0");
+            var plugin = System.IO.Path.Combine(root, "plugin.dll");
+            File.WriteAllText(plugin, "x");
+            var solution = WriteSolution(root, "All.slnx", "A", "B");
+            var credentials = new[] { new PackageSourceCredential("feed.example.test", "user", "not-a-real-secret") };
+
+            var outcome = await new PackageRestoreRunner(
+                    timeout: TimeSpan.FromSeconds(60), sourceCredentials: credentials, credentialPluginPath: plugin)
+                { DotnetPath = fake.Path }
+                .RunAsync(root, [solution], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
+
+            Assert.AreEqual(1, outcome.SolutionsRetriedPerProject);
+            var envs = File.ReadAllLines(envLog);
+            Assert.AreEqual(2, envs.Length, "one restore attempt and one per-project retry");
+            Assert.AreEqual(envs[0], envs[1], "the retry child inherits exactly the first attempt's environment");
+            var parts = envs[0].Split('|');
+            Assert.AreEqual(packages, parts[0]);
+            Assert.AreEqual(plugin, parts[1]);
+            Assert.IsFalse(string.IsNullOrEmpty(parts[2]));
+            CollectionAssert.AreEqual(new[] { "restore", "msbuild" }, fake.Calls.Select(c => c.Split(' ')[0]).ToArray());
+            StringAssert.Contains(fake.Calls[0], "-p:TreatWarningsAsErrors=false");
+            StringAssert.Contains(fake.Traversal, "TreatWarningsAsErrors=false;WarningsAsErrors=");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("NUGET_PACKAGES", previous);
+            TryDelete(root);
+        }
+    }
+
+    [TestMethod]
     public async Task ARetryThatStillFails_ReportsTheSolutionFailed_WithTheRetrysProjectErrors()
     {
         RequireUnix();

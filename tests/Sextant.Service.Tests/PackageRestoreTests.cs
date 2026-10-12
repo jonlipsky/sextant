@@ -597,11 +597,13 @@ public class PackageRestoreTests
             // Issue #272: why the union could not be used is recorded on the outcome (and the job's timings).
             Assert.AreEqual("'App.csproj' references a project outside the selected solution union", outcome.UnionFallbackReason);
             var recorder = new JobTimingsRecorder();
-            recorder.RecordRestore(outcome, persistentPackageFolder: true);
+            recorder.RecordRestore(outcome with { SolutionsRetriedPerProject = 1, ProjectsRetried = 3 }, persistentPackageFolder: true);
             var restore = recorder.Build().Restore!;
             Assert.AreEqual("per_solution", restore.Mode);
             Assert.AreEqual(outcome.UnionFallbackReason, restore.FallbackReason);
             Assert.AreEqual("persistent", restore.PackageFolder);
+            Assert.AreEqual(1, restore.SolutionsRetriedPerProject);
+            Assert.AreEqual(3, restore.ProjectsRetried);
             Assert.IsTrue(logs.Any(line => line.Contains("per-solution fallback", StringComparison.Ordinal)));
             Assert.IsTrue(File.Exists(Path.Combine(sharedDir, "obj", "project.assets.json")),
                 "the fallback retains transitive restore behavior for projects outside the selected solution union");

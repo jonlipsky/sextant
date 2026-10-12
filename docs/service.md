@@ -467,6 +467,8 @@ package folder by id and version alone. With one shared folder, a repository who
 contents, and checks each gets its own, and that a shared folder would have been poisoned). Two spellings of one
 remote share a folder, exactly as they share a checkout. The sandbox refuses (fail closed) to point
 `NUGET_PACKAGES` at anything but one repository's folder under `nuget-packages/`.
+NuGet's `.nupkg.metadata` in that persistent folder records each package's source URL, so a `nuget.config` source URL must
+never embed credentials (use `SEXTANT_SERVICE_PACKAGE_SOURCE_CREDENTIALS` instead).
 
 - **Bounded.** After each job the folder it used is measured and recorded next to it
   (`<repository>.usage`, written only by the service). While all folders together exceed

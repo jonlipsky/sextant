@@ -69,6 +69,12 @@ public sealed record JobRestoreTimings
 
     /// <summary>Wall-clock time of the restore, in milliseconds.</summary>
     public long WallMs { get; init; }
+
+    /// <summary>Solutions whose whole restore failed and was retried project by project (issue #304).</summary>
+    public int SolutionsRetriedPerProject { get; init; }
+
+    /// <summary>Projects restored one by one by those retries (issue #304).</summary>
+    public int ProjectsRetried { get; init; }
 }
 
 /// <summary>The solution load of a job (issue #267).</summary>
@@ -143,7 +149,9 @@ public sealed class JobTimingsRecorder
                 : "solution",
             FallbackReason = restore.UnionFallbackReason,
             PackageFolder = persistentPackageFolder ? "persistent" : "scratch",
-            WallMs = (long)restore.Elapsed.TotalMilliseconds
+            WallMs = (long)restore.Elapsed.TotalMilliseconds,
+            SolutionsRetriedPerProject = restore.SolutionsRetriedPerProject,
+            ProjectsRetried = restore.ProjectsRetried
         };
         lock (_gate) _restore = timings;
     }
