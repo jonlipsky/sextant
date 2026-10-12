@@ -72,6 +72,13 @@ public sealed class BenchmarkOptions
     /// large catalog is measurable. The source is never modified.
     /// </summary>
     public string? CatalogPath { get; init; }
+
+    /// <summary>
+    /// Issue #288: a previous benchmark report whose per-project compile timings are passed to the symbol phase's
+    /// compilation prefetcher on the <see cref="ServicePath"/> run, as the service worker passes its job history's.
+    /// The effect is in the report's <see cref="IndexingMetrics.CompileHints"/>.
+    /// </summary>
+    public string? CompileCostHintsPath { get; init; }
 }
 
 /// <summary>
@@ -160,8 +167,11 @@ public sealed class BenchmarkRunner
             var orchestrator = new IndexOrchestrator(db, log, options.UseDocumentExtractor,
                 ExtractionParallelismOptions.Resolve(options.MaxParallelism, 0),
                 IndexProfileDescriptor.For(options.Profile));
+            var hints = options.ServicePath && options.CompileCostHintsPath != null
+                ? CompileCostHintsReader.Load(options.CompileCostHintsPath)
+                : null;
             await orchestrator.IndexSolutionAsync(
-                solution, progress: null, metrics, ct, solutionMembership: membership);
+                solution, progress: null, metrics, ct, solutionMembership: membership, compileCostHints: hints);
         }
         catch (OperationCanceledException)
         {

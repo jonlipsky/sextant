@@ -123,6 +123,7 @@ public static class Program
         var profile = Core.IndexProfiles.Deep;
         var servicePath = false;
         string? catalog = null;
+        string? compileCostHints = null;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -145,6 +146,7 @@ public static class Program
                 case "--profile": profile = RequireValue(args, ref i); break;
                 case "--service-path": servicePath = true; break;
                 case "--catalog": catalog = RequireValue(args, ref i); break;
+                case "--compile-cost-hints": compileCostHints = RequireValue(args, ref i); break;
                 default: throw new ArgumentException($"unknown argument '{args[i]}'");
             }
         }
@@ -167,8 +169,11 @@ public static class Program
             Profile = profile,
             ServicePath = servicePath,
             CatalogPath = catalog,
+            CompileCostHintsPath = compileCostHints,
             Log = msg => Console.WriteLine($"  {msg}")
         };
+        if (compileCostHints != null && !servicePath)
+            throw new ArgumentException("'--compile-cost-hints' needs '--service-path'");
         return (options, outDir);
     }
 
@@ -211,6 +216,9 @@ public static class Program
               --service-path        load like the service: --path is a checkout directory whose solutions are
                                     selected, restored and loaded by the service's code (several → union path)
               --catalog <db>        index into a copy of this existing catalog instead of a fresh database
+              --compile-cost-hints <report.json>
+                                    with --service-path: start the compilations a previous report measured as
+                                    expensive first (the service does this from its job history; issue #288)
               --machine <label>     machine label recorded in the report
               -h, --help            show this help
             """);

@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Sextant.Core;
 using Sextant.Indexer;
 
@@ -36,7 +37,55 @@ public sealed record JobTimings
 
     /// <summary>The slowest projects of the extraction phases, slowest first (at most <see cref="JobTimingsRecorder.Top"/>).</summary>
     public IReadOnlyList<ProjectTiming> SlowestProjects { get; init; } = [];
+
+    /// <summary>
+    /// What the symbol phase's longest compilations took (issue #288), most expensive first: the hints a later job of the
+    /// same repository gives its compilation prefetcher.
+    /// </summary>
+    [JsonConverter(typeof(CompileCostsConverter))]
+    public IReadOnlyList<ProjectCompileCost> CompileCosts { get; init; } = [];
 }
+
+/// <summary>
+/// Reads the compile costs leniently: an entry that is not an object with a string <c>key</c> and an integer <c>ms</c>
+/// is skipped, so one bad entry never makes the rest of a stored document unreadable.
+/// </summary>
+internal sealed class CompileCostsConverter : JsonConverter<IReadOnlyList<ProjectCompileCost>>
+{
+    public override IReadOnlyList<ProjectCompileCost> Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        using var document = JsonDocument.ParseValue(ref reader);
+        var costs = new List<ProjectCompileCost>();
+        if (document.RootElement.ValueKind != JsonValueKind.Array)
+            return costs;
+        foreach (var entry in document.RootElement.EnumerateArray())
+        {
+            if (entry.ValueKind == JsonValueKind.Object
+                && entry.TryGetProperty("key", out var key) && key.ValueKind == JsonValueKind.String && key.GetString() is { } text
+                && entry.TryGetProperty("ms", out var ms) && ms.ValueKind == JsonValueKind.Number && ms.TryGetInt64(out var value))
+                costs.Add(new ProjectCompileCost(text, value));
+        }
+        return costs;
+    }
+
+    public override void Write(Utf8JsonWriter writer, IReadOnlyList<ProjectCompileCost> value, JsonSerializerOptions options)
+    {
+        writer.WriteStartArray();
+        foreach (var cost in value)
+        {
+            writer.WriteStartObject();
+            writer.WriteString("key", cost.Key);
+            writer.WriteNumber("ms", cost.Ms);
+            writer.WriteEndObject();
+        }
+        writer.WriteEndArray();
+    }
+}
+
+/// <summary>One project's compile time in the symbol phase (issue #288).</summary>
+/// <param name="Key">The project's <see cref="CompileCostHints.KeyOf"/> key: repo-relative path and target framework.</param>
+/// <param name="Ms">Compile time (ended minus started), in milliseconds.</param>
+public sealed record ProjectCompileCost(string Key, long Ms);
 
 /// <summary>One phase of a job (issue #267). <c>cpu_ms / wall_ms</c> is the parallelism it achieved.</summary>
 /// <param name="Name">The phase (<see cref="IndexPhaseNames"/>): <c>checkout</c>, <c>sdk_pin</c>, <c>restore</c>, <c>load</c>,
@@ -195,6 +244,7 @@ public sealed class JobTimingsRecorder
         {
             var phases = new List<JobPhaseTiming>(_phases);
             IReadOnlyList<ProjectTiming> slowest = [];
+            IReadOnlyList<ProjectCompileCost> compileCosts = [];
             if (_indexing is { } indexing)
             {
                 foreach (var phase in indexing.Phases)
@@ -207,6 +257,7 @@ public sealed class JobTimingsRecorder
                 if (other > 0)
                     phases.Add(new JobPhaseTiming(IndexPhaseNames.IndexerOther, other, null, null));
                 slowest = indexing.Projects.OrderByDescending(p => p.WallMs).Take(Top).ToList();
+                compileCosts = CompileCostsOf(indexing.Projects);
             }
 
             return new JobTimings
@@ -217,10 +268,29 @@ public sealed class JobTimingsRecorder
                 Phases = phases,
                 Restore = _restore,
                 Load = _load,
-                SlowestProjects = slowest
+                SlowestProjects = slowest,
+                CompileCosts = compileCosts
             };
         }
     }
+
+    /// <summary>Projects recorded as compile costs: at least this long (the prefetcher promotes from 2 s).</summary>
+    internal const long MinCompileCostMs = 1000;
+
+    /// <summary>At most this many compile costs are recorded per job.</summary>
+    internal const int MaxCompileCosts = 100;
+
+    internal static IReadOnlyList<ProjectCompileCost> CompileCostsOf(IEnumerable<ProjectTiming> projects) =>
+        projects
+            .Where(p => p.Phase == IndexPhaseNames.ExtractingSymbols && p.Key != null
+                        && (p.CompileCostMs != null || (p.CompileStartedAtMs != null && p.CompileEndedAtMs != null)))
+            .Select(p => new ProjectCompileCost(
+                p.Key!, p.CompileCostMs ?? p.CompileEndedAtMs!.Value - p.CompileStartedAtMs!.Value))
+            .Where(c => c.Ms >= MinCompileCostMs)
+            .OrderByDescending(c => c.Ms)
+            .ThenBy(c => c.Key, StringComparer.Ordinal)
+            .Take(MaxCompileCosts)
+            .ToList();
 
     private void Add(JobPhaseTiming phase)
     {

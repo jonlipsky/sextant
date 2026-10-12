@@ -460,6 +460,37 @@ public sealed class SnapshotJobStore(SqliteConnection connection)
         return rows;
     }
 
+    /// <summary>
+    /// The timings of the most recently recorded completed (<c>complete</c> or <c>partial</c>) jobs of a repository (issue
+    /// #288), newest first, at most <paramref name="limit"/>: (branch name, timings JSON). The repository is matched on
+    /// <see cref="RemoteUrlIdentity.Normalize"/>, so a spelling of its URL never hides its history. A job that is still
+    /// queued or running, or that failed, is never returned. Read-only.
+    /// </summary>
+    public IReadOnlyList<(string? BranchName, string TimingsJson)> RecentCompletedTimingsOfRepository(
+        string repositoryUrl, int limit)
+    {
+        var key = RemoteUrlIdentity.Normalize(repositoryUrl);
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT j.repository_url, j.branch_name, t.timings_json
+            FROM snapshot_job_timings t
+            JOIN snapshot_jobs j ON j.id = t.job_id
+            WHERE j.status IN (@complete, @partial)
+            ORDER BY t.recorded_at DESC, t.job_id DESC;
+            """;
+        cmd.Parameters.AddWithValue("@complete", SnapshotJobStatus.Complete);
+        cmd.Parameters.AddWithValue("@partial", SnapshotJobStatus.Partial);
+        var rows = new List<(string?, string)>();
+        using var reader = cmd.ExecuteReader();
+        // Bounded scan: a repository with no recent history costs at most this many rows.
+        for (var scanned = 0; rows.Count < limit && scanned < 2000 && reader.Read(); scanned++)
+        {
+            if (RemoteUrlIdentity.Normalize(reader.GetString(0)) == key)
+                rows.Add((reader.IsDBNull(1) ? null : reader.GetString(1), reader.GetString(2)));
+        }
+        return rows;
+    }
+
     public IReadOnlyList<SnapshotJobDiagnostic> GetDiagnostics(long jobId)
     {
         using var cmd = connection.CreateCommand();
