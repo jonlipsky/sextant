@@ -74,6 +74,18 @@ public sealed class ProjectTiming
     /// <summary>Time spent writing the project's rows and committing its batch, in milliseconds.</summary>
     public long PersistMs { get; set; }
 
+    /// <summary>For the symbol phase (issue #288): when the compilation was requested, in ms from the phase's start (the prefetch's when it succeeded, else the walk's own call).</summary>
+    public long? CompileRequestedAtMs { get; set; }
+
+    /// <summary>For the symbol phase: when the compilation started, in ms from the phase's start.</summary>
+    public long? CompileStartedAtMs { get; set; }
+
+    /// <summary>For the symbol phase: when the compilation ended, in ms from the phase's start.</summary>
+    public long? CompileEndedAtMs { get; set; }
+
+    /// <summary>For the symbol phase: whether the prefetch succeeded and finished before the phase reached the project (a failed or cancelled prefetch is a miss).</summary>
+    public bool? CompilePrefetchHit { get; set; }
+
     /// <summary>Rows written for the project in this phase.</summary>
     public long Rows { get; set; }
 
