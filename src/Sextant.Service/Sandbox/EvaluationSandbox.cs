@@ -10,7 +10,8 @@ namespace Sextant.Service.Sandbox;
 ///   <item>a wall-clock TIME budget (linked cancellation — a cooperative evaluation is aborted on breach);</item>
 ///   <item>a MEMORY ceiling (a watchdog samples the process working set and cancels on breach);</item>
 ///   <item>SECRET isolation + FILESYSTEM redirection + OFFLINE toolchain via <see cref="SandboxedEnvironmentScope"/>;</item>
-///   <item>FAIL-CLOSED filesystem confinement: the per-job scratch MUST be under the scratch root, else it refuses to run.</item>
+///   <item>FAIL-CLOSED filesystem confinement: the per-job scratch MUST be under the scratch root, and a persistent
+///   package folder MUST be one repository's folder under the package cache root, else it refuses to run.</item>
 /// </list>
 /// Enforcement boundary — read this before hosting untrusted code. This sandbox is DEFENSE IN DEPTH, NOT a
 /// hard security boundary. The untrusted work (MSBuild evaluation: imported targets, SDK resolvers, inline
@@ -40,7 +41,8 @@ public sealed class EvaluationSandbox(SandboxPolicy policy, ServicePaths paths, 
     public string? BudgetPolicyToken => EvaluationBudgetPolicy.Token(policy);
 
     public async Task<T> RunAsync<T>(
-        string checkoutDir, string scratchDir, Func<CancellationToken, Task<T>> evaluate, CancellationToken cancellationToken)
+        string checkoutDir, string scratchDir, string? packagesDir, Func<CancellationToken, Task<T>> evaluate,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(evaluate);
 
@@ -54,13 +56,19 @@ public sealed class EvaluationSandbox(SandboxPolicy policy, ServicePaths paths, 
             throw new SandboxViolationException(
                 $"refusing to evaluate: sandbox scratch '{scratchDir}' is not under the service scratch root.");
 
+        // The one persistent location evaluation may write (issue #272): ONE repository's package folder on the
+        // cache volume, never another volume or the package root itself.
+        if (packagesDir is not null && !paths.IsPackageCacheDirectory(packagesDir))
+            throw new SandboxViolationException(
+                $"refusing to evaluate: package folder '{packagesDir}' is not a repository folder under the package cache root.");
+
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         if (policy.TimeBudget > TimeSpan.Zero)
             linked.CancelAfter(policy.TimeBudget);
 
         var breach = SandboxBreach.None;
         using var watchdog = StartMemoryWatchdog(linked, () => breach = SandboxBreach.Memory);
-        using var environment = new SandboxedEnvironmentScope(policy, scratchDir);
+        using var environment = new SandboxedEnvironmentScope(policy, scratchDir, packagesDir);
 
         try
         {

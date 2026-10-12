@@ -133,6 +133,7 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
         // is the checkout-volume analogue of ServicePaths' scratch sweep; the locate provider never mistakes
         // a `.tmp-clone-*` dir for a canonical checkout, so only the disk leak needs reclaiming.
         SweepOrphanedTempClones();
+        SweepDiscardedStores();
     }
 
     public bool TryResolve(EnsureSnapshotRequest request, out CheckoutResolution resolution)
@@ -347,10 +348,12 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
             // permanent shallow rejection followed by a TRANSIENT full-fetch failure (a network blip) is still
             // transient (retryable), so a real connectivity failure can never be miscached as a permanent
             // `unsupported`.
-            var shallow = RunGit(temp, topEnv, "fetch", "--depth", "1", "--end-of-options", cleanUrl, commit);
+            // Issue #272: through the repository's persistent object store when there is one, so only objects it
+            // lacks cross the network (the store is fetched with this same environment; see FetchCommit).
+            var store = RepositoryStore(Path.GetFileName(target));
+            var (shallow, full) = FetchCommit(temp, topEnv, cleanUrl, commit, submodule: false, store);
             if (!shallow.Ok)
             {
-                var full = RunGit(temp, topEnv, "fetch", "--end-of-options", cleanUrl);
                 if (!full.Ok)
                 {
                     var shallowTransient = IsTransientGitFailure(GitStage.Fetch, shallow.Kind, shallow.Stderr);
@@ -387,7 +390,7 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
             // permanently unfetchable submodule is left unpopulated with a recorded reason (coverage partial);
             // a transient failure throws and the whole staged clone is discarded + retried — except on the
             // service's final attempt, where it too is left unpopulated with its reason.
-            var submodules = ProvisionSubmodules(temp, cleanUrl, repositoryAuthority, request.IsFinalProvisioningAttempt);
+            var submodules = ProvisionSubmodules(temp, cleanUrl, repositoryAuthority, request.IsFinalProvisioningAttempt, store);
             WriteMarker(temp, submodules);
 
             // Scrub + verify EVERY git dir before publishing to the durable volume: delete every FETCH_HEAD
