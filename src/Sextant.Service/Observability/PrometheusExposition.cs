@@ -92,6 +92,12 @@ public static class PrometheusExposition
             s.Maintenance.IdleBranchesRetiredTotal);
         Gauge(sb, "sextant_idle_branches_retired_last_pass", "Idle branch pointers retired by the latest pass.",
             s.Maintenance.LastIdleBranchesRetired);
+        Gauge(sb, "sextant_repositories_reclaimed_total", "Inactive repositories whose checkout and caches were deleted since start.",
+            s.Maintenance.RepositoriesReclaimedTotal);
+        Gauge(sb, "sextant_repository_bytes_reclaimed_total", "Bytes freed by repository reclaims since start.",
+            s.Maintenance.RepositoryBytesReclaimedTotal);
+        Gauge(sb, "sextant_repository_reclaim_failures_total", "Repository reclaims that failed since start.",
+            s.Maintenance.RepositoryReclaimFailuresTotal);
         Gauge(sb, "sextant_scheduled_retention_runs", "Scheduled retention passes run since start.",
             s.Maintenance.ScheduledRetentionRuns);
         Gauge(sb, "sextant_scheduled_retention_skipped_busy", "Due scheduled retention passes skipped while indexing held the writer.",

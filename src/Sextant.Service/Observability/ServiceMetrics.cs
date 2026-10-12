@@ -68,6 +68,22 @@ public sealed class ServiceMetrics
             };
     }
 
+    /// <summary>Records one maintenance tick's repository reclaim pass (issue #291).</summary>
+    public void RecordRepositoryReclaimPass(int reclaimed, long bytes, int failed, long atUnixMs, double durationMs)
+    {
+        lock (_maintenanceLock)
+            _maintenance = _maintenance with
+            {
+                RepositoriesReclaimedTotal = _maintenance.RepositoriesReclaimedTotal + reclaimed,
+                RepositoryBytesReclaimedTotal = _maintenance.RepositoryBytesReclaimedTotal + bytes,
+                RepositoryReclaimFailuresTotal = _maintenance.RepositoryReclaimFailuresTotal + failed,
+                LastRepositoriesReclaimed = reclaimed,
+                LastRepositoryBytesReclaimed = bytes,
+                LastReclaimPassAtUnixMs = atUnixMs,
+                LastReclaimPassDurationMs = durationMs
+            };
+    }
+
     /// <summary>Records a scheduled retention pass that ran (issue #299).</summary>
     public void RecordScheduledRetention(Sextant.Store.RetentionReport report, long atUnixMs, double durationMs)
     {

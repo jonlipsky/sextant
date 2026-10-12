@@ -24,6 +24,9 @@ public static class AuditAction
     /// <summary>A branch retirement (SVC-6, <c>POST /control/branches/retire</c>).</summary>
     public const string Retire = "retire";
 
+    /// <summary>A repository's checkout and caches reclaimed from disk by the maintenance loop (issue #291).</summary>
+    public const string Reclaim = "reclaim";
+
     /// <summary>A repository grant written or revoked (SVC-4, <c>PUT</c>/<c>DELETE /control/grants/*</c>).</summary>
     public const string Grant = "grant";
 }
