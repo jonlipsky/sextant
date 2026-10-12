@@ -699,7 +699,8 @@ public sealed class IndexOrchestrator
         bool ExtractsSymbols(Project project) =>
             project.FilePath != null && projectRoslynToId.ContainsKey(project.Id) && processSet.Contains(project.Id);
         await using var prefetch = new CompilationPrefetcher(
-            solution.Projects.Where(ExtractsSymbols).ToList(), _parallelism.MaxParallelism, cancellationToken);
+            solution.Projects.Where(ExtractsSymbols).ToList(), _parallelism.MaxParallelism, cancellationToken,
+            recordTimings: metrics != null);
 
         foreach (var project in solution.Projects)
         {
@@ -707,6 +708,8 @@ public sealed class IndexOrchestrator
                 continue;
             var projectId = projectRoslynToId[project.Id];
             prefetch.Reached();
+            var reachedAtMs = metrics != null ? prefetch.NowMs : 0;
+            var prefetchHit = metrics != null && prefetch.IsHit(project.Id);
 
             if (timeBudget != null && !providerProjectInfo.ContainsKey(projectId))
             {
@@ -757,8 +760,13 @@ public sealed class IndexOrchestrator
             // so the extractor's own GetCompilationAsync returns this one rather than building it again.
             var projectWatch = Stopwatch.StartNew();
             Compilation? timedCompilation = null;
+            long walkStartedMs = 0, walkEndedMs = 0;
             if (metrics != null)
+            {
+                walkStartedMs = prefetch.NowMs;
                 timedCompilation = await project.GetCompilationAsync(cancellationToken);
+                walkEndedMs = prefetch.NowMs;
+            }
             var compileMs = projectWatch.ElapsedMilliseconds;
 
             var (symbols, compilationAvailable) = await SymbolExtractor.ExtractFromProjectWithStatusAsync(
@@ -797,6 +805,9 @@ public sealed class IndexOrchestrator
 
             session.CommitBatch();
 
+            var compileWindow = metrics != null
+                ? prefetch.CompileWindow(project.Id, reachedAtMs, walkStartedMs, walkEndedMs)
+                : default;
             metrics?.RecordProject(new ProjectTiming
             {
                 Phase = IndexPhaseNames.ExtractingSymbols,
@@ -805,6 +816,10 @@ public sealed class IndexOrchestrator
                 CompileMs = compileMs,
                 AnalyzeMs = analyzedAt - compileMs,
                 PersistMs = projectWatch.ElapsedMilliseconds - analyzedAt,
+                CompileRequestedAtMs = compileWindow.Requested,
+                CompileStartedAtMs = compileWindow.Started,
+                CompileEndedAtMs = compileWindow.Ended,
+                CompilePrefetchHit = prefetchHit,
                 Rows = symbols.Count
             });
             _log?.Invoke($"    {symbols.Count} symbols extracted");

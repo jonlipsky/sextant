@@ -98,13 +98,71 @@ public sealed class CompilationPrefetcherTests
         Assert.HasCount(2, _started);
     }
 
+    [TestMethod]
+    public async Task APrefetchThatFinishedFirst_IsAHit_WithThePrefetchsOwnTimings()
+    {
+        var projects = Projects(2);
+        await using var prefetch = new CompilationPrefetcher(projects, 2, CancellationToken.None, Record, recordTimings: true);
+        await WaitUntil(() => prefetch.IsHit(projects[0].Id));
+
+        var timing = prefetch.TimingOf(projects[0].Id)!;
+        var window = prefetch.CompileWindow(projects[0].Id, walkRequestedMs: 900, walkStartedMs: 901, walkEndedMs: 902);
+        Assert.AreEqual((timing.RequestedMs, timing.StartedMs, timing.EndedMs), window);
+    }
+
+    [TestMethod]
+    public async Task AProjectTheWalkCompilesItself_IsAMiss_WithTheWalksTimings()
+    {
+        var projects = Projects(2);
+        await using var prefetch = new CompilationPrefetcher(projects, 0, CancellationToken.None, Record, recordTimings: true);
+
+        Assert.IsFalse(prefetch.IsHit(projects[0].Id));
+        Assert.IsNull(prefetch.TimingOf(projects[0].Id));
+        Assert.AreEqual((10L, 12L, 40L), prefetch.CompileWindow(projects[0].Id, 10, 12, 40));
+    }
+
+    [TestMethod]
+    public async Task AFailedPrefetch_IsAMiss_WithTheWalksTimings()
+    {
+        var projects = Projects(2);
+        await using var prefetch = new CompilationPrefetcher(projects, 2, CancellationToken.None,
+            (_, _) => throw new InvalidOperationException("broken project"), recordTimings: true);
+        await WaitUntil(() => prefetch.TimingOf(projects[0].Id) is { EndedMs: >= 0 });
+
+        Assert.IsFalse(prefetch.TimingOf(projects[0].Id)!.Succeeded);
+        Assert.IsFalse(prefetch.IsHit(projects[0].Id), "a failed prefetch is not a hit");
+        Assert.AreEqual((10L, 12L, 40L), prefetch.CompileWindow(projects[0].Id, 10, 12, 40));
+    }
+
+    [TestMethod]
+    public async Task RecordedTimingsAreOrdered_AndNothingIsRecordedWhenOff()
+    {
+        var projects = Projects(3);
+        await using var prefetch = new CompilationPrefetcher(projects, 3, CancellationToken.None, Record, recordTimings: true);
+        await WaitUntil(() => projects.All(p => prefetch.IsHit(p.Id)));
+        foreach (var project in projects)
+        {
+            var timing = prefetch.TimingOf(project.Id)!;
+            Assert.IsTrue(timing.RequestedMs <= timing.StartedMs && timing.StartedMs <= timing.EndedMs);
+        }
+
+        // A walk window given out of order is clamped.
+        var (requested, started, ended) = prefetch.CompileWindow(ProjectId.CreateNewId(), 50, 20, 10);
+        Assert.IsTrue(requested <= started && started <= ended);
+
+        await using var off = new CompilationPrefetcher(projects, 3, CancellationToken.None, Record);
+        await WaitUntil(() => _started.Count >= 6);
+        Assert.IsNull(off.TimingOf(projects[0].Id));
+        Assert.IsFalse(off.IsHit(projects[0].Id));
+    }
+
     private Task Record(Project project, CancellationToken token)
     {
         _started.Enqueue(project.Name);
         return Task.CompletedTask;
     }
 
-    private static List<Project> Projects(int count)
+    private static List<Project> Projects(int count, params (int From, int To)[] references)
     {
         var solution = new AdhocWorkspace().CurrentSolution;
         var ids = new List<ProjectId>();
@@ -114,6 +172,8 @@ public sealed class CompilationPrefetcherTests
             solution = solution.AddProject(id, $"P{i}", $"P{i}", LanguageNames.CSharp);
             ids.Add(id);
         }
+        foreach (var (from, to) in references)
+            solution = solution.AddProjectReference(ids[from], new ProjectReference(ids[to]));
         return ids.Select(solution.GetProject).Select(p => p!).ToList();
     }
 
