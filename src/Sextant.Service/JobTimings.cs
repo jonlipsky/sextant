@@ -75,6 +75,21 @@ public sealed record JobRestoreTimings
 
     /// <summary>Projects restored one by one by those retries (issue #304).</summary>
     public int ProjectsRetried { get; init; }
+
+    /// <summary>Selected solutions not restored because an earlier one had already restored all their projects (issue #290).</summary>
+    public int SolutionsSkippedRedundant { get; init; }
+
+    /// <summary>File names of the skipped solutions (issue #290).</summary>
+    public IReadOnlyList<string> SkippedSolutionNames { get; init; } = [];
+
+    /// <summary>Solutions restored only for their not-yet-covered projects (issue #290).</summary>
+    public int SolutionsPartiallySkipped { get; init; }
+
+    /// <summary>Projects restored that way (issue #290).</summary>
+    public int ProjectsRestoredPartially { get; init; }
+
+    /// <summary>File names of the partially skipped solutions (issue #290).</summary>
+    public IReadOnlyList<string> PartiallySkippedSolutionNames { get; init; } = [];
 }
 
 /// <summary>The solution load of a job (issue #267).</summary>
@@ -151,7 +166,12 @@ public sealed class JobTimingsRecorder
             PackageFolder = persistentPackageFolder ? "persistent" : "scratch",
             WallMs = (long)restore.Elapsed.TotalMilliseconds,
             SolutionsRetriedPerProject = restore.SolutionsRetriedPerProject,
-            ProjectsRetried = restore.ProjectsRetried
+            ProjectsRetried = restore.ProjectsRetried,
+            SolutionsSkippedRedundant = restore.SolutionsSkippedRedundant,
+            SkippedSolutionNames = restore.SkippedSolutionNames,
+            SolutionsPartiallySkipped = restore.SolutionsPartiallySkipped,
+            ProjectsRestoredPartially = restore.ProjectsRestoredPartially,
+            PartiallySkippedSolutionNames = restore.PartiallySkippedSolutionNames
         };
         lock (_gate) _restore = timings;
     }

@@ -39,35 +39,12 @@ internal static partial class UnionSolutionWriter
     public static UnionPartition Partition(
         IReadOnlyList<string> solutionPaths, IReadOnlyList<string> projectPaths, ISdkResolutionProbe? probe = null)
     {
-        probe ??= HostFxrSdkResolutionProbe.Instance;
-        var common = CommonDirectory(solutionPaths.Select(p => Path.GetDirectoryName(Path.GetFullPath(p))!).ToList());
-        if (common is null)
-            return AllIndividually(projectPaths, "the selected solutions share no common directory");
-        var shared = GlobalJsonLocator.FindNearest(common);
-        if (ReadGlobalJson(shared) is not { } sharedPins)
-            return AllIndividually(projectPaths, $"the selected solutions' global.json ('{shared}') cannot be read");
-        if (sharedPins.OtherSdkKeys.Count > 0)
-            return AllIndividually(projectPaths,
-                $"the selected solutions' global.json sets {string.Join(", ", sharedPins.OtherSdkKeys.Keys)}, which a copy would not reproduce");
-
-        var sdkByGlobalJson = new Dictionary<string, string?>(GlobalJsonLocator.PathComparer);
-        string? ResolvedSdk(string directory, string? globalJson)
-        {
-            // hostfxr's answer depends only on the global.json it finds (and the installed SDKs).
-            var key = globalJson ?? string.Empty;
-            if (!sdkByGlobalJson.TryGetValue(key, out var version))
-                sdkByGlobalJson[key] = version = probe.Probe(directory).ResolvedSdkVersion;
-            return version;
-        }
-
-        var heldBack = new HashSet<string>(GlobalJsonLocator.PathComparer);
-        string? firstReason = null;
-        foreach (var project in projectPaths)
-            if (Unfaithful(project) is { } why)
-            {
-                heldBack.Add(Path.GetFullPath(project));
-                firstReason ??= why;
-            }
+        var assessment = Assess(solutionPaths, projectPaths, probe);
+        if (assessment.AllHeldBackReason is { } allReason)
+            return AllIndividually(projectPaths, allReason);
+        var shared = assessment.SharedGlobalJson;
+        var heldBack = new HashSet<string>(assessment.HeldBack, GlobalJsonLocator.PathComparer);
+        var firstReason = assessment.FirstReason;
 
         // A project that references a held-back one would pull it into the generated solution and evaluate it there,
         // so it is held back too, until no remaining project references one. A reference this cannot read is caught
@@ -88,6 +65,51 @@ internal static partial class UnionSolutionWriter
         var onePass = projectPaths.Where(p => !heldBack.Contains(Path.GetFullPath(p))).ToList();
         var individually = projectPaths.Where(p => heldBack.Contains(Path.GetFullPath(p))).ToList();
         return new UnionPartition(onePass.Count > 0, shared, onePass, individually, firstReason ?? string.Empty);
+    }
+
+    /// <summary>
+    /// The projects whose evaluation would differ between the generated union solution (or any other selected
+    /// solution) and a load of their own: <see cref="Partition"/>'s per-project test, before the held-back set is
+    /// closed over project references. <see cref="SolutionAssessment.AllHeldBackReason"/> is set when nothing can be
+    /// told apart (no common directory, an unreadable or location-dependent shared <c>global.json</c>), and then every
+    /// project must be treated as sensitive.
+    /// </summary>
+    internal static SolutionAssessment Assess(
+        IReadOnlyList<string> solutionPaths, IReadOnlyList<string> projectPaths, ISdkResolutionProbe? probe = null,
+        bool sameDirectory = false)
+    {
+        probe ??= HostFxrSdkResolutionProbe.Instance;
+        if (sameDirectory)
+            return AssessSolutionProperties(projectPaths);
+        var common = CommonDirectory(solutionPaths.Select(p => Path.GetDirectoryName(Path.GetFullPath(p))!).ToList());
+        if (common is null)
+            return SolutionAssessment.All("the selected solutions share no common directory");
+        var shared = GlobalJsonLocator.FindNearest(common);
+        if (ReadGlobalJson(shared) is not { } sharedPins)
+            return SolutionAssessment.All($"the selected solutions' global.json ('{shared}') cannot be read");
+        if (sharedPins.OtherSdkKeys.Count > 0)
+            return SolutionAssessment.All(
+                $"the selected solutions' global.json sets {string.Join(", ", sharedPins.OtherSdkKeys.Keys)}, which a copy would not reproduce");
+
+        var sdkByGlobalJson = new Dictionary<string, string?>(GlobalJsonLocator.PathComparer);
+        string? ResolvedSdk(string directory, string? globalJson)
+        {
+            // hostfxr's answer depends only on the global.json it finds (and the installed SDKs).
+            var key = globalJson ?? string.Empty;
+            if (!sdkByGlobalJson.TryGetValue(key, out var version))
+                sdkByGlobalJson[key] = version = probe.Probe(directory).ResolvedSdkVersion;
+            return version;
+        }
+
+        var heldBack = new HashSet<string>(GlobalJsonLocator.PathComparer);
+        string? firstReason = null;
+        foreach (var project in projectPaths)
+            if (Unfaithful(project) is { } why)
+            {
+                heldBack.Add(Path.GetFullPath(project));
+                firstReason ??= why;
+            }
+        return new SolutionAssessment(shared, heldBack, firstReason, null);
 
         string? Unfaithful(string project)
         {
@@ -114,6 +136,25 @@ internal static partial class UnionSolutionWriter
                 ? $"'{name}' uses the MSBuild SDK '{used}', which its own global.json pins differently"
                 : null;
         }
+    }
+
+    // Solutions in one directory share the global.json chain, so only what a solution load itself sets can differ.
+    private static SolutionAssessment AssessSolutionProperties(IReadOnlyList<string> projectPaths)
+    {
+        var heldBack = new HashSet<string>(GlobalJsonLocator.PathComparer);
+        var categories = new Dictionary<string, string>(GlobalJsonLocator.PathComparer);
+        foreach (var project in projectPaths)
+        {
+            var full = Path.GetFullPath(project);
+            if (EvaluationText(project, ignoreToolsetImports: true) is not { } text)
+                categories[full] = "unresolvable import";
+            else if (SolutionPropertyReference().IsMatch(text))
+                categories[full] = "SolutionDir property";
+            else
+                continue;
+            heldBack.Add(full);
+        }
+        return new SolutionAssessment(null, heldBack, null, null) { Categories = categories };
     }
 
     private static UnionPartition AllIndividually(IReadOnlyList<string> projectPaths, string reason) =>
@@ -202,7 +243,7 @@ internal static partial class UnionSolutionWriter
     /// this way. Not read: the build files NuGet packages contribute (through restore's <c>obj/*.nuget.g.*</c>), so a
     /// package that reads <c>$(SolutionDir)</c> or names an <c>msbuild-sdks</c> pin is not detected.
     /// </summary>
-    internal static string? EvaluationText(string projectPath)
+    internal static string? EvaluationText(string projectPath, bool ignoreToolsetImports = false)
     {
         var project = Path.GetFullPath(projectPath);
         var projectDirectory = Path.GetDirectoryName(project)!;
@@ -238,7 +279,12 @@ internal static partial class UnionSolutionWriter
             {
                 if (import.Attribute("Sdk") is not null)
                     continue; // An SDK import: its name is in the text already.
-                if (ResolveImport(import.Attribute("Project")?.Value, fileDirectory, projectDirectory) is not { } resolved)
+                if (ignoreToolsetImports && IsToolsetImport(import.Attribute("Project")?.Value))
+                    continue;
+                var importValue = import.Attribute("Project")?.Value;
+                if (ignoreToolsetImports)
+                    importValue = ThroughFileAboveProperty(importValue, document) ?? importValue;
+                if (ResolveImport(importValue, fileDirectory, projectDirectory) is not { } resolved)
                     return null;
                 if (File.Exists(resolved))
                     pending.Enqueue(resolved);
@@ -246,6 +292,27 @@ internal static partial class UnionSolutionWriter
         }
         return text.ToString();
     }
+
+    // `<Import Project="$(P)" />` where the same file sets `<P>$([MSBuild]::GetPathOfFileAbove(...))</P>`: the import is that call.
+    private static string? ThroughFileAboveProperty(string? value, XDocument document)
+    {
+        if (value is null || PropertyOnly().Match(value.Trim()) is not { Success: true } match)
+            return null;
+        var definitions = document.Descendants()
+            .Where(e => e.Name.LocalName == match.Groups["name"].Value && !e.HasElements)
+            .Select(e => e.Value.Trim()).ToList();
+        return definitions.Count == 1 && definitions[0].Contains("GetPathOfFileAbove", StringComparison.Ordinal) ? definitions[0] : null;
+    }
+
+    [GeneratedRegex(@"^\$\(\s*(?<name>[A-Za-z_][A-Za-z0-9_]*)\s*\)$")]
+    private static partial Regex PropertyOnly();
+
+    // A file under the MSBuild toolset or an installed SDK: its text is not the repository's and reads no solution property.
+    private static bool IsToolsetImport(string? value) =>
+        value is not null && ToolsetImport().IsMatch(value);
+
+    [GeneratedRegex(@"^\s*\$\(\s*(MSBuildExtensionsPath(32|64)?|MSBuildToolsPath(32|64)?|MSBuildBinPath|MSBuildSDKsPath|VSToolsPath)\s*\)", RegexOptions.IgnoreCase)]
+    private static partial Regex ToolsetImport();
 
     private static string? ResolveImport(string? value, string fileDirectory, string projectDirectory)
     {
@@ -334,3 +401,298 @@ internal static partial class UnionSolutionWriter
 internal sealed record UnionPartition(
     bool CanLoadInOnePass, string? GlobalJson, IReadOnlyList<string> OnePass, IReadOnlyList<string> Individually,
     string Reason);
+
+/// <summary>
+/// <see cref="UnionSolutionWriter.Assess"/>'s verdict: the projects held back from a one-pass load because their
+/// evaluation depends on which solution (or <c>global.json</c>) loads them, or, when <see cref="AllHeldBackReason"/>
+/// is set, every project.
+/// </summary>
+internal sealed record SolutionAssessment(
+    string? SharedGlobalJson, IReadOnlySet<string> HeldBack, string? FirstReason, string? AllHeldBackReason)
+{
+    /// <summary>Held-back project to the category of the reason, when the assessment recorded one.</summary>
+    public IReadOnlyDictionary<string, string> Categories { get; init; } = new Dictionary<string, string>();
+
+    public static SolutionAssessment All(string reason) =>
+        new(null, new HashSet<string>(), null, reason);
+}
+
+/// <summary>
+/// Which projects of a multi-solution selection can evaluate differently depending on the solution they are
+/// restored or loaded through (issue #290): the same detection the union load uses (<c>$(SolutionDir)</c> and
+/// related properties, a different SDK or <c>msbuild-sdks</c> pin through another <c>global.json</c>).
+/// </summary>
+public static class SolutionSensitivity
+{
+    /// <summary>
+    /// The full paths of the projects of <paramref name="projectPaths"/> whose evaluation depends on the selected
+    /// solution. When the selection cannot be told apart at all, every project is returned.
+    /// </summary>
+    public static IReadOnlySet<string> Find(IReadOnlyList<string> solutionPaths, IReadOnlyList<string> projectPaths)
+        => Find(solutionPaths, projectPaths, sameDirectory: false);
+
+    /// <summary>
+    /// As above; with <paramref name="sameDirectory"/> (every solution is in one directory, so they share one
+    /// <c>global.json</c>, <c>NuGet.config</c> and <c>Directory.Solution.*</c> chain) a differing SDK or
+    /// <c>msbuild-sdks</c> pin is not a difference between the solutions: only <c>$(SolutionDir)</c>-family
+    /// properties and the configuration mapping are.
+    /// </summary>
+    public static IReadOnlySet<string> Find(
+        IReadOnlyList<string> solutionPaths, IReadOnlyList<string> projectPaths, bool sameDirectory)
+        => Classify(solutionPaths, projectPaths, sameDirectory).Keys.ToHashSet(GlobalJsonLocator.PathComparer);
+
+    /// <summary>
+    /// The projects <paramref name="solutionPath"/> declares that it does NOT map to the project's own default
+    /// configuration (<c>Debug|Any CPU</c>, what a standalone restore evaluates with), or whose mapping cannot be read
+    /// reliably. Restoring any other project on its own is identical to restoring it inside the solution (issue #290).
+    /// An unreadable solution returns every declared project.
+    /// </summary>
+    public static IReadOnlySet<string> FindNotDefaultMapped(string solutionPath)
+    {
+        var result = new HashSet<string>(GlobalJsonLocator.PathComparer);
+        var mapping = SolutionConfigurationMapping.Read(solutionPath);
+        foreach (var project in SolutionProjectEnumerator.Enumerate(solutionPath))
+        {
+            var full = Path.GetFullPath(project);
+            if (mapping is null || !mapping.TryGetValue(full, out var value) || value is null
+                || !value.Equals("Debug|Any CPU", StringComparison.OrdinalIgnoreCase))
+                result.Add(full);
+        }
+        return result;
+    }
+
+    /// <summary>The distinct configuration mappings read for <paramref name="projects"/> (diagnostics), or <c>unreadable</c>.</summary>
+    public static string DescribeMapping(string solutionPath, IEnumerable<string> projects)
+    {
+        var mapping = SolutionConfigurationMapping.Read(solutionPath);
+        if (mapping is null)
+            return "unreadable";
+        return string.Join(" | ", projects.Select(p => mapping.TryGetValue(p, out var v) ? v : null).Distinct().Take(2)
+            .Select(v => v is null ? "none" : v.Length > 80 ? v[..80] + "..." : v));
+    }
+
+    /// <summary>The sensitive projects (see <see cref="Find(IReadOnlyList{string}, IReadOnlyList{string}, bool)"/>) with the category of the reason.</summary>
+    public static IReadOnlyDictionary<string, string> Classify(
+        IReadOnlyList<string> solutionPaths, IReadOnlyList<string> projectPaths, bool sameDirectory)
+    {
+        var result = new Dictionary<string, string>(GlobalJsonLocator.PathComparer);
+        var assessment = UnionSolutionWriter.Assess(solutionPaths, projectPaths, sameDirectory: sameDirectory);
+        if (assessment.AllHeldBackReason is not null)
+        {
+            foreach (var project in projectPaths)
+                result[Path.GetFullPath(project)] = "global.json/SDK (selection cannot be told apart)";
+            return result;
+        }
+
+        foreach (var project in assessment.HeldBack)
+            result[project] = assessment.Categories.TryGetValue(project, out var category) ? category : "global.json/SDK or msbuild-sdks";
+        foreach (var project in SolutionConfigurationMapping.FindDivergent(solutionPaths))
+            result.TryAdd(project, "configuration mapping");
+        return result;
+    }
+}
+
+/// <summary>
+/// The project Configuration|Platform each solution maps a project to for its default solution configuration, the
+/// one <c>dotnet restore &lt;solution&gt;</c> evaluates with (issue #290). A mapping that cannot be read reliably is
+/// <c>null</c>, which callers treat as "differs".
+/// </summary>
+internal static class SolutionConfigurationMapping
+{
+    private const string ImplicitDefault = "Debug|Any CPU";
+
+    private static readonly Regex ProjectLine = new(
+        "^Project\\(\"[^\"]*\"\\)\\s*=\\s*\"[^\"]*\"\\s*,\\s*\"([^\"]*)\"\\s*,\\s*\"(\\{[^\"]*\\})\"",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase, TimeSpan.FromSeconds(1));
+
+    /// <summary>The projects of <paramref name="solutionPaths"/> mapped differently (or unreliably) by the solutions declaring them.</summary>
+    public static IReadOnlySet<string> FindDivergent(IReadOnlyList<string> solutionPaths)
+    {
+        var seen = new Dictionary<string, string?>(GlobalJsonLocator.PathComparer);
+        var divergent = new HashSet<string>(GlobalJsonLocator.PathComparer);
+        foreach (var solution in solutionPaths)
+        {
+            var declared = SolutionProjectEnumerator.Enumerate(solution);
+            var mapping = Read(solution);
+            foreach (var project in declared)
+            {
+                var value = mapping is not null && mapping.TryGetValue(project, out var m) ? m : null;
+                if (value is null)
+                    divergent.Add(project);
+                if (seen.TryGetValue(project, out var earlier))
+                {
+                    if (earlier is null || !string.Equals(earlier, value, StringComparison.Ordinal))
+                        divergent.Add(project);
+                }
+                else
+                    seen[project] = value;
+            }
+        }
+        return divergent;
+    }
+
+    /// <summary>Project full path to mapping, or <c>null</c> when the solution cannot be read reliably.</summary>
+    internal static IReadOnlyDictionary<string, string?>? Read(string solutionPath)
+    {
+        try
+        {
+            return Path.GetExtension(solutionPath).ToLowerInvariant() switch
+            {
+                ".sln" => ReadSln(solutionPath),
+                ".slnx" => ReadSlnx(solutionPath),
+                _ => null
+            };
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or XmlException
+                                   or ArgumentException or RegexMatchTimeoutException)
+        {
+            return null;
+        }
+    }
+
+    private static string NormalizePlatform(string value) =>
+        value.Trim().Equals("AnyCPU", StringComparison.OrdinalIgnoreCase) ? "Any CPU" : value.Trim();
+
+    private static string NormalizePair(string value)
+    {
+        var parts = value.Split('|', 2);
+        return parts.Length == 2 ? parts[0].Trim() + "|" + NormalizePlatform(parts[1]) : value.Trim();
+    }
+
+    private static Dictionary<string, string?>? ReadSln(string solutionPath)
+    {
+        var solutionDir = Path.GetDirectoryName(Path.GetFullPath(solutionPath)) ?? ".";
+        var guidToProject = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var solutionConfigs = new List<string>();
+        var projectLines = new List<(string Guid, string Key, string Value)>();
+        var hasProjectSection = false;
+        var section = string.Empty;
+        foreach (var raw in File.ReadLines(solutionPath))
+        {
+            var line = raw.Trim();
+            if (line.StartsWith("Project(", StringComparison.OrdinalIgnoreCase))
+            {
+                var match = ProjectLine.Match(line);
+                if (match.Success)
+                {
+                    var relative = match.Groups[1].Value.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar);
+                    guidToProject[match.Groups[2].Value] = Path.GetFullPath(Path.Combine(solutionDir, relative));
+                }
+                continue;
+            }
+            if (line.StartsWith("GlobalSection(SolutionConfigurationPlatforms)", StringComparison.Ordinal))
+            {
+                section = "solution";
+                continue;
+            }
+            if (line.StartsWith("GlobalSection(ProjectConfigurationPlatforms)", StringComparison.Ordinal))
+            {
+                section = "project";
+                hasProjectSection = true;
+                continue;
+            }
+            if (line.StartsWith("EndGlobalSection", StringComparison.Ordinal))
+            {
+                section = string.Empty;
+                continue;
+            }
+            var eq = line.IndexOf('=');
+            if (eq < 0)
+                continue;
+            var key = line[..eq].Trim();
+            var value = line[(eq + 1)..].Trim();
+            if (section == "solution")
+                solutionConfigs.Add(NormalizePair(key));
+            else if (section == "project" && key.StartsWith('{'))
+            {
+                var guidEnd = key.IndexOf('}');
+                if (guidEnd > 0 && guidEnd + 1 < key.Length && key[guidEnd + 1] == '.')
+                    projectLines.Add((key[..(guidEnd + 1)], key[(guidEnd + 2)..], value));
+            }
+        }
+
+        var result = new Dictionary<string, string?>(GlobalJsonLocator.PathComparer);
+        if (solutionConfigs.Count == 0 && !hasProjectSection)
+        {
+            foreach (var project in guidToProject.Values)
+                result[project] = ImplicitDefault;
+            return result;
+        }
+
+        var defaultConfig = DefaultSolutionConfiguration(solutionConfigs);
+        foreach (var (guid, project) in guidToProject)
+        {
+            string? mapped;
+            if (defaultConfig is not null)
+            {
+                var active = projectLines.Where(l => l.Guid.Equals(guid, StringComparison.OrdinalIgnoreCase)
+                        && l.Key.EndsWith(".ActiveCfg", StringComparison.Ordinal)
+                        && NormalizePair(l.Key[..^".ActiveCfg".Length]).Equals(defaultConfig, StringComparison.OrdinalIgnoreCase))
+                    .Select(l => l.Value).ToList();
+                mapped = active.Count == 1 ? NormalizePair(active[0]) : null;
+            }
+            else
+            {
+                // The default configuration is not certain, so compare every solution configuration and its mappings.
+                var lines = projectLines.Where(l => l.Guid.Equals(guid, StringComparison.OrdinalIgnoreCase))
+                    .Select(l => NormalizePair(l.Key) + "=" + NormalizePair(l.Value)).Order(StringComparer.Ordinal);
+                mapped = "sln:" + string.Join(";", solutionConfigs.Order(StringComparer.Ordinal)) + "/" + string.Join(";", lines);
+            }
+            result[project] = mapped;
+        }
+        return result;
+    }
+
+    // Debug|Any CPU when it is the Debug configuration's only candidate (a "Mixed Platforms" sibling makes the choice
+    // uncertain), or the sole configuration; otherwise null.
+    private static string? DefaultSolutionConfiguration(IReadOnlyList<string> configs)
+    {
+        var distinct = configs.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        if (distinct.Count == 1)
+            return distinct[0];
+        if (distinct.Contains(ImplicitDefault, StringComparer.OrdinalIgnoreCase)
+            && !distinct.Contains("Debug|Mixed Platforms", StringComparer.OrdinalIgnoreCase))
+            return ImplicitDefault;
+        return null;
+    }
+
+    private static Dictionary<string, string?>? ReadSlnx(string solutionPath)
+    {
+        var solutionDir = Path.GetDirectoryName(Path.GetFullPath(solutionPath)) ?? ".";
+        var settings = new XmlReaderSettings { DtdProcessing = DtdProcessing.Prohibit, XmlResolver = null, IgnoreComments = true };
+        using var reader = XmlReader.Create(solutionPath, settings);
+        var root = XDocument.Load(reader).Root;
+        if (root is null || root.Name.LocalName != "Solution")
+            return null;
+
+        var topLevel = string.Join(";", root.Elements()
+            .Where(e => e.Name.LocalName.Equals("Configurations", StringComparison.OrdinalIgnoreCase))
+            .Select(Canonical).Order(StringComparer.Ordinal));
+        // Platform names only (no build types) selects Debug|AnyCPU like a .slnx without the block (measured with
+        // dotnet restore on this SDK, whatever the platform order).
+        var platformsOnly = topLevel.Length > 0 && root.Elements()
+            .Where(e => e.Name.LocalName.Equals("Configurations", StringComparison.OrdinalIgnoreCase))
+            .All(c => c.Attributes().Count() == 0 && c.Elements().All(p => p.Name.LocalName.Equals("Platform", StringComparison.OrdinalIgnoreCase)
+                && !p.Elements().Any() && p.Attributes().All(at => at.Name.LocalName == "Name")))
+            && root.Elements().Where(e => e.Name.LocalName.Equals("Configurations", StringComparison.OrdinalIgnoreCase))
+                .SelectMany(c => c.Elements()).Any(p => NormalizePlatform(p.Attribute("Name")?.Value ?? "") == "Any CPU");
+        var result = new Dictionary<string, string?>(GlobalJsonLocator.PathComparer);
+        foreach (var project in root.Descendants().Where(e => e.Name.LocalName.Equals("Project", StringComparison.OrdinalIgnoreCase)))
+        {
+            var path = project.Attribute("Path")?.Value;
+            if (string.IsNullOrWhiteSpace(path))
+                continue;
+            var full = Path.GetFullPath(Path.Combine(solutionDir,
+                path.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar)));
+            var own = string.Join(";", project.Elements().Select(Canonical).Order(StringComparer.Ordinal));
+            result[full] = own.Length == 0 && (topLevel.Length == 0 || platformsOnly)
+                ? ImplicitDefault
+                : "slnx:" + topLevel + "/" + own;
+        }
+        return result;
+    }
+
+    private static string Canonical(XElement element) =>
+        element.Name.LocalName + "[" + string.Join(",", element.Attributes().Select(a => a.Name.LocalName + "=" + a.Value).Order(StringComparer.Ordinal))
+        + "]{" + string.Join(";", element.Elements().Select(Canonical).Order(StringComparer.Ordinal)) + "}";
+}

@@ -1,3 +1,4 @@
+using Sextant.Indexer;
 using Sextant.Service.Restore;
 
 namespace Sextant.Service.Tests;
@@ -546,6 +547,848 @@ public class PackageRestoreIsolationTests
                 "the bad project is reported as a per-project load issue (package_restore_incomplete)");
         }
         finally { TryDelete(root); }
+    }
+
+    // ==== issue #290: redundant per-solution restores ====================================================
+
+    // Rewrites project "A" so it references a project outside every selected solution, which forces the per-solution
+    // fallback (the union cannot close its reference graph).
+    private static void ForcePerSolutionFallback(string root, string extraProperty = "")
+    {
+        Directory.CreateDirectory(System.IO.Path.Combine(root, "Outside"));
+        File.WriteAllText(System.IO.Path.Combine(root, "Outside", "Outside.csproj"),
+            $"<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>{Tfm}</TargetFramework></PropertyGroup></Project>");
+        File.WriteAllText(System.IO.Path.Combine(root, "A", "A.csproj"), $"""
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup><TargetFramework>{Tfm}</TargetFramework>{extraProperty}</PropertyGroup>
+              <ItemGroup><ProjectReference Include="../Outside/Outside.csproj" /></ItemGroup>
+            </Project>
+            """);
+    }
+
+    // A restore that writes an assets file for every project directory next to the solution.
+    private const string WriteAssets =
+        "d=$(dirname \"$2\"); for p in \"$d\"/*/; do mkdir -p \"$p/obj\"; echo '{}' > \"$p/obj/project.assets.json\"; done; exit 0";
+
+    private static IEnumerable<string> RestoredSolutions(FakeDotnet fake) =>
+        fake.Calls.Where(c => c.StartsWith("restore ", StringComparison.Ordinal))
+            .Select(c => System.IO.Path.GetFileName(c.Split(' ')[1]));
+
+    [TestMethod]
+    public async Task ASubsetSolution_AfterItsSuperset_IsSkipped_AndRecorded()
+    {
+        RequireUnix();
+        var root = NewRoot("skip-subset");
+        try
+        {
+            var fake = CreateFakeDotnet(System.IO.Path.Combine(root, "fake"), WriteAssets, "exit 0");
+            var small = WriteSolution(root, "Small.slnx", "A", "B");
+            var big = WriteSolution(root, "Big.slnx", "A", "B", "C");
+            ForcePerSolutionFallback(root);
+            var logs = new List<string>();
+
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), log: logs.Add) { DotnetPath = fake.Path }
+                .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
+
+            Assert.IsFalse(outcome.UsedProjectUnion);
+            CollectionAssert.AreEqual(new[] { "Big.slnx" }, RestoredSolutions(fake).ToArray(), "the superset restores first in the input order; the subset is skipped");
+            Assert.AreEqual(2, outcome.SolutionsSelected);
+            Assert.AreEqual(1, outcome.SolutionsAttempted);
+            Assert.AreEqual(1, outcome.SolutionsSkippedRedundant);
+            CollectionAssert.AreEqual(new[] { "Small.slnx" }, outcome.SkippedSolutionNames.ToArray());
+            Assert.IsTrue(outcome.Clean);
+            Assert.IsTrue(logs.Any(l => l.Contains("1 solution(s) skipped as already restored (Small.slnx)", StringComparison.Ordinal)), string.Join("\n", logs));
+
+            var recorder = new JobTimingsRecorder();
+            recorder.RecordRestore(outcome, persistentPackageFolder: false);
+            var restore = recorder.Build().Restore!;
+            Assert.AreEqual(1, restore.SolutionsSkippedRedundant);
+            CollectionAssert.AreEqual(new[] { "Small.slnx" }, restore.SkippedSolutionNames.ToArray());
+        }
+        finally { TryDelete(root); }
+    }
+
+    [TestMethod]
+    public async Task ASubset_SharingAProjectWithItsOwnNestedGlobalJson_InTheSameDirectory_IsSkipped()
+    {
+        RequireUnix();
+        var root = NewRoot("skip-nested-globaljson");
+        try
+        {
+            var script = "d=$(dirname \"$2\"); for p in \"$d\"/*/ \"$d\"/sub/D/; do mkdir -p \"$p/obj\"; echo '{}' > \"$p/obj/project.assets.json\"; done; exit 0";
+            var fake = CreateFakeDotnet(System.IO.Path.Combine(root, "fake"), script, "exit 0");
+            WriteSolution(root, "Seed.slnx", "A", "C");
+            Directory.CreateDirectory(System.IO.Path.Combine(root, "sub", "D"));
+            File.WriteAllText(System.IO.Path.Combine(root, "sub", "D", "D.csproj"),
+                $"<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>{Tfm}</TargetFramework></PropertyGroup></Project>");
+            var small = WriteSolutionRefs(root, "Small.slnx", "A/A.csproj", "sub/D/D.csproj");
+            var big = WriteSolutionRefs(root, "Big.slnx", "A/A.csproj", "sub/D/D.csproj", "C/C.csproj");
+            ForcePerSolutionFallback(root);
+            File.WriteAllText(System.IO.Path.Combine(root, "global.json"), "{\"sdk\":{\"version\":\"9.0.100\",\"rollForward\":\"latestMajor\"}}");
+            File.WriteAllText(System.IO.Path.Combine(root, "sub", "D", "global.json"), "{\"sdk\":{\"version\":\"8.0.100\",\"rollForward\":\"latestMajor\"}}");
+
+            var logs = new List<string>();
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), log: logs.Add) { DotnetPath = fake.Path }
+                .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
+
+            CollectionAssert.AreEqual(new[] { "Big.slnx" }, RestoredSolutions(fake).ToArray(), string.Join("\n", logs));
+            CollectionAssert.AreEqual(new[] { "Small.slnx" }, outcome.SkippedSolutionNames.ToArray());
+        }
+        finally { TryDelete(root); }
+    }
+
+    [TestMethod]
+    public void SameDirectorySensitivity_IgnoresToolsetImports_ButNotSolutionDir()
+    {
+        var root = NewRoot("sensitivity-toolset");
+        try
+        {
+            var a = WriteSolution(root, "A.slnx", "P", "Q");
+            var b = WriteSolution(root, "B.slnx", "P");
+            File.WriteAllText(System.IO.Path.Combine(root, "P", "P.csproj"),
+                "<Project Sdk=\"Microsoft.NET.Sdk\"><Import Project=\"$(MSBuildExtensionsPath)\\Xamarin\\Mac\\X.targets\" /></Project>");
+            File.WriteAllText(System.IO.Path.Combine(root, "Q", "Q.csproj"),
+                "<Project Sdk=\"Microsoft.NET.Sdk\"><Import Project=\"$(Other)\\X.targets\" /></Project>");
+            WriteSolution(root, "Seed.slnx", "R");
+            File.WriteAllText(System.IO.Path.Combine(root, "Directory.Build.props"), "<Project />");
+            File.WriteAllText(System.IO.Path.Combine(root, "R", "Directory.Build.props"),
+                "<Project><PropertyGroup><Parent>$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))</Parent></PropertyGroup>"
+                + "<Import Project=\"$(Parent)\" Condition=\"'$(Parent)' != ''\" /></Project>");
+            var sensitive = SolutionSensitivity.Find([a, b], [FullProject(root, "P"), FullProject(root, "Q"), FullProject(root, "R")], sameDirectory: true);
+            Assert.IsFalse(sensitive.Contains(FullProject(root, "R")), "an import through a GetPathOfFileAbove property resolves");
+            Assert.IsFalse(sensitive.Contains(FullProject(root, "P")));
+            Assert.IsTrue(sensitive.Contains(FullProject(root, "Q")), "an import that cannot be resolved stays sensitive");
+        }
+        finally { TryDelete(root); }
+    }
+
+    [TestMethod]
+    public async Task ASubset_BeforeItsSuperset_InInputOrder_IsNotSkipped_AndNothingIsReordered()
+    {
+        RequireUnix();
+        var root = NewRoot("order-subset-first");
+        try
+        {
+            var fake = CreateFakeDotnet(System.IO.Path.Combine(root, "fake"), WriteAssets, "exit 0");
+            var small = WriteSolution(root, "Small.slnx", "A", "B");
+            var big = WriteSolution(root, "Big.slnx", "A", "B", "C", "D");
+            ForcePerSolutionFallback(root);
+
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+                .RunAsync(root, [small, big], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
+
+            CollectionAssert.AreEqual(new[] { "Small.slnx", "Big.slnx" }, RestoredSolutions(fake).ToArray());
+            Assert.AreEqual(0, outcome.SolutionsSkippedRedundant);
+        }
+        finally { TryDelete(root); }
+    }
+
+    [TestMethod]
+    public async Task ASubset_IsNotSkipped_WhenASolutionOfAnotherDirectoryRestoredASharedProjectSince()
+    {
+        RequireUnix();
+        var root = NewRoot("order-last-writer");
+        try
+        {
+            var one = System.IO.Path.Combine(root, "one");
+            var fake = CreateFakeDotnet(System.IO.Path.Combine(root, "fake"),
+                $"for p in \"{one}\"/*/; do mkdir -p \"$p/obj\"; echo '{{}}' > \"$p/obj/project.assets.json\"; done; exit 0", "exit 0");
+            var big = WriteSolution(one, "Big.slnx", "A", "B", "C");
+            var other = WriteSolutionRefs(System.IO.Path.Combine(root, "two"), "Other.slnx", "../one/A/A.csproj");
+            var small = WriteSolution(one, "Small.slnx", "A", "B");
+            ForcePerSolutionFallback(one);
+
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+                .RunAsync(root, [big, other, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
+
+            CollectionAssert.AreEqual(new[] { "Big.slnx", "Other.slnx", "Small.slnx" }, RestoredSolutions(fake).ToArray(),
+                "A was last attempted by the other directory, so Small restores it again");
+            Assert.AreEqual(0, outcome.SolutionsSkippedRedundant);
+        }
+        finally { TryDelete(root); }
+    }
+
+
+    [TestMethod]
+    public async Task ASubsetWhoseProjectReadsSolutionDir_IsNotSkipped()
+    {
+        RequireUnix();
+        var root = NewRoot("skip-solutiondir");
+        try
+        {
+            var fake = CreateFakeDotnet(System.IO.Path.Combine(root, "fake"), WriteAssets, "exit 0");
+            var small = WriteSolution(root, "Small.slnx", "A");
+            var big = WriteSolution(root, "Big.slnx", "A", "B");
+            ForcePerSolutionFallback(root, "<Marker>$(SolutionDir)</Marker>");
+
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+                .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
+
+            CollectionAssert.AreEqual(new[] { "Big.slnx", "Small.slnx" }, RestoredSolutions(fake).ToArray());
+            Assert.AreEqual(0, outcome.SolutionsSkippedRedundant);
+            Assert.AreEqual(0, outcome.SkippedSolutionNames.Count);
+        }
+        finally { TryDelete(root); }
+    }
+
+    private static string SlnxWith(string root, string name, string topLevel, string projectChildren, params string[] projects)
+    {
+        var path = System.IO.Path.Combine(root, name);
+        File.WriteAllText(path, "<Solution>" + topLevel + string.Join(string.Empty,
+            projects.Select(p => $"<Project Path=\"{p}/{p}.csproj\">{projectChildren}</Project>")) + "</Solution>");
+        return path;
+    }
+
+    private static string SlnWith(string root, string name, string mapping, params string[] projects)
+    {
+        var guids = projects.Select((p, i) => (Name: p, Guid: "{00000000-0000-0000-0000-00000000000" + (i + 1) + "}")).ToList();
+        var text = "Microsoft Visual Studio Solution File, Format Version 12.00\n"
+            + string.Join(string.Empty, guids.Select(g =>
+                $"Project(\"{{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}}\") = \"{g.Name}\", \"{g.Name}\\{g.Name}.csproj\", \"{g.Guid}\"\nEndProject\n"))
+            + "Global\n\tGlobalSection(SolutionConfigurationPlatforms) = preSolution\n\t\tDebug|Any CPU = Debug|Any CPU\n\t\tRelease|Any CPU = Release|Any CPU\n\tEndGlobalSection\n"
+            + "\tGlobalSection(ProjectConfigurationPlatforms) = postSolution\n"
+            + string.Join(string.Empty, guids.Select(g =>
+                $"\t\t{g.Guid}.Debug|Any CPU.ActiveCfg = {mapping}\n\t\t{g.Guid}.Debug|Any CPU.Build.0 = {mapping}\n"
+                + $"\t\t{g.Guid}.Release|Any CPU.ActiveCfg = Release|Any CPU\n"))
+            + "\tEndGlobalSection\nEndGlobal\n";
+        var path = System.IO.Path.Combine(root, name);
+        File.WriteAllText(path, text);
+        return path;
+    }
+
+    private static string FullProject(string root, string name) => System.IO.Path.GetFullPath(System.IO.Path.Combine(root, name, name + ".csproj"));
+
+    [TestMethod]
+    public void ConfigurationMapping_SlnxWithDifferentPlatform_MakesTheSharedProjectSensitive()
+    {
+        var root = NewRoot("map-slnx");
+        try
+        {
+            WriteSolution(root, "Seed.slnx", "A", "B");
+            var big = SlnxWith(root, "Big.slnx", string.Empty, string.Empty, "A", "B");
+            var small = SlnxWith(root, "Small.slnx", string.Empty, "<Platform Solution=\"*|*\" Project=\"x64\" />", "A");
+            var sensitive = SolutionSensitivity.Find([big, small], [FullProject(root, "A"), FullProject(root, "B")]);
+            Assert.IsTrue(sensitive.Contains(FullProject(root, "A")));
+            Assert.IsFalse(sensitive.Contains(FullProject(root, "B")));
+        }
+        finally { TryDelete(root); }
+    }
+
+    [TestMethod]
+    public void ConfigurationMapping_SlnxWithDifferentConfigurations_OrIdenticalDefaults()
+    {
+        var root = NewRoot("map-slnx2");
+        try
+        {
+            WriteSolution(root, "Seed.slnx", "A");
+            var projects = new[] { FullProject(root, "A") };
+            var plain = SlnxWith(root, "Plain.slnx", string.Empty, string.Empty, "A");
+            var plain2 = SlnxWith(root, "Plain2.slnx", string.Empty, string.Empty, "A");
+            var configured = SlnxWith(root, "Configured.slnx", "<Configurations><BuildType Name=\"Release\" /></Configurations>", string.Empty, "A");
+            var mapped1 = SlnxWith(root, "M1.slnx", string.Empty, "<BuildType Solution=\"Debug|*\" Project=\"Release\" />", "A");
+            var mapped2 = SlnxWith(root, "M2.slnx", string.Empty, "<BuildType Solution=\"Debug|*\" Project=\"Release\" />", "A");
+
+            Assert.AreEqual(0, SolutionSensitivity.Find([plain, plain2], projects).Count, "identical default mappings");
+            Assert.AreEqual(1, SolutionSensitivity.Find([plain, configured], projects).Count, "different declared configurations");
+            Assert.AreEqual(1, SolutionSensitivity.Find([plain, mapped1], projects).Count, "a different Configuration");
+            Assert.AreEqual(0, SolutionSensitivity.Find([mapped1, mapped2], projects).Count, "identical explicit mappings");
+        }
+        finally { TryDelete(root); }
+    }
+
+    [TestMethod]
+    public void ConfigurationMapping_Sln_DifferentPlatform_IsSensitive_IdenticalIsNot()
+    {
+        var root = NewRoot("map-sln");
+        try
+        {
+            WriteSolution(root, "Seed.slnx", "A", "B");
+            var projects = new[] { FullProject(root, "A"), FullProject(root, "B") };
+            var big = SlnWith(root, "Big.sln", "Debug|Any CPU", "A", "B");
+            var same = SlnWith(root, "Same.sln", "Debug|AnyCPU", "A");
+            var x64 = SlnWith(root, "X64.sln", "Debug|x64", "A");
+            var release = SlnWith(root, "Rel.sln", "Release|Any CPU", "A");
+
+            Assert.AreEqual(0, SolutionSensitivity.Find([big, same], projects).Count, "AnyCPU and Any CPU are the same mapping");
+            CollectionAssert.AreEqual(new[] { projects[0] }, SolutionSensitivity.Find([big, x64], projects).ToArray());
+            CollectionAssert.AreEqual(new[] { projects[0] }, SolutionSensitivity.Find([big, release], projects).ToArray());
+        }
+        finally { TryDelete(root); }
+    }
+
+    [TestMethod]
+    public async Task ASubset_MappingASharedProjectToADifferentPlatform_IsNotSkipped()
+    {
+        RequireUnix();
+        var root = NewRoot("skip-platform");
+        try
+        {
+            var fake = CreateFakeDotnet(System.IO.Path.Combine(root, "fake"), WriteAssets, "exit 0");
+            WriteSolution(root, "Seed.slnx", "A", "B");
+            var big = SlnxWith(root, "Big.slnx", string.Empty, string.Empty, "A", "B");
+            var small = SlnxWith(root, "Small.slnx", string.Empty, "<Platform Solution=\"*|*\" Project=\"x64\" />", "A");
+            ForcePerSolutionFallback(root);
+
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+                .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
+
+            CollectionAssert.AreEqual(new[] { "Big.slnx", "Small.slnx" }, RestoredSolutions(fake).ToArray());
+            Assert.AreEqual(0, outcome.SolutionsSkippedRedundant);
+        }
+        finally { TryDelete(root); }
+    }
+
+    // A project that redirects its output (ArtifactsPath) has no obj/project.assets.json, so the per-project retry's
+    // silence about it is the evidence that it restored (the rest of the superset failed deterministically).
+    [TestMethod]
+    public async Task ASubset_WhoseProjectsRestoredInARetry_WithoutAnObjAssetsFile_IsSkipped()
+    {
+        RequireUnix();
+        var root = NewRoot("skip-redirected");
+        try
+        {
+            var bad = System.IO.Path.Combine(root, "C", "C.csproj");
+            var ok = string.Join(" ", new[] { "A", "B" }.Select(n => $"echo 'sextant-restore-ok: {System.IO.Path.Combine(root, n, n + ".csproj")}' ;"));
+            var line = $"{ok} echo '{bad} : error NU1105: Invalid target framework x.' ; exit 1";
+            var fake = CreateFakeDotnet(System.IO.Path.Combine(root, "fake"), "exit 1", line);
+            var small = WriteSolution(root, "Small.slnx", "A", "B");
+            var big = WriteSolution(root, "Big.slnx", "A", "B", "C");
+            ForcePerSolutionFallback(root);
+
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+                .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
+
+            CollectionAssert.AreEqual(new[] { "Big.slnx" }, RestoredSolutions(fake).ToArray());
+            Assert.AreEqual(1, outcome.SolutionsSkippedRedundant);
+        }
+        finally { TryDelete(root); }
+    }
+
+    // An aborted traversal: only A printed its sentinel, B was never reached and has no error either.
+    [TestMethod]
+    public async Task ASubset_WithAnUnreachedProjectOfAnAbortedRetry_IsNotSkipped()
+    {
+        RequireUnix();
+        var root = NewRoot("skip-aborted");
+        try
+        {
+            var bad = System.IO.Path.Combine(root, "C", "C.csproj");
+            var line = $"echo 'sextant-restore-ok: {System.IO.Path.Combine(root, "A", "A.csproj")}' ; echo '{bad} : error NU1105: x.' ; exit 1";
+            var fake = CreateFakeDotnet(System.IO.Path.Combine(root, "fake"), "exit 1", line);
+            var small = WriteSolution(root, "Small.slnx", "A", "B");
+            var big = WriteSolution(root, "Big.slnx", "A", "B", "C");
+            ForcePerSolutionFallback(root);
+
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+                .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
+
+            CollectionAssert.AreEqual(new[] { "Big.slnx", "Small.slnx" }, RestoredSolutions(fake).ToArray());
+            Assert.AreEqual(0, outcome.SolutionsSkippedRedundant);
+        }
+        finally { TryDelete(root); }
+    }
+
+    // A sentinel naming another path (or only another case/directory) never credits the declared project.
+    [TestMethod]
+    public async Task ASentinel_ForADifferentPath_DoesNotCoverTheProject()
+    {
+        RequireUnix();
+        var root = NewRoot("skip-mismatch");
+        try
+        {
+            var other = System.IO.Path.Combine(root, "other");
+            var ok = string.Join(" ", new[] { "A", "B" }.Select(n => $"echo 'sextant-restore-ok: {System.IO.Path.Combine(other, n, n + ".csproj")}' ;"));
+            var fake = CreateFakeDotnet(System.IO.Path.Combine(root, "fake"), "exit 1", $"{ok} exit 1");
+            var small = WriteSolution(root, "Small.slnx", "A", "B");
+            var big = WriteSolution(root, "Big.slnx", "A", "B", "C");
+            ForcePerSolutionFallback(root);
+
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+                .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
+
+            Assert.AreEqual(0, outcome.SolutionsSkippedRedundant);
+        }
+        finally { TryDelete(root); }
+    }
+
+    [TestMethod]
+    public async Task ASubset_WhoseProjectFailedInTheEarlierRestore_IsNotSkipped()
+    {
+        RequireUnix();
+        var root = NewRoot("skip-failed");
+        try
+        {
+            var fake = CreateFakeDotnet(System.IO.Path.Combine(root, "fake"), "exit 1", "exit 1");
+            var small = WriteSolution(root, "Small.slnx", "A");
+            var big = WriteSolution(root, "Big.slnx", "A", "B");
+            ForcePerSolutionFallback(root);
+
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+                .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
+
+            CollectionAssert.AreEqual(new[] { "Big.slnx", "Small.slnx" }, RestoredSolutions(fake).ToArray());
+            Assert.AreEqual(0, outcome.SolutionsSkippedRedundant);
+        }
+        finally { TryDelete(root); }
+    }
+
+    private static string WriteSolutionRefs(string solutionDir, string name, params string[] projectPaths)
+    {
+        Directory.CreateDirectory(solutionDir);
+        var solution = System.IO.Path.Combine(solutionDir, name);
+        File.WriteAllText(solution,
+            "<Solution>" + string.Join(string.Empty, projectPaths.Select(p => $"<Project Path=\"{p}\" />")) + "</Solution>");
+        return solution;
+    }
+
+    [TestMethod]
+    public async Task ASubset_InASiblingDirectory_SharingTheProjects_IsNotSkipped()
+    {
+        RequireUnix();
+        var root = NewRoot("skip-sibling");
+        try
+        {
+            var fake = CreateFakeDotnet(System.IO.Path.Combine(root, "fake"),
+                $"for p in \"{root}\"/one/*/; do mkdir -p \"$p/obj\"; echo '{{}}' > \"$p/obj/project.assets.json\"; done; exit 0", "exit 0");
+            var big = WriteSolution(System.IO.Path.Combine(root, "one"), "Big.slnx", "A", "B", "C");
+            ForcePerSolutionFallback(System.IO.Path.Combine(root, "one"));
+            var small = WriteSolutionRefs(System.IO.Path.Combine(root, "two"), "Small.slnx", "../one/A/A.csproj", "../one/B/B.csproj");
+
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+                .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
+
+            Assert.IsFalse(outcome.UsedProjectUnion);
+            CollectionAssert.AreEqual(new[] { "Big.slnx", "Small.slnx" }, RestoredSolutions(fake).ToArray());
+            Assert.AreEqual(0, outcome.SolutionsSkippedRedundant);
+        }
+        finally { TryDelete(root); }
+    }
+
+    [TestMethod]
+    public async Task ASubset_WhoseProjectsHaveAssetsFromAPreviousJob_ButFailedNow_IsNotSkipped()
+    {
+        RequireUnix();
+        var root = NewRoot("skip-stale");
+        try
+        {
+            var fake = CreateFakeDotnet(System.IO.Path.Combine(root, "fake"), "exit 1", "exit 1");
+            var small = WriteSolution(root, "Small.slnx", "A");
+            var big = WriteSolution(root, "Big.slnx", "A", "B");
+            ForcePerSolutionFallback(root);
+            foreach (var project in new[] { "A", "B" })
+            {
+                Directory.CreateDirectory(System.IO.Path.Combine(root, project, "obj"));
+                File.WriteAllText(System.IO.Path.Combine(root, project, "obj", "project.assets.json"), "{}");
+            }
+
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+                .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
+
+            CollectionAssert.AreEqual(new[] { "Big.slnx", "Small.slnx" }, RestoredSolutions(fake).ToArray());
+            Assert.AreEqual(0, outcome.SolutionsSkippedRedundant);
+        }
+        finally { TryDelete(root); }
+    }
+
+    [TestMethod]
+    public async Task ASubset_IsSkipped_AfterTheSupersetSucceededThroughThePerProjectRetry()
+    {
+        RequireUnix();
+        var root = NewRoot("skip-after-retry");
+        try
+        {
+            var fake = CreateFakeDotnet(System.IO.Path.Combine(root, "fake"), "exit 1",
+                $"for p in \"{root}\"/*/; do mkdir -p \"$p/obj\"; echo '{{}}' > \"$p/obj/project.assets.json\"; done; exit 0");
+            var small = WriteSolution(root, "Small.slnx", "A", "B");
+            var big = WriteSolution(root, "Big.slnx", "A", "B", "C");
+            ForcePerSolutionFallback(root);
+
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+                .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
+
+            Assert.AreEqual(1, outcome.SolutionsRetriedPerProject);
+            CollectionAssert.AreEqual(new[] { "Big.slnx" }, RestoredSolutions(fake).ToArray());
+            CollectionAssert.AreEqual(new[] { "Small.slnx" }, outcome.SkippedSolutionNames.ToArray());
+        }
+        finally { TryDelete(root); }
+    }
+
+    private static string AssetsFor(string root, params string[] projects) =>
+        string.Join("; ", projects.Select(p => $"mkdir -p \"{root}/{p}/obj\"; echo '{{}}' > \"{root}/{p}/obj/project.assets.json\""));
+
+    [TestMethod]
+    public async Task ASubset_IsSkipped_WhenTheSupersetsRetryFailedDeterministicallyForSomeProjects_AndDiagnosticsAppearOnce()
+    {
+        RequireUnix();
+        var root = NewRoot("skip-deterministic");
+        try
+        {
+            var b = System.IO.Path.Combine(root, "B", "B.csproj");
+            var c = System.IO.Path.Combine(root, "C", "C.csproj");
+            var d = System.IO.Path.Combine(root, "D", "D.csproj");
+            var errors = $"echo '{b} : error NU1101: Unable to find package Foo.Bar. No packages exist with this id in source(s): s'; " +
+                $"echo '{c} : error NU1102: Unable to find package Baz with version (>= 1.0)'; " +
+                $"echo '/sdk/Sdks.targets(1,1): error NETSDK1147: To build this project, the following workloads must be installed: x [{d}]'; ";
+            var fake = CreateFakeDotnet(System.IO.Path.Combine(root, "fake"), errors + "exit 1",
+                errors + AssetsFor(root, "A") + $"; echo 'sextant-restore-ok: {System.IO.Path.Combine(root, "A", "A.csproj")}'; exit 1");
+            var small = WriteSolution(root, "Small.slnx", "A", "B", "C");
+            var big = WriteSolution(root, "Big.slnx", "A", "B", "C", "D");
+            ForcePerSolutionFallback(root);
+
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+                .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
+
+            Assert.AreEqual(1, outcome.SolutionsRetriedPerProject);
+            CollectionAssert.AreEqual(new[] { "Big.slnx" }, RestoredSolutions(fake).ToArray());
+            CollectionAssert.AreEqual(new[] { "Small.slnx" }, outcome.SkippedSolutionNames.ToArray());
+            CollectionAssert.AreEqual(
+                new[] { "B/B.csproj", "C/C.csproj", "D/D.csproj" }, outcome.Projects.Select(x => x.Project).ToArray());
+        }
+        finally { TryDelete(root); }
+    }
+
+    [TestMethod]
+    public async Task ASubset_IsNotSkipped_WhenTheSupersetFailedTransiently()
+    {
+        RequireUnix();
+        var root = NewRoot("skip-transient");
+        try
+        {
+            var b = System.IO.Path.Combine(root, "B", "B.csproj");
+            var errors = $"echo '{b} : error NU1301: Unable to load the service index for source https://example.invalid/index.json.'; ";
+            var fake = CreateFakeDotnet(System.IO.Path.Combine(root, "fake"), errors + "exit 1",
+                errors + AssetsFor(root, "A") + "; exit 1");
+            var small = WriteSolution(root, "Small.slnx", "A", "B");
+            var big = WriteSolution(root, "Big.slnx", "A", "B", "C");
+            ForcePerSolutionFallback(root);
+
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+                .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
+
+            CollectionAssert.AreEqual(new[] { "Big.slnx", "Small.slnx" }, RestoredSolutions(fake).ToArray());
+            Assert.AreEqual(0, outcome.SolutionsSkippedRedundant);
+        }
+        finally { TryDelete(root); }
+    }
+
+    [TestMethod]
+    public async Task CaseDistinctProjectPaths_AreNotConflated_OnACaseSensitiveHost()
+    {
+        RequireUnix();
+        var root = NewRoot("skip-case");
+        try
+        {
+            var probe = System.IO.Path.Combine(root, "probe");
+            Directory.CreateDirectory(probe);
+            if (Directory.Exists(System.IO.Path.Combine(root, "PROBE")))
+                Assert.Inconclusive("The file system is case-insensitive.");
+            var fake = CreateFakeDotnet(System.IO.Path.Combine(root, "fake"), WriteAssets, "exit 0");
+            var big = WriteSolution(root, "Big.slnx", "a", "b", "c");
+            var small = WriteSolution(root, "Small.slnx", "A", "B");
+            Directory.CreateDirectory(System.IO.Path.Combine(root, "Outside"));
+            File.WriteAllText(System.IO.Path.Combine(root, "Outside", "Outside.csproj"),
+                $"<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>{Tfm}</TargetFramework></PropertyGroup></Project>");
+            foreach (var project in new[] { "a", "A" })
+                File.WriteAllText(System.IO.Path.Combine(root, project, project + ".csproj"), $"""
+                    <Project Sdk="Microsoft.NET.Sdk">
+                      <PropertyGroup><TargetFramework>{Tfm}</TargetFramework></PropertyGroup>
+                      <ItemGroup><ProjectReference Include="../Outside/Outside.csproj" /></ItemGroup>
+                    </Project>
+                    """);
+
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60)) { DotnetPath = fake.Path }
+                .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
+
+            Assert.IsFalse(outcome.UsedProjectUnion);
+            CollectionAssert.AreEqual(new[] { "Big.slnx", "Small.slnx" }, RestoredSolutions(fake).ToArray(), string.Join("|", fake.Calls));
+            Assert.AreEqual(0, outcome.SolutionsSkippedRedundant);
+        }
+        finally { TryDelete(root); }
+    }
+
+    [TestMethod]
+    public async Task ASubsetSolution_IsSkippedByARealRestore_AndEveryProjectHasItsAssets()
+    {
+        var root = NewRoot("skip-real");
+        try
+        {
+            WriteOfflineNuGetConfig(root);
+            var small = WriteSolution(root, "Small.slnx", "A", "B");
+            var big = WriteSolution(root, "Big.slnx", "A", "B", "C");
+            ForcePerSolutionFallback(root);
+
+            var logs = new List<string>();
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromMinutes(4), log: logs.Add)
+                .RunAsync(root, [big, small], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
+
+            Assert.IsFalse(outcome.UsedProjectUnion, string.Join("\n", logs));
+            Assert.AreEqual(1, outcome.SolutionsSkippedRedundant, string.Join("\n", logs));
+            CollectionAssert.AreEqual(new[] { "Small.slnx" }, outcome.SkippedSolutionNames.ToArray());
+            Assert.AreEqual(1, outcome.SolutionsAttempted);
+            Assert.IsTrue(outcome.Clean, string.Join("\n", logs));
+            foreach (var project in new[] { "A", "B", "C", "Outside" })
+                Assert.IsTrue(File.Exists(System.IO.Path.Combine(root, project, "obj", "project.assets.json")), project);
+        }
+        finally { TryDelete(root); }
+    }
+
+    private static string SetUpSmallInBig(string root, out string small, out string big)
+    {
+        WriteOfflineNuGetConfig(root);
+        small = WriteSolution(root, "Small.slnx", "A", "B", "C");
+        big = WriteSolution(root, "Big.slnx", "A", "B", "C", "D");
+        ForcePerSolutionFallback(root);
+        File.WriteAllText(System.IO.Path.Combine(root, "D", "D.csproj"), $"""
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup><TargetFramework>{Tfm}</TargetFramework></PropertyGroup>
+              <ItemGroup><ProjectReference Include="../C/C.csproj" /></ItemGroup>
+            </Project>
+            """);
+        return root;
+    }
+
+    private static Dictionary<string, string> NormalizedAssets(string root)
+        => Directory.EnumerateFiles(root, "project.assets.json", SearchOption.AllDirectories)
+            .ToDictionary(
+                f => System.IO.Path.GetRelativePath(root, f).Replace('\\', '/'),
+                f => File.ReadAllText(f).Replace(root.Replace("\\", "/"), "<ROOT>", StringComparison.Ordinal)
+                    .Replace(root, "<ROOT>", StringComparison.Ordinal));
+
+    [TestMethod]
+    public async Task APartialSkip_WritesTheSameAssetsFiles_AsRestoringTheSupersetWhole_ByRealRestores()
+    {
+        var wholeRoot = NewRoot("partial-real-whole");
+        var partialRoot = NewRoot("partial-real-partial");
+        try
+        {
+            SetUpSmallInBig(wholeRoot, out _, out var wholeBig);
+            var wholeLogs = new List<string>();
+            var whole = await new PackageRestoreRunner(timeout: TimeSpan.FromMinutes(4), log: wholeLogs.Add)
+                .RunAsync(wholeRoot, [wholeBig], limit: null, CancellationToken.None, System.IO.Path.Combine(wholeRoot, "scratch"));
+            Assert.IsTrue(whole.Clean, string.Join("\n", wholeLogs));
+            Assert.AreEqual(0, whole.SolutionsPartiallySkipped);
+
+            SetUpSmallInBig(partialRoot, out var small, out var big);
+            var logs = new List<string>();
+            var partial = await new PackageRestoreRunner(timeout: TimeSpan.FromMinutes(4), log: logs.Add)
+                .RunAsync(partialRoot, [small, big], limit: null, CancellationToken.None, System.IO.Path.Combine(partialRoot, "scratch"));
+            Assert.IsTrue(partial.Clean, string.Join("\n", logs));
+            Assert.AreEqual(1, partial.SolutionsPartiallySkipped, string.Join("\n", logs));
+            Assert.AreEqual(1, partial.ProjectsRestoredPartially);
+
+            var expected = NormalizedAssets(wholeRoot);
+            var actual = NormalizedAssets(partialRoot);
+            Assert.IsTrue(expected.Count >= 5, string.Join(", ", expected.Keys));
+            CollectionAssert.AreEquivalent(expected.Keys.ToList(), actual.Keys.ToList());
+            foreach (var (path, text) in expected)
+                Assert.AreEqual(text, actual[path], path);
+        }
+        finally
+        {
+            TryDelete(wholeRoot);
+            TryDelete(partialRoot);
+        }
+    }
+
+    [TestMethod]
+    [DataRow("Directory.Solution.props")]
+    [DataRow("Directory.Solution.targets")]
+    public async Task ASuperset_WithADirectorySolutionFile_InItsDirectoryOrAnAncestor_IsRestoredWhole(string fileName)
+    {
+        RequireUnix();
+        foreach (var inAncestor in new[] { false, true })
+        {
+            var outer = NewRoot("partial-dirsolution");
+            try
+            {
+                var root = inAncestor ? System.IO.Path.Combine(outer, "sub") : outer;
+                Directory.CreateDirectory(root);
+                File.WriteAllText(System.IO.Path.Combine(outer, fileName), "<Project />");
+                var (outcome, fake, logs) = await RunSubsetThenSupersetAt(
+                    outer, root, () => WriteSolution(root, "Big.slnx", "A", "B", "C", "D", "E", "F", "G"));
+
+                CollectionAssert.AreEqual(new[] { "Small.slnx", "Big.slnx" }, RestoredSolutions(fake).ToArray(), fileName);
+                Assert.AreEqual(0, outcome.SolutionsPartiallySkipped);
+                Assert.IsTrue(logs.Any(l => l.Contains("partial skip declined for 1 solution(s)", StringComparison.Ordinal)), string.Join("\n", logs));
+            }
+            finally { TryDelete(outer); }
+        }
+    }
+
+    private static async Task<(PackageRestoreOutcome Outcome, FakeDotnet Fake, List<string> Logs)> RunSubsetThenSupersetAt(
+        string checkout, string root, Func<string> superset)
+    {
+        var fake = CreateFakeDotnet(System.IO.Path.Combine(checkout, "fake"), WriteAssets, "exit 0");
+        var small = WriteSolution(root, "Small.slnx", "A", "B", "C", "D");
+        var big = superset();
+        ForcePerSolutionFallback(root);
+        var logs = new List<string>();
+        var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), log: logs.Add) { DotnetPath = fake.Path }
+            .RunAsync(checkout, [small, big], limit: null, CancellationToken.None, System.IO.Path.Combine(checkout, "scratch"));
+        return (outcome, fake, logs);
+    }
+
+    // ==== issue #290: partial skip =======================================================================
+
+    private static async Task<(PackageRestoreOutcome Outcome, FakeDotnet Fake, List<string> Logs)> RunSubsetThenSuperset(
+        string root, string restoreBody, string msbuildBody, Func<string> superset, string? extraProperty = null)
+    {
+        var fake = CreateFakeDotnet(System.IO.Path.Combine(root, "fake"), restoreBody, msbuildBody);
+        var small = WriteSolution(root, "Small.slnx", "A", "B", "C", "D");
+        var big = superset();
+        ForcePerSolutionFallback(root, extraProperty ?? string.Empty);
+        var logs = new List<string>();
+        var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromSeconds(60), log: logs.Add) { DotnetPath = fake.Path }
+            .RunAsync(root, [small, big], limit: null, CancellationToken.None, System.IO.Path.Combine(root, "scratch"));
+        return (outcome, fake, logs);
+    }
+
+    [TestMethod]
+    public async Task ASuperset_AfterItsSubset_RestoresOnlyTheUncoveredProjects_ThroughTheTraversal()
+    {
+        RequireUnix();
+        var root = NewRoot("partial-skip");
+        try
+        {
+            var (outcome, fake, logs) = await RunSubsetThenSuperset(
+                root, WriteAssets, AssetsFor(root, "E", "F", "G") + "; exit 0",
+                () => WriteSolution(root, "Big.slnx", "A", "B", "C", "D", "E", "F", "G"));
+
+            CollectionAssert.AreEqual(new[] { "Small.slnx" }, RestoredSolutions(fake).ToArray(), "Big itself is never restored");
+            Assert.AreEqual(1, fake.Calls.Count(c => c.StartsWith("msbuild ", StringComparison.Ordinal)));
+            foreach (var project in new[] { "E", "F", "G" })
+                StringAssert.Contains(fake.Traversal, $"{project}/{project}.csproj");
+            foreach (var project in new[] { "B", "C", "D" })
+                Assert.IsFalse(fake.Traversal.Contains($"{project}/{project}.csproj", StringComparison.Ordinal), project);
+            Assert.AreEqual(1, outcome.SolutionsPartiallySkipped);
+            Assert.AreEqual(3, outcome.ProjectsRestoredPartially);
+            CollectionAssert.AreEqual(new[] { "Big.slnx" }, outcome.PartiallySkippedSolutionNames.ToArray());
+            Assert.AreEqual(0, outcome.SolutionsSkippedRedundant);
+            Assert.AreEqual(2, outcome.SolutionsAttempted);
+            Assert.IsTrue(outcome.Clean);
+            Assert.IsTrue(logs.Any(l => l.Contains("1 solution(s) restored only for their uncovered projects (3 project(s): Big.slnx)", StringComparison.Ordinal)), string.Join("\n", logs));
+
+            var recorder = new JobTimingsRecorder();
+            recorder.RecordRestore(outcome, persistentPackageFolder: false);
+            var restore = recorder.Build().Restore!;
+            Assert.AreEqual(1, restore.SolutionsPartiallySkipped);
+            Assert.AreEqual(3, restore.ProjectsRestoredPartially);
+        }
+        finally { TryDelete(root); }
+    }
+
+    [TestMethod]
+    public async Task ASuperset_WithASolutionSensitiveProject_IsRestoredWhole()
+    {
+        RequireUnix();
+        var root = NewRoot("partial-sensitive");
+        try
+        {
+            var (outcome, fake, _) = await RunSubsetThenSuperset(
+                root, WriteAssets, "exit 0",
+                () =>
+                {
+                    var big = WriteSolution(root, "Big.slnx", "A", "B", "C", "D", "E", "F", "G");
+                    File.WriteAllText(System.IO.Path.Combine(root, "E", "E.csproj"),
+                        $"<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>{Tfm}</TargetFramework><M>$(SolutionDir)</M></PropertyGroup></Project>");
+                    return big;
+                });
+
+            CollectionAssert.AreEqual(new[] { "Small.slnx", "Big.slnx" }, RestoredSolutions(fake).ToArray());
+            Assert.AreEqual(0, outcome.SolutionsPartiallySkipped);
+        }
+        finally { TryDelete(root); }
+    }
+
+    [TestMethod]
+    public async Task ASuperset_MappingAnUncoveredProjectToANonDefaultPlatform_IsRestoredWhole()
+    {
+        RequireUnix();
+        var root = NewRoot("partial-nondefault");
+        try
+        {
+            var (outcome, fake, _) = await RunSubsetThenSuperset(
+                root, WriteAssets, "exit 0",
+                () => SlnxWith(root, "Big.slnx", "<Configurations><Platform Name=\"x64\" /></Configurations>", string.Empty,
+                    "A", "B", "C", "D", "E", "F", "G"));
+
+            CollectionAssert.AreEqual(new[] { "Small.slnx", "Big.slnx" }, RestoredSolutions(fake).ToArray());
+            Assert.AreEqual(0, outcome.SolutionsPartiallySkipped);
+        }
+        finally { TryDelete(root); }
+    }
+
+    [TestMethod]
+    public async Task ASuperset_WithHalfOrMoreProjectsUncovered_IsRestoredWhole()
+    {
+        RequireUnix();
+        var root = NewRoot("partial-half");
+        try
+        {
+            var (outcome, fake, _) = await RunSubsetThenSuperset(
+                root, WriteAssets, "exit 0", () => WriteSolution(root, "Big.slnx", "A", "B", "C", "D", "E", "F", "G", "H"));
+
+            CollectionAssert.AreEqual(new[] { "Small.slnx", "Big.slnx" }, RestoredSolutions(fake).ToArray());
+            Assert.AreEqual(0, outcome.SolutionsPartiallySkipped);
+        }
+        finally { TryDelete(root); }
+    }
+
+    [TestMethod]
+    public async Task APartialRestore_WhoseTraversalFailsForAnUncoveredProject_ReportsItAsBefore()
+    {
+        RequireUnix();
+        var root = NewRoot("partial-failure");
+        try
+        {
+            var f = System.IO.Path.Combine(root, "F", "F.csproj");
+            var errors = $"echo '{f} : error NU1101: Unable to find package Foo.Bar. No packages exist with this id in source(s): s'; ";
+            var (outcome, fake, _) = await RunSubsetThenSuperset(
+                root, WriteAssets,
+                errors + AssetsFor(root, "E", "G") + $"; echo 'sextant-restore-ok: {System.IO.Path.Combine(root, "E", "E.csproj")}'; exit 1",
+                () => WriteSolution(root, "Big.slnx", "A", "B", "C", "D", "E", "F", "G"));
+
+            CollectionAssert.AreEqual(new[] { "Small.slnx" }, RestoredSolutions(fake).ToArray());
+            Assert.AreEqual(1, outcome.SolutionsPartiallySkipped);
+            Assert.IsFalse(outcome.Clean);
+            Assert.AreEqual("F/F.csproj", outcome.Projects.Single().Project);
+            Assert.AreEqual(1, outcome.Projects.Count);
+        }
+        finally { TryDelete(root); }
+    }
+
+    private static string WriteSlnx(string body)
+    {
+        var dir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "slnx-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var path = System.IO.Path.Combine(dir, "App.slnx");
+        File.WriteAllText(path, body);
+        return path;
+    }
+
+    [TestMethod]
+    public void SlnxWithPlatformOnlyConfigurations_IsDefaultMapped()
+    {
+        var path = WriteSlnx("<Solution><Configurations><Platform Name=\"Any CPU\" /><Platform Name=\"x64\" /><Platform Name=\"x86\" /></Configurations>"
+            + "<Folder Name=\"/s/\"><Project Path=\"a/a.csproj\" /></Folder></Solution>");
+        try { Assert.AreEqual(0, SolutionSensitivity.FindNotDefaultMapped(path).Count); }
+        finally { Directory.Delete(System.IO.Path.GetDirectoryName(path)!, true); }
+    }
+
+    [TestMethod]
+    public void SlnxWithBuildTypesOrProjectOverrides_IsNotDefaultMapped()
+    {
+        foreach (var body in new[]
+        {
+            "<Solution><Configurations><BuildType Name=\"Debug\" /><Platform Name=\"Any CPU\" /></Configurations><Project Path=\"a/a.csproj\" /></Solution>",
+            "<Solution><Configurations><Platform Name=\"x64\" /></Configurations><Project Path=\"a/a.csproj\" /></Solution>",
+            "<Solution><Configurations><Platform Name=\"Any CPU\" /></Configurations><Project Path=\"a/a.csproj\"><Build Solution=\"Debug|*\" Project=\"false\" /></Project></Solution>",
+        })
+        {
+            var path = WriteSlnx(body);
+            try { Assert.AreEqual(1, SolutionSensitivity.FindNotDefaultMapped(path).Count, body); }
+            finally { Directory.Delete(System.IO.Path.GetDirectoryName(path)!, true); }
+        }
     }
 
     private static int Count(string text, string needle)

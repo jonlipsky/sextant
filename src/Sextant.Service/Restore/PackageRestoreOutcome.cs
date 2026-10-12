@@ -75,6 +75,27 @@ public sealed record PackageRestoreOutcome
     /// <summary>Projects the per-project retries restored one by one.</summary>
     public int ProjectsRetried { get; init; }
 
+    /// <summary>
+    /// Selected solutions the per-solution fallback did not restore because every project they declare was already
+    /// restored cleanly by an earlier (broader) solution of the same job (issue #290).
+    /// </summary>
+    public int SolutionsSkippedRedundant { get; init; }
+
+    /// <summary>File names of the solutions counted in <see cref="SolutionsSkippedRedundant"/>.</summary>
+    public IReadOnlyList<string> SkippedSolutionNames { get; init; } = [];
+
+    /// <summary>
+    /// Solutions the per-solution fallback restored only for the projects an earlier same-directory solution had not
+    /// covered, through the per-project traversal instead of a whole-solution restore (issue #290).
+    /// </summary>
+    public int SolutionsPartiallySkipped { get; init; }
+
+    /// <summary>Projects restored that way (the uncovered ones), summed over those solutions.</summary>
+    public int ProjectsRestoredPartially { get; init; }
+
+    /// <summary>File names of the solutions counted in <see cref="SolutionsPartiallySkipped"/>.</summary>
+    public IReadOnlyList<string> PartiallySkippedSolutionNames { get; init; } = [];
+
     /// <summary>Distinct projects explicitly restored by a project-union traversal.</summary>
     public int ProjectsAttempted { get; init; }
 

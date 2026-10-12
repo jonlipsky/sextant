@@ -233,9 +233,133 @@ public sealed class PackageRestoreRunner(
         var stopwatch = Stopwatch.StartNew();
         int attempted = 0, succeeded = 0, notStarted = 0, retried = 0, retriedProjects = 0;
         var timedOut = false;
+        var startedUtc = DateTime.UtcNow;
+
+        var declaredBySolution = solutions.ToDictionary(
+            solution => solution,
+            solution => SolutionProjectEnumerator.Enumerate(solution).Select(Path.GetFullPath)
+                .Distinct(CheckoutInventory.PathComparer).ToList());
+        // Only solutions of one directory can skip each other, and they share the global.json chain, so a differing
+        // SDK pin is irrelevant: assess each directory's solutions on their own.
+        var sensitiveByDir = new Dictionary<string, IReadOnlyDictionary<string, string>>(CheckoutInventory.PathComparer);
+        foreach (var group in solutions.GroupBy(
+                     solution => Path.GetDirectoryName(Path.GetFullPath(solution)) ?? string.Empty, CheckoutInventory.PathComparer))
+        {
+            var members = group.ToList();
+            if (members.Count > 1)
+                sensitiveByDir[group.Key] = SolutionSensitivity.Classify(
+                    members, [.. members.SelectMany(m => declaredBySolution[m]).Distinct(CheckoutInventory.PathComparer)], sameDirectory: true);
+        }
+        // Project -> directories of the solutions that restored it cleanly in this job.
+        var restoredBy = new Dictionary<string, HashSet<string>>(CheckoutInventory.PathComparer);
+        // Project -> directories of the solutions whose attempt in this job failed for it DETERMINISTICALLY: the
+        // same restore would fail the same way, and its diagnostics are already in the outcome (no assets file).
+        var failedBy = new Dictionary<string, HashSet<string>>(CheckoutInventory.PathComparer);
+        var skippedNames = new List<string>();
+        int partialSkipped = 0, partialProjects = 0;
+        var partialDeclinedNames = new List<string>();
+        var partialSkippedNames = new List<string>();
+        var attemptedDirs = new HashSet<string>(CheckoutInventory.PathComparer);
+        // Project -> directory of the solution that made the MOST RECENT attempt at it in this job (any outcome).
+        var lastAttemptDir = new Dictionary<string, string>(CheckoutInventory.PathComparer);
 
         foreach (var solution in solutions)
         {
+            // Skipping is output-neutral for the SKIPPED solution: every project it declares was restored cleanly in
+            // this job by a solution in the SAME directory (same global.json, NuGet.config and Directory.Solution.*
+            // chain), has its assets file, and is not solution-sensitive, so restoring it again would rewrite the
+            // same files. It is exactly output-neutral: the most recent attempt at every declared project was by a
+            // solution of this same directory, so skipping never changes which solution restored a project last.
+            var declared = declaredBySolution[solution];
+            var solutionDir = Path.GetDirectoryName(Path.GetFullPath(solution)) ?? string.Empty;
+            var sensitive = sensitiveByDir.TryGetValue(solutionDir, out var sensitiveHere)
+                ? sensitiveHere
+                : new Dictionary<string, string>();
+            bool Covered(string project) => !sensitive.ContainsKey(project)
+                && lastAttemptDir.TryGetValue(project, out var lastDir) && CheckoutInventory.PathComparer.Equals(lastDir, solutionDir)
+                && ((restoredBy.TryGetValue(project, out var dirs) && dirs.Contains(solutionDir) && File.Exists(AssetsFile(project)))
+                    || (failedBy.TryGetValue(project, out var failedDirs) && failedDirs.Contains(solutionDir)));
+            var uncovered = declared.Where(project => !Covered(project)).ToList();
+            if (declared.Count > 0 && uncovered.Count == 0)
+            {
+                skippedNames.Add(Path.GetFileName(solution));
+                continue;
+            }
+
+            // Partial skip (#290): when most projects are covered, restore only the rest. Output-neutral for the
+            // same reason as the full skip, plus: no project of the solution is solution-sensitive and the solution
+            // maps every project to its own default configuration, so a traversal restoring a project on its own
+            // (Debug|AnyCPU, recursive like the solution restore) writes what the solution would have written, also for
+            // the covered projects it recurses into. An unreadable mapping or any doubt restores the whole solution.
+            var solutionImports = declared.Count > 0 && uncovered.Count * 2 < declared.Count
+                && HasSolutionLevelImports(solutionDir, checkoutDir);
+            if (solutionImports)
+                partialDeclinedNames.Add(Path.GetFileName(solution));
+            if (declared.Count > 0 && uncovered.Count * 2 < declared.Count && attemptedDirs.Contains(solutionDir) && !solutionImports
+                && !declared.Any(sensitive.ContainsKey) && SolutionSensitivity.FindNotDefaultMapped(solution).Count == 0
+                && SafeForMsBuildProperty(Path.GetFullPath(solution)) && uncovered.All(project => SafeForMsBuildProperty(project)))
+            {
+                var partialRemaining = deadline - stopwatch.Elapsed;
+                if (partialRemaining <= TimeSpan.Zero)
+                {
+                    timedOut = true;
+                    break;
+                }
+
+                var partialParser = new RestoreOutputParser(checkoutDir);
+                var solutionPath = Path.GetFullPath(solution);
+                var partialResult = await RunTraversalAsync(
+                        solutionDir, [.. uncovered.Select(project => new UnionProject(project, solutionPath))], globals, recursive: true,
+                        partialRemaining, partialParser, cancellationToken, scratchDir, environment)
+                    .ConfigureAwait(false);
+                if (partialResult is { } ran)
+                {
+                    attempted++;
+                    partialSkipped++;
+                    partialProjects += uncovered.Count;
+                    partialSkippedNames.Add(Path.GetFileName(solution));
+                    foreach (var project in uncovered)
+                        lastAttemptDir[project] = solutionDir;
+                    parser.MergeFrom(partialParser);
+                    switch (ran)
+                    {
+                        case RunResult.Succeeded:
+                            succeeded++;
+                            foreach (var project in uncovered)
+                            {
+                                if (!restoredBy.TryGetValue(project, out var dirs))
+                                    restoredBy[project] = dirs = new HashSet<string>(CheckoutInventory.PathComparer);
+                                dirs.Add(solutionDir);
+                            }
+                            break;
+                        case RunResult.NotStarted:
+                            notStarted++;
+                            break;
+                        case RunResult.TimedOut:
+                            timedOut = true;
+                            break;
+                        case RunResult.Failed:
+                            foreach (var project in DeterministicallyAttempted(uncovered, partialParser, startedUtc, solutionDir, restoredBy))
+                            {
+                                if (!failedBy.TryGetValue(project, out var dirs))
+                                    failedBy[project] = dirs = new HashSet<string>(CheckoutInventory.PathComparer);
+                                dirs.Add(solutionDir);
+                            }
+                            break;
+                    }
+                    if (timedOut)
+                        break;
+                    continue;
+                }
+            }
+
+            if (declared.Count > 0 && attemptedDirs.Contains(solutionDir) && sensitiveByDir.ContainsKey(solutionDir))
+                log?.Invoke($"package restore: '{Path.GetFileName(solution)}' is restored although a solution of its directory ran earlier: " +
+                    DescribeNotSkipped(declared, solutionDir, sensitive, restoredBy, failedBy));
+            if (declared.Count > 0 && attemptedDirs.Contains(solutionDir) && uncovered.Count * 2 < declared.Count)
+                log?.Invoke($"package restore: '{Path.GetFileName(solution)}' is a partial-skip candidate ({uncovered.Count} of {declared.Count} uncovered) but is restored whole: " +
+                    DescribePartialBlocker(solution, declared, uncovered, sensitive));
+
             var remaining = deadline - stopwatch.Elapsed;
             if (remaining <= TimeSpan.Zero)
             {
@@ -244,21 +368,28 @@ public sealed class PackageRestoreRunner(
             }
 
             attempted++;
+            attemptedDirs.Add(solutionDir);
+            foreach (var project in declared)
+                lastAttemptDir[project] = solutionDir;
             var attempt = new RestoreOutputParser(checkoutDir);
             var result = await RunOneAsync(solution, globals, remaining, attempt, cancellationToken, environment).ConfigureAwait(false);
             var retrySucceeded = false;
+            var outcomeParser = attempt;
             if (result == RunResult.Failed && AnyProjectWithoutAssets(solution))
             {
                 // Issue #296: a graph-level error leaves projects of the solution without assets. Restore its
                 // projects one by one so only the ones that really cannot restore stay unrestored. A failure that
                 // left every project its assets file (an ordinary per-project error) is reported as it is.
+                var retryParser = new RestoreOutputParser(checkoutDir);
                 var retry = await RetryPerProjectAsync(
-                        solution, globals, deadline - stopwatch.Elapsed, parser, cancellationToken, scratchDir, environment)
+                        solution, globals, deadline - stopwatch.Elapsed, retryParser, cancellationToken, scratchDir, environment)
                     .ConfigureAwait(false);
+                parser.MergeFrom(retryParser);
                 if (retry is { Result: not RunResult.NotStarted } done)
                 {
                     retried++;
                     retriedProjects += done.Projects;
+                    outcomeParser = retryParser;
                     result = done.Result;
                     retrySucceeded = result == RunResult.Succeeded;
                 }
@@ -269,12 +400,26 @@ public sealed class PackageRestoreRunner(
             {
                 case RunResult.Succeeded:
                     succeeded++;
+                    foreach (var project in declared)
+                    {
+                        if (!restoredBy.TryGetValue(project, out var dirs))
+                            restoredBy[project] = dirs = new HashSet<string>(CheckoutInventory.PathComparer);
+                        dirs.Add(solutionDir);
+                    }
                     break;
                 case RunResult.NotStarted:
                     notStarted++;
                     break;
                 case RunResult.TimedOut:
                     timedOut = true;
+                    break;
+                case RunResult.Failed:
+                    foreach (var project in DeterministicallyAttempted(declared, outcomeParser, startedUtc, solutionDir, restoredBy))
+                    {
+                        if (!failedBy.TryGetValue(project, out var dirs))
+                            failedBy[project] = dirs = new HashSet<string>(CheckoutInventory.PathComparer);
+                        dirs.Add(solutionDir);
+                    }
                     break;
             }
             if (timedOut)
@@ -289,6 +434,11 @@ public sealed class PackageRestoreRunner(
             SolutionsNotStarted = notStarted,
             SolutionsRetriedPerProject = retried,
             ProjectsRetried = retriedProjects,
+            SolutionsSkippedRedundant = skippedNames.Count,
+            SkippedSolutionNames = skippedNames,
+            SolutionsPartiallySkipped = partialSkipped,
+            ProjectsRestoredPartially = partialProjects,
+            PartiallySkippedSolutionNames = partialSkippedNames,
             TimedOut = timedOut,
             Timeout = deadline,
             Elapsed = stopwatch.Elapsed,
@@ -300,9 +450,123 @@ public sealed class PackageRestoreRunner(
         log?.Invoke(
             $"package restore: {succeeded}/{attempted} solution(s) restored cleanly in {outcome.Elapsed.TotalSeconds:0.#}s" +
             (retried > 0 ? $"; {retried} solution(s) retried per project ({retriedProjects} project(s))" : string.Empty) +
+            (skippedNames.Count > 0
+                ? $"; {skippedNames.Count} solution(s) skipped as already restored ({string.Join(", ", skippedNames)})"
+                : string.Empty) +
+            (partialSkipped > 0
+                ? $"; {partialSkipped} solution(s) restored only for their uncovered projects ({partialProjects} project(s): {string.Join(", ", partialSkippedNames)})"
+                : string.Empty) +
+            (partialDeclinedNames.Count > 0
+                ? $"; partial skip declined for {partialDeclinedNames.Count} solution(s) because a Directory.Solution.props/targets applies ({string.Join(", ", partialDeclinedNames)})"
+                : string.Empty) +
             (timedOut ? " (timed out)" : string.Empty) +
             (outcome.Projects.Count > 0 ? $"; {outcome.Projects.Count} project(s) reported restore errors" : string.Empty) + ".");
         return outcome;
+    }
+
+    // The traversal never evaluates the solution metaproject, which imports these files.
+    private static bool HasSolutionLevelImports(string solutionDir, string checkoutDir)
+    {
+        var root = Path.GetFullPath(checkoutDir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var dir = solutionDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        while (!string.IsNullOrEmpty(dir))
+        {
+            foreach (var name in new[] { "Directory.Solution.props", "Directory.Solution.targets" })
+            {
+                if (File.Exists(Path.Combine(dir, name)))
+                    return true;
+            }
+
+            if (CheckoutInventory.PathComparer.Equals(dir, root))
+                break;
+            dir = Path.GetDirectoryName(dir) ?? string.Empty;
+        }
+
+        return false;
+    }
+
+    private static string DescribeNotSkipped(
+        IReadOnlyList<string> declared, string solutionDir, IReadOnlyDictionary<string, string> sensitive,
+        Dictionary<string, HashSet<string>> restoredBy, Dictionary<string, HashSet<string>> failedBy)
+    {
+        var otherDirectory = declared.Count(project =>
+            !(restoredBy.TryGetValue(project, out var r) && r.Contains(solutionDir))
+            && !(failedBy.TryGetValue(project, out var f) && f.Contains(solutionDir)));
+        var notCovered = declared.Where(project => otherDirectory > 0 && !sensitive.ContainsKey(project)
+            && !(restoredBy.TryGetValue(project, out var r2) && r2.Contains(solutionDir))
+            && !(failedBy.TryGetValue(project, out var f2) && f2.Contains(solutionDir))).ToList();
+        var missingAssets = declared.Where(project =>
+            restoredBy.TryGetValue(project, out var r) && r.Contains(solutionDir) && !File.Exists(AssetsFile(project))).ToList();
+        var reasons = declared.Where(sensitive.ContainsKey).GroupBy(project => sensitive[project])
+            .OrderBy(group => group.Key, StringComparer.Ordinal)
+            .Select(group => $"{group.Count()} solution-sensitive ({group.Key}){NameSome(group)}");
+        return string.Join("; ", reasons
+            .Append($"{notCovered.Count} with no clean or deterministic outcome from a solution of this directory (earlier restore failed transiently, reported no result, or a solution of another directory attempted it since){NameSome(notCovered)}")
+            .Append($"{missingAssets.Count} without an assets file{NameSome(missingAssets)}")) + $" (of {declared.Count} project(s)).";
+    }
+
+    private static string DescribePartialBlocker(
+        string solution, IReadOnlyList<string> declared, IReadOnlyList<string> uncovered, IReadOnlyDictionary<string, string> sensitive)
+    {
+        var parts = new List<string>();
+        var sensitiveHere = declared.Where(sensitive.ContainsKey).ToList();
+        if (sensitiveHere.Count > 0)
+            parts.Add($"{sensitiveHere.Count} solution-sensitive project(s) ({string.Join(", ", sensitiveHere.Select(p => sensitive[p]).Distinct().Order(StringComparer.Ordinal))}){NameSome(sensitiveHere)}");
+        var notDefault = SolutionSensitivity.FindNotDefaultMapped(solution);
+        if (notDefault.Count > 0)
+        {
+            var read = "mapping read: " + SolutionSensitivity.DescribeMapping(solution, notDefault);
+            parts.Add($"{notDefault.Count} project(s) not mapped to Debug|Any CPU ({read}){NameSome(notDefault)}");
+        }
+        var unsafePaths = new List<string>();
+        if (!SafeForMsBuildProperty(Path.GetFullPath(solution)))
+            unsafePaths.Add(solution);
+        unsafePaths.AddRange(uncovered.Where(project => !SafeForMsBuildProperty(project)));
+        if (unsafePaths.Count > 0)
+            parts.Add($"{unsafePaths.Count} path(s) unsafe for an MSBuild property{NameSome(unsafePaths)}");
+        if (parts.Count == 0)
+            parts.Add("no eligibility rule failed, so the traversal could not be staged or ran no result");
+        return string.Join("; ", parts) + ".";
+    }
+
+    private static string NameSome(IEnumerable<string> projects)
+    {
+        var names = projects.Take(6).Select(project => Path.GetFileName(project)).ToList();
+        return names.Count == 0 ? string.Empty : " [" + string.Join(", ", names.Take(5)) + (names.Count > 5 ? ", ..." : string.Empty) + "]";
+    }
+
+    // Issue #290: the declared projects whose outcome in a FAILED restore is known and deterministic, so a later
+    // solution of the same directory need not restore them again. Coverage rests on POSITIVE evidence, never on the
+    // absence of an error. A project qualifies when
+    //  - the per-project traversal printed its success sentinel (the MSBuild task for it succeeded), or
+    //  - the parser attributed errors to it and none is a source-unreachable code (NU1301/NU1801 are transient), or
+    //  - an earlier clean restore of the SAME directory credited it and its assets file was rewritten during this job.
+    // A source-unreachable report that named no project makes the whole attempt transient. An unreached project of an
+    // aborted traversal has no sentinel and no issue, so it is never covered. Known limitation: a whole-solution
+    // restore that succeeds only counts a project whose assets file is at the default obj/ location (a custom
+    // ArtifactsPath is never skipped there), and error lines for a project outside the checkout are keyed by file name.
+    private static List<string> DeterministicallyAttempted(
+        IReadOnlyList<string> declared, RestoreOutputParser attempt, DateTime startedUtc, string solutionDir,
+        Dictionary<string, HashSet<string>> restoredBy)
+    {
+        var covered = new List<string>();
+        if (attempt.SourceUnreachableGeneral)
+            return covered;
+        var issues = attempt.Projects().ToDictionary(issue => issue.Project, StringComparer.Ordinal);
+        foreach (var project in declared)
+        {
+            if (issues.TryGetValue(attempt.ProjectKey(project), out var issue))
+            {
+                if (!issue.SourceUnreachable)
+                    covered.Add(project);
+            }
+            else if (attempt.WasRestored(project))
+                covered.Add(project);
+            else if (restoredBy.TryGetValue(project, out var dirs) && dirs.Contains(solutionDir)
+                && File.Exists(AssetsFile(project)) && File.GetLastWriteTimeUtc(AssetsFile(project)) >= startedUtc)
+                covered.Add(project);
+        }
+        return covered;
     }
 
     // True when a declared project of the solution has no assets file. Only the default obj/ location is checked (a
@@ -311,9 +575,11 @@ public sealed class PackageRestoreRunner(
     private static bool AnyProjectWithoutAssets(string solution)
     {
         var declared = SolutionProjectEnumerator.Enumerate(solution);
-        return declared.Any(project =>
-            !File.Exists(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(project)) ?? ".", "obj", "project.assets.json")));
+        return declared.Any(project => !File.Exists(AssetsFile(project)));
     }
+
+    private static string AssetsFile(string project) =>
+        Path.Combine(Path.GetDirectoryName(Path.GetFullPath(project)) ?? ".", "obj", "project.assets.json");
 
     private async Task<PackageRestoreOutcome?> RunProjectUnionAsync(
         string checkoutDir, int solutionCount, IReadOnlyList<UnionProject> projects,
@@ -833,6 +1099,10 @@ public sealed class PackageRestoreRunner(
             xml.AppendLine(
                 $"    <MSBuild Projects=\"{Xml(project.ProjectPath)}\" Targets=\"Restore\" BuildInParallel=\"false\" " +
                 $"ContinueOnError=\"ErrorAndContinue\" Properties=\"{Xml(string.Join(';', properties))}\" />");
+            // Positive per-project evidence (issue #290): printed only when the task above succeeded.
+            xml.AppendLine(
+                $"    <Message Importance=\"high\" Condition=\"'$(MSBuildLastTaskResult)' == 'true'\" " +
+                $"Text=\"{RestoreOutputParser.RestoredSentinel}{Xml(project.ProjectPath)}\" />");
         }
         xml.AppendLine("  </Target>");
         xml.AppendLine("</Project>");
