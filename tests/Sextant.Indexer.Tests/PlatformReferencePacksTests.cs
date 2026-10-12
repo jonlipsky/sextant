@@ -2,6 +2,7 @@ namespace Sextant.Indexer.Tests;
 
 /// <summary>Platform reference pack resolution, lookup order and allowlist (issue #295).</summary>
 [TestClass]
+[DoNotParallelize] // reads or sets NUGET_PACKAGES
 public sealed class PlatformReferencePacksTests
 {
     private string _dir = null!;
@@ -107,6 +108,52 @@ public sealed class PlatformReferencePacksTests
         var third = await PlatformReferencePacks.LocateAsync(pack, 10, options, _dir, null, CancellationToken.None);
         Assert.AreEqual(PlatformReferencePacks.SourcePacksDirectory, third!.Value.Source);
         Assert.AreEqual(1, downloader.Calls);
+    }
+
+    [TestMethod]
+    public async Task Locate_IgnoresAPackFolderWithoutTheCompletionMarker_AndDownloadsAgain()
+    {
+        var pack = new PlatformPackId("Microsoft.iOS.Ref.net10.0_27.0", "27.0.10722");
+        var folder = Path.Combine(_dir, "pkgs");
+        var partial = Path.Combine(folder, pack.Id.ToLowerInvariant(), pack.Version.ToLowerInvariant(), "ref", "net10.0");
+        Directory.CreateDirectory(partial);
+        File.WriteAllBytes(Path.Combine(partial, "Microsoft.iOS.dll"), []);
+        var downloader = new FakeDownloader(folder, pack);
+        var options = new PlatformPackOptions
+        {
+            PackageFolders = [folder], ScratchDirectory = Path.Combine(_dir, "scratch"), Downloader = downloader,
+        };
+
+        var result = await PlatformReferencePacks.LocateAsync(pack, 10, options, _dir, null, CancellationToken.None);
+
+        Assert.AreEqual(PlatformReferencePacks.SourceDownload, result!.Value.Source);
+        Assert.AreEqual(1, downloader.Calls);
+    }
+
+    [TestMethod]
+    public async Task Locate_PackageFolderPackIsAcceptedOnlyWithTheMarker_AndThePacksDirectoryWinsWithoutOne()
+    {
+        var pack = new PlatformPackId("Microsoft.iOS.Ref.net10.0_27.0", "27.0.10722");
+        var folder = Path.Combine(_dir, "pkgs");
+        var packDir = Path.Combine(folder, pack.Id.ToLowerInvariant(), pack.Version.ToLowerInvariant());
+        Directory.CreateDirectory(Path.Combine(packDir, "ref", "net10.0"));
+        File.WriteAllBytes(Path.Combine(packDir, "ref", "net10.0", "Microsoft.iOS.dll"), []);
+        var downloader = new FakeDownloader(Path.Combine(_dir, "other"), pack);
+        var options = new PlatformPackOptions { PackageFolders = [folder], Downloader = downloader };
+
+        Assert.IsNull(await PlatformReferencePacks.LocateAsync(pack, 10, options, _dir, null, CancellationToken.None));
+
+        File.WriteAllText(Path.Combine(packDir, ".nupkg.metadata"), "{}");
+        var accepted = await PlatformReferencePacks.LocateAsync(pack, 10, options, _dir, null, CancellationToken.None);
+        Assert.AreEqual(PlatformReferencePacks.SourcePackageFolder, accepted!.Value.Source);
+
+        File.Delete(Path.Combine(packDir, ".nupkg.metadata"));
+        var installed = Path.Combine(_dir, "packs", pack.Id, pack.Version, "ref", "net10.0");
+        Directory.CreateDirectory(installed);
+        File.WriteAllBytes(Path.Combine(installed, "Microsoft.iOS.dll"), []);
+        var sdk = await PlatformReferencePacks.LocateAsync(pack, 10, options, _dir, null, CancellationToken.None);
+        Assert.AreEqual(PlatformReferencePacks.SourcePacksDirectory, sdk!.Value.Source);
+        Assert.AreEqual(0, downloader.Calls);
     }
 
     [TestMethod]
@@ -302,6 +349,7 @@ public sealed class PlatformReferencePacksTests
             var refDir = Path.Combine(packageFolder, pack.Id.ToLowerInvariant(), pack.Version.ToLowerInvariant(), "ref", "net10.0");
             Directory.CreateDirectory(refDir);
             File.WriteAllBytes(Path.Combine(refDir, "Microsoft.iOS.dll"), []);
+            File.WriteAllText(Path.Combine(Path.GetDirectoryName(Path.GetDirectoryName(refDir))!, ".nupkg.metadata"), "{}");
             return Task.FromResult(true);
         }
     }

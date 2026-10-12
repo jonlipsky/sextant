@@ -247,7 +247,7 @@ public static partial class PlatformReferencePacks
             folders.Add(env);
         foreach (var folder in folders)
         {
-            if (ReferenceAssemblies(PackageDirectory(folder, pack), dotnetMajor) is { Count: > 0 } cached)
+            if (IsCompletePackage(PackageDirectory(folder, pack)) && ReferenceAssemblies(PackageDirectory(folder, pack), dotnetMajor) is { Count: > 0 } cached)
                 return (cached, SourcePackageFolder);
         }
 
@@ -285,10 +285,16 @@ public static partial class PlatformReferencePacks
             return null;
         }
 
-        return ReferenceAssemblies(PackageDirectory(target, pack), dotnetMajor) is { Count: > 0 } downloaded
+        return IsCompletePackage(PackageDirectory(target, pack))
+            && ReferenceAssemblies(PackageDirectory(target, pack), dotnetMajor) is { Count: > 0 } downloaded
             ? (downloaded, SourceDownload)
             : null;
     }
+
+    // NuGet writes .nupkg.metadata after a package is fully extracted, so a download that was cancelled or timed out
+    // mid-extraction is never taken for a present pack.
+    private static bool IsCompletePackage(string packageDirectory) =>
+        File.Exists(Path.Combine(packageDirectory, ".nupkg.metadata"));
 
     private static string PackageDirectory(string folder, PlatformPackId pack) =>
         Path.Combine(folder, pack.Id.ToLowerInvariant(), pack.Version.ToLowerInvariant());

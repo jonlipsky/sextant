@@ -3,6 +3,7 @@ using Sextant.Core;
 namespace Sextant.Core.Tests;
 
 [TestClass]
+[DoNotParallelize] // sets process environment variables
 public class ConfigurationTests
 {
     private string _tempDir = null!;
@@ -226,6 +227,46 @@ public class ConfigurationTests
         finally
         {
             Environment.SetEnvironmentVariable("SEXTANT_DOCUMENT_EXTRACTOR", null);
+        }
+    }
+
+    [TestMethod]
+    public void PlatformReferencePacks_DefaultsOff_AndJsonKeyTurnsItOn()
+    {
+        Assert.IsFalse(SextantConfiguration.Load(_tempDir).PlatformReferencePacks);
+
+        File.WriteAllText(Path.Combine(_tempDir, "sextant.json"), """{ "platform_reference_packs": true }""");
+        Assert.IsTrue(SextantConfiguration.Load(_tempDir).PlatformReferencePacks);
+    }
+
+    [TestMethod]
+    public void PlatformReferencePacks_EnvVarOverridesConfig()
+    {
+        File.WriteAllText(Path.Combine(_tempDir, "sextant.json"), """{ "platform_reference_packs": true }""");
+        try
+        {
+            Environment.SetEnvironmentVariable("SEXTANT_PLATFORM_REFERENCE_PACKS", "false");
+            Assert.IsFalse(SextantConfiguration.Load(_tempDir).PlatformReferencePacks);
+            Environment.SetEnvironmentVariable("SEXTANT_PLATFORM_REFERENCE_PACKS", "0");
+            Assert.IsFalse(SextantConfiguration.Load(_tempDir).PlatformReferencePacks);
+
+            File.WriteAllText(Path.Combine(_tempDir, "sextant.json"), """{ "platform_reference_packs": false }""");
+            foreach (var on in new[] { "true", "TRUE", "1" })
+            {
+                Environment.SetEnvironmentVariable("SEXTANT_PLATFORM_REFERENCE_PACKS", on);
+                Assert.IsTrue(SextantConfiguration.Load(_tempDir).PlatformReferencePacks, on);
+            }
+
+            File.WriteAllText(Path.Combine(_tempDir, "sextant.json"), """{ "platform_reference_packs": true }""");
+            foreach (var off in new[] { "yes", "on", "2", "garbage" })
+            {
+                Environment.SetEnvironmentVariable("SEXTANT_PLATFORM_REFERENCE_PACKS", off);
+                Assert.IsFalse(SextantConfiguration.Load(_tempDir).PlatformReferencePacks, off);
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("SEXTANT_PLATFORM_REFERENCE_PACKS", null);
         }
     }
 
