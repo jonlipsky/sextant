@@ -2117,7 +2117,7 @@ public sealed partial class SnapshotService : IDisposable
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            Console.Error.WriteLine($"maintenance: retention pass audit failed: {ex.GetType().Name}.");
+            await Console.Error.WriteLineAsync($"maintenance: retention pass audit failed: {ex.GetType().Name}.").ConfigureAwait(false);
         }
     }
 
