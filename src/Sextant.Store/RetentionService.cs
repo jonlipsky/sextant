@@ -91,11 +91,27 @@ public sealed class RetentionPlan
     private int _snapshotCursor;
     private int _runCursor;
     private int _commitCursor;
+    private readonly FileSweepCursor _fileSweep;
+    // This plan's own sweep position, seeded from the shared cursor; the shared one moves only when a batch commits.
+    private long _filePosition;
+    // The shared position as this plan last saw it: a finished sweep rewinds it only while it still holds that value.
+    private long _fileSeen;
+    private bool _filePublishPending;
+    private int _sweepSpansLeft;
+    private bool _fileVersionsDone;
+    private bool _apiStale;
+    private bool _apiTurn = true;
 
     internal RetentionPlan(RetentionReport report, List<long> snapshots, List<RetentionGeneration> runs,
         List<string> commits, bool apiDeferred, string? stopReason = null, HashSet<long>? deletableRunIds = null,
-        Dictionary<long, long?>? planRunIds = null)
+        Dictionary<long, long?>? planRunIds = null, ApiHistoryPlan? apiHistory = null, bool pruneFileVersions = false,
+        FileSweepCursor? fileSweep = null, int sweepSpans = RetentionService.MaxSweepSpansPerPass)
     {
+        _fileSweep = fileSweep ?? new FileSweepCursor();
+        _filePosition = _fileSeen = _fileSweep.Position;
+        _sweepSpansLeft = sweepSpans;
+        ApiHistory = apiHistory ?? new ApiHistoryPlan([], []);
+        _fileVersionsDone = !pruneFileVersions;
         PlanRunIds = planRunIds ?? [];
         DeletableRunIds = deletableRunIds ?? [];
         Report = report;
@@ -103,7 +119,7 @@ public sealed class RetentionPlan
         SnapshotSet = snapshots.ToHashSet();
         _runs = runs;
         _commits = commits;
-        ApiDeferred = apiDeferred;
+        _apiDeferred = apiDeferred;
         StopReason = stopReason;
     }
 
@@ -114,7 +130,8 @@ public sealed class RetentionPlan
     public string? StopReason { get; }
 
     /// <summary>The API-history candidates could not be computed in time; the next pass does them.</summary>
-    public bool ApiDeferred { get; }
+    public bool ApiDeferred => _apiDeferred || _apiStale;
+    private readonly bool _apiDeferred;
 
     internal HashSet<long> SnapshotSet { get; }
 
@@ -139,11 +156,101 @@ public sealed class RetentionPlan
     internal void AdvanceRun() => _runCursor++;
     internal string? PeekCommit() => _commitCursor < _commits.Count ? _commits[_commitCursor] : null;
     internal void AdvanceCommit() => _commitCursor++;
-    internal bool HasWork => PeekSnapshot() != null || PeekRun() != null || PeekCommit() != null;
+    internal bool HasWork => PeekSnapshot() != null || PeekRun() != null || (PeekCommit() != null && !_apiStale) || SweepPending;
 
-    internal (int, int, int) Mark() => (_snapshotCursor, _runCursor, _commitCursor);
-    internal void Restore((int, int, int) mark) => (_snapshotCursor, _runCursor, _commitCursor) = mark;
+    /// <summary>
+    /// The API-history keep window and the planned newest capture of each candidate commit, so a batch can re-verify a
+    /// candidate with index seeks instead of regrouping the whole API table (issue #317).
+    /// </summary>
+    internal ApiHistoryPlan ApiHistory { get; }
+
+    /// <summary>The last <c>file_versions</c> id the orphan sweep has examined; the sweep resumes after it.</summary>
+    internal long FileVersionCursor => _filePosition;
+    internal bool FileVersionsDone => _fileVersionsDone;
+
+    /// <summary>The sweep has ids left and this pass's span allowance is not used up.</summary>
+    internal bool SweepPending => !_fileVersionsDone && _sweepSpansLeft > 0;
+
+    // Moves only this plan's position; PublishFileSweep shares it once the batch has committed.
+    internal void AdvanceFileVersions(long lastExamined, bool done)
+    {
+        _filePosition = done ? 0 : lastExamined;
+        _fileVersionsDone = done;
+        _sweepSpansLeft--;
+        _filePublishPending = true;
+    }
+
+    // Called after a batch commits. Progress only moves the shared cursor forward; a finished sweep rewinds it only if
+    // no other pass moved it since this plan last saw it, so one pass finishing never resets another's progress.
+    internal void PublishFileSweep()
+    {
+        if (!_filePublishPending) return;
+        _filePublishPending = false;
+        _fileSeen = _fileVersionsDone ? (_fileSweep.TryRewind(_fileSeen) ? 0 : _fileSeen) : _fileSweep.Advance(_filePosition);
+    }
+
+    /// <summary>
+    /// A planned API candidate could not be re-verified with index seeks; the rest of the API history waits for the
+    /// next plan instead of running the full regroup inside a batch.
+    /// </summary>
+    internal bool ApiStale => _apiStale;
+    internal void MarkApiStale() => _apiStale = true;
+
+    /// <summary>Whose turn the next tail batch is: API history (true) or the blob sweep (false).</summary>
+    internal bool ApiTurn { get => _apiTurn; set => _apiTurn = value; }
+
+    // Restore never touches the shared cursor: a rolled-back batch published nothing.
+    internal PlanMark Mark() => new(_snapshotCursor, _runCursor, _commitCursor, _filePosition, _fileVersionsDone, _apiStale, _apiTurn, _sweepSpansLeft, _filePublishPending);
+    internal void Restore(PlanMark mark) =>
+        (_snapshotCursor, _runCursor, _commitCursor, _filePosition, _fileVersionsDone, _apiStale, _apiTurn, _sweepSpansLeft, _filePublishPending) =
+        (mark.Snapshot, mark.Run, mark.Commit, mark.FileCursor, mark.FileDone, mark.ApiStale, mark.ApiTurn, mark.SweepSpansLeft, mark.FilePublishPending);
 }
+
+internal readonly record struct PlanMark(int Snapshot, int Run, int Commit, long FileCursor, bool FileDone, bool ApiStale, bool ApiTurn,
+    int SweepSpansLeft, bool FilePublishPending);
+
+/// <summary>
+/// Where the orphan-blob sweep resumes: the last <c>file_versions</c> id it examined. The service keeps one for its
+/// lifetime so each pass continues where the last one stopped (issue #317); a restart begins again at 0. Plans seed a
+/// private position from it and publish back through <see cref="Advance"/>/<see cref="TryRewind"/> only on commit.
+/// </summary>
+public sealed class FileSweepCursor
+{
+    private readonly object _gate = new();
+    private long _position;
+
+    internal long Position
+    {
+        get { lock (_gate) return _position; }
+    }
+
+    /// <summary>Moves the position forward (never back); returns the position now held.</summary>
+    internal long Advance(long to)
+    {
+        lock (_gate)
+        {
+            if (to > _position) _position = to;
+            return _position;
+        }
+    }
+
+    /// <summary>Rewinds to 0 only if the position is still <paramref name="expected"/>.</summary>
+    internal bool TryRewind(long expected)
+    {
+        lock (_gate)
+        {
+            if (_position != expected) return false;
+            _position = 0;
+            return true;
+        }
+    }
+}
+
+/// <summary>
+/// What a plan knows about the API history: the newest-first keep window (commit, newest capture) and the newest
+/// capture each deletable commit had when planned.
+/// </summary>
+internal sealed record ApiHistoryPlan(List<(string Commit, long Newest)> Window, Dictionary<string, long> Candidates);
 
 /// <summary>
 /// Applies retention limits (<see cref="RetentionPolicy"/>) to a single index database while honoring a
@@ -167,7 +274,11 @@ public sealed class RetentionService
     private readonly SqliteConnection _connection;
     private readonly RetentionPolicy _policy;
     private readonly IReadOnlyList<IRetentionProtectionProvider> _providers;
+    private readonly FileSweepCursor? _fileSweep;
     private RetentionWorkBudget? _budget;
+
+    /// <summary>True while a batch is running that deleted no snapshot data (ledger/API/blob work only).</summary>
+    public bool TailBatchInProgress { get; private set; }
 
     /// <summary>The default pass budget (an interactive run); the service passes its own.</summary>
     public static TimeSpan PassTimeLimit { get; } = TimeSpan.FromSeconds(10);
@@ -176,14 +287,30 @@ public sealed class RetentionService
     public static TimeSpan BatchTimeLimit { get; } = TimeSpan.FromSeconds(2);
     public const int BatchRowLimit = 256;
 
+    /// <summary>The <c>file_versions</c> ids one batch of the orphan-blob sweep examines (issue #317).</summary>
+    internal const int FileSweepSpan = 4096;
+
+    /// <summary>
+    /// The spans one plan's sweep examines (256 x 4096 = about a million ids). Each id costs three index seeks (a few
+    /// microseconds), so a pass spends seconds of writer time on it rather than its whole budget; a larger table
+    /// finishes over several passes because the shared cursor persists, and a pass that only swept stops without
+    /// reporting <c>time_budget</c>.
+    /// </summary>
+    public const int MaxSweepSpansPerPass = 256;
+
+    /// <summary>Test seam: the per-plan sweep allowance handed to plans this service creates.</summary>
+    internal int SweepSpansPerPass { get; set; } = MaxSweepSpansPerPass;
+
     /// <summary>Test seam: runs inside a batch's transaction right before a snapshot unit is deleted.</summary>
     internal Action<long>? BeforeUnitDelete { get; set; }
 
     public RetentionService(
         SqliteConnection connection,
         RetentionPolicy policy,
-        IEnumerable<IRetentionProtectionProvider>? providers = null)
+        IEnumerable<IRetentionProtectionProvider>? providers = null,
+        FileSweepCursor? fileSweep = null)
     {
+        _fileSweep = fileSweep;
         _connection = connection;
         _policy = policy.Normalized();
         _providers = (providers ?? DefaultProviders).ToList();
@@ -203,7 +330,7 @@ public sealed class RetentionService
             budget.Check();
             Exec("BEGIN;");
             var (report, snapshots, _, protections) = ClassifyCore();
-            var commits = DeletableApiCommits(protections);
+            var (commits, _) = DeletableApiCommits(protections);
             var projects = snapshots.Sum(id => CountRows(RetentionCount.ProjectVersions, id));
             var apiRows = commits.Sum(commit => CountRows(RetentionCount.ApiRows, commit));
             var files = _policy.PruneSupersededSourceBlobs ? OrphanFileVersionIds(protections).Count : 0;
@@ -269,6 +396,7 @@ public sealed class RetentionService
 
         var runs = report.Deleted.ToList();
         var commits = new List<string>();
+        var apiHistory = new ApiHistoryPlan([], []);
         var apiDeferred = false;
         var remaining = limit - Stopwatch.GetElapsedTime(started);
         if (remaining <= TimeSpan.Zero)
@@ -281,7 +409,7 @@ public sealed class RetentionService
             {
                 budget.Check();
                 Exec("BEGIN;");
-                commits = DeletableApiCommits(BuildProtections());
+                (commits, apiHistory) = DeletableApiCommits(BuildProtections());
             }
             catch (Exception ex) when (IsBudgetOrBusy(ex, budget))
             {
@@ -298,7 +426,8 @@ public sealed class RetentionService
         }
 
         return new RetentionPlan(report with { DryRun = false, Deleted = [] }, snapshots, runs, commits, apiDeferred,
-            deletableRunIds: deletableRuns, planRunIds: planRunIds);
+            deletableRunIds: deletableRuns, planRunIds: planRunIds, apiHistory: apiHistory,
+            pruneFileVersions: _policy.PruneSupersededSourceBlobs, fileSweep: _fileSweep, sweepSpans: SweepSpansPerPass);
     }
 
     /// <summary>Applies bounded batches. Service callers acquire/release their writer gate around ExecuteBatch instead.</summary>
@@ -320,7 +449,7 @@ public sealed class RetentionService
             report = Combine(report, batch);
             if (batch.StopReason != null) return report;
         } while (report.MoreRemaining);
-        return plan.ApiDeferred ? report with { MoreRemaining = true, StopReason = "time_budget" } : report;
+        return plan.ApiDeferred ? report with { MoreRemaining = true, StopReason = "api_deferred" } : report;
     }
 
     /// <summary>One atomic batch computed from a fresh plan. Interrupted cascades roll back the entire batch.</summary>
@@ -413,7 +542,9 @@ public sealed class RetentionService
 
             // Do not remove ledger rows ahead of snapshot GC: they go once no snapshot data was touched in this batch.
             var deletedRuns = new List<RetentionGeneration>();
-            if (plan.PeekSnapshot() is null && projectsDeleted == 0 && snapshotsDeleted == 0)
+            var tailBatch = plan.PeekSnapshot() is null && projectsDeleted == 0 && snapshotsDeleted == 0;
+            TailBatchInProgress = tailBatch;
+            if (tailBatch)
             {
                 while (plan.PeekRun() is { } run && deletedRuns.Count < BatchRowLimit)
                 {
@@ -425,24 +556,43 @@ public sealed class RetentionService
                 }
             }
 
+            // The tail (ledger rows, API history, orphan blobs) runs only in a batch that deleted no snapshot data
+            // (issue #317): a slow tail step that hits the batch limit rolls the whole batch back, and must never
+            // take a finished deletion unit with it. API history and the blob sweep take turns, one per tail batch,
+            // so neither starves the other; a side with nothing left yields its turn.
             var apiDeleted = 0;
-            if (plan.PeekCommit() is { } commit)
+            var fileDeleted = 0;
+            if (tailBatch)
             {
-                budget.Check();
-                if (protections.IsCommitProtected(commit) || IsInApiKeepWindow(commit))
-                    plan.AdvanceCommit();
-                else
+                var apiWork = plan.PeekCommit() is not null && !plan.ApiStale;
+                var sweepWork = plan.SweepPending;
+                if (apiWork && (plan.ApiTurn || !sweepWork))
                 {
-                    apiDeleted = DeleteApiCommits([commit]);
-                    if (apiDeleted < BatchRowLimit) plan.AdvanceCommit();
+                    var commit = plan.PeekCommit()!;
+                    budget.Check();
+                    plan.ApiTurn = false;
+                    if (protections.IsCommitProtected(commit))
+                        plan.AdvanceCommit();
+                    else if (!IsOutsideApiKeepWindow(commit, plan))
+                        plan.MarkApiStale();
+                    else
+                    {
+                        apiDeleted = DeleteApiCommits([commit]);
+                        if (apiDeleted < BatchRowLimit) plan.AdvanceCommit();
+                    }
+                }
+                else if (sweepWork)
+                {
+                    plan.ApiTurn = true;
+                    fileDeleted = PruneOrphanFileVersions(plan, protections);
                 }
             }
-            var fileDeleted = _policy.PruneSupersededSourceBlobs ? PruneOrphanFileVersions(protections) : 0;
             var reclaimed = Math.Max(0, ScalarLong("PRAGMA freelist_count;") - freeBefore) * pageSize;
             budget.Check();
             beforeCommit?.Invoke();
             budget.Check();
             Exec("COMMIT;");
+            plan.PublishFileSweep();
             held.Stop();
             return plan.Report with
             {
@@ -457,7 +607,7 @@ public sealed class RetentionService
                 ReclaimedBytesKnown = true,
                 Batches = 1,
                 MaxBatchWriterHoldMs = held.Elapsed.TotalMilliseconds,
-                MoreRemaining = plan.HasWork || fileDeleted > 0 || apiDeleted > 0
+                MoreRemaining = plan.HasWork || apiDeleted > 0
             };
         }
         catch (Exception ex) when (IsBudgetOrBusy(ex, budget))
@@ -833,9 +983,9 @@ public sealed class RetentionService
     };
 
     /// <summary>API-history commits outside the keep window and not protected, oldest windowing first.</summary>
-    private List<string> DeletableApiCommits(RetentionProtectionSet protections)
+    private (List<string> Deletable, ApiHistoryPlan History) DeletableApiCommits(RetentionProtectionSet protections)
     {
-        var commits = new List<string>();
+        var commits = new List<(string Commit, long Newest)>();
         using (var cmd = _connection.CreateCommand())
         {
             cmd.CommandText = """
@@ -848,34 +998,56 @@ public sealed class RetentionService
             while (reader.Read())
             {
                 _budget?.Check();
-                commits.Add(reader.GetString(0));
+                commits.Add((reader.GetString(0), reader.GetInt64(1)));
             }
         }
 
         var deletable = new List<string>();
+        var history = new ApiHistoryPlan([], []);
         for (var i = 0; i < commits.Count; i++)
         {
             _budget?.Check();
-            if (i < _policy.ApiSnapshotKeepCommits) continue;
-            if (protections.IsCommitProtected(commits[i])) continue;
-            deletable.Add(commits[i]);
+            if (i < _policy.ApiSnapshotKeepCommits)
+            {
+                history.Window.Add(commits[i]);
+                continue;
+            }
+            if (protections.IsCommitProtected(commits[i].Commit)) continue;
+            deletable.Add(commits[i].Commit);
+            history.Candidates[commits[i].Commit] = commits[i].Newest;
         }
-        return deletable;
+        return (deletable, history);
     }
 
-    private bool IsInApiKeepWindow(string commit)
+    private long? NewestApiCapture(string commit)
     {
         using var cmd = _connection.CreateCommand();
-        cmd.CommandText = """
-            SELECT 1 FROM (
-                SELECT git_commit FROM api_surface_snapshots
-                GROUP BY git_commit
-                ORDER BY MAX(captured_at) DESC, git_commit DESC
-                LIMIT @keep) WHERE git_commit = @c;
-            """;
-        cmd.Parameters.AddWithValue("@keep", _policy.ApiSnapshotKeepCommits);
+        cmd.CommandText = "SELECT MAX(captured_at) FROM api_surface_snapshots WHERE git_commit = @c;";
         cmd.Parameters.AddWithValue("@c", commit);
-        return cmd.ExecuteScalar() is not null;
+        return cmd.ExecuteScalar() is long newest ? newest : null;
+    }
+
+    // Re-verifies a planned API candidate with index seeks (issue #317): regrouping the whole API table per batch took
+    // 4-14 s on a 25 M-row catalog. A commit is outside the keep window when at least `keep` window commits currently
+    // rank above it by (newest capture, commit), the order the window is cut in. Both sides are read now, so a partial
+    // delete of the candidate (which only lowers its newest capture) and a window commit gaining captures keep the
+    // check exact. A planned commit that cannot be shown outside this way is never settled by the full regroup inside a
+    // batch: the caller marks the plan's API step stale and the next plan recomputes it.
+    private bool IsOutsideApiKeepWindow(string commit, RetentionPlan plan)
+    {
+        var history = plan.ApiHistory;
+        if (!history.Candidates.ContainsKey(commit) || history.Window.Count < _policy.ApiSnapshotKeepCommits
+            || NewestApiCapture(commit) is not long candidate)
+            return false;
+        foreach (var (windowCommit, _) in history.Window)
+        {
+            _budget?.Check();
+            if (NewestApiCapture(windowCommit) is not long now) return false;
+            var order = now.CompareTo(candidate);
+            if (order == 0) order = string.CompareOrdinal(windowCommit, commit);
+            if (order <= 0) return false;
+        }
+        return true;
     }
 
     private int DeleteApiCommits(List<string> commits)
@@ -1080,11 +1252,41 @@ public sealed class RetentionService
 
     /// <summary>
     /// Prunes source blobs referenced by no live symbol/occurrence/comment (bounded, protected-set-aware —
-    /// issue #37). Materializes at most BatchRowLimit unprotected ids before deleting them.
+    /// issue #37). Resumable (issue #317): one batch examines the next <see cref="FileSweepSpan"/> ids after the plan's
+    /// cursor, so a sweep never rescans the referenced prefix it already passed, and its cost per batch is bounded by
+    /// the span rather than by how far the next orphans lie. The orphan test itself is unchanged.
     /// </summary>
-    private int PruneOrphanFileVersions(RetentionProtectionSet protections)
+    private int PruneOrphanFileVersions(RetentionPlan plan, RetentionProtectionSet protections)
     {
-        var ids = OrphanFileVersionIds(protections, BatchRowLimit);
+        var ids = new List<long>();
+        var examined = 0;
+        var last = plan.FileVersionCursor;
+        var capped = false;
+        using (var cmd = _connection.CreateCommand())
+        {
+            cmd.CommandText = """
+                SELECT fv.id,
+                       NOT EXISTS (SELECT 1 FROM symbols WHERE file_version_id = fv.id)
+                       AND NOT EXISTS (SELECT 1 FROM occurrences WHERE file_version_id = fv.id)
+                       AND NOT EXISTS (SELECT 1 FROM comments WHERE file_version_id = fv.id)
+                FROM (SELECT id FROM file_versions WHERE id > @after ORDER BY id LIMIT @span) fv;
+                """;
+            cmd.Parameters.AddWithValue("@after", plan.FileVersionCursor);
+            cmd.Parameters.AddWithValue("@span", FileSweepSpan);
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                _budget?.Check();
+                examined++;
+                last = reader.GetInt64(0);
+                if (reader.GetInt64(1) == 1 && !protections.IsFileVersionProtected(last)) ids.Add(last);
+                if (ids.Count >= BatchRowLimit)
+                {
+                    capped = true;
+                    break;
+                }
+            }
+        }
 
         var deleted = 0;
         foreach (var chunk in Chunk(ids, 256))
@@ -1094,6 +1296,7 @@ public sealed class RetentionService
             cmd.Parameters.AddWithValue("@ids", "[" + string.Join(",", chunk) + "]");
             deleted += cmd.ExecuteNonQuery();
         }
+        plan.AdvanceFileVersions(last, !capped && examined < FileSweepSpan);
         return deleted;
     }
 

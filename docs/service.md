@@ -2184,8 +2184,11 @@ with a one-second command retry limit. Request cancellation stops subsequent wor
 in-progress batch; earlier committed batches remain applied and have `retention`/`complete` audit rows
 with detail `execute_batch`. A queued publish runs before the next retention batch.
 
-`more_remaining: true` means another pass may be needed. `stop_reason: time_budget` or `sqlite_busy`
-explicitly reports bounded deferral, not completion. A timed-out plan also sets these fields; its empty
+`more_remaining: true` means another pass may be needed. `stop_reason: time_budget`, `api_deferred` (API-history
+candidates could not be planned or verified in time; the next pass does them) or `sqlite_busy`
+explicitly reports bounded deferral, not completion. The orphan-blob sweep examines at most 256 spans of 4096
+`file_versions` ids per pass and resumes from a shared in-memory cursor, so a very large table is swept over several
+passes without a stop reason. A timed-out plan also sets these fields; its empty
 counts are **not** a complete plan. Execution's `reclaimed_bytes_known: true` reports freed pages reusable
 by SQLite, **not a smaller database file**. No full VACUUM or blocking truncate-checkpoint runs on this hot
 path; the writer's existing automatic WAL checkpoints remain in effect. A pinned reader can still grow

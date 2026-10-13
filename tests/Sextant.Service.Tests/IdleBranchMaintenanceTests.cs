@@ -391,16 +391,15 @@ public class IdleBranchMaintenanceTests
         var audit = h.Service.RecentAudit(action: AuditAction.Retention);
         Assert.IsTrue(audit.Count > 0);
         Assert.IsTrue(audit.All(e => e.Actor == AuditLogStore.HashActor("retention_schedule")
-                                     && e.Detail == "execute_batch;source=retention_schedule"));
+                                     && e.Detail is "execute_batch;source=retention_schedule"
+                                         or "execute_pass;done;source=retention_schedule"));
     }
 
     [TestMethod]
     public async Task ScheduledRetention_AlreadyRunToday_IsNotRepeatedAfterARestart()
     {
         await using var h = Harness.Create(
-            maintenance: NoLoop() with { BranchIdleRetireDays = 0 },
-            // The audit log's timestamps are wall-clock, so this test's clock is too.
-            start: DateTimeOffset.UtcNow, retentionHour: 0);
+            maintenance: NoLoop() with { BranchIdleRetireDays = 0 }, retentionHour: 0);
         h.Start();
         Assert.AreEqual("ran", (await h.Service.RunMaintenanceTickAsync()).Retention);
 
@@ -408,6 +407,41 @@ public class IdleBranchMaintenanceTests
 
         Assert.AreEqual("not_due", (await h.Service.RunMaintenanceTickAsync()).Retention,
             "the audit log shows today's scheduled pass already ran");
+    }
+
+    [TestMethod]
+    public async Task ScheduledRetention_RestartMidContinuation_ResumesOnTheNextTick()
+    {
+        await using var h = Harness.Create(
+            maintenance: NoLoop() with { BranchIdleRetireDays = 0 }, retentionHour: 0);
+        h.Start();
+        var caller = SnapshotService.RetentionScheduleCaller;
+        var audit = new AuditLogStore(h.Db.GetConnection());
+        var at = ClockStart.AddMinutes(1).ToUnixTimeMilliseconds();
+        // Per-batch rows and a pass that asked to continue: neither closes the day.
+        audit.Append(AuditAction.Retention, AuditOutcome.Complete, actor: caller.Actor, detail: caller.Detail("execute_batch"), timestampMs: at);
+        audit.Append(AuditAction.Retention, AuditOutcome.Complete, actor: caller.Actor,
+            detail: caller.Detail(SnapshotService.RetentionPassContinueDetail), timestampMs: at);
+
+        h.Restart();
+
+        Assert.AreEqual("ran", (await h.Service.RunMaintenanceTickAsync()).Retention,
+            "a restart mid-continuation resumes instead of waiting for tomorrow");
+    }
+
+    [TestMethod]
+    public async Task ScheduledRetention_FinalPassRow_ClosesTheDayAfterARestart()
+    {
+        await using var h = Harness.Create(
+            maintenance: NoLoop() with { BranchIdleRetireDays = 0 }, retentionHour: 0);
+        h.Start();
+        var caller = SnapshotService.RetentionScheduleCaller;
+        new AuditLogStore(h.Db.GetConnection()).Append(AuditAction.Retention, AuditOutcome.Complete, actor: caller.Actor,
+            detail: caller.Detail(SnapshotService.RetentionPassDoneDetail), timestampMs: ClockStart.AddMinutes(1).ToUnixTimeMilliseconds());
+
+        h.Restart();
+
+        Assert.AreEqual("not_due", (await h.Service.RunMaintenanceTickAsync()).Retention);
     }
 
     [TestMethod]

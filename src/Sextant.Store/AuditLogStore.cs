@@ -223,10 +223,10 @@ public sealed class AuditLogStore(SqliteConnection connection)
     /// <paramref name="actor"/> (an already-hashed actor, <see cref="HashActor"/>) — filtered in SQL, so no number of
     /// other rows can hide it (issue #299).
     /// </summary>
-    public bool HasActionByActor(string action, string actor, long sinceTs, long untilTs) =>
-        HasAction(action, outcome: null, sinceTs, untilTs, actor);
+    public bool HasActionByActor(string action, string actor, long sinceTs, long untilTs, string? detailPrefix = null) =>
+        HasAction(action, outcome: null, sinceTs, untilTs, actor, detailPrefix);
 
-    private bool HasAction(string action, string? outcome, long? sinceTs, long? untilTs, string? actor)
+    private bool HasAction(string action, string? outcome, long? sinceTs, long? untilTs, string? actor, string? detailPrefix = null)
     {
         using var cmd = connection.CreateCommand();
         cmd.CommandText = """
@@ -236,13 +236,15 @@ public sealed class AuditLogStore(SqliteConnection connection)
                   AND (@outcome IS NULL OR outcome = @outcome)
                   AND (@since IS NULL OR ts >= @since)
                   AND (@until IS NULL OR ts < @until)
-                  AND (@actor IS NULL OR actor = @actor));
+                  AND (@actor IS NULL OR actor = @actor)
+                  AND (@detail IS NULL OR instr(detail, @detail) = 1));
             """;
         cmd.Parameters.AddWithValue("@action", action);
         cmd.Parameters.AddWithValue("@outcome", (object?)outcome ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@since", (object?)sinceTs ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@until", (object?)untilTs ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@actor", (object?)actor ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@detail", (object?)detailPrefix ?? DBNull.Value);
         return Convert.ToInt64(cmd.ExecuteScalar()) != 0;
     }
 

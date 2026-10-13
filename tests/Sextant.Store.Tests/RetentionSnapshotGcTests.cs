@@ -335,6 +335,46 @@ public class RetentionSnapshotGcTests
         Assert.IsNull(runs.GetById(consumerRun));
     }
 
+    [TestMethod]
+    public void DeletionBatch_CarriesNoTailWork_SoASlowTailCannotRollItBack()
+    {
+        var retention = new RetentionService(_conn, Policy());
+        var plan = retention.CreatePlan();
+        var first = retention.ExecuteBatch(plan);
+        Assert.IsTrue(first.SnapshotProjectVersionsDeleted > 0);
+        Assert.AreEqual(0, first.ApiSnapshotsDeleted);
+        Assert.AreEqual(0, first.FileVersionsDeleted);
+        Assert.AreEqual(0, first.Deleted.Count);
+    }
+
+    [TestMethod]
+    public void Batches_MakeMonotonicProgress_MatchUnboundedPass_AndNeverDeleteProtected()
+    {
+        var retention = new RetentionService(_conn, Policy());
+        var plan = retention.CreatePlan();
+        var total = new RetentionReport { DryRun = false };
+        var batches = 0;
+        long lastSnapshots = ScalarLong("SELECT COUNT(*) FROM snapshots;");
+        do
+        {
+            var batch = retention.ExecuteBatch(plan);
+            Assert.IsNull(batch.StopReason);
+            total = RetentionService.Combine(total, batch);
+            var snapshots = ScalarLong("SELECT COUNT(*) FROM snapshots;");
+            Assert.IsTrue(snapshots <= lastSnapshots, "a batch never un-deletes or re-adds");
+            lastSnapshots = snapshots;
+            Assert.IsTrue(++batches < 100);
+        } while (total.MoreRemaining);
+
+        Assert.AreEqual(2, total.SnapshotsDeleted);
+        Assert.IsNull(_snapshots.GetById(_consumerOld));
+        Assert.IsNull(_snapshots.GetById(_providerOrphan));
+        Assert.IsNotNull(_snapshots.GetById(_consumerNew));
+        Assert.IsNotNull(_snapshots.GetById(_providerShared));
+        Assert.IsNotNull(_snapshots.GetById(_branchPointed));
+        Assert.AreEqual(1L, ProjectCount(_consumerNew));
+    }
+
     private void Exec(string sql)
     {
         using var cmd = _conn.CreateCommand();

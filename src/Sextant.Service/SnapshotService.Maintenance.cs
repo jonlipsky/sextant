@@ -504,7 +504,7 @@ public sealed partial class SnapshotService
             execute: true, RetentionScheduleCaller, cancellationToken,
             TimeSpan.FromSeconds(Math.Clamp(policy.RetentionPassSeconds, 1, MaintenancePolicy.MaxRetentionPassSeconds))).ConfigureAwait(false);
         var durationMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
-        _lastScheduledRetentionDay = today;
+        _lastScheduledRetentionDay = ScheduledRetentionContinues(report) ? _lastScheduledRetentionDay : today;
         _metrics.RecordScheduledRetention(report, now.ToUnixTimeMilliseconds(), durationMs);
         Log($"maintenance: scheduled retention deleted {report.SnapshotsDeleted} snapshot(s), " +
             $"{report.FileVersionsDeleted} file version(s), {report.SourceTextsDeleted ?? 0} source text(s) in {durationMs:F0} ms" +
@@ -514,6 +514,13 @@ public sealed partial class SnapshotService
             IdleBranches = idle, Retention = "ran", RetentionReport = report, RetentionDurationMs = durationMs
         };
     }
+
+    // A scheduled pass that ran out of budget with work left, having deleted something, stays due: the next tick continues
+    // it (issue #317) instead of leaving the rest for tomorrow. A pass that left work but deleted nothing is done for the
+    // day, so a stuck catalog is not re-planned every tick.
+    internal static bool ScheduledRetentionContinues(RetentionReport report) =>
+        report.MoreRemaining && (report.SnapshotsDeleted + report.SnapshotProjectVersionsDeleted + report.ApiSnapshotsDeleted +
+            report.FileVersionsDeleted + report.Deleted.Count + (report.SourceTextsDeleted ?? 0)) > 0;
 
     // A production holds the writer for its whole run, and a write waiting for its turn would queue behind it: either
     // way a retention pass now would only spend its budget waiting, or delay that write (issue #299).
@@ -527,14 +534,15 @@ public sealed partial class SnapshotService
         return _writeGate.CurrentCount == 0;
     }
 
-    // The UTC day of today's scheduled retention when one already ran today (a restart after it ran), from the audit
-    // log's retention rows attributed to retention_schedule; else null.
+    // The UTC day of today's scheduled retention when a pass that asked for no continuation already ended today (a
+    // restart after it ran), from the audit log's pass rows attributed to retention_schedule; else null. A pass that
+    // asked to continue, or per-batch rows with no pass row, leave the day open.
     private DateOnly? LastScheduledRetentionDay(DateOnly today)
     {
         var dayStart = new DateTimeOffset(today.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero).ToUnixTimeMilliseconds();
         var dayEnd = dayStart + (long)TimeSpan.FromDays(1).TotalMilliseconds;
         using var reader = OpenReadConnection();
-        return new AuditLogStore(reader).HasActionByActor(AuditAction.Retention, RetentionScheduleCaller.Actor!, dayStart, dayEnd)
+        return new AuditLogStore(reader).HasActionByActor(AuditAction.Retention, RetentionScheduleCaller.Actor!, dayStart, dayEnd, RetentionPassDoneDetail)
             ? today
             : null;
     }
