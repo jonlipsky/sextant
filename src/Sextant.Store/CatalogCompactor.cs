@@ -277,7 +277,7 @@ public static class CatalogCompactor
     private static long CountRows(SqliteConnection connection, string table)
     {
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = "SELECT COUNT(*) FROM \"" + table.Replace("\"", "\"\"", StringComparison.Ordinal) + "\";";
+        cmd.CommandText = "SELECT COUNT(*) FROM \"" + table.Replace("\"", "\"\"", StringComparison.Ordinal) + "\";"; // NOSONAR S2077: identifier read from sqlite_master of the catalog being compacted, double-quote escaped; no user input, and a table name cannot be a bound parameter
         return Convert.ToInt64(cmd.ExecuteScalar());
     }
 
