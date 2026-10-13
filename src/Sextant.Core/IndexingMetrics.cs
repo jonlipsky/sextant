@@ -62,6 +62,9 @@ public sealed class ProjectTiming
     /// <summary>The project's display name (for <c>load</c>, the project file name).</summary>
     public required string Project { get; init; }
 
+    /// <summary>For the symbol phase (issue #288): the project's stable key across jobs (repo-relative path and target framework), used to hint later compile order.</summary>
+    public string? Key { get; set; }
+
     /// <summary>Wall-clock time spent on this project in this phase, in milliseconds.</summary>
     public long WallMs { get; set; }
 
@@ -83,6 +86,9 @@ public sealed class ProjectTiming
     /// <summary>For the symbol phase: when the compilation ended, in ms from the phase's start.</summary>
     public long? CompileEndedAtMs { get; set; }
 
+    /// <summary>For the symbol phase: the project's full compile duration in milliseconds, used as a hint for later jobs. Unlike the window it includes the part of a prefetch that ran before the walk reached the project.</summary>
+    public long? CompileCostMs { get; set; }
+
     /// <summary>For the symbol phase: whether the prefetch succeeded and finished before the phase reached the project (a failed or cancelled prefetch is a miss).</summary>
     public bool? CompilePrefetchHit { get; set; }
 
@@ -91,6 +97,16 @@ public sealed class ProjectTiming
 
     /// <summary>For <c>load</c>: projects added to the workspace by this open (the project plus references it pulled in).</summary>
     public int? ProjectsAdded { get; set; }
+}
+
+/// <summary>How the compile-cost hints (issue #288) applied to a run.</summary>
+public sealed class CompileHintsMetric
+{
+    /// <summary>Projects the hints carried a compile cost for.</summary>
+    public int Hinted { get; init; }
+
+    /// <summary>Projects compiled ahead of their walk position because of the hints.</summary>
+    public int Promoted { get; init; }
 }
 
 /// <summary>
@@ -198,6 +214,9 @@ public sealed class IndexingMetrics
 
     /// <summary>For incremental runs, the number of changed files processed.</summary>
     public int ChangedFileCount { get; set; }
+
+    /// <summary>Compile-cost hints the symbol phase's prefetcher was given (issue #288), or null when it had none.</summary>
+    public CompileHintsMetric? CompileHints { get; set; }
 
     /// <summary>Per-phase timing, in execution order.</summary>
     public List<PhaseMetric> Phases { get; } = [];

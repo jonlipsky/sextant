@@ -181,6 +181,9 @@ public sealed class BenchmarkReport
             sb.AppendLine();
         }
 
+        if (m.CompileHints is { } hints)
+            sb.AppendLine($"- Compile cost hints: {hints.Hinted} projects hinted, {hints.Promoted} compiled first\n");
+
         var slowest = m.Projects.OrderByDescending(p => p.WallMs).Take(10).ToList();
         if (slowest.Count > 0)
         {

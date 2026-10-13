@@ -388,7 +388,11 @@ public sealed class LocalIndexerSnapshotWorker(
             {
                 await orchestrator.IndexSolutionAsync(
                     load.Solution, progress: null, metrics: indexing, cancellationToken: token,
-                    snapshotContext: indexContext, solutionMembership: load.Membership).ConfigureAwait(false);
+                    snapshotContext: indexContext, solutionMembership: load.Membership,
+                    compileCostHints: CompileCostHintLoader.Load(
+                        new SnapshotJobStore(database.GetConnection()), request.RepositoryRemoteUrl,
+                        EffectiveBranchName(request), log))
+                    .ConfigureAwait(false);
             }
             finally
             {
@@ -958,6 +962,9 @@ public sealed class LocalIndexerSnapshotWorker(
     /// component (issue #113); the orchestrator folds it into the identity of every snapshot it publishes.
     /// <paramref name="restorePolicy"/> is the restore runner's identity component, folded the same way.
     /// </summary>
+    /// <summary>The branch a job is recorded and published under: the requested one, else <c>main</c>.</summary>
+    internal static string EffectiveBranchName(EnsureSnapshotRequest request) => request.BranchName ?? "main";
+
     internal static SnapshotContext CreateSnapshotContext(
         EnsureSnapshotRequest request, WorkerCapability? capability, string? sdkPinPolicy = null,
         string? restorePolicy = null) => new()
@@ -965,7 +972,7 @@ public sealed class LocalIndexerSnapshotWorker(
         RepositoryRemoteUrl = request.RepositoryRemoteUrl,
         CommitSha = request.CommitSha,
         TreeSha = request.TreeSha,
-        BranchName = request.BranchName ?? "main",
+        BranchName = EffectiveBranchName(request),
         IsDefaultBranch = request.ResolveIsDefaultBranch(),
         // Stamp the producing node's capability fingerprint (Phase 15) so the published snapshot's
         // identity + provenance record what evaluated it. Null when unset — an ordinary local index
@@ -980,7 +987,7 @@ public sealed class LocalIndexerSnapshotWorker(
         // Issue #199: a caller that may not pick the default gets the first-branch default only for the remote's own
         // default branch, as the service verified it. Null for every other ensure, so its advance is unchanged.
         AllowImplicitDefault = request.RestrictsImplicitDefault
-            ? request.AllowsImplicitDefault(request.BranchName ?? "main")
+            ? request.AllowsImplicitDefault(EffectiveBranchName(request))
             : null,
         // Issue #113: must equal the service's ServiceOptions.SdkPinIdentityComponent, or the service's
         // ValidateWorkerResult fails the job closed (published identity != requested identity).

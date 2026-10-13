@@ -71,7 +71,8 @@ public sealed class IndexOrchestrator
         string? workingTreeDelta = null,
         string? fallbackReason = null,
         GitStatePin? gitStatePin = null,
-        IReadOnlyList<SolutionMembership>? solutionMembership = null)
+        IReadOnlyList<SolutionMembership>? solutionMembership = null,
+        CompileCostHints? compileCostHints = null)
     {
         var totalStopwatch = Stopwatch.StartNew();
         var phaseStopwatch = new Stopwatch();
@@ -696,11 +697,26 @@ public sealed class IndexOrchestrator
             || (projectRoslynToId.TryGetValue(project.Id, out var budgetProjectId) && PastExtractionDeadline(budgetProjectId));
 
         // Issue #269: compile the projects ahead of the symbol walk, which is otherwise compile-bound on one core.
+        string? HintKeyOf(Project project) =>
+            projectRoslynToId.TryGetValue(project.Id, out var hintProjectId)
+            && bindingProjectPaths.TryGetValue(hintProjectId, out var hintPath)
+                ? CompileCostHints.KeyOf(hintPath.Path, hintPath.TargetFramework)
+                : null;
         bool ExtractsSymbols(Project project) =>
             project.FilePath != null && projectRoslynToId.ContainsKey(project.Id) && processSet.Contains(project.Id);
         await using var prefetch = new CompilationPrefetcher(
             solution.Projects.Where(ExtractsSymbols).ToList(), _parallelism.MaxParallelism, cancellationToken,
-            recordTimings: metrics != null);
+            recordTimings: metrics != null, hints: compileCostHints, keyOf: HintKeyOf);
+        if (compileCostHints is { Count: > 0 })
+        {
+            if (metrics != null)
+                metrics.CompileHints = new CompileHintsMetric { Hinted = compileCostHints.Count, Promoted = prefetch.Promoted.Count };
+            _log?.Invoke(
+                $"  Compile cost hints: {compileCostHints.Count} project(s) hinted, {prefetch.Promoted.Count} compiled first" +
+                (prefetch.Promoted.Count > 0
+                    ? ": " + string.Join(", ", prefetch.Promoted.Select(p => $"{p.Key} ({p.CostMs} ms)"))
+                    : "."));
+        }
 
         foreach (var project in solution.Projects)
         {
@@ -812,6 +828,9 @@ public sealed class IndexOrchestrator
             {
                 Phase = IndexPhaseNames.ExtractingSymbols,
                 Project = project.Name,
+                Key = bindingProjectPaths.TryGetValue(projectId, out var timingPath)
+                    ? CompileCostHints.KeyOf(timingPath.Path, timingPath.TargetFramework)
+                    : null,
                 WallMs = projectWatch.ElapsedMilliseconds,
                 CompileMs = compileMs,
                 AnalyzeMs = analyzedAt - compileMs,
@@ -819,6 +838,7 @@ public sealed class IndexOrchestrator
                 CompileRequestedAtMs = compileWindow.Requested,
                 CompileStartedAtMs = compileWindow.Started,
                 CompileEndedAtMs = compileWindow.Ended,
+                CompileCostMs = metrics != null ? prefetch.CompileCostMs(project.Id, reachedAtMs, walkStartedMs, walkEndedMs) : null,
                 CompilePrefetchHit = prefetchHit,
                 Rows = symbols.Count
             });

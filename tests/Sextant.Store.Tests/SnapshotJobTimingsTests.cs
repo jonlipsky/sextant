@@ -55,4 +55,32 @@ public class SnapshotJobTimingsTests
         }
         Assert.IsNull(jobs.GetTimings(first.Id), "the timings go with their job (ON DELETE CASCADE)");
     }
+
+    [TestMethod]
+    public void RecentCompletedTimingsOfRepository_ReturnsOnlyCompletedJobsOfThatRepository_NewestFirst()
+    {
+        using var db = new IndexDatabase(_dbPath);
+        db.RunMigrations();
+        var jobs = new SnapshotJobStore(db.GetConnection());
+        long Job(string identity, string url, string branch, string status, string json)
+        {
+            var (job, _) = jobs.EnsureJob(identity, url, identity, branch);
+            jobs.MarkResult(job.Id, status, null, null);
+            jobs.ReplaceTimings(job.Id, json);
+            Thread.Sleep(5);
+            return job.Id;
+        }
+
+        Job("i1", "https://example.test/a.git", "main", SnapshotJobStatus.Complete, "{\"n\":1}");
+        Job("i2", "https://example.test/b.git", "main", SnapshotJobStatus.Complete, "{\"n\":2}");
+        Job("i3", "https://EXAMPLE.test/a", "dev", SnapshotJobStatus.Partial, "{\"n\":3}");
+        Job("i4", "https://example.test/a.git", "main", SnapshotJobStatus.Failed, "{\"n\":4}");
+
+        var rows = jobs.RecentCompletedTimingsOfRepository("https://example.test/a.git", 10);
+
+        CollectionAssert.AreEqual(new[] { "{\"n\":3}", "{\"n\":1}" }, rows.Select(r => r.TimingsJson).ToArray());
+        CollectionAssert.AreEqual(new[] { "dev", "main" }, rows.Select(r => r.BranchName).ToArray());
+        Assert.HasCount(1, jobs.RecentCompletedTimingsOfRepository("https://example.test/a.git", 1));
+        Assert.IsEmpty(jobs.RecentCompletedTimingsOfRepository("https://example.test/none.git", 10));
+    }
 }
