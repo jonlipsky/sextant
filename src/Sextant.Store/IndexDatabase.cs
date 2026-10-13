@@ -157,6 +157,7 @@ public sealed class IndexDatabase : IDisposable
         // A negative cache_size is a size in KiB rather than a page count, so the budget holds whatever the page size.
         var cache = _writeOptions.CacheMib > 0 ? $"PRAGMA cache_size = {-_writeOptions.CacheMib * 1024L};" : "";
         cmd.CommandText = $"""
+            PRAGMA auto_vacuum = INCREMENTAL;
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA foreign_keys = ON;

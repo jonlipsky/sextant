@@ -29,7 +29,8 @@ var rootCommand = new RootCommand("Sextant — Roslyn-based semantic code indexe
     InstallCommand.Build(dbOption, profileOption),
     UninstallCommand.Build(),
     ProfilesCommand.Build(profileOption),
-    RetentionCommand.Build(dbOption, profileOption)
+    RetentionCommand.Build(dbOption, profileOption),
+    CatalogCommand.Build(dbOption)
 };
 
 // Legacy: treat bare .sln path as "index <path>"

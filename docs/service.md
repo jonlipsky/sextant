@@ -2170,11 +2170,22 @@ it does not fit, so it can never keep snapshot GC from progressing.
 SQLite's progress handler interrupts long planning/deletion statements at a **2-second batch work
 deadline**; an interrupted batch rolls back whole.
 
-**Oversized units (issue #303).** The 2-second batch deadline does not apply to the batch's one deletion unit (a
-single snapshot project cascade): a batch always completes at least one unit, so an unusually large cascade cannot
+**Chunked project deletion (issue #252).** A snapshot project version is no longer deleted by one FK cascade. Each
+batch deletes at most `RetentionService.ProjectChunkRows` (5000) rows of the snapshot's first remaining project
+version, in this order: its occurrences, comments and API-surface rows; then its symbols in groups of 256 (with the
+occurrences and relationships that target or originate from them); then its file versions and files; the project row
+last. A batch is one transaction, so the writer is released between chunks, and the candidate is re-verified at the
+start of every chunk. A half-deleted project version is already withdrawn (never published, never served) and its state
+is in the catalog itself (the first project still present), so the next chunk, in this or a later pass, continues it;
+the snapshot row goes only once its last project is gone. `project_chunk_rows_deleted` in the report counts the rows.
+On the production-catalog copy this took the longest single writer hold from 8-9 s to under 1 s (831 ms).
+The 60-second unit cap below is now a backstop for a single chunk.
+
+**Oversized units (issue #303).** The 2-second batch deadline does not apply to the batch's one deletion unit (one
+chunk of a snapshot project cascade): a batch always completes at least one unit, so an unusually large chunk cannot
 stall retention, but a unit is bounded by a hard cap, `SEXTANT_SERVICE_RETENTION_UNIT_MAX_SECONDS` (default 60,
-`0` or less = default, capped at 600). A unit that runs past the cap is **rolled back whole** (a snapshot's deletion is never split
-across transactions, since a half-deleted snapshot could be re-selected by a branch advance), reported in the pass
+`0` or less = default, capped at 600). A unit that runs past the cap is **rolled back whole**,
+reported in the pass
 report as `oversized_snapshot_ids` / `oversized`, logged to stderr, and the pass continues with the next unit. The
 oversized snapshot stays; the service remembers it in memory and skips it for the rest of the UTC day (reported as
 `oversized_deferred`), then retries it. `max_batch_writer_hold_ms` shows the longest writer hold,
@@ -2190,9 +2201,24 @@ explicitly reports bounded deferral, not completion. The orphan-blob sweep exami
 `file_versions` ids per pass and resumes from a shared in-memory cursor, so a very large table is swept over several
 passes without a stop reason. A timed-out plan also sets these fields; its empty
 counts are **not** a complete plan. Execution's `reclaimed_bytes_known: true` reports freed pages reusable
-by SQLite, **not a smaller database file**. No full VACUUM or blocking truncate-checkpoint runs on this hot
-path; the writer's existing automatic WAL checkpoints remain in effect. A pinned reader can still grow
-the WAL. Compaction is a separate offline operator action, not an implicit retention step.
+by SQLite, **not a smaller database file**. No full VACUUM runs on the hot path. A catalog created with
+`auto_vacuum = INCREMENTAL` (every new catalog; `IndexDatabase` sets it before the first table exists) gives disk back
+at the end of an executed pass: bounded `PRAGMA incremental_vacuum(8192)` steps (32 MiB at 4 KiB pages), each its own
+writer turn so a queued publish goes first, then one non-blocking `wal_checkpoint(TRUNCATE)` (the busy wait is zero for
+that call, so a reader pinning the WAL makes it return busy at once; it is logged and retried next pass). Vacuuming stops
+a 2 s safety margin before the pass limit, and the checkpoint runs on the service lifetime, not the spent pass token.
+`pages_vacuumed` reports it; a pass that
+spends its budget with free pages left reports `more_remaining` / `stop_reason: vacuum_budget`. On a catalog created
+before this change (`auto_vacuum = NONE`) the step is a no-op and freed pages are only reused; switch it once with the
+offline `sextant catalog compact` ([runbook](runbooks.md#runbook-offline-catalog-compaction-sextant-catalog-compact)).
+A pinned reader can still grow the WAL.
+
+**Scheduling contract.** Safe to run daily and cheap to continue: every pass is bounded by its work budget, every
+transaction is bounded (a batch, a project chunk, a vacuum step) and the writer is released between them, so indexing
+publishes interleave. The maintenance loop runs the scheduled pass once per UTC day from
+`SEXTANT_SERVICE_RETENTION_SCHEDULE_HOUR_UTC`; a pass that stops with `more_remaining` after making progress (rows deleted,
+chunk rows deleted or pages vacuumed) stays due, so the hourly maintenance tick continues it until a pass finishes or
+makes no progress. Repeated bounded passes converge to the same state as one unbounded pass.
 
 Branch pointers, open PRs, pending retry snapshots, and their transitive overlay/provider closure are
 never eligible. Restaging a retry binds `snapshots.run_id` to its new publishing run in the staging

@@ -59,6 +59,15 @@ public sealed record RetentionReport
 
     public int OversizedDeferred => OversizedDeferredSnapshotIds.Count;
 
+    /// <summary>
+    /// Child rows (occurrences, symbols, ...) removed by bounded project-version delete chunks (issue #252), whether or
+    /// not their project row is gone yet. A chunk that did not finish its project still counts as progress.
+    /// </summary>
+    public long ProjectChunkRowsDeleted { get; init; }
+
+    /// <summary>Pages an incremental vacuum handed back to the file system at the end of an executed pass (issue #252).</summary>
+    public long PagesVacuumed { get; init; }
+
     public long ReclaimedBytes { get; init; }
     /// <summary>Space estimates are unavailable on a read-only plan; execution measures reusable pages, not disk shrinkage.</summary>
     public bool ReclaimedBytesKnown { get; init; }
@@ -280,12 +289,25 @@ public sealed class RetentionService
     /// <summary>True while a batch is running that deleted no snapshot data (ledger/API/blob work only).</summary>
     public bool TailBatchInProgress { get; private set; }
 
+    /// <summary>True when the running batch deleted a project row or a snapshot (a chunk of rows alone is not).</summary>
+    public bool ProjectOrSnapshotDeletedInBatch { get; private set; }
+
     /// <summary>The default pass budget (an interactive run); the service passes its own.</summary>
     public static TimeSpan PassTimeLimit { get; } = TimeSpan.FromSeconds(10);
 
     /// <summary>The longest one write batch may run, which bounds how long it holds the writer.</summary>
     public static TimeSpan BatchTimeLimit { get; } = TimeSpan.FromSeconds(2);
     public const int BatchRowLimit = 256;
+
+    /// <summary>
+    /// The rows one write batch deletes directly from a project version's child tables (issue #252): occurrences,
+    /// symbols, relationships and so on, in chunks, with the project row last. Cascaded flow rows and file-version
+    /// SET NULL updates ride on top of these.
+    /// </summary>
+    public const int ProjectChunkRows = 5000;
+
+    /// <summary>Test seam: the chunk size handed to project-version deletes.</summary>
+    internal int ProjectChunkRowLimit { get; set; } = ProjectChunkRows;
 
     /// <summary>The <c>file_versions</c> ids one batch of the orphan-blob sweep examines (issue #317).</summary>
     internal const int FileSweepSpan = 4096;
@@ -488,6 +510,7 @@ public sealed class RetentionService
             var pageSize = ScalarLong("PRAGMA page_size;");
             var freeBefore = ScalarLong("PRAGMA freelist_count;");
             var projectsDeleted = 0;
+            long chunkRowsDeleted = 0;
             var snapshotsDeleted = 0;
             var skipped = 0;
 
@@ -509,10 +532,8 @@ public sealed class RetentionService
                 {
                     BeforeUnitDelete?.Invoke(id);
                     WithdrawAffectedPublication(affected);
-                    using var cmd = _connection.CreateCommand();
-                    cmd.CommandText = "DELETE FROM projects WHERE id IN (SELECT id FROM projects WHERE snapshot_id = @id ORDER BY id LIMIT 1);";
-                    cmd.Parameters.AddWithValue("@id", id);
-                    projectsDeleted = cmd.ExecuteNonQuery();
+                    projectsDeleted = DeleteProjectChunk(id, out var chunkRows) ? 1 : 0;
+                    chunkRowsDeleted += chunkRows;
                     if (CountRows(RetentionCount.ProjectVersions, id) == 0)
                     {
                         snapshotsDeleted = DeleteEmptySnapshot(id);
@@ -544,6 +565,7 @@ public sealed class RetentionService
             var deletedRuns = new List<RetentionGeneration>();
             var tailBatch = plan.PeekSnapshot() is null && projectsDeleted == 0 && snapshotsDeleted == 0;
             TailBatchInProgress = tailBatch;
+            ProjectOrSnapshotDeletedInBatch = projectsDeleted > 0 || snapshotsDeleted > 0;
             if (tailBatch)
             {
                 while (plan.PeekRun() is { } run && deletedRuns.Count < BatchRowLimit)
@@ -600,6 +622,7 @@ public sealed class RetentionService
                 Deleted = deletedRuns,
                 SnapshotsDeleted = snapshotsDeleted,
                 SnapshotProjectVersionsDeleted = projectsDeleted,
+                ProjectChunkRowsDeleted = chunkRowsDeleted,
                 SnapshotsSkipped = skipped,
                 ApiSnapshotsDeleted = apiDeleted,
                 FileVersionsDeleted = fileDeleted,
@@ -672,6 +695,8 @@ public sealed class RetentionService
         OversizedDeferredSnapshotIds = total.OversizedDeferredSnapshotIds.Concat(batch.OversizedDeferredSnapshotIds).ToList(),
         ApiSnapshotsDeleted = total.ApiSnapshotsDeleted + batch.ApiSnapshotsDeleted,
         FileVersionsDeleted = total.FileVersionsDeleted + batch.FileVersionsDeleted,
+        ProjectChunkRowsDeleted = total.ProjectChunkRowsDeleted + batch.ProjectChunkRowsDeleted,
+        PagesVacuumed = total.PagesVacuumed + batch.PagesVacuumed,
         ReclaimedBytes = total.ReclaimedBytes + batch.ReclaimedBytes,
         ReclaimedBytesKnown = total.ReclaimedBytesKnown || batch.ReclaimedBytesKnown,
         Batches = total.Batches + batch.Batches,
@@ -1235,6 +1260,120 @@ public sealed class RetentionService
         }
         return evict.ToList();
     }
+
+    /// <summary>
+    /// Deletes up to <see cref="ProjectChunkRowLimit"/> rows of the snapshot's first project version, child tables
+    /// first, and the project row itself only once everything under it is gone (issue #252). The cascade of a single
+    /// large project held the writer for seconds; a chunk per batch keeps every transaction short and releases the
+    /// writer between chunks. The state lives in the database (a half-deleted project is simply the first project
+    /// left), so no plan state is needed, and every batch re-verifies the snapshot before calling this.
+    /// Returns true when the project row was deleted by this call.
+    /// </summary>
+    private bool DeleteProjectChunk(long snapshotId, out int rows)
+    {
+        rows = 0;
+        long projectId;
+        using (var pick = _connection.CreateCommand())
+        {
+            pick.CommandText = "SELECT id FROM projects WHERE snapshot_id = @id ORDER BY id LIMIT 1;";
+            pick.Parameters.AddWithValue("@id", snapshotId);
+            if (pick.ExecuteScalar() is not long found) return false;
+            projectId = found;
+        }
+
+        var remaining = Math.Max(1, ProjectChunkRowLimit);
+        foreach (var sql in ProjectOwnedChunkSql)
+        {
+            var deleted = ChunkStep(sql, projectId, null, remaining);
+            rows += deleted;
+            remaining -= deleted;
+            if (remaining <= 0) return false;
+        }
+
+        while (true)
+        {
+            var symbolIds = FirstSymbolIds(projectId, Math.Min(SymbolChunkSize, remaining));
+            if (symbolIds.Count == 0) break;
+            var ids = "[" + string.Join(",", symbolIds) + "]";
+            foreach (var sql in SymbolEdgeChunkSql)
+            {
+                var deleted = ChunkStep(sql, projectId, ids, remaining);
+                rows += deleted;
+                remaining -= deleted;
+                if (remaining <= 0) return false;
+            }
+            var symbolsDeleted = ChunkStep(DeleteSymbolsChunkSql, projectId, ids, remaining);
+            rows += symbolsDeleted;
+            remaining -= symbolsDeleted;
+            if (remaining <= 0) return false;
+        }
+
+        foreach (var sql in ProjectFileChunkSql)
+        {
+            var deleted = ChunkStep(sql, projectId, null, remaining);
+            rows += deleted;
+            remaining -= deleted;
+            if (remaining <= 0) return false;
+        }
+
+        _budget?.Check();
+        using var project = _connection.CreateCommand();
+        project.CommandText = "DELETE FROM projects WHERE id = @p;";
+        project.Parameters.AddWithValue("@p", projectId);
+        var removed = project.ExecuteNonQuery();
+        rows += removed;
+        return removed > 0;
+    }
+
+    private int ChunkStep(string sql, long projectId, string? symbolIds, int limit)
+    {
+        _budget?.Check();
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = sql;
+        cmd.Parameters.AddWithValue("@n", limit);
+        if (sql.Contains("@p", StringComparison.Ordinal)) cmd.Parameters.AddWithValue("@p", projectId);
+        if (symbolIds is not null) cmd.Parameters.AddWithValue("@ids", symbolIds);
+        return cmd.ExecuteNonQuery();
+    }
+
+    private List<long> FirstSymbolIds(long projectId, int limit)
+    {
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "SELECT id FROM symbols WHERE project_id = @p LIMIT @n;";
+        cmd.Parameters.AddWithValue("@p", projectId);
+        cmd.Parameters.AddWithValue("@n", limit);
+        var ids = new List<long>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read()) ids.Add(reader.GetInt64(0));
+        return ids;
+    }
+
+    private const int SymbolChunkSize = 256;
+
+    private static readonly string[] ProjectOwnedChunkSql =
+    [
+        "DELETE FROM occurrences WHERE id IN (SELECT id FROM occurrences WHERE in_project_id = @p LIMIT @n);",
+        "DELETE FROM comments WHERE id IN (SELECT id FROM comments WHERE project_id = @p LIMIT @n);",
+        "DELETE FROM api_surface_snapshots WHERE id IN (SELECT id FROM api_surface_snapshots WHERE project_id = @p LIMIT @n);"
+    ];
+
+    // Edges that point at, or start from, a chunk of the project's symbols, from any project (a cross-project usage).
+    private static readonly string[] SymbolEdgeChunkSql =
+    [
+        "DELETE FROM occurrences WHERE id IN (SELECT id FROM occurrences WHERE target_symbol_id IN (SELECT value FROM json_each(@ids)) LIMIT @n);",
+        "DELETE FROM occurrences WHERE id IN (SELECT id FROM occurrences WHERE source_symbol_id IS NOT NULL AND source_symbol_id IN (SELECT value FROM json_each(@ids)) LIMIT @n);",
+        "DELETE FROM relationships WHERE id IN (SELECT id FROM relationships WHERE from_symbol_id IN (SELECT value FROM json_each(@ids)) LIMIT @n);",
+        "DELETE FROM relationships WHERE id IN (SELECT id FROM relationships WHERE to_symbol_id IN (SELECT value FROM json_each(@ids)) LIMIT @n);"
+    ];
+
+    private const string DeleteSymbolsChunkSql =
+        "DELETE FROM symbols WHERE id IN (SELECT value FROM json_each(@ids));";
+
+    private static readonly string[] ProjectFileChunkSql =
+    [
+        "DELETE FROM file_versions WHERE id IN (SELECT fv.id FROM file_versions fv JOIN files f ON f.id = fv.file_id WHERE f.project_id = @p LIMIT @n);",
+        "DELETE FROM files WHERE id IN (SELECT id FROM files WHERE project_id = @p LIMIT @n);"
+    ];
 
     /// <summary>
     /// Deletes the catalog row only after all of its owned project versions have been collected.

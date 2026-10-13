@@ -84,6 +84,8 @@ internal static class RetentionHandler
         Console.WriteLine($"  Source blobs deleted:          {report.FileVersionsDeleted}");
         Console.WriteLine($"  Reusable pages:                {(report.ReclaimedBytesKnown ? FormatBytes(report.ReclaimedBytes) : "not estimated (read-only plan)")}");
         Console.WriteLine($"  More remaining:                {report.MoreRemaining}");
+        if (!report.DryRun)
+            Console.WriteLine($"  Batches / longest writer hold: {report.Batches} / {report.MaxBatchWriterHoldMs:F0} ms (project chunk rows {report.ProjectChunkRowsDeleted})");
         if (report.StopReason != null) Console.WriteLine($"  Stopped:                       {report.StopReason}");
 
         if (report.DryRun)

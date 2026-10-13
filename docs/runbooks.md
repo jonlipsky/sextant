@@ -123,18 +123,44 @@ loop. Local executed retention still requires exclusive writer-lease ownership; 
 the daemon/service.
 
 Plans report `reclaimed_bytes_known: false`: a read-only plan cannot simulate cascade freelist deltas.
-Execution measures **reusable pages**, not disk shrinkage. Retention no longer runs full `VACUUM` or a
-blocking `wal_checkpoint(TRUNCATE)`; normal automatic WAL checkpoints remain configured on the writer.
-Full compaction is a separate **offline**, explicitly approved maintenance operation requiring enough
-temporary disk space for a database rewrite. No incremental-auto-vacuum migration is introduced.
+Execution measures **reusable pages**. Retention never runs a full `VACUUM`. A catalog created with
+`auto_vacuum = INCREMENTAL` shrinks at the end of an executed service pass through bounded
+`incremental_vacuum` steps and a `wal_checkpoint(TRUNCATE)` (`pages_vacuumed` in the report). A project version is deleted
+in chunks of at most 5000 rows per transaction, so the writer is never held for a whole cascade. An older catalog
+(`auto_vacuum = NONE`, check with `PRAGMA auto_vacuum;`) only reuses its free pages; switch it with the offline
+procedure below.
 
 Snapshots with a legacy abandoned/NULL retry-generation pointer are deliberately retained until their
 ownership can be established; this release neither migrates nor repairs them. All branch heads, pending
 retries, open PR roots, and required providers/bases remain protected.
 
-**Scheduling is deferred.** The API supports one bounded pass per future approved daily invocation, but
-this change adds no timer, workflow, production settings, or deletion approval. Validate the report and
-bounded behavior on a representative non-production catalog before approving any production schedule.
+**Scheduling.** The service's maintenance loop runs one bounded pass a day and continues an unfinished one on the
+hourly tick (see [Bounded retention contract](service.md#bounded-retention-contract-127--252)). Each pass and each
+transaction is bounded and the writer is released between batches, chunks and vacuum steps.
+
+---
+
+## Runbook: offline catalog compaction (`sextant catalog compact`)
+
+Use once per catalog created before `auto_vacuum = INCREMENTAL` (and when a large one holds far more free pages than it
+needs). It rewrites the catalog into a new file; it needs the service **stopped** and free space in the output's directory of about the input's size (plus its `-wal`) and a
+margin (check `PRAGMA freelist_count;` x page size for how much will be saved). The command refuses to run while the
+input's writer lease is held or it has a non-empty `-wal`, refuses a leftover `<out>.compacting` file (it names it; delete
+it yourself), points SQLite's temporary files at the output's directory (`SQLITE_TMPDIR`, `TMP` on Windows, restored
+afterwards), and Ctrl-C removes its own staging files.
+
+1. Stop the service (maintenance window). Leave the original file, its `-wal` and `-shm` in place.
+2. `sextant catalog compact --db /data/catalog.db --out /data/catalog.compact.db` (add `--full-integrity-check` for the
+   slower `PRAGMA integrity_check` instead of `quick_check`, and `--count-rows` to compare every table's row count
+   between input and output). The input is opened read-only and never modified. The command runs
+   `PRAGMA auto_vacuum = INCREMENTAL` then `VACUUM INTO`, confirms the output reports `auto_vacuum = 2`, checks it, prints
+   both sizes and the elapsed time, and writes the final file only if the checks pass. It refuses an existing output.
+3. Keep the old file. Move it (with its `-wal`/`-shm`) aside, rename the output to the catalog's path, start the service
+   and watch `/health`, `/ready` and one `resolve` before removing the old file. To roll back, stop the service and put
+   the old files back. Writes made after the swap are not in the old file.
+4. The next executed retention pass now returns free pages incrementally.
+
+On the 93 GB production-catalog copy (1.74 M free pages) the command took 3 h 40 min and produced an 81.7 GB file (11.4 GB saved), with `quick_check` taking about 2 h of that. Plan for several hours of downtime.
 
 ---
 
