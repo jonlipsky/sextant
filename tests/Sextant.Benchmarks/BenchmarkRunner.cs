@@ -21,6 +21,9 @@ public sealed class BenchmarkOptions
     public string WorkDir { get; init; } = Path.Combine(Path.GetTempPath(), "sextant-benchmarks");
 
     public bool Restore { get; init; } = true;
+
+    /// <summary>Whether the <see cref="ServicePath"/> restore uses static-graph evaluation; defaults to the service's.</summary>
+    public bool StaticGraphRestore { get; init; } = PackageRestoreRunner.DefaultStaticGraphRestore;
     public bool RunIncremental { get; init; } = true;
     public bool Redact { get; init; }
     public int SampleIntervalMs { get; init; } = 50;
@@ -371,9 +374,11 @@ public sealed class BenchmarkRunner
         var scratch = Path.Combine(options.WorkDir, "restore-scratch");
         Directory.CreateDirectory(scratch);
         var restoreSw = Stopwatch.StartNew();
+        PackageRestoreOutcome? restore = null;
         if (options.Restore)
         {
-            var restore = await new PackageRestoreRunner(timeout: SourceRestoreTimeout, log: log)
+            restore = await new PackageRestoreRunner(
+                    timeout: SourceRestoreTimeout, log: log, staticGraphRestore: options.StaticGraphRestore)
                 .RunAsync(checkoutDir, selection.SolutionPaths, limit: null, ct, scratch);
             log($"Restore: {restore.SolutionsSucceeded}/{restore.SolutionsAttempted} solution(s) clean.");
         }
@@ -403,6 +408,9 @@ public sealed class BenchmarkRunner
             Mode = result.LoadMode,
             SolutionsSelected = selection.SolutionPaths.Count,
             RestoreMs = restoreSw.ElapsedMilliseconds,
+            StaticGraphRestore = options.Restore && options.StaticGraphRestore,
+            StaticGraphPasses = restore?.StaticGraphPasses ?? 0,
+            StaticGraphFallbacks = restore?.StaticGraphFallbacks ?? 0,
             WallMs = result.LoadMs,
             ProjectsLoaded = result.Solution.ProjectIds.Count,
             ProjectsOpened = result.LoadTimings.Count,

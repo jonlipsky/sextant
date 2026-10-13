@@ -119,6 +119,12 @@ public sealed record JobRestoreTimings
     /// <summary>Wall-clock time of the restore, in milliseconds.</summary>
     public long WallMs { get; init; }
 
+    /// <summary>True when at least one restore pass ran with static-graph evaluation (issue #272); see <see cref="StaticGraphFallbacks"/>.</summary>
+    public bool StaticGraph { get; init; }
+
+    /// <summary>Static-graph passes that failed as a whole and were re-run once without it (issue #272).</summary>
+    public int StaticGraphFallbacks { get; init; }
+
     /// <summary>Solutions whose whole restore failed and was retried project by project (issue #304).</summary>
     public int SolutionsRetriedPerProject { get; init; }
 
@@ -214,6 +220,8 @@ public sealed class JobTimingsRecorder
             FallbackReason = restore.UnionFallbackReason,
             PackageFolder = persistentPackageFolder ? "persistent" : "scratch",
             WallMs = (long)restore.Elapsed.TotalMilliseconds,
+            StaticGraph = restore.StaticGraphPasses > 0,
+            StaticGraphFallbacks = restore.StaticGraphFallbacks,
             SolutionsRetriedPerProject = restore.SolutionsRetriedPerProject,
             ProjectsRetried = restore.ProjectsRetried,
             SolutionsSkippedRedundant = restore.SolutionsSkippedRedundant,

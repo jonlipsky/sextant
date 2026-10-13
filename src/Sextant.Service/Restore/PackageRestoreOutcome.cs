@@ -75,6 +75,12 @@ public sealed record PackageRestoreOutcome
     /// <summary>Projects the per-project retries restored one by one.</summary>
     public int ProjectsRetried { get; init; }
 
+    /// <summary>Per-solution restore passes run with static-graph evaluation (issue #272).</summary>
+    public int StaticGraphPasses { get; init; }
+
+    /// <summary>Static-graph passes that failed as a whole and were re-run once without it (issue #272).</summary>
+    public int StaticGraphFallbacks { get; init; }
+
     /// <summary>
     /// Selected solutions the per-solution fallback did not restore because every project they declare was already
     /// restored cleanly by an earlier (broader) solution of the same job (issue #290).
