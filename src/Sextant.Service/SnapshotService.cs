@@ -2087,6 +2087,44 @@ public sealed partial class SnapshotService : IDisposable
         bool execute, AuditCaller principal = default, CancellationToken cancellationToken = default,
         TimeSpan? passLimit = null)
     {
+        var passStartedMs = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
+        var report = await RunRetentionPassAsync(execute, principal, cancellationToken, passLimit).ConfigureAwait(false);
+        if (execute && report.Batches > 0)
+            await AuditRetentionPassAsync(report, principal, passStartedMs).ConfigureAwait(false);
+        return report;
+    }
+
+    internal const string RetentionPassDoneDetail = "execute_pass;done";
+    internal const string RetentionPassContinueDetail = "execute_pass;continue";
+
+    // One audit row per executed pass, written after it ends. It records whether the pass asks for a continuation, which
+    // is what a restart reads to tell a finished day from one cut short (issue #317). A pass that never reaches this
+    // row (a crash, shutdown) leaves no "done" row, so the next tick continues it.
+    // The row is stamped with the pass's START, so a pass that straddles UTC midnight closes the day it began on.
+    private async Task AuditRetentionPassAsync(RetentionReport report, AuditCaller principal, long passStartedMs)
+    {
+        try
+        {
+            await WithWriteAsync(() =>
+            {
+                EnsureLeaseHeld();
+                new AuditLogStore(_conn).Append(AuditAction.Retention, AuditOutcome.Complete, actor: principal.Actor,
+                    detail: principal.Detail(ScheduledRetentionContinues(report) ? RetentionPassContinueDetail : RetentionPassDoneDetail),
+                    costBytes: report.ReclaimedBytes, timestampMs: passStartedMs);
+                return Task.FromResult(0);
+            }, _lifetime.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Console.Error.WriteLine($"maintenance: retention pass audit failed: {ex.GetType().Name}.");
+        }
+    }
+
+    private readonly FileSweepCursor _fileSweepCursor = new();
+
+    private async Task<RetentionReport> RunRetentionPassAsync(
+        bool execute, AuditCaller principal, CancellationToken cancellationToken, TimeSpan? passLimit)
+    {
         using var activity = ServiceTelemetry.Source.StartActivity("retention");
         activity?.SetTag("sextant.execute", execute);
         var limit = passLimit ?? RetentionService.PassTimeLimit;
@@ -2106,7 +2144,7 @@ public sealed partial class SnapshotService : IDisposable
 
             RetentionPlan plan;
             using (var reader = OpenReadConnection())
-                plan = new RetentionService(reader, _options.Retention).CreatePlan(pass.Token, limit);
+                plan = new RetentionService(reader, _options.Retention, fileSweep: _fileSweepCursor).CreatePlan(pass.Token, limit);
             if (plan.StopReason != null)
                 return new RetentionReport { DryRun = false, MoreRemaining = true, StopReason = plan.StopReason };
             var deferred = OversizedToDeferToday();
@@ -2120,11 +2158,14 @@ public sealed partial class SnapshotService : IDisposable
                     pass.Token.ThrowIfCancellationRequested();
                     var remaining = limit - System.Diagnostics.Stopwatch.GetElapsedTime(started);
                     var batchLimit = remaining < RetentionService.BatchTimeLimit ? remaining : RetentionService.BatchTimeLimit;
-                    return Task.FromResult(new RetentionService(_conn, _options.Retention).ExecuteBatch(plan, pass.Token, batchLimit, () =>
+                    var retention = new RetentionService(_conn, _options.Retention);
+                    return Task.FromResult(retention.ExecuteBatch(plan, pass.Token, batchLimit, () =>
                     {
                         EnsureLeaseHeld();
-                        new AuditLogStore(_conn).Append(AuditAction.Retention, AuditOutcome.Complete,
-                            actor: principal.Actor, detail: principal.Detail("execute_batch"));
+                        // A batch that deleted no snapshot data (ledger/API/blob work) is covered by the pass row.
+                        if (!retention.TailBatchInProgress)
+                            new AuditLogStore(_conn).Append(AuditAction.Retention, AuditOutcome.Complete,
+                                actor: principal.Actor, detail: principal.Detail("execute_batch"));
                     }));
                 }, pass.Token).ConfigureAwait(false);
                 report = RetentionService.Combine(report, batch);
@@ -2148,7 +2189,7 @@ public sealed partial class SnapshotService : IDisposable
             }, pass.Token).ConfigureAwait(false);
             report = report with { SourceTextsDeleted = sweep.SourceTextsDeleted,
                 MoreRemaining = sweep.MoreRemaining || plan.ApiDeferred,
-                StopReason = sweep.StopReason ?? (plan.ApiDeferred ? "time_budget" : null) };
+                StopReason = sweep.StopReason ?? (plan.ApiDeferred ? "api_deferred" : null) };
         }
         catch (OperationCanceledException) when (!lifetime.IsCancellationRequested && pass.IsCancellationRequested)
         {
