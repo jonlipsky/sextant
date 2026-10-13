@@ -520,7 +520,8 @@ public sealed partial class SnapshotService
     // day, so a stuck catalog is not re-planned every tick.
     internal static bool ScheduledRetentionContinues(RetentionReport report) =>
         report.MoreRemaining && (report.SnapshotsDeleted + report.SnapshotProjectVersionsDeleted + report.ApiSnapshotsDeleted +
-            report.FileVersionsDeleted + report.Deleted.Count + (report.SourceTextsDeleted ?? 0)) > 0;
+            report.FileVersionsDeleted + report.Deleted.Count + (report.SourceTextsDeleted ?? 0) +
+            report.ProjectChunkRowsDeleted + report.PagesVacuumed) > 0;
 
     // A production holds the writer for its whole run, and a write waiting for its turn would queue behind it: either
     // way a retention pass now would only spend its budget waiting, or delay that write (issue #299).

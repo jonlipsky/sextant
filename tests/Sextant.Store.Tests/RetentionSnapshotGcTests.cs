@@ -375,6 +375,114 @@ public class RetentionSnapshotGcTests
         Assert.AreEqual(1L, ProjectCount(_consumerNew));
     }
 
+    [TestMethod]
+    public void ChunkedProjectDelete_MatchesUnboundedCascade_AndNeverExceedsChunkPerBatch()
+    {
+        var coProj = ScalarLong($"SELECT id FROM projects WHERE snapshot_id = {_consumerOld};");
+        var fv = _coBlob;
+        Exec($"""
+            WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 40)
+            INSERT INTO symbols (project_id, symbol_key, fully_qualified_name, display_name, kind, accessibility,
+                                 file_version_id, line_start, line_end, last_indexed_at)
+            SELECT {coProj}, 'global::co.X' || i, 'global::co.X' || i, 'X' || i, 0, 0, {fv}, 1, 2, {_now} FROM n;
+            """);
+        Exec($"""
+            INSERT INTO occurrences (in_project_id, target_symbol_id, source_symbol_id, file_version_id, line, col, kind, flags, last_indexed_at)
+            SELECT {coProj}, s.id, CASE WHEN s.id % 2 = 0 THEN s.id END, {fv}, s.id, 1, 0, 0, {_now}
+            FROM symbols s WHERE s.project_id = {coProj};
+            """);
+        var retainedOccurrences = ScalarLong("SELECT COUNT(*) FROM occurrences;") - ScalarLong($"SELECT COUNT(*) FROM occurrences WHERE in_project_id = {coProj};");
+        var retainedSymbols = ScalarLong($"SELECT COUNT(*) FROM symbols WHERE project_id IN (SELECT id FROM projects WHERE snapshot_id IN ({_consumerNew}, {_providerShared}, {_branchPointed}));");
+        Assert.IsTrue(ScalarLong($"SELECT COUNT(*) FROM occurrences WHERE in_project_id = {coProj};") >= 41);
+
+        const int chunk = 7;
+        var retention = new RetentionService(_conn, Policy()) { ProjectChunkRowLimit = chunk };
+        var plan = retention.CreatePlan();
+        var total = new RetentionReport { DryRun = false };
+        var batches = 0;
+        do
+        {
+            long rowsBefore = ScalarLong("SELECT (SELECT COUNT(*) FROM occurrences) + (SELECT COUNT(*) FROM symbols);");
+            var batch = retention.ExecuteBatch(plan);
+            long rowsAfter = ScalarLong("SELECT (SELECT COUNT(*) FROM occurrences) + (SELECT COUNT(*) FROM symbols);");
+            Assert.IsNull(batch.StopReason);
+            Assert.IsTrue(batch.ProjectChunkRowsDeleted <= chunk, $"batch deleted {batch.ProjectChunkRowsDeleted} chunk rows");
+            Assert.IsTrue(rowsBefore - rowsAfter <= chunk, $"batch removed {rowsBefore - rowsAfter} symbol/occurrence rows");
+            total = RetentionService.Combine(total, batch);
+            Assert.IsTrue(++batches < 500);
+        } while (total.MoreRemaining);
+
+        Assert.IsTrue(batches > 5, "the project needed several bounded transactions");
+        Assert.AreEqual(2, total.SnapshotsDeleted);
+        Assert.AreEqual(0L, ScalarLong($"SELECT COUNT(*) FROM occurrences WHERE in_project_id = {coProj};"));
+        Assert.AreEqual(0L, ScalarLong($"SELECT COUNT(*) FROM symbols WHERE project_id = {coProj};"));
+        Assert.AreEqual(0L, ScalarLong($"SELECT COUNT(*) FROM files WHERE project_id = {coProj};"));
+        Assert.AreEqual(0, ProjectCount(_consumerOld));
+        Assert.AreEqual(retainedOccurrences, ScalarLong("SELECT COUNT(*) FROM occurrences;"));
+        Assert.AreEqual(retainedSymbols, ScalarLong("SELECT COUNT(*) FROM symbols;"));
+        Assert.IsNotNull(_snapshots.GetById(_consumerNew));
+        Assert.IsNotNull(_snapshots.GetById(_providerShared));
+    }
+
+    [TestMethod]
+    public void ChunkedProjectDelete_StopsMidProject_WhenTheProjectBecomesProtected_ThenLeavesTheRest()
+    {
+        var coProj = ScalarLong($"SELECT id FROM projects WHERE snapshot_id = {_consumerOld};");
+        Exec($"""
+            WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 30)
+            INSERT INTO symbols (project_id, symbol_key, fully_qualified_name, display_name, kind, accessibility,
+                                 file_version_id, line_start, line_end, last_indexed_at)
+            SELECT {coProj}, 'global::co.Y' || i, 'global::co.Y' || i, 'Y' || i, 0, 0, {_coBlob}, 1, 2, {_now} FROM n;
+            """);
+        var retention = new RetentionService(_conn, Policy()) { ProjectChunkRowLimit = 4 };
+        var plan = retention.CreatePlan();
+        var first = retention.ExecuteBatch(plan);
+        Assert.IsTrue(first.MoreRemaining);
+        Assert.AreEqual(0, first.SnapshotsDeleted, "a partly deleted project does not complete its snapshot");
+
+        // The snapshot becomes branch-pointed before the next chunk: the re-verification stops the deletion.
+        var branch = _snapshots.EnsureBranch(_snapshots.GetById(_consumerOld)!.RepositoryId, "late", false, _now);
+        _snapshots.SetBranchPointer(branch, _consumerOld, _now);
+        var rest = retention.ExecuteBatch(plan);
+        Assert.AreEqual(0, rest.ProjectChunkRowsDeleted);
+        Assert.IsNotNull(_snapshots.GetById(_consumerOld));
+    }
+
+    [TestMethod]
+    public void ProjectOrSnapshotDeletedInBatch_IsFalseForChunkOnlyBatches_TrueWhenAProjectRowGoes()
+    {
+        var coProj = ScalarLong($"SELECT id FROM projects WHERE snapshot_id = {_consumerOld};");
+        Exec($"""
+            WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 30)
+            INSERT INTO symbols (project_id, symbol_key, fully_qualified_name, display_name, kind, accessibility,
+                                 file_version_id, line_start, line_end, last_indexed_at)
+            SELECT {coProj}, 'global::co.Z' || i, 'global::co.Z' || i, 'Z' || i, 0, 0, {_coBlob}, 1, 2, {_now} FROM n;
+            """);
+        var retention = new RetentionService(_conn, Policy()) { ProjectChunkRowLimit = 4 };
+        var plan = retention.CreatePlan();
+        var sawChunkOnly = false;
+        var sawDeletion = false;
+        var guard = 0;
+        RetentionReport batch;
+        do
+        {
+            var deleted = false;
+            batch = retention.ExecuteBatch(plan, beforeCommit: () => deleted = retention.ProjectOrSnapshotDeletedInBatch);
+            if (batch.ProjectChunkRowsDeleted > 0 && batch.SnapshotProjectVersionsDeleted == 0 && batch.SnapshotsDeleted == 0)
+            {
+                Assert.IsFalse(deleted, "a chunk of rows alone is not a project/snapshot deletion");
+                sawChunkOnly = true;
+            }
+            if (batch.SnapshotProjectVersionsDeleted > 0 || batch.SnapshotsDeleted > 0)
+            {
+                Assert.IsTrue(deleted);
+                sawDeletion = true;
+            }
+        } while (batch.MoreRemaining && ++guard < 500);
+        Assert.IsTrue(sawChunkOnly);
+        Assert.IsTrue(sawDeletion);
+    }
+
     private void Exec(string sql)
     {
         using var cmd = _conn.CreateCommand();

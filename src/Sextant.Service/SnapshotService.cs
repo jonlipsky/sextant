@@ -2109,7 +2109,8 @@ public sealed partial class SnapshotService : IDisposable
             {
                 EnsureLeaseHeld();
                 new AuditLogStore(_conn).Append(AuditAction.Retention, AuditOutcome.Complete, actor: principal.Actor,
-                    detail: principal.Detail(ScheduledRetentionContinues(report) ? RetentionPassContinueDetail : RetentionPassDoneDetail),
+                    detail: principal.Detail(ScheduledRetentionContinues(report) ? RetentionPassContinueDetail : RetentionPassDoneDetail)
+                        + (report.ProjectChunkRowsDeleted > 0 ? $";chunk_rows={report.ProjectChunkRowsDeleted}" : ""),
                     costBytes: report.ReclaimedBytes, timestampMs: passStartedMs);
                 return Task.FromResult(0);
             }, _lifetime.Token).ConfigureAwait(false);
@@ -2162,8 +2163,9 @@ public sealed partial class SnapshotService : IDisposable
                     return Task.FromResult(retention.ExecuteBatch(plan, pass.Token, batchLimit, () =>
                     {
                         EnsureLeaseHeld();
-                        // A batch that deleted no snapshot data (ledger/API/blob work) is covered by the pass row.
-                        if (!retention.TailBatchInProgress)
+                        // One row per project or snapshot actually deleted; chunk-only batches and tail batches are
+                        // covered by the pass row (which carries the chunk counts).
+                        if (retention.ProjectOrSnapshotDeletedInBatch)
                             new AuditLogStore(_conn).Append(AuditAction.Retention, AuditOutcome.Complete,
                                 actor: principal.Actor, detail: principal.Detail("execute_batch"));
                     }));
@@ -2190,12 +2192,81 @@ public sealed partial class SnapshotService : IDisposable
             report = report with { SourceTextsDeleted = sweep.SourceTextsDeleted,
                 MoreRemaining = sweep.MoreRemaining || plan.ApiDeferred,
                 StopReason = sweep.StopReason ?? (plan.ApiDeferred ? "api_deferred" : null) };
+
+            // Give disk back (issue #252): bounded incremental_vacuum steps, the writer released between them.
+            // A no-op on a catalog created before auto_vacuum=INCREMENTAL (it needs `sextant catalog compact`).
+            // Vacuuming stops a safety margin before the pass limit, so the final checkpoint and the report never run
+            // on a cancelled pass token; whatever happens, the pages vacuumed so far stay in the report.
+            long pagesVacuumed = 0;
+            var vacuumLeft = false;
+            var vacuumStop = limit - TimeSpan.FromTicks(Math.Min(limit.Ticks / 4, VacuumSafetyMargin.Ticks));
+            try
+            {
+                while (true)
+                {
+                    if (System.Diagnostics.Stopwatch.GetElapsedTime(started) >= vacuumStop)
+                    {
+                        using var reader = OpenReadConnection();
+                        vacuumLeft = IncrementalVacuum.IsIncremental(reader) && IncrementalVacuum.FreelistPages(reader) > 0;
+                        break;
+                    }
+                    var step = await WithWriteAsync(() =>
+                    {
+                        pass.Token.ThrowIfCancellationRequested();
+                        EnsureLeaseHeld();
+                        var freed = IncrementalVacuum.Step(_conn);
+                        return Task.FromResult((Freed: freed, Left: IncrementalVacuum.FreelistPages(_conn)));
+                    }, pass.Token).ConfigureAwait(false);
+                    pagesVacuumed += step.Freed;
+                    if (step.Freed == 0 || step.Left == 0) break;
+                }
+            }
+            catch (OperationCanceledException) when (!lifetime.IsCancellationRequested && pass.IsCancellationRequested)
+            {
+                vacuumLeft = true;
+            }
+            report = report with
+            {
+                PagesVacuumed = pagesVacuumed,
+                MoreRemaining = report.MoreRemaining || vacuumLeft,
+                StopReason = report.StopReason ?? (vacuumLeft ? "vacuum_budget" : null)
+            };
+
+            if (pagesVacuumed > 0)
+                await TruncateWalAfterVacuumAsync(lifetime.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (!lifetime.IsCancellationRequested && pass.IsCancellationRequested)
         {
             return report with { MoreRemaining = true, StopReason = "time_budget" };
         }
         return report;
+    }
+
+    private static readonly TimeSpan VacuumSafetyMargin = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan VacuumCheckpointWait = TimeSpan.FromSeconds(5);
+
+    // Never blocks the writer on a reader: the checkpoint itself waits for nothing, and a busy or timed-out attempt is
+    // logged once and left for the next pass. The wait for the writer turn is bounded and uses the service lifetime,
+    // not the (possibly spent) pass token.
+    private async Task TruncateWalAfterVacuumAsync(CancellationToken lifetimeToken)
+    {
+        using var wait = CancellationTokenSource.CreateLinkedTokenSource(lifetimeToken);
+        wait.CancelAfter(VacuumCheckpointWait);
+        try
+        {
+            var complete = await WithWriteAsync(
+                () => Task.FromResult(IncrementalVacuum.CheckpointTruncate(_conn)), wait.Token).ConfigureAwait(false);
+            if (!complete)
+                await Console.Error.WriteLineAsync("maintenance: WAL checkpoint after vacuum was busy; it is retried next pass.").ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!lifetimeToken.IsCancellationRequested)
+        {
+            await Console.Error.WriteLineAsync("maintenance: WAL checkpoint after vacuum waited too long for the writer; it is retried next pass.").ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            await Console.Error.WriteLineAsync($"maintenance: WAL checkpoint after vacuum failed: {ex.GetType().Name}.").ConfigureAwait(false);
+        }
     }
 
     /// <summary>

@@ -70,6 +70,102 @@ public class BoundedRetentionTests
     }
 
     [TestMethod]
+    public async Task Execute_GivesFreePagesBack_WithIncrementalVacuum_AtTheEndOfThePass()
+    {
+        var service = Start(new FakeSnapshotWorker(_db));
+        var conn = _db.GetConnection();
+        Exec(conn, "CREATE TABLE scratch_vacuum (id INTEGER PRIMARY KEY, b BLOB);");
+        Exec(conn, """
+            WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000)
+            INSERT INTO scratch_vacuum (id, b) SELECT i, zeroblob(3000) FROM n;
+            """);
+        Exec(conn, "DROP TABLE scratch_vacuum;");
+        Assert.IsTrue(IncrementalVacuum.FreelistPages(conn) > 500);
+        var pagesBefore = Convert.ToInt64(Scalar(conn, "PRAGMA page_count;"));
+
+        var report = await service.RunRetentionAsync(true);
+
+        Assert.IsTrue(report.PagesVacuumed > 500);
+        Assert.IsFalse(report.MoreRemaining);
+        Assert.AreEqual(0, IncrementalVacuum.FreelistPages(conn));
+        Assert.IsTrue(Convert.ToInt64(Scalar(conn, "PRAGMA page_count;")) < pagesBefore);
+    }
+
+    private static void Exec(SqliteConnection c, string sql)
+    {
+        using var cmd = c.CreateCommand();
+        cmd.CommandText = sql;
+        cmd.ExecuteNonQuery();
+    }
+
+    private void FillAndDropScratch(SqliteConnection conn, int rows)
+    {
+        Exec(conn, "CREATE TABLE scratch_vacuum (id INTEGER PRIMARY KEY, b BLOB);");
+        Exec(conn, $"""
+            WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {rows})
+            INSERT INTO scratch_vacuum (id, b) SELECT i, zeroblob(3000) FROM n;
+            """);
+        Exec(conn, "DROP TABLE scratch_vacuum;");
+    }
+
+    [TestMethod]
+    public async Task Execute_VacuumReport_MatchesPagesActuallyReleased_AndNeverThrows_OnATightBudget()
+    {
+        var service = Start(new FakeSnapshotWorker(_db));
+        var conn = _db.GetConnection();
+        FillAndDropScratch(conn, 6000);
+        var freeBefore = IncrementalVacuum.FreelistPages(conn);
+
+        var report = await service.RunRetentionAsync(true, passLimit: TimeSpan.FromMilliseconds(300));
+
+        var released = freeBefore - IncrementalVacuum.FreelistPages(conn);
+        Assert.AreEqual(released, report.PagesVacuumed, $"stop reason {report.StopReason}");
+        if (IncrementalVacuum.FreelistPages(conn) > 0)
+        {
+            Assert.IsTrue(report.MoreRemaining);
+            Assert.IsNotNull(report.StopReason);
+        }
+    }
+
+    [TestMethod]
+    public async Task Execute_VacuumCheckpointBlockedByAReader_DoesNotWait_AndDoesNotThrow()
+    {
+        var service = Start(new FakeSnapshotWorker(_db));
+        var conn = _db.GetConnection();
+        FillAndDropScratch(conn, 2000);
+        using var reader = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _dbPath, Pooling = false }.ToString());
+        reader.Open();
+        Exec(reader, "BEGIN;");
+        Assert.IsNotNull(Scalar(reader, "SELECT COUNT(*) FROM sqlite_master;"));
+
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        var report = await service.RunRetentionAsync(true).WaitAsync(TimeSpan.FromSeconds(20));
+        Assert.IsTrue(report.PagesVacuumed > 500);
+        Assert.IsTrue(clock.Elapsed < TimeSpan.FromSeconds(4), "a pinned WAL must not hold the writer for busy_timeout");
+
+        Exec(reader, "COMMIT;");
+        var next = await service.RunRetentionAsync(true);
+        Assert.IsFalse(next.MoreRemaining);
+    }
+
+    [TestMethod]
+    public async Task Execute_WritesNoBatchAuditRow_WhenNoProjectOrSnapshotIsDeleted()
+    {
+        var service = Start(new FakeSnapshotWorker(_db));
+        FillAndDropScratch(_db.GetConnection(), 1000);
+        await service.RunRetentionAsync(true);
+        Assert.AreEqual(0, service.RecentAudit(action: AuditAction.Retention)
+            .Count(e => e.Detail != null && e.Detail.StartsWith("execute_batch", StringComparison.Ordinal)));
+    }
+
+    private static object? Scalar(SqliteConnection c, string sql)
+    {
+        using var cmd = c.CreateCommand();
+        cmd.CommandText = sql;
+        return cmd.ExecuteScalar();
+    }
+
+    [TestMethod]
     public async Task Execute_WriterGateWaitCountsAgainstPassBudget()
     {
         var worker = new FakeSnapshotWorker(_db) { UseGate = true };
