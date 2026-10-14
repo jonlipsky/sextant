@@ -182,13 +182,15 @@ public sealed partial class SnapshotService : IDisposable
         {
             db.RunMigrations(recover: false);
 
-            var lease = WriterLease.TryAcquire(options.CatalogDbPath, options.Holder, options.LeaseTtl)
+            var lease = WriterLease.TryAcquire(options.CatalogDbPath, options.Holder, options.LeaseTtl, kind: WriterKind.Service)
                 ?? throw new InvalidOperationException(
                     $"Another writer holds the single-writer lease on '{options.CatalogDbPath}'. " +
-                    "Retention/publish/GC must not race a live daemon/service (issue #38).");
+                    "Retention/publish/GC must not race a live daemon/service (issue #38). A lease whose holder is " +
+                    "provably dead on this host is taken over at once; otherwise it must expire first (issue #320).");
 
             try
             {
+                LogLeaseAcquisition(lease.Acquisition);
                 // Once the lease is held, make every write session abort between batches if it is ever
                 // stolen (issue #38 / criterion 3): a long worker index run consults this probe at each
                 // batch boundary and rolls back rather than racing the new owner into a corrupt publish.
@@ -212,6 +214,38 @@ public sealed partial class SnapshotService : IDisposable
         {
             if (ownsDatabase) db.Dispose();
             throw;
+        }
+    }
+
+    /// <summary>
+    /// Makes a crash of the previous run visible (issue #320): one line when a dead holder's lease was taken over
+    /// without waiting for its TTL, one WARNING when the previous run never released the lease (clean-shutdown
+    /// marker missing). The durable counters behind the metrics are written by <see cref="WriterLease"/> itself.
+    /// </summary>
+    internal static void LogLeaseAcquisition(WriterLeaseAcquisition acquisition, TextWriter? output = null)
+    {
+        var writer = output ?? Console.Error;
+        if (acquisition.TakenOverReason is { } reason)
+            writer.WriteLine(
+                $"Took over the stale single-writer lease of '{acquisition.TakenOverHolder ?? "unknown holder"}' " +
+                $"(last heartbeat {TimeSpan.FromMilliseconds(acquisition.TakenOverAgeMs).TotalSeconds:0} s ago): {reason}.");
+        if (acquisition.PreviousRunUnclean)
+        {
+            var last = acquisition.PreviousRunHeartbeatAt is { } ms
+                ? DateTimeOffset.FromUnixTimeMilliseconds(ms).ToString("u", System.Globalization.CultureInfo.InvariantCulture)
+                : "an unknown time";
+            var kind = acquisition.PreviousRunKind ?? "writer";
+            writer.WriteLine(acquisition.PreviousRunEndReason switch
+            {
+                WriterEndReason.Abandoned =>
+                    $"Note: previous {kind} run abandoned the lease at ~{last} (it could not confirm it had stopped " +
+                    "writing, e.g. a shutdown drain timeout); not a crash.",
+                WriterEndReason.ReleaseFailed =>
+                    $"Note: previous {kind} run could not release the lease at ~{last} (a database error during " +
+                    "shutdown); not a crash.",
+                _ => $"WARNING: previous {kind} run ended without a clean shutdown at ~{last}; " +
+                     "possible crash or kill (e.g. OOM)."
+            });
         }
     }
 
@@ -875,6 +909,8 @@ public sealed partial class SnapshotService : IDisposable
             entry.Production = Task.Run(
                 () => RunProductionAsync(request, hash, jobId, existed, principal, entry), CancellationToken.None);
             _inFlight[hash] = entry;
+            // After the production Task completed (not from inside its frame, which still roots the job's state).
+            ScheduleJobMemoryReclaim(entry.Production, jobId);
             return entry.Production;
         }
     }

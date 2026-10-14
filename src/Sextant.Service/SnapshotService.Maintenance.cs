@@ -570,4 +570,117 @@ public sealed partial class SnapshotService
     }
 
     private static void Log(string message) => Console.Error.WriteLine(message);
+
+    // Issue #320: a job's heap is unreachable once the worker returns, but the runtime keeps the freed regions
+    // committed until a later GC decommits them, which an idle service never runs. Return them after the job, but only
+    // when it is worth the ~2 s all-threads pause. It runs AFTER the write gate was released, on a fresh pool work item
+    // (so the job's frames have yielded and its locals are unreachable), and never holds the gate or fails anything.
+    private int _reclaiming;
+    private Task _pendingReclaim = Task.CompletedTask;
+    private long _reclaimGeneration;
+
+    internal SemaphoreSlim WriteGateForTesting => _writeGate;
+
+    private enum JobReclaim { Ran, Busy, Skipped }
+
+    internal TimeSpan MemoryReclaimBusyRetryDelay { get; set; } = TimeSpan.FromSeconds(15);
+    internal int MemoryReclaimBusyRetries { get; set; } = 8;
+
+    internal long MemoryReclaimMinWorkingSetBytes { get; set; } = JobMemoryReclaimer.MinWorkingSetBytes;
+    internal Func<long> WorkingSetProbe { get; set; } = static () => Environment.WorkingSet;
+    internal Func<JobMemoryReclaimer.Result> MemoryReclaimAction { get; set; } = JobMemoryReclaimer.Reclaim;
+    internal Action<string> MemoryReclaimLog { get; set; } = Log;
+
+    /// <summary>The latest scheduled end-of-job reclaim (completed when none is pending); never faults.</summary>
+    internal Task PendingMemoryReclaim => Volatile.Read(ref _pendingReclaim);
+
+    internal void ScheduleJobMemoryReclaim(Task production, long jobId)
+    {
+        try
+        {
+            var generation = Interlocked.Increment(ref _reclaimGeneration);
+            // Waits for the production Task to complete (its frames have unwound by the time the yield resumes),
+            // on a pool thread, so nothing of the job is on a stack when the collection runs.
+            Volatile.Write(ref _pendingReclaim, Task.Run(async () =>
+            {
+                try
+                {
+                    await production.ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+                    await Task.Yield();
+                    for (var attempt = 0; ; attempt++)
+                    {
+                        // A newer production's reclaim supersedes this one, so a burst never queues two.
+                        if (Interlocked.Read(ref _reclaimGeneration) != generation)
+                            return;
+                        if (TryReclaimOnce(jobId) != JobReclaim.Busy || attempt >= MemoryReclaimBusyRetries)
+                            return;
+                        // Busy only because the gate is held or a production is running (a queued retire, an attached
+                        // ensure, ...): nothing will schedule another reclaim, so look again shortly, a bounded number of times.
+                        await Task.Delay(MemoryReclaimBusyRetryDelay, _timeProvider, _lifetime.Token).ConfigureAwait(false);
+                    }
+                }
+                catch
+                {
+                    // Best effort: never faults.
+                }
+            }));
+        }
+        catch
+        {
+            // Best effort: scheduling a reclaim must never fail the job or leave the gate held.
+        }
+    }
+
+    // True when the reclaim ran. Never throws.
+    internal bool TryReclaimJobMemory(long jobId) => TryReclaimOnce(jobId) == JobReclaim.Ran;
+
+    private JobReclaim TryReclaimOnce(long jobId)
+    {
+        try
+        {
+            var state = ReclaimState();
+            if (state != JobReclaim.Ran)
+                return state;
+            if (Interlocked.CompareExchange(ref _reclaiming, 1, 0) != 0)
+                return JobReclaim.Skipped;
+            try
+            {
+                // Re-checked right before collecting: another job may have been admitted since the first look.
+                state = ReclaimState();
+                if (state != JobReclaim.Ran)
+                    return state;
+                var r = MemoryReclaimAction();
+                MemoryReclaimLog($"Job {jobId}: memory reclaimed in {r.Elapsed.TotalMilliseconds:F0} ms " +
+                    $"(working set {r.WorkingSetBefore / (1024 * 1024)} -> {r.WorkingSetAfter / (1024 * 1024)} MiB, " +
+                    $"managed heap {r.HeapAfter / (1024 * 1024)} MiB).");
+                return JobReclaim.Ran;
+            }
+            finally
+            {
+                Volatile.Write(ref _reclaiming, 0);
+            }
+        }
+        catch
+        {
+            return JobReclaim.Skipped;
+        }
+    }
+
+    // Only the last job of a burst reclaims: not while shutting down, not while another production is running or
+    // queued for the gate (a released gate with a queued waiter is handed over, so CurrentCount stays 0), and not
+    // when the working set is too small for the pause to buy anything. Busy (gate/production) is the only skip a
+    // later look can change; shutdown and the threshold are final. Ran means "worthwhile now".
+    private JobReclaim ReclaimState()
+    {
+        if (_lifetime.IsCancellationRequested)
+            return JobReclaim.Skipped;
+        lock (_inFlightLock)
+        {
+            if (_inFlight.Count > 0)
+                return JobReclaim.Busy;
+        }
+        if (_writeGate.CurrentCount == 0)
+            return JobReclaim.Busy;
+        return WorkingSetProbe() >= MemoryReclaimMinWorkingSetBytes ? JobReclaim.Ran : JobReclaim.Skipped;
+    }
 }

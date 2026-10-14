@@ -88,7 +88,7 @@ public sealed class DaemonHost : IDisposable
         // staging generation.
         _db.RunMigrations(recover: false);
         _lease = WriterLease.AcquireOrThrow(
-            _db.DbPath, $"sextant-daemon@{Environment.MachineName}#{Environment.ProcessId}");
+            _db.DbPath, $"sextant-daemon@{Environment.MachineName}#{Environment.ProcessId}", kind: WriterKind.Daemon);
         // Abort any in-flight index between batches if the lease is ever stolen (issue #38 / criterion 3).
         _db.SetWriterLostProbe(() => _lease.IsLost);
         _db.Recover();

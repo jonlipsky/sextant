@@ -144,6 +144,25 @@ public sealed record Alert
 }
 
 /// <summary>
+/// Whether the service's previous runs ended without releasing the writer lease (issue #320): a crash or kill such as
+/// the kernel OOM killer. <see cref="UncleanShutdownsTotal"/> is durable and monotonic (alert on its increase);
+/// <see cref="PreviousRunUnclean"/> is 1 for the current run when its predecessor never shut down cleanly.
+/// </summary>
+public sealed record CrashMetrics
+{
+    /// <summary>Runs that ended with no recorded reason (crash or kill). Abandoned and failed-release runs are counted separately.</summary>
+    public long UncleanShutdownsTotal { get; init; }
+    public bool PreviousRunUnclean { get; init; }
+    public long? PreviousRunLastHeartbeatUnixMs { get; init; }
+
+    /// <summary>Why the previous run ended when not clean: unclean | abandoned | release_failed.</summary>
+    public string? PreviousRunEndReason { get; init; }
+    public long AbandonedRunsTotal { get; init; }
+    public long ReleaseFailuresTotal { get; init; }
+    public long StaleLeaseTakeoversTotal { get; init; }
+}
+
+/// <summary>
 /// A point-in-time observability snapshot of the standalone index service (criterion 5). It carries every
 /// signal the dashboards must report — indexing latency, queue delay, success/completeness, worker
 /// capacity, storage, cache reuse, and query latency — plus the alerts evaluated over them and per-
@@ -173,6 +192,9 @@ public sealed record MetricsSnapshot
 
     /// <summary>The maintenance loop's idle-branch and scheduled-retention record (issue #299).</summary>
     public MaintenanceMetrics Maintenance { get; init; } = new();
+
+    /// <summary>Crash visibility from the catalog's writer run state (issue #320).</summary>
+    public CrashMetrics Crash { get; init; } = new();
 
     public IReadOnlyList<Alert> Alerts { get; init; } = [];
     public IReadOnlyList<Sextant.Store.AuditCostAttribution> CostByRepository { get; init; } = [];

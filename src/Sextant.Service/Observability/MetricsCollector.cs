@@ -65,10 +65,37 @@ public sealed class MetricsCollector(
             },
             QueryErrors = metrics.QueryErrors,
             Maintenance = metrics.Maintenance,
+            Crash = CollectCrash(),
             CostByRepository = cost
         };
 
         return snapshot with { Alerts = AlertEvaluator.Evaluate(snapshot, thresholds) };
+    }
+
+    // The crash counters are a bonus signal: a missing table (a pre-032 catalog being read) or a database error must
+    // never fail /control/metrics.
+    private CrashMetrics CollectCrash()
+    {
+        try
+        {
+            return Sextant.Store.WriterLease.GetRunState(connection) is { } state
+                ? new CrashMetrics
+                {
+                    UncleanShutdownsTotal = state.UncleanShutdownsTotal,
+                    PreviousRunUnclean = state.PreviousRunUnclean
+                        && (state.PreviousRunEndReason ?? Sextant.Store.WriterEndReason.Unclean) == Sextant.Store.WriterEndReason.Unclean,
+                    PreviousRunLastHeartbeatUnixMs = state.PreviousRunHeartbeatAt,
+                    PreviousRunEndReason = state.PreviousRunEndReason,
+                    AbandonedRunsTotal = state.AbandonedRunsTotal,
+                    ReleaseFailuresTotal = state.ReleaseFailuresTotal,
+                    StaleLeaseTakeoversTotal = state.StaleLeaseTakeoversTotal
+                }
+                : new CrashMetrics();
+        }
+        catch (Microsoft.Data.Sqlite.SqliteException)
+        {
+            return new CrashMetrics();
+        }
     }
 
     private IReadOnlyDictionary<string, LatencyStats> CollectPhaseLatency()

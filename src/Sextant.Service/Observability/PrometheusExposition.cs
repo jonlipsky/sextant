@@ -108,6 +108,25 @@ public static class PrometheusExposition
             s.Maintenance.LastScheduledRetentionDurationMs);
 
         // Per-repository cost attribution (operator-only; control-plane gated).
+        // Issue #320: crash visibility. The total is durable across restarts; alert on its increase.
+        Counter(sb, "sextant_service_unclean_shutdowns_total",
+            "Service runs that ended with no recorded reason (crash or kill, e.g. OOM), durable across restarts.",
+            s.Crash.UncleanShutdownsTotal);
+        Counter(sb, "sextant_service_stale_lease_takeovers_total",
+            "Writer leases taken over from a provably dead holder instead of waiting for expiry.",
+            s.Crash.StaleLeaseTakeoversTotal);
+        Gauge(sb, "sextant_service_previous_run_unclean",
+            "Whether the run before this one ended with no recorded reason, i.e. a crash or kill (1/0). An abandoned or failed release is not a crash.",
+            s.Crash.PreviousRunUnclean ? 1 : 0);
+        Counter(sb, "sextant_service_abandoned_runs_total",
+            "Runs that abandoned the writer lease because they could not confirm they had stopped writing (shutdown drain timeout).",
+            s.Crash.AbandonedRunsTotal);
+        Counter(sb, "sextant_service_lease_release_failures_total",
+            "Runs that could not release the writer lease at shutdown (database error).",
+            s.Crash.ReleaseFailuresTotal);
+        if (s.Crash.PreviousRunLastHeartbeatUnixMs is long lastHeartbeat)
+            Gauge(sb, "sextant_service_previous_run_last_heartbeat_timestamp_seconds",
+                "Last heartbeat (Unix seconds) of the previous run that did not end cleanly.", lastHeartbeat / 1000.0);
         if (s.CostByRepository.Count > 0)
         {
             sb.Append("# HELP sextant_repository_index_ms Worker index milliseconds attributed to a repository.\n");
