@@ -2215,7 +2215,7 @@ public sealed partial class SnapshotService : IDisposable
         // Bounded: a production holding the writer must not hold a finished pass (issue #321). Without the row the
         // next tick continues the day, as after a crash.
         using var wait = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
-        if (auditWait <= TimeSpan.Zero) wait.Cancel();
+        if (auditWait <= TimeSpan.Zero) await wait.CancelAsync();
         else wait.CancelAfter(auditWait);
         try
         {
