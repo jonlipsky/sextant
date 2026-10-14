@@ -2082,30 +2082,109 @@ public sealed partial class SnapshotService : IDisposable
     /// so publishes interleave. The whole pass, writer-queue waits included, is bounded by <paramref name="passLimit"/>
     /// (default <see cref="RetentionService.PassTimeLimit"/>). A pass that runs out of time reports what it computed and
     /// deleted so far; cancellation interrupts the current batch, and committed batches stay applied.
+    /// <paramref name="auditWait"/> caps the wait for the writer of the closing audit row (default
+    /// <see cref="InteractiveRetentionAuditWait"/>; the scheduled pass passes its short cap).
     /// </summary>
     public async Task<RetentionReport> RunRetentionAsync(
         bool execute, AuditCaller principal = default, CancellationToken cancellationToken = default,
-        TimeSpan? passLimit = null)
+        TimeSpan? passLimit = null, TimeSpan? auditWait = null)
     {
         var passStartedMs = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
-        var report = await RunRetentionPassAsync(execute, principal, cancellationToken, passLimit).ConfigureAwait(false);
-        if (execute && report.Batches > 0)
-            await AuditRetentionPassAsync(report, principal, passStartedMs).ConfigureAwait(false);
-        return report;
+        var timer = new RetentionPassTimer();
+        var report = await RunRetentionPassAsync(execute, principal, cancellationToken, passLimit, timer).ConfigureAwait(false);
+        if (!execute) return report;
+        // A pass that was cut short without deleting anything asks for a continuation (capped by the scheduler).
+        if (report.MoreRemaining && !MadeRetentionProgress(report) && report.StopReason is "time_budget" or "unit_budget")
+            report = report with { StopReason = "unit_budget" };
+        if (report.Batches > 0)
+        {
+            var skipped = await AuditRetentionPassAsync(
+                report, principal, passStartedMs, timer, auditWait ?? InteractiveRetentionAuditWait).ConfigureAwait(false);
+            if (skipped)
+            {
+                report = report with { AuditSkipped = true };
+                _metrics.RecordRetentionAuditSkipped();
+            }
+        }
+        return report with { Timings = timer.ToTimings(report.Batches) };
+    }
+
+    internal static bool MadeRetentionProgress(RetentionReport report) =>
+        (report.SnapshotsDeleted + report.SnapshotProjectVersionsDeleted + report.ApiSnapshotsDeleted +
+            report.FileVersionsDeleted + report.Deleted.Count + (report.SourceTextsDeleted ?? 0) +
+            report.ProjectChunkRowsDeleted + report.PagesVacuumed) > 0;
+
+    // Accumulates the step timings of one executed pass (issue #321). The pass is sequential, so no locking.
+    private sealed class RetentionPassTimer
+    {
+        public double PlanMs, WriterWaitMs, DeleteMs, TailMs, VacuumMs, AuditMs;
+
+        public RetentionPassTimings ToTimings(int batches) => new()
+        {
+            PlanMs = PlanMs, WriterWaitMs = WriterWaitMs, DeleteMs = DeleteMs, TailMs = TailMs,
+            VacuumMs = VacuumMs, AuditMs = AuditMs, Batches = batches
+        };
+
+        // Runs a writer turn, splitting the time into the wait for the gate and the work under it.
+        public async Task<T> WriteAsync<T>(SnapshotService service, Func<Task<T>> work, Action<double> addWork, CancellationToken ct)
+        {
+            var asked = System.Diagnostics.Stopwatch.GetTimestamp();
+            long entered = 0;
+            try
+            {
+                return await service.WithWriteAsync(async () =>
+                {
+                    entered = System.Diagnostics.Stopwatch.GetTimestamp();
+                    return await work().ConfigureAwait(false);
+                }, ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                var end = System.Diagnostics.Stopwatch.GetTimestamp();
+                if (entered == 0)
+                    WriterWaitMs += System.Diagnostics.Stopwatch.GetElapsedTime(asked, end).TotalMilliseconds;
+                else
+                {
+                    WriterWaitMs += System.Diagnostics.Stopwatch.GetElapsedTime(asked, entered).TotalMilliseconds;
+                    addWork(System.Diagnostics.Stopwatch.GetElapsedTime(entered, end).TotalMilliseconds);
+                }
+            }
+        }
     }
 
     internal const string RetentionPassDoneDetail = "execute_pass;done";
+
+    // How far past its budget a scheduled pass may run (issue #321): the closing audit row waits at most
+    // RetentionAuditWait for the writer, the post-vacuum checkpoint at most VacuumCheckpointWait, and a batch in
+    // flight at the limit rolls back within RollbackSlack.
+    internal static TimeSpan RetentionPassMargin => RetentionAuditWait + VacuumCheckpointWait + RollbackSlack;
+    internal static readonly TimeSpan RetentionAuditWait = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan RollbackSlack = TimeSpan.FromSeconds(2);
+
+    /// <summary>The audit-row writer wait of an interactive pass: a human caller is waiting on the answer anyway.</summary>
+    internal static readonly TimeSpan InteractiveRetentionAuditWait = TimeSpan.FromSeconds(30);
+
+    /// <summary>The audit-row writer wait of the scheduled pass (settable for tests).</summary>
+    internal TimeSpan ScheduledRetentionAuditWait { get; set; } = RetentionAuditWait;
     internal const string RetentionPassContinueDetail = "execute_pass;continue";
 
     // One audit row per executed pass, written after it ends. It records whether the pass asks for a continuation, which
     // is what a restart reads to tell a finished day from one cut short (issue #317). A pass that never reaches this
     // row (a crash, shutdown) leaves no "done" row, so the next tick continues it.
     // The row is stamped with the pass's START, so a pass that straddles UTC midnight closes the day it began on.
-    private async Task AuditRetentionPassAsync(RetentionReport report, AuditCaller principal, long passStartedMs)
+    // Returns true when the row was skipped (writer wait cap or failure).
+    private async Task<bool> AuditRetentionPassAsync(
+        RetentionReport report, AuditCaller principal, long passStartedMs, RetentionPassTimer timer, TimeSpan auditWait)
     {
+        // Bounded: a production holding the writer must not hold a finished pass (issue #321). Without the row the
+        // next tick continues the day, as after a crash.
+        using var wait = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        if (auditWait <= TimeSpan.Zero) wait.Cancel();
+        else wait.CancelAfter(auditWait);
         try
         {
-            await WithWriteAsync(() =>
+            wait.Token.ThrowIfCancellationRequested();
+            await timer.WriteAsync(this, () =>
             {
                 EnsureLeaseHeld();
                 new AuditLogStore(_conn).Append(AuditAction.Retention, AuditOutcome.Complete, actor: principal.Actor,
@@ -2113,18 +2192,26 @@ public sealed partial class SnapshotService : IDisposable
                         + (report.ProjectChunkRowsDeleted > 0 ? $";chunk_rows={report.ProjectChunkRowsDeleted}" : ""),
                     costBytes: report.ReclaimedBytes, timestampMs: passStartedMs);
                 return Task.FromResult(0);
-            }, _lifetime.Token).ConfigureAwait(false);
+            }, ms => timer.AuditMs += ms, wait.Token).ConfigureAwait(false);
+            return false;
+        }
+        catch (OperationCanceledException) when (!_lifetime.IsCancellationRequested)
+        {
+            await Console.Error.WriteLineAsync("maintenance: retention pass audit waited too long for the writer; it is skipped.").ConfigureAwait(false);
+            return true;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             await Console.Error.WriteLineAsync($"maintenance: retention pass audit failed: {ex.GetType().Name}.").ConfigureAwait(false);
+            return true;
         }
     }
 
     private readonly FileSweepCursor _fileSweepCursor = new();
 
     private async Task<RetentionReport> RunRetentionPassAsync(
-        bool execute, AuditCaller principal, CancellationToken cancellationToken, TimeSpan? passLimit)
+        bool execute, AuditCaller principal, CancellationToken cancellationToken, TimeSpan? passLimit,
+        RetentionPassTimer timer)
     {
         using var activity = ServiceTelemetry.Source.StartActivity("retention");
         activity?.SetTag("sextant.execute", execute);
@@ -2144,8 +2231,16 @@ public sealed partial class SnapshotService : IDisposable
             }
 
             RetentionPlan plan;
-            using (var reader = OpenReadConnection())
+            var planStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+            try
+            {
+                using var reader = OpenReadConnection();
                 plan = new RetentionService(reader, _options.Retention, fileSweep: _fileSweepCursor).CreatePlan(pass.Token, limit);
+            }
+            finally
+            {
+                timer.PlanMs = System.Diagnostics.Stopwatch.GetElapsedTime(planStarted).TotalMilliseconds;
+            }
             if (plan.StopReason != null)
                 return new RetentionReport { DryRun = false, MoreRemaining = true, StopReason = plan.StopReason };
             var deferred = OversizedToDeferToday();
@@ -2154,7 +2249,7 @@ public sealed partial class SnapshotService : IDisposable
 
             do
             {
-                var batch = await WithWriteAsync(() =>
+                var batch = await timer.WriteAsync(this, () =>
                 {
                     pass.Token.ThrowIfCancellationRequested();
                     var remaining = limit - System.Diagnostics.Stopwatch.GetElapsedTime(started);
@@ -2168,8 +2263,10 @@ public sealed partial class SnapshotService : IDisposable
                         if (retention.ProjectOrSnapshotDeletedInBatch)
                             new AuditLogStore(_conn).Append(AuditAction.Retention, AuditOutcome.Complete,
                                 actor: principal.Actor, detail: principal.Detail("execute_batch"));
-                    }));
-                }, pass.Token).ConfigureAwait(false);
+                    }, passRemaining: remaining, passLimit: limit,
+                    // Until the pass has deleted something its first unit always starts, however long planning took.
+                    enforceUnitStart: MadeRetentionProgress(report) || report.Oversized > 0));
+                }, ms => timer.DeleteMs += ms, pass.Token).ConfigureAwait(false);
                 report = RetentionService.Combine(report, batch);
                 foreach (var oversizedId in batch.OversizedSnapshotIds)
                 {
@@ -2181,14 +2278,14 @@ public sealed partial class SnapshotService : IDisposable
                 // WithWriteAsync releases the gate before the next admission; already-queued publishes go first.
             } while (report.MoreRemaining);
 
-            var sweep = await WithWriteAsync(() =>
+            var sweep = await timer.WriteAsync(this, () =>
             {
                 pass.Token.ThrowIfCancellationRequested();
                 var remaining = limit - System.Diagnostics.Stopwatch.GetElapsedTime(started);
                 var sweepLimit = remaining < RetentionService.BatchTimeLimit ? remaining : RetentionService.BatchTimeLimit;
                 return Task.FromResult(new RetentionService(_conn, _options.Retention)
                     .SweepSourceTexts(SourceTexts, pass.Token, sweepLimit));
-            }, pass.Token).ConfigureAwait(false);
+            }, ms => timer.TailMs += ms, pass.Token).ConfigureAwait(false);
             report = report with { SourceTextsDeleted = sweep.SourceTextsDeleted,
                 MoreRemaining = sweep.MoreRemaining || plan.ApiDeferred,
                 StopReason = sweep.StopReason ?? (plan.ApiDeferred ? "api_deferred" : null) };
@@ -2210,13 +2307,13 @@ public sealed partial class SnapshotService : IDisposable
                         vacuumLeft = IncrementalVacuum.IsIncremental(reader) && IncrementalVacuum.FreelistPages(reader) > 0;
                         break;
                     }
-                    var step = await WithWriteAsync(() =>
+                    var step = await timer.WriteAsync(this, () =>
                     {
                         pass.Token.ThrowIfCancellationRequested();
                         EnsureLeaseHeld();
                         var freed = IncrementalVacuum.Step(_conn);
                         return Task.FromResult((Freed: freed, Left: IncrementalVacuum.FreelistPages(_conn)));
-                    }, pass.Token).ConfigureAwait(false);
+                    }, ms => timer.VacuumMs += ms, pass.Token).ConfigureAwait(false);
                     pagesVacuumed += step.Freed;
                     if (step.Freed == 0 || step.Left == 0) break;
                 }
@@ -2233,7 +2330,7 @@ public sealed partial class SnapshotService : IDisposable
             };
 
             if (pagesVacuumed > 0)
-                await TruncateWalAfterVacuumAsync(lifetime.Token).ConfigureAwait(false);
+                await TruncateWalAfterVacuumAsync(lifetime.Token, timer).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (!lifetime.IsCancellationRequested && pass.IsCancellationRequested)
         {
@@ -2248,14 +2345,15 @@ public sealed partial class SnapshotService : IDisposable
     // Never blocks the writer on a reader: the checkpoint itself waits for nothing, and a busy or timed-out attempt is
     // logged once and left for the next pass. The wait for the writer turn is bounded and uses the service lifetime,
     // not the (possibly spent) pass token.
-    private async Task TruncateWalAfterVacuumAsync(CancellationToken lifetimeToken)
+    private async Task TruncateWalAfterVacuumAsync(CancellationToken lifetimeToken, RetentionPassTimer timer)
     {
         using var wait = CancellationTokenSource.CreateLinkedTokenSource(lifetimeToken);
         wait.CancelAfter(VacuumCheckpointWait);
         try
         {
-            var complete = await WithWriteAsync(
-                () => Task.FromResult(IncrementalVacuum.CheckpointTruncate(_conn)), wait.Token).ConfigureAwait(false);
+            var complete = await timer.WriteAsync(
+                this, () => Task.FromResult(IncrementalVacuum.CheckpointTruncate(_conn)),
+                ms => timer.VacuumMs += ms, wait.Token).ConfigureAwait(false);
             if (!complete)
                 await Console.Error.WriteLineAsync("maintenance: WAL checkpoint after vacuum was busy; it is retried next pass.").ConfigureAwait(false);
         }

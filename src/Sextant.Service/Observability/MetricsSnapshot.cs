@@ -117,6 +117,9 @@ public sealed record MaintenanceMetrics
     /// <summary>Due scheduled retention passes skipped because indexing held the writer (retried next tick).</summary>
     public long ScheduledRetentionSkippedBusy { get; init; }
 
+    /// <summary>Executed retention passes whose closing audit row was skipped because the writer stayed busy (issue #321).</summary>
+    public long RetentionAuditSkipped { get; init; }
+
     public long LastScheduledRetentionAtUnixMs { get; init; }
     public double LastScheduledRetentionDurationMs { get; init; }
     public long LastScheduledRetentionSnapshotsDeleted { get; init; }

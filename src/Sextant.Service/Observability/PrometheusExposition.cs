@@ -102,6 +102,8 @@ public static class PrometheusExposition
             s.Maintenance.ScheduledRetentionRuns);
         Gauge(sb, "sextant_scheduled_retention_skipped_busy", "Due scheduled retention passes skipped while indexing held the writer.",
             s.Maintenance.ScheduledRetentionSkippedBusy);
+        Counter(sb, "sextant_retention_audit_skipped_total", "Executed retention passes whose closing audit row was skipped.",
+            s.Maintenance.RetentionAuditSkipped);
         Gauge(sb, "sextant_scheduled_retention_last_duration_ms", "Duration of the latest scheduled retention pass (ms).",
             s.Maintenance.LastScheduledRetentionDurationMs);
 
@@ -123,6 +125,13 @@ public static class PrometheusExposition
     {
         sb.Append("# HELP ").Append(name).Append(' ').Append(help).Append('\n');
         sb.Append("# TYPE ").Append(name).Append(" gauge\n");
+        sb.Append(name).Append(' ').Append(value.ToString("G", CultureInfo.InvariantCulture)).Append('\n');
+    }
+
+    private static void Counter(StringBuilder sb, string name, string help, double value)
+    {
+        sb.Append("# HELP ").Append(name).Append(' ').Append(help).Append('\n');
+        sb.Append("# TYPE ").Append(name).Append(" counter\n");
         sb.Append(name).Append(' ').Append(value.ToString("G", CultureInfo.InvariantCulture)).Append('\n');
     }
 

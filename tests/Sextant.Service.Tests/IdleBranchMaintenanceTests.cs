@@ -363,6 +363,24 @@ public class IdleBranchMaintenanceTests
     }
 
     [TestMethod]
+    public async Task ScheduledRetention_LogLineCarriesTheStepTimings_OnOneLine()
+    {
+        await using var h = Harness.Create(maintenance: Loop() with { BranchIdleRetireDays = 0, RetentionHourUtc = 3 });
+        h.Start();
+        await h.TickAsync();
+        await h.TickAsync();
+        var original = Console.Error;
+        var captured = new StringWriter();
+        Console.SetError(captured);
+        try { await h.TickAsync(); }
+        finally { Console.SetError(original); }
+
+        var line = captured.ToString().Split('\n').Single(l => l.Contains("scheduled retention deleted", StringComparison.Ordinal));
+        foreach (var part in new[] { "plan ", "writer wait ", "delete ", "tail ", "vacuum ", "audit ", "batch(es)" })
+            StringAssert.Contains(line, part);
+    }
+
+    [TestMethod]
     public async Task ScheduledRetention_RunsOncePerDay_FromTheConfiguredUtcHour()
     {
         await using var h = Harness.Create(maintenance: Loop() with { BranchIdleRetireDays = 0, RetentionHourUtc = 3 });
@@ -442,6 +460,47 @@ public class IdleBranchMaintenanceTests
         h.Restart();
 
         Assert.AreEqual("not_due", (await h.Service.RunMaintenanceTickAsync()).Retention);
+    }
+
+    // Issue #321: a skipped closing audit row leaves no "done" row, so a restart re-runs exactly one more pass that day.
+    [TestMethod]
+    public async Task ScheduledRetention_SkippedAuditRow_ReRunsOnePassAfterARestart()
+    {
+        await using var h = Harness.Create(
+            maintenance: NoLoop() with { BranchIdleRetireDays = 0 }, retentionHour: 0);
+        h.Start(s => s.ScheduledRetentionAuditWait = TimeSpan.Zero);
+
+        var first = await h.Service.RunMaintenanceTickAsync();
+        Assert.AreEqual("ran", first.Retention);
+        Assert.IsTrue(first.RetentionReport!.AuditSkipped, $"{first.RetentionReport.StopReason} batches={first.RetentionReport.Batches}");
+        Assert.AreEqual(1, h.Service.CollectMetrics().Maintenance.RetentionAuditSkipped);
+        Assert.AreEqual("not_due", (await h.Service.RunMaintenanceTickAsync()).Retention, "the running service remembers the day");
+
+        h.Restart();
+        var second = await h.Service.RunMaintenanceTickAsync();
+        Assert.AreEqual("ran", second.Retention, "no done row was written, so the restart runs one pass");
+        Assert.IsFalse(second.RetentionReport!.AuditSkipped);
+
+        h.Restart();
+        Assert.AreEqual("not_due", (await h.Service.RunMaintenanceTickAsync()).Retention);
+    }
+
+    // Issue #321: a pass cut short without deleting anything continues, but only a bounded number of times in a row.
+    [TestMethod]
+    public async Task ScheduledPass_UnitBudgetWithoutProgress_ContinuesAtMostAFewTimes()
+    {
+        await using var h = Harness.Create(maintenance: NoLoop() with { BranchIdleRetireDays = 0 });
+        h.Start();
+        var cut = new RetentionReport { DryRun = false, MoreRemaining = true, StopReason = "unit_budget" };
+
+        for (var i = 0; i < SnapshotService.MaxScheduledNoProgressContinues; i++)
+            Assert.IsTrue(h.Service.ScheduledPassContinues(cut), $"continue {i + 1}");
+        Assert.IsFalse(h.Service.ScheduledPassContinues(cut), "the day closes after the cap");
+
+        Assert.IsTrue(h.Service.ScheduledPassContinues(cut), "the counter restarts once the day closed");
+        Assert.IsTrue(h.Service.ScheduledPassContinues(cut with { SnapshotsDeleted = 1, StopReason = "time_budget" }));
+        Assert.IsFalse(SnapshotService.ScheduledRetentionContinues(new RetentionReport { DryRun = false, MoreRemaining = true, StopReason = "time_budget" }),
+            "a stuck catalog with no budget cut stays done for the day");
     }
 
     [TestMethod]

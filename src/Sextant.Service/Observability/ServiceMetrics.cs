@@ -106,6 +106,13 @@ public sealed class ServiceMetrics
             _maintenance = _maintenance with { ScheduledRetentionSkippedBusy = _maintenance.ScheduledRetentionSkippedBusy + 1 };
     }
 
+    /// <summary>Records an executed retention pass whose closing audit row was skipped (issue #321).</summary>
+    public void RecordRetentionAuditSkipped()
+    {
+        lock (_maintenanceLock)
+            _maintenance = _maintenance with { RetentionAuditSkipped = _maintenance.RetentionAuditSkipped + 1 };
+    }
+
     /// <summary>Records a maintenance tick that failed with an exception (issue #299); the loop carries on.</summary>
     public void RecordMaintenanceFailure()
     {

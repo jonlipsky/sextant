@@ -502,26 +502,47 @@ public sealed partial class SnapshotService
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
         var report = await RunRetentionAsync(
             execute: true, RetentionScheduleCaller, cancellationToken,
-            TimeSpan.FromSeconds(Math.Clamp(policy.RetentionPassSeconds, 1, MaintenancePolicy.MaxRetentionPassSeconds))).ConfigureAwait(false);
+            TimeSpan.FromSeconds(Math.Clamp(policy.RetentionPassSeconds, 1, MaintenancePolicy.MaxRetentionPassSeconds)),
+            ScheduledRetentionAuditWait).ConfigureAwait(false);
         var durationMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
-        _lastScheduledRetentionDay = ScheduledRetentionContinues(report) ? _lastScheduledRetentionDay : today;
+        var continues = ScheduledPassContinues(report);
+        _lastScheduledRetentionDay = continues ? _lastScheduledRetentionDay : today;
         _metrics.RecordScheduledRetention(report, now.ToUnixTimeMilliseconds(), durationMs);
         Log($"maintenance: scheduled retention deleted {report.SnapshotsDeleted} snapshot(s), " +
             $"{report.FileVersionsDeleted} file version(s), {report.SourceTextsDeleted ?? 0} source text(s) in {durationMs:F0} ms" +
-            (report.MoreRemaining ? $"; more remaining ({report.StopReason ?? "unfinished"})." : "."));
+            (report.MoreRemaining ? $"; more remaining ({report.StopReason ?? "unfinished"})." : ".") +
+            (report.Timings is { } t ? $" Steps: {t.ToLogText()}." : ""));
         return new MaintenanceTickReport
         {
             IdleBranches = idle, Retention = "ran", RetentionReport = report, RetentionDurationMs = durationMs
         };
     }
 
-    // A scheduled pass that ran out of budget with work left, having deleted something, stays due: the next tick continues
-    // it (issue #317) instead of leaving the rest for tomorrow. A pass that left work but deleted nothing is done for the
-    // day, so a stuck catalog is not re-planned every tick.
+    // A scheduled pass that ran out of budget with work left stays due: the next tick continues it (issue #317) instead
+    // of leaving the rest for tomorrow. A pass that left work but neither deleted anything nor ran out of budget (a stuck
+    // catalog) is done for the day, so it is not re-planned every tick. A pass cut short before any deletion ("unit_budget",
+    // issue #321) continues too, at most MaxScheduledNoProgressContinues times in a row.
+    internal const int MaxScheduledNoProgressContinues = 3;
+    private int _scheduledNoProgressContinues;
+
+    // Whether the scheduled day stays open after this pass. Bounded: a pass that only ever runs out of budget must not
+    // re-plan every tick for the rest of the day.
+    internal bool ScheduledPassContinues(RetentionReport report)
+    {
+        var continues = ScheduledRetentionContinues(report);
+        if (continues && !MadeRetentionProgress(report))
+        {
+            if (++_scheduledNoProgressContinues > MaxScheduledNoProgressContinues)
+                continues = false;
+        }
+        else
+            _scheduledNoProgressContinues = 0;
+        if (!continues) _scheduledNoProgressContinues = 0;
+        return continues;
+    }
+
     internal static bool ScheduledRetentionContinues(RetentionReport report) =>
-        report.MoreRemaining && (report.SnapshotsDeleted + report.SnapshotProjectVersionsDeleted + report.ApiSnapshotsDeleted +
-            report.FileVersionsDeleted + report.Deleted.Count + (report.SourceTextsDeleted ?? 0) +
-            report.ProjectChunkRowsDeleted + report.PagesVacuumed) > 0;
+        report.MoreRemaining && (MadeRetentionProgress(report) || report.StopReason == "unit_budget");
 
     // A production holds the writer for its whole run, and a write waiting for its turn would queue behind it: either
     // way a retention pass now would only spend its budget waiting, or delay that write (issue #299).
