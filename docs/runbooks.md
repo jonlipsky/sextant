@@ -42,6 +42,41 @@ recorded job outcomes, not a new coverage audit of legacy snapshots.
 
 ---
 
+## Runbook: previous run ended without a clean shutdown (possible OOM kill)
+
+Symptom: the service log shows `WARNING: previous service run ended without a clean shutdown at ~<time>; possible
+crash or kill (e.g. OOM)`, and `sextant_service_unclean_shutdowns_total` in `/control/metrics` increased (alert on
+its increase). A `Note: previous service run abandoned the lease` (drain timeout, counted in
+`sextant_service_abandoned_runs_total`) or `could not release the lease` is not a crash. Often accompanied by `Took over the stale single-writer lease of '<holder>'`, which means the dead
+process's lease was provably dead (same host/container, pid gone or restarted) and was taken over without waiting
+for the TTL. Start failures with `Another writer holds the single-writer lease` that persist mean the holder
+could not be proven dead (another host/container, or a live process): stop it or wait for the TTL.
+
+Check for an out-of-memory kill:
+
+1. `docker inspect <container> --format '{{.State.OOMKilled}} {{.State.ExitCode}} {{.State.FinishedAt}}'`
+   (`true`/exit 137 = killed by the kernel; the flag only reflects the main process's last run).
+2. Inside the container (cgroup v2): `cat /sys/fs/cgroup/memory.events` — a non-zero `oom_kill` counts kills;
+   `memory.max` is the limit and `memory.peak` the high-water mark. cgroup v1: `memory.oom_control` and
+   `memory.max_usage_in_bytes`.
+3. On the host: `dmesg -T | grep -i -E 'killed process|out of memory'` or `journalctl -k | grep -i oom`.
+
+Job rows that were `running` are requeued by the startup reconcile; no manual cleanup is needed. If OOM is
+confirmed, raise the container memory limit or reduce load parallelism (`SEXTANT_MAX_PARALLELISM`).
+
+The lease holder's `HostId` is the machine name, which **changes when a container is recreated**. A recreated
+container therefore cannot prove its predecessor dead and waits for the lease TTL before taking over (safe, only
+slower); a restart of the same container takes over at once.
+
+## Runbook: RSS drops and the service pauses briefly after a job
+
+Expected (issue #320). After the last job of a burst the service runs an end-of-job memory reclaim: it collects the
+managed heap and trims glibc's native heap, so the process RSS falls from several GiB back toward the baseline and
+every thread pauses for about 2 s. The log line is `Job <id>: memory reclaimed in <n> ms (working set <a> -> <b> MiB,
+managed heap <c> MiB).`. It is skipped (no line) while another job is running or queued, during shutdown, and when the
+working set is under 1 GiB. A reclaim never blocks or fails a job; if RSS stays high after an idle period, look for
+another cause (a running job, or a non-glibc image where the native trim is a no-op).
+
 ## Runbook: unsupported workloads
 
 **Symptom.** `GET /control/metrics` shows a rising `jobs_unsupported`; `GET /control/status/{jobId}` returns
@@ -168,6 +203,10 @@ On the 93 GB production-catalog copy (1.74 M free pages) the command took 3 h 40
 
 Migrations are **additive/forward-only** from `011` onward; `LatestSchemaVersion` auto-derives from the
 highest migration file. A restored/older catalog is upgraded on next startup.
+
+**Rollback caveat (migration 032).** A pre-032 binary refuses a 032 catalog (`CheckReadiness`: newer schema), so
+rolling the service back after it has started on 032 needs the pre-upgrade backup (the g2d backup) restored, not
+just the old image. The crash counters (`writer_run_state`) live in the catalog and come back with a restored backup.
 
 **Rehearsal (do this before upgrading production).**
 1. Take a backup of the current production catalog. Stop the service and run
