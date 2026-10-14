@@ -598,11 +598,15 @@ public sealed partial class SnapshotService
                         await Task.Delay(MemoryReclaimBusyRetryDelay, _timeProvider, _lifetime.Token).ConfigureAwait(false);
                     }
                 }
+                catch (OperationCanceledException)
+                {
+                    // The service is stopping: a quiet exit.
+                }
                 catch
                 {
                     // Best effort: never faults.
                 }
-            }));
+            }, _lifetime.Token).ContinueWith(static _ => { }, CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default));
         }
         catch
         {
