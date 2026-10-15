@@ -1389,6 +1389,24 @@ unreachable or its answer is unparseable. The repository then gets a default fro
 ensure (a push or reconcile) or from a user ensure of the remote's default branch. Application and
 assertion-less callers are unchanged.
 
+## End-of-job memory reclaim (#320)
+
+A job's managed heap peaks at several GiB, and the runtime keeps the freed regions committed after the job (an idle
+service never triggers the GC that would decommit them). After a production, **once the write gate is released**,
+the service schedules a reclaim on a fresh thread-pool work item (so the job's frames have yielded): finalizers
+run, an aggressive blocking compacting GC (with a one-time LOH compaction) decommits the heap, and glibc's
+`malloc_trim(0)` returns native arenas (SQLite, the MSBuild host, brotli). All threads pause for about **2 s**.
+The reclaim never holds the gate, never blocks the job's caller and never throws; it changes nothing a snapshot
+contains. The first plain collection is kept because finalizable objects survive it and only a collection after
+`WaitForPendingFinalizers` can free them.
+
+It is **skipped** when the service is shutting down, when another production is in flight or queued for the writer
+(only the last job of a burst reclaims; checked again right before collecting), when the working set is under 1 GiB
+(`JobMemoryReclaimer.MinWorkingSetBytes`: an idle service sits near 0.5 GiB, so little is left to give back), and
+when another reclaim is running. It logs `Job <id>: memory reclaimed in <n> ms (working set <a> -> <b> MiB, managed
+heap <c> MiB).`. `malloc_trim` assumes glibc, which the Debian/Ubuntu-based dotnet runtime service image uses; on
+musl the native trim is a no-op and only the managed part applies.
+
 ## The `SnapshotService` data plane
 
 `SnapshotService` owns the durable snapshot catalog + semantic store on a **single writer connection**,
@@ -2041,6 +2059,38 @@ snapshot-DATA garbage collection Phase 9 deferred:
 - **#38 — single-writer lease.** Retention/publish/GC run under the `writer_lease`, so they can never race
   a live daemon/service. The lease is acquired fail-closed at `Start`, heartbeated for the service's
   lifetime, and a stale lease may be stolen so a crash never wedges the DB.
+  **#320 — a crashed holder does not block its successor.** The lease row's companion `writer_run_state`
+  (migration `032`, identity-neutral) records the holder's host name, machine id, container id, the container
+  init's start time, boot id, pid namespace, pid, kernel process start time, holder kind (`service` | `daemon` |
+  `cli`) and a random per-process instance id. When in doubt the lease BLOCKS until its TTL; a starting process
+  takes over a still-unexpired lease at once only when it can PROVE the holder dead (same host name required):
+
+  | Evidence | Verdict |
+  |---|---|
+  | Same instance id, other host, no recorded identity, no boot id on either side | block |
+  | Boot id differs AND both sides have the same known `/etc/machine-id` | dead (reboot) |
+  | Boot id differs, machine id unknown/different (never read inside a container: absent or image-baked) | no reboot proof; only the container proof below can apply |
+  | Same boot, same pid namespace: `kill(pid, 0)` = ESRCH | dead |
+  | ... pid present (0 or EPERM) with a different `/proc/<pid>/stat` start time | dead (pid reused) |
+  | ... pid present with the recorded start time | alive: block |
+  | ... `/proc` not trustworthy (`/proc/self` or `/proc/1` invisible), `/proc/<pid>/stat` unreadable (hidepid), other errno | unknown: block |
+  | Different pid namespace, same container id, container init start time differs on both sides | dead (container restarted) |
+  | ... same init start time (a nested namespace in one run), or either init time unknown | block |
+  | Different pid namespace, other/unknown container id | block |
+
+  `/proc/<pid>` being absent is never proof: `hidepid` hides live processes, so `kill(pid, 0)` is the authority.
+  The takeover logs one line (holder, heartbeat age, proof) and is decided inside the `BEGIN IMMEDIATE` that
+  rewrites the lease, so two concurrent acquirers cannot both win.
+  **Unclean shutdown.** `Release` (service dispose) marks the run clean; the run state records why a run ended
+  otherwise: `abandoned` (a drain timeout, see #148), `release_failed` (a database error at shutdown), or nothing
+  (`unclean`: a crash or kill). Acquiring a lease whose previous run did not end cleanly logs, for a crash,
+  `WARNING: previous <kind> run ended without a clean shutdown at ~<last heartbeat>; possible crash or kill (e.g.
+  OOM)` (`service` for the service, `daemon`/`cli` for the others) and increments the durable counter
+  `sextant_service_unclean_shutdowns_total` in `/control/metrics` (also `sextant_service_previous_run_unclean`,
+  `sextant_service_previous_run_last_heartbeat_timestamp_seconds`, `sextant_service_stale_lease_takeovers_total`;
+  JSON `crash`). An abandoned or failed-release run is logged as a `Note:` (not a crash) and counted in
+  `sextant_service_abandoned_runs_total` / `sextant_service_lease_release_failures_total` instead. The counters
+  live in the catalog, so a restored backup restores them too.
 - **#244 — stored source text follows the file versions.** An executed pass then deletes every blob in the
   artifact volume's `source-text/` store whose SHA-256 no `file_versions` row records any more (at most
   256 per sweep), and reports the count as `source_texts_deleted` (absent on a dry run). It runs under

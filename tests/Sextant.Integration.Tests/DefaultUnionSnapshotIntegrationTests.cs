@@ -222,6 +222,52 @@ public sealed class DefaultUnionSnapshotIntegrationTests : IDisposable
     }
 
     [TestMethod]
+    public async Task TheRealWorkersJobState_IsCollectableOnceTheJobCompletes_WithoutAnyReclaim()
+    {
+        var paths = new ServicePaths(ServiceVolumes.Rooted(_dataRoot));
+        CreateCheckout(paths, includeUnloadableHead: false);
+        var provider = new PersistentVolumeCheckoutProvider(paths);
+        var request = Request();
+        var weak = new List<WeakReference>();
+        LocalIndexerSnapshotWorker.JobStateReleasing = load =>
+        {
+            weak.Add(new WeakReference(load.Solution.Workspace));
+            weak.Add(new WeakReference(load.Solution));
+        };
+        try
+        {
+            var (db, config) = OpenCatalog();
+            using (db)
+            {
+                var result = await new LocalIndexerSnapshotWorker(db, config, provider)
+                    .ProduceAsync(request, IdentityHash(request, config), paths.AllocateScratch("job-gc"), CancellationToken.None);
+                Assert.AreEqual(SnapshotJobStatus.Complete, result.Status, result.Error);
+            }
+        }
+        finally
+        {
+            LocalIndexerSnapshotWorker.JobStateReleasing = null;
+        }
+
+        Assert.AreEqual(2, weak.Count, "the worker released the loaded job state once");
+        await Task.Delay(500);
+        // A plain collection only: nothing calls the service's reclaim, so this proves nothing roots the job.
+        CollectFully(weak);
+        Assert.IsFalse(weak[0].IsAlive, "the job's workspace is unreachable");
+        Assert.IsFalse(weak[1].IsAlive, "the job's solution and compilations are unreachable");
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void CollectFully(List<WeakReference> weak)
+    {
+        for (var i = 0; i < 5 && weak.Any(w => w.IsAlive); i++)
+        {
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+        }
+    }
+
+    [TestMethod]
     public async Task NoConfig_OverlappingSolutions_AllLoadable_IsComplete()
     {
         var paths = new ServicePaths(ServiceVolumes.Rooted(_dataRoot));

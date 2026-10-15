@@ -321,6 +321,11 @@ public sealed class LocalIndexerSnapshotWorker(
             }
             pinState.LoadCompleted = true;
 
+            // The job's workspace, compilations and extraction state are released HERE, as soon as the work is done:
+            // an undisposed MSBuildWorkspace keeps the whole Solution reachable, and a completed async state machine
+            // keeps its hoisted locals for as long as anything holds its Task (issue #320).
+            try
+            {
             if (pinOverlay.RestoreError is { } restoreError)
                 throw SdkPinRestoreFailure(pinOverlay, restoreError);
 
@@ -414,6 +419,12 @@ public sealed class LocalIndexerSnapshotWorker(
             return BuildResult(
                 published.Id, checkoutDir, resolution, load, coverage with { Coverage = recorded },
                 pins, InstalledSdks(pins, load: load), restore);
+            }
+            finally
+            {
+                ReleaseJobState(load);
+                load = null!;
+            }
         }
 
         // A failed restore outranks every other outcome: the checkout no longer matches its commit, so the job
@@ -487,6 +498,24 @@ public sealed class LocalIndexerSnapshotWorker(
         {
             // Record what the folder now holds and keep the cache under its bound.
             packageCache?.Release(packagesDir);
+        }
+    }
+
+    // Test hook: sees the job's load result just before its workspace is disposed (to hold a weak reference).
+    internal static Action<MultiSolutionLoadResult>? JobStateReleasing { get; set; }
+
+    // Disposes the job's workspace (drops its solution, projects and cached compilations) and never throws.
+    internal static void ReleaseJobState(MultiSolutionLoadResult? load)
+    {
+        try
+        {
+            if (load is not null)
+                JobStateReleasing?.Invoke(load);
+            load?.Solution.Workspace.Dispose();
+        }
+        catch
+        {
+            // Best effort: releasing memory must not change the job's outcome.
         }
     }
 

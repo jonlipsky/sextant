@@ -227,7 +227,7 @@ public sealed class IndexDatabase : IDisposable
     /// index-only migration that did), and those identities are left as they are.
     /// </summary>
     public static IReadOnlySet<int> IdentityNeutralMigrations { get; } =
-        new HashSet<int> { 25, 27, 28, 29, 30, 31 };
+        new HashSet<int> { 25, 27, 28, 29, 30, 31, 32 };
 
     /// <summary>
     /// Tables the service keeps about its jobs only: job telemetry (issue #267), branch-advance handovers (issue
@@ -235,7 +235,7 @@ public sealed class IndexDatabase : IDisposable
     /// snapshot. Creating one is identity-neutral.
     /// </summary>
     public static IReadOnlySet<string> ServiceJobTables { get; } =
-        new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "snapshot_job_timings", "branch_advance_handovers", "retired_branch_heads" };
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "snapshot_job_timings", "branch_advance_handovers", "retired_branch_heads", "writer_run_state" };
 
     /// <summary>
     /// The schema version folded into a snapshot's identity (<c>SnapshotIdentity.SchemaVersion</c>) and compared by
