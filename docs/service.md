@@ -2245,6 +2245,19 @@ with a one-second command retry limit. Request cancellation stops subsequent wor
 in-progress batch; earlier committed batches remain applied and have `retention`/`complete` audit rows
 with detail `execute_batch`. A queued publish runs before the next retention batch.
 
+**Pass time contract (issue #321).** A pass is bounded by its budget (`?seconds=` / `SEXTANT_SERVICE_RETENTION_PASS_SECONDS`)
+plus a margin. A new deletion unit starts only while its cap (the unit cap, or half the pass when shorter) still fits in
+the remaining budget, except that **the first unit of a pass always starts**, so a pass whose planning used most of its
+budget still deletes. What may overrun the budget, in the scheduled pass: the closing audit row waits at most 3 s for the
+writer, the post-vacuum WAL checkpoint at most 5 s, and a batch in flight at the limit rolls back within about 2 s, so a
+scheduled pass ends within budget + 10 s (`RetentionPassMargin`, the sum of those three). A skipped audit row leaves no
+"done" row, so the day stays open like after a crash; it is reported as `audit_skipped: true` in the response and counted
+in `maintenance.retention_audit_skipped` / `sextant_retention_audit_skipped_total`. An interactive
+`POST /control/retention?execute=true` waits up to 30 s for the audit row (a human is waiting anyway), so it may run up to
+budget + 30 s + the other two terms. `timings` splits writer wait from work for every step, including the audit and the
+post-vacuum checkpoint. A pass that stops on its budget or the unit-start rule before deleting anything reports
+`stop_reason: unit_budget`; the scheduler continues it on the next tick, at most 3 times in a row, then closes the day.
+
 `more_remaining: true` means another pass may be needed. `stop_reason: time_budget`, `api_deferred` (API-history
 candidates could not be planned or verified in time; the next pass does them) or `sqlite_busy`
 explicitly reports bounded deferral, not completion. The orphan-blob sweep examines at most 256 spans of 4096

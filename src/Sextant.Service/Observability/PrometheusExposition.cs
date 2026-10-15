@@ -102,6 +102,8 @@ public static class PrometheusExposition
             s.Maintenance.ScheduledRetentionRuns);
         Gauge(sb, "sextant_scheduled_retention_skipped_busy", "Due scheduled retention passes skipped while indexing held the writer.",
             s.Maintenance.ScheduledRetentionSkippedBusy);
+        Counter(sb, "sextant_retention_audit_skipped_total", "Executed retention passes whose closing audit row was skipped.",
+            s.Maintenance.RetentionAuditSkipped);
         Gauge(sb, "sextant_scheduled_retention_last_duration_ms", "Duration of the latest scheduled retention pass (ms).",
             s.Maintenance.LastScheduledRetentionDurationMs);
 

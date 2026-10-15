@@ -299,6 +299,62 @@ public class RetentionProtectedSetEquivalenceTests
         Assert.AreNotEqual(0, old);
     }
 
+    // Issue #321: a unit whose cap does not fit in what is left of the pass is not started; the plan is left untouched.
+    [TestMethod]
+    public void AUnit_IsNotStarted_WhenItsCapDoesNotFitTheRemainingPassBudget()
+    {
+        var (_, candidate) = OldGenerationWithCandidate();
+        var started = false;
+        var service = new RetentionService(_conn, new RetentionPolicy { KeepCompleteGenerations = 0, UnitMaxSeconds = 60 })
+        {
+            BeforeUnitDelete = _ => started = true
+        };
+        var plan = service.CreatePlan();
+
+        var report = service.ExecuteBatch(plan, timeLimit: TimeSpan.FromSeconds(2),
+            passRemaining: TimeSpan.FromSeconds(30), passLimit: TimeSpan.FromSeconds(600));
+
+        Assert.IsFalse(started);
+        Assert.AreEqual("unit_budget", report.StopReason);
+        Assert.IsTrue(report.MoreRemaining);
+        Assert.AreEqual(1, ScalarLong($"SELECT COUNT(*) FROM snapshots WHERE id = {candidate};"));
+
+        var fits = service.ExecuteBatch(plan, passRemaining: TimeSpan.FromSeconds(90), passLimit: TimeSpan.FromSeconds(600));
+        Assert.IsTrue(started);
+        Assert.IsNull(fits.StopReason);
+        Assert.AreEqual(1, fits.SnapshotsDeleted);
+    }
+
+    // Issue #321: a pass whose planning ate its budget must still delete: the unit-start rule is off until it has progressed.
+    [TestMethod]
+    public void AFirstUnit_StartsRegardlessOfTheRemainingBudget_WhenTheRuleIsNotEnforced()
+    {
+        var (_, candidate) = OldGenerationWithCandidate();
+        var service = new RetentionService(_conn, new RetentionPolicy { KeepCompleteGenerations = 0, UnitMaxSeconds = 60 });
+        var plan = service.CreatePlan();
+
+        var refused = service.ExecuteBatch(plan, passRemaining: TimeSpan.FromSeconds(1), passLimit: TimeSpan.FromSeconds(600));
+        Assert.AreEqual("unit_budget", refused.StopReason);
+        Assert.AreEqual(1, ScalarLong($"SELECT COUNT(*) FROM snapshots WHERE id = {candidate};"));
+
+        var forced = service.ExecuteBatch(plan, passRemaining: TimeSpan.FromSeconds(1), passLimit: TimeSpan.FromSeconds(600),
+            enforceUnitStart: false);
+        Assert.IsNull(forced.StopReason);
+        Assert.AreEqual(1, forced.SnapshotsDeleted);
+    }
+
+    [TestMethod]
+    public void AUnit_InAShortPass_StartsWhileHalfThePassIsLeft()
+    {
+        OldGenerationWithCandidate();
+        var service = new RetentionService(_conn, new RetentionPolicy { KeepCompleteGenerations = 0, UnitMaxSeconds = 60 });
+        var plan = service.CreatePlan();
+
+        var report = service.ExecuteBatch(plan, passRemaining: TimeSpan.FromSeconds(6), passLimit: TimeSpan.FromSeconds(10));
+
+        Assert.AreEqual(1, report.SnapshotsDeleted);
+    }
+
     [TestMethod]
     public void AUnit_OverTheCap_IsRolledBackAndReported_AndLaterUnitsProgress()
     {

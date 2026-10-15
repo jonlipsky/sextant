@@ -177,7 +177,7 @@ public class BoundedRetentionTests
             var report = await service.RunRetentionAsync(true)
                 .WaitAsync(RetentionService.PassTimeLimit + TimeSpan.FromSeconds(5));
             Assert.IsTrue(report.MoreRemaining);
-            Assert.AreEqual("time_budget", report.StopReason);
+            Assert.AreEqual("unit_budget", report.StopReason, "nothing was deleted, so the cut asks for a continuation");
             Assert.AreEqual(0, report.SnapshotsDeleted);
             Assert.AreEqual(0, service.RecentAudit(action: AuditAction.Retention).Count, "no batch got the writer");
         }
@@ -209,6 +209,107 @@ public class BoundedRetentionTests
             await ensure.WaitAsync(TimeSpan.FromSeconds(5));
         }
         Assert.AreEqual(0, service.RecentAudit(action: AuditAction.Retention).Count);
+    }
+
+    // Issue #321: an indexing job takes the writer right after the pass's first batch and holds it. The pass runs out of
+    // budget waiting; its closing audit row must not wait for that job (it overran 600 s by 384 s and 852 s in production).
+    [TestMethod]
+    public async Task Execute_GateWaitIsBoundedByTheRemainingBudget_NotByTheIndexJob()
+    {
+        var worker = new FakeSnapshotWorker(_db) { UseGate = true };
+        var service = Start(worker);
+        var ensure = service.EnsureSnapshotAsync(ServiceTestFixtures.Request());
+        await WaitForWorkerAsync(worker);
+        try
+        {
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            var report = await service.RunRetentionAsync(true, passLimit: TimeSpan.FromMilliseconds(700))
+                .WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.IsTrue(clock.Elapsed < TimeSpan.FromSeconds(3), clock.Elapsed.ToString());
+            Assert.AreEqual("unit_budget", report.StopReason);
+            Assert.IsTrue(report.Timings!.WriterWaitMs >= 500, "the wait is reported");
+        }
+        finally
+        {
+            worker.Gate.TrySetResult();
+            await ensure.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+    }
+
+    [TestMethod]
+    public async Task Execute_ARunningIndexHoldingTheWriter_DoesNotHoldThePassPastItsBudgetPlusMargin()
+    {
+        var first = ServiceTestFixtures.PublishComplete(_db, ServiceTestFixtures.Request(commit: "old-A"));
+        ServiceTestFixtures.PublishComplete(_db, ServiceTestFixtures.Request(commit: "old-B", branch: "release"));
+        ServiceTestFixtures.PublishComplete(_db, ServiceTestFixtures.Request(commit: "current"));
+        var worker = new FakeSnapshotWorker(_db) { UseGate = true };
+        var service = Start(worker);
+        var conn = _db.GetConnection();
+        Task<EnsureSnapshotResult>? ensure = null;
+        conn.CreateFunction("queue_ensure", () =>
+        {
+            ensure ??= service.EnsureSnapshotAsync(ServiceTestFixtures.Request(commit: "brand-new"));
+            return 1;
+        });
+        using (var trigger = conn.CreateCommand())
+        {
+            trigger.CommandText = $"""
+                CREATE TEMP TRIGGER retention_interleave BEFORE DELETE ON projects
+                WHEN OLD.snapshot_id = {first}
+                BEGIN SELECT queue_ensure(); END;
+                """;
+            trigger.ExecuteNonQuery();
+        }
+
+        // A pass long enough that scheduling jitter on a loaded CI machine cannot reach the bounds asserted below.
+        var limit = TimeSpan.FromSeconds(6);
+        var auditWait = SnapshotService.RetentionAuditWait;
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        try
+        {
+            var report = await service.RunRetentionAsync(true, passLimit: limit, auditWait: auditWait)
+                .WaitAsync(limit + SnapshotService.RetentionPassMargin + TimeSpan.FromSeconds(10));
+            Assert.IsTrue(report.SnapshotsDeleted >= 1);
+            Assert.IsTrue(report.MoreRemaining);
+            Assert.AreEqual("time_budget", report.StopReason);
+            Assert.IsTrue(report.AuditSkipped, "the audit row gave up on the busy writer");
+            Assert.AreEqual(1, service.CollectMetrics().Maintenance.RetentionAuditSkipped);
+            Assert.IsTrue(clock.Elapsed >= limit, clock.Elapsed.ToString());
+            Assert.IsTrue(clock.Elapsed < limit + auditWait + TimeSpan.FromSeconds(2), clock.Elapsed.ToString());
+        }
+        finally
+        {
+            worker.Gate.TrySetResult();
+            if (ensure != null) await ensure.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+    }
+
+    [TestMethod]
+    public async Task Execute_PassSpentBeforeAnyDeletion_ReportsUnitBudget_AndAsksToContinue()
+    {
+        ServiceTestFixtures.PublishComplete(_db, ServiceTestFixtures.Request(commit: "old-A"));
+        ServiceTestFixtures.PublishComplete(_db, ServiceTestFixtures.Request(commit: "current"));
+        var service = Start(new FakeSnapshotWorker(_db));
+
+        var report = await service.RunRetentionAsync(true, passLimit: TimeSpan.FromMilliseconds(1));
+
+        Assert.IsTrue(report.MoreRemaining);
+        Assert.AreEqual("unit_budget", report.StopReason);
+        Assert.IsTrue(SnapshotService.ScheduledRetentionContinues(report));
+    }
+
+    [TestMethod]
+    public async Task Execute_ReportCarriesTheStepTimings()
+    {
+        var service = Start(new FakeSnapshotWorker(_db));
+        FillAndDropScratch(_db.GetConnection(), 2000);
+        var report = await service.RunRetentionAsync(true);
+        Assert.IsNotNull(report.Timings);
+        Assert.IsTrue(report.Timings.PlanMs >= 0 && report.Timings.VacuumMs > 0);
+        Assert.IsTrue(report.Timings.Batches >= 1);
+        StringAssert.Contains(report.Timings.ToLogText(), "plan ");
+        StringAssert.Contains(report.Timings.ToLogText(), "writer wait ");
+        Assert.IsFalse(report.Timings.ToLogText().Contains('\n'));
     }
 
     [TestMethod]

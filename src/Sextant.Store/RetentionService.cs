@@ -85,6 +85,30 @@ public sealed record RetentionReport
     /// Null on a dry run and where no source-text store is kept.
     /// </summary>
     public int? SourceTextsDeleted { get; init; }
+
+    /// <summary>Where an executed service pass spent its time (issue #321). Null on a dry run and below the service.</summary>
+    public RetentionPassTimings? Timings { get; init; }
+
+    /// <summary>True when the closing audit row of an executed service pass was skipped (the writer stayed busy past its cap).</summary>
+    public bool AuditSkipped { get; init; }
+}
+
+/// <summary>
+/// Step timings of one executed service retention pass (issue #321), so an overrun is diagnosable from one log line:
+/// planning, queueing for the writer, deleting under it, the source-text sweep (tail), vacuum, and the closing audit row.
+/// </summary>
+public sealed record RetentionPassTimings
+{
+    public double PlanMs { get; init; }
+    public double WriterWaitMs { get; init; }
+    public double DeleteMs { get; init; }
+    public double TailMs { get; init; }
+    public double VacuumMs { get; init; }
+    public double AuditMs { get; init; }
+    public int Batches { get; init; }
+
+    public string ToLogText() => FormattableString.Invariant(
+        $"plan {PlanMs:F0} ms, writer wait {WriterWaitMs:F0} ms, delete {DeleteMs:F0} ms, tail {TailMs:F0} ms, vacuum {VacuumMs:F0} ms, audit {AuditMs:F0} ms, {Batches} batch(es)");
 }
 
 /// <summary>
@@ -492,8 +516,10 @@ public sealed class RetentionService
     /// project cascade of the first that passes. Interrupted cascades roll back the whole batch and the plan's position.
     /// </summary>
     public RetentionReport ExecuteBatch(RetentionPlan plan, CancellationToken cancellationToken = default,
-        TimeSpan? timeLimit = null, Action? beforeCommit = null)
+        TimeSpan? timeLimit = null, Action? beforeCommit = null, TimeSpan? passRemaining = null, TimeSpan? passLimit = null,
+        bool enforceUnitStart = true)
     {
+        var sinceCall = Stopwatch.StartNew();
         using var budget = new RetentionWorkBudget(_connection, timeLimit ?? BatchTimeLimit, cancellationToken);
         _budget = budget;
         var held = Stopwatch.StartNew();
@@ -524,6 +550,17 @@ public sealed class RetentionService
                     if (verdict == SnapshotVerdict.Protected) skipped++;
                     plan.AdvanceSnapshot();
                     continue;
+                }
+                // A unit that could outlast the pass is not started (issue #321): it would be cut at the pass limit and
+                // rolled back whole. Its cap is the unit cap, or half the pass when the pass is shorter than that.
+                // The caller turns the rule off until the pass has made progress, so a pass whose planning ate most of
+                // its budget still starts its first unit instead of starving every pass (issue #321).
+                if (enforceUnitStart && passRemaining is { } left && passLimit is { } total)
+                {
+                    var need = TimeSpan.FromSeconds(_policy.UnitMaxSeconds);
+                    if (total / 2 < need) need = total / 2;
+                    if (left - sinceCall.Elapsed < need)
+                        throw new UnitStartBudgetException();
                 }
                 // One unit always gets to finish, up to its own hard cap; a unit over the cap rolls back whole.
                 var unitMark = plan.Mark();
@@ -682,7 +719,10 @@ public sealed class RetentionService
         ex is TimeoutException || ex is SqliteException sql &&
         (sql.SqliteErrorCode is 5 or 6 || sql.SqliteErrorCode == 9 && budget.ShouldStop);
 
+    private sealed class UnitStartBudgetException() : TimeoutException("Not enough pass budget left to start a deletion unit.");
+
     private static string StopReason(Exception ex) =>
+        ex is UnitStartBudgetException ? "unit_budget" :
         ex is SqliteException { SqliteErrorCode: 5 or 6 } ? "sqlite_busy" : "time_budget";
 
     public static RetentionReport Combine(RetentionReport total, RetentionReport batch) => batch with
