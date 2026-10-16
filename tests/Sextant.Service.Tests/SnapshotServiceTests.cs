@@ -136,8 +136,8 @@ public class SnapshotServiceTests
 
         var status = _service.GetStatus(jobId);
         Assert.IsNotNull(status, "the durable job survived restart (criterion 2)");
-        Assert.AreEqual(SnapshotJobStatus.Queued, status!.Job.Status,
-            "a job orphaned 'running' by a dead worker is reconciled to queued on restart (criterion 2)");
+        Assert.AreEqual(SnapshotJobStatus.Cancelled, status!.Job.Status,
+            "a job orphaned 'running' by a dead worker is reconciled on restart and, having no live turn, settled (criterion 2, #327)");
 
         // The published catalog data is intact and still resolvable after restart.
         var resolved = _service.GetStatusByIdentity(request.ToIdentity().Hash);

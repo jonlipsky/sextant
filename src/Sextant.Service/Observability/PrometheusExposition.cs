@@ -98,6 +98,12 @@ public static class PrometheusExposition
             s.Maintenance.RepositoryBytesReclaimedTotal);
         Gauge(sb, "sextant_repository_reclaim_failures_total", "Repository reclaims that failed since start.",
             s.Maintenance.RepositoryReclaimFailuresTotal);
+        sb.Append("# HELP sextant_startup_jobs_settled_total Queued jobs with no live turn settled at startup, by kind.\n");
+        sb.Append("# TYPE sextant_startup_jobs_settled_total counter\n");
+        sb.Append("sextant_startup_jobs_settled_total{kind=\"coalesced\"} ")
+            .Append(s.Maintenance.StartupJobsSettledCoalesced.ToString(CultureInfo.InvariantCulture)).Append('\n');
+        sb.Append("sextant_startup_jobs_settled_total{kind=\"cancelled\"} ")
+            .Append(s.Maintenance.StartupJobsSettledCancelled.ToString(CultureInfo.InvariantCulture)).Append('\n');
         sb.Append("# HELP sextant_memory_reclaims_total Job-memory reclaims that ran, by phase (post_job or pre_job).\n");
         sb.Append("# TYPE sextant_memory_reclaims_total counter\n");
         foreach (var phase in MemoryReclaimPhases.All)

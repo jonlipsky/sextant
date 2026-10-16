@@ -61,7 +61,8 @@ Check for an out-of-memory kill:
    `memory.max_usage_in_bytes`.
 3. On the host: `dmesg -T | grep -i -E 'killed process|out of memory'` or `journalctl -k | grep -i oom`.
 
-Job rows that were `running` are requeued by the startup reconcile; no manual cleanup is needed. If OOM is
+Job rows that were `running` are reset by the startup reconcile and then settled (issue #327, see
+[Startup settles orphaned queued jobs](#startup-settles-orphaned-queued-jobs)); no manual cleanup is needed. If OOM is
 confirmed, raise the container memory limit or reduce load parallelism (`SEXTANT_MAX_PARALLELISM`).
 
 The lease holder's `HostId` is the machine name, which **changes when a container is recreated**. A recreated
@@ -137,9 +138,28 @@ refused, or a project shape the indexer does not model).
 3. If a job is `running` but the process crashed, restart the service. **Startup recovery** checkpoints the
    WAL, sweeps abandoned staging generations, and reconciles phantom terminal jobs (a job whose worker died
    is reconciled, never left "running" forever). Recovery runs under the **writer lease** so it never abandons
-   a live writer's staging generation.
+   a live writer's staging generation. It then settles every `queued` row left by the dead run (see below).
 4. Re-`ensure` the identity — ensure is **idempotent**; it attaches to the existing durable job rather than
-   duplicating work.
+   duplicating work. A job the restart settled as `cancelled` or `coalesced` is produced again by this ensure.
+
+---
+
+## Startup settles orphaned queued jobs
+
+**Symptom.** A startup log line `Startup settled N orphaned queued job(s) with no live turn: A coalesced
+(superseded), C cancelled (not produced; a later ensure produces them).`, an audit row `reconcile` with detail
+`settled_queued_coalesced_A_cancelled_C`, or `sextant_startup_jobs_settled_total` above 0.
+
+**Meaning.** Jobs are produced only when a client calls `ensure`, so a `queued` row from the previous run had lost
+its in-process turn (restart, crash, cancel, retention requeue). Startup settled it so it no longer looks like a
+backlog or blocks idle-branch retirement and repository reclaim. `coalesced` rows had a newer job of their branch
+that already ran; `cancelled` rows were never produced. Nothing is lost: the next `ensure` of the identity
+produces it. A large count on the first start after upgrading is the backfill of old stale rows. A count at
+every restart is the number of ensures that were still queued when the previous run stopped; frequent deploys
+during pushes make it larger. After startup, `sextant_jobs_queued` is only jobs admitted in this run.
+
+**Action.** None. If `sextant_jobs_queued` stays above 0 for long with `worker_in_flight` idle, see
+"stuck indexing" above.
 
 ---
 

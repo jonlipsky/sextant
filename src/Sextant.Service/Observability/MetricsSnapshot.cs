@@ -126,6 +126,12 @@ public sealed record MaintenanceMetrics
 
     public long ScheduledRetentionRuns { get; init; }
 
+    /// <summary>Queued jobs with no live turn that startup settled as coalesced (superseded), since start (issue #327).</summary>
+    public long StartupJobsSettledCoalesced { get; init; }
+
+    /// <summary>Queued jobs with no live turn that startup settled as cancelled, since start (issue #327).</summary>
+    public long StartupJobsSettledCancelled { get; init; }
+
     /// <summary>Due scheduled retention passes skipped because indexing held the writer (retried next tick).</summary>
     public long ScheduledRetentionSkippedBusy { get; init; }
 

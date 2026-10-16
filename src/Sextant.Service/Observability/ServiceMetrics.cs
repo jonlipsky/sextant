@@ -168,6 +168,17 @@ public sealed class ServiceMetrics
             _maintenance = _maintenance with { RetentionAuditSkipped = _maintenance.RetentionAuditSkipped + 1 };
     }
 
+    /// <summary>Records the orphaned queued jobs settled at startup (issue #327).</summary>
+    public void RecordStartupJobsSettled(int coalesced, int cancelled)
+    {
+        lock (_maintenanceLock)
+            _maintenance = _maintenance with
+            {
+                StartupJobsSettledCoalesced = _maintenance.StartupJobsSettledCoalesced + coalesced,
+                StartupJobsSettledCancelled = _maintenance.StartupJobsSettledCancelled + cancelled
+            };
+    }
+
     /// <summary>Records a maintenance tick that failed with an exception (issue #299); the loop carries on.</summary>
     public void RecordMaintenanceFailure()
     {

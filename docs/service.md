@@ -803,7 +803,8 @@ cost a full copy per job and break checkout-relative paths. So the service handl
      journal".
 
    If a restore fails during a job (even a cancelled one), or a leftover journal cannot be replayed, the
-   checkout is not indexed, the journal is kept, and the job is **requeued** with an `sdk_pin_restore_failed`
+   checkout is not indexed, the journal is kept, and the job is **requeued** (until the next start settles it as
+   cancelled, see [Job lifecycle (#327)](#job-lifecycle-queued-means-admitted-in-this-run-issue-327)) with an `sdk_pin_restore_failed`
    diagnostic rather than recorded as a terminal failure. The checkout's state is the problem, not the commit,
    so it must not poison the identity: once the checkout is repaired, the next ensure retries. There is no
    background retry: the next attempt runs when the orchestrator **re-calls `POST /control/ensure`** for the
@@ -870,7 +871,7 @@ Outcomes and diagnostics. All paths are checkout-relative, and every diagnostic 
 | pin overridden, checkout loaded | `complete` (unless another coverage gap applies) | `sdk_pin_overridden` (warning; also the substituted SDK) |
 | pin not overridden and the **whole** load failed SDK resolution | `failed` with a typed reason (requested vs installed, pin path, why not overridden) — never a bare exception message. This also applies when the load fails with an error that names no hostfxr function (e.g. every project came back empty) while a pin it depends on is known not to resolve; the reason then carries the load error too | `sdk_resolution_failed` (error) |
 | pin not overridden, but only **some** solutions/projects are governed by it (#90-style isolation, e.g. a `tools/global.json` in one of several solutions, or a refused pin inside one submodule while the root pin is overridden) | `partial`; the reason names the pin | `sdk_resolution_failed` (warning) for the pin and for each project it kept from loading |
-| a neutralized pin could not be restored (or a leftover journal could not be replayed, or its presence ruled out) | `queued` (requeued; HTTP 202 — re-call ensure to retry), nothing indexed; `failed` once `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS` is exhausted | `sdk_pin_restore_failed` (error) |
+| a neutralized pin could not be restored (or a leftover journal could not be replayed, or its presence ruled out) | `queued` (requeued; HTTP 202 — re-call ensure to retry, before the next start settles it as cancelled; see [Job lifecycle (#327)](#job-lifecycle-queued-means-admitted-in-this-run-issue-327)), nothing indexed; `failed` once `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS` is exhausted | `sdk_pin_restore_failed` (error) |
 
 An overridden snapshot is **complete**, because the override restored full coverage, but it is never
 silent:
@@ -928,7 +929,7 @@ tree is not a git repository and carries no solution). The service classifies th
 poisons a recoverable commit while still caching genuinely-hopeless ones:
 
 - **Transient** — the failing ensure does **not** record a suppressing terminal result. The identity is
-  requeued, so the orchestrator's natural retry (re-calling `ensure` for the same commit) re-runs the
+  requeued (until the next start settles it as cancelled, see [Job lifecycle (#327)](#job-lifecycle-queued-means-admitted-in-this-run-issue-327)), so the orchestrator's natural retry (re-calling `ensure` for the same commit) re-runs the
   worker. This is bounded by `SEXTANT_SERVICE_MAX_PROVISIONING_ATTEMPTS` (default `5`); once exhausted the
   job settles to terminal `failed`. Such an ensure returns **HTTP 202 Accepted** with a non-terminal
   (`queued`) status. `/control/status/{jobId}` shows the queued job and its diagnostics, but nothing
@@ -1014,7 +1015,7 @@ The host deliberately **separates control endpoints from query endpoints**, and 
 | --- | --- | --- | --- |
 | `GET /health` | — | open | Service **AVAILABILITY**: the process is up and the catalog is reachable. |
 | `GET /ready` | — | open | Worker **CAPACITY**: `503` when this node has no worker (query-only), so an operator can tell "up" from "can index". |
-| `POST /control/ensure` | control | control token | Idempotent ensure-snapshot (criterion 1). Accepts an optional monotonic `branch_head_sequence` for forward-only branch-head advance (Phase 14, issue #84), **or** an `expected_head_commit` head CAS, plus `forced` and `branch_update` (see [Branch-pointer guards](#branch-pointer-guards-head-cas-branch_update-none-retire-svc-67)); the result carries `branch_advanced`. Blocks until terminal (`200`; `202` when transient-requeued) unless `?wait=false`, which returns `202` at once with the job to poll (issue #148). When that registration is still waiting for the writer after `CONTROL_WRITE_WAIT_SECONDS` (another identity is producing), it returns `202 {"job_id":<integer>,"identity_hash":…,"status":"queued","attached":…}` with the id the job is (or will be) registered under, which `/control/status/{job_id}` resolves at once (issue #158, see [Queued control writes](#queued-control-writes-issue-158)). A caller disconnect/timeout **never** cancels production. A repository URL the [repository URL policy](#repository-url-policy-svc-5) refuses, both branch guards together (`conflicting_branch_guards`) or an unknown `branch_update` (`invalid_branch_update`) is `400 {"status":"rejected","reason":"<code>"}` before any job exists (audited `ensure`/`denied`). A user caller (`act=user` assertion) may ensure only a repository it can read: otherwise `403 {"status":"rejected","reason":"not_granted"}` (SVC-4), whatever the body asks. A user caller's ensure is then bounded (SX-6d, see [User callers on the control plane](#user-callers-on-the-control-plane-issue-193)): `default_branch: true`, any `branch_head_sequence`, or an advance with no `expected_head_commit` or no `branch_name` is `400` (`default_branch_not_allowed`, `branch_head_sequence_not_allowed`, `branch_guard_required`, `branch_required`). |
+| `POST /control/ensure` | control | control token | Idempotent ensure-snapshot (criterion 1). Accepts an optional monotonic `branch_head_sequence` for forward-only branch-head advance (Phase 14, issue #84), **or** an `expected_head_commit` head CAS, plus `forced` and `branch_update` (see [Branch-pointer guards](#branch-pointer-guards-head-cas-branch_update-none-retire-svc-67)); the result carries `branch_advanced`. Blocks until terminal (`200`; `202` when transient-requeued, until the next start settles it as cancelled, see [Job lifecycle (#327)](#job-lifecycle-queued-means-admitted-in-this-run-issue-327)) unless `?wait=false`, which returns `202` at once with the job to poll (issue #148). When that registration is still waiting for the writer after `CONTROL_WRITE_WAIT_SECONDS` (another identity is producing), it returns `202 {"job_id":<integer>,"identity_hash":…,"status":"queued","attached":…}` with the id the job is (or will be) registered under, which `/control/status/{job_id}` resolves at once (issue #158, see [Queued control writes](#queued-control-writes-issue-158)). A caller disconnect/timeout **never** cancels production. A repository URL the [repository URL policy](#repository-url-policy-svc-5) refuses, both branch guards together (`conflicting_branch_guards`) or an unknown `branch_update` (`invalid_branch_update`) is `400 {"status":"rejected","reason":"<code>"}` before any job exists (audited `ensure`/`denied`). A user caller (`act=user` assertion) may ensure only a repository it can read: otherwise `403 {"status":"rejected","reason":"not_granted"}` (SVC-4), whatever the body asks. A user caller's ensure is then bounded (SX-6d, see [User callers on the control plane](#user-callers-on-the-control-plane-issue-193)): `default_branch: true`, any `branch_head_sequence`, or an advance with no `expected_head_commit` or no `branch_name` is `400` (`default_branch_not_allowed`, `branch_head_sequence_not_allowed`, `branch_guard_required`, `branch_required`). |
 | `POST /control/contribute` | control | control **or** contribute token | Ingest a client/CI semantic contribution (Phase 16); the least-privilege contribute token authorizes this endpoint only. |
 | `GET /control/status/{jobId}` | control | control token | Job status + per-project diagnostics (criterion 5) + checkout `coverage` (#119) + phase `timings` (#267, see [Job phase timings](#observability-criterion-5)). For a user caller, a job on a repository it cannot read is the same `404` as an unknown id (SVC-4). |
 | `GET /control/resolve` | control | control token | Resolve a repository branch (`?branch=`, else the default) to its current published snapshot (+ its `coverage`, #119), plus `commit_sha`, the resolved `branch` name, `is_default` and `head_sequence` (SVC-7; a null `commit_sha`/`head_sequence` is omitted), and `current_identity_hash` + `identity_current`: whether the snapshot is what an ensure of its commit would build on this node now (both omitted when there is no `commit_sha` or the head is a contribution; see [Identity currency](#branch-pointer-guards-head-cas-branch_update-none-retire-svc-67)). For a user caller, a repository it cannot read is the same bare `404` as an absent one (SVC-4). |
@@ -1458,7 +1459,8 @@ worker runs per identity while concurrent callers attach. The pluggable `ISnapsh
 snapshot under a per-job **scratch** directory; its output is validated — a worker that claims
 `complete`/`partial` but published no complete snapshot, **or** published a snapshot whose identity does not
 match the requested hash, is **downgraded to `failed`** — and published through the catalog, then a terminal
-status + per-project diagnostics are recorded. A job **cancelled** mid-run is requeued (transient), never
+status + per-project diagnostics are recorded. A job **cancelled** mid-run is requeued (transient; until the next
+start settles it as cancelled, see [Job lifecycle (#327)](#job-lifecycle-queued-means-admitted-in-this-run-issue-327)), never
 recorded as a permanent failure.
 
 ### Ensure lifecycle: production outlives the caller (issue #148)
@@ -1481,7 +1483,7 @@ owned by the **service**, never by the request:
   `GET /control/status/{job_id}` until `job.status` is terminal. Without the parameter the ensure keeps the
   blocking contract (`200` terminal, `202` transient-requeued).
 - **Only shutdown cancels a worker.** On host `ApplicationStopping` (and `SnapshotService.Dispose`) the
-  service lifetime is cancelled: each in-flight worker is cancelled and its job **requeued** (never
+  service lifetime is cancelled: each in-flight worker is cancelled and its job **requeued** (until the next start settles it as cancelled, see [Job lifecycle (#327)](#job-lifecycle-queued-means-admitted-in-this-run-issue-327); never
   failed; even a worker that ignores the cancellation and then reports a failure is requeued, because such a
   failure is usually just the shutdown surfacing). Dispose waits up to `ShutdownDrainTimeout` (30 s) for those requeues to land **before** it
   releases the writer lease. From the moment shutdown begins, every ensure is refused with **`503`**
@@ -1556,8 +1558,9 @@ itself never gives up.
   `503 {"status":"unavailable"}` and nothing is queued. Writes queued before that **drain**: Dispose
   cancels and requeues the running production, then waits (up to `ShutdownDrainTimeout`, 30 s) for each
   queued write to take its turn before it releases the lease. A queued retirement applies, and a queued
-  registration inserts its job row under its reserved id. That job is not produced: it stays `queued`, and
-  the next ensure of the identity produces it.
+  registration inserts its job row under its reserved id. That job is not produced: it stays `queued` until the
+  next start settles it as `cancelled` (see [Job lifecycle](#job-lifecycle-queued-means-admitted-in-this-run-issue-327)),
+  and the next ensure of the identity produces it.
 - **A crash loses queued writes.** Queued registrations and retirements are held in memory only, so a
   crash, or a drain that times out, **loses** them:
   - A reserved `job_id` then answers `404` from the next instance. Re-ensure the identity to register it.
@@ -1830,8 +1833,41 @@ The local CLI/daemon path never sets these guards (`SnapshotContext.ExpectedHead
 
 The catalog, published data, branch pointers, and dependency edges are all durable SQLite. A restart
 holds a **fresh** lease token, so `ReconcileOrphanedJobs` resets every `running` job **not** owned by the
-new token back to `queued` for re-attempt — a job a dead worker abandoned is never stuck `running`, and a
+new token back to `queued` for re-attempt (until the same start settles it as cancelled or coalesced, see
+[Job lifecycle (#327)](#job-lifecycle-queued-means-admitted-in-this-run-issue-327)) — a job a dead worker abandoned is never stuck `running`, and a
 job a still-live writer owns is left alone.
+
+### Job lifecycle: `queued` means admitted in this run (issue #327)
+
+A job is produced only when a client's `ensure` calls for it; nothing drains the queue in the background. So
+`queued` means **admitted by this service run** and waiting for its in-process turn. A `queued` row an earlier
+run left behind (a restart or crash before its turn, a requeue after a cancel or a retention reclaim, or a
+`running` or phantom-terminal row startup just reset) has no turn any more and would otherwise stay `queued`
+forever. It would also count as pending work, blocking idle-branch retirement and repository reclaim and
+inflating `sextant_jobs_queued`.
+
+Startup therefore **settles** every such row, right after `ReconcileOrphanedJobs`, in transactions of at most 500
+rows, with the existing statuses only:
+
+- `coalesced` when a newer job (`complete`, `partial`, `failed` or `unsupported`) of the same repository (any URL
+  spelling) and branch already ran: that job produced the branch's snapshot. No handover is recorded: the newer
+  job already ran, and the row does not store the head commit a handover would carry. A newer `failed` or
+  `unsupported` job counts as "ran": both are re-produced on a later ensure anyway (a `failed` job unless its result
+  is reusable, see the ensure lifecycle), so the coalesced row loses nothing.
+- `cancelled` otherwise, with `last_error` "not produced: its service run ended before its turn (restart); a
+  later ensure produces it".
+
+Neither is a result worth reusing. A later ensure of the same identity requeues the row and produces it
+(a `cancelled` job is never attached as a cached result). The settle runs under the writer lease before the
+service accepts any request, so a row admitted by this run is never settled; the next restart settles it if its
+turn was lost. Settling touches **no timestamp** (`completed_at` stays NULL, `created_at`/`updated_at`/`started_at`
+keep their values), so a settled row neither makes its repository look freshly active for reclaim nor counts as a
+fresh outcome: the job metrics (all-time counts, rolling-window rates, latency samples) exclude rows whose
+`last_error` starts with `not produced:`, and the rows are counted only in `sextant_startup_jobs_settled_total`.
+The settlement time is the audit row's. The pass is audited as `reconcile` (detail `settled_queued_coalesced_<n>_cancelled_<m>`, committed in the last settlement batch's transaction), logged
+as one line, and counted in `sextant_startup_jobs_settled_total{kind="coalesced"|"cancelled"}`. The first start
+after this change also backfills rows that accumulated earlier. `sextant_jobs_queued` is afterwards the number of
+jobs admitted in this run, and the maintenance passes see only real work.
 
 ### Structured diagnostics (criterion 5)
 

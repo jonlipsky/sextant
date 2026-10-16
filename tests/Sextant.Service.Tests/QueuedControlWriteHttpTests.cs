@@ -328,7 +328,8 @@ public class QueuedControlWriteHttpTests
         var status = restarted.GetStatus(jobId);
         Assert.IsNotNull(status, "the id handed out while queued is the durable job's id");
         Assert.AreEqual(request.ToIdentity().Hash, status.Job.IdentityHash);
-        Assert.AreEqual(SnapshotJobStatus.Queued, status.Job.Status, "registered, not produced: the next ensure produces it");
+        Assert.AreEqual(SnapshotJobStatus.Cancelled, status.Job.Status,
+            "registered, not produced, and its run ended: startup settles it and the next ensure produces it (#327)");
         Assert.IsNull(restarted.ResolveBranch(Repo, "feature"), "the queued retire applied during the drain");
         Assert.AreEqual(1, host.Worker.Calls);
     }
