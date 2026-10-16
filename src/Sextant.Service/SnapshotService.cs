@@ -257,9 +257,10 @@ public sealed partial class SnapshotService : IDisposable
     /// <c>partial</c> with a now-NULL <c>snapshot_id</c> (crash between the status write and the publish
     /// commit, or the snapshot later reclaimed) — back to <c>queued</c> so a later ensure regenerates it
     /// rather than reporting a phantom-complete forever; and (3) sweeps orphaned per-job scratch left by a
-    /// crash. Returns the number of jobs reconciled.
+    /// crash. Returns the number of jobs reconciled. Startup only: it must run before admission opens (it resets every
+    /// non-owned running job and settles every queued one).
     /// </summary>
-    public int ReconcileOnStartup()
+    internal int ReconcileOnStartup()
     {
         var reconciled = WithWrite(() =>
         {
@@ -269,6 +270,7 @@ public sealed partial class SnapshotService : IDisposable
             // Durable audit trail of the recovery action (criterion 5). Service-wide (no repository scope).
             new AuditLogStore(_conn).Append(
                 AuditAction.Reconcile, AuditOutcome.Complete, detail: $"reconciled_{count}");
+            SettleOrphanedQueuedJobsLocked(jobs);
             return count;
         });
 
@@ -278,6 +280,61 @@ public sealed partial class SnapshotService : IDisposable
 
         RecoveryCompleted = true;
         return reconciled;
+    }
+
+    // Issue #327: at startup no job has a live in-process turn, so every queued row is an orphan of an earlier run (its
+    // turn was lost to a restart, a cancel or a retention requeue). Settle it with the existing statuses, in bounded
+    // transactions: coalesced when a newer job of its branch already ran (complete/partial/failed/unsupported; that job
+    // produced the branch's snapshot or is itself re-produced on a later ensure; the successor already used any head the
+    // coalesced commit expected, so no handover is recorded, and the row carries no expected_head_commit to record),
+    // cancelled otherwise. A later ensure of either identity produces it again. Timestamps are not touched.
+    // MUST only run before admission opens (it takes the write gate and treats every queued row as orphaned).
+    private const int StartupSettleBatchSize = 500;
+
+    private void SettleOrphanedQueuedJobsLocked(SnapshotJobStore jobs)
+    {
+        var queued = jobs.FindQueuedJobs();
+        if (queued.Count == 0)
+            return;
+
+        int coalesced = 0, cancelled = 0;
+        for (var offset = 0; offset < queued.Count; offset += StartupSettleBatchSize)
+        {
+            ExecRaw("BEGIN IMMEDIATE;");
+            try
+            {
+                var last = offset + StartupSettleBatchSize >= queued.Count;
+                foreach (var (jobId, superseded) in queued.Skip(offset).Take(StartupSettleBatchSize))
+                {
+                    var settled = superseded
+                        ? jobs.SettleQueued(jobId, SnapshotJobStatus.Coalesced,
+                            SnapshotJobStore.StartupSettledReasonPrefix + " superseded by a newer job of its branch that already ran; a later ensure produces it")
+                        : jobs.SettleQueued(jobId, SnapshotJobStatus.Cancelled,
+                            SnapshotJobStore.StartupSettledReasonPrefix + " its service run ended before its turn (restart); a later ensure produces it");
+                    if (!settled)
+                        continue;
+                    if (superseded) coalesced++;
+                    else cancelled++;
+                }
+                // The settlement time lives only here (the job rows keep their timestamps), and the audit row commits
+                // with the last batch, so a settlement is never unaudited.
+                if (last)
+                    new AuditLogStore(_conn).Append(
+                        AuditAction.Reconcile, AuditOutcome.Complete,
+                        detail: $"settled_queued_coalesced_{coalesced}_cancelled_{cancelled}");
+                ExecRaw("COMMIT;");
+            }
+            catch
+            {
+                ExecRaw("ROLLBACK;");
+                throw;
+            }
+        }
+
+        _metrics.RecordStartupJobsSettled(coalesced, cancelled);
+        Console.Error.WriteLine(
+            $"Startup settled {coalesced + cancelled} orphaned queued job(s) with no live turn: " +
+            $"{coalesced} coalesced (superseded), {cancelled} cancelled (not produced; a later ensure produces them).");
     }
 
     /// <summary>
@@ -2628,14 +2685,16 @@ public sealed partial class SnapshotService : IDisposable
     // a complete/partial job MUST still point at a published COMPLETE snapshot that carries this exact
     // identity. If retention has since reclaimed that snapshot (its snapshot_id NULLed via ON DELETE SET
     // NULL, or the row replaced), the "complete" result is a phantom and the job must be regenerated.
-    // Unsupported/cancelled carry no snapshot to verify, so they remain terminal as recorded. So does a
-    // failure, except a sandbox budget abort under an older policy (issue #245): the worker has since learned
+    // Unsupported carries no snapshot to verify, so it remains terminal as recorded. A cancelled job is never reused (a
+    // later ensure produces it), and so is a failure, except a sandbox budget abort under an older policy (issue #245): the worker has since learned
     // to publish a partial snapshot inside the budget, so the identity is produced again, once per policy.
     private bool TerminalResultUsable(
         SnapshotJobRow job, string identityHash, SnapshotStore snapshots, SnapshotJobStore jobs)
     {
         if (job.Status == SnapshotJobStatus.Failed)
             return !IsStaleBudgetAbort(job, jobs);
+        if (job.Status == SnapshotJobStatus.Cancelled)
+            return false;
         if (job.Status is not (SnapshotJobStatus.Complete or SnapshotJobStatus.Partial))
             return true;
         if (job.SnapshotId is not long id || snapshots.GetById(id) is not { Status: SnapshotStatus.Complete })

@@ -6,7 +6,10 @@ namespace Sextant.Store;
 /// <summary>The lifecycle states of a durable ensure-snapshot job (migration 016 <c>snapshot_jobs.status</c>).</summary>
 public static class SnapshotJobStatus
 {
-    /// <summary>Accepted, awaiting a worker.</summary>
+    /// <summary>
+    /// Admitted by this service run and awaiting its in-process turn (issue #327). A row left queued by an earlier run
+    /// is settled at startup (<see cref="Coalesced"/> or <see cref="Cancelled"/>), so a queued row always has a live turn.
+    /// </summary>
     public const string Queued = "queued";
 
     /// <summary>A worker (identified by <c>owner_token</c>) is producing the snapshot.</summary>
@@ -24,7 +27,10 @@ public static class SnapshotJobStatus
     /// <summary>The request targets something this build of Sextant cannot index (capability gate).</summary>
     public const string Unsupported = "unsupported";
 
-    /// <summary>Explicitly cancelled.</summary>
+    /// <summary>
+    /// Cancelled, or settled at startup because its service run ended before its turn (issue #327). Terminal, but never a
+    /// result worth reusing: a later ensure of the same identity produces it.
+    /// </summary>
     public const string Cancelled = "cancelled";
 
     /// <summary>
@@ -266,6 +272,86 @@ public sealed class SnapshotJobStore(SqliteConnection connection)
         if (liveOwnerToken is not null)
             cmd.Parameters.AddWithValue("@owner", liveOwnerToken);
         return cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// Every <c>queued</c> job row with whether a newer job of the same repository and branch already ran (issue #327).
+    /// Called at startup, when no job has a live turn, so each row returned is orphaned. The repository is matched on
+    /// <see cref="RemoteUrlIdentity.Normalize"/>, so a spelling of its URL never hides a successor. "Ran" means a
+    /// <c>complete</c>/<c>partial</c>/<c>failed</c>/<c>unsupported</c> job created after the queued one.
+    /// </summary>
+    public IReadOnlyList<(long JobId, bool Superseded)> FindQueuedJobs()
+    {
+        var newestRan = new Dictionary<(string, string), (long CreatedAt, long Id)>();
+        using (var ran = connection.CreateCommand())
+        {
+            ran.CommandText = """
+                SELECT repository_url, branch_name, created_at, id FROM snapshot_jobs
+                WHERE branch_name IS NOT NULL AND status IN (@complete, @partial, @failed, @unsupported);
+                """;
+            ran.Parameters.AddWithValue("@complete", SnapshotJobStatus.Complete);
+            ran.Parameters.AddWithValue("@partial", SnapshotJobStatus.Partial);
+            ran.Parameters.AddWithValue("@failed", SnapshotJobStatus.Failed);
+            ran.Parameters.AddWithValue("@unsupported", SnapshotJobStatus.Unsupported);
+            using var reader = ran.ExecuteReader();
+            while (reader.Read())
+            {
+                var key = (RemoteUrlIdentity.Normalize(reader.GetString(0)), reader.GetString(1));
+                var value = (reader.GetInt64(2), reader.GetInt64(3));
+                if (!newestRan.TryGetValue(key, out var current) || value.CompareTo(current) > 0)
+                    newestRan[key] = value;
+            }
+        }
+
+        var result = new List<(long, bool)>();
+        using var queued = connection.CreateCommand();
+        queued.CommandText = """
+            SELECT id, repository_url, branch_name, created_at FROM snapshot_jobs
+            WHERE status = @queued ORDER BY id;
+            """;
+        queued.Parameters.AddWithValue("@queued", SnapshotJobStatus.Queued);
+        using var rows = queued.ExecuteReader();
+        while (rows.Read())
+        {
+            var superseded = !rows.IsDBNull(2)
+                && newestRan.TryGetValue((RemoteUrlIdentity.Normalize(rows.GetString(1)), rows.GetString(2)), out var newest)
+                && (newest.CreatedAt, newest.Id).CompareTo((rows.GetInt64(3), rows.GetInt64(0))) > 0;
+            result.Add((rows.GetInt64(0), superseded));
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// The <c>last_error</c> prefix of every row <see cref="SettleQueued"/> settles. The job metrics exclude such rows
+    /// (they were never produced, so they are not outcomes); a requeue clears <c>last_error</c> and a result overwrites
+    /// it, so a re-produced row stops matching.
+    /// </summary>
+    public const string StartupSettledReasonPrefix = "not produced:";
+
+    /// <summary>SQL predicate (on <c>snapshot_jobs</c>) true for a row that was NOT settled at startup.</summary>
+    public const string NotStartupSettledSql =
+        "(last_error IS NULL OR substr(last_error, 1, 13) <> 'not produced:')";
+
+    /// <summary>
+    /// Settles a still-<c>queued</c> job to <paramref name="status"/> (issue #327) with <paramref name="reason"/> as its
+    /// <c>last_error</c>; a row that is no longer queued is left alone. Returns whether it settled.
+    /// </summary>
+    public bool SettleQueued(long jobId, string status, string reason)
+    {
+        // No timestamp is touched: settling is bookkeeping, not activity or an outcome. completed_at stays NULL and
+        // updated_at/started_at keep their values, so repository activity (reclaim) and the rolling job metrics are
+        // unchanged; the reason's StartupSettledReasonPrefix identifies the row for the all-time metrics.
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            UPDATE snapshot_jobs
+               SET status = @status, snapshot_id = NULL, owner_token = NULL, last_error = @err
+             WHERE id = @id AND status = @queued;
+            """;
+        cmd.Parameters.AddWithValue("@status", status);
+        cmd.Parameters.AddWithValue("@err", reason);
+        cmd.Parameters.AddWithValue("@id", jobId);
+        cmd.Parameters.AddWithValue("@queued", SnapshotJobStatus.Queued);
+        return cmd.ExecuteNonQuery() > 0;
     }
 
     /// <summary>

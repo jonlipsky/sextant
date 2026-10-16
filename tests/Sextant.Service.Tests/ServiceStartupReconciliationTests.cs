@@ -53,8 +53,8 @@ public class ServiceStartupReconciliationTests
         _service = SnapshotService.Start(ServiceTestFixtures.NewOptions(_dbPath), new FakeSnapshotWorker(_db), _db);
 
         var status = _service.GetStatus(jobId)!;
-        Assert.AreEqual(SnapshotJobStatus.Queued, status.Job.Status,
-            "a phantom-complete job with a NULL snapshot is reconciled to queued on restart (criterion 3)");
+        Assert.AreEqual(SnapshotJobStatus.Cancelled, status.Job.Status,
+            "a phantom-complete job with a NULL snapshot is reconciled on restart and settled, never phantom-complete (criterion 3, #327)");
     }
 
     [TestMethod]

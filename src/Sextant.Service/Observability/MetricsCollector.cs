@@ -130,6 +130,9 @@ public sealed class MetricsCollector(
             FROM snapshot_jobs INDEXED BY ix_snapshot_jobs_completed_at
             WHERE completed_at >= @window_start AND completed_at < @window_end
               AND status IN (@complete, @partial, @failed, @unsupported, @cancelled)
+              AND
+            """ + SnapshotJobStore.NotStartupSettledSql + """
+
             GROUP BY status;
             """;
         cmd.Parameters.AddWithValue("@window_start", windowStart);
@@ -161,7 +164,11 @@ public sealed class MetricsCollector(
         var counts = new Dictionary<string, long>(StringComparer.Ordinal);
         using (var cmd = connection.CreateCommand())
         {
-            cmd.CommandText = "SELECT status, COUNT(*) FROM snapshot_jobs GROUP BY status;";
+            // Rows settled at startup (issue #327) were never produced: they are counted only in
+            // sextant_startup_jobs_settled_total, not as outcomes.
+            cmd.CommandText =
+                "SELECT status, COUNT(*) FROM snapshot_jobs WHERE " + SnapshotJobStore.NotStartupSettledSql +
+                " GROUP BY status;";
             using var reader = cmd.ExecuteReader();
             while (reader.Read())
                 counts[reader.GetString(0)] = reader.GetInt64(1);
@@ -189,7 +196,9 @@ public sealed class MetricsCollector(
         cmd.CommandText = """
             SELECT created_at, started_at, completed_at
             FROM snapshot_jobs
-            WHERE started_at IS NOT NULL
+            WHERE started_at IS NOT NULL AND
+            """ + SnapshotJobStore.NotStartupSettledSql + """
+
             ORDER BY id DESC
             LIMIT @limit;
             """;

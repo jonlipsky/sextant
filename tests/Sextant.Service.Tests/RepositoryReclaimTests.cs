@@ -68,12 +68,13 @@ public class RepositoryReclaimTests
             h.PublishWithoutBranch(url, "c1");
             dirs.Add(h.Populate(url));
         }
+        h.Start();
+        // Admitted by this run (after startup settled earlier runs' orphans), so they have a live turn.
         var jobs = new SnapshotJobStore(h.Db.GetConnection());
         jobs.EnsureJob("id-queued", urls[0] + ".git", "c2", null);
         jobs.EnsureJob("id-running", urls[1], "c2", null);
         h.Execute("UPDATE snapshot_jobs SET status = 'running' WHERE identity_hash = 'id-running';");
         jobs.RecordHandover(RemoteUrlIdentity.Normalize(urls[2]), "feature", "c-x", "c-h", "c-y");
-        h.Start();
 
         var report = await h.Service.ReclaimInactiveRepositoriesAsync();
 
@@ -102,6 +103,27 @@ public class RepositoryReclaimTests
     }
 
     [TestMethod]
+    public async Task ARepositoryWhoseOnlyRowsWereSettledAtStartup_KeepsItsOriginalActivityTime()
+    {
+        await using var h = Harness.Create(Policy());
+        h.PublishWithoutBranch(Repo, "c1");
+        var dirs = h.Populate(Repo);
+        h.SetActivity(Repo, h.Clock.GetUtcNow().AddDays(-60));
+        new SnapshotJobStore(h.Db.GetConnection()).EnsureJob("id-orphan", Repo, "c2", null);
+        var original = h.Clock.GetUtcNow().AddDays(-40).ToUnixTimeMilliseconds();
+        h.Execute($"UPDATE snapshot_jobs SET created_at = {original}, updated_at = {original};");
+
+        h.Start();
+
+        Assert.AreEqual("cancelled", new SnapshotJobStore(h.Db.GetConnection()).GetJobByIdentity("id-orphan")!.Status);
+        Assert.AreEqual(original, new RepositoryActivityStore(h.Db.GetConnection()).List().Single().LastActivityMs,
+            "settling stamps no timestamp, so the repository is not freshly active");
+        Assert.AreEqual(1, (await h.Service.ReclaimInactiveRepositoriesAsync()).Reclaimed,
+            "reclaimable after its real inactivity");
+        Assert.IsFalse(Directory.Exists(dirs.Checkout));
+    }
+
+    [TestMethod]
     public async Task ARecentJobOrRetiredHead_CountsAsActivity()
     {
         await using var h = Harness.Create(Policy());
@@ -110,7 +132,7 @@ public class RepositoryReclaimTests
         h.SetActivity(Repo, h.Clock.GetUtcNow().AddDays(-60));
         new SnapshotJobStore(h.Db.GetConnection()).EnsureJob("id-done", Repo, "c1", null);
         var recent = h.Clock.GetUtcNow().AddDays(-2).ToUnixTimeMilliseconds();
-        h.Execute($"UPDATE snapshot_jobs SET status = 'complete', created_at = 1, updated_at = 1, completed_at = {recent};");
+        h.Execute($"UPDATE snapshot_jobs SET status = 'complete', snapshot_id = (SELECT MIN(id) FROM snapshots), created_at = 1, updated_at = 1, completed_at = {recent};");
         h.Start();
 
         Assert.AreEqual(0, (await h.Service.ReclaimInactiveRepositoriesAsync()).Reclaimed);

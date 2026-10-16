@@ -85,10 +85,11 @@ public class IdleBranchMaintenanceTests
         h.Seed("queued", isDefault: false, "commit-q", idleFor: TimeSpan.FromDays(20));
         h.Seed("handed-over", isDefault: false, "commit-h", idleFor: TimeSpan.FromDays(20));
         h.Seed("idle", isDefault: false, "commit-i", idleFor: TimeSpan.FromDays(20));
+        h.Start();
+        // Admitted by this run (after startup settled earlier runs' orphans), so it has a live turn.
         var jobs = new SnapshotJobStore(h.Db.GetConnection());
         jobs.EnsureJob("identity-queued", Repo + ".git", "commit-q2", "queued");
         jobs.RecordHandover(RemoteUrlIdentity.Normalize(Repo), "handed-over", "commit-x", "commit-h", "commit-y");
-        h.Start();
 
         var report = await h.Service.RetireIdleBranchesAsync();
 
