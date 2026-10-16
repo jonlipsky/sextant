@@ -1020,6 +1020,12 @@ public sealed partial class SnapshotService : IDisposable
             ? request with { IsFinalProvisioningAttempt = true }
             : request;
 
+        // Issue #325: nothing of the previous job is reachable here, so its memory can be returned before restore/load.
+        // The debt is taken only by a production that reaches its worker (attach/reuse/reselect paths returned above),
+        // and a previous job's unreturned memory is carried when its post-job reclaim did not run to completion.
+        if (TakeCarriedJobMemory())
+            ReclaimBeforeJob(jobId);
+
         var scratch = _paths.AllocateScratch($"job-{jobId}");
         SnapshotWorkResult result;
         try

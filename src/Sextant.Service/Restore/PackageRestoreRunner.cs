@@ -50,9 +50,18 @@ namespace Sextant.Service.Restore;
 public sealed class PackageRestoreRunner(
     bool enabled = true, TimeSpan? timeout = null, Action<string>? log = null,
     IReadOnlyList<PackageSourceCredential>? sourceCredentials = null, string? credentialPluginPath = null,
-    bool staticGraphRestore = PackageRestoreRunner.DefaultStaticGraphRestore)
+    bool staticGraphRestore = PackageRestoreRunner.DefaultStaticGraphRestore, int maxNodes = PackageRestoreRunner.DefaultMaxNodes)
 {
     private readonly IReadOnlyList<PackageSourceCredential> _sourceCredentials = ValidateCredentials(sourceCredentials, credentialPluginPath);
+
+    /// <summary>The default cap on MSBuild worker processes of a restore (<c>SEXTANT_SERVICE_RESTORE_MAX_NODES</c>, issue #325).</summary>
+    public const int DefaultMaxNodes = 2;
+
+    /// <summary>The largest accepted cap; a larger configured value is clamped to it.</summary>
+    public const int MaxMaxNodes = 64;
+
+    /// <summary>The MSBuild node cap every restore invocation passes as <c>-maxcpucount:N</c>; a value below 1 means the default.</summary>
+    public int MaxNodes { get; } = maxNodes < 1 ? DefaultMaxNodes : Math.Min(maxNodes, MaxMaxNodes);
 
     /// <summary>The default bound on one job's restore step (<c>SEXTANT_SERVICE_PACKAGE_RESTORE_TIMEOUT_SECONDS</c>).</summary>
     public static readonly TimeSpan DefaultTimeout = TimeSpan.FromMinutes(5);
@@ -1165,13 +1174,17 @@ public sealed class PackageRestoreRunner(
     internal ProcessStartInfo CreateStartInfo(
         string solution, IReadOnlyList<KeyValuePair<string, string>> globals, IReadOnlyDictionary<string, string>? environment = null,
         bool staticGraph = false)
-        => CreateStartInfo(Arguments(solution, globals, staticGraph), Path.GetDirectoryName(Path.GetFullPath(solution)) ?? Environment.CurrentDirectory,
+        => CreateStartInfo(Arguments(solution, globals, staticGraph, MaxNodes), Path.GetDirectoryName(Path.GetFullPath(solution)) ?? Environment.CurrentDirectory,
             environment);
 
-    private ProcessStartInfo CreateUnionStartInfo(string project, string checkoutDir, IReadOnlyDictionary<string, string> environment)
+    // The union traversal and the per-project retry both run this invocation.
+    internal ProcessStartInfo CreateUnionStartInfo(string project, string checkoutDir, IReadOnlyDictionary<string, string> environment)
         => CreateStartInfo(
-            ["msbuild", project, "-target:RestoreUnion", "-nologo", "-verbosity:minimal", "--disable-build-servers", "-nodeReuse:false"],
+            ["msbuild", project, "-target:RestoreUnion", "-nologo", "-verbosity:minimal", "--disable-build-servers", "-nodeReuse:false",
+                MaxCpuCountArgument(MaxNodes)],
             checkoutDir, environment);
+
+    private static string MaxCpuCountArgument(int maxNodes) => $"-maxcpucount:{maxNodes}";
 
     private ProcessStartInfo CreateStartInfo(
         IReadOnlyList<string> arguments, string workingDirectory, IReadOnlyDictionary<string, string>? environment)
@@ -1217,10 +1230,11 @@ public sealed class PackageRestoreRunner(
 
     /// <summary>
     /// The <c>dotnet restore</c> arguments for one solution, with the selection's <see cref="EvaluationGlobalProperties"/>
-    /// and, when <paramref name="staticGraph"/> is set, static-graph evaluation (issue #272).
+    /// and, when <paramref name="staticGraph"/> is set, static-graph evaluation (issue #272). A <paramref name="maxNodes"/>
+    /// caps MSBuild's worker processes with <c>-maxcpucount:N</c> (issue #325); null leaves MSBuild's one per CPU.
     /// </summary>
     internal static IReadOnlyList<string> Arguments(
-        string solution, IReadOnlyList<KeyValuePair<string, string>> globals, bool staticGraph = false) =>
+        string solution, IReadOnlyList<KeyValuePair<string, string>> globals, bool staticGraph = false, int? maxNodes = null) =>
     [
         "restore", solution,
         "-p:DesignTimeBuild=true",
@@ -1229,6 +1243,7 @@ public sealed class PackageRestoreRunner(
         "--ignore-failed-sources",
         "--disable-build-servers",
         "-nodeReuse:false",
+        .. maxNodes is { } n ? new[] { MaxCpuCountArgument(n) } : [],
         "-nologo"
     ];
 

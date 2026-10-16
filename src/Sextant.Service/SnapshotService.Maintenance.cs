@@ -583,6 +583,104 @@ public sealed partial class SnapshotService
 
     private enum JobReclaim { Ran, Busy, Skipped }
 
+    // Issue #325: 1 while the last production's memory was returned (or was never worth returning); 0 from the moment
+    // a production reaches its worker until a post-job reclaim ran or found the working set below the threshold. A
+    // production that starts while it is 0 inherits the previous job's memory and reclaims it before its own work.
+    // _productionGeneration counts the productions that took the flag: a reclaim captures it when it starts and may mark
+    // memory clean only if no production started meanwhile (it would otherwise mark a running job's memory clean).
+    private readonly object _memoryDebtLock = new();
+    private long _productionGeneration;
+    private int _jobMemoryClean = 1;
+
+    private bool TakeCarriedJobMemory()
+    {
+        lock (_memoryDebtLock)
+        {
+            _productionGeneration++;
+            var carried = _jobMemoryClean == 0;
+            _jobMemoryClean = 0;
+            return carried;
+        }
+    }
+
+    private long ProductionGeneration()
+    {
+        lock (_memoryDebtLock)
+            return _productionGeneration;
+    }
+
+    private void MarkJobMemoryClean(long generation)
+    {
+        lock (_memoryDebtLock)
+        {
+            if (_productionGeneration == generation)
+                _jobMemoryClean = 1;
+        }
+    }
+
+    private void RecordReclaimSkipped(long jobId, string reason, string detail, string phase)
+    {
+        _metrics.RecordMemoryReclaimSkipped(reason, phase);
+        try
+        {
+            MemoryReclaimLog($"Job {jobId}: {PhaseLabel(phase)}memory reclaim skipped ({reason}): {detail}.");
+        }
+        catch
+        {
+            // Logging is best effort.
+        }
+    }
+
+    private static string PhaseLabel(string phase) => phase == MemoryReclaimPhases.PreJob ? "start-of-job " : "";
+
+    // The start-of-job reclaim: runs on the production's own thread, under the write gate, so no other production is
+    // in flight (never two at once is still enforced through _reclaiming). Never throws. The writer lease keeps
+    // renewing meanwhile: WriterLease renews from its own System.Threading.Timer on its own connection.
+    private void ReclaimBeforeJob(long jobId)
+    {
+        const string phase = MemoryReclaimPhases.PreJob;
+        try
+        {
+            if (_lifetime.IsCancellationRequested)
+            {
+                RecordReclaimSkipped(jobId, MemoryReclaimSkipReasons.ShuttingDown, "the service is stopping", phase);
+                return;
+            }
+            if (WorkingSetProbe() < MemoryReclaimMinWorkingSetBytes)
+            {
+                RecordReclaimSkipped(jobId, MemoryReclaimSkipReasons.BelowThreshold, "working set below the threshold at job start", phase);
+                return;
+            }
+            if (Interlocked.CompareExchange(ref _reclaiming, 1, 0) != 0)
+            {
+                RecordReclaimSkipped(jobId, MemoryReclaimSkipReasons.Busy, "another reclaim is running", phase);
+                return;
+            }
+            try
+            {
+                // Shutdown may have begun since the first look (taking the flag/probing can take a moment).
+                if (_lifetime.IsCancellationRequested)
+                {
+                    RecordReclaimSkipped(jobId, MemoryReclaimSkipReasons.ShuttingDown, "the service is stopping", phase);
+                    return;
+                }
+                var r = MemoryReclaimAction();
+                _metrics.RecordMemoryReclaimRun(phase);
+                MemoryReclaimLog($"Job {jobId}: start-of-job memory reclaimed in {r.Elapsed.TotalMilliseconds:F0} ms " +
+                    $"(working set {r.WorkingSetBefore / (1024 * 1024)} -> {r.WorkingSetAfter / (1024 * 1024)} MiB, " +
+                    $"managed heap {r.HeapAfter / (1024 * 1024)} MiB; {r.PhaseSummary}).");
+            }
+            finally
+            {
+                Volatile.Write(ref _reclaiming, 0);
+            }
+        }
+        catch
+        {
+            // Best effort: never fails the job.
+        }
+    }
+
     internal TimeSpan MemoryReclaimBusyRetryDelay { get; set; } = TimeSpan.FromSeconds(15);
     internal int MemoryReclaimBusyRetries { get; set; } = 8;
 
@@ -611,9 +709,19 @@ public sealed partial class SnapshotService
                     {
                         // A newer production's reclaim supersedes this one, so a burst never queues two.
                         if (Interlocked.Read(ref _reclaimGeneration) != generation)
+                        {
+                            RecordReclaimSkipped(jobId, MemoryReclaimSkipReasons.Superseded, "a newer job's reclaim replaces it", MemoryReclaimPhases.PostJob);
                             return;
-                        if (TryReclaimOnce(jobId) != JobReclaim.Busy || attempt >= MemoryReclaimBusyRetries)
+                        }
+                        var outcome = TryReclaimOnce(jobId);
+                        if (outcome != JobReclaim.Busy)
                             return;
+                        if (attempt >= MemoryReclaimBusyRetries)
+                        {
+                            RecordReclaimSkipped(jobId, MemoryReclaimSkipReasons.Deferred,
+                                "still busy (another job queued or running); the next job reclaims before it starts", MemoryReclaimPhases.PostJob);
+                            return;
+                        }
                         // Busy only because the gate is held or a production is running (a queued retire, an attached
                         // ensure, ...): nothing will schedule another reclaim, so look again shortly, a bounded number of times.
                         await Task.Delay(MemoryReclaimBusyRetryDelay, _timeProvider, _lifetime.Token).ConfigureAwait(false);
@@ -642,21 +750,29 @@ public sealed partial class SnapshotService
     {
         try
         {
-            var state = ReclaimState();
+            // A production that starts while this runs (the gate is not held) re-arms the debt; clean is only
+            // recorded if none did.
+            var generation = ProductionGeneration();
+            var state = ReclaimState(jobId, generation);
             if (state != JobReclaim.Ran)
                 return state;
             if (Interlocked.CompareExchange(ref _reclaiming, 1, 0) != 0)
+            {
+                RecordReclaimSkipped(jobId, MemoryReclaimSkipReasons.Busy, "another reclaim is running", MemoryReclaimPhases.PostJob);
                 return JobReclaim.Skipped;
+            }
             try
             {
                 // Re-checked right before collecting: another job may have been admitted since the first look.
-                state = ReclaimState();
+                state = ReclaimState(jobId, generation);
                 if (state != JobReclaim.Ran)
                     return state;
                 var r = MemoryReclaimAction();
+                MarkJobMemoryClean(generation);
+                _metrics.RecordMemoryReclaimRun(MemoryReclaimPhases.PostJob);
                 MemoryReclaimLog($"Job {jobId}: memory reclaimed in {r.Elapsed.TotalMilliseconds:F0} ms " +
                     $"(working set {r.WorkingSetBefore / (1024 * 1024)} -> {r.WorkingSetAfter / (1024 * 1024)} MiB, " +
-                    $"managed heap {r.HeapAfter / (1024 * 1024)} MiB).");
+                    $"managed heap {r.HeapAfter / (1024 * 1024)} MiB; {r.PhaseSummary}).");
                 return JobReclaim.Ran;
             }
             finally
@@ -674,10 +790,14 @@ public sealed partial class SnapshotService
     // queued for the gate (a released gate with a queued waiter is handed over, so CurrentCount stays 0), and not
     // when the working set is too small for the pause to buy anything. Busy (gate/production) is the only skip a
     // later look can change; shutdown and the threshold are final. Ran means "worthwhile now".
-    private JobReclaim ReclaimState()
+    // A busy look is not recorded here: the caller retries and records the final outcome. A final skip is recorded.
+    private JobReclaim ReclaimState(long jobId, long generation)
     {
         if (_lifetime.IsCancellationRequested)
+        {
+            RecordReclaimSkipped(jobId, MemoryReclaimSkipReasons.ShuttingDown, "the service is stopping", MemoryReclaimPhases.PostJob);
             return JobReclaim.Skipped;
+        }
         lock (_inFlightLock)
         {
             if (_inFlight.Count > 0)
@@ -685,6 +805,11 @@ public sealed partial class SnapshotService
         }
         if (_writeGate.CurrentCount == 0)
             return JobReclaim.Busy;
-        return WorkingSetProbe() >= MemoryReclaimMinWorkingSetBytes ? JobReclaim.Ran : JobReclaim.Skipped;
+        if (WorkingSetProbe() >= MemoryReclaimMinWorkingSetBytes)
+            return JobReclaim.Ran;
+        // Nothing worth returning: the next job inherits nothing (unless a production started since the generation was read).
+        MarkJobMemoryClean(generation);
+        RecordReclaimSkipped(jobId, MemoryReclaimSkipReasons.BelowThreshold, "working set below the threshold", MemoryReclaimPhases.PostJob);
+        return JobReclaim.Skipped;
     }
 }

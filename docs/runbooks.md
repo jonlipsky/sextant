@@ -73,9 +73,34 @@ slower); a restart of the same container takes over at once.
 Expected (issue #320). After the last job of a burst the service runs an end-of-job memory reclaim: it collects the
 managed heap and trims glibc's native heap, so the process RSS falls from several GiB back toward the baseline and
 every thread pauses for about 2 s. The log line is `Job <id>: memory reclaimed in <n> ms (working set <a> -> <b> MiB,
-managed heap <c> MiB).`. It is skipped (no line) while another job is running or queued, during shutdown, and when the
-working set is under 1 GiB. A reclaim never blocks or fails a job; if RSS stays high after an idle period, look for
+managed heap <c> MiB).`. It is skipped while another job is running or queued, during shutdown, and when the
+working set is under 1 GiB; every skip logs `Job <id>: memory reclaim skipped (<reason>): ...` and is counted (see
+`docs/service.md`, "Start-of-job reclaim and skip reasons"). A skipped post-job reclaim is made up by the NEXT job,
+which reclaims before its restore (`start-of-job memory reclaimed`), so a burst never carries one job's memory into
+the next. A reclaim never blocks or fails a job; if RSS stays high after an idle period, look for
 another cause (a running job, or a non-glibc image where the native trim is a no-op).
+
+## Runbook: container memory budget (issue #325)
+
+The container limit (7 GiB in production) covers the service process **and** its children **and** page cache:
+
+- **Service process, per job:** the managed heap peaks at several GiB while a job indexes. It is returned by the
+  post-job reclaim, or by the start-of-job reclaim of the next job in a burst. Look for `memory reclaimed` /
+  `memory reclaim skipped (<reason>)` lines (the per-phase timings in the reclaimed line show which of gen2 gc,
+  finalizers, aggressive gc or malloc_trim took the time) and the `sextant_memory_reclaims_*{phase=post_job|pre_job}`
+  counters; a rising `deferred` count
+  just means bursts (the next job made it up), while a service RSS of GiBs at the start of a restore with no
+  start-of-job line means the working set was under the threshold or the reclaim could not run.
+- **Restore nodes:** each MSBuild worker of a restore adds ~200-240 MB. `SEXTANT_SERVICE_RESTORE_MAX_NODES` (default
+  2) caps them for every restore invocation; raise it only if restores are time-bound and memory is spare. The
+  process-tree RSS (service + `dotnet` + nodes) is what the limit sees.
+- **Page cache vs the limit:** `memory.current` includes file cache, which the kernel evicts under pressure, so a
+  `memory.current` near the limit is not by itself a problem. Anonymous memory (`anon` in `memory.stat`) is the
+  number to watch: it cannot be evicted, and OOM kill follows when it alone approaches the limit.
+- **`memory.events` `max` growing** means the cgroup hit its limit and the kernel reclaimed (mostly page cache) to stay
+  under it. A steadily growing `max` with `oom_kill 0` is memory pressure with heavy cache eviction (slower
+  checkouts, package reads and SQLite pages), not data loss; `oom_kill` above 0 is the real failure (see the
+  unclean-shutdown runbook above). Cut anonymous memory (reclaim, node cap) before raising the limit.
 
 ## Runbook: unsupported workloads
 

@@ -15,7 +15,25 @@ namespace Sextant.Service;
 /// </summary>
 public static class JobMemoryReclaimer
 {
-    public readonly record struct Result(long WorkingSetBefore, long WorkingSetAfter, long HeapAfter, TimeSpan Elapsed);
+    public readonly record struct Result(long WorkingSetBefore, long WorkingSetAfter, long HeapAfter, TimeSpan Elapsed)
+    {
+        /// <summary>Time spent in the first compacting gen2 collection (issue #325).</summary>
+        public TimeSpan CompactingGc { get; init; }
+
+        /// <summary>Time spent in <see cref="GC.WaitForPendingFinalizers"/>.</summary>
+        public TimeSpan Finalizers { get; init; }
+
+        /// <summary>Time spent in the aggressive blocking collection.</summary>
+        public TimeSpan AggressiveGc { get; init; }
+
+        /// <summary>Time spent in the native <c>malloc_trim</c>.</summary>
+        public TimeSpan MallocTrim { get; init; }
+
+        /// <summary>The per-phase part of the log line, e.g. <c>gen2 gc 800 ms, finalizers 5 ms, ...</c>.</summary>
+        public string PhaseSummary =>
+            $"gen2 gc {CompactingGc.TotalMilliseconds:F0} ms, finalizers {Finalizers.TotalMilliseconds:F0} ms, " +
+            $"aggressive gc {AggressiveGc.TotalMilliseconds:F0} ms, malloc_trim {MallocTrim.TotalMilliseconds:F0} ms";
+    }
 
     /// <summary>
     /// Below this working set the pause buys nothing: an idle service sits around 0.5 GiB (measured) and a job that
@@ -30,6 +48,7 @@ public static class JobMemoryReclaimer
     {
         var watch = System.Diagnostics.Stopwatch.StartNew();
         var before = 0L;
+        TimeSpan gc = default, finalizers = default, aggressive = default, trim = default;
         try
         {
             before = Environment.WorkingSet;
@@ -37,10 +56,18 @@ public static class JobMemoryReclaimer
             // Both collections are needed: the first finds finalizable objects dead and queues their finalizers
             // (workspace/SQLite/stream handles), which free memory only once they have run; those objects survive the
             // first GC and only a collection after WaitForPendingFinalizers can free them (and decommit, aggressively).
+            var phase = System.Diagnostics.Stopwatch.StartNew();
             GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+            gc = phase.Elapsed;
+            phase.Restart();
             GC.WaitForPendingFinalizers();
+            finalizers = phase.Elapsed;
+            phase.Restart();
             GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+            aggressive = phase.Elapsed;
+            phase.Restart();
             TrimNativeHeap();
+            trim = phase.Elapsed;
         }
         catch
         {
@@ -48,11 +75,13 @@ public static class JobMemoryReclaimer
         }
         try
         {
-            return new Result(before, Environment.WorkingSet, GC.GetTotalMemory(false), watch.Elapsed);
+            return new Result(before, Environment.WorkingSet, GC.GetTotalMemory(false), watch.Elapsed)
+                { CompactingGc = gc, Finalizers = finalizers, AggressiveGc = aggressive, MallocTrim = trim };
         }
         catch
         {
-            return new Result(before, before, 0, watch.Elapsed);
+            return new Result(before, before, 0, watch.Elapsed)
+                { CompactingGc = gc, Finalizers = finalizers, AggressiveGc = aggressive, MallocTrim = trim };
         }
     }
 

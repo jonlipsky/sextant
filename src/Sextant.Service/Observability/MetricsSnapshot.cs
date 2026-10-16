@@ -112,6 +112,18 @@ public sealed record MaintenanceMetrics
     public long LastReclaimPassAtUnixMs { get; init; }
     public double LastReclaimPassDurationMs { get; init; }
 
+    /// <summary>Job-memory reclaims that ran (after a job or at the start of the next one) since start (issue #325).</summary>
+    public long MemoryReclaimsRun { get; init; }
+
+    /// <summary>Job-memory reclaims that did not run, by reason (<see cref="MemoryReclaimSkipReasons"/>); absent = 0.</summary>
+    public IReadOnlyDictionary<string, long> MemoryReclaimsSkipped { get; init; } = new Dictionary<string, long>();
+
+    /// <summary>Reclaims that ran, by phase (<see cref="MemoryReclaimPhases"/>); absent = 0.</summary>
+    public IReadOnlyDictionary<string, long> MemoryReclaimsRunByPhase { get; init; } = new Dictionary<string, long>();
+
+    /// <summary>Reclaims that did not run, keyed <c>phase/reason</c> (<see cref="MemoryReclaimPhases.Key"/>); absent = 0.</summary>
+    public IReadOnlyDictionary<string, long> MemoryReclaimsSkippedByPhase { get; init; } = new Dictionary<string, long>();
+
     public long ScheduledRetentionRuns { get; init; }
 
     /// <summary>Due scheduled retention passes skipped because indexing held the writer (retried next tick).</summary>

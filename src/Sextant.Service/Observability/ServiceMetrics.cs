@@ -1,5 +1,29 @@
 namespace Sextant.Service.Observability;
 
+/// <summary>The reasons a job-memory reclaim did not run (issue #325); the metric label values.</summary>
+public static class MemoryReclaimSkipReasons
+{
+    public const string Busy = "busy";
+    public const string BelowThreshold = "below_threshold";
+    public const string ShuttingDown = "shutting_down";
+    public const string Superseded = "superseded";
+    public const string Deferred = "deferred";
+
+    public static readonly IReadOnlyList<string> All = [Busy, BelowThreshold, ShuttingDown, Superseded, Deferred];
+}
+
+/// <summary>When a job-memory reclaim was attempted (issue #325); the <c>phase</c> metric label values.</summary>
+public static class MemoryReclaimPhases
+{
+    public const string PostJob = "post_job";
+    public const string PreJob = "pre_job";
+
+    public static readonly IReadOnlyList<string> All = [PostJob, PreJob];
+
+    /// <summary>The key of the per-phase dictionaries: <c>phase</c>, or <c>phase/reason</c> for a skip.</summary>
+    public static string Key(string phase, string reason) => phase + "/" + reason;
+}
+
 /// <summary>
 /// The service's live, in-process metric counters (criterion 5). It holds the signals that can only be
 /// observed as events happen — query latency, ensure idempotent-reuse, and snapshot page-cache reuse —
@@ -104,6 +128,37 @@ public sealed class ServiceMetrics
     {
         lock (_maintenanceLock)
             _maintenance = _maintenance with { ScheduledRetentionSkippedBusy = _maintenance.ScheduledRetentionSkippedBusy + 1 };
+    }
+
+    /// <summary>Records a job-memory reclaim that ran, after a job or before the next one (issue #325).</summary>
+    public void RecordMemoryReclaimRun(string phase)
+    {
+        lock (_maintenanceLock)
+        {
+            var byPhase = new Dictionary<string, long>(_maintenance.MemoryReclaimsRunByPhase);
+            byPhase[phase] = byPhase.GetValueOrDefault(phase) + 1;
+            _maintenance = _maintenance with
+            {
+                MemoryReclaimsRun = _maintenance.MemoryReclaimsRun + 1, MemoryReclaimsRunByPhase = byPhase
+            };
+        }
+    }
+
+    /// <summary>
+    /// Records a job-memory reclaim that did not run, by one of <see cref="MemoryReclaimSkipReasons"/> and the
+    /// <see cref="MemoryReclaimPhases"/> it was attempted in (issue #325).
+    /// </summary>
+    public void RecordMemoryReclaimSkipped(string reason, string phase)
+    {
+        lock (_maintenanceLock)
+        {
+            var skipped = new Dictionary<string, long>(_maintenance.MemoryReclaimsSkipped);
+            skipped[reason] = skipped.GetValueOrDefault(reason) + 1;
+            var byPhase = new Dictionary<string, long>(_maintenance.MemoryReclaimsSkippedByPhase);
+            var key = MemoryReclaimPhases.Key(phase, reason);
+            byPhase[key] = byPhase.GetValueOrDefault(key) + 1;
+            _maintenance = _maintenance with { MemoryReclaimsSkipped = skipped, MemoryReclaimsSkippedByPhase = byPhase };
+        }
     }
 
     /// <summary>Records an executed retention pass whose closing audit row was skipped (issue #321).</summary>
