@@ -117,6 +117,7 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_SDK_PIN_OVERRIDE` | Temporarily neutralize a checkout `global.json` SDK pin that no installed SDK satisfies, so the checkout still indexes with an installed SDK (issue #113; see [SDK pins](#repository-globaljson-sdk-pins-issue-113)). `false` leaves such pins alone and the job fails / goes partial with a typed `sdk_resolution_failed` diagnostic. `false` is part of the snapshot identity, so flipping the toggle re-indexes a commit instead of reusing a result built under the other policy. An unparseable value **fails startup** | `true` |
 | `SEXTANT_SERVICE_PACKAGE_RESTORE` | Restore the selected solutions' deduplicated project union before the load (see [Package restore](#package-restore-before-the-load)). `false` loads unrestored projects, which compile against their direct project references only, so calls into transitively referenced projects may not bind. `false` is part of the snapshot identity (`restore=off`). An unparseable value **fails startup** | `true` |
 | `SEXTANT_SERVICE_RESTORE_STATIC_GRAPH` | Run each per-solution `dotnet restore` with `-p:RestoreUseStaticGraphEvaluation=true` and re-run a pass that fails as a whole once without it (see [Static-graph restore](#static-graph-restore-issue-272)). `false` = the previous arguments exactly. Not part of the snapshot identity | `true` |
+| `SEXTANT_SERVICE_RESTORE_MAX_NODES` | Cap on MSBuild worker processes of every restore invocation (issue #325): passed as `-maxcpucount:N` to the per-solution `dotnet restore`, the union `dotnet msbuild` traversal and the per-project retry (`-nodeReuse:false` stays). Without a cap MSBuild starts one ~200-240 MB node per CPU, which adds GiBs during a large restore. Clamped to `64`; `0`, negative or non-numeric uses the default. Not part of the snapshot identity | `2` |
 | `SEXTANT_SERVICE_PACKAGE_RESTORE_TIMEOUT_SECONDS` | Bound on one job's whole project-union restore step, clamped to 3600. Under the sandbox the step also stops at a fifth of the sandbox time budget, whichever is shorter. On expiry the restore process tree is killed and the load goes ahead with whatever was restored | `300` |
 | `SEXTANT_SERVICE_PACKAGE_CACHE_MAX_MB` | Bound, in MiB, on all per-repository NuGet package folders together (see [Package and git caches between jobs](#package-and-git-caches-between-jobs-issue-272)). Over it, whole folders are evicted least recently used first. `0` disables the cache: each job restores into a cold folder in its scratch again. Anything but a non-negative whole number **fails startup** | `10240` |
 | `SEXTANT_SERVICE_GIT_OBJECT_STORE` | In `clone` mode, fetch each new commit through a per-repository bare object store on the cache volume, so only objects the store lacks cross the network (see [Package and git caches between jobs](#package-and-git-caches-between-jobs-issue-272)). `false` fetches every commit from the remote afresh. An unparseable value **fails startup** | `true` |
@@ -1401,11 +1402,40 @@ contains. The first plain collection is kept because finalizable objects survive
 `WaitForPendingFinalizers` can free them.
 
 It is **skipped** when the service is shutting down, when another production is in flight or queued for the writer
-(only the last job of a burst reclaims; checked again right before collecting), when the working set is under 1 GiB
+(checked again right before collecting), when the working set is under 1 GiB
 (`JobMemoryReclaimer.MinWorkingSetBytes`: an idle service sits near 0.5 GiB, so little is left to give back), and
-when another reclaim is running. It logs `Job <id>: memory reclaimed in <n> ms (working set <a> -> <b> MiB, managed
-heap <c> MiB).`. `malloc_trim` assumes glibc, which the Debian/Ubuntu-based dotnet runtime service image uses; on
+when another reclaim is running. When it runs it logs `Job <id>: memory reclaimed in <n> ms (working set <a> -> <b> MiB,
+managed heap <c> MiB; gen2 gc <n> ms, finalizers <n> ms, aggressive gc <n> ms, malloc_trim <n> ms).`, so a long reclaim
+can be attributed to a phase. `malloc_trim` assumes glibc, which the Debian/Ubuntu-based dotnet runtime service image uses; on
 musl the native trim is a no-op and only the managed part applies.
+
+### Start-of-job reclaim and skip reasons (issue #325)
+
+A burst never gets an idle moment, so the post-job reclaim is skipped (busy, superseded by the next job's, or given
+up after about two minutes) and the next job used to start on top of the previous job's committed memory. Now the
+service remembers that a job's memory has not been returned: the **next production that reaches its worker** (an
+attach, reuse or re-select that never runs a worker neither takes nor clears the debt) reclaims
+first, on its own thread under the write gate, before restore or load, when the working set is at least the threshold.
+Nothing of the previous job is reachable then, so the roughly 2 s pause is cheap. It logs `Job <id>: start-of-job
+memory reclaimed in <n> ms (working set <a> -> <b> MiB, ...)` with the same per-phase timings. A post-job reclaim that
+ran (the idle case), or found the working set below the threshold, clears the debt, so an idle service pays nothing
+extra; it does so only if no production started while it ran (the post-job reclaim does not hold the write gate), so
+a late-finishing reclaim never marks a running job's memory clean. The start-of-job reclaim is not blocked by the
+writer lease: `WriterLease` renews from its own timer and connection (about every third of the TTL). It never throws,
+never runs two at once and is skipped during shutdown (checked again right before the collection).
+
+Every reclaim that does not run logs one line, `Job <id>: memory reclaim skipped (<reason>): <detail>.` (prefixed
+`start-of-job` for the start-of-job path), and is counted with its phase, `post_job` or `pre_job`: under
+`maintenance.memory_reclaims_skipped_by_phase` of `GET /control/metrics` (an object keyed `<phase>/<reason>`; a missing
+key is 0; `maintenance.memory_reclaims_skipped` keeps the per-reason totals) and as
+`sextant_memory_reclaims_skipped_total{phase="...",reason="..."}` in the Prometheus text. Reasons: `busy`
+(another production queued or running, or another reclaim running), `below_threshold`, `shutting_down`, `superseded`
+(a newer job's reclaim replaced it) and `deferred` (still busy after the bounded retries; the next job reclaims at its
+start). Reclaims that ran are `sextant_memory_reclaims_total{phase="post_job"|"pre_job"}` and
+`maintenance.memory_reclaims_run_by_phase` (`maintenance.memory_reclaims_run` is the total). Because each series
+carries its phase, a job whose post-job reclaim was skipped below the threshold and whose next start-of-job check was
+below it too shows as one `post_job` and one `pre_job` count, not an ambiguous double count. Counters are per service
+instance.
 
 ## The `SnapshotService` data plane
 

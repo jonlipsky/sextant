@@ -98,6 +98,18 @@ public static class PrometheusExposition
             s.Maintenance.RepositoryBytesReclaimedTotal);
         Gauge(sb, "sextant_repository_reclaim_failures_total", "Repository reclaims that failed since start.",
             s.Maintenance.RepositoryReclaimFailuresTotal);
+        sb.Append("# HELP sextant_memory_reclaims_total Job-memory reclaims that ran, by phase (post_job or pre_job).\n");
+        sb.Append("# TYPE sextant_memory_reclaims_total counter\n");
+        foreach (var phase in MemoryReclaimPhases.All)
+            sb.Append("sextant_memory_reclaims_total{phase=\"").Append(phase).Append("\"} ")
+                .Append(s.Maintenance.MemoryReclaimsRunByPhase.GetValueOrDefault(phase).ToString(CultureInfo.InvariantCulture)).Append('\n');
+        sb.Append("# HELP sextant_memory_reclaims_skipped_total Job-memory reclaims that did not run, by phase and reason.\n");
+        sb.Append("# TYPE sextant_memory_reclaims_skipped_total counter\n");
+        foreach (var phase in MemoryReclaimPhases.All)
+            foreach (var reason in MemoryReclaimSkipReasons.All)
+                sb.Append("sextant_memory_reclaims_skipped_total{phase=\"").Append(phase).Append("\",reason=\"").Append(reason).Append("\"} ")
+                    .Append(s.Maintenance.MemoryReclaimsSkippedByPhase.GetValueOrDefault(MemoryReclaimPhases.Key(phase, reason))
+                        .ToString(CultureInfo.InvariantCulture)).Append('\n');
         Gauge(sb, "sextant_scheduled_retention_runs", "Scheduled retention passes run since start.",
             s.Maintenance.ScheduledRetentionRuns);
         Gauge(sb, "sextant_scheduled_retention_skipped_busy", "Due scheduled retention passes skipped while indexing held the writer.",
