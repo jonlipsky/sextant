@@ -2163,9 +2163,15 @@ public sealed partial class SnapshotService : IDisposable
 
     private readonly System.Collections.Concurrent.ConcurrentDictionary<long, DateTime> _oversizedToday = new();
 
+    private long _tailTuningDayTicks;
+
     private HashSet<long> OversizedToDeferToday()
     {
         var today = _timeProvider.GetUtcNow().UtcDateTime.Date;
+        // Tail steps cut down or stepped over (issue #329) get the same one-day memory. Only the caller that moves
+        // the day resets the tuning.
+        if (Interlocked.Exchange(ref _tailTuningDayTicks, today.Ticks) != today.Ticks)
+            _fileSweepCursor.ResetTuning();
         var ids = new HashSet<long>();
         foreach (var (id, day) in _oversizedToday)
         {
@@ -2193,8 +2199,11 @@ public sealed partial class SnapshotService : IDisposable
         var report = await RunRetentionPassAsync(execute, principal, cancellationToken, passLimit, timer).ConfigureAwait(false);
         if (!execute) return report;
         // A pass that was cut short without deleting anything asks for a continuation (capped by the scheduler).
-        if (report.MoreRemaining && !MadeRetentionProgress(report) && report.StopReason is "time_budget" or "unit_budget")
+        if (report.MoreRemaining && !MadeDeletionProgress(report) && report.StopReason is "time_budget" or "unit_budget")
             report = report with { StopReason = "unit_budget" };
+        // Never "more remaining" without a reason (issue #329).
+        if (report.MoreRemaining && report.StopReason == null)
+            report = report with { StopReason = "work_remaining" };
         if (report.Batches > 0)
         {
             var skipped = await AuditRetentionPassAsync(
@@ -2209,9 +2218,14 @@ public sealed partial class SnapshotService : IDisposable
     }
 
     internal static bool MadeRetentionProgress(RetentionReport report) =>
+        MadeDeletionProgress(report) || report.PagesVacuumed > 0;
+
+    // Rows or blobs actually removed. Vacuumed pages are left out: they only return space and say nothing about whether
+    // the work behind a stop reason moved (issue #329).
+    internal static bool MadeDeletionProgress(RetentionReport report) =>
         (report.SnapshotsDeleted + report.SnapshotProjectVersionsDeleted + report.ApiSnapshotsDeleted +
             report.FileVersionsDeleted + report.Deleted.Count + (report.SourceTextsDeleted ?? 0) +
-            report.ProjectChunkRowsDeleted + report.PagesVacuumed) > 0;
+            report.ProjectChunkRowsDeleted) > 0;
 
     // Accumulates the step timings of one executed pass (issue #321). The pass is sequential, so no locking.
     private sealed class RetentionPassTimer
@@ -2346,13 +2360,15 @@ public sealed partial class SnapshotService : IDisposable
             var deferredNow = deferred.Count == 0 ? [] : plan.ExcludeSnapshots(deferred);
             report = plan.Report with { OversizedDeferredSnapshotIds = deferredNow };
 
+            var batchPassBound = false;
             do
             {
                 var batch = await timer.WriteAsync(this, () =>
                 {
                     pass.Token.ThrowIfCancellationRequested();
                     var remaining = limit - System.Diagnostics.Stopwatch.GetElapsedTime(started);
-                    var batchLimit = remaining < RetentionService.BatchTimeLimit ? remaining : RetentionService.BatchTimeLimit;
+                    batchPassBound = remaining < RetentionService.BatchTimeLimit;
+                    var batchLimit = batchPassBound ? remaining : RetentionService.BatchTimeLimit;
                     var retention = new RetentionService(_conn, _options.Retention);
                     return Task.FromResult(retention.ExecuteBatch(plan, pass.Token, batchLimit, () =>
                     {
@@ -2366,6 +2382,9 @@ public sealed partial class SnapshotService : IDisposable
                     // Until the pass has deleted something its first unit always starts, however long planning took.
                     enforceUnitStart: MadeRetentionProgress(report) || report.Oversized > 0));
                 }, ms => timer.DeleteMs += ms, pass.Token).ConfigureAwait(false);
+                // A batch cut at its own cap while the pass still had time is not "the budget was spent" (issue #329).
+                if (batch.StopReason == "time_budget" && !batchPassBound)
+                    batch = batch with { StopReason = "batch_budget" };
                 report = RetentionService.Combine(report, batch);
                 foreach (var oversizedId in batch.OversizedSnapshotIds)
                 {
@@ -2373,21 +2392,27 @@ public sealed partial class SnapshotService : IDisposable
                     await Console.Error.WriteLineAsync(
                         $"Retention rolled back the deletion unit of snapshot {oversizedId}: it ran past {_options.Retention.Normalized().UnitMaxSeconds}s. It is skipped for the rest of the UTC day.").ConfigureAwait(false);
                 }
-                if (batch.StopReason != null) return report;
+                foreach (var line in batch.TailSkipped)
+                    await Console.Error.WriteLineAsync(line).ConfigureAwait(false);
+                if (batch.StopReason != null) return report with { LeftWork = plan.DescribeLeft() };
                 // WithWriteAsync releases the gate before the next admission; already-queued publishes go first.
             } while (report.MoreRemaining);
 
+            var sweepPassBound = false;
             var sweep = await timer.WriteAsync(this, () =>
             {
                 pass.Token.ThrowIfCancellationRequested();
                 var remaining = limit - System.Diagnostics.Stopwatch.GetElapsedTime(started);
-                var sweepLimit = remaining < RetentionService.BatchTimeLimit ? remaining : RetentionService.BatchTimeLimit;
+                sweepPassBound = remaining < RetentionService.BatchTimeLimit;
+                var sweepLimit = sweepPassBound ? remaining : RetentionService.BatchTimeLimit;
                 return Task.FromResult(new RetentionService(_conn, _options.Retention)
                     .SweepSourceTexts(SourceTexts, pass.Token, sweepLimit));
             }, ms => timer.TailMs += ms, pass.Token).ConfigureAwait(false);
+            var sweepReason = sweep.StopReason == "time_budget" && !sweepPassBound ? "sweep_budget" : sweep.StopReason;
             report = report with { SourceTextsDeleted = sweep.SourceTextsDeleted,
                 MoreRemaining = sweep.MoreRemaining || plan.ApiDeferred,
-                StopReason = sweep.StopReason ?? (plan.ApiDeferred ? "api_deferred" : null) };
+                StopReason = sweepReason ?? (plan.ApiDeferred ? "api_deferred" : null),
+                LeftWork = plan.DescribeLeft() + (sweep.MoreRemaining ? " texts=more" : " texts=0") };
 
             // Give disk back (issue #252): bounded incremental_vacuum steps, the writer released between them.
             // A no-op on a catalog created before auto_vacuum=INCREMENTAL (it needs `sextant catalog compact`).
@@ -2419,13 +2444,25 @@ public sealed partial class SnapshotService : IDisposable
             }
             catch (OperationCanceledException) when (!lifetime.IsCancellationRequested && pass.IsCancellationRequested)
             {
-                vacuumLeft = true;
+                // Same gate as the time check: only an incremental catalog with free pages has anything left.
+                try
+                {
+                    using var reader = OpenReadConnection();
+                    vacuumLeft = IncrementalVacuum.IsIncremental(reader) && IncrementalVacuum.FreelistPages(reader) > 0;
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    vacuumLeft = false;
+                }
             }
             report = report with
             {
                 PagesVacuumed = pagesVacuumed,
                 MoreRemaining = report.MoreRemaining || vacuumLeft,
-                StopReason = report.StopReason ?? (vacuumLeft ? "vacuum_budget" : null)
+                VacuumLeft = vacuumLeft,
+                // Vacuum progress wins over a reason that only says "run again"; a stuck reason stays visible.
+                StopReason = vacuumLeft && report.StopReason is null or "api_deferred" or "sweep_budget" or "work_remaining"
+                    ? "vacuum_budget" : report.StopReason
             };
 
             if (pagesVacuumed > 0)

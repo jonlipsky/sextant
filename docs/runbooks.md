@@ -196,7 +196,7 @@ The service endpoint has the same [bounded retention contract](service.md#bounde
 planning uses an independent reader and never queues behind indexing; execution yields the service writer
 between freshly revalidated batches. Each pass has a 10-second work budget (including gate wait), a
 2-second SQLite batch deadline, and a one-second lock retry limit. Inspect `more_remaining` and
-`stop_reason` (`time_budget`/`api_deferred`/`sqlite_busy`) before requesting a subsequent pass. Caller cancellation stops
+`stop_reason` (`time_budget`, `unit_budget`, `batch_budget`, `sweep_budget`, `api_deferred`, `sqlite_busy`, `vacuum_budget`, `source_text_cap`, `source_text_undeletable`, `source_text_error`, `work_remaining`) and the additive `left_work` summary (what each step still has queued) before requesting a subsequent pass. Caller cancellation stops
 remaining work; already-committed batches stay applied. A large project cascade that cannot meet the
 deadline is rolled back and deferred, so repeated budget stops need investigation, not an unbounded retry
 loop. Local executed retention still requires exclusive writer-lease ownership; it must not run alongside

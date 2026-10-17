@@ -180,6 +180,73 @@ public class SourceTextStoreTests
     }
 
     [TestMethod]
+    public void DeleteUnreferenced_StoreEmptiedExactlyAtTheCap_ReportsNothingRemaining()
+    {
+        var store = new SourceTextStore(_root);
+        var kept = Bytes("class Kept { }");
+        var orphans = Enumerable.Range(0, 2).Select(i => Bytes($"class Orphan{i} {{ }}")).ToList();
+        foreach (var content in orphans.Append(kept))
+            store.Put(SHA256.HashData(content), content);
+        var referenced = new HashSet<UInt128> { SourceTextStore.SweepKey(SHA256.HashData(kept)) };
+
+        Assert.AreEqual(2, store.DeleteUnreferenced(referenced, 2, () => false, out string? reason));
+        Assert.IsNull(reason, "only referenced blobs are left past the cap, so the sweep is finished");
+    }
+
+    [TestMethod]
+    public void DeleteUnreferenced_OrphansLeftPastTheCap_ReportsTheCap()
+    {
+        var store = new SourceTextStore(_root);
+        foreach (var content in Enumerable.Range(0, 3).Select(i => Bytes($"class Orphan{i} {{ }}")))
+            store.Put(SHA256.HashData(content), content);
+
+        Assert.AreEqual(2, store.DeleteUnreferenced(new HashSet<UInt128>(), 2, () => false, out string? reason));
+        Assert.AreEqual("source_text_cap", reason);
+    }
+
+    [TestMethod]
+    public void DeleteUnreferenced_StopRequested_ReportsTheBudget()
+    {
+        var store = new SourceTextStore(_root);
+        var content = Bytes("class Orphan { }");
+        store.Put(SHA256.HashData(content), content);
+
+        Assert.AreEqual(0, store.DeleteUnreferenced(new HashSet<UInt128>(), 2, () => true, out string? reason));
+        Assert.AreEqual("time_budget", reason);
+    }
+
+    [TestMethod]
+    public void DeleteUnreferenced_IoErrorMidEnumeration_ReportsAnErrorNotUndeletable()
+    {
+        var store = new SourceTextStore(_root);
+        var orphan = Bytes("class Orphan { }");
+        store.Put(SHA256.HashData(orphan), orphan);
+        var path = BlobPath(orphan);
+        store.EnumerateOverride = _ => FailAfter(path);
+
+        Assert.AreEqual(1, store.DeleteUnreferenced(new HashSet<UInt128>(), 10, () => false, out string? reason));
+        Assert.AreEqual("source_text_error", reason);
+
+        static IEnumerable<string> FailAfter(string first)
+        {
+            yield return first;
+            throw new IOException("disk went away");
+        }
+    }
+
+    [TestMethod]
+    public void DeleteUnreferenced_EnumerationFailsUpFront_ReportsAnError()
+    {
+        var store = new SourceTextStore(_root);
+        var orphan = Bytes("class Orphan { }");
+        store.Put(SHA256.HashData(orphan), orphan);
+        store.EnumerateOverride = _ => throw new UnauthorizedAccessException("denied");
+
+        Assert.AreEqual(0, store.DeleteUnreferenced(new HashSet<UInt128>(), 10, () => false, out string? reason));
+        Assert.AreEqual("source_text_error", reason);
+    }
+
+    [TestMethod]
     public void DeleteUnreferenced_NoStoreYet_DeletesNothing() =>
         Assert.AreEqual(0, new SourceTextStore(_root).DeleteUnreferenced(new HashSet<UInt128>(), maxDeletes: 10));
 
