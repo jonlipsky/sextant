@@ -1431,12 +1431,28 @@ Every reclaim that does not run logs one line, `Job <id>: memory reclaim skipped
 key is 0; `maintenance.memory_reclaims_skipped` keeps the per-reason totals) and as
 `sextant_memory_reclaims_skipped_total{phase="...",reason="..."}` in the Prometheus text. Reasons: `busy`
 (another production queued or running, or another reclaim running), `below_threshold`, `shutting_down`, `superseded`
-(a newer job's reclaim replaced it) and `deferred` (still busy after the bounded retries; the next job reclaims at its
-start). Reclaims that ran are `sextant_memory_reclaims_total{phase="post_job"|"pre_job"}` and
+(a newer job's reclaim replaced it) and `deferred` (still busy after the bounded retries, or the managed heap was still
+large after the reclaim and its retries; the next job reclaims at its start). Reclaims that ran are
+`sextant_memory_reclaims_total{phase="post_job"|"pre_job"}` and
 `maintenance.memory_reclaims_run_by_phase` (`maintenance.memory_reclaims_run` is the total). Because each series
 carries its phase, a job whose post-job reclaim was skipped below the threshold and whose next start-of-job check was
 below it too shows as one `post_job` and one `pre_job` count, not an ambiguous double count. Counters are per service
 instance.
+
+#### Off-worker-stack continuation and the residual retry (issue #330)
+
+A worker's async chain completes inline: the thread that finished the last extraction step went on to run the rest of
+the production with every state machine of the worker still on its stack, so a post-job reclaim that started at once on
+another thread found the job's whole `Solution` reachable and kept GiBs committed. The service therefore awaits the
+worker through `ContinueOffWorkerStack`, which resumes the production on a fresh pool work item (the worker's
+exception or cancellation still surfaces from the same `await`, so the requeue, transient and failed-result handling is
+unchanged). As a second line of defence a post-job reclaim whose gen2 collection still leaves the live managed heap more
+than 256 MiB (`MemoryReclaimResidualHeapBytes`) above a baseline is a **residual** outcome: the baseline is the smallest
+heap any reclaim has left so far (the service's own steady state; the first reclaim has none and uses the 256 MiB
+margin alone, so a legitimately large heap costs one extra retry once). A residual reclaim does not clear the memory
+debt and runs again after 15 s, at most 4 times, and a newer job's reclaim supersedes a retry that is waiting. When the
+retries are exhausted it is counted as `deferred`, the baseline is rebased to the observed heap, and the next job reclaims
+before its restore as usual.
 
 ## The `SnapshotService` data plane
 

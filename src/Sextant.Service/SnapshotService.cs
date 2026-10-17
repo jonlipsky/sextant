@@ -1017,6 +1017,23 @@ public sealed partial class SnapshotService : IDisposable
         }
     }
 
+    // Issue #330: a worker's async chain completes INLINE, each frame's continuation running inside the completing
+    // frame of the one below it, so the thread that finished the last extraction step goes on to run the rest of the
+    // production (and the post-job reclaim's yield) with every one of those state machines still on its stack. The
+    // reclaim, started on another pool thread at once, then found the job's whole Solution reachable (a GC root in
+    // that stack) and kept 1.85 GB committed. The service continues on a fresh pool work item instead, so the worker's
+    // frames unwind on their own thread and nothing of the job is on the stack the production continues on.
+    private static async Task<T> ContinueOffWorkerStack<T>(Task<T> work)
+    {
+        var finished = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _ = work.ContinueWith(
+            static (_, state) => ((TaskCompletionSource)state!).TrySetResult(), finished,
+            CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        await finished.Task.ConfigureAwait(false);
+        // Awaiting the finished task rethrows the worker's own exception, exactly as awaiting it directly did.
+        return await work.ConfigureAwait(false);
+    }
+
     // The production critical section. The caller holds the write gate (and has checked the lease).
     private async Task<EnsureSnapshotResult> ProduceLockedAsync(
         EnsureSnapshotRequest request, string hash, long jobId, bool existed)
@@ -1089,7 +1106,7 @@ public sealed partial class SnapshotService : IDisposable
         {
             // Issue #148: the worker runs on the SERVICE lifetime, never a caller's token — a caller that
             // disconnects or times out must not throw away a long index run. Only shutdown cancels it.
-            result = await _worker.ProduceAsync(workRequest, hash, scratch, _lifetime.Token).ConfigureAwait(false);
+            result = await ContinueOffWorkerStack(_worker.ProduceAsync(workRequest, hash, scratch, _lifetime.Token)).ConfigureAwait(false);
         }
         // Every catch below writes the job row, so each is skipped once the lease is lost (issue #38): the
         // exception propagates and the job stays running for the NEW owner's startup reconcile to requeue.
