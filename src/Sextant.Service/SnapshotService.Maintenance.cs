@@ -508,20 +508,25 @@ public sealed partial class SnapshotService
         var continues = ScheduledPassContinues(report);
         _lastScheduledRetentionDay = continues ? _lastScheduledRetentionDay : today;
         _metrics.RecordScheduledRetention(report, now.ToUnixTimeMilliseconds(), durationMs);
-        Log($"maintenance: scheduled retention deleted {report.SnapshotsDeleted} snapshot(s), " +
-            $"{report.FileVersionsDeleted} file version(s), {report.SourceTextsDeleted ?? 0} source text(s) in {durationMs:F0} ms" +
-            (report.MoreRemaining ? $"; more remaining ({report.StopReason ?? "unfinished"})." : ".") +
-            (report.Timings is { } t ? $" Steps: {t.ToLogText()}." : ""));
+        Log(ScheduledRetentionLogLine(report, durationMs));
         return new MaintenanceTickReport
         {
             IdleBranches = idle, Retention = "ran", RetentionReport = report, RetentionDurationMs = durationMs
         };
     }
 
+    internal static string ScheduledRetentionLogLine(RetentionReport report, double durationMs) =>
+        $"maintenance: scheduled retention deleted {report.SnapshotsDeleted} snapshot(s), " +
+        $"{report.FileVersionsDeleted} file version(s), {report.SourceTextsDeleted ?? 0} source text(s) in {durationMs.ToString("F0", System.Globalization.CultureInfo.InvariantCulture)} ms" +
+        (report.MoreRemaining ? $"; more remaining ({report.StopReason ?? "unfinished"})" : "") +
+        $"; skipped={report.SnapshotsSkipped}" +
+        (report.LeftWork is { } left ? $"; left: {left}" : "") + "." +
+        (report.Timings is { } t ? $" Steps: {t.ToLogText()}." : "");
+
     // A scheduled pass that ran out of budget with work left stays due: the next tick continues it (issue #317) instead
-    // of leaving the rest for tomorrow. A pass that left work but neither deleted anything nor ran out of budget (a stuck
-    // catalog) is done for the day, so it is not re-planned every tick. A pass cut short before any deletion ("unit_budget",
-    // issue #321) continues too, at most MaxScheduledNoProgressContinues times in a row.
+    // of leaving the rest for tomorrow. A pass that left work but neither deleted anything nor stopped for a budget or a
+    // busy writer (a stuck catalog) is done for the day, so it is not re-planned every tick. Any zero-progress stop that
+    // does continue (issue #321, #329) does so at most MaxScheduledNoProgressContinues times in a row.
     internal const int MaxScheduledNoProgressContinues = 3;
     private int _scheduledNoProgressContinues;
 
@@ -530,7 +535,7 @@ public sealed partial class SnapshotService
     internal bool ScheduledPassContinues(RetentionReport report)
     {
         var continues = ScheduledRetentionContinues(report);
-        if (continues && !MadeRetentionProgress(report))
+        if (continues && !MadeStopReasonProgress(report))
         {
             if (++_scheduledNoProgressContinues > MaxScheduledNoProgressContinues)
                 continues = false;
@@ -541,8 +546,17 @@ public sealed partial class SnapshotService
         return continues;
     }
 
+    // Real movement on the work the pass stopped for: rows or blobs deleted, or pages vacuumed when vacuum is what is left.
+    private static bool MadeStopReasonProgress(RetentionReport report) =>
+        MadeDeletionProgress(report) || (report.PagesVacuumed > 0 && report.VacuumLeft);
+
+    // Stops that are about a budget or a busy writer, not a catalog that cannot move: they may continue without progress,
+    // but only a bounded number of times in a row (ScheduledPassContinues).
+    private static bool IsRetryableStop(string? reason) =>
+        reason is "unit_budget" or "batch_budget" or "sweep_budget" or "api_deferred" or "sqlite_busy";
+
     internal static bool ScheduledRetentionContinues(RetentionReport report) =>
-        report.MoreRemaining && (MadeRetentionProgress(report) || report.StopReason == "unit_budget");
+        report.MoreRemaining && (MadeStopReasonProgress(report) || IsRetryableStop(report.StopReason));
 
     // A production holds the writer for its whole run, and a write waiting for its turn would queue behind it: either
     // way a retention pass now would only spend its budget waiting, or delay that write (issue #299).

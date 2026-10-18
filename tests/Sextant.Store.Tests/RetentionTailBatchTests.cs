@@ -308,6 +308,190 @@ public class RetentionTailBatchTests
         Assert.AreEqual(0L, cursor.Position, "the finished sweep wraps");
     }
 
+    // ---- a tail step that never fits one batch (issue #329) ----
+
+    [TestMethod]
+    public void SlowSweepSpan_IsHalvedAndRetried_UntilItFits()
+    {
+        SeedOrphans(300);
+        var cursor = new FileSweepCursor();
+        var retention = new RetentionService(_conn, Keep(5), fileSweep: cursor);
+        retention.BeforeTailStep = step =>
+        {
+            if (step == "sweep" && cursor.SweepSpan > 1024) throw new TimeoutException("slow");
+        };
+        var plan = retention.CreatePlan();
+
+        var total = DrainTolerant(retention, plan);
+
+        Assert.AreEqual(1024, cursor.SweepSpan, "4096 halves twice");
+        Assert.AreEqual(0, total.TailSkipped.Count, "a shrink that then fits is silent");
+        Assert.AreEqual(300, total.FileVersionsDeleted, "the sweep made its progress at the smaller span");
+        Assert.IsTrue(plan.FileVersionsDone);
+    }
+
+    [TestMethod]
+    public void SweepSpanThatNeverFits_IsSkippedForTheDay_WithOneLine_AndTheRunConverges()
+    {
+        SeedOrphans(300);
+        var cursor = new FileSweepCursor();
+        var retention = new RetentionService(_conn, Keep(5), fileSweep: cursor) { SweepSpansPerPass = 10 };
+        retention.BeforeTailStep = step =>
+        {
+            if (step == "sweep") throw new TimeoutException("slow");
+        };
+        var plan = retention.CreatePlan();
+
+        var total = DrainTolerant(retention, plan);
+
+        Assert.AreEqual(FileSweepCursor.MinSweepSpan, cursor.SweepSpan);
+        Assert.IsTrue(total.TailSkipped.Count > 0);
+        StringAssert.Contains(total.TailSkipped[0], "until the sweep wraps");
+        Assert.AreEqual(0, total.FileVersionsDeleted);
+        Assert.AreEqual(300L, Scalar("SELECT COUNT(*) FROM file_versions;"));
+        // 300 ids in spans of 64: four full spans and a last one of 44, each skipped once; the next step finds no ids
+        // left after the last existing id, so the sweep is complete and the shared cursor wraps.
+        Assert.AreEqual(5, total.TailSkipped.Count, "one line per skipped span");
+        StringAssert.Contains(total.TailSkipped[^1], $"through id {Scalar("SELECT MAX(id) FROM file_versions;")}");
+        Assert.IsTrue(plan.FileVersionsDone, "no ids remain after the last span, so the sweep is done");
+        Assert.AreEqual(0L, cursor.Position, "the finished sweep wraps");
+
+        cursor.ResetTuning();
+        Assert.AreEqual(RetentionService.FileSweepSpan, cursor.SweepSpan);
+    }
+
+    [TestMethod]
+    public void ATimeoutAfterAFastTailStep_DoesNotShrinkOrSkipIt()
+    {
+        SeedOrphans(10);
+        var cursor = new FileSweepCursor();
+        var retention = new RetentionService(_conn, Keep(5), fileSweep: cursor);
+        var plan = retention.CreatePlan();
+
+        var batch = retention.ExecuteBatch(plan, beforeCommit: () => throw new TimeoutException("late"));
+
+        Assert.AreEqual("time_budget", batch.StopReason);
+        Assert.AreEqual(0, batch.TailSkipped.Count);
+        Assert.AreEqual(RetentionService.FileSweepSpan, cursor.SweepSpan, "the step was fast; its span is not cut");
+        Assert.AreEqual(0L, plan.FileVersionCursor, "the rolled-back batch moved nothing");
+        Assert.AreEqual(10L, Scalar("SELECT COUNT(*) FROM file_versions;"));
+    }
+
+    [TestMethod]
+    public void SkippedSpan_AdvancesToTheLastExistingId_WhenIdsHaveGaps()
+    {
+        SeedOrphans(300);
+        Exec("DELETE FROM file_versions WHERE id % 2 = 0;");
+        var expected = Scalar($"SELECT id FROM file_versions ORDER BY id LIMIT 1 OFFSET {FileSweepCursor.MinSweepSpan - 1};");
+        var cursor = new FileSweepCursor();
+        var retention = new RetentionService(_conn, Keep(5), fileSweep: cursor);
+        retention.BeforeTailStep = step =>
+        {
+            if (step == "sweep") throw new TimeoutException("slow");
+        };
+        var plan = retention.CreatePlan();
+
+        RetentionReport batch;
+        var guard = 0;
+        do
+        {
+            batch = retention.ExecuteBatch(plan);
+            Assert.IsTrue(++guard < 50, "the span is skipped after the span shrinks to its minimum");
+        } while (batch.TailSkipped.Count == 0);
+
+        Assert.AreEqual(expected, cursor.Position, "the cursor lands on the 64th existing id, not on 64");
+        Assert.IsTrue(expected > FileSweepCursor.MinSweepSpan);
+        StringAssert.Contains(batch.TailSkipped[0], $"through id {expected}");
+        StringAssert.Contains(batch.TailSkipped[0], "until the sweep wraps");
+    }
+
+    [TestMethod]
+    public void ShrunkUnits_DoubleBack_AfterCleanTailBatches()
+    {
+        var cursor = new FileSweepCursor();
+        Assert.IsTrue(cursor.TryShrinkSweepSpan());
+        Assert.IsTrue(cursor.TryShrinkSweepSpan());
+        Assert.IsTrue(cursor.TryShrinkApiDeleteRows());
+        Assert.AreEqual(1024, cursor.SweepSpan);
+
+        for (var i = 0; i < 7; i++) cursor.NoteCleanTailBatch();
+        Assert.AreEqual(1024, cursor.SweepSpan, "seven clean batches are not enough");
+        cursor.NoteCleanTailBatch();
+        Assert.AreEqual(2048, cursor.SweepSpan);
+        Assert.AreEqual(RetentionService.BatchRowLimit, cursor.ApiDeleteRows);
+
+        for (var i = 0; i < 7; i++) cursor.NoteCleanTailBatch();
+        Assert.IsTrue(cursor.TryShrinkSweepSpan(), "a new shrink restarts the count");
+        for (var i = 0; i < 7; i++) cursor.NoteCleanTailBatch();
+        Assert.AreEqual(1024, cursor.SweepSpan);
+
+        for (var i = 0; i < 40; i++) cursor.NoteCleanTailBatch();
+        Assert.AreEqual(RetentionService.FileSweepSpan, cursor.SweepSpan, "never above the default");
+    }
+
+    [TestMethod]
+    public void SlowApiDelete_IsShrunk_ThenTheCommitIsSkippedForTheDay_AndRetriedAfterTheReset()
+    {
+        SeedApi("old", 100, 2);
+        SeedApi("new", 500, 2);
+        var cursor = new FileSweepCursor();
+        var calls = 0;
+        var retention = new RetentionService(_conn, Keep(1), fileSweep: cursor);
+        retention.BeforeTailStep = step =>
+        {
+            if (step != "api") return;
+            calls++;
+            throw new TimeoutException("slow");
+        };
+
+        var total = DrainTolerant(retention, retention.CreatePlan());
+
+        Assert.AreEqual(8, cursor.ApiDeleteRows, "256 halves down to the minimum");
+        Assert.AreEqual(1, total.TailSkipped.Count);
+        StringAssert.Contains(total.TailSkipped[0], "old");
+        Assert.AreEqual(2L, ApiRows("old"));
+        var callsAfterFirst = calls;
+
+        DrainTolerant(retention, retention.CreatePlan());
+        Assert.AreEqual(callsAfterFirst, calls, "a skipped commit is not retried the same day");
+
+        cursor.ResetTuning();
+        retention.BeforeTailStep = null;
+        DrainTolerant(retention, retention.CreatePlan());
+        Assert.AreEqual(0L, ApiRows("old"));
+    }
+
+    [TestMethod]
+    public void LeftWork_AfterTheSpanAllowanceIsUsed_ReportsTheCursor_NotZero()
+    {
+        SeedOrphans(RetentionService.FileSweepSpan * 2 + 10);
+        var cursor = new FileSweepCursor();
+        var provider = new ProtectUpTo(Scalar("SELECT MAX(id) FROM file_versions;"));
+        var retention = new RetentionService(_conn, Keep(5), [provider], cursor) { SweepSpansPerPass = 1 };
+        var plan = retention.CreatePlan();
+
+        Assert.AreEqual("snapshots=0 runs=0 api=0 files=cursor@0", plan.DescribeLeft());
+        DrainTolerant(retention, plan);
+
+        Assert.IsFalse(plan.FileVersionsDone);
+        StringAssert.EndsWith(plan.DescribeLeft(), $"files=cursor@{cursor.Position}");
+        Assert.IsTrue(cursor.Position > 0);
+    }
+
+    private RetentionReport DrainTolerant(RetentionService retention, RetentionPlan plan)
+    {
+        var total = new RetentionReport { DryRun = false };
+        for (var i = 0; i < 400; i++)
+        {
+            var batch = retention.ExecuteBatch(plan);
+            Assert.IsNull(batch.StopReason, "a cut-down tail step retries; it never stops the pass");
+            total = RetentionService.Combine(total, batch);
+            if (!batch.MoreRemaining) return total;
+        }
+        Assert.Fail("did not converge");
+        return total;
+    }
+
     // ---- helpers ----
 
     private RetentionReport Drain(RetentionService retention, RetentionPlan plan)

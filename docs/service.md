@@ -2340,11 +2340,20 @@ budget + 30 s + the other two terms. `timings` splits writer wait from work for 
 post-vacuum checkpoint. A pass that stops on its budget or the unit-start rule before deleting anything reports
 `stop_reason: unit_budget`; the scheduler continues it on the next tick, at most 3 times in a row, then closes the day.
 
-`more_remaining: true` means another pass may be needed. `stop_reason: time_budget`, `api_deferred` (API-history
-candidates could not be planned or verified in time; the next pass does them) or `sqlite_busy`
-explicitly reports bounded deferral, not completion. The orphan-blob sweep examines at most 256 spans of 4096
+`more_remaining: true` means another pass may be needed, and every such response names a `stop_reason`:
+`time_budget` (the pass budget), `unit_budget` (see above), `batch_budget` (one batch hit its own 2 s cap while the pass still
+had time), `sweep_budget` (the blob sweep did), `api_deferred` (API-history candidates could not be planned or verified in
+time; the next pass does them), `sqlite_busy`, `vacuum_budget` (free pages are left; wins over `api_deferred`,
+`sweep_budget` and `work_remaining` when pages were vacuumed), `source_text_cap` (more orphan source-text blobs than one
+pass deletes), `source_text_undeletable` (a blob would not delete; the scheduler closes the day), `source_text_error`
+(the source-text store could not be enumerated or an IO error cut the walk; also closes the day) and `work_remaining`
+(a fallback when no other reason applies). These explicitly report bounded deferral, not completion. A tail step
+(one API commit, one file-version span) that runs past the 2 s batch cap with nothing done is halved and retried, and at the
+smallest size is skipped with one log line: an API commit for the rest of the UTC day, a file-version span until the sweep wraps (the sweep's cursor is in memory, so a restart also starts it over). The response also carries `left_work`, a one-line
+summary of what each step still has queued (e.g. `snapshots=0 runs=0 api=0 files=cursor@120 texts=more`); it is additive,
+null on a dry run, and clients that do not know it can ignore it. The orphan-blob sweep examines at most 256 spans of 4096
 `file_versions` ids per pass and resumes from a shared in-memory cursor, so a very large table is swept over several
-passes without a stop reason. A timed-out plan also sets these fields; its empty
+passes without a stop reason (`left_work` then shows `files=cursor@<id>`). A timed-out plan also sets these fields; its empty
 counts are **not** a complete plan. Execution's `reclaimed_bytes_known: true` reports freed pages reusable
 by SQLite, **not a smaller database file**. No full VACUUM runs on the hot path. A catalog created with
 `auto_vacuum = INCREMENTAL` (every new catalog; `IndexDatabase` sets it before the first table exists) gives disk back

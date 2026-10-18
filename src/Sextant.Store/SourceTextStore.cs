@@ -165,12 +165,18 @@ public sealed class SourceTextStore
     /// Returns the number of blobs deleted.
     /// </summary>
     public int DeleteUnreferenced(IReadOnlySet<UInt128> referencedKeys, int maxDeletes)
-        => DeleteUnreferenced(referencedKeys, maxDeletes, () => false, out _);
+        => DeleteUnreferenced(referencedKeys, maxDeletes, () => false, out string? _);
 
+    /// <summary>
+    /// As above, and says why the sweep left work: <c>time_budget</c> (<paramref name="shouldStop"/>),
+    /// <c>source_text_cap</c> (more orphans past <paramref name="maxDeletes"/>), <c>source_text_error</c> (the store
+    /// could not be enumerated or an IO error cut the walk) or <c>source_text_undeletable</c> (a blob that would not
+    /// delete); null when the sweep finished. The first reason hit wins, in that order of occurrence.
+    /// </summary>
     public int DeleteUnreferenced(IReadOnlySet<UInt128> referencedKeys, int maxDeletes,
-        Func<bool> shouldStop, out bool moreRemaining)
+        Func<bool> shouldStop, out string? stopReason)
     {
-        moreRemaining = false;
+        stopReason = null;
         if (!Directory.Exists(Root))
             return 0;
 
@@ -178,12 +184,12 @@ public sealed class SourceTextStore
         IEnumerable<string> files;
         try
         {
-            files = Directory.EnumerateFiles(Root, "*", new EnumerationOptions { RecurseSubdirectories = true });
+            files = (EnumerateOverride ?? DefaultEnumerate)(Root);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             _log?.Invoke($"Source text sweep could not enumerate: {ex.Message}");
-            moreRemaining = true;
+            stopReason = "source_text_error";
             return 0;
         }
 
@@ -191,9 +197,9 @@ public sealed class SourceTextStore
         {
             foreach (var path in files)
             {
-                if (deleted >= maxDeletes || shouldStop())
+                if (shouldStop())
                 {
-                    moreRemaining = true;
+                    stopReason ??= "time_budget";
                     break;
                 }
 
@@ -202,7 +208,7 @@ public sealed class SourceTextStore
                 {
                     if (!TryDelete(path))
                     {
-                        moreRemaining = true;
+                        stopReason ??= "source_text_undeletable";
                         _log?.Invoke("Source text sweep could not delete a temporary blob.");
                     }
                     continue;
@@ -212,11 +218,17 @@ public sealed class SourceTextStore
                     continue;
                 if (TryParseBlobKey(name, out var key) && referencedKeys.Contains(key))
                     continue;
+                // The cap only counts when another orphan is found: a store with nothing left past it is finished.
+                if (deleted >= maxDeletes)
+                {
+                    stopReason ??= "source_text_cap";
+                    break;
+                }
                 if (TryDelete(path))
                     deleted++;
                 else
                 {
-                    moreRemaining = true;
+                    stopReason ??= "source_text_undeletable";
                     _log?.Invoke("Source text sweep could not delete an unreferenced blob.");
                 }
             }
@@ -224,10 +236,16 @@ public sealed class SourceTextStore
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             _log?.Invoke($"Source text sweep stopped early: {ex.Message}");
-            moreRemaining = true;
+            stopReason ??= "source_text_error";
         }
         return deleted;
     }
+
+    // Test seam: replaces the directory walk so a test can fail it part-way.
+    internal Func<string, IEnumerable<string>>? EnumerateOverride { get; set; }
+
+    private static IEnumerable<string> DefaultEnumerate(string root) =>
+        Directory.EnumerateFiles(root, "*", new EnumerationOptions { RecurseSubdirectories = true });
 
     // A blob's name is its 64-digit hex hash; any other name is not one Put wrote, so it is never referenced.
     private static bool TryParseBlobKey(string name, out UInt128 key)

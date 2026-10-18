@@ -68,11 +68,26 @@ public sealed record RetentionReport
     /// <summary>Pages an incremental vacuum handed back to the file system at the end of an executed pass (issue #252).</summary>
     public long PagesVacuumed { get; init; }
 
+    /// <summary>The pass stopped vacuuming with free pages still left (issue #329); vacuum is then progress that continues.</summary>
+    public bool VacuumLeft { get; init; }
+
     public long ReclaimedBytes { get; init; }
     /// <summary>Space estimates are unavailable on a read-only plan; execution measures reusable pages, not disk shrinkage.</summary>
     public bool ReclaimedBytesKnown { get; init; }
     public bool MoreRemaining { get; init; }
     public string? StopReason { get; init; }
+
+    /// <summary>
+    /// Tail steps an executed pass stepped over because one batch could not finish them even cut down (issue #329):
+    /// an API commit for the rest of the UTC day, a file-version span until the sweep wraps; one line each.
+    /// </summary>
+    public IReadOnlyList<string> TailSkipped { get; init; } = [];
+
+    /// <summary>
+    /// Which steps an executed service pass left work in (issue #329), e.g. <c>snapshots=0 api=0 files=cursor@120</c>;
+    /// null on a dry run and below the service.
+    /// </summary>
+    public string? LeftWork { get; init; }
 
     /// <summary>Write batches an executed pass ran (issue #303).</summary>
     public int Batches { get; init; }
@@ -189,6 +204,11 @@ public sealed class RetentionPlan
     internal void AdvanceRun() => _runCursor++;
     internal string? PeekCommit() => _commitCursor < _commits.Count ? _commits[_commitCursor] : null;
     internal void AdvanceCommit() => _commitCursor++;
+    /// <summary>What each step still has queued, for the pass log line (issue #329).</summary>
+    public string DescribeLeft() => string.Create(System.Globalization.CultureInfo.InvariantCulture,
+        $"snapshots={_snapshots.Count - _snapshotCursor} runs={_runs.Count - _runCursor} " +
+        $"api={(_apiStale ? "stale" : _commits.Count - _commitCursor)} files={(_fileVersionsDone ? "0" : $"cursor@{_filePosition}")}");
+
     internal bool HasWork => PeekSnapshot() != null || PeekRun() != null || (PeekCommit() != null && !_apiStale) || SweepPending;
 
     /// <summary>
@@ -200,6 +220,19 @@ public sealed class RetentionPlan
     /// <summary>The last <c>file_versions</c> id the orphan sweep has examined; the sweep resumes after it.</summary>
     internal long FileVersionCursor => _filePosition;
     internal bool FileVersionsDone => _fileVersionsDone;
+
+    /// <summary>The shared cursor, which also holds how far a tail step has been cut down today.</summary>
+    internal FileSweepCursor Tuning => _fileSweep;
+
+    // A span that cannot fit in one batch even at its smallest is stepped over up to its last existing id (so it is
+    // examined again when the sweep wraps); the position is published at once because the batch that skipped it rolled back.
+    internal void SkipFileSpan(long lastIdInSpan)
+    {
+        _filePosition = Math.Max(_filePosition, lastIdInSpan);
+        _sweepSpansLeft--;
+        _filePublishPending = true;
+        PublishFileSweep();
+    }
 
     /// <summary>The sweep has ids left and this pass's span allowance is not used up.</summary>
     internal bool SweepPending => !_fileVersionsDone && _sweepSpansLeft > 0;
@@ -275,6 +308,90 @@ public sealed class FileSweepCursor
             if (_position != expected) return false;
             _position = 0;
             return true;
+        }
+    }
+
+    // What a tail step that could not finish inside one batch has been cut down to (issue #329). Shared like the
+    // position, so the next batch and the next pass of the UTC day start from the smaller unit; ResetTuning ends the day.
+    internal const int MinSweepSpan = 64;
+    internal const int MinApiDeleteRows = 8;
+    private int _sweepSpan = RetentionService.FileSweepSpan;
+    private int _apiDeleteRows = RetentionService.BatchRowLimit;
+    private readonly HashSet<string> _skippedCommits = [];
+
+    internal int SweepSpan
+    {
+        get { lock (_gate) return _sweepSpan; }
+    }
+
+    internal int ApiDeleteRows
+    {
+        get { lock (_gate) return _apiDeleteRows; }
+    }
+
+    /// <summary>Halves the sweep span; false when it is already as small as it goes.</summary>
+    internal bool TryShrinkSweepSpan()
+    {
+        lock (_gate)
+        {
+            if (_sweepSpan <= MinSweepSpan) return false;
+            _sweepSpan = Math.Max(MinSweepSpan, _sweepSpan / 2);
+            _cleanTailBatches = 0;
+            return true;
+        }
+    }
+
+    /// <summary>Halves the rows one API delete removes; false when it is already as small as it goes.</summary>
+    internal bool TryShrinkApiDeleteRows()
+    {
+        lock (_gate)
+        {
+            if (_apiDeleteRows <= MinApiDeleteRows) return false;
+            _apiDeleteRows = Math.Max(MinApiDeleteRows, _apiDeleteRows / 2);
+            _cleanTailBatches = 0;
+            return true;
+        }
+    }
+
+    private const int CleanBatchesToGrow = 8;
+    private int _cleanTailBatches;
+
+    /// <summary>A tail batch that ran a step and committed; after enough of them a cut-down unit doubles back toward its default.</summary>
+    internal void NoteCleanTailBatch()
+    {
+        lock (_gate)
+        {
+            if (_sweepSpan >= RetentionService.FileSweepSpan && _apiDeleteRows >= RetentionService.BatchRowLimit)
+            {
+                _cleanTailBatches = 0;
+                return;
+            }
+            if (++_cleanTailBatches < CleanBatchesToGrow) return;
+            _cleanTailBatches = 0;
+            _sweepSpan = Math.Min(RetentionService.FileSweepSpan, _sweepSpan * 2);
+            _apiDeleteRows = Math.Min(RetentionService.BatchRowLimit, _apiDeleteRows * 2);
+        }
+    }
+
+    internal void SkipCommit(string commit)
+    {
+        lock (_gate) _skippedCommits.Add(commit);
+    }
+
+    internal bool IsCommitSkipped(string commit)
+    {
+        lock (_gate) return _skippedCommits.Contains(commit);
+    }
+
+    /// <summary>Forgets what a tail step was cut down to (the service calls it when the UTC day rolls over).</summary>
+    public void ResetTuning()
+    {
+        lock (_gate)
+        {
+            _sweepSpan = RetentionService.FileSweepSpan;
+            _apiDeleteRows = RetentionService.BatchRowLimit;
+            _skippedCommits.Clear();
+            _cleanTailBatches = 0;
         }
     }
 }
@@ -524,6 +641,9 @@ public sealed class RetentionService
         _budget = budget;
         var held = Stopwatch.StartNew();
         var mark = plan.Mark();
+        string? tailStep = null;
+        string? tailCommit = null;
+        var tailRan = false;
         try
         {
             budget.Check();
@@ -630,20 +750,30 @@ public sealed class RetentionService
                     var commit = plan.PeekCommit()!;
                     budget.Check();
                     plan.ApiTurn = false;
-                    if (protections.IsCommitProtected(commit))
+                    if (protections.IsCommitProtected(commit) || plan.Tuning.IsCommitSkipped(commit))
                         plan.AdvanceCommit();
                     else if (!IsOutsideApiKeepWindow(commit, plan))
                         plan.MarkApiStale();
                     else
                     {
-                        apiDeleted = DeleteApiCommits([commit]);
-                        if (apiDeleted < BatchRowLimit) plan.AdvanceCommit();
+                        tailStep = "api";
+                        tailCommit = commit;
+                        BeforeTailStep?.Invoke(tailStep);
+                        var rows = plan.Tuning.ApiDeleteRows;
+                        apiDeleted = DeleteApiCommits([commit], rows);
+                        tailStep = null;
+                        tailRan = true;
+                        if (apiDeleted < rows) plan.AdvanceCommit();
                     }
                 }
                 else if (sweepWork)
                 {
                     plan.ApiTurn = true;
+                    tailStep = "sweep";
+                    BeforeTailStep?.Invoke(tailStep);
                     fileDeleted = PruneOrphanFileVersions(plan, protections);
+                    tailStep = null;
+                    tailRan = true;
                 }
             }
             var reclaimed = Math.Max(0, ScalarLong("PRAGMA freelist_count;") - freeBefore) * pageSize;
@@ -652,6 +782,7 @@ public sealed class RetentionService
             budget.Check();
             Exec("COMMIT;");
             plan.PublishFileSweep();
+            if (tailRan) plan.Tuning.NoteCleanTailBatch();
             held.Stop();
             return plan.Report with
             {
@@ -668,6 +799,24 @@ public sealed class RetentionService
                 Batches = 1,
                 MaxBatchWriterHoldMs = held.Elapsed.TotalMilliseconds,
                 MoreRemaining = plan.HasWork || apiDeleted > 0
+            };
+        }
+        catch (Exception ex) when (tailStep != null && IsBudgetOrBusy(ex, budget) && ex is not UnitStartBudgetException &&
+            !cancellationToken.IsCancellationRequested && (timeLimit ?? BatchTimeLimit) >= BatchTimeLimit &&
+            ex is not SqliteException { SqliteErrorCode: 5 or 6 })
+        {
+            // A tail step that ran the batch's own limit rolled back with nothing done; retried as is it would do the
+            // same forever (issue #329). Cut it down and retry; at the smallest size step over it for the UTC day.
+            plan.Restore(mark);
+            held.Stop();
+            var skipped = ShrinkOrSkipTailStep(plan, tailStep, tailCommit);
+            return plan.Report with
+            {
+                DryRun = false,
+                Batches = 1,
+                MaxBatchWriterHoldMs = held.Elapsed.TotalMilliseconds,
+                MoreRemaining = true,
+                TailSkipped = skipped is null ? [] : [skipped]
             };
         }
         catch (Exception ex) when (IsBudgetOrBusy(ex, budget))
@@ -690,6 +839,48 @@ public sealed class RetentionService
         }
     }
 
+    // Halves the unit a tail step works on; at the smallest size it is stepped over for the rest of the UTC day.
+    // Returns the one log line for a skip, null for a shrink.
+    private string? ShrinkOrSkipTailStep(RetentionPlan plan, string step, string? commit)
+    {
+        if (step == "api" && commit != null)
+        {
+            if (plan.Tuning.TryShrinkApiDeleteRows()) return null;
+            plan.Tuning.SkipCommit(commit);
+            plan.AdvanceCommit();
+            return $"Retention rolled back the API-history delete of commit {commit}: it ran past {BatchTimeLimit.TotalSeconds}s even at {FileSweepCursor.MinApiDeleteRows} rows. It is skipped for the rest of the UTC day.";
+        }
+        if (plan.Tuning.TryShrinkSweepSpan()) return null;
+        var from = plan.FileVersionCursor;
+        var to = LastIdOfSpan(from, FileSweepCursor.MinSweepSpan);
+        if (to is null)
+        {
+            // Nothing is left after the cursor: the sweep is complete rather than stuck.
+            plan.AdvanceFileVersions(from, true);
+            plan.PublishFileSweep();
+            return null;
+        }
+        plan.SkipFileSpan(to.Value);
+        return $"Retention rolled back the file-version sweep: the {FileSweepCursor.MinSweepSpan} file_versions ids after id {from} (through id {to.Value}) ran past {BatchTimeLimit.TotalSeconds}s. They are skipped until the sweep wraps.";
+    }
+
+    // The id of the span-th existing file_versions row after the cursor (or the last one if fewer remain). The batch
+    // has timed out, so its transaction is ended and the progress handler lifted before this read.
+    private long? LastIdOfSpan(long after, int span)
+    {
+        if (SQLitePCL.raw.sqlite3_get_autocommit(_connection.Handle) == 0) Exec("ROLLBACK;");
+        SQLitePCL.raw.sqlite3_progress_handler(_connection.Handle, 0, null, null);
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "SELECT MAX(id) FROM (SELECT id FROM file_versions WHERE id > @after ORDER BY id LIMIT @span);";
+        cmd.Parameters.AddWithValue("@after", after);
+        cmd.Parameters.AddWithValue("@span", span);
+        var result = cmd.ExecuteScalar();
+        return result is null or DBNull ? null : Convert.ToInt64(result);
+    }
+
+    /// <summary>Test seam: runs inside a batch's transaction right before an API-delete or file-sweep tail step.</summary>
+    internal Action<string>? BeforeTailStep { get; set; }
+
     /// <summary>Run only under the service writer gate: blobs can precede their file_versions rows.</summary>
     public RetentionReport SweepSourceTexts(SourceTextStore texts, CancellationToken cancellationToken,
         TimeSpan timeLimit)
@@ -700,12 +891,12 @@ public sealed class RetentionService
             budget.Check();
             var keys = new FileStore(_connection).ReferencedSourceTextKeys();
             budget.Check();
-            var deleted = texts.DeleteUnreferenced(keys, BatchRowLimit, () => budget.ShouldStop, out var remaining);
+            var deleted = texts.DeleteUnreferenced(keys, BatchRowLimit, () => budget.ShouldStop, out var reason);
             cancellationToken.ThrowIfCancellationRequested();
+            // Every "more remaining" names why (issue #329), as the sweep itself saw it.
             return new RetentionReport
             {
-                DryRun = false, SourceTextsDeleted = deleted, MoreRemaining = remaining,
-                StopReason = budget.ShouldStop ? "time_budget" : null
+                DryRun = false, SourceTextsDeleted = deleted, MoreRemaining = reason != null, StopReason = reason
             };
         }
         catch (Exception ex) when (IsBudgetOrBusy(ex, budget))
@@ -737,6 +928,7 @@ public sealed class RetentionService
         FileVersionsDeleted = total.FileVersionsDeleted + batch.FileVersionsDeleted,
         ProjectChunkRowsDeleted = total.ProjectChunkRowsDeleted + batch.ProjectChunkRowsDeleted,
         PagesVacuumed = total.PagesVacuumed + batch.PagesVacuumed,
+        TailSkipped = total.TailSkipped.Concat(batch.TailSkipped).ToList(),
         ReclaimedBytes = total.ReclaimedBytes + batch.ReclaimedBytes,
         ReclaimedBytesKnown = total.ReclaimedBytesKnown || batch.ReclaimedBytesKnown,
         Batches = total.Batches + batch.Batches,
@@ -1115,7 +1307,7 @@ public sealed class RetentionService
         return true;
     }
 
-    private int DeleteApiCommits(List<string> commits)
+    private int DeleteApiCommits(List<string> commits, int rows)
     {
         var deleted = 0;
         foreach (var commit in commits)
@@ -1123,7 +1315,7 @@ public sealed class RetentionService
             using var cmd = _connection.CreateCommand();
             cmd.CommandText = "DELETE FROM api_surface_snapshots WHERE id IN (SELECT id FROM api_surface_snapshots WHERE git_commit = @c LIMIT @limit);";
             cmd.Parameters.AddWithValue("@c", commit);
-            cmd.Parameters.AddWithValue("@limit", BatchRowLimit);
+            cmd.Parameters.AddWithValue("@limit", rows);
             deleted += cmd.ExecuteNonQuery();
         }
         return deleted;
@@ -1439,6 +1631,7 @@ public sealed class RetentionService
     {
         var ids = new List<long>();
         var examined = 0;
+        var span = plan.Tuning.SweepSpan;
         var last = plan.FileVersionCursor;
         var capped = false;
         using (var cmd = _connection.CreateCommand())
@@ -1451,7 +1644,7 @@ public sealed class RetentionService
                 FROM (SELECT id FROM file_versions WHERE id > @after ORDER BY id LIMIT @span) fv;
                 """;
             cmd.Parameters.AddWithValue("@after", plan.FileVersionCursor);
-            cmd.Parameters.AddWithValue("@span", FileSweepSpan);
+            cmd.Parameters.AddWithValue("@span", span);
             using var reader = cmd.ExecuteReader();
             while (reader.Read())
             {
@@ -1475,7 +1668,7 @@ public sealed class RetentionService
             cmd.Parameters.AddWithValue("@ids", "[" + string.Join(",", chunk) + "]");
             deleted += cmd.ExecuteNonQuery();
         }
-        plan.AdvanceFileVersions(last, !capped && examined < FileSweepSpan);
+        plan.AdvanceFileVersions(last, !capped && examined < span);
         return deleted;
     }
 

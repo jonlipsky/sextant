@@ -84,6 +84,71 @@ public class RetentionProtectedSetEquivalenceTests
         Assert.IsTrue(report.SnapshotsSkipped >= 1);
     }
 
+    // Issue #329: candidates the batch re-verification rejects are dropped from the remaining work, so a catalog whose
+    // only candidates are protected settles in one batch instead of reporting "more remaining" every pass.
+    [TestMethod]
+    public void OnlyProtectedCandidates_SettleWithNoMoreRemaining_AndAreCounted()
+    {
+        var (_, candidate) = OldGenerationWithCandidate();
+        var service = new RetentionService(_conn, new RetentionPolicy { KeepCompleteGenerations = 0 });
+        var plan = service.CreatePlan();
+        Exec($"INSERT INTO branches (repository_id, name, snapshot_id, is_default, updated_at) VALUES (1, 'late', {candidate}, 0, {_now});");
+
+        var report = service.ExecuteBatch(plan);
+
+        Assert.AreEqual(0, report.SnapshotsDeleted);
+        Assert.IsTrue(report.SnapshotsSkipped >= 1);
+        Assert.IsFalse(report.MoreRemaining, "nothing is left once the protected candidate is dropped");
+        Assert.IsFalse(plan.HasWork);
+        Assert.AreEqual("snapshots=0 runs=0 api=0 files=0", plan.DescribeLeft());
+
+        var next = service.CreatePlan();
+        Assert.IsNull(next.PeekSnapshot(), "the next plan no longer lists it");
+    }
+
+    [TestMethod]
+    public void SweepSourceTexts_Converged_ReportsNoMoreRemainingAndNoReason()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"sextant_retsweep_{Guid.NewGuid():N}");
+        try
+        {
+            var report = new RetentionService(_conn, new RetentionPolicy())
+                .SweepSourceTexts(new SourceTextStore(root), CancellationToken.None, TimeSpan.FromSeconds(30));
+            Assert.IsFalse(report.MoreRemaining);
+            Assert.IsNull(report.StopReason);
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [TestMethod]
+    public void SweepSourceTexts_OrphansPastTheCap_NamesTheCap()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"sextant_retsweep_{Guid.NewGuid():N}");
+        try
+        {
+            var store = new SourceTextStore(root);
+            foreach (var i in Enumerable.Range(0, RetentionService.BatchRowLimit + 1))
+            {
+                var content = System.Text.Encoding.UTF8.GetBytes($"class Orphan{i} {{ }}");
+                store.Put(System.Security.Cryptography.SHA256.HashData(content), content);
+            }
+
+            var report = new RetentionService(_conn, new RetentionPolicy())
+                .SweepSourceTexts(store, CancellationToken.None, TimeSpan.FromSeconds(30));
+
+            Assert.IsTrue(report.MoreRemaining);
+            Assert.AreEqual("source_text_cap", report.StopReason);
+            Assert.AreEqual(RetentionService.BatchRowLimit, report.SourceTextsDeleted);
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+        }
+    }
+
     [TestMethod]
     public void EveryBatch_SkipsACandidate_ThatBecameThePendingBaseOfANewSnapshot()
     {
