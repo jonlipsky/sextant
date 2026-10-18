@@ -581,7 +581,9 @@ public sealed partial class SnapshotService
 
     internal SemaphoreSlim WriteGateForTesting => _writeGate;
 
-    private enum JobReclaim { Ran, Busy, Skipped }
+    internal Lock InFlightLockForTesting => _inFlightLock;
+
+    private enum JobReclaim { Ran, Busy, Skipped, Residual }
 
     // Issue #325: 1 while the last production's memory was returned (or was never worth returning); 0 from the moment
     // a production reaches its worker until a post-job reclaim ran or found the working set below the threshold. A
@@ -684,6 +686,41 @@ public sealed partial class SnapshotService
     internal TimeSpan MemoryReclaimBusyRetryDelay { get; set; } = TimeSpan.FromSeconds(15);
     internal int MemoryReclaimBusyRetries { get; set; } = 8;
 
+    // Issue #330: a reclaim whose collections still leave this much live managed heap ABOVE the baseline (the smallest
+    // heap a reclaim has left so far: the service's own steady state, which may legitimately exceed any fixed size) ran
+    // while something still held the job's state (a transient root); the freed regions would stay committed, so it
+    // runs again later, a bounded number of times. The first reclaim has no baseline yet and uses the margin alone;
+    // the baseline is the minimum (never an average) so a job-sized excess never raises it, and it is rebased to
+    // the observed heap when the retries are exhausted, so a legitimately grown heap stops triggering retries.
+    internal long MemoryReclaimResidualHeapBytes { get; set; } = 256L * 1024 * 1024;
+    private long _reclaimHeapBaseline = -1;
+    private long _lastReclaimHeapAfter;
+
+    private bool IsResidualHeap(long heapAfter)
+    {
+        lock (_memoryDebtLock)
+        {
+            var baseline = Math.Max(_reclaimHeapBaseline, 0);
+            var residual = heapAfter > baseline + MemoryReclaimResidualHeapBytes;
+            if (heapAfter > 0 && (_reclaimHeapBaseline < 0 || heapAfter < _reclaimHeapBaseline))
+                _reclaimHeapBaseline = heapAfter;
+            return residual;
+        }
+    }
+
+    private void RebaseReclaimHeap(long heapAfter)
+    {
+        lock (_memoryDebtLock)
+            _reclaimHeapBaseline = heapAfter;
+    }
+
+    internal long ReclaimHeapBaselineForTesting
+    {
+        get { lock (_memoryDebtLock) return _reclaimHeapBaseline; }
+    }
+    internal TimeSpan MemoryReclaimResidualRetryDelay { get; set; } = TimeSpan.FromSeconds(15);
+    internal int MemoryReclaimResidualRetries { get; set; } = 4;
+
     internal long MemoryReclaimMinWorkingSetBytes { get; set; } = JobMemoryReclaimer.MinWorkingSetBytes;
     internal Func<long> WorkingSetProbe { get; set; } = static () => Environment.WorkingSet;
     internal Func<JobMemoryReclaimer.Result> MemoryReclaimAction { get; set; } = JobMemoryReclaimer.Reclaim;
@@ -705,6 +742,7 @@ public sealed partial class SnapshotService
                 {
                     await production.ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
                     await Task.Yield();
+                    var residualRetries = 0;
                     for (var attempt = 0; ; attempt++)
                     {
                         // A newer production's reclaim supersedes this one, so a burst never queues two.
@@ -714,6 +752,19 @@ public sealed partial class SnapshotService
                             return;
                         }
                         var outcome = TryReclaimOnce(jobId);
+                        if (outcome == JobReclaim.Residual)
+                        {
+                            if (residualRetries++ >= MemoryReclaimResidualRetries)
+                            {
+                                RebaseReclaimHeap(Interlocked.Read(ref _lastReclaimHeapAfter));
+                                RecordReclaimSkipped(jobId, MemoryReclaimSkipReasons.Deferred,
+                                    "the managed heap is still large after the reclaim; the next job reclaims before it starts", MemoryReclaimPhases.PostJob);
+                                return;
+                            }
+                            attempt = -1;
+                            await Task.Delay(MemoryReclaimResidualRetryDelay, _timeProvider, _lifetime.Token).ConfigureAwait(false);
+                            continue;
+                        }
                         if (outcome != JobReclaim.Busy)
                             return;
                         if (attempt >= MemoryReclaimBusyRetries)
@@ -744,7 +795,7 @@ public sealed partial class SnapshotService
     }
 
     // True when the reclaim ran. Never throws.
-    internal bool TryReclaimJobMemory(long jobId) => TryReclaimOnce(jobId) == JobReclaim.Ran;
+    internal bool TryReclaimJobMemory(long jobId) => TryReclaimOnce(jobId) is JobReclaim.Ran or JobReclaim.Residual;
 
     private JobReclaim TryReclaimOnce(long jobId)
     {
@@ -768,12 +819,17 @@ public sealed partial class SnapshotService
                 if (state != JobReclaim.Ran)
                     return state;
                 var r = MemoryReclaimAction();
-                MarkJobMemoryClean(generation);
+                var residual = IsResidualHeap(r.HeapAfter);
+                Interlocked.Exchange(ref _lastReclaimHeapAfter, r.HeapAfter);
+                // A residual heap means the memory was not returned: the debt stays, so the next job reclaims first.
+                if (!residual)
+                    MarkJobMemoryClean(generation);
                 _metrics.RecordMemoryReclaimRun(MemoryReclaimPhases.PostJob);
                 MemoryReclaimLog($"Job {jobId}: memory reclaimed in {r.Elapsed.TotalMilliseconds:F0} ms " +
                     $"(working set {r.WorkingSetBefore / (1024 * 1024)} -> {r.WorkingSetAfter / (1024 * 1024)} MiB, " +
-                    $"managed heap {r.HeapAfter / (1024 * 1024)} MiB; {r.PhaseSummary}).");
-                return JobReclaim.Ran;
+                    $"managed heap {r.HeapAfter / (1024 * 1024)} MiB; {r.PhaseSummary})" +
+                    (residual ? "; the heap is still large, retrying later." : "."));
+                return residual ? JobReclaim.Residual : JobReclaim.Ran;
             }
             finally
             {

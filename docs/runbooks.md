@@ -90,7 +90,9 @@ The container limit (7 GiB in production) covers the service process **and** its
   `memory reclaim skipped (<reason>)` lines (the per-phase timings in the reclaimed line show which of gen2 gc,
   finalizers, aggressive gc or malloc_trim took the time) and the `sextant_memory_reclaims_*{phase=post_job|pre_job}`
   counters; a rising `deferred` count
-  just means bursts (the next job made it up), while a service RSS of GiBs at the start of a restore with no
+  just means bursts or a heap that stayed large after the reclaim (the next job made it up; a post-job reclaim whose
+  managed heap stays more than 256 MiB above the service's baseline is retried every 15 s, up to 4 times, see
+  `docs/service.md` "Off-worker-stack continuation and the residual retry"), while a service RSS of GiBs at the start of a restore with no
   start-of-job line means the working set was under the threshold or the reclaim could not run.
 - **Restore nodes:** each MSBuild worker of a restore adds ~200-240 MB. `SEXTANT_SERVICE_RESTORE_MAX_NODES` (default
   2) caps them for every restore invocation; raise it only if restores are time-bound and memory is spare. The
