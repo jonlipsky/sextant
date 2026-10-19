@@ -14,6 +14,9 @@ namespace Sextant.Service.Observability;
 /// </summary>
 public static class PrometheusExposition
 {
+    private static readonly string[] MaintenanceDeferralSteps =
+        ["idle_branch_retire", "retired_head_prune", "repository_reclaim", "reclaim_audit", "scheduled_retention"];
+
     public static string Render(MetricsSnapshot s)
     {
         var sb = new StringBuilder();
@@ -90,6 +93,8 @@ public static class PrometheusExposition
         Gauge(sb, "sextant_maintenance_failures", "Maintenance ticks that failed since start.", s.Maintenance.Failures);
         Gauge(sb, "sextant_idle_branches_retired_total", "Idle non-default branch pointers retired since start.",
             s.Maintenance.IdleBranchesRetiredTotal);
+        Gauge(sb, "sextant_idle_branch_retires_skipped_total", "Idle-branch retirements that applied but retired nothing since start.",
+            s.Maintenance.IdleBranchRetiresSkippedTotal);
         Gauge(sb, "sextant_idle_branches_retired_last_pass", "Idle branch pointers retired by the latest pass.",
             s.Maintenance.LastIdleBranchesRetired);
         Gauge(sb, "sextant_repositories_reclaimed_total", "Inactive repositories whose checkout and caches were deleted since start.",
@@ -118,8 +123,19 @@ public static class PrometheusExposition
                         .ToString(CultureInfo.InvariantCulture)).Append('\n');
         Gauge(sb, "sextant_scheduled_retention_runs", "Scheduled retention passes run since start.",
             s.Maintenance.ScheduledRetentionRuns);
-        Gauge(sb, "sextant_scheduled_retention_skipped_busy", "Due scheduled retention passes skipped while indexing held the writer.",
+        Gauge(sb, "sextant_scheduled_retention_skipped_busy", "Always 0 since issue 333 (kept for dashboards): a due pass waits for its priority turn instead of skipping.",
             s.Maintenance.ScheduledRetentionSkippedBusy);
+        Counter(sb, "sextant_maintenance_writer_turns_total", "Maintenance writes that took a priority turn on the writer gate.",
+            s.Maintenance.MaintenanceWriterTurns);
+        Counter(sb, "sextant_maintenance_writer_wait_ms_total", "Milliseconds maintenance writes waited for their priority turn.",
+            s.Maintenance.MaintenanceWriterWaitMsTotal);
+        Gauge(sb, "sextant_maintenance_writer_wait_ms_max", "Longest wait of a maintenance write for its priority turn (ms).",
+            s.Maintenance.MaintenanceWriterWaitMsMax);
+        sb.Append("# HELP sextant_maintenance_deferrals_total Maintenance steps deferred to the next tick because the writer was not available in time, by step.\n");
+        sb.Append("# TYPE sextant_maintenance_deferrals_total counter\n");
+        foreach (var step in MaintenanceDeferralSteps)
+            sb.Append("sextant_maintenance_deferrals_total{step=\"").Append(step).Append("\"} ")
+                .Append(s.Maintenance.MaintenanceDeferrals.GetValueOrDefault(step).ToString(CultureInfo.InvariantCulture)).Append('\n');
         Counter(sb, "sextant_retention_audit_skipped_total", "Executed retention passes whose closing audit row was skipped.",
             s.Maintenance.RetentionAuditSkipped);
         Gauge(sb, "sextant_scheduled_retention_last_duration_ms", "Duration of the latest scheduled retention pass (ms).",

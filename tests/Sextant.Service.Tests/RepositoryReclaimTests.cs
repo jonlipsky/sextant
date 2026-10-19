@@ -312,7 +312,7 @@ public class RepositoryReclaimTests
     }
 
     [TestMethod]
-    public async Task TheTick_RecordsNoReclaimMetrics_WhenDisabled_OrIndexingHoldsTheWriter()
+    public async Task TheTick_RecordsNoReclaimMetrics_WhenDisabled_OrTheWriterIsNotAvailableInTime()
     {
         await using (var h = Harness.Create(Policy() with { RepositoryReclaimDays = 0 }))
         {
@@ -320,12 +320,22 @@ public class RepositoryReclaimTests
             await h.Service.RunMaintenanceTickAsync();
             Assert.AreEqual(0, h.Service.CollectMetrics().Maintenance.LastReclaimPassAtUnixMs);
         }
-        await using (var h = Harness.Create(Policy(), gatedWorker: true))
+        await using (var h = Harness.Create(Policy() with { ScheduledRetention = false }, gatedWorker: true))
         {
+            h.PublishWithoutBranch(Repo, "c1");
+            h.Populate(Repo);
             h.Start();
             var blocker = h.Service.EnsureSnapshotAsync(new EnsureSnapshotRequest { RepositoryRemoteUrl = OtherRepo, CommitSha = "b-1" });
             await WaitUntilAsync(() => h.Worker.Calls == 1);
-            var tick = await h.Service.RunMaintenanceTickAsync();
+            var ticking = h.Service.RunMaintenanceTickAsync();
+            // Each gated tick step waits for its own priority turn, so advance past the bound until the tick ends.
+            while (!ticking.IsCompleted)
+            {
+                if (h.Service.WriteGateForTesting.PriorityWaiters > 0)
+                    h.Clock.Advance(h.Service.MaintenanceStepLimitForTesting + TimeSpan.FromSeconds(1));
+                await Task.Delay(10);
+            }
+            var tick = await ticking;
             Assert.IsTrue(tick.RepositoryReclaim!.Busy);
             Assert.AreEqual(0, h.Service.CollectMetrics().Maintenance.LastReclaimPassAtUnixMs);
             h.Worker.Gate.TrySetResult();
@@ -367,7 +377,7 @@ public class RepositoryReclaimTests
     }
 
     [TestMethod]
-    public async Task ReclaimWaitsForNothing_WhenIndexingHoldsTheWriter()
+    public async Task ReclaimIsDeferredAfterTheStepBound_WhenIndexingHoldsTheWriter()
     {
         await using var h = Harness.Create(Policy(), gatedWorker: true);
         h.PublishWithoutBranch(Repo, "c1");
@@ -376,9 +386,14 @@ public class RepositoryReclaimTests
         var blocker = h.Service.EnsureSnapshotAsync(new EnsureSnapshotRequest { RepositoryRemoteUrl = OtherRepo, CommitSha = "b-1" });
         await WaitUntilAsync(() => h.Worker.Calls == 1);
 
-        var report = await h.Service.ReclaimInactiveRepositoriesAsync();
+        var pass = h.Service.ReclaimInactiveRepositoriesAsync();
+        await WaitUntilAsync(() => h.Service.WriteGateForTesting.PriorityWaiters == 1);
+        Assert.IsFalse(pass.IsCompleted, "it waits for its priority turn within the bound");
+        h.Clock.Advance(h.Service.MaintenanceStepLimitForTesting + TimeSpan.FromSeconds(1));
+        var report = await pass;
 
         Assert.IsTrue(report.Busy);
+        Assert.AreEqual(1, h.Service.CollectMetrics().Maintenance.MaintenanceDeferrals["repository_reclaim"]);
         Assert.IsTrue(Directory.Exists(dirs.Checkout));
         h.Worker.Gate.TrySetResult();
         await blocker;
@@ -411,6 +426,25 @@ public class RepositoryReclaimTests
         Assert.AreEqual(AuditLogStore.HashActor("reclaim_policy"), audit[0].Actor);
         Assert.AreEqual(tick.RepositoryReclaim.BytesFreed, audit[0].CostBytes);
         StringAssert.StartsWith(audit[0].Detail, "reclaimed;checkout,git_object_store,package_folder;source=reclaim_policy");
+    }
+
+    [TestMethod]
+    public async Task TheReclaimAuditRow_IsWritten_EvenWhenTheTickDeadlineIsSpent()
+    {
+        await using var h = Harness.Create(Policy());
+        h.PublishWithoutBranch(Repo, "c1");
+        h.Populate(Repo);
+        h.Start();
+        h.Service.BeforeReclaimAudit = () =>
+        {
+            h.Clock.Advance(h.Service.MaintenanceStepLimitForTesting + TimeSpan.FromSeconds(1));
+            return Task.CompletedTask;
+        };
+
+        var tick = await h.Service.RunMaintenanceTickAsync();
+
+        Assert.AreEqual(1, tick.RepositoryReclaim!.Reclaimed);
+        Assert.AreEqual(1, h.Service.RecentAudit(action: AuditAction.Reclaim).Count, "the audit has its own bound");
     }
 
     [TestMethod]

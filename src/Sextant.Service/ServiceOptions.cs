@@ -485,7 +485,8 @@ public sealed record ServiceOptions
                 Env("MAINTENANCE_INTERVAL_MINUTES"), Env("BRANCH_IDLE_RETIRE_DAYS"),
                 Env("BRANCH_IDLE_RETIRE_MAX_PER_PASS"), EnvBool("RETENTION_SCHEDULE"),
                 Env("RETENTION_SCHEDULE_HOUR_UTC"), Env("RETENTION_PASS_SECONDS"),
-                Env("REPOSITORY_RECLAIM_DAYS"), Env("REPOSITORY_RECLAIM_MAX_PER_PASS")),
+                Env("REPOSITORY_RECLAIM_DAYS"), Env("REPOSITORY_RECLAIM_MAX_PER_PASS"),
+                Env("RETENTION_BURST_SECONDS"), Env("RETENTION_CONTINUE_MINUTES"), Env("MAINTENANCE_TICK_DEADLINE_SECONDS")),
             // Fold the node's own profile hash into request identities by default, so an ensure request that
             // omits ConfigHash resolves to the SAME identity_hash the local worker's orchestrator publishes
             // under (IndexProfileDescriptor.ConfigurationHash) — without it the idempotency lookup misses.
@@ -636,7 +637,8 @@ public sealed record ServiceOptions
     /// </summary>
     internal static MaintenancePolicy ParseMaintenance(
         string? intervalMinutes, string? idleDays, string? maxPerPass, bool? scheduledRetention, string? retentionHourUtc,
-        string? retentionPassSeconds = null, string? repositoryReclaimDays = null, string? repositoryReclaimMaxPerPass = null) => new()
+        string? retentionPassSeconds = null, string? repositoryReclaimDays = null, string? repositoryReclaimMaxPerPass = null,
+        string? retentionBurstSeconds = null, string? retentionContinueMinutes = null, string? tickDeadlineSeconds = null) => new()
         {
             Interval = TimeSpan.FromMinutes(int.TryParse(intervalMinutes, out var minutes) && minutes >= 0
                 ? Math.Min(minutes, MaintenancePolicy.MaxIntervalMinutes) : MaintenancePolicy.DefaultIntervalMinutes),
@@ -652,7 +654,13 @@ public sealed record ServiceOptions
             RepositoryReclaimDays = int.TryParse(repositoryReclaimDays, out var reclaimDays) && reclaimDays >= 0
                 ? Math.Min(reclaimDays, MaintenancePolicy.MaxRepositoryReclaimDays) : MaintenancePolicy.DefaultRepositoryReclaimDays,
             RepositoryReclaimMaxPerPass = int.TryParse(repositoryReclaimMaxPerPass, out var reclaimCap) && reclaimCap > 0
-                ? Math.Min(reclaimCap, MaintenancePolicy.MaxRepositoryReclaimMaxPerPass) : MaintenancePolicy.DefaultRepositoryReclaimMaxPerPass
+                ? Math.Min(reclaimCap, MaintenancePolicy.MaxRepositoryReclaimMaxPerPass) : MaintenancePolicy.DefaultRepositoryReclaimMaxPerPass,
+            RetentionBurstSeconds = int.TryParse(retentionBurstSeconds, out var burst) && burst >= 0
+                ? Math.Min(burst, MaintenancePolicy.MaxRetentionBurstSeconds) : MaintenancePolicy.DefaultRetentionBurstSeconds,
+            RetentionContinueMinutes = int.TryParse(retentionContinueMinutes, out var cont) && cont >= 0
+                ? Math.Min(cont, MaintenancePolicy.MaxRetentionContinueMinutes) : MaintenancePolicy.DefaultRetentionContinueMinutes,
+            TickDeadlineSeconds = int.TryParse(tickDeadlineSeconds, out var deadline) && deadline > 0
+                ? Math.Min(deadline, MaintenancePolicy.MaxTickDeadlineSeconds) : MaintenancePolicy.DefaultTickDeadlineSeconds
         };
 
     internal static RetentionPolicy WithUnitMaxForTesting(RetentionPolicy policy) =>

@@ -103,7 +103,10 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_RETENTION_SCHEDULE` | Run the bounded retention pass once a day from the maintenance loop (issue #299). A malformed boolean **fails startup** | `true` |
 | `SEXTANT_SERVICE_RETENTION_SCHEDULE_HOUR_UTC` | The UTC hour (`0`–`23`) from which the day's scheduled retention runs: the first tick at or after it runs the pass, once per UTC day. Any other value uses the default | `3` |
 | `SEXTANT_SERVICE_RETENTION_UNIT_MAX_SECONDS` | Hard cap on one retention deletion unit (a snapshot project cascade). A unit over it is rolled back, reported as oversized and retried on a later pass (issue #303). `0` or less and invalid values use the default; larger values are capped at `600` | `60` |
-| `SEXTANT_SERVICE_RETENTION_PASS_SECONDS` | Work budget of the scheduled retention pass, and the ceiling for `?seconds=` on `POST /control/retention` (issue #303). Clamped to `3600`; a non-numeric or non-positive value uses the default | `600` |
+| `SEXTANT_SERVICE_RETENTION_PASS_SECONDS` | Work budget of the scheduled retention pass, and the ceiling for `?seconds=` on `POST /control/retention` (issue #303). The scheduled pass spends it only while it holds the writer (issue #333). Clamped to `3600`; a non-numeric or non-positive value uses the default | `600` |
+| `SEXTANT_SERVICE_RETENTION_BURST_SECONDS` | How long the scheduled retention pass keeps the writer in one priority turn, running batches back to back (issue #333). A waiting production is delayed by at most this plus one batch. `0` releases after every batch. Clamped to `3600`; a non-numeric or negative value uses the default | `120` |
+| `SEXTANT_SERVICE_RETENTION_CONTINUE_MINUTES` | Delay before the maintenance loop ticks again after a scheduled pass ended with work left and made progress. `0` waits for the next interval tick. Clamped to `1440` | `5` |
+| `SEXTANT_SERVICE_MAINTENANCE_TICK_DEADLINE_SECONDS` | One deadline shared by every step of a maintenance tick; each step waits for the writer for what is left of it. Clamped to `86400`; a non-numeric or non-positive value uses the default | `900` |
 | `SEXTANT_SERVICE_PEERS` | Comma-separated peer base URLs for federation | none |
 | `SEXTANT_SERVICE_REMOTE_TIMEOUT_SECONDS` | Per-request remote-fetch timeout | `10` |
 | `SEXTANT_SERVICE_CONTRIB_REQUIRE_AUTH` | Require contribution authorization (Phase 16) | `false` (dev-open) |
@@ -2240,8 +2243,8 @@ their snapshots forever. A service-owned loop cleans them up.
   reclaimed only for a delete that succeeded. A failure on one repository is logged and counted
   (`repository_reclaim_failures_total`) and the loop carries on, and a leftover `.reclaiming-*` is retried by the
   next pass's sweep. A repository refused by a path guard is logged at most once per UTC day and does not count
-  against the per-pass cap. The pass metrics are recorded only when the rule is enabled and the pass ran (not
-  while indexing holds the writer).
+  against the per-pass cap. The pass metrics are recorded only when the rule is enabled and the pass ran or
+  reclaimed something (a pass whose writer turn was deferred records a `repository_reclaim` deferral instead).
   **Any branch row keeps a repository.** A repository that still has a branch pointer (for example a watched
   default branch, which the idle rule never retires) is never reclaimed, however quiet: reclaiming it would only
   force a cold re-clone and re-restore on its next push. Only a repository whose branches are all gone is
@@ -2252,12 +2255,48 @@ their snapshots forever. A service-owned loop cleans them up.
   `SEXTANT_SERVICE_RETENTION_SCHEDULE_HOUR_UTC` (default 3) each UTC day runs the same bounded
   `execute=true` pass as `POST /control/retention?execute=true`. The audit actor is `retention_schedule` and the
   detail is `execute_batch;source=retention_schedule`. It runs at most once per UTC day, and a restart reads
-  today's `retention` rows from the audit log, so it does not run twice. While indexing holds the writer (a
-  production is in flight, or a write is waiting for its turn), the due pass **does not start and is retried on
-  the next tick** (`maintenance.scheduled_retention_skipped_busy`). Once it has started, a production admitted
-  meanwhile waits at most one bounded batch (2 s) for its turn, exactly as behind a manual pass.
+  today's `retention` rows from the audit log, so it does not run twice. **Issue #333:** a busy writer no longer
+  skips the pass. Its writer turns (plan, each batch, the audit row) take the gate's **priority lane**, so the pass
+  runs on the tick even under continuous indexing; the whole pass is bounded by its budget
+  (`SEXTANT_SERVICE_RETENTION_PASS_SECONDS`), and a pass that never got a turn is counted as a
+  `scheduled_retention` deferral (stop reason `starved`) and retried on the next tick. A production admitted
+  meanwhile waits for the current priority hold: at most the burst B plus one unit of work (a unit is capped at 60 s),
+  so a waiting production can be delayed by up to about 3 min.
   `SEXTANT_SERVICE_RETENTION_SCHEDULE=false` turns it off. Like a manual pass, it never runs `VACUUM` (#252).
   Compaction stays an offline operator action.
+- **Writer gate: priority lane for maintenance (#333).** The single-writer gate has two lanes. Productions,
+  registrations and request-thread writes keep FIFO order among themselves. Maintenance writes (the idle-branch
+  retire, the retired-head prune, repository reclaim's catalog writes and audit, and the scheduled retention
+  turns) take the **next turn after the current holder**, ahead of every queued production. Starvation the
+  other way is bounded: a retire or reclaim turn is short, and once the priority lane has held the gate for 30 s
+  while a production waits, the next turn goes to that production.
+  **Scheduled retention holds a burst (#333 round 2).** A turn per batch (2 s) gave retention ~0.5% of the writer,
+  because the priority lane was empty whenever the gate was released and the next production (5-10 min) won. The
+  scheduled pass now runs its batches (snapshot units, tail, vacuum steps) in a loop inside ONE priority hold, each
+  batch still committing and rolling back on its own, and releases at `SEXTANT_SERVICE_RETENTION_BURST_SECONDS`
+  (default 120; `0` = release after every batch, the old behaviour) or when the pass is done, then queues again.
+  Expect about B of retention per production turn (~22% of the writer for 420 s productions while a backlog
+  exists) and an **indexing delay of at most B plus one unit of work (cap 60 s)**, about 3 min, for a waiting production.
+  Before #333 the gate was FIFO, so a retire queued behind every earlier ensure and one waited ~2.1 h with the
+  whole maintenance loop blocked behind it.
+- **The pass budget counts writer-held time.** `SEXTANT_SERVICE_RETENTION_PASS_SECONDS` is spent only while the
+  pass holds the writer, never while it waits for a turn. A pass that ends `more_remaining` after making progress
+  is continued after `SEXTANT_SERVICE_RETENTION_CONTINUE_MINUTES` (default 5; `0` = wait for the next interval tick)
+  instead of the hourly tick; the no-progress caps still apply. The continuation waits at least as long as the previous
+  pass took (never less than the continue interval) and is capped at 100 continuation ticks per UTC day; after that the
+  pass continues on the interval ticks. A pass that never got the writer before the tick deadline (zero batches, stop
+  reason `starved`, e.g. productions longer than the deadline) keeps the day open and does **not** count toward the
+  no-progress cap; only the UTC day bounds it, so retention runs once the writer frees. The audit row of a completed
+  reclaim has its own 5 s writer wait, independent of the tick deadline.
+  An idle-branch retire is answered `branch_busy` while a branch-advance ensure of the same repository and branch is
+  admitted, since the priority lane could otherwise run it before that earlier ensure.
+- **Every maintenance tick has one deadline.** All steps share `SEXTANT_SERVICE_MAINTENANCE_TICK_DEADLINE_SECONDS`
+  (default 900, clamped to 86400); each step waits for the writer for what is left of it, so the loop never blocks
+  longer than that. A step that cannot get its turn in time is **deferred to the next tick** with one log line
+  (`maintenance: <step> deferred ...`) and the later steps still run. A deferred retire stays queued as a
+  service-owned write and still applies its own guards (CAS, default, pending work) when its turn comes; it is
+  counted (`idle_branches_retired_total` / `idle_branch_retires_skipped_total`) when it applies, and the next tick
+  leaves a branch with a queued retire out of its candidates, so the queue never grows duplicates.
 - **Observability.** Each tick logs one line for the idle-branch pass (retired / idle / busy / attempted /
   skipped, duration), one for the reclaim pass (repositories, bytes freed, inactive, skipped, failed, duration)
   and one for a scheduled retention pass (deleted snapshots, file versions and source texts,
@@ -2265,8 +2304,12 @@ their snapshots forever. A service-owned loop cleans them up.
   `idle_branches_retired_total`, `last_idle_branches_retired`, `last_idle_pass_at_unix_ms`,
   `last_idle_pass_duration_ms`, `repositories_reclaimed_total`, `repository_bytes_reclaimed_total`,
   `repository_reclaim_failures_total`, `last_repositories_reclaimed`, `last_repository_bytes_reclaimed`,
-  `last_reclaim_pass_at_unix_ms`, `last_reclaim_pass_duration_ms`, `scheduled_retention_runs`, `scheduled_retention_skipped_busy` and the latest
-  scheduled pass (`last_scheduled_retention_*`). The Prometheus text adds the `sextant_maintenance_*`,
+  `last_reclaim_pass_at_unix_ms`, `last_reclaim_pass_duration_ms`, `scheduled_retention_runs`,
+  `scheduled_retention_skipped_busy` (always 0 since #333, kept for dashboards), `maintenance_writer_turns`,
+  `maintenance_writer_wait_ms_total`, `maintenance_writer_wait_ms_max`, `maintenance_deferrals` (per step) and the latest
+  scheduled pass (`last_scheduled_retention_*`). The Prometheus text adds the `sextant_maintenance_*`
+  (including `sextant_maintenance_writer_turns_total`, `sextant_maintenance_writer_wait_ms_total`,
+  `sextant_maintenance_writer_wait_ms_max` and `sextant_maintenance_deferrals_total{step=...}`),
   `sextant_idle_branches_retired_*`, `sextant_repositories_reclaimed_total`,
   `sextant_repository_bytes_reclaimed_total`, `sextant_repository_reclaim_failures_total` and `sextant_scheduled_retention_*` gauges. The counters are per service
   instance. The startup log prints the effective policy.
@@ -2371,7 +2414,7 @@ A pinned reader can still grow the WAL.
 transaction is bounded (a batch, a project chunk, a vacuum step) and the writer is released between them, so indexing
 publishes interleave. The maintenance loop runs the scheduled pass once per UTC day from
 `SEXTANT_SERVICE_RETENTION_SCHEDULE_HOUR_UTC`; a pass that stops with `more_remaining` after making progress (rows deleted,
-chunk rows deleted or pages vacuumed) stays due, so the hourly maintenance tick continues it until a pass finishes or
+chunk rows deleted or pages vacuumed) stays due and is continued after `SEXTANT_SERVICE_RETENTION_CONTINUE_MINUTES` (default 5), until a pass finishes or
 makes no progress. Repeated bounded passes converge to the same state as one unbounded pass.
 
 Branch pointers, open PRs, pending retry snapshots, and their transitive overlay/provider closure are

@@ -216,9 +216,23 @@ Snapshots with a legacy abandoned/NULL retry-generation pointer are deliberately
 ownership can be established; this release neither migrates nor repairs them. All branch heads, pending
 retries, open PR roots, and required providers/bases remain protected.
 
-**Scheduling.** The service's maintenance loop runs one bounded pass a day and continues an unfinished one on the
-hourly tick (see [Bounded retention contract](service.md#bounded-retention-contract-127--252)). Each pass and each
-transaction is bounded and the writer is released between batches, chunks and vacuum steps.
+**Scheduling.** The service's maintenance loop runs one bounded pass a day and continues an unfinished one that made
+progress after `SEXTANT_SERVICE_RETENTION_CONTINUE_MINUTES` (default 5; see [Bounded retention contract](service.md#bounded-retention-contract-127--252)).
+Each batch is its own transaction; the pass holds the writer in a burst of `SEXTANT_SERVICE_RETENTION_BURST_SECONDS`
+(default 120) per turn and spends `SEXTANT_SERVICE_RETENTION_PASS_SECONDS` only while holding it. Expect a waiting
+production to be delayed by at most the burst plus one batch (~2 s).
+
+**Maintenance deferrals (#333).** Maintenance writes (idle-branch retire, retired-head prune, repository reclaim,
+scheduled retention) take a priority lane on the writer gate, so continuous indexing cannot starve them. Watch
+`sextant_maintenance_writer_wait_ms_max` / `sextant_maintenance_writer_wait_ms_total` /
+`sextant_maintenance_writer_turns_total` (how long maintenance waited for the writer) and
+`sextant_maintenance_deferrals_total{step=idle_branch_retire|retired_head_prune|repository_reclaim|reclaim_audit|scheduled_retention}`.
+A deferral means a step could not get the writer before the tick's shared deadline
+(`SEXTANT_SERVICE_MAINTENANCE_TICK_DEADLINE_SECONDS`, default 900; one log line
+`maintenance: <step> deferred`); it is retried on the next tick and later steps still ran. An occasional
+deferral is normal under a long production; a rising counter or a wait near the bound means productions hold the
+writer for minutes at a time (look at `sextant_job_*` durations and the stuck-indexing runbook).
+`sextant_scheduled_retention_skipped_busy` is always 0 now.
 
 ---
 
