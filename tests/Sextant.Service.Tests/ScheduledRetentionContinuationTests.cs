@@ -37,7 +37,14 @@ public class ScheduledRetentionContinuationTests
     [TestMethod]
     public void PassWithWorkLeftButNoProgress_IsNotRetriedEveryTick()
     {
-        var report = new RetentionReport { DryRun = false, MoreRemaining = true, StopReason = "time_budget" };
+        var report = new RetentionReport { DryRun = false, MoreRemaining = true, StopReason = "time_budget", Batches = 2 };
         Assert.IsFalse(SnapshotService.ScheduledRetentionContinues(report));
+    }
+
+    [TestMethod]
+    public void PassThatNeverGotTheWriter_StaysDue()
+    {
+        var starved = new RetentionReport { DryRun = false, MoreRemaining = true, StopReason = "time_budget", Batches = 0 };
+        Assert.IsTrue(SnapshotService.ScheduledRetentionContinues(starved));
     }
 }

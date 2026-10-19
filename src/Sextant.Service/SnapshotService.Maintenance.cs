@@ -28,6 +28,9 @@ public sealed record IdleBranchRetireReport
     /// <summary>Submitted retirements that did not apply (the pointer moved, work appeared, or the branch went away).</summary>
     public int Skipped { get; init; }
 
+    /// <summary>Submitted retirements still waiting for the writer when the step's bound passed (issue #333); they apply when their turn comes.</summary>
+    public int Deferred { get; init; }
+
     public double DurationMs { get; init; }
 }
 
@@ -37,7 +40,7 @@ public sealed record RepositoryReclaimReport
     /// <summary>False when the rule is disabled (<see cref="MaintenancePolicy.RepositoryReclaimDays"/> is 0).</summary>
     public required bool Enabled { get; init; }
 
-    /// <summary>True when indexing held the writer, so the pass did not run (retried next tick).</summary>
+    /// <summary>True when the pass could not get the writer within <see cref="MaintenanceStepLimit"/>, so it stopped (retried next tick).</summary>
     public bool Busy { get; init; }
 
     /// <summary>Inactive repositories found, before the on-disk filter and the per-pass cap.</summary>
@@ -65,7 +68,8 @@ public sealed record MaintenanceTickReport
 
     /// <summary>
     /// What happened to scheduled retention this tick: <c>disabled</c>, <c>not_due</c> (before the hour, or already run
-    /// today), <c>busy</c> (due, but indexing holds the writer: retried next tick), or <c>ran</c>.
+    /// today), or <c>ran</c>. A due pass no longer skips while indexing holds the writer (issue #333): it waits for its
+    /// priority turn inside its pass budget and continues next tick if the budget ran out.
     /// </summary>
     public required string Retention { get; init; }
 
@@ -73,6 +77,12 @@ public sealed record MaintenanceTickReport
     public RetentionReport? RetentionReport { get; init; }
 
     public double RetentionDurationMs { get; init; }
+
+    /// <summary>
+    /// True when the scheduled pass ended with work left after making progress (issue #333): the loop then ticks again
+    /// after <see cref="MaintenancePolicy.RetentionContinueMinutes"/> instead of at the next interval tick.
+    /// </summary>
+    public bool ContinueSoon { get; init; }
 
     /// <summary>The tick's inactive-repository reclaim pass (issue #291).</summary>
     public RepositoryReclaimReport? RepositoryReclaim { get; init; }
@@ -108,6 +118,60 @@ public sealed partial class SnapshotService
     /// <summary>Test hook: runs at the start of every maintenance tick (a throwing hook fails that tick).</summary>
     internal Func<Task>? BeforeMaintenanceTick { get; set; }
 
+    // Issue #333: ONE deadline per maintenance tick, shared by every step. Read on the service's clock, so tests drive it
+    // with a ManualClock. Each step waits and works only for what is left of it (BeginStep).
+    internal TimeSpan MaintenanceStepLimit { get; set; } = TimeSpan.Zero;
+
+    internal TimeSpan MaintenanceStepLimitForTesting => StepLimit();
+
+    private TimeSpan StepLimit() => MaintenanceStepLimit > TimeSpan.Zero
+        ? MaintenanceStepLimit
+        : TimeSpan.FromSeconds(Math.Clamp(_options.Maintenance.TickDeadlineSeconds, 1, MaintenancePolicy.MaxTickDeadlineSeconds));
+
+    // Set under the serialized tick (_maintenanceTick) to the moment the running tick's deadline passes; null outside a tick.
+    private DateTimeOffset? _tickDeadlineAt;
+
+    private TimeSpan StepRemaining()
+    {
+        if (_tickDeadlineAt is not { } at)
+            return StepLimit();
+        var left = at - _timeProvider.GetUtcNow();
+        return left > TimeSpan.Zero ? left : TimeSpan.Zero;
+    }
+
+    // A token cancelled when the caller's is, or when the step's bound passes; TimedOut tells the two apart.
+    private sealed class StepBound : IDisposable
+    {
+        private readonly CancellationTokenSource _bound;
+        private readonly CancellationTokenSource _linked;
+        private readonly CancellationToken _outer;
+
+        public StepBound(TimeSpan limit, TimeProvider time, CancellationToken outer)
+        {
+            _outer = outer;
+            _bound = new CancellationTokenSource(limit, time);
+            _linked = CancellationTokenSource.CreateLinkedTokenSource(outer, _bound.Token);
+        }
+
+        public CancellationToken Token => _linked.Token;
+
+        public bool TimedOut => _bound.IsCancellationRequested && !_outer.IsCancellationRequested;
+
+        public void Dispose()
+        {
+            _linked.Dispose();
+            _bound.Dispose();
+        }
+    }
+
+    private StepBound BeginStep(CancellationToken cancellationToken) => new(StepRemaining(), _timeProvider, cancellationToken);
+
+    private void DeferStep(string step, string detail)
+    {
+        _metrics.RecordMaintenanceDeferral(step);
+        Log($"maintenance: {step} could not finish within the tick deadline of {StepLimit().TotalSeconds:F0} s ({detail}); deferred to the next tick.");
+    }
+
     // Starts the loop (issue #299) when the policy enables it. Tracked as an operation, so Dispose drains it after
     // StopProduction cancelled the lifetime it waits on.
     private void StartMaintenanceLoop()
@@ -130,29 +194,70 @@ public sealed partial class SnapshotService
         {
             while (await timer.WaitForNextTickAsync(lifetime).ConfigureAwait(false))
             {
-                try
-                {
-                    LastMaintenanceTick = await RunMaintenanceTickAsync(lifetime).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
-                {
-                    return;
-                }
-                catch (Exception ex)
-                {
-                    // A failed tick never ends the loop: the next tick retries.
-                    _metrics.RecordMaintenanceFailure();
-                    Log($"maintenance: tick failed: {ex.GetType().Name}: {ex.Message}");
-                }
-                finally
-                {
-                    _maintenanceTicked.Release();
-                }
+                // Issue #333: while a scheduled pass keeps making progress with work left, tick again after the short
+                // continuation interval instead of waiting for the next interval tick.
+                var soon = TimeSpan.FromMinutes(Math.Clamp(
+                    _options.Maintenance.RetentionContinueMinutes, 0, MaintenancePolicy.MaxRetentionContinueMinutes));
+                while (await RunLoopTickAsync(lifetime).ConfigureAwait(false)
+                    && soon > TimeSpan.Zero && LastMaintenanceTick is { } last && ShouldTickSoon(last)
+                    && TryCountContinue())
+                    // Never re-plan faster than the last pass took to plan and run.
+                    await Task.Delay(MinReTickDelay(soon, last), _timeProvider, lifetime).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
         {
             // Shutdown.
+        }
+    }
+
+    // One loop tick: false when it failed (the next interval tick retries), never throws except the shutdown cancellation.
+    /// <summary>At most this many short-interval continuation ticks run per UTC day; later continues wait for the interval tick.</summary>
+    internal const int MaxContinuesPerDay = 100;
+
+    private DateOnly _continueDay;
+    private int _continuesToday;
+
+    private bool TryCountContinue()
+    {
+        var today = DateOnly.FromDateTime(_timeProvider.GetUtcNow().UtcDateTime);
+        if (_continueDay != today)
+        {
+            _continueDay = today;
+            _continuesToday = 0;
+        }
+        return ++_continuesToday <= MaxContinuesPerDay;
+    }
+
+    /// <summary>The delay before a continuation tick: the continue interval, or the previous pass's duration if longer.</summary>
+    internal static TimeSpan MinReTickDelay(TimeSpan interval, MaintenanceTickReport last)
+    {
+        var previous = TimeSpan.FromMilliseconds(Math.Max(0, last.RetentionDurationMs));
+        return previous > interval ? previous : interval;
+    }
+
+    // One loop tick: false when it failed (the next interval tick retries), never throws except the shutdown cancellation.
+    private async Task<bool> RunLoopTickAsync(CancellationToken lifetime)
+    {
+        try
+        {
+            LastMaintenanceTick = await RunMaintenanceTickAsync(lifetime).ConfigureAwait(false);
+            return true;
+        }
+        catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // A failed tick never ends the loop: the next tick retries.
+            _metrics.RecordMaintenanceFailure();
+            Log($"maintenance: tick failed: {ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+        finally
+        {
+            _maintenanceTicked.Release();
         }
     }
 
@@ -172,6 +277,7 @@ public sealed partial class SnapshotService
     public async Task<MaintenanceTickReport> RunMaintenanceTickAsync(CancellationToken cancellationToken = default)
     {
         await _maintenanceTick.WaitAsync(cancellationToken).ConfigureAwait(false);
+        _tickDeadlineAt = _timeProvider.GetUtcNow() + StepLimit();
         try
         {
             if (BeforeMaintenanceTick is { } hook)
@@ -186,7 +292,7 @@ public sealed partial class SnapshotService
                     $"in {idle.DurationMs:F0} ms.");
 
             var reclaim = await ReclaimInactiveRepositoriesAsync(cancellationToken).ConfigureAwait(false);
-            if (reclaim.Enabled && !reclaim.Busy)
+            if (reclaim.Enabled && (!reclaim.Busy || reclaim.Reclaimed + reclaim.Failed > 0))
             {
                 _metrics.RecordRepositoryReclaimPass(
                     reclaim.Reclaimed, reclaim.BytesFreed, reclaim.Failed, _timeProvider.GetUtcNow().ToUnixTimeMilliseconds(), reclaim.DurationMs);
@@ -200,6 +306,7 @@ public sealed partial class SnapshotService
         }
         finally
         {
+            _tickDeadlineAt = null;
             _maintenanceTick.Release();
         }
     }
@@ -222,7 +329,7 @@ public sealed partial class SnapshotService
             // Records the rule wrote while it was on still expire on schedule.
             return new IdleBranchRetireReport
             {
-                Enabled = false, RetiredHeadsPruned = await PruneRetiredHeadsAsync(cancellationToken).ConfigureAwait(false)
+                Enabled = false, RetiredHeadsPruned = await PruneRetiredHeadsBoundedAsync(cancellationToken).ConfigureAwait(false)
             };
         }
 
@@ -236,17 +343,23 @@ public sealed partial class SnapshotService
             idle = new SnapshotStore(reader).ListIdleNonDefaultBranches(cutoff);
             pending = new SnapshotJobStore(reader).BranchesWithPendingWork();
         }
-        // An admitted branch-advance ensure that has not finished is pending work too (issue #273's registry).
+        // An admitted branch-advance ensure that has not finished is pending work too (issue #273's registry), and so is
+        // an idle retirement an earlier tick queued that has not applied yet (issue #333: never queue a duplicate).
         HashSet<string> advancing;
+        HashSet<string> retiring;
         lock (_inFlightLock)
+        {
             advancing = [.. _latestAdvance.Keys];
+            retiring = [.. _pendingIdleRetires];
+        }
 
         var eligible = new List<IdleBranchCandidate>();
         var busy = 0;
         foreach (var candidate in idle)
         {
             var repositoryKey = RemoteUrlIdentity.Normalize(candidate.RepositoryRemoteUrl);
-            if (pending.Contains((repositoryKey, candidate.Name)) || advancing.Contains(repositoryKey + "\n" + candidate.Name))
+            if (pending.Contains((repositoryKey, candidate.Name)) || advancing.Contains(repositoryKey + "\n" + candidate.Name)
+                || retiring.Contains(IdleRetireKey(candidate.RepositoryRemoteUrl, candidate.Name)))
                 busy++;
             else
                 eligible.Add(candidate);
@@ -261,10 +374,26 @@ public sealed partial class SnapshotService
                 IdlePolicyCaller,
                 new IdleRetireGuard(candidate.SnapshotId, candidate.UpdatedAt)));
         }
-        // Each retirement is service-owned: this only waits for them (cancellation ends the wait, not the retirements).
-        var results = await Task.WhenAll(retirements).WaitAsync(cancellationToken).ConfigureAwait(false);
+        // Each retirement is service-owned: this only waits for them (cancellation or the step bound ends the wait, not the
+        // retirements, which apply when their priority turn comes).
+        int deferred;
+        RetireBranchResult[] results;
+        using (var step = BeginStep(cancellationToken))
+        {
+            try
+            {
+                results = await Task.WhenAll(retirements).WaitAsync(step.Token).ConfigureAwait(false);
+                deferred = 0;
+            }
+            catch (OperationCanceledException) when (step.TimedOut)
+            {
+                results = [.. retirements.Where(t => t.IsCompletedSuccessfully).Select(t => t.Result)];
+                deferred = retirements.Count - results.Length;
+                DeferStep("idle_branch_retire", $"{deferred} of {retirements.Count} retirement(s) still queued");
+            }
+        }
         var retired = results.Count(r => r.Retired);
-        var pruned = await PruneRetiredHeadsAsync(cancellationToken).ConfigureAwait(false);
+        var pruned = await PruneRetiredHeadsBoundedAsync(cancellationToken).ConfigureAwait(false);
         return new IdleBranchRetireReport
         {
             Enabled = true,
@@ -272,7 +401,8 @@ public sealed partial class SnapshotService
             Busy = busy,
             Attempted = retirements.Count,
             Retired = retired,
-            Skipped = retirements.Count - retired,
+            Skipped = retirements.Count - retired - deferred,
+            Deferred = deferred,
             RetiredHeadsPruned = pruned,
             DurationMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds
         };
@@ -296,8 +426,6 @@ public sealed partial class SnapshotService
         var policy = _options.Maintenance;
         if (policy.RepositoryReclaimDays <= 0)
             return new RepositoryReclaimReport { Enabled = false };
-        if (IndexingHoldsWriter())
-            return new RepositoryReclaimReport { Enabled = true, Busy = true };
 
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
         var cutoff = _timeProvider.GetUtcNow()
@@ -312,6 +440,7 @@ public sealed partial class SnapshotService
         var activeNames = ActiveDirectoryNames(activity, cutoff);
 
         int reclaimed = 0, skipped = 0, failed = 0;
+        var deferredPass = false;
         long bytes = 0;
         foreach (var candidate in inactive)
         {
@@ -332,8 +461,31 @@ public sealed partial class SnapshotService
             {
                 if (BeforeReclaimWriterTurn is { } hook)
                     await hook().ConfigureAwait(false);
-                var outcome = await WithWriteAsync(() => Task.FromResult(ReclaimUnderWriter(reclaimer, candidate, cutoff)), cancellationToken)
-                    .ConfigureAwait(false);
+                bool turnTimedOut;
+                ReclaimOutcome? outcome;
+                // The wait for the writer is bounded per candidate (issue #333): a pass that cannot get a turn stops
+                // here and the next tick retries, instead of blocking the loop.
+                using (var step = BeginStep(cancellationToken))
+                {
+                    try
+                    {
+                        outcome = await WithWriteAsync(
+                            () => Task.FromResult(ReclaimUnderWriter(reclaimer, candidate, cutoff)), step.Token, priority: true)
+                            .ConfigureAwait(false);
+                        turnTimedOut = false;
+                    }
+                    catch (OperationCanceledException) when (step.TimedOut)
+                    {
+                        outcome = null;
+                        turnTimedOut = true;
+                    }
+                }
+                if (turnTimedOut)
+                {
+                    deferredPass = true;
+                    DeferStep("repository_reclaim", $"repository {candidate.RepositoryId}");
+                    break;
+                }
                 if (outcome is null)
                 {
                     skipped++;
@@ -351,6 +503,8 @@ public sealed partial class SnapshotService
                     deleted.Add(aside.Target.Kind.Replace(' ', '_'));
                 }
                 var clean = outcome.MoveFailures == 0 && deleted.Count == outcome.Asides.Count;
+                if (BeforeReclaimAudit is { } beforeAudit)
+                    await beforeAudit().ConfigureAwait(false);
                 await AuditReclaimAsync(outcome.RemoteUrl, clean, deleted, freed, cancellationToken).ConfigureAwait(false);
                 bytes += freed;
                 if (clean)
@@ -370,7 +524,7 @@ public sealed partial class SnapshotService
         }
         return new RepositoryReclaimReport
         {
-            Enabled = true, Inactive = inactive.Count, Reclaimed = reclaimed, BytesFreed = bytes, Skipped = skipped, Failed = failed,
+            Enabled = true, Busy = deferredPass, Inactive = inactive.Count, Reclaimed = reclaimed, BytesFreed = bytes, Skipped = skipped, Failed = failed,
             DurationMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds
         };
     }
@@ -384,6 +538,9 @@ public sealed partial class SnapshotService
         lock (_inFlightLock)
             return _latestAdvance.Keys.Any(k => k.StartsWith(prefix, StringComparison.Ordinal));
     }
+
+    // Test seam: runs after a reclaim's directories are deleted and before its audit row is written.
+    internal Func<Task>? BeforeReclaimAudit { get; set; }
 
     // Test seam: runs after a candidate is selected and before it takes its writer turn.
     internal Func<Task>? BeforeReclaimWriterTurn { get; set; }
@@ -406,8 +563,13 @@ public sealed partial class SnapshotService
     private static HashSet<string> ActiveDirectoryNames(IEnumerable<RepositoryActivity> activity, long cutoff) =>
         activity.Where(a => !IsInactive(a, cutoff)).Select(a => ServicePaths.RepoDirectoryName(a.RemoteUrl)).ToHashSet(StringComparer.Ordinal);
 
+    // The audit row of a completed reclaim has its own small bound, independent of the tick deadline (which may be spent
+    // by then): the directories are already gone, so the row should not be lost to an exhausted tick.
+    internal TimeSpan ReclaimAuditWait { get; set; } = TimeSpan.FromSeconds(5);
+
     private async Task AuditReclaimAsync(string remoteUrl, bool clean, List<string> kinds, long bytes, CancellationToken cancellationToken)
     {
+        using var step = new StepBound(ReclaimAuditWait, _timeProvider, cancellationToken);
         try
         {
             await WithWriteAsync(() =>
@@ -419,7 +581,11 @@ public sealed partial class SnapshotService
                     detail: ReclaimPolicyCaller.Detail((clean ? "reclaimed;" : "reclaim_incomplete;") + string.Join(',', kinds)),
                     costBytes: bytes);
                 return Task.FromResult(0);
-            }, cancellationToken).ConfigureAwait(false);
+            }, step.Token, priority: true).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (step.TimedOut)
+        {
+            DeferStep("reclaim_audit", $"the audit row is skipped after {ReclaimAuditWait.TotalSeconds:F0} s");
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -456,6 +622,20 @@ public sealed partial class SnapshotService
     // Deletes the retired-head records older than MaintenancePolicy.RetiredHeadRetention: a branch idle-retired that long
     // ago and never pushed since is no longer re-created by a push expecting its old head (it is re-created like a new
     // branch, or by any unguarded ensure). Takes the writer only when there is something to prune.
+    private async Task<int> PruneRetiredHeadsBoundedAsync(CancellationToken cancellationToken)
+    {
+        using var step = BeginStep(cancellationToken);
+        try
+        {
+            return await PruneRetiredHeadsAsync(step.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (step.TimedOut)
+        {
+            DeferStep("retired_head_prune", "pruning retired heads");
+            return 0;
+        }
+    }
+
     private async Task<int> PruneRetiredHeadsAsync(CancellationToken cancellationToken)
     {
         var cutoff = (_timeProvider.GetUtcNow() - MaintenancePolicy.RetiredHeadRetention).ToUnixTimeMilliseconds();
@@ -468,13 +648,13 @@ public sealed partial class SnapshotService
                 return 0;
         }
         return await WithWriteAsync(
-            () => Task.FromResult(new SnapshotStore(_conn).PruneRetiredHeads(cutoff)), cancellationToken).ConfigureAwait(false);
+            () => Task.FromResult(new SnapshotStore(_conn).PruneRetiredHeads(cutoff)), cancellationToken, priority: true).ConfigureAwait(false);
     }
 
     // The tick's scheduled retention (issue #299): once per UTC day, on the first tick at or after the configured hour,
-    // the same bounded pass as POST /control/retention?execute=true, audited as retention_schedule. While a production
-    // holds (or waits for) the writer the pass does not start and is retried next tick. Once started, a production
-    // admitted meanwhile waits at most one bounded batch (RetentionService.BatchTimeLimit) for its turn.
+    // the same bounded pass as POST /control/retention?execute=true, audited as retention_schedule. The pass takes priority
+    // turns on the write gate and runs its batches in held bursts (issue #333); a production admitted meanwhile waits at
+    // most one burst (SEXTANT_SERVICE_RETENTION_BURST_SECONDS) plus one batch for its turn.
     private async Task<MaintenanceTickReport> RunScheduledRetentionIfDueAsync(
         IdleBranchRetireReport idle, CancellationToken cancellationToken)
     {
@@ -492,26 +672,34 @@ public sealed partial class SnapshotService
         if (now.UtcDateTime.Hour < policy.RetentionHourUtc || _lastScheduledRetentionDay == today)
             return new MaintenanceTickReport { IdleBranches = idle, Retention = "not_due" };
 
-        if (IndexingHoldsWriter())
-        {
-            _metrics.RecordScheduledRetentionSkippedBusy();
-            Log("maintenance: scheduled retention is due but indexing holds the writer; retrying next tick.");
-            return new MaintenanceTickReport { IdleBranches = idle, Retention = "busy" };
-        }
-
+        // Issue #333: a busy writer no longer skips the tick. The pass takes priority turns on the gate, runs its batches
+        // in held bursts and spends its budget only while holding; the tick's shared deadline bounds the whole wait, so a
+        // pass that never got a turn ends with no batches and stays due (the day stays open below).
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
-        var report = await RunRetentionAsync(
-            execute: true, RetentionScheduleCaller, cancellationToken,
-            TimeSpan.FromSeconds(Math.Clamp(policy.RetentionPassSeconds, 1, MaintenancePolicy.MaxRetentionPassSeconds)),
-            ScheduledRetentionAuditWait).ConfigureAwait(false);
+        RetentionReport report;
+        using (var step = BeginStep(cancellationToken))
+        {
+            report = await RunRetentionAsync(
+                execute: true, RetentionScheduleCaller, cancellationToken,
+                TimeSpan.FromSeconds(Math.Clamp(policy.RetentionPassSeconds, 1, MaintenancePolicy.MaxRetentionPassSeconds)),
+                ScheduledRetentionAuditWait, maintenancePriority: true, passBound: step.Token).ConfigureAwait(false);
+        }
         var durationMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+        if (report.Batches == 0 && report.MoreRemaining)
+        {
+            if (report.StopReason == StarvedStopReason)
+                DeferStep("scheduled_retention", "the writer was never free");
+            else
+                Log($"maintenance: scheduled retention ran no batch (stop reason {report.StopReason ?? "unfinished"}); it stays due.");
+        }
         var continues = ScheduledPassContinues(report);
         _lastScheduledRetentionDay = continues ? _lastScheduledRetentionDay : today;
         _metrics.RecordScheduledRetention(report, now.ToUnixTimeMilliseconds(), durationMs);
         Log(ScheduledRetentionLogLine(report, durationMs));
         return new MaintenanceTickReport
         {
-            IdleBranches = idle, Retention = "ran", RetentionReport = report, RetentionDurationMs = durationMs
+            IdleBranches = idle, Retention = "ran", RetentionReport = report, RetentionDurationMs = durationMs,
+            ContinueSoon = continues && MadeStopReasonProgress(report)
         };
     }
 
@@ -535,6 +723,10 @@ public sealed partial class SnapshotService
     internal bool ScheduledPassContinues(RetentionReport report)
     {
         var continues = ScheduledRetentionContinues(report);
+        // A pass that never got the writer did nothing, so it says nothing about whether the catalog can move: it neither
+        // counts toward the cap nor resets it. Only the UTC day bounds it (the day rolls over and the pass is due again).
+        if (continues && report.StopReason == StarvedStopReason)
+            return true;
         if (continues && !MadeStopReasonProgress(report))
         {
             if (++_scheduledNoProgressContinues > MaxScheduledNoProgressContinues)
@@ -553,13 +745,20 @@ public sealed partial class SnapshotService
     // Stops that are about a budget or a busy writer, not a catalog that cannot move: they may continue without progress,
     // but only a bounded number of times in a row (ScheduledPassContinues).
     private static bool IsRetryableStop(string? reason) =>
-        reason is "unit_budget" or "batch_budget" or "sweep_budget" or "api_deferred" or "sqlite_busy";
+        reason is "unit_budget" or "batch_budget" or "sweep_budget" or "api_deferred" or "sqlite_busy" or StarvedStopReason;
 
+    // A pass that never got the writer (starved by productions until the tick deadline) did not run at all: the day stays
+    // open without counting toward the no-progress cap (ScheduledPassContinues), bounded only by the UTC day (issue #333).
     internal static bool ScheduledRetentionContinues(RetentionReport report) =>
-        report.MoreRemaining && (MadeStopReasonProgress(report) || IsRetryableStop(report.StopReason));
+        report.MoreRemaining && (MadeStopReasonProgress(report) || IsRetryableStop(report.StopReason) || report.Batches == 0);
 
-    // A production holds the writer for its whole run, and a write waiting for its turn would queue behind it: either
-    // way a retention pass now would only spend its budget waiting, or delay that write (issue #299).
+    /// <summary>
+    /// Whether the maintenance loop should tick again after the short continuation interval instead of waiting for the next
+    /// interval tick: a scheduled pass ended with work left AND made progress (issue #333).
+    /// </summary>
+    internal static bool ShouldTickSoon(MaintenanceTickReport report) => report.ContinueSoon;
+
+    // Whether a production is running or the gate is taken: only the job-memory reclaim (issue #325) still asks.
     private bool IndexingHoldsWriter()
     {
         lock (_inFlightLock)
@@ -593,7 +792,7 @@ public sealed partial class SnapshotService
     private Task _pendingReclaim = Task.CompletedTask;
     private long _reclaimGeneration;
 
-    internal SemaphoreSlim WriteGateForTesting => _writeGate;
+    internal WriteGate WriteGateForTesting => _writeGate;
 
     internal Lock InFlightLockForTesting => _inFlightLock;
 

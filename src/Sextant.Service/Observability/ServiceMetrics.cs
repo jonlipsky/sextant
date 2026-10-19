@@ -85,11 +85,22 @@ public sealed class ServiceMetrics
             _maintenance = _maintenance with
             {
                 Ticks = _maintenance.Ticks + 1,
-                IdleBranchesRetiredTotal = _maintenance.IdleBranchesRetiredTotal + retired,
                 LastIdleBranchesRetired = retired,
                 LastIdlePassAtUnixMs = atUnixMs,
                 LastIdlePassDurationMs = durationMs
             };
+    }
+
+    /// <summary>
+    /// Records one applied idle-branch retirement (issue #333), when it applies: a retirement the pass stopped waiting for
+    /// still counts, instead of vanishing from the totals.
+    /// </summary>
+    public void RecordIdleBranchRetireApplied(bool retired)
+    {
+        lock (_maintenanceLock)
+            _maintenance = retired
+                ? _maintenance with { IdleBranchesRetiredTotal = _maintenance.IdleBranchesRetiredTotal + 1 }
+                : _maintenance with { IdleBranchRetiresSkippedTotal = _maintenance.IdleBranchRetiresSkippedTotal + 1 };
     }
 
     /// <summary>Records one maintenance tick's repository reclaim pass (issue #291).</summary>
@@ -121,6 +132,29 @@ public sealed class ServiceMetrics
                 LastScheduledRetentionMoreRemaining = report.MoreRemaining,
                 LastScheduledRetentionStopReason = report.StopReason
             };
+    }
+
+    /// <summary>Records how long a maintenance write waited for its priority turn on the writer gate (issue #333).</summary>
+    public void RecordMaintenanceWriterWait(double waitMs)
+    {
+        lock (_maintenanceLock)
+            _maintenance = _maintenance with
+            {
+                MaintenanceWriterTurns = _maintenance.MaintenanceWriterTurns + 1,
+                MaintenanceWriterWaitMsTotal = _maintenance.MaintenanceWriterWaitMsTotal + waitMs,
+                MaintenanceWriterWaitMsMax = Math.Max(_maintenance.MaintenanceWriterWaitMsMax, waitMs)
+            };
+    }
+
+    /// <summary>Records a maintenance step deferred to the next tick (issue #333).</summary>
+    public void RecordMaintenanceDeferral(string step)
+    {
+        lock (_maintenanceLock)
+        {
+            var byStep = new Dictionary<string, long>(_maintenance.MaintenanceDeferrals);
+            byStep[step] = byStep.GetValueOrDefault(step) + 1;
+            _maintenance = _maintenance with { MaintenanceDeferrals = byStep };
+        }
     }
 
     /// <summary>Records a due scheduled retention pass skipped because indexing held the writer (issue #299).</summary>

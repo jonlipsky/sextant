@@ -60,7 +60,7 @@ public class RetentionConvergenceTests
     [TestMethod]
     public void MoreRemaining_NeverCarriesNoReason_AndVacuumIsProgressOnlyWhilePagesAreLeft()
     {
-        var vacuumOnly = new RetentionReport { DryRun = false, MoreRemaining = true, PagesVacuumed = 500, StopReason = "sweep_budget" };
+        var vacuumOnly = new RetentionReport { DryRun = false, MoreRemaining = true, PagesVacuumed = 500, StopReason = "sweep_budget", Batches = 2 };
         Assert.IsFalse(SnapshotService.MadeDeletionProgress(vacuumOnly));
         Assert.IsTrue(SnapshotService.MadeRetentionProgress(vacuumOnly));
         Assert.IsTrue(SnapshotService.ScheduledRetentionContinues(vacuumOnly), "a retryable stop continues (bounded)");

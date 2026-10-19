@@ -15,6 +15,18 @@ public sealed record MaintenancePolicy
     internal const int DefaultRepositoryReclaimDays = 14;
     internal const int DefaultRepositoryReclaimMaxPerPass = 5;
     internal const int DefaultRetentionPassSeconds = 600;
+    internal const int DefaultRetentionBurstSeconds = 120;
+    internal const int DefaultRetentionContinueMinutes = 5;
+    internal const int DefaultTickDeadlineSeconds = 900;
+
+    /// <summary>The longest retention hold of the writer, in seconds (1 hour); a longer value is clamped to it.</summary>
+    public const int MaxRetentionBurstSeconds = 3600;
+
+    /// <summary>The longest tick deadline, in seconds (1 day); a longer value is clamped to it.</summary>
+    public const int MaxTickDeadlineSeconds = 86400;
+
+    /// <summary>The longest wait before a retention continuation, in minutes (1 day); a longer value is clamped to it.</summary>
+    public const int MaxRetentionContinueMinutes = 1440;
 
     /// <summary>The longest retention pass, in seconds (1 hour); a longer value is clamped to it.</summary>
     public const int MaxRetentionPassSeconds = 3600;
@@ -84,11 +96,35 @@ public sealed record MaintenancePolicy
     public int RetentionHourUtc { get; init; } = DefaultRetentionHourUtc;
 
     /// <summary>
-    /// The time budget, in seconds, of one scheduled retention pass; also the ceiling of the <c>seconds</c> an interactive
+    /// The time budget, in seconds, of one scheduled retention pass, counted as writer-HELD time (the wait for turns is not
+    /// spent); also the ceiling of the <c>seconds</c> an interactive
     /// <c>POST /control/retention</c> may ask for (its default stays 10). <c>SEXTANT_SERVICE_RETENTION_PASS_SECONDS</c>
     /// (default 600; clamped to <see cref="MaxRetentionPassSeconds"/>).
     /// </summary>
     public int RetentionPassSeconds { get; init; } = DefaultRetentionPassSeconds;
+
+    /// <summary>
+    /// How long the scheduled retention pass may keep the writer in ONE priority turn (issue #333): it runs its batches
+    /// back to back inside the hold and releases the gate once the hold reaches this (or the pass is done), then queues
+    /// again on the priority lane. While a backlog exists this gives retention about <c>burst / (burst + production)</c>
+    /// of the writer, and delays a waiting production by at most this plus one batch. <c>0</c> releases after every
+    /// batch. <c>SEXTANT_SERVICE_RETENTION_BURST_SECONDS</c> (default 120; clamped to <see cref="MaxRetentionBurstSeconds"/>).
+    /// </summary>
+    public int RetentionBurstSeconds { get; init; } = DefaultRetentionBurstSeconds;
+
+    /// <summary>
+    /// After a scheduled pass that ends with work left but made progress, the next pass is scheduled this many minutes
+    /// later instead of at the next <see cref="Interval"/> tick. <c>0</c> turns the early continuation off.
+    /// <c>SEXTANT_SERVICE_RETENTION_CONTINUE_MINUTES</c> (default 5; clamped to <see cref="MaxRetentionContinueMinutes"/>).
+    /// </summary>
+    public int RetentionContinueMinutes { get; init; } = DefaultRetentionContinueMinutes;
+
+    /// <summary>
+    /// ONE deadline for a whole maintenance tick, shared by every step (idle-branch retire, reclaim, retention): each step
+    /// waits and works only for what is left of it, so the loop never blocks longer. <c>SEXTANT_SERVICE_MAINTENANCE_TICK_DEADLINE_SECONDS</c>
+    /// (default 900; clamped to <see cref="MaxTickDeadlineSeconds"/>).
+    /// </summary>
+    public int TickDeadlineSeconds { get; init; } = DefaultTickDeadlineSeconds;
 
     /// <summary>A one-line description of the effective policy for the startup log.</summary>
     public string Describe()

@@ -42,7 +42,7 @@ public sealed partial class SnapshotService : IDisposable
     private readonly IndexDatabase _db;
     private readonly SqliteConnection _conn;
     private readonly WriterLease _lease;
-    private readonly SemaphoreSlim _writeGate = new(1, 1);
+    private readonly WriteGate _writeGate;
     private readonly bool _ownsDatabase;
     private readonly IContributionAuthorizer _authorizer;
     private readonly IGitContentProvider _gitContent;
@@ -75,6 +75,26 @@ public sealed partial class SnapshotService : IDisposable
     private long _writeAdmissions;
     private PendingRetire? _pendingRetire;
 
+    // Idle-branch retirements admitted and not yet applied (issue #333), guarded by _inFlightLock: the next maintenance
+    // tick leaves these branches out, so a step that stopped waiting never grows the queue with duplicates.
+    private readonly HashSet<string> _pendingIdleRetires = new(StringComparer.Ordinal);
+
+    private static string IdleRetireKey(string repository, string branch) => repository + "\n" + branch;
+
+    private void ForgetPendingIdleRetire(RetireBranchRequest request, IdleRetireGuard? idle)
+    {
+        if (idle is null)
+            return;
+        lock (_inFlightLock)
+            _pendingIdleRetires.Remove(IdleRetireKey(request.Repository, request.Branch));
+    }
+
+    internal bool HasPendingIdleRetire(string repository, string branch)
+    {
+        lock (_inFlightLock)
+            return _pendingIdleRetires.Contains(IdleRetireKey(repository, branch));
+    }
+
     // Issue #273: the latest admitted branch-advance ensure per (repository, branch), guarded by _inFlightLock. When a
     // newer linked one is admitted while the previous one is still waiting for its turn, the previous one is superseded:
     // it is settled as coalesced at its turn instead of producing, and records a durable handover of its
@@ -102,6 +122,7 @@ public sealed partial class SnapshotService : IDisposable
         _contributionPolicy = contributionPolicy;
         _remoteDefaults = remoteDefaults is null ? null : new RemoteDefaultBranchLookup(remoteDefaults);
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _writeGate = new WriteGate(_timeProvider);
         _jobIds = new JobIdReservations(
             JobIdReservations.FloorPathFor(options.CatalogDbPath),
             () => ReadCatalog(conn => new SnapshotJobStore(conn).MaxJobId()));
@@ -669,15 +690,18 @@ public sealed partial class SnapshotService : IDisposable
     // _inFlightLock, so turns are taken in admission order, and the write gate grants waiting turns first-in,
     // first-out (SemaphoreSlim releases its asynchronous waiters in the order they queued), so writes apply in
     // submission order: a branch delete's retire is never overtaken by the re-create push's ensure that followed it.
+    // The one exception is the idle-branch retirement (issue #333), which takes the priority lane and so can run before an
+    // earlier-admitted ensure; ApplyRetireAsync therefore answers it BranchBusy while a branch-advance ensure of the same
+    // repository and branch is still admitted (_latestAdvance), and the idle rule never deletes a branch with such work.
     // The wait is not tied to the service lifetime, so a write admitted before shutdown still lands during the
     // Dispose drain. The returned turn MUST be awaited and the gate released exactly once on every path, or the
     // writer stalls for good (ReleaseTurn covers a turn abandoned before it was granted).
     private Task TakeWriteTurnLocked() => TakeWriteTurnLocked(out _);
 
-    private Task TakeWriteTurnLocked(out long admission)
+    private Task TakeWriteTurnLocked(out long admission, bool priority = false)
     {
         admission = Interlocked.Increment(ref _writeAdmissions);
-        return _writeGate.WaitAsync(CancellationToken.None);
+        return _writeGate.WaitAsync(CancellationToken.None, priority);
     }
 
     private Task TakeWriteTurn()
@@ -2054,11 +2078,16 @@ public sealed partial class SnapshotService : IDisposable
             if (_pendingRetire is { } pending && pending.Key == key && pending.Admission == Interlocked.Read(ref _writeAdmissions))
                 return pending.Retire;
 
-            var turn = TakeWriteTurnLocked(out var admission);
+            // An idle-branch retirement is maintenance (issue #333): it takes the priority lane, so it is the next turn
+            // after the current holder instead of waiting behind every production admitted before it.
+            var turn = TakeWriteTurnLocked(out var admission, priority: idle is not null);
             entry = new PendingRetire(key, admission);
+            var asked = System.Diagnostics.Stopwatch.GetTimestamp();
             // Published under the lock BEFORE the retirement can clear it (it takes the same lock).
-            entry.Retire = Task.Run(() => ApplyRetireAsync(request, principal, entry, turn, idle), CancellationToken.None);
+            entry.Retire = Task.Run(() => ApplyRetireAsync(request, principal, entry, turn, idle, asked), CancellationToken.None);
             _pendingRetire = entry;
+            if (idle is not null)
+                _pendingIdleRetires.Add(IdleRetireKey(request.Repository, request.Branch));
             _operations.Add(entry.Retire);
         }
         _ = entry.Retire.ContinueWith(
@@ -2073,19 +2102,41 @@ public sealed partial class SnapshotService : IDisposable
     }
 
     private async Task<RetireBranchResult> ApplyRetireAsync(
-        RetireBranchRequest request, AuditCaller principal, PendingRetire entry, Task turn, IdleRetireGuard? idle)
+        RetireBranchRequest request, AuditCaller principal, PendingRetire entry, Task turn, IdleRetireGuard? idle, long asked)
     {
-        await turn.ConfigureAwait(false);
         try
         {
+            await turn.ConfigureAwait(false);
+        }
+        catch
+        {
+            ForgetPendingIdleRetire(request, idle);
+            throw;
+        }
+        try
+        {
+            if (idle is not null)
+                _metrics.RecordMaintenanceWriterWait(System.Diagnostics.Stopwatch.GetElapsedTime(asked).TotalMilliseconds);
+            var advanceAdmitted = false;
             lock (_inFlightLock)
             {
                 if (ReferenceEquals(_pendingRetire, entry))
                     _pendingRetire = null;
+                if (idle is not null)
+                {
+                    _pendingIdleRetires.Remove(IdleRetireKey(request.Repository, request.Branch));
+                    // The priority lane lets this retirement overtake an earlier-admitted ensure; an admitted advance
+                    // of this very branch makes it busy instead.
+                    advanceAdmitted = _latestAdvance.ContainsKey(RemoteUrlIdentity.Normalize(request.Repository) + "\n" + request.Branch);
+                }
             }
             using var activity = ServiceTelemetry.Source.StartActivity("retire_branch");
             EnsureLeaseHeld();
-            return RetireBranchLocked(request, principal, idle);
+            var result = RetireBranchLocked(request, principal, idle, advanceAdmitted);
+            // Counted when it applies, so a retirement the maintenance step stopped waiting for still shows (issue #333).
+            if (idle is not null)
+                _metrics.RecordIdleBranchRetireApplied(result.Retired);
+            return result;
         }
         finally
         {
@@ -2093,7 +2144,8 @@ public sealed partial class SnapshotService : IDisposable
         }
     }
 
-    private RetireBranchResult RetireBranchLocked(RetireBranchRequest request, AuditCaller principal, IdleRetireGuard? idle)
+    private RetireBranchResult RetireBranchLocked(
+        RetireBranchRequest request, AuditCaller principal, IdleRetireGuard? idle, bool advanceAdmitted = false)
     {
         var snapshots = new SnapshotStore(_conn);
         ExecRaw("BEGIN IMMEDIATE;");
@@ -2120,8 +2172,8 @@ public sealed partial class SnapshotService : IDisposable
                 result = new RetireBranchResult { Retired = false, Reason = BranchGuardReason.DefaultBranch };
             else if (idle is { } selected && (branch.SnapshotId != selected.SnapshotId || branch.UpdatedAt != selected.UpdatedAt))
                 result = new RetireBranchResult { Retired = false, Reason = BranchGuardReason.PointerMoved };
-            else if (idle is not null && new SnapshotJobStore(_conn).BranchesWithPendingWork()
-                         .Contains((RemoteUrlIdentity.Normalize(request.Repository), branch.Name)))
+            else if (idle is not null && (advanceAdmitted || new SnapshotJobStore(_conn).BranchesWithPendingWork()
+                         .Contains((RemoteUrlIdentity.Normalize(request.Repository), branch.Name))))
                 result = new RetireBranchResult { Retired = false, Reason = BranchGuardReason.BranchBusy };
             else if (request.ExpectedHeadCommit is { } expected && !snapshots.BranchHeadMatches(branch.Id, expected))
                 result = new RetireBranchResult { Retired = false, Reason = BranchGuardReason.HeadMismatch };
@@ -2200,39 +2252,65 @@ public sealed partial class SnapshotService : IDisposable
 
     /// <summary>
     /// A dry run plans on an independent reader. An executed pass computes its plan on a reader too (no writer held),
-    /// then runs short batches under the writer, each re-verifying its candidates; the gate is released between batches
-    /// so publishes interleave. The whole pass, writer-queue waits included, is bounded by <paramref name="passLimit"/>
-    /// (default <see cref="RetentionService.PassTimeLimit"/>). A pass that runs out of time reports what it computed and
-    /// deleted so far; cancellation interrupts the current batch, and committed batches stay applied.
+    /// then runs short batches under the writer, each re-verifying its candidates. An interactive pass releases the gate
+    /// between batches so publishes interleave, and its whole time, writer-queue waits included, is bounded by
+    /// <paramref name="passLimit"/> (default <see cref="RetentionService.PassTimeLimit"/>). The scheduled
+    /// (<paramref name="maintenancePriority"/>) pass runs its batches, tail and vacuum steps back to back inside ONE
+    /// priority gate hold (issue #333), releases at <see cref="MaintenancePolicy.RetentionBurstSeconds"/> or when it is
+    /// done and queues again on the priority lane; its budget counts only the time it HELD the writer, and
+    /// <paramref name="passBound"/> (the tick deadline) ends a wait for a turn. A pass that runs out of time reports what
+    /// it computed and deleted so far; cancellation interrupts the current batch, and committed batches stay applied.
     /// <paramref name="auditWait"/> caps the wait for the writer of the closing audit row (default
     /// <see cref="InteractiveRetentionAuditWait"/>; the scheduled pass passes its short cap).
     /// </summary>
     public async Task<RetentionReport> RunRetentionAsync(
         bool execute, AuditCaller principal = default, CancellationToken cancellationToken = default,
-        TimeSpan? passLimit = null, TimeSpan? auditWait = null)
+        TimeSpan? passLimit = null, TimeSpan? auditWait = null, bool maintenancePriority = false,
+        CancellationToken passBound = default)
     {
         var passStartedMs = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
-        var timer = new RetentionPassTimer();
-        var report = await RunRetentionPassAsync(execute, principal, cancellationToken, passLimit, timer).ConfigureAwait(false);
-        if (!execute) return report;
-        // A pass that was cut short without deleting anything asks for a continuation (capped by the scheduler).
-        if (report.MoreRemaining && !MadeDeletionProgress(report) && report.StopReason is "time_budget" or "unit_budget")
-            report = report with { StopReason = "unit_budget" };
-        // Never "more remaining" without a reason (issue #329).
-        if (report.MoreRemaining && report.StopReason == null)
-            report = report with { StopReason = "work_remaining" };
-        if (report.Batches > 0)
+        var timer = new RetentionPassTimer
         {
-            var skipped = await AuditRetentionPassAsync(
-                report, principal, passStartedMs, timer, auditWait ?? InteractiveRetentionAuditWait).ConfigureAwait(false);
-            if (skipped)
+            Priority = maintenancePriority,
+            Time = _timeProvider,
+            Burst = TimeSpan.FromSeconds(Math.Clamp(
+                _options.Maintenance.RetentionBurstSeconds, 0, MaintenancePolicy.MaxRetentionBurstSeconds))
+        };
+        try
+        {
+            var report = await RunRetentionPassAsync(execute, principal, cancellationToken, passLimit, timer, passBound).ConfigureAwait(false);
+            if (!execute) return report;
+            // A priority pass that waited for the writer until the tick deadline and never held it did not run at all.
+            if (report.MoreRemaining && report.Batches == 0 && timer.Priority && timer.HeldTime == TimeSpan.Zero
+                && timer.WriterWaitMs > 0 && passBound.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+                report = report with { StopReason = StarvedStopReason };
+            // A pass that was cut short without deleting anything asks for a continuation (capped by the scheduler).
+            if (report.MoreRemaining && !MadeDeletionProgress(report) && report.StopReason is "time_budget" or "unit_budget")
+                report = report with { StopReason = "unit_budget" };
+            // Never "more remaining" without a reason (issue #329).
+            if (report.MoreRemaining && report.StopReason == null)
+                report = report with { StopReason = "work_remaining" };
+            if (report.Batches > 0)
             {
-                report = report with { AuditSkipped = true };
-                _metrics.RecordRetentionAuditSkipped();
+                var skipped = await AuditRetentionPassAsync(
+                    report, principal, passStartedMs, timer, auditWait ?? InteractiveRetentionAuditWait).ConfigureAwait(false);
+                if (skipped)
+                {
+                    report = report with { AuditSkipped = true };
+                    _metrics.RecordRetentionAuditSkipped();
+                }
             }
+            return report with { Timings = timer.ToTimings(report.Batches) };
         }
-        return report with { Timings = timer.ToTimings(report.Batches) };
+        finally
+        {
+            // Whatever ended the pass, a held burst never outlives it.
+            timer.EndTurn(this);
+        }
     }
+
+    /// <summary>Stop reason of a scheduled pass that never got the writer before the tick deadline (issue #333).</summary>
+    internal const string StarvedStopReason = "starved";
 
     internal static bool MadeRetentionProgress(RetentionReport report) =>
         MadeDeletionProgress(report) || report.PagesVacuumed > 0;
@@ -2245,9 +2323,47 @@ public sealed partial class SnapshotService : IDisposable
             report.ProjectChunkRowsDeleted) > 0;
 
     // Accumulates the step timings of one executed pass (issue #321). The pass is sequential, so no locking.
-    private sealed class RetentionPassTimer
+    // A priority (scheduled) pass holds the gate across consecutive writes: a "turn" starts at the first write after the
+    // gate was released and ends (EndTurn) once its hold reaches Burst, or when the pass ends or a write fails
+    // (issue #333). Batches still commit one by one inside the hold; only the gate is kept.
+    internal sealed class RetentionPassTimer
     {
         public double PlanMs, WriterWaitMs, DeleteMs, TailMs, VacuumMs, AuditMs;
+
+        private readonly long _startedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+        private bool _holding;
+        private DateTimeOffset _holdStart;
+        private TimeSpan _held;
+
+        // The scheduled pass's writer turns take the priority lane (issue #333).
+        public bool Priority { get; init; }
+
+        /// <summary>How long one priority turn may keep the gate before it is released (zero: after every write).</summary>
+        public TimeSpan Burst { get; init; }
+
+        /// <summary>The clock the held time is read on (the service's, so tests drive it).</summary>
+        public TimeProvider Time { get; init; } = TimeProvider.System;
+
+        /// <summary>
+        /// The time the pass has spent against its budget: for a priority pass only the time it HELD the writer (the wait
+        /// for turns is not spent); otherwise the wall time since it started.
+        /// </summary>
+        public TimeSpan BudgetElapsed() => !Priority
+            ? System.Diagnostics.Stopwatch.GetElapsedTime(_startedAt)
+            : _held + (_holding ? Time.GetUtcNow() - _holdStart : TimeSpan.Zero);
+
+        /// <summary>The total time this pass held the gate (priority passes), including a turn still open.</summary>
+        public TimeSpan HeldTime => _held + (_holding ? Time.GetUtcNow() - _holdStart : TimeSpan.Zero);
+
+        /// <summary>Releases the gate if this pass holds it; a no-op otherwise.</summary>
+        public void EndTurn(SnapshotService service)
+        {
+            if (!_holding)
+                return;
+            _held += Time.GetUtcNow() - _holdStart;
+            _holding = false;
+            service._writeGate.Release();
+        }
 
         public RetentionPassTimings ToTimings(int batches) => new()
         {
@@ -2258,6 +2374,9 @@ public sealed partial class SnapshotService : IDisposable
         // Runs a writer turn, splitting the time into the wait for the gate and the work under it.
         public async Task<T> WriteAsync<T>(SnapshotService service, Func<Task<T>> work, Action<double> addWork, CancellationToken ct)
         {
+            if (Priority)
+                return await WriteHeldAsync(service, work, addWork, ct).ConfigureAwait(false);
+
             var asked = System.Diagnostics.Stopwatch.GetTimestamp();
             long entered = 0;
             try
@@ -2266,7 +2385,7 @@ public sealed partial class SnapshotService : IDisposable
                 {
                     entered = System.Diagnostics.Stopwatch.GetTimestamp();
                     return await work().ConfigureAwait(false);
-                }, ct).ConfigureAwait(false);
+                }, ct, Priority).ConfigureAwait(false);
             }
             finally
             {
@@ -2278,6 +2397,45 @@ public sealed partial class SnapshotService : IDisposable
                     WriterWaitMs += System.Diagnostics.Stopwatch.GetElapsedTime(asked, entered).TotalMilliseconds;
                     addWork(System.Diagnostics.Stopwatch.GetElapsedTime(entered, end).TotalMilliseconds);
                 }
+            }
+        }
+
+        private async Task<T> WriteHeldAsync<T>(SnapshotService service, Func<Task<T>> work, Action<double> addWork, CancellationToken ct)
+        {
+            if (!_holding)
+            {
+                // Counted like any write's turn, so a retirement is never coalesced across it (issue #158).
+                Interlocked.Increment(ref service._writeAdmissions);
+                var asked = System.Diagnostics.Stopwatch.GetTimestamp();
+                try
+                {
+                    await service._writeGate.WaitAsync(ct, priority: true).ConfigureAwait(false);
+                    // Set before anything that could throw, so EndTurn always releases a granted turn.
+                    _holding = true;
+                    _holdStart = Time.GetUtcNow();
+                }
+                finally
+                {
+                    var waitMs = System.Diagnostics.Stopwatch.GetElapsedTime(asked).TotalMilliseconds;
+                    WriterWaitMs += waitMs;
+                    service._metrics.RecordMaintenanceWriterWait(waitMs);
+                }
+            }
+
+            var entered = System.Diagnostics.Stopwatch.GetTimestamp();
+            var completed = false;
+            try
+            {
+                service.EnsureLeaseHeld();
+                var result = await work().ConfigureAwait(false);
+                completed = true;
+                return result;
+            }
+            finally
+            {
+                addWork(System.Diagnostics.Stopwatch.GetElapsedTime(entered).TotalMilliseconds);
+                if (!completed || Burst <= TimeSpan.Zero || Time.GetUtcNow() - _holdStart >= Burst)
+                    EndTurn(service);
             }
         }
     }
@@ -2341,15 +2499,17 @@ public sealed partial class SnapshotService : IDisposable
 
     private async Task<RetentionReport> RunRetentionPassAsync(
         bool execute, AuditCaller principal, CancellationToken cancellationToken, TimeSpan? passLimit,
-        RetentionPassTimer timer)
+        RetentionPassTimer timer, CancellationToken passBound = default)
     {
         using var activity = ServiceTelemetry.Source.StartActivity("retention");
         activity?.SetTag("sextant.execute", execute);
         var limit = passLimit ?? RetentionService.PassTimeLimit;
         using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetime.Token);
-        using var pass = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
-        pass.CancelAfter(limit);
-        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        using var pass = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, passBound);
+        // A priority pass spends only its writer-HELD time (timer.BudgetElapsed), never the wall time it waited for turns;
+        // passBound (the tick deadline) is what ends such a wait.
+        if (!timer.Priority)
+            pass.CancelAfter(limit);
         var report = new RetentionReport { DryRun = !execute };
         try
         {
@@ -2383,7 +2543,7 @@ public sealed partial class SnapshotService : IDisposable
                 var batch = await timer.WriteAsync(this, () =>
                 {
                     pass.Token.ThrowIfCancellationRequested();
-                    var remaining = limit - System.Diagnostics.Stopwatch.GetElapsedTime(started);
+                    var remaining = limit - timer.BudgetElapsed();
                     batchPassBound = remaining < RetentionService.BatchTimeLimit;
                     var batchLimit = batchPassBound ? remaining : RetentionService.BatchTimeLimit;
                     var retention = new RetentionService(_conn, _options.Retention);
@@ -2412,14 +2572,16 @@ public sealed partial class SnapshotService : IDisposable
                 foreach (var line in batch.TailSkipped)
                     await Console.Error.WriteLineAsync(line).ConfigureAwait(false);
                 if (batch.StopReason != null) return report with { LeftWork = plan.DescribeLeft() };
-                // WithWriteAsync releases the gate before the next admission; already-queued publishes go first.
+                // The writer-held budget is spent: stop here (a wall-clock pass is cut by its token instead).
+                if (report.MoreRemaining && timer.Priority && timer.BudgetElapsed() >= limit)
+                    return report with { MoreRemaining = true, StopReason = "time_budget", LeftWork = plan.DescribeLeft() };
             } while (report.MoreRemaining);
 
             var sweepPassBound = false;
             var sweep = await timer.WriteAsync(this, () =>
             {
                 pass.Token.ThrowIfCancellationRequested();
-                var remaining = limit - System.Diagnostics.Stopwatch.GetElapsedTime(started);
+                var remaining = limit - timer.BudgetElapsed();
                 sweepPassBound = remaining < RetentionService.BatchTimeLimit;
                 var sweepLimit = sweepPassBound ? remaining : RetentionService.BatchTimeLimit;
                 return Task.FromResult(new RetentionService(_conn, _options.Retention)
@@ -2442,7 +2604,7 @@ public sealed partial class SnapshotService : IDisposable
             {
                 while (true)
                 {
-                    if (System.Diagnostics.Stopwatch.GetElapsedTime(started) >= vacuumStop)
+                    if (timer.BudgetElapsed() >= vacuumStop)
                     {
                         using var reader = OpenReadConnection();
                         vacuumLeft = IncrementalVacuum.IsIncremental(reader) && IncrementalVacuum.FreelistPages(reader) > 0;
@@ -2939,11 +3101,15 @@ public sealed partial class SnapshotService : IDisposable
         }
     }
 
-    private async Task<T> WithWriteAsync<T>(Func<Task<T>> work, CancellationToken cancellationToken = default)
+    private async Task<T> WithWriteAsync<T>(Func<Task<T>> work, CancellationToken cancellationToken = default, bool priority = false)
     {
         // Counted like a control write's turn, so a retirement is never coalesced across another write (issue #158).
         Interlocked.Increment(ref _writeAdmissions);
-        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        // A maintenance write (issue #333) takes the priority lane and records how long it waited, so starvation shows.
+        var asked = System.Diagnostics.Stopwatch.GetTimestamp();
+        await _writeGate.WaitAsync(cancellationToken, priority).ConfigureAwait(false);
+        if (priority)
+            _metrics.RecordMaintenanceWriterWait(System.Diagnostics.Stopwatch.GetElapsedTime(asked).TotalMilliseconds);
         try
         {
             EnsureLeaseHeld();
@@ -3008,7 +3174,6 @@ public sealed partial class SnapshotService : IDisposable
         _maintenanceTimer?.Dispose();
         _maintenanceTick.Dispose();
         _maintenanceTicked.Dispose();
-        _writeGate.Dispose();
         _lifetime.Dispose();
     }
 

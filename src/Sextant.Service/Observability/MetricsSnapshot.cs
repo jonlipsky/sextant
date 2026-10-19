@@ -94,6 +94,9 @@ public sealed record MaintenanceMetrics
     public long Failures { get; init; }
 
     public long IdleBranchesRetiredTotal { get; init; }
+
+    /// <summary>Idle-branch retirements that applied but retired nothing (pointer moved, work appeared, gone), since start (issue #333).</summary>
+    public long IdleBranchRetiresSkippedTotal { get; init; }
     public long LastIdleBranchesRetired { get; init; }
     public long LastIdlePassAtUnixMs { get; init; }
     public double LastIdlePassDurationMs { get; init; }
@@ -132,8 +135,20 @@ public sealed record MaintenanceMetrics
     /// <summary>Queued jobs with no live turn that startup settled as cancelled, since start (issue #327).</summary>
     public long StartupJobsSettledCancelled { get; init; }
 
-    /// <summary>Due scheduled retention passes skipped because indexing held the writer (retried next tick).</summary>
+    /// <summary>Always 0 since issue #333: a due pass no longer skips while indexing holds the writer (it waits for a priority turn). Kept so dashboards keep resolving.</summary>
     public long ScheduledRetentionSkippedBusy { get; init; }
+
+    /// <summary>Maintenance writes that took a priority turn on the writer gate (issue #333).</summary>
+    public long MaintenanceWriterTurns { get; init; }
+
+    /// <summary>Total milliseconds maintenance writes waited for their priority turn (issue #333).</summary>
+    public double MaintenanceWriterWaitMsTotal { get; init; }
+
+    /// <summary>Longest single wait of a maintenance write for its priority turn (issue #333).</summary>
+    public double MaintenanceWriterWaitMsMax { get; init; }
+
+    /// <summary>Maintenance steps deferred to the next tick because the writer was not available in time, by step (issue #333).</summary>
+    public IReadOnlyDictionary<string, long> MaintenanceDeferrals { get; init; } = new Dictionary<string, long>();
 
     /// <summary>Executed retention passes whose closing audit row was skipped because the writer stayed busy (issue #321).</summary>
     public long RetentionAuditSkipped { get; init; }

@@ -500,12 +500,12 @@ public class IdleBranchMaintenanceTests
 
         Assert.IsTrue(h.Service.ScheduledPassContinues(cut), "the counter restarts once the day closed");
         Assert.IsTrue(h.Service.ScheduledPassContinues(cut with { SnapshotsDeleted = 1, StopReason = "time_budget" }));
-        Assert.IsFalse(SnapshotService.ScheduledRetentionContinues(new RetentionReport { DryRun = false, MoreRemaining = true, StopReason = "time_budget" }),
+        Assert.IsFalse(SnapshotService.ScheduledRetentionContinues(new RetentionReport { DryRun = false, MoreRemaining = true, StopReason = "time_budget", Batches = 2 }),
             "a stuck catalog with no budget cut stays done for the day");
     }
 
     [TestMethod]
-    public async Task ScheduledRetention_WhileIndexingHoldsTheWriter_IsSkippedAndRetried()
+    public async Task ScheduledRetention_WhileIndexingHoldsTheWriter_WaitsForItsPriorityTurn_InsteadOfSkipping()
     {
         await using var h = Harness.Create(
             maintenance: NoLoop() with { BranchIdleRetireDays = 0, RetentionHourUtc = 0 }, gatedWorker: true);
@@ -513,16 +513,16 @@ public class IdleBranchMaintenanceTests
         var blocker = h.Service.EnsureSnapshotAsync(new EnsureSnapshotRequest { RepositoryRemoteUrl = BlockerRepo, CommitSha = "b-1" });
         await WaitUntilAsync(() => h.Worker.Calls == 1);
 
-        var busy = await h.Service.RunMaintenanceTickAsync().WaitAsync(Settle);
-        Assert.AreEqual("busy", busy.Retention);
-        Assert.AreEqual(1, h.Service.CollectMetrics().Maintenance.ScheduledRetentionSkippedBusy);
-        Assert.AreEqual(0, h.Service.RecentAudit(action: AuditAction.Retention).Count, "nothing ran");
+        var tick = h.Service.RunMaintenanceTickAsync();
+        await WaitUntilAsync(() => h.Service.WriteGateForTesting.PriorityWaiters >= 1);
+        Assert.IsFalse(tick.IsCompleted, "the pass waits for its turn instead of skipping the tick");
 
         h.Worker.Gate.TrySetResult();
         await blocker.WaitAsync(Settle);
 
-        var retried = await h.Service.RunMaintenanceTickAsync().WaitAsync(Settle);
-        Assert.AreEqual("ran", retried.Retention);
+        var ran = await tick.WaitAsync(Settle);
+        Assert.AreEqual("ran", ran.Retention);
+        Assert.AreEqual(0, h.Service.CollectMetrics().Maintenance.ScheduledRetentionSkippedBusy);
     }
 
     // ---- options -------------------------------------------------------------------------------------
