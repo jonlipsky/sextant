@@ -286,6 +286,9 @@ public static class BranchGuardReason
     /// <summary>The idle-branch rule skipped a branch whose pointer moved after it was selected (issue #299).</summary>
     public const string PointerMoved = "pointer_moved";
 
+    /// <summary>The upstream-branch reconcile skipped a branch with job or pointer activity after its confirming listing started (issue #338).</summary>
+    public const string UpstreamActivity = "upstream_activity";
+
     /// <summary>The idle-branch rule skipped a branch with a queued/running job or a pending handover (issue #299).</summary>
     public const string BranchBusy = "branch_busy";
 

@@ -486,7 +486,8 @@ public sealed record ServiceOptions
                 Env("BRANCH_IDLE_RETIRE_MAX_PER_PASS"), EnvBool("RETENTION_SCHEDULE"),
                 Env("RETENTION_SCHEDULE_HOUR_UTC"), Env("RETENTION_PASS_SECONDS"),
                 Env("REPOSITORY_RECLAIM_DAYS"), Env("REPOSITORY_RECLAIM_MAX_PER_PASS"),
-                Env("RETENTION_BURST_SECONDS"), Env("RETENTION_CONTINUE_MINUTES"), Env("MAINTENANCE_TICK_DEADLINE_SECONDS")),
+                Env("RETENTION_BURST_SECONDS"), Env("RETENTION_CONTINUE_MINUTES"), Env("MAINTENANCE_TICK_DEADLINE_SECONDS"),
+                Env("BRANCH_UPSTREAM_CHECK_MINUTES"), Env("BRANCH_UPSTREAM_CHECK_MAX_REPOSITORIES_PER_TICK")),
             // Fold the node's own profile hash into request identities by default, so an ensure request that
             // omits ConfigHash resolves to the SAME identity_hash the local worker's orchestrator publishes
             // under (IndexProfileDescriptor.ConfigurationHash) — without it the idempotency lookup misses.
@@ -638,7 +639,8 @@ public sealed record ServiceOptions
     internal static MaintenancePolicy ParseMaintenance(
         string? intervalMinutes, string? idleDays, string? maxPerPass, bool? scheduledRetention, string? retentionHourUtc,
         string? retentionPassSeconds = null, string? repositoryReclaimDays = null, string? repositoryReclaimMaxPerPass = null,
-        string? retentionBurstSeconds = null, string? retentionContinueMinutes = null, string? tickDeadlineSeconds = null) => new()
+        string? retentionBurstSeconds = null, string? retentionContinueMinutes = null, string? tickDeadlineSeconds = null,
+        string? upstreamCheckMinutes = null, string? upstreamCheckMaxRepositories = null) => new()
         {
             Interval = TimeSpan.FromMinutes(int.TryParse(intervalMinutes, out var minutes) && minutes >= 0
                 ? Math.Min(minutes, MaintenancePolicy.MaxIntervalMinutes) : MaintenancePolicy.DefaultIntervalMinutes),
@@ -660,7 +662,12 @@ public sealed record ServiceOptions
             RetentionContinueMinutes = int.TryParse(retentionContinueMinutes, out var cont) && cont >= 0
                 ? Math.Min(cont, MaintenancePolicy.MaxRetentionContinueMinutes) : MaintenancePolicy.DefaultRetentionContinueMinutes,
             TickDeadlineSeconds = int.TryParse(tickDeadlineSeconds, out var deadline) && deadline > 0
-                ? Math.Min(deadline, MaintenancePolicy.MaxTickDeadlineSeconds) : MaintenancePolicy.DefaultTickDeadlineSeconds
+                ? Math.Min(deadline, MaintenancePolicy.MaxTickDeadlineSeconds) : MaintenancePolicy.DefaultTickDeadlineSeconds,
+            BranchUpstreamCheckMinutes = int.TryParse(upstreamCheckMinutes, out var upstreamMinutes) && upstreamMinutes >= 0
+                ? Math.Min(upstreamMinutes, MaintenancePolicy.MaxBranchUpstreamCheckMinutes) : MaintenancePolicy.DefaultBranchUpstreamCheckMinutes,
+            BranchUpstreamCheckMaxRepositoriesPerTick = int.TryParse(upstreamCheckMaxRepositories, out var upstreamCap) && upstreamCap > 0
+                ? Math.Min(upstreamCap, MaintenancePolicy.MaxBranchUpstreamCheckMaxRepositoriesPerTick)
+                : MaintenancePolicy.DefaultBranchUpstreamCheckMaxRepositoriesPerTick
         };
 
     internal static RetentionPolicy WithUnitMaxForTesting(RetentionPolicy policy) =>

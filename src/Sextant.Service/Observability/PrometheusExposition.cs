@@ -97,6 +97,16 @@ public static class PrometheusExposition
             s.Maintenance.IdleBranchRetiresSkippedTotal);
         Gauge(sb, "sextant_idle_branches_retired_last_pass", "Idle branch pointers retired by the latest pass.",
             s.Maintenance.LastIdleBranchesRetired);
+        Gauge(sb, "sextant_upstream_repositories_checked_total", "Repositories whose upstream branches were listed since start.",
+            s.Maintenance.UpstreamRepositoriesCheckedTotal);
+        Gauge(sb, "sextant_upstream_branches_retired_total", "Branch pointers retired because the branch no longer exists upstream since start.",
+            s.Maintenance.UpstreamBranchesRetiredTotal);
+        Gauge(sb, "sextant_upstream_branch_retires_skipped_total", "Upstream-branch retirements that applied but retired nothing since start.",
+            s.Maintenance.UpstreamBranchRetiresSkippedTotal);
+        Gauge(sb, "sextant_upstream_listing_failures_total", "Upstream branch listings that failed or were not trustworthy since start.",
+            s.Maintenance.UpstreamListingFailuresTotal);
+        Gauge(sb, "sextant_upstream_pass_duration_ms", "Duration of the latest upstream-branch pass in milliseconds.",
+            s.Maintenance.LastUpstreamPassDurationMs);
         Gauge(sb, "sextant_repositories_reclaimed_total", "Inactive repositories whose checkout and caches were deleted since start.",
             s.Maintenance.RepositoriesReclaimedTotal);
         Gauge(sb, "sextant_repository_bytes_reclaimed_total", "Bytes freed by repository reclaims since start.",

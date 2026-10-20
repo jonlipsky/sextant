@@ -101,6 +101,20 @@ public sealed record MaintenanceMetrics
     public long LastIdlePassAtUnixMs { get; init; }
     public double LastIdlePassDurationMs { get; init; }
 
+    /// <summary>Repositories whose upstream branches were listed (successfully or not) since start (issue #338).</summary>
+    public long UpstreamRepositoriesCheckedTotal { get; init; }
+
+    /// <summary>Branch pointers retired because their branch no longer exists upstream, since start.</summary>
+    public long UpstreamBranchesRetiredTotal { get; init; }
+
+    /// <summary>Upstream-branch retirements that applied but retired nothing (pointer moved, work appeared, gone), since start.</summary>
+    public long UpstreamBranchRetiresSkippedTotal { get; init; }
+
+    /// <summary>Upstream listings that failed or were not trustworthy (timeout, error, unparseable, empty), since start.</summary>
+    public long UpstreamListingFailuresTotal { get; init; }
+    public long LastUpstreamPassAtUnixMs { get; init; }
+    public double LastUpstreamPassDurationMs { get; init; }
+
     /// <summary>Inactive repositories whose checkout and caches were deleted since start (issue #291).</summary>
     public long RepositoriesReclaimedTotal { get; init; }
 
