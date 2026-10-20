@@ -103,6 +103,28 @@ public sealed class ServiceMetrics
                 : _maintenance with { IdleBranchRetiresSkippedTotal = _maintenance.IdleBranchRetiresSkippedTotal + 1 };
     }
 
+    /// <summary>Records one maintenance tick's upstream-branch reconcile pass (issue #338).</summary>
+    public void RecordUpstreamBranchPass(int repositoriesChecked, int listingFailures, long atUnixMs, double durationMs)
+    {
+        lock (_maintenanceLock)
+            _maintenance = _maintenance with
+            {
+                UpstreamRepositoriesCheckedTotal = _maintenance.UpstreamRepositoriesCheckedTotal + repositoriesChecked,
+                UpstreamListingFailuresTotal = _maintenance.UpstreamListingFailuresTotal + listingFailures,
+                LastUpstreamPassAtUnixMs = atUnixMs,
+                LastUpstreamPassDurationMs = durationMs
+            };
+    }
+
+    /// <summary>Records one applied upstream-branch retirement (issue #338), when it applies.</summary>
+    public void RecordUpstreamBranchRetireApplied(bool retired)
+    {
+        lock (_maintenanceLock)
+            _maintenance = retired
+                ? _maintenance with { UpstreamBranchesRetiredTotal = _maintenance.UpstreamBranchesRetiredTotal + 1 }
+                : _maintenance with { UpstreamBranchRetiresSkippedTotal = _maintenance.UpstreamBranchRetiresSkippedTotal + 1 };
+    }
+
     /// <summary>Records one maintenance tick's repository reclaim pass (issue #291).</summary>
     public void RecordRepositoryReclaimPass(int reclaimed, long bytes, int failed, long atUnixMs, double durationMs)
     {

@@ -134,7 +134,8 @@ public static class ServiceHostRunner
             // Issue #199: in clone mode the provider also looks up a repository's remote default branch for a user
             // ensure. Locate mode has no outbound git, so there a user's first branch never becomes the default.
             service = SnapshotService.Start(options, worker, database, gitContent: gitContent,
-                remoteDefaults: checkoutProvider as IRemoteDefaultBranchResolver);
+                remoteDefaults: checkoutProvider as IRemoteDefaultBranchResolver,
+                remoteBranches: checkoutProvider as IRemoteBranchLister);
         }
         catch (Exception ex)
         {

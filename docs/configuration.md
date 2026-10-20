@@ -178,6 +178,8 @@ snapshots become reclaimable (issue #299). Both run from its maintenance loop:
 | `SEXTANT_SERVICE_MAINTENANCE_INTERVAL_MINUTES` | `60` | Maintenance loop tick interval (clamped to 7 days); `0` turns the loop (and both rules below) off. |
 | `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_DAYS` | `7` | Retire a non-default branch pointer that has not moved for more than this many days (clamped to 3650); `0` disables. The default branch is never retired, and the branch's next push re-creates it. |
 | `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_MAX_PER_PASS` | `20` | Most idle branches retired per tick (clamped to `1000`). |
+| `SEXTANT_SERVICE_BRANCH_UPSTREAM_CHECK_MINUTES` | `60` | Minimum minutes between upstream branch listings of one repository; a non-default pointer absent on two consecutive listings (at most 3 intervals apart) is retired; up to 3 repositories are listed in parallel with a 30 s timeout each. `0` disables (clamped to `10080`). |
+| `SEXTANT_SERVICE_BRANCH_UPSTREAM_CHECK_MAX_REPOSITORIES_PER_TICK` | `10` | Most repositories listed per tick (clamped to `1000`). |
 | `SEXTANT_SERVICE_REPOSITORY_RECLAIM_DAYS` | `14` | Delete the checkout, git object store and NuGet package folder of a repository with no branch pointer, no pending work and no activity for more than this many days (clamped to 3650); `0` disables. Catalog rows stay; the next ensure re-clones cold. |
 | `SEXTANT_SERVICE_REPOSITORY_RECLAIM_MAX_PER_PASS` | `5` | Most inactive repositories reclaimed per tick (clamped to `1000`). |
 | `SEXTANT_SERVICE_RETENTION_SCHEDULE` | `true` | Run the bounded retention pass once a day (never a `VACUUM`). |

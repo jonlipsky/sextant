@@ -48,6 +48,7 @@ public sealed partial class SnapshotService : IDisposable
     private readonly IGitContentProvider _gitContent;
     private readonly ContributionPolicy _contributionPolicy;
     private readonly RemoteDefaultBranchLookup? _remoteDefaults;
+    private readonly IRemoteBranchLister? _remoteBranches;
     private readonly TimeProvider _timeProvider;
     private readonly ServiceMetrics _metrics = new();
 
@@ -107,7 +108,7 @@ public sealed partial class SnapshotService : IDisposable
         ServiceOptions options, ISnapshotWorker worker, ServicePaths paths,
         IndexDatabase db, WriterLease lease, bool ownsDatabase,
         IContributionAuthorizer authorizer, IGitContentProvider gitContent, ContributionPolicy contributionPolicy,
-        IRemoteDefaultBranchResolver? remoteDefaults, TimeProvider? timeProvider)
+        IRemoteDefaultBranchResolver? remoteDefaults, TimeProvider? timeProvider, IRemoteBranchLister? remoteBranches)
     {
         _options = options;
         _worker = worker;
@@ -121,6 +122,7 @@ public sealed partial class SnapshotService : IDisposable
         _gitContent = gitContent;
         _contributionPolicy = contributionPolicy;
         _remoteDefaults = remoteDefaults is null ? null : new RemoteDefaultBranchLookup(remoteDefaults);
+        _remoteBranches = remoteBranches;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _writeGate = new WriteGate(_timeProvider);
         _jobIds = new JobIdReservations(
@@ -177,7 +179,7 @@ public sealed partial class SnapshotService : IDisposable
         ServiceOptions options, ISnapshotWorker? worker = null, IndexDatabase? database = null,
         IContributionAuthorizer? authorizer = null, IGitContentProvider? gitContent = null,
         ContributionPolicy? contributionPolicy = null, IRemoteDefaultBranchResolver? remoteDefaults = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null, IRemoteBranchLister? remoteBranches = null)
     {
         var effectivePolicy = contributionPolicy ?? options.Contribution;
         var effectiveAuthorizer = authorizer ?? OpenContributionAuthorizer.Instance;
@@ -219,7 +221,7 @@ public sealed partial class SnapshotService : IDisposable
                 db.Recover();
                 var service = new SnapshotService(
                     options, worker ?? new UnavailableSnapshotWorker(), paths, db, lease, ownsDatabase,
-                    effectiveAuthorizer, effectiveGitContent, effectivePolicy, remoteDefaults, timeProvider);
+                    effectiveAuthorizer, effectiveGitContent, effectivePolicy, remoteDefaults, timeProvider, remoteBranches);
                 service._jobIds.Load();
                 service.ReconcileOnStartup();
                 service.StartMaintenanceLoop();
@@ -2134,7 +2136,9 @@ public sealed partial class SnapshotService : IDisposable
             EnsureLeaseHeld();
             var result = RetireBranchLocked(request, principal, idle, advanceAdmitted);
             // Counted when it applies, so a retirement the maintenance step stopped waiting for still shows (issue #333).
-            if (idle is not null)
+            if (idle is { Upstream: true })
+                _metrics.RecordUpstreamBranchRetireApplied(result.Retired);
+            else if (idle is not null)
                 _metrics.RecordIdleBranchRetireApplied(result.Retired);
             return result;
         }
@@ -2172,11 +2176,22 @@ public sealed partial class SnapshotService : IDisposable
                 result = new RetireBranchResult { Retired = false, Reason = BranchGuardReason.DefaultBranch };
             else if (idle is { } selected && (branch.SnapshotId != selected.SnapshotId || branch.UpdatedAt != selected.UpdatedAt))
                 result = new RetireBranchResult { Retired = false, Reason = BranchGuardReason.PointerMoved };
+            else if (idle is { Upstream: true } listed
+                     && (branch.UpdatedAt >= listed.ListedAtUnixMs
+                         || new SnapshotJobStore(_conn).HasBranchActivitySince(
+                             RemoteUrlIdentity.Normalize(request.Repository), branch.Name, listed.ListedAtUnixMs)))
+                // Issue #338: the branch was touched after the listing that called it deleted (re-created upstream and
+                // ensured), so that listing no longer speaks for it.
+                result = new RetireBranchResult { Retired = false, Reason = BranchGuardReason.UpstreamActivity };
             else if (idle is not null && (advanceAdmitted || new SnapshotJobStore(_conn).BranchesWithPendingWork()
                          .Contains((RemoteUrlIdentity.Normalize(request.Repository), branch.Name))))
                 result = new RetireBranchResult { Retired = false, Reason = BranchGuardReason.BranchBusy };
             else if (request.ExpectedHeadCommit is { } expected && !snapshots.BranchHeadMatches(branch.Id, expected))
                 result = new RetireBranchResult { Retired = false, Reason = BranchGuardReason.HeadMismatch };
+            else if (idle is { Upstream: true })
+                // Issue #338: the branch is gone from git too, so no head is recorded (like a delete-push retire); a
+                // retired head would let a later push resurrect it.
+                result = new RetireBranchResult { Retired = snapshots.DeleteBranch(branch.Id) };
             else if (idle is not null)
             {
                 // Issue #299: the branch still exists in git, so its next push expects this head; record it so that push
@@ -3302,7 +3317,7 @@ public sealed partial class SnapshotService : IDisposable
         string Repository, string Branch, string? ExpectedHeadCommit, string? Actor, IdleRetireGuard? Idle);
 
     // The pointer an idle-branch retirement selected (issue #299): it applies only while the branch still has exactly it.
-    private readonly record struct IdleRetireGuard(long? SnapshotId, long UpdatedAt);
+    private readonly record struct IdleRetireGuard(long? SnapshotId, long UpdatedAt, bool Upstream = false, long ListedAtUnixMs = 0);
 
     // A retirement waiting for (or holding) its write-gate turn (issue #158). Admission is the write-admission count
     // its own turn produced; Retire is assigned under _inFlightLock before the entry is published.

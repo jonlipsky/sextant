@@ -18,6 +18,14 @@ public sealed record MaintenancePolicy
     internal const int DefaultRetentionBurstSeconds = 120;
     internal const int DefaultRetentionContinueMinutes = 5;
     internal const int DefaultTickDeadlineSeconds = 900;
+    internal const int DefaultBranchUpstreamCheckMinutes = 60;
+    internal const int DefaultBranchUpstreamCheckMaxRepositoriesPerTick = 10;
+
+    /// <summary>The longest upstream-check interval, in minutes (7 days); a longer value is clamped to it.</summary>
+    public const int MaxBranchUpstreamCheckMinutes = 7 * 24 * 60;
+
+    /// <summary>The largest per-tick upstream-check repository cap the environment can set.</summary>
+    public const int MaxBranchUpstreamCheckMaxRepositoriesPerTick = 1000;
 
     /// <summary>The longest retention hold of the writer, in seconds (1 hour); a longer value is clamped to it.</summary>
     public const int MaxRetentionBurstSeconds = 3600;
@@ -126,6 +134,19 @@ public sealed record MaintenancePolicy
     /// </summary>
     public int TickDeadlineSeconds { get; init; } = DefaultTickDeadlineSeconds;
 
+    /// <summary>
+    /// The least time between upstream-branch checks of one repository (issue #338): the loop lists the remote's
+    /// branches and retires the non-default pointers whose branch is gone (absent on two consecutive listings).
+    /// <c>0</c> disables the step. <c>SEXTANT_SERVICE_BRANCH_UPSTREAM_CHECK_MINUTES</c> (default 60; clamped to <see cref="MaxBranchUpstreamCheckMinutes"/>).
+    /// </summary>
+    public int BranchUpstreamCheckMinutes { get; init; } = DefaultBranchUpstreamCheckMinutes;
+
+    /// <summary>
+    /// The most repositories one tick lists upstream (the least recently checked first).
+    /// <c>SEXTANT_SERVICE_BRANCH_UPSTREAM_CHECK_MAX_REPOSITORIES_PER_TICK</c> (default 10).
+    /// </summary>
+    public int BranchUpstreamCheckMaxRepositoriesPerTick { get; init; } = DefaultBranchUpstreamCheckMaxRepositoriesPerTick;
+
     /// <summary>A one-line description of the effective policy for the startup log.</summary>
     public string Describe()
     {
@@ -137,10 +158,13 @@ public sealed record MaintenancePolicy
         var reclaim = RepositoryReclaimDays > 0
             ? $"reclaims disk of repositories inactive >= {RepositoryReclaimDays} day(s), at most {RepositoryReclaimMaxPerPass} per tick"
             : "repository reclaim disabled";
+        var upstream = BranchUpstreamCheckMinutes > 0
+            ? $"checks upstream branches of each repository every {BranchUpstreamCheckMinutes} min, at most {BranchUpstreamCheckMaxRepositoriesPerTick} repositories per tick"
+            : "upstream-branch check disabled";
         var retention = ScheduledRetention
             ? $"scheduled retention daily from {RetentionHourUtc:D2}:00 UTC"
             : "scheduled retention disabled";
-        return $"maintenance: every {Interval.TotalMinutes:0.##} min; {idle}; {reclaim}; {retention}.";
+        return $"maintenance: every {Interval.TotalMinutes:0.##} min; {idle}; {upstream}; {reclaim}; {retention}.";
     }
 
     /// <summary>The policy with the loop off (no ticks at all).</summary>

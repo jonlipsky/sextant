@@ -222,11 +222,11 @@ Each batch is its own transaction; the pass holds the writer in a burst of `SEXT
 (default 120) per turn and spends `SEXTANT_SERVICE_RETENTION_PASS_SECONDS` only while holding it. Expect a waiting
 production to be delayed by at most the burst plus one batch (~2 s).
 
-**Maintenance deferrals (#333).** Maintenance writes (idle-branch retire, retired-head prune, repository reclaim,
+**Maintenance deferrals (#333).** Maintenance writes (idle-branch retire, upstream-branch retire, retired-head prune, repository reclaim,
 scheduled retention) take a priority lane on the writer gate, so continuous indexing cannot starve them. Watch
 `sextant_maintenance_writer_wait_ms_max` / `sextant_maintenance_writer_wait_ms_total` /
 `sextant_maintenance_writer_turns_total` (how long maintenance waited for the writer) and
-`sextant_maintenance_deferrals_total{step=idle_branch_retire|retired_head_prune|repository_reclaim|reclaim_audit|scheduled_retention}`.
+`sextant_maintenance_deferrals_total{step=idle_branch_retire|upstream_branch_check|upstream_branch_retire|retired_head_prune|repository_reclaim|reclaim_audit|scheduled_retention}`.
 A deferral means a step could not get the writer before the tick's shared deadline
 (`SEXTANT_SERVICE_MAINTENANCE_TICK_DEADLINE_SECONDS`, default 900; one log line
 `maintenance: <step> deferred`); it is retried on the next tick and later steps still ran. An occasional

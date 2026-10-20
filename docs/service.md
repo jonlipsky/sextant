@@ -98,6 +98,8 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_MAINTENANCE_INTERVAL_MINUTES` | How often the service-owned maintenance loop ticks (issue #299; see [Maintenance loop](#maintenance-loop-idle-branch-retirement--scheduled-retention-issue-299)). `0` turns the loop off: no idle-branch retirement, no retired-head pruning and no scheduled retention. Clamped to `10080` (7 days); a non-numeric or negative value uses the default | `60` |
 | `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_DAYS` | Retire a NON-DEFAULT branch pointer that has not moved for more than this many days (issue #299). `0` disables the rule. Clamped to `3650`; a non-numeric or negative value uses the default | `7` |
 | `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_MAX_PER_PASS` | The most idle branch pointers one tick retires (least recently moved first; the rest wait for the next tick). Clamped to `1000`; a non-numeric or non-positive value uses the default | `20` |
+| `SEXTANT_SERVICE_BRANCH_UPSTREAM_CHECK_MINUTES` | Minimum minutes between upstream (`git ls-remote --heads`) checks of one repository; a non-default branch pointer absent upstream on two consecutive listings is retired (issue #338). `0` disables. Clamped to `10080`; a non-numeric or negative value uses the default | `60` |
+| `SEXTANT_SERVICE_BRANCH_UPSTREAM_CHECK_MAX_REPOSITORIES_PER_TICK` | The most repositories one tick lists (least recently checked first). Clamped to `1000`; a non-numeric or non-positive value uses the default | `10` |
 | `SEXTANT_SERVICE_REPOSITORY_RECLAIM_DAYS` | Reclaim the checkout, git object store and NuGet package folder of a repository with no branch pointer, no pending work and no activity for more than this many days (issue #291). `0` disables the rule. Clamped to `3650`; a non-numeric or negative value uses the default | `14` |
 | `SEXTANT_SERVICE_REPOSITORY_RECLAIM_MAX_PER_PASS` | The most inactive repositories one tick reclaims (least active first). Clamped to `1000`; a non-numeric or non-positive value uses the default | `5` |
 | `SEXTANT_SERVICE_RETENTION_SCHEDULE` | Run the bounded retention pass once a day from the maintenance loop (issue #299). A malformed boolean **fails startup** | `true` |
@@ -2218,6 +2220,39 @@ their snapshots forever. A service-owned loop cleans them up.
   stale push re-create a deleted branch. While the loop runs, every tick prunes records older than 90 days,
   even with the idle rule turned off (`retired_heads_pruned` in the tick log). After that, an idle-retired branch
   that was never pushed comes back only as a new branch.
+- **Upstream-deleted branch retirement (every tick, issue #338).** After the idle rule and before reclaim, a
+  repository with at least one NON-DEFAULT branch pointer is listed with a hardened
+  `git ls-remote --heads --end-of-options <url>` over the same hardened environment and
+  `SEXTANT_SERVICE_CHECKOUT_TOKEN` handling as a clone. The lister itself only refuses a URL with userinfo; the
+  catalog URLs already passed the ensure-intake URL policy. The listing runs OUTSIDE the writer gate; only the
+  retirements take writer turns. At most `SEXTANT_SERVICE_BRANCH_UPSTREAM_CHECK_MAX_REPOSITORIES_PER_TICK`
+  (default 10) repositories are checked per tick, least recently checked first, and one repository is checked at
+  most every `SEXTANT_SERVICE_BRANCH_UPSTREAM_CHECK_MINUTES` (default 60, `0` = off; the last-checked times are in
+  memory, so a restart re-checks). URL spellings of one repository are listed once. **Listing is bounded:** at most
+  3 repositories are listed in parallel, each `ls-remote` has a 30 s timeout, and the whole listing phase gets half
+  of what is left of the tick deadline when the step starts; repositories not listed in time stay due and are counted
+  in the `upstream_branch_check` deferral. A listing still running from an earlier tick (its wait was abandoned; the
+  git call ends by its own timeout and is harmless) is not started again until it finishes. State is mutated only
+  by the tick after the listings return. A listing must be complete to act on: a timeout, a non-zero exit,
+  unparseable output or an EMPTY head list for a repository that has pointers retires nothing, counts a listing
+  failure and clears that repository's pending confirmations. A pointer is retired only when it was absent on two
+  consecutive successful listings that began at most 3 check intervals apart (an in-memory map keyed by
+  repository, branch and snapshot id holding the first listing's start time; a branch that reappears, whose pointer
+  moves or whose confirmation is older than the window starts over). A stored branch name that starts with `refs/`
+  or contains characters git ref names cannot have is NEVER retired (counted `unverifiable`). Branches with a
+  `queued`/`running` job, a handover or an admitted branch-advance ensure are skipped. The retirement goes through
+  the same guarded path as the idle rule (`IdleRetireGuard`: snapshot id and `updated_at` as read, so a moved
+  pointer is `pointer_moved`, a busy one `branch_busy`, the default branch is refused), plus an upstream-only
+  check: if any job row for that repository and branch, or the branch row itself, was created or updated at or
+  after the moment the confirming listing started (the branch was re-created and ensured meanwhile), the retire is
+  skipped as `upstream_activity`. Audit actor `upstream_policy`, detail `;source=upstream_policy`. **It
+  records NO retired head and never clears one**, like a delete-push retire: the branch is gone from git, so a
+  stale push must not resurrect it. Waiting for the writer is bounded by what is left of the tick deadline
+  (`SEXTANT_SERVICE_MAINTENANCE_TICK_DEADLINE_SECONDS`; a retirement still queued is the `upstream_branch_retire`
+  deferral and applies when its turn comes). Metrics: `sextant_upstream_repositories_checked_total`,
+  `sextant_upstream_branches_retired_total`, `sextant_upstream_branch_retires_skipped_total`,
+  `sextant_upstream_listing_failures_total`, `sextant_upstream_pass_duration_ms` (also in
+  `MetricsSnapshot.Maintenance`), and one `maintenance: upstream-branch pass …` log line per tick.
 - **Inactive-repository reclaim (every tick, issue #291).** A repository is inactive when it has no branch pointer
   row, no `queued`/`running` job and no unconsumed branch-advance handover, and its most recent activity is more
   than `SEXTANT_SERVICE_REPOSITORY_RECLAIM_DAYS` (default 14, `0` = off) old. Activity is the latest of: the

@@ -489,6 +489,28 @@ public sealed class SnapshotJobStore(SqliteConnection connection)
     }
 
     /// <summary>
+    /// True when a job for the branch (any status) was created, updated or completed at or after <paramref name="sinceUnixMs"/>
+    /// (issue #338: an ensure of the branch that ran after the upstream listing that called it deleted). Read-only;
+    /// repository URLs are compared with <see cref="RemoteUrlIdentity"/>.
+    /// </summary>
+    public bool HasBranchActivitySince(string repositoryKey, string branch, long sinceUnixMs)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT repository_url FROM snapshot_jobs
+            WHERE branch_name = @branch
+              AND (created_at >= @since OR updated_at >= @since OR COALESCE(completed_at, 0) >= @since);
+            """;
+        cmd.Parameters.AddWithValue("@branch", branch);
+        cmd.Parameters.AddWithValue("@since", sinceUnixMs);
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            if (string.Equals(RemoteUrlIdentity.Normalize(reader.GetString(0)), repositoryKey, StringComparison.Ordinal))
+                return true;
+        return false;
+    }
+
+    /// <summary>
     /// The branches with work still pending against them (issue #299), as (normalized repository URL, branch name): a
     /// queued or running job that names the branch, or an unconsumed branch-advance handover (issue #273). The idle-branch
     /// rule never retires one of them. Read-only; repository URLs are normalized with <see cref="RemoteUrlIdentity"/>.

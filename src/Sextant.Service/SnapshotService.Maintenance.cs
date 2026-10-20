@@ -86,6 +86,9 @@ public sealed record MaintenanceTickReport
 
     /// <summary>The tick's inactive-repository reclaim pass (issue #291).</summary>
     public RepositoryReclaimReport? RepositoryReclaim { get; init; }
+
+    /// <summary>The tick's upstream-branch reconcile pass (issue #338).</summary>
+    public UpstreamBranchReport? UpstreamBranches { get; init; }
 }
 
 public sealed partial class SnapshotService
@@ -270,7 +273,8 @@ public sealed partial class SnapshotService
         await _maintenanceTicked.WaitAsync(timeout, CancellationToken.None).ConfigureAwait(false);
 
     /// <summary>
-    /// Runs one maintenance tick (issue #299): the idle-branch retire pass, then the scheduled retention pass when it is
+    /// Runs one maintenance tick (issue #299): the idle-branch retire pass, the upstream-branch reconcile (issue #338),
+    /// the inactive-repository reclaim, then the scheduled retention pass when it is
     /// due and the writer is free. The loop calls it every <see cref="MaintenancePolicy.Interval"/>; ticks never overlap
     /// (a call made while one runs waits for it).
     /// </summary>
@@ -291,6 +295,16 @@ public sealed partial class SnapshotService
                     $"retired heads pruned {idle.RetiredHeadsPruned}) " +
                     $"in {idle.DurationMs:F0} ms.");
 
+            var upstream = await ReconcileUpstreamBranchesAsync(cancellationToken).ConfigureAwait(false);
+            if (upstream.Enabled)
+            {
+                _metrics.RecordUpstreamBranchPass(
+                    upstream.Checked, upstream.ListingFailures, _timeProvider.GetUtcNow().ToUnixTimeMilliseconds(), upstream.DurationMs);
+                Log($"maintenance: upstream-branch pass retired {upstream.Retired} branch pointer(s) " +
+                    $"(repositories due {upstream.Due}, checked {upstream.Checked}, listing failures {upstream.ListingFailures}, " +
+                    $"busy {upstream.Busy}, awaiting confirmation {upstream.AwaitingConfirmation}, " +
+                    $"attempted {upstream.Attempted}, skipped {upstream.Skipped}) in {upstream.DurationMs:F0} ms.");
+            }
             var reclaim = await ReclaimInactiveRepositoriesAsync(cancellationToken).ConfigureAwait(false);
             if (reclaim.Enabled && (!reclaim.Busy || reclaim.Reclaimed + reclaim.Failed > 0))
             {
@@ -302,7 +316,7 @@ public sealed partial class SnapshotService
             }
 
             var report = await RunScheduledRetentionIfDueAsync(idle, cancellationToken).ConfigureAwait(false);
-            return report with { RepositoryReclaim = reclaim };
+            return report with { RepositoryReclaim = reclaim, UpstreamBranches = upstream };
         }
         finally
         {
