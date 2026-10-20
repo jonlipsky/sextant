@@ -24,14 +24,25 @@ public class ScheduledRetentionContinuationTests
     {
         Assert.IsTrue(SnapshotService.ScheduledRetentionContinues(
             new RetentionReport { DryRun = false, MoreRemaining = true, ApiSnapshotsDeleted = 256 }));
-        Assert.IsTrue(SnapshotService.ScheduledRetentionContinues(
-            new RetentionReport { DryRun = false, MoreRemaining = true, FileVersionsDeleted = 256 }));
-        Assert.IsTrue(SnapshotService.ScheduledRetentionContinues(
-            new RetentionReport { DryRun = false, MoreRemaining = true, SourceTextsDeleted = 10 }));
+        Assert.IsTrue(SnapshotService.ScheduledRetentionContinues(new RetentionReport
+        {
+            DryRun = false, MoreRemaining = true, SourceTextsDeleted = 10, SourceTextSweepAdvanced = true
+        }));
         Assert.IsTrue(SnapshotService.ScheduledRetentionContinues(new RetentionReport
         {
             DryRun = false, MoreRemaining = true, Deleted = [new RetentionGeneration { Id = 1, Status = "complete", Reason = "test" }]
         }));
+    }
+
+    [TestMethod]
+    public void FileVersionAndSourceTextDeletionsAlone_AreNotBacklogProgress()
+    {
+        foreach (var report in new[]
+        {
+            new RetentionReport { DryRun = false, MoreRemaining = true, StopReason = "time_budget", Batches = 2, FileVersionsDeleted = 256 },
+            new RetentionReport { DryRun = false, MoreRemaining = true, StopReason = "time_budget", Batches = 2, SourceTextsDeleted = 10 }
+        })
+            Assert.IsFalse(SnapshotService.ScheduledRetentionContinues(report));
     }
 
     [TestMethod]

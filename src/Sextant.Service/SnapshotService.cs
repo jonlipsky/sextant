@@ -2240,7 +2240,10 @@ public sealed partial class SnapshotService : IDisposable
         // Tail steps cut down or stepped over (issue #329) get the same one-day memory. Only the caller that moves
         // the day resets the tuning.
         if (Interlocked.Exchange(ref _tailTuningDayTicks, today.Ticks) != today.Ticks)
+        {
             _fileSweepCursor.ResetTuning();
+            _scheduledFileCursor.ResetTuning();
+        }
         var ids = new HashSet<long>();
         foreach (var (id, day) in _oversizedToday)
         {
@@ -2496,10 +2499,83 @@ public sealed partial class SnapshotService : IDisposable
     }
 
     private readonly FileSweepCursor _fileSweepCursor = new();
+    // Like the file-version cursor: held for the service lifetime, so each pass continues the source-text walk (issue #336).
+    private readonly SourceTextSweepCursor _sourceTextCursor = new();
+    // The scheduled pass and its continuations have cursors of their own, so a manual pass moving the shared ones can never
+    // make a scheduled slice "complete" a cycle it only walked the tail of: the scheduled day's cycle is a full one.
+    private readonly FileSweepCursor _scheduledFileCursor = new();
+    private readonly SourceTextSweepCursor _scheduledTextCursor = new();
+    internal SourceTextSweepCursor ScheduledSourceTextCursor => _scheduledTextCursor;
+    internal SourceTextSweepCursor ManualSourceTextCursor => _sourceTextCursor;
+
+    // One cycle per sweep per scheduled retention day (issue #336). The scheduled pass and its continuations of a UTC day
+    // run each sweep (file versions, source texts) through at most one full cycle that STARTED that day; once a cycle
+    // is done the later passes skip the sweep and report it finished, so steady churn cannot keep two out-of-phase
+    // sweeps open for ever. The next day's scheduled pass starts both over. Manual passes never read or write this state
+    // (they only move the shared cursors); a restart forgets it, which costs at most one more cycle.
+    private readonly object _sweepDayGate = new();
+    private DateOnly _sweepDay;
+    private bool _sweepDayFilesDone;
+    private bool _sweepDayTextsDone;
+
+    // The scheduled retention day whose chain of passes is running (set when its first pass starts, cleared when the chain
+    // ends), so a chain that crosses 00:00 stays one day; null outside the maintenance loop (the pass's own UTC date).
+    private DateOnly? _scheduledChainDay;
+
+    private (bool FilesDone, bool TextsDone) BeginScheduledSweepDay()
+    {
+        lock (_sweepDayGate)
+        {
+            var today = _scheduledChainDay ?? DateOnly.FromDateTime(_timeProvider.GetUtcNow().UtcDateTime);
+            if (_sweepDay != today)
+            {
+                _sweepDay = today;
+                _sweepDayFilesDone = _sweepDayTextsDone = false;
+                _scheduledFileCursor.Reset();
+                _scheduledTextCursor.Reset();
+            }
+            return (_sweepDayFilesDone, _sweepDayTextsDone);
+        }
+    }
+
+    private void NoteScheduledSweepDone(bool files, bool texts)
+    {
+        lock (_sweepDayGate)
+        {
+            _sweepDayFilesDone |= files;
+            _sweepDayTextsDone |= texts;
+        }
+    }
 
     private async Task<RetentionReport> RunRetentionPassAsync(
         bool execute, AuditCaller principal, CancellationToken cancellationToken, TimeSpan? passLimit,
         RetentionPassTimer timer, CancellationToken passBound = default)
+    {
+        var scope = new RetentionPassScope();
+        try
+        {
+            var report = await RunRetentionPassCoreAsync(execute, principal, cancellationToken, passLimit, timer, scope, passBound)
+                .ConfigureAwait(false);
+            return scope.Plan is { } plan ? report with { FileSweepAdvanced = plan.FileSweepAdvanced } : report;
+        }
+        finally
+        {
+            if (timer.Priority && execute && scope.Plan is { FileSweepCompleted: true })
+                NoteScheduledSweepDone(files: true, texts: false);
+        }
+    }
+
+    /// <summary>Test seam: the file-version spans one retention plan sweeps (null = the default allowance).</summary>
+    internal int? RetentionSweepSpansPerPass { get; set; }
+
+    private sealed class RetentionPassScope
+    {
+        public RetentionPlan? Plan;
+    }
+
+    private async Task<RetentionReport> RunRetentionPassCoreAsync(
+        bool execute, AuditCaller principal, CancellationToken cancellationToken, TimeSpan? passLimit,
+        RetentionPassTimer timer, RetentionPassScope scope, CancellationToken passBound = default)
     {
         using var activity = ServiceTelemetry.Source.StartActivity("retention");
         activity?.SetTag("sextant.execute", execute);
@@ -2521,11 +2597,15 @@ public sealed partial class SnapshotService : IDisposable
             }
 
             RetentionPlan plan;
+            var scheduledDay = timer.Priority ? BeginScheduledSweepDay() : (FilesDone: false, TextsDone: false);
             var planStarted = System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
                 using var reader = OpenReadConnection();
-                plan = new RetentionService(reader, _options.Retention, fileSweep: _fileSweepCursor).CreatePlan(pass.Token, limit);
+                var planner = new RetentionService(reader, _options.Retention, fileSweep: timer.Priority ? _scheduledFileCursor : _fileSweepCursor,
+                    sweepFileVersions: !scheduledDay.FilesDone);
+                if (RetentionSweepSpansPerPass is { } spans) planner.SweepSpansPerPass = spans;
+                plan = planner.CreatePlan(pass.Token, limit);
             }
             finally
             {
@@ -2533,6 +2613,7 @@ public sealed partial class SnapshotService : IDisposable
             }
             if (plan.StopReason != null)
                 return new RetentionReport { DryRun = false, MoreRemaining = true, StopReason = plan.StopReason };
+            scope.Plan = plan;
             var deferred = OversizedToDeferToday();
             var deferredNow = deferred.Count == 0 ? [] : plan.ExcludeSnapshots(deferred);
             report = plan.Report with { OversizedDeferredSnapshotIds = deferredNow };
@@ -2578,19 +2659,31 @@ public sealed partial class SnapshotService : IDisposable
             } while (report.MoreRemaining);
 
             var sweepPassBound = false;
-            var sweep = await timer.WriteAsync(this, () =>
+            var sweep = scheduledDay.TextsDone ? new RetentionReport { DryRun = false, SourceTextsDeleted = 0 }
+                : await timer.WriteAsync(this, () =>
             {
                 pass.Token.ThrowIfCancellationRequested();
                 var remaining = limit - timer.BudgetElapsed();
                 sweepPassBound = remaining < RetentionService.BatchTimeLimit;
                 var sweepLimit = sweepPassBound ? remaining : RetentionService.BatchTimeLimit;
+                // The key build (it reads every referenced hash) has its own budget, so it never eats the walk's slice.
+                // It never has less than the floor, and never more than the pass budget plus the floor.
+                var keyLimit = TimeSpan.FromTicks(Math.Min(Math.Max(remaining.Ticks, RetentionService.SourceTextKeyBuildFloor.Ticks),
+                    (limit + RetentionService.SourceTextKeyBuildFloor).Ticks));
                 return Task.FromResult(new RetentionService(_conn, _options.Retention)
-                    .SweepSourceTexts(SourceTexts, pass.Token, sweepLimit));
+                    .SweepSourceTexts(SourceTexts, pass.Token, sweepLimit, keyLimit,
+                        timer.Priority ? _scheduledTextCursor : _sourceTextCursor));
             }, ms => timer.TailMs += ms, pass.Token).ConfigureAwait(false);
+            if (timer.Priority && sweep.SourceTextCycleCompleted)
+                NoteScheduledSweepDone(files: false, texts: true);
+            // A scheduled day stays open until the file-version sweep's one cycle is done, even when this pass used up its span allowance.
+            var fileSweepOpen = timer.Priority && plan.FileSweepOpen;
             var sweepReason = sweep.StopReason == "time_budget" && !sweepPassBound ? "sweep_budget" : sweep.StopReason;
             report = report with { SourceTextsDeleted = sweep.SourceTextsDeleted,
-                MoreRemaining = sweep.MoreRemaining || plan.ApiDeferred,
-                StopReason = sweepReason ?? (plan.ApiDeferred ? "api_deferred" : null),
+                SourceTextSweepAdvanced = sweep.SourceTextSweepAdvanced,
+                SourceTextCycleCompleted = sweep.SourceTextCycleCompleted,
+                MoreRemaining = sweep.MoreRemaining || plan.ApiDeferred || fileSweepOpen,
+                StopReason = sweepReason ?? (plan.ApiDeferred ? "api_deferred" : fileSweepOpen ? "sweep_budget" : null),
                 LeftWork = plan.DescribeLeft() + (sweep.MoreRemaining ? " texts=more" : " texts=0") };
 
             // Give disk back (issue #252): bounded incremental_vacuum steps, the writer released between them.

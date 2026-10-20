@@ -171,20 +171,29 @@ public sealed class SourceTextStore
     /// As above, and says why the sweep left work: <c>time_budget</c> (<paramref name="shouldStop"/>),
     /// <c>source_text_cap</c> (more orphans past <paramref name="maxDeletes"/>), <c>source_text_error</c> (the store
     /// could not be enumerated or an IO error cut the walk) or <c>source_text_undeletable</c> (a blob that would not
-    /// delete); null when the sweep finished. The first reason hit wins, in that order of occurrence.
+    /// delete); null when the sweep finished. With a <paramref name="cursor"/> the walk resumes after the last path
+    /// the previous slice handled and, on reaching the end of the store, completes the cycle (the cursor wraps). The first reason hit wins, in that order of occurrence.
     /// </summary>
     public int DeleteUnreferenced(IReadOnlySet<UInt128> referencedKeys, int maxDeletes,
-        Func<bool> shouldStop, out string? stopReason)
+        Func<bool> shouldStop, out string? stopReason, SourceTextSweepCursor? cursor = null)
     {
         stopReason = null;
         if (!Directory.Exists(Root))
             return 0;
 
+        // The walk is in ordinal order of the store-relative path (shard directory, then blob name), so the cursor
+        // (the last path fully handled) means the same thing on every pass.
+        var after = cursor?.Position;
         var deleted = 0;
+        string? last = null;
+        var finished = false;
+        var broke = false;
+        string? seen = null;
+        string? failedShard = null;
         IEnumerable<string> files;
         try
         {
-            files = (EnumerateOverride ?? DefaultEnumerate)(Root);
+            files = (EnumerateOverride ?? (root => DefaultEnumerate(root, after, shard => failedShard = shard)))(Root);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -197,9 +206,14 @@ public sealed class SourceTextStore
         {
             foreach (var path in files)
             {
+                var relative = Path.GetRelativePath(Root, path).Replace('\\', '/');
+                seen = relative;
+                if (after != null && string.CompareOrdinal(relative, after) <= 0)
+                    continue;
                 if (shouldStop())
                 {
                     stopReason ??= "time_budget";
+                    broke = true;
                     break;
                 }
 
@@ -211,17 +225,26 @@ public sealed class SourceTextStore
                         stopReason ??= "source_text_undeletable";
                         _log?.Invoke("Source text sweep could not delete a temporary blob.");
                     }
+                    last = relative;
                     continue;
                 }
 
                 if (!name.EndsWith(BlobExtension, StringComparison.Ordinal))
+                {
+                    last = relative;
                     continue;
+                }
                 if (TryParseBlobKey(name, out var key) && referencedKeys.Contains(key))
+                {
+                    last = relative;
                     continue;
+                }
                 // The cap only counts when another orphan is found: a store with nothing left past it is finished.
+                // The cursor stays before this orphan, so the next slice starts with it.
                 if (deleted >= maxDeletes)
                 {
                     stopReason ??= "source_text_cap";
+                    broke = true;
                     break;
                 }
                 if (TryDelete(path))
@@ -231,12 +254,25 @@ public sealed class SourceTextStore
                     stopReason ??= "source_text_undeletable";
                     _log?.Invoke("Source text sweep could not delete an unreferenced blob.");
                 }
+                last = relative;
             }
+            finished = !broke;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             _log?.Invoke($"Source text sweep stopped early: {ex.Message}");
             stopReason ??= "source_text_error";
+            // Step past the shard that failed, so the next slice does not stop at the same blob for ever.
+            var shard = failedShard ?? seen?.Split('/')[0];
+            if (shard != null) last = shard + "/\uffff";
+        }
+
+        // Only a walk that reached the end of the store completes the cycle; the next slice then starts over (wraps).
+        // Any other stop leaves the cursor at the last path handled.
+        if (cursor != null)
+        {
+            if (finished) cursor.CompleteCycle();
+            else if (last != null) cursor.Advance(last);
         }
         return deleted;
     }
@@ -244,8 +280,31 @@ public sealed class SourceTextStore
     // Test seam: replaces the directory walk so a test can fail it part-way.
     internal Func<string, IEnumerable<string>>? EnumerateOverride { get; set; }
 
-    private static IEnumerable<string> DefaultEnumerate(string root) =>
-        Directory.EnumerateFiles(root, "*", new EnumerationOptions { RecurseSubdirectories = true });
+    // Shard directories and the blobs in them in ordinal order; shards wholly before the cursor are not listed.
+    // Nothing is skipped by not recursing from the root: BlobPath (Put's target) and Put's temp files
+    // (<shard>/<hex>.<guid>.tmp), and TryGet's discarded blobs (<blob path>.<guid>.tmp), all sit directly in Root/<hex[..2]>/.
+    private static IEnumerable<string> DefaultEnumerate(string root, string? after, Action<string> shardFailed)
+    {
+        var afterShard = after?.Split('/')[0];
+        var shards = Directory.GetDirectories(root).OrderBy(d => Path.GetFileName(d), StringComparer.Ordinal);
+        foreach (var shard in shards)
+        {
+            if (afterShard != null && string.CompareOrdinal(Path.GetFileName(shard), afterShard) < 0)
+                continue;
+            string[] names;
+            try
+            {
+                names = Directory.GetFiles(shard);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                shardFailed(Path.GetFileName(shard));
+                throw;
+            }
+            foreach (var file in names.OrderBy(f => Path.GetFileName(f), StringComparer.Ordinal))
+                yield return file;
+        }
+    }
 
     // A blob's name is its 64-digit hex hash; any other name is not one Put wrote, so it is never referenced.
     private static bool TryParseBlobKey(string name, out UInt128 key)
@@ -280,6 +339,67 @@ public sealed class SourceTextStore
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             return false;
+        }
+    }
+}
+
+/// <summary>
+/// Where the source-text sweep resumes (issue #336): the store-relative path (<c>&lt;shard&gt;/&lt;name&gt;</c>, ordinal
+/// order) of the last blob it handled. The service keeps one for its lifetime, like <see cref="FileSweepCursor"/>, so each
+/// pass continues where the last one stopped; a restart begins again at the first shard. A walk that reaches the end of
+/// the store completes the cycle and the position wraps to the start.
+/// </summary>
+public sealed class SourceTextSweepCursor
+{
+    private readonly object _gate = new();
+    private string? _position;
+    private long _version;
+    private long _cycles;
+
+    /// <summary>The last path handled, or null at the start of a cycle.</summary>
+    public string? Position
+    {
+        get { lock (_gate) return _position; }
+    }
+
+    /// <summary>Changes every time the position moves or wraps, so a caller can tell a slice made progress.</summary>
+    internal long Version
+    {
+        get { lock (_gate) return _version; }
+    }
+
+    /// <summary>How many times the walk has reached the end of the store.</summary>
+    internal long Cycles
+    {
+        get { lock (_gate) return _cycles; }
+    }
+
+    /// <summary>Starts a cycle over (the service does it when a scheduled retention day begins).</summary>
+    public void Reset()
+    {
+        lock (_gate)
+        {
+            _position = null;
+            _version++;
+        }
+    }
+
+    internal void Advance(string position)
+    {
+        lock (_gate)
+        {
+            _position = position;
+            _version++;
+        }
+    }
+
+    internal void CompleteCycle()
+    {
+        lock (_gate)
+        {
+            _position = null;
+            _version++;
+            _cycles++;
         }
     }
 }
