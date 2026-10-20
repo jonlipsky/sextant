@@ -2389,14 +2389,23 @@ had time), `sweep_budget` (the blob sweep did), `api_deferred` (API-history cand
 time; the next pass does them), `sqlite_busy`, `vacuum_budget` (free pages are left; wins over `api_deferred`,
 `sweep_budget` and `work_remaining` when pages were vacuumed), `source_text_cap` (more orphan source-text blobs than one
 pass deletes), `source_text_undeletable` (a blob would not delete; the scheduler closes the day), `source_text_error`
-(the source-text store could not be enumerated or an IO error cut the walk; also closes the day) and `work_remaining`
+(the source-text store could not be enumerated or an IO error cut the walk; also closes the day; after an IO error part-way
+through a shard the cursor moves past that shard, so the next slice does not stop at the same blob again),
+`source_text_keys_budget` (the source-text slice ran out of its key-build budget, which is at least one 2 s batch whatever the
+pass has left and at most the pass budget plus that; it deletes and walks nothing, so it is not progress, but like the other
+budget stops the scheduler continues it only a bounded number of times in a row) and `work_remaining`
 (a fallback when no other reason applies). These explicitly report bounded deferral, not completion. A tail step
 (one API commit, one file-version span) that runs past the 2 s batch cap with nothing done is halved and retried, and at the
 smallest size is skipped with one log line: an API commit for the rest of the UTC day, a file-version span until the sweep wraps (the sweep's cursor is in memory, so a restart also starts it over). The response also carries `left_work`, a one-line
 summary of what each step still has queued (e.g. `snapshots=0 runs=0 api=0 files=cursor@120 texts=more`); it is additive,
 null on a dry run, and clients that do not know it can ignore it. The orphan-blob sweep examines at most 256 spans of 4096
 `file_versions` ids per pass and resumes from a shared in-memory cursor, so a very large table is swept over several
-passes without a stop reason (`left_work` then shows `files=cursor@<id>`). A timed-out plan also sets these fields; its empty
+passes without a stop reason (`left_work` then shows `files=cursor@<id>`). The source-text sweep (#336) walks the store in ordinal order (shard, then blob name) from a service-lifetime in-memory cursor
+(a restart starts at the first shard), so successive 2-second slices continue where the last stopped and wrap after the last
+shard; a slice builds the referenced-key set in the same writer turn as its deletes (own budget, so it never starves the walk;
+a blob stored ahead of its `file_versions` row is therefore never deleted). Only files inside shard directories
+(`<root>/<2 hex>/`) are swept: blobs, `Put` temp files and the temp names `TryGet` moves a corrupt blob to all live there.
+A completed cycle with no stop reason reports `texts=0` whether or not it found an orphan. A timed-out plan also sets these fields; its empty
 counts are **not** a complete plan. Execution's `reclaimed_bytes_known: true` reports freed pages reusable
 by SQLite, **not a smaller database file**. No full VACUUM runs on the hot path. A catalog created with
 `auto_vacuum = INCREMENTAL` (every new catalog; `IndexDatabase` sets it before the first table exists) gives disk back
@@ -2415,7 +2424,17 @@ transaction is bounded (a batch, a project chunk, a vacuum step) and the writer 
 publishes interleave. The maintenance loop runs the scheduled pass once per UTC day from
 `SEXTANT_SERVICE_RETENTION_SCHEDULE_HOUR_UTC`; a pass that stops with `more_remaining` after making progress (rows deleted,
 chunk rows deleted or pages vacuumed) stays due and is continued after `SEXTANT_SERVICE_RETENTION_CONTINUE_MINUTES` (default 5), until a pass finishes or
-makes no progress. Repeated bounded passes converge to the same state as one unbounded pass.
+makes no progress. Progress means the planned backlog shrank (snapshots, project versions, API commits, project chunk
+rows), the file-version sweep cursor or the source-text walk advanced, or pages were vacuumed; file versions or source
+texts freed by ongoing indexing alone do not count (#336). **Each sweep runs one cycle per scheduled day:** the day's first
+scheduled pass starts both of the scheduled passes' own cursors (separate from the manual passes' cursors) at the beginning, the scheduled pass and its continuations keep a sweep open (more
+remaining, `sweep_budget`) until its cycle reaches the end, and a sweep that has finished its cycle is skipped by the
+later passes of that day (`files=0` / `texts=0`, not more remaining). Two sweeps that finish on different passes
+therefore cannot keep the day open under steady churn; blobs orphaned after a sweep passed them wait for the next day's
+cycle. The scheduled day is the day whose scheduled pass started the continuation chain, so a chain that runs past 00:00
+stays one day; only the first pass of the next scheduled day starts both over. Manual `POST /control/retention` passes keep
+sweeping a slice per call from their own cursors and never read or change the scheduled cursors or the day's state (held in memory; a restart costs at most one
+more cycle). Repeated bounded passes converge to the same state as one unbounded pass.
 
 Branch pointers, open PRs, pending retry snapshots, and their transitive overlay/provider closure are
 never eligible. Restaging a retry binds `snapshots.run_id` to its new publishing run in the staging

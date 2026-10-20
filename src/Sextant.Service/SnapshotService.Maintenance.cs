@@ -677,12 +677,30 @@ public sealed partial class SnapshotService
         // pass that never got a turn ends with no batches and stays due (the day stays open below).
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
         RetentionReport report;
-        using (var step = BeginStep(cancellationToken))
+        // A chain day other than today or the still-open previous day is stale (a chain only continues while the last
+        // scheduled day is before today), so it is replaced.
+        lock (_sweepDayGate)
         {
-            report = await RunRetentionAsync(
-                execute: true, RetentionScheduleCaller, cancellationToken,
-                TimeSpan.FromSeconds(Math.Clamp(policy.RetentionPassSeconds, 1, MaintenancePolicy.MaxRetentionPassSeconds)),
-                ScheduledRetentionAuditWait, maintenancePriority: true, passBound: step.Token).ConfigureAwait(false);
+            if (_scheduledChainDay is not { } chain || (chain != today && chain != today.AddDays(-1)))
+                _scheduledChainDay = today;
+        }
+        var passCompleted = false;
+        try
+        {
+            using (var step = BeginStep(cancellationToken))
+            {
+                ScheduledRetentionFault?.Invoke();
+                report = await RunRetentionAsync(
+                    execute: true, RetentionScheduleCaller, cancellationToken,
+                    TimeSpan.FromSeconds(Math.Clamp(policy.RetentionPassSeconds, 1, MaintenancePolicy.MaxRetentionPassSeconds)),
+                    ScheduledRetentionAuditWait, maintenancePriority: true, passBound: step.Token).ConfigureAwait(false);
+            }
+            passCompleted = true;
+        }
+        finally
+        {
+            // A pass that throws or is cancelled ends the chain.
+            if (!passCompleted) lock (_sweepDayGate) _scheduledChainDay = null;
         }
         var durationMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
         if (report.Batches == 0 && report.MoreRemaining)
@@ -694,6 +712,8 @@ public sealed partial class SnapshotService
         }
         var continues = ScheduledPassContinues(report);
         _lastScheduledRetentionDay = continues ? _lastScheduledRetentionDay : today;
+        // The chain ended: the next scheduled day's first pass is the only thing that resets the sweep cycles.
+        if (!continues) lock (_sweepDayGate) _scheduledChainDay = null;
         _metrics.RecordScheduledRetention(report, now.ToUnixTimeMilliseconds(), durationMs);
         Log(ScheduledRetentionLogLine(report, durationMs));
         return new MaintenanceTickReport
@@ -720,6 +740,9 @@ public sealed partial class SnapshotService
 
     // Whether the scheduled day stays open after this pass. Bounded: a pass that only ever runs out of budget must not
     // re-plan every tick for the rest of the day.
+    /// <summary>Test seam: invoked at the start of a scheduled retention pass (may throw).</summary>
+    internal Action? ScheduledRetentionFault { get; set; }
+
     internal bool ScheduledPassContinues(RetentionReport report)
     {
         var continues = ScheduledRetentionContinues(report);
@@ -738,14 +761,21 @@ public sealed partial class SnapshotService
         return continues;
     }
 
-    // Real movement on the work the pass stopped for: rows or blobs deleted, or pages vacuumed when vacuum is what is left.
-    private static bool MadeStopReasonProgress(RetentionReport report) =>
-        MadeDeletionProgress(report) || (report.PagesVacuumed > 0 && report.VacuumLeft);
+    // Real movement on the BACKLOG the pass started with (issue #336): planned snapshots, generations, API history or chunk
+    // rows deleted, a blob sweep's cursor advancing within its one cycle of the day (files, source texts), or pages
+    // vacuumed when vacuum is what is left. File versions and source texts freed by ongoing indexing are deliberately not
+    // counted by themselves: a trickle of them never ends. The cursor is what shows blob work moved, and each sweep runs
+    // at most one cycle per scheduled day (BeginScheduledSweepDay), so the trickle is bounded too.
+    internal static bool MadeStopReasonProgress(RetentionReport report) =>
+        (report.SnapshotsDeleted + report.SnapshotProjectVersionsDeleted + report.ApiSnapshotsDeleted +
+            report.Deleted.Count + report.ProjectChunkRowsDeleted) > 0 ||
+        report.SourceTextSweepAdvanced || report.FileSweepAdvanced || (report.PagesVacuumed > 0 && report.VacuumLeft);
 
     // Stops that are about a budget or a busy writer, not a catalog that cannot move: they may continue without progress,
     // but only a bounded number of times in a row (ScheduledPassContinues).
     private static bool IsRetryableStop(string? reason) =>
-        reason is "unit_budget" or "batch_budget" or "sweep_budget" or "api_deferred" or "sqlite_busy" or StarvedStopReason;
+        reason is "unit_budget" or "batch_budget" or "sweep_budget" or "api_deferred" or "sqlite_busy" or StarvedStopReason
+            or RetentionService.KeysBudgetStopReason;
 
     // A pass that never got the writer (starved by productions until the tick deadline) did not run at all: the day stays
     // open without counting toward the no-progress cap (ScheduledPassContinues), bounded only by the UTC day (issue #333).

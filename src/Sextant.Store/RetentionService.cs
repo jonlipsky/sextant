@@ -78,6 +78,21 @@ public sealed record RetentionReport
     public string? StopReason { get; init; }
 
     /// <summary>
+    /// The source-text sweep moved on the backlog this pass: it deleted a blob, advanced its cursor or finished a cycle
+    /// (issue #336). False on a dry run and for a slice that spent its budget before handling a blob.
+    /// </summary>
+    public bool SourceTextSweepAdvanced { get; init; }
+
+    /// <summary>The source-text walk reached the end of the store this pass: one full cycle is done (issue #336).</summary>
+    public bool SourceTextCycleCompleted { get; init; }
+
+    /// <summary>
+    /// The file-version sweep moved this pass: its cursor advanced or it finished a cycle (issue #336). Like
+    /// <see cref="SourceTextSweepAdvanced"/>, it is what shows blob backlog progress, instead of the deletion counts.
+    /// </summary>
+    public bool FileSweepAdvanced { get; init; }
+
+    /// <summary>
     /// Tail steps an executed pass stepped over because one batch could not finish them even cut down (issue #329):
     /// an API commit for the rest of the UTC day, a file-version span until the sweep wraps; one line each.
     /// </summary>
@@ -147,6 +162,8 @@ public sealed class RetentionPlan
     private bool _filePublishPending;
     private int _sweepSpansLeft;
     private bool _fileVersionsDone;
+    private readonly bool _sweepActive;
+    private readonly long _fileStart;
     private bool _apiStale;
     private bool _apiTurn = true;
 
@@ -156,7 +173,8 @@ public sealed class RetentionPlan
         FileSweepCursor? fileSweep = null, int sweepSpans = RetentionService.MaxSweepSpansPerPass)
     {
         _fileSweep = fileSweep ?? new FileSweepCursor();
-        _filePosition = _fileSeen = _fileSweep.Position;
+        _filePosition = _fileSeen = _fileStart = _fileSweep.Position;
+        _sweepActive = pruneFileVersions;
         _sweepSpansLeft = sweepSpans;
         ApiHistory = apiHistory ?? new ApiHistoryPlan([], []);
         _fileVersionsDone = !pruneFileVersions;
@@ -220,6 +238,18 @@ public sealed class RetentionPlan
     /// <summary>The last <c>file_versions</c> id the orphan sweep has examined; the sweep resumes after it.</summary>
     internal long FileVersionCursor => _filePosition;
     internal bool FileVersionsDone => _fileVersionsDone;
+
+    /// <summary>This plan runs the file-version sweep at all (false when the policy or the caller turned it off).</summary>
+    public bool FileSweepActive => _sweepActive;
+
+    /// <summary>The sweep finished its cycle (the cursor wrapped) while this plan ran it.</summary>
+    public bool FileSweepCompleted => _sweepActive && _fileVersionsDone;
+
+    /// <summary>The sweep's cursor moved or its cycle finished during this plan (issue #336).</summary>
+    public bool FileSweepAdvanced => _sweepActive && (_fileVersionsDone || _filePosition != _fileStart);
+
+    /// <summary>The sweep is on and has ids left, whether or not this pass's span allowance is used up.</summary>
+    public bool FileSweepOpen => _sweepActive && !_fileVersionsDone;
 
     /// <summary>The shared cursor, which also holds how far a tail step has been cut down today.</summary>
     internal FileSweepCursor Tuning => _fileSweep;
@@ -298,6 +328,12 @@ public sealed class FileSweepCursor
             if (to > _position) _position = to;
             return _position;
         }
+    }
+
+    /// <summary>Starts a cycle over (the service does it when a scheduled retention day begins).</summary>
+    public void Reset()
+    {
+        lock (_gate) _position = 0;
     }
 
     /// <summary>Rewinds to 0 only if the position is still <paramref name="expected"/>.</summary>
@@ -425,6 +461,8 @@ public sealed class RetentionService
     private readonly RetentionPolicy _policy;
     private readonly IReadOnlyList<IRetentionProtectionProvider> _providers;
     private readonly FileSweepCursor? _fileSweep;
+    // False when the caller already ran this sweep's one cycle for the day (issue #336): the plan carries no file work.
+    private readonly bool _sweepFileVersions;
     private RetentionWorkBudget? _budget;
 
     /// <summary>True while a batch is running that deleted no snapshot data (ledger/API/blob work only).</summary>
@@ -462,7 +500,7 @@ public sealed class RetentionService
     public const int MaxSweepSpansPerPass = 256;
 
     /// <summary>Test seam: the per-plan sweep allowance handed to plans this service creates.</summary>
-    internal int SweepSpansPerPass { get; set; } = MaxSweepSpansPerPass;
+    public int SweepSpansPerPass { get; set; } = MaxSweepSpansPerPass;
 
     /// <summary>Test seam: runs inside a batch's transaction right before a snapshot unit is deleted.</summary>
     internal Action<long>? BeforeUnitDelete { get; set; }
@@ -471,8 +509,10 @@ public sealed class RetentionService
         SqliteConnection connection,
         RetentionPolicy policy,
         IEnumerable<IRetentionProtectionProvider>? providers = null,
-        FileSweepCursor? fileSweep = null)
+        FileSweepCursor? fileSweep = null,
+        bool sweepFileVersions = true)
     {
+        _sweepFileVersions = sweepFileVersions;
         _fileSweep = fileSweep;
         _connection = connection;
         _policy = policy.Normalized();
@@ -590,7 +630,7 @@ public sealed class RetentionService
 
         return new RetentionPlan(report with { DryRun = false, Deleted = [] }, snapshots, runs, commits, apiDeferred,
             deletableRunIds: deletableRuns, planRunIds: planRunIds, apiHistory: apiHistory,
-            pruneFileVersions: _policy.PruneSupersededSourceBlobs, fileSweep: _fileSweep, sweepSpans: SweepSpansPerPass);
+            pruneFileVersions: _policy.PruneSupersededSourceBlobs && _sweepFileVersions, fileSweep: _fileSweep, sweepSpans: SweepSpansPerPass);
     }
 
     /// <summary>Applies bounded batches. Service callers acquire/release their writer gate around ExecuteBatch instead.</summary>
@@ -881,34 +921,74 @@ public sealed class RetentionService
     /// <summary>Test seam: runs inside a batch's transaction right before an API-delete or file-sweep tail step.</summary>
     internal Action<string>? BeforeTailStep { get; set; }
 
-    /// <summary>Run only under the service writer gate: blobs can precede their file_versions rows.</summary>
+    /// <summary>
+    /// One slice of the source-text sweep. Run it only under the service writer gate, and build the key set inside that
+    /// same writer turn: an index job stores a blob before its file_versions row commits, and only the gate keeps a job
+    /// from landing a blob between the key set and the deletes (so a key set is never reused across turns). The key
+    /// build gets its own budget (<paramref name="keyBuildLimit"/>, default <paramref name="timeLimit"/>) and the walk's
+    /// <paramref name="timeLimit"/> starts after it, so building the keys never starves the walk (issue #336).
+    /// With a <paramref name="cursor"/> successive slices resume where the last stopped; a walk that reaches the end of
+    /// the store with no stop reason is a finished cycle: <c>MoreRemaining</c> is false.
+    /// </summary>
     public RetentionReport SweepSourceTexts(SourceTextStore texts, CancellationToken cancellationToken,
-        TimeSpan timeLimit)
+        TimeSpan timeLimit, TimeSpan? keyBuildLimit = null, SourceTextSweepCursor? cursor = null)
     {
-        using var budget = new RetentionWorkBudget(_connection, timeLimit, cancellationToken);
+        var versionBefore = cursor?.Version ?? 0;
+        var cyclesBefore = cursor?.Cycles ?? 0;
+        RetentionWorkBudget? keyBudget = null;
+        RetentionWorkBudget? budget = null;
+        var buildingKeys = true;
         try
         {
-            budget.Check();
-            var keys = new FileStore(_connection).ReferencedSourceTextKeys();
-            budget.Check();
-            var deleted = texts.DeleteUnreferenced(keys, BatchRowLimit, () => budget.ShouldStop, out var reason);
+            IReadOnlySet<UInt128> keys;
+            keyBudget = new RetentionWorkBudget(_connection, keyBuildLimit ?? timeLimit, cancellationToken);
+            keyBudget.Check();
+            keys = new FileStore(_connection).ReferencedSourceTextKeys();
+            keyBudget.Check();
+            keyBudget.Dispose();
+            keyBudget = null;
+            buildingKeys = false;
+
+            var walkBudget = budget = new RetentionWorkBudget(_connection, timeLimit, cancellationToken);
+            var deleted = texts.DeleteUnreferenced(keys, BatchRowLimit, () => walkBudget.ShouldStop, out var reason, cursor);
             cancellationToken.ThrowIfCancellationRequested();
             // Every "more remaining" names why (issue #329), as the sweep itself saw it.
             return new RetentionReport
             {
-                DryRun = false, SourceTextsDeleted = deleted, MoreRemaining = reason != null, StopReason = reason
+                DryRun = false, SourceTextsDeleted = deleted, MoreRemaining = reason != null, StopReason = reason,
+                SourceTextSweepAdvanced = deleted > 0 || cursor != null && cursor.Version != versionBefore,
+                SourceTextCycleCompleted = cursor != null && cursor.Cycles != cyclesBefore
             };
         }
-        catch (Exception ex) when (IsBudgetOrBusy(ex, budget))
+        catch (Exception ex) when (IsBudgetOrBusy(ex, keyBudget, budget))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            return new RetentionReport { DryRun = false, MoreRemaining = true, StopReason = StopReason(ex) };
+            // The key build timing out is its own reason: it made no progress, but it is a budget stop (issue #336).
+            var reason = buildingKeys && ex is not SqliteException { SqliteErrorCode: 5 or 6 }
+                ? KeysBudgetStopReason : StopReason(ex);
+            return new RetentionReport { DryRun = false, MoreRemaining = true, StopReason = reason };
+        }
+        finally
+        {
+            keyBudget?.Dispose();
+            budget?.Dispose();
         }
     }
 
+    /// <summary>The source-text sweep ran out of its key-build budget before it could walk anything (issue #336).</summary>
+    public const string KeysBudgetStopReason = "source_text_keys_budget";
+
+    /// <summary>The floor of the key-build budget of one source-text slice, whatever the pass has left.</summary>
+    public static TimeSpan SourceTextKeyBuildFloor => BatchTimeLimit;
+
     private static bool IsBudgetOrBusy(Exception ex, RetentionWorkBudget budget) =>
+        IsBudgetOrBusy(ex, budget, null);
+
+    // Code 9 (interrupt) is a budget stop only when a budget actually asked to stop; anything else propagates.
+    private static bool IsBudgetOrBusy(Exception ex, RetentionWorkBudget? budget, RetentionWorkBudget? other) =>
         ex is TimeoutException || ex is SqliteException sql &&
-        (sql.SqliteErrorCode is 5 or 6 || sql.SqliteErrorCode == 9 && budget.ShouldStop);
+        (sql.SqliteErrorCode is 5 or 6 ||
+         sql.SqliteErrorCode == 9 && (budget?.ShouldStop == true || other?.ShouldStop == true));
 
     private sealed class UnitStartBudgetException() : TimeoutException("Not enough pass budget left to start a deletion unit.");
 
