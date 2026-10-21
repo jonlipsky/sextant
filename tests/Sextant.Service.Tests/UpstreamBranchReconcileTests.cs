@@ -28,7 +28,7 @@ public class UpstreamBranchReconcileTests
         h.Lister.Set(Repo, "main", "other");
         h.Start();
 
-        var first = await h.Service.ReconcileUpstreamBranchesAsync();
+        var first = await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         Assert.IsTrue(first.Enabled);
         Assert.AreEqual(1, first.Checked);
         Assert.AreEqual(1, first.AwaitingConfirmation);
@@ -36,7 +36,7 @@ public class UpstreamBranchReconcileTests
         Assert.IsTrue(h.BranchExists(Repo, "gone"), "one listing is not enough");
 
         h.Clock.Advance(TimeSpan.FromMinutes(61));
-        var second = await h.Service.ReconcileUpstreamBranchesAsync();
+        var second = await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
 
         Assert.AreEqual(1, second.Retired);
         Assert.IsFalse(h.BranchExists(Repo, "gone"));
@@ -59,13 +59,13 @@ public class UpstreamBranchReconcileTests
         h.Start();
 
         h.Lister.Set(Repo, "main", "kept");
-        await h.Service.ReconcileUpstreamBranchesAsync();
+        await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         h.Clock.Advance(TimeSpan.FromMinutes(61));
         h.Lister.Set(Repo, "main", "kept", "flaky");
-        await h.Service.ReconcileUpstreamBranchesAsync();
+        await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         h.Clock.Advance(TimeSpan.FromMinutes(61));
         h.Lister.Set(Repo, "main", "kept");
-        var third = await h.Service.ReconcileUpstreamBranchesAsync();
+        var third = await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
 
         Assert.AreEqual(0, third.Retired);
         Assert.AreEqual(1, third.AwaitingConfirmation, "absent once again, not twice in a row");
@@ -82,10 +82,10 @@ public class UpstreamBranchReconcileTests
         h.Lister.Set(Repo, "main");
         h.Start();
 
-        await h.Service.ReconcileUpstreamBranchesAsync();
+        await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         h.Seed(Repo, "gone", false, "c-gone-2");
         h.Clock.Advance(TimeSpan.FromMinutes(61));
-        var second = await h.Service.ReconcileUpstreamBranchesAsync();
+        var second = await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
 
         Assert.AreEqual(0, second.Retired);
         Assert.AreEqual(1, second.AwaitingConfirmation);
@@ -111,7 +111,7 @@ public class UpstreamBranchReconcileTests
                 default: h.Lister.Set(Repo); break;
             }
             h.Clock.Advance(TimeSpan.FromMinutes(61));
-            var report = await h.Service.ReconcileUpstreamBranchesAsync();
+            var report = await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
             Assert.AreEqual(1, report.Checked, mode);
             Assert.AreEqual(1, report.ListingFailures, mode);
             Assert.AreEqual(0, report.Retired, mode);
@@ -132,13 +132,13 @@ public class UpstreamBranchReconcileTests
         h.Start();
 
         h.Lister.Set(Repo, "main");
-        await h.Service.ReconcileUpstreamBranchesAsync();
+        await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         h.Lister.Fail(Repo);
         h.Clock.Advance(TimeSpan.FromMinutes(61));
-        await h.Service.ReconcileUpstreamBranchesAsync();
+        await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         h.Lister.Set(Repo, "main");
         h.Clock.Advance(TimeSpan.FromMinutes(61));
-        var report = await h.Service.ReconcileUpstreamBranchesAsync();
+        var report = await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
 
         Assert.AreEqual(0, report.Retired);
         Assert.AreEqual(1, report.AwaitingConfirmation);
@@ -154,14 +154,14 @@ public class UpstreamBranchReconcileTests
         h.Lister.Set(Repo, "main");
         h.Start();
 
-        await h.Service.ReconcileUpstreamBranchesAsync();
+        await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         h.Clock.Advance(TimeSpan.FromMinutes(60 * 3 + 1));
-        var late = await h.Service.ReconcileUpstreamBranchesAsync();
+        var late = await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         Assert.AreEqual(0, late.Retired);
         Assert.AreEqual(1, late.AwaitingConfirmation);
 
         h.Clock.Advance(TimeSpan.FromMinutes(61));
-        var next = await h.Service.ReconcileUpstreamBranchesAsync();
+        var next = await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         Assert.AreEqual(1, next.Retired, "the late listing started a fresh confirmation");
     }
 
@@ -174,10 +174,10 @@ public class UpstreamBranchReconcileTests
         h.Lister.Set(Repo, "main");
         h.Start();
 
-        await h.Service.ReconcileUpstreamBranchesAsync();
+        await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         h.Clock.Advance(TimeSpan.FromMinutes(60 * 3));
 
-        Assert.AreEqual(1, (await h.Service.ReconcileUpstreamBranchesAsync()).Retired);
+        Assert.AreEqual(1, (await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow())).Retired);
     }
 
     [TestMethod]
@@ -191,9 +191,9 @@ public class UpstreamBranchReconcileTests
         h.Lister.Set(Repo, "main");
         h.Start();
 
-        await h.Service.ReconcileUpstreamBranchesAsync();
+        await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         h.Clock.Advance(TimeSpan.FromMinutes(61));
-        var report = await h.Service.ReconcileUpstreamBranchesAsync();
+        var report = await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
 
         Assert.AreEqual(3, report.Unverifiable);
         Assert.AreEqual(0, report.Retired);
@@ -219,9 +219,9 @@ public class UpstreamBranchReconcileTests
         h.Lister.Set(Repo, "feature");
         h.Start();
 
-        await h.Service.ReconcileUpstreamBranchesAsync();
+        await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         h.Clock.Advance(TimeSpan.FromMinutes(61));
-        var report = await h.Service.ReconcileUpstreamBranchesAsync();
+        var report = await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
 
         Assert.AreEqual(0, report.Retired);
         Assert.IsTrue(h.BranchExists(Repo, "main"));
@@ -241,9 +241,9 @@ public class UpstreamBranchReconcileTests
         jobs.EnsureJob("identity-queued", Repo + ".git", "c-q2", "queued");
         jobs.RecordHandover(RemoteUrlIdentity.Normalize(Repo), "handed-over", "c-x", "c-h", "c-y");
 
-        await h.Service.ReconcileUpstreamBranchesAsync();
+        await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         h.Clock.Advance(TimeSpan.FromMinutes(61));
-        var report = await h.Service.ReconcileUpstreamBranchesAsync();
+        var report = await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
 
         Assert.AreEqual(2, report.Busy);
         Assert.AreEqual(1, report.Retired);
@@ -260,14 +260,14 @@ public class UpstreamBranchReconcileTests
         h.Seed(Repo, "gone", false, "c-gone");
         h.Lister.Set(Repo, "main");
         h.Start();
-        await h.Service.ReconcileUpstreamBranchesAsync();
+        await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         h.Clock.Advance(TimeSpan.FromMinutes(61));
 
         // A production of another repository holds the single writer, so the retirement queues behind it.
         var blocker = h.Service.EnsureSnapshotAsync(new EnsureSnapshotRequest { RepositoryRemoteUrl = OtherRepo, CommitSha = "b-1" });
         await WaitUntilAsync(() => h.Worker.Calls == 1);
         var admitted = h.Service.WriteAdmissions;
-        var pass = h.Service.ReconcileUpstreamBranchesAsync();
+        var pass = h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         await WaitUntilAsync(() => h.Service.WriteAdmissions > admitted);
         h.Execute("UPDATE branches SET updated_at = updated_at + 1 WHERE name = 'gone';");
         h.Worker.Gate.TrySetResult();
@@ -289,13 +289,13 @@ public class UpstreamBranchReconcileTests
         h.Seed(Repo, "gone", false, "c-gone");
         h.Lister.Set(Repo, "main");
         h.Start();
-        await h.Service.ReconcileUpstreamBranchesAsync();
+        await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         h.Clock.Advance(TimeSpan.FromMinutes(61));
 
         var blocker = h.Service.EnsureSnapshotAsync(new EnsureSnapshotRequest { RepositoryRemoteUrl = OtherRepo, CommitSha = "b-1" });
         await WaitUntilAsync(() => h.Worker.Calls == 1);
         var admitted = h.Service.WriteAdmissions;
-        var pass = h.Service.ReconcileUpstreamBranchesAsync();
+        var pass = h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         await WaitUntilAsync(() => h.Service.WriteAdmissions > admitted);
         // The branch was re-created upstream and its ensure completed after the confirming listing started, leaving the
         // pointer's snapshot and updated_at as they were.
@@ -325,10 +325,10 @@ public class UpstreamBranchReconcileTests
         h.Execute($"INSERT INTO snapshot_jobs (identity_hash, repository_url, commit_sha, branch_name, status, created_at, updated_at, completed_at) " +
                   $"VALUES ('old', '{Repo}', 'c-gone', 'gone', 'complete', {before}, {before}, {before});");
 
-        await h.Service.ReconcileUpstreamBranchesAsync();
+        await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         h.Clock.Advance(TimeSpan.FromMinutes(61));
 
-        Assert.AreEqual(1, (await h.Service.ReconcileUpstreamBranchesAsync()).Retired);
+        Assert.AreEqual(1, (await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow())).Retired);
     }
 
     [TestMethod]
@@ -339,13 +339,13 @@ public class UpstreamBranchReconcileTests
         h.Seed(Repo, "gone", false, "c-gone");
         h.Lister.Set(Repo, "main");
         h.Start();
-        await h.Service.ReconcileUpstreamBranchesAsync();
+        await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         h.Clock.Advance(TimeSpan.FromMinutes(61));
 
         var blocker = h.Service.EnsureSnapshotAsync(new EnsureSnapshotRequest { RepositoryRemoteUrl = OtherRepo, CommitSha = "b-1" });
         await WaitUntilAsync(() => h.Worker.Calls == 1);
         var admitted = h.Service.WriteAdmissions;
-        var pass = h.Service.ReconcileUpstreamBranchesAsync();
+        var pass = h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         await WaitUntilAsync(() => h.Service.WriteAdmissions > admitted);
         // The branch row went away (idle-retired, head recorded) before the queued retirement's turn.
         h.Execute("DELETE FROM branches WHERE name = 'gone';");
@@ -372,7 +372,7 @@ public class UpstreamBranchReconcileTests
         using var release = new ManualResetEventSlim(false);
         h.Lister.Block(Repo, release, "main");
 
-        var pass = h.Service.ReconcileUpstreamBranchesAsync();
+        var pass = h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         await WaitUntilAsync(() => h.Lister.Calls.Count == 1);
         h.Clock.Advance(TimeSpan.FromMinutes(6));
         var report = await pass.WaitAsync(TimeSpan.FromSeconds(10));
@@ -382,13 +382,13 @@ public class UpstreamBranchReconcileTests
         Assert.AreEqual(0, report.AwaitingConfirmation);
         Assert.AreEqual(1, h.Service.CollectMetrics().Maintenance.MaintenanceDeferrals["upstream_branch_check"]);
 
-        var again = await h.Service.ReconcileUpstreamBranchesAsync();
+        var again = await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         Assert.AreEqual(0, again.Checked, "its listing is still running");
         Assert.AreEqual(1, h.Lister.Calls.Count);
 
         release.Set();
         await WaitUntilAsync(() => !h.Service.IsListingUpstreamForTesting(Repo));
-        var third = await h.Service.ReconcileUpstreamBranchesAsync();
+        var third = await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         Assert.AreEqual(1, third.Checked);
         Assert.AreEqual(2, h.Lister.Calls.Count);
     }
@@ -402,13 +402,13 @@ public class UpstreamBranchReconcileTests
         h.Lister.Set(Repo, "main");
         h.Start();
         h.Service.MaintenanceStepLimit = TimeSpan.FromMinutes(10);
-        await h.Service.ReconcileUpstreamBranchesAsync();
+        await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         h.Clock.Advance(TimeSpan.FromMinutes(61));
 
         var blocker = h.Service.EnsureSnapshotAsync(new EnsureSnapshotRequest { RepositoryRemoteUrl = OtherRepo, CommitSha = "b-1" });
         await WaitUntilAsync(() => h.Worker.Calls == 1);
         var admitted = h.Service.WriteAdmissions;
-        var pass = h.Service.ReconcileUpstreamBranchesAsync();
+        var pass = h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         await WaitUntilAsync(() => h.Service.WriteAdmissions > admitted);
         // The step's timer is created just after the retirement is admitted, so keep the clock moving until it fires.
         while (!pass.IsCompleted)
@@ -442,7 +442,7 @@ public class UpstreamBranchReconcileTests
         h.Lister.DelayMs = 100;
         h.Start();
 
-        var report = await h.Service.ReconcileUpstreamBranchesAsync();
+        var report = await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
 
         Assert.AreEqual(6, report.Checked);
         Assert.AreEqual(3, h.Lister.MaxConcurrent);
@@ -460,7 +460,7 @@ public class UpstreamBranchReconcileTests
         h.Lister.Set(Repo.ToUpperInvariant().Replace("HTTPS", "https"), "main", "side", "other");
         h.Start();
 
-        var report = await h.Service.ReconcileUpstreamBranchesAsync();
+        var report = await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
 
         Assert.AreEqual(1, report.Due);
         Assert.AreEqual(1, report.Checked);
@@ -468,6 +468,98 @@ public class UpstreamBranchReconcileTests
     }
 
     // ---- caps, interval, switch ---------------------------------------------------------------------
+
+    [TestMethod]
+    public async Task TicksSlightlyShorterThanTheInterval_ListEveryTick_AndConfirmOnTheSecond()
+    {
+        await using var h = Harness.Create();
+        h.Seed(Repo, "main", true, "c-main");
+        h.Seed(Repo, "gone", false, "c-gone");
+        h.Lister.Set(Repo, "main");
+        h.Start();
+        var tick = TimeSpan.FromMinutes(60) - TimeSpan.FromSeconds(2);
+
+        var first = await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
+        Assert.AreEqual(1, first.Checked);
+        h.Clock.Advance(tick);
+        var second = await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
+        Assert.AreEqual(1, second.Checked, "a tick a little early still lists the repository");
+        Assert.AreEqual(1, second.Retired);
+        Assert.IsFalse(h.BranchExists(Repo, "gone"));
+
+        h.Seed(Repo, "gone2", false, "c-gone2");
+        h.Clock.Advance(tick);
+        Assert.AreEqual(1, (await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow())).Checked);
+        Assert.AreEqual(3, h.Lister.Calls.Count);
+    }
+
+    [TestMethod]
+    public async Task ASlowListing_DoesNotPushTheNextDueTimePastTheNextTick()
+    {
+        await using var h = Harness.Create();
+        h.Seed(Repo, "main", true, "c-main");
+        h.Seed(Repo, "a", false, "c-a");
+        h.Start();
+        h.Lister.Set(Repo, "main", "a");
+        // The listing returns 6 minutes after the tick began: longer than the 5 minute slack, inside the listing budget.
+        h.Lister.OnList = () => h.Clock.Advance(TimeSpan.FromMinutes(6));
+
+        Assert.AreEqual(1, (await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow())).Checked);
+        h.Lister.OnList = null;
+        // The next tick fires one interval after the previous one began (6 minutes of which are already gone).
+        h.Clock.Advance(TimeSpan.FromMinutes(54));
+        Assert.AreEqual(1, (await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow())).Checked);
+    }
+
+    [TestMethod]
+    public async Task DueExactlyAtTheIntervalMinusTheSlack_AndNotOneMillisecondEarlier()
+    {
+        await using var h = Harness.Create();
+        h.Seed(Repo, "main", true, "c-main");
+        h.Seed(Repo, "a", false, "c-a");
+        h.Lister.Set(Repo, "main", "a");
+        h.Start();
+
+        Assert.AreEqual(1, (await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow())).Checked);
+        // 60 minutes: a tenth is 6 minutes, capped to a 5 minute slack.
+        h.Clock.Advance(TimeSpan.FromMinutes(55) - TimeSpan.FromMilliseconds(1));
+        Assert.AreEqual(0, (await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow())).Checked);
+        h.Clock.Advance(TimeSpan.FromMilliseconds(1));
+        Assert.AreEqual(1, (await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow())).Checked);
+    }
+
+    [TestMethod]
+    public async Task TheSlackIsCappedAtFiveMinutes_ForALongInterval()
+    {
+        await using var h = Harness.Create(policy => policy with { BranchUpstreamCheckMinutes = 24 * 60 });
+        h.Seed(Repo, "main", true, "c-main");
+        h.Seed(Repo, "a", false, "c-a");
+        h.Lister.Set(Repo, "main", "a");
+        h.Start();
+        var interval = TimeSpan.FromHours(24);
+
+        Assert.AreEqual(1, (await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow())).Checked);
+        h.Clock.Advance(interval - TimeSpan.FromMinutes(6));
+        Assert.AreEqual(0, (await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow())).Checked);
+        h.Clock.Advance(TimeSpan.FromMinutes(1));
+        Assert.AreEqual(1, (await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow())).Checked);
+    }
+
+    [TestMethod]
+    public async Task ATickWellInsideTheInterval_DoesNotListAgain()
+    {
+        await using var h = Harness.Create();
+        h.Seed(Repo, "main", true, "c-main");
+        h.Seed(Repo, "a", false, "c-a");
+        h.Lister.Set(Repo, "main", "a");
+        h.Start();
+
+        Assert.AreEqual(1, (await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow())).Checked);
+        h.Clock.Advance(TimeSpan.FromMinutes(30));
+        var second = await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
+        Assert.AreEqual(0, second.Due);
+        Assert.AreEqual(1, h.Lister.Calls.Count);
+    }
 
     [TestMethod]
     public async Task PerTickRepositoryCap_AndPerRepositoryInterval_AreRespected()
@@ -481,19 +573,19 @@ public class UpstreamBranchReconcileTests
         h.Lister.Set(OtherRepo, "main", "b");
         h.Start();
 
-        var first = await h.Service.ReconcileUpstreamBranchesAsync();
+        var first = await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         Assert.AreEqual(2, first.Due);
         Assert.AreEqual(1, first.Checked);
-        var second = await h.Service.ReconcileUpstreamBranchesAsync();
+        var second = await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         Assert.AreEqual(1, second.Checked, "the repository not yet checked goes next, the checked one is not due");
         Assert.AreEqual(2, h.Lister.Calls.Count);
         CollectionAssert.AreEquivalent(new[] { Repo, OtherRepo }, h.Lister.Calls.ToArray());
 
-        var third = await h.Service.ReconcileUpstreamBranchesAsync();
+        var third = await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         Assert.AreEqual(0, third.Due, "both were checked within the interval");
 
         h.Clock.Advance(TimeSpan.FromMinutes(61));
-        var fourth = await h.Service.ReconcileUpstreamBranchesAsync();
+        var fourth = await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
         Assert.AreEqual(2, fourth.Due);
         Assert.AreEqual(1, fourth.Checked);
         Assert.AreEqual(Repo == h.Lister.Calls[0] ? Repo : OtherRepo, h.Lister.Calls[2], "least recently checked first");
@@ -508,7 +600,7 @@ public class UpstreamBranchReconcileTests
         h.Lister.Set(Repo, "main");
         h.Start();
 
-        var report = await h.Service.ReconcileUpstreamBranchesAsync();
+        var report = await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow());
 
         Assert.IsFalse(report.Enabled);
         Assert.AreEqual(0, h.Lister.Calls.Count);
@@ -521,7 +613,7 @@ public class UpstreamBranchReconcileTests
         h.Seed(Repo, "main", true, "c-main");
         h.Start(withLister: false);
 
-        Assert.IsFalse((await h.Service.ReconcileUpstreamBranchesAsync()).Enabled);
+        Assert.IsFalse((await h.Service.ReconcileUpstreamBranchesAsync(h.Clock.GetUtcNow())).Enabled);
     }
 
     [TestMethod]
@@ -605,6 +697,7 @@ public class UpstreamBranchReconcileTests
         private int _running;
         public List<string> Calls { get; } = [];
         public int DelayMs { get; set; }
+        public Action? OnList { get; set; }
         public int MaxConcurrent { get; private set; }
 
         public void Block(string url, ManualResetEventSlim release, params string[] branches) => _answers[url] = () =>
@@ -628,6 +721,7 @@ public class UpstreamBranchReconcileTests
             {
                 if (DelayMs > 0)
                     Thread.Sleep(DelayMs);
+                OnList?.Invoke();
                 return _answers.TryGetValue(repositoryRemoteUrl, out var answer) ? answer() : null;
             }
             finally

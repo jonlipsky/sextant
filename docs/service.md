@@ -2228,7 +2228,11 @@ their snapshots forever. A service-owned loop cleans them up.
   retirements take writer turns. At most `SEXTANT_SERVICE_BRANCH_UPSTREAM_CHECK_MAX_REPOSITORIES_PER_TICK`
   (default 10) repositories are checked per tick, least recently checked first, and one repository is checked at
   most every `SEXTANT_SERVICE_BRANCH_UPSTREAM_CHECK_MINUTES` (default 60, `0` = off; the last-checked times are in
-  memory, so a restart re-checks). URL spellings of one repository are listed once. **Listing is bounded:** at most
+  memory, so a restart re-checks). The check time is the START of the maintenance tick that listed the repository,
+  and a repository is due when that was at least the interval minus a tenth of it (at most 5 minutes) ago. So with an
+  interval equal to the maintenance tick period, every repository is listed on every tick as long as tick jitter stays
+  under that slack; a slow listing does not push the next check back. URL spellings of one repository are listed
+  once. **Listing is bounded:** at most
   3 repositories are listed in parallel, each `ls-remote` has a 30 s timeout, and the whole listing phase gets half
   of what is left of the tick deadline when the step starts; repositories not listed in time stay due and are counted
   in the `upstream_branch_check` deferral. A listing still running from an earlier tick (its wait was abandoned; the

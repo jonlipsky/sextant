@@ -60,6 +60,15 @@ public sealed partial class SnapshotService
     private const int UpstreamListingParallelism = 3;
     private const int UpstreamConfirmationWindowIntervals = 3;
 
+    private const long UpstreamDueSlackMaxMs = 5 * 60 * 1000;
+
+    /// <summary>
+    /// Timer jitter tolerance of the due test: a repository is due when its last check (recorded as the START of the
+    /// maintenance tick that listed it) is at least the interval minus this slack ago, so a tick that fires a little early still
+    /// lists it. A tenth of the interval, at most five minutes.
+    /// </summary>
+    private static long DueSlack(long intervalMs) => Math.Min(intervalMs / 10, UpstreamDueSlackMaxMs);
+
     private readonly record struct UpstreamListing(string RepositoryKey, bool Listed, IReadOnlySet<string>? Heads, long StartedAt);
 
     /// <summary>
@@ -75,14 +84,14 @@ public sealed partial class SnapshotService
     /// compare-and-swap, never a default branch, never a branch with pending work) and records no retired head, since the
     /// branch is gone from git too.
     /// </summary>
-    internal async Task<UpstreamBranchReport> ReconcileUpstreamBranchesAsync(CancellationToken cancellationToken = default)
+    internal async Task<UpstreamBranchReport> ReconcileUpstreamBranchesAsync(DateTimeOffset tickStartedAt, CancellationToken cancellationToken = default)
     {
         var policy = _options.Maintenance;
         if (policy.BranchUpstreamCheckMinutes <= 0 || _remoteBranches is not { } lister)
             return new UpstreamBranchReport { Enabled = false };
 
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
-        var now = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
+        var tickStart = tickStartedAt.ToUnixTimeMilliseconds();
         var interval = (long)TimeSpan.FromMinutes(
             Math.Min(policy.BranchUpstreamCheckMinutes, MaintenancePolicy.MaxBranchUpstreamCheckMinutes)).TotalMilliseconds;
 
@@ -110,7 +119,7 @@ public sealed partial class SnapshotService
         ForgetAbsent(k => !byRepository.ContainsKey(k.Repository));
 
         var due = byRepository
-            .Where(r => !_upstreamCheckedAt.TryGetValue(r.Key, out var last) || now - last >= interval)
+            .Where(r => !_upstreamCheckedAt.TryGetValue(r.Key, out var last) || tickStart - last >= interval - DueSlack(interval))
             .OrderBy(r => _upstreamCheckedAt.GetValueOrDefault(r.Key))
             .ThenBy(r => r.Key, StringComparer.Ordinal)
             .ToList();
@@ -135,7 +144,7 @@ public sealed partial class SnapshotService
             var repositoryKey = listing.RepositoryKey;
             var branches = byRepository[repositoryKey];
             checkedCount++;
-            _upstreamCheckedAt[repositoryKey] = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
+            _upstreamCheckedAt[repositoryKey] = tickStart;
             var heads = listing.Heads;
             // The repository has pointers, so an empty listing is as untrustworthy as a failed one. Either one drops the
             // pending confirmations, so two "absent" listings are never separated by a gap nobody saw.

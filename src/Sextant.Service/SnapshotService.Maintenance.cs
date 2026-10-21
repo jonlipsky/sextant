@@ -281,7 +281,8 @@ public sealed partial class SnapshotService
     public async Task<MaintenanceTickReport> RunMaintenanceTickAsync(CancellationToken cancellationToken = default)
     {
         await _maintenanceTick.WaitAsync(cancellationToken).ConfigureAwait(false);
-        _tickDeadlineAt = _timeProvider.GetUtcNow() + StepLimit();
+        var tickStartedAt = _timeProvider.GetUtcNow();
+        _tickDeadlineAt = tickStartedAt + StepLimit();
         try
         {
             if (BeforeMaintenanceTick is { } hook)
@@ -295,7 +296,7 @@ public sealed partial class SnapshotService
                     $"retired heads pruned {idle.RetiredHeadsPruned}) " +
                     $"in {idle.DurationMs:F0} ms.");
 
-            var upstream = await ReconcileUpstreamBranchesAsync(cancellationToken).ConfigureAwait(false);
+            var upstream = await ReconcileUpstreamBranchesAsync(tickStartedAt, cancellationToken).ConfigureAwait(false);
             if (upstream.Enabled)
             {
                 _metrics.RecordUpstreamBranchPass(
