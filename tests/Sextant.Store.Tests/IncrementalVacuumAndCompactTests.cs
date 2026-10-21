@@ -94,6 +94,21 @@ public class IncrementalVacuumAndCompactTests
     }
 
     [TestMethod]
+    public void Step_RecordsOneHoldOwnedByIncrementalVacuum_AndNoWait()
+    {
+        var path = SeededDb("INCREMENTAL");
+        using var c = Open(path);
+        var tracker = new WriteLockTracker();
+
+        Assert.IsTrue(IncrementalVacuum.Step(c, tracker) > 0);
+
+        var m = tracker.Snapshot();
+        Assert.AreEqual(1, m.HoldsTotal);
+        Assert.AreEqual("incremental-vacuum", m.LongestHoldOwner);
+        Assert.AreEqual(0, m.LongestWaitMs, "the PRAGMA's duration is a hold, not a wait");
+    }
+
+    [TestMethod]
     public void CheckpointTruncate_WhenAReaderPinsTheWal_ReturnsFalseWithoutWaiting_AndSucceedsLater()
     {
         var path = SeededDb("INCREMENTAL");

@@ -198,7 +198,8 @@ public sealed class IndexOrchestrator
         using var runScope = runStore.BeginScope(
             metrics?.Mode ?? "full", now,
             _profile.ConfigurationHash, _profile.Profile, (long)_profile.Features);
-        using var session = _db.BeginWriteSession();
+        using var session = _db.BeginWriteSession(
+            detail: snapshotContext is null ? null : $"repository={snapshotContext.RepositoryRemoteUrl} branch={snapshotContext.BranchName} commit={snapshotContext.CommitSha}");
         using var symbolInsert = symbolStore.CreateInsertCommand();
         using var referenceInsert = referenceStore.CreateInsertCommand();
         using var relationshipInsert = relationshipStore.CreateInsertCommand();

@@ -252,6 +252,38 @@ public sealed record ServiceOptions
 
     internal const int DefaultControlWriteWaitSeconds = 5;
 
+    /// <summary>
+    /// How long a grant write waits for SQLite's write lock before it answers <c>503</c> with <c>Retry-After</c>
+    /// (issue #342). It runs on its own connection outside the write gate, so a long index batch or checkpoint can
+    /// hold the lock; keep it well under the callers' HTTP timeout (commonly 30 s) so they see the 503, not a
+    /// timeout. The wait is rounded up to whole seconds (the connection's command timeout).
+    /// <c>SEXTANT_SERVICE_GRANT_WRITE_BUSY_TIMEOUT_SECONDS</c> (default 10); must be positive.
+    /// </summary>
+    public TimeSpan GrantWriteBusyTimeout { get; init; } = TimeSpan.FromSeconds(DefaultGrantWriteBusyTimeoutSeconds);
+
+    internal const int DefaultGrantWriteBusyTimeoutSeconds = 10;
+
+    /// <summary>
+    /// A write transaction that holds the catalog's write lock longer than this, or a lock acquisition that waits
+    /// longer, is logged as a warning naming its owner and counted in <c>/control/metrics</c> (issue #342).
+    /// <c>SEXTANT_SERVICE_WRITE_LOCK_WARN_SECONDS</c> (default 5); must be positive.
+    /// </summary>
+    public TimeSpan WriteLockWarnThreshold { get; init; } = TimeSpan.FromSeconds(DefaultWriteLockWarnSeconds);
+
+    internal const int DefaultWriteLockWarnSeconds = 5;
+
+    internal static TimeSpan ParsePositiveSeconds(string name, string? value, int defaultSeconds)
+    {
+        if (value is null)
+            return TimeSpan.FromSeconds(defaultSeconds);
+        if (!int.TryParse(value.Trim(), System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out var seconds) || seconds <= 0 || seconds > 3600)
+            throw new InvalidOperationException(
+                $"Environment variable {EnvPrefix}{name} has an invalid value '{value}'. Use a whole number of seconds " +
+                "from 1 to 3600.");
+        return TimeSpan.FromSeconds(seconds);
+    }
+
     /// <summary>The largest <see cref="ControlWriteWait"/> the environment can set, in seconds.</summary>
     public const int MaxControlWriteWaitSeconds = 25;
 
@@ -528,7 +560,11 @@ public sealed record ServiceOptions
                 ? TimeSpan.FromSeconds(restoreSeconds) : PackageRestoreRunner.DefaultTimeout,
             PackageSourceCredentials = ParsePackageSourceCredentials(Env("PACKAGE_SOURCE_CREDENTIALS")),
             PackageCacheMaxBytes = ParsePackageCacheMaxBytes(Env("PACKAGE_CACHE_MAX_MB")),
-            GitObjectStore = EnvBool("GIT_OBJECT_STORE") ?? true
+            GitObjectStore = EnvBool("GIT_OBJECT_STORE") ?? true,
+            GrantWriteBusyTimeout = ParsePositiveSeconds(
+                "GRANT_WRITE_BUSY_TIMEOUT_SECONDS", Env("GRANT_WRITE_BUSY_TIMEOUT_SECONDS"), DefaultGrantWriteBusyTimeoutSeconds),
+            WriteLockWarnThreshold = ParsePositiveSeconds(
+                "WRITE_LOCK_WARN_SECONDS", Env("WRITE_LOCK_WARN_SECONDS"), DefaultWriteLockWarnSeconds)
         };
         options.ValidateCallerIdentity();
         return options;

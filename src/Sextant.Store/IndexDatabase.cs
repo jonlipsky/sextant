@@ -63,14 +63,28 @@ public sealed class IndexDatabase : IDisposable
     public void Checkpoint()
     {
         var conn = GetConnection();
-        using var cmd = conn.CreateCommand();
-        cmd.CommandText = "PRAGMA wal_checkpoint(TRUNCATE);";
-        cmd.ExecuteNonQuery();
+        var tracker = WriteLockTracker ?? Sextant.Store.WriteLockTracker.Untracked;
+        var started = tracker.BeginAcquire();
+        try
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "PRAGMA wal_checkpoint(TRUNCATE);";
+            cmd.ExecuteNonQuery();
+        }
+        finally
+        {
+            // A TRUNCATE checkpoint blocks writers while it waits for readers, so its whole duration is a hold.
+            tracker.Released(new WriteLockHold("wal-checkpoint", null, started));
+        }
     }
 
+    /// <summary>Records this database's write-lock holds and waits (issue #342); null leaves them untracked.</summary>
+    public WriteLockTracker? WriteLockTracker { get; set; }
+
     /// <summary>Opens a bounded, batched write session over the single writer connection.</summary>
-    public IndexWriteSession BeginWriteSession(IndexWriteOptions? options = null)
-        => new(GetConnection(), options ?? _writeOptions, InvalidateConnection, _writerLostProbe);
+    public IndexWriteSession BeginWriteSession(
+        IndexWriteOptions? options = null, string owner = "index-write-session", string? detail = null)
+        => new(GetConnection(), options ?? _writeOptions, InvalidateConnection, _writerLostProbe, WriteLockTracker, owner, detail);
 
     /// <summary>
     /// Registers a probe every write session consults at each batch boundary to detect a LOST
@@ -323,9 +337,7 @@ public sealed class IndexDatabase : IDisposable
 
         try
         {
-            using var checkpoint = conn.CreateCommand();
-            checkpoint.CommandText = "PRAGMA wal_checkpoint(TRUNCATE);";
-            checkpoint.ExecuteNonQuery();
+            Checkpoint();
         }
         catch (SqliteException)
         {

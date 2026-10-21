@@ -243,6 +243,9 @@ public sealed record MetricsSnapshot
     /// <summary>Crash visibility from the catalog's writer run state (issue #320).</summary>
     public CrashMetrics Crash { get; init; } = new();
 
+    /// <summary>Catalog write-lock holds and waits since start, with the owner of the longest of each (issue #342).</summary>
+    public Sextant.Store.WriteLockMetrics WriteLock { get; init; } = new();
+
     public IReadOnlyList<Alert> Alerts { get; init; } = [];
     public IReadOnlyList<Sextant.Store.AuditCostAttribution> CostByRepository { get; init; } = [];
 }

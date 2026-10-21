@@ -69,6 +69,17 @@ public class RetentionProtectedSetEquivalenceTests
     }
 
     [TestMethod]
+    public void ExecuteBatch_RecordsExactlyOneHold_PerSuccessfulBegin()
+    {
+        OldGenerationWithCandidate();
+        var tracker = new WriteLockTracker();
+        var service = new RetentionService(_conn, new RetentionPolicy { KeepCompleteGenerations = 0 }) { WriteLockTracker = tracker };
+        service.ExecuteBatch(service.CreatePlan());
+
+        Assert.AreEqual(1, tracker.Snapshot().HoldsTotal);
+    }
+
+    [TestMethod]
     public void EveryBatch_SkipsACandidate_ThatBecameBranchPointedSinceThePlan()
     {
         var (_, candidate) = OldGenerationWithCandidate();

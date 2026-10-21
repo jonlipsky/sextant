@@ -29,17 +29,34 @@ public static class IncrementalVacuum
     /// takes no bound parameter). Returns the pages released: zero on a database that is not incremental (nothing is
     /// attempted) or has no free pages.
     /// </summary>
-    public static long Step(SqliteConnection connection)
+    public static long Step(SqliteConnection connection, WriteLockTracker? tracker = null)
     {
         if (!IsIncremental(connection)) return 0;
         var before = FreelistPages(connection);
         if (before == 0) return 0;
-        using (var cmd = connection.CreateCommand())
+        tracker ??= WriteLockTracker.Untracked;
+        var started = tracker.BeginAcquire();
+        try
         {
+            using var cmd = connection.CreateCommand();
             // Keep this literal equal to DefaultStepPages.
             cmd.CommandText = "PRAGMA incremental_vacuum(8192);";
             cmd.ExecuteNonQuery();
         }
+        catch (SqliteException ex) when (ex.SqliteErrorCode is 5 or 6)
+        {
+            tracker.AcquireFailed("incremental-vacuum", null, started);
+            throw;
+        }
+        catch
+        {
+            // Not a lock failure: the lock was held while the step ran, so it still counts as a hold.
+            tracker.Released(new WriteLockHold("incremental-vacuum", null, started));
+            throw;
+        }
+        // The PRAGMA waits for and holds the write lock in one call, so the two cannot be separated: the whole
+        // duration is recorded as a hold and may include the busy wait.
+        tracker.Released(new WriteLockHold("incremental-vacuum", null, started));
         return Math.Max(0, before - FreelistPages(connection));
     }
 
@@ -49,8 +66,19 @@ public static class IncrementalVacuum
     /// writer for the connection's <c>busy_timeout</c>. A false result (busy or a partial checkpoint) means "try again
     /// next pass"; the WAL is still bounded by its autocheckpoint and <c>journal_size_limit</c>.
     /// </summary>
-    public static bool CheckpointTruncate(SqliteConnection connection)
+    public static bool CheckpointTruncate(SqliteConnection connection, WriteLockTracker? tracker = null)
     {
+        tracker ??= WriteLockTracker.Untracked;
+        var started = tracker.BeginAcquire();
+        var ran = CheckpointTruncateCore(connection, out var completed);
+        // A checkpoint that returned busy at once held nothing; recording it would pollute hold metrics.
+        if (ran) tracker.Released(new WriteLockHold("wal-checkpoint", null, started));
+        return completed;
+    }
+
+    private static bool CheckpointTruncateCore(SqliteConnection connection, out bool completed)
+    {
+        completed = false;
         var previous = Scalar(connection, "PRAGMA busy_timeout;");
         SQLitePCL.raw.sqlite3_busy_timeout(connection.Handle, 0);
         try
@@ -60,7 +88,9 @@ public static class IncrementalVacuum
             cmd.CommandTimeout = 1;
             using var reader = cmd.ExecuteReader();
             // Columns: busy (1 = could not complete), WAL frames, frames checkpointed.
-            return reader.Read() && reader.GetInt64(0) == 0;
+            var ok = reader.Read() && reader.GetInt64(0) == 0;
+            completed = ok;
+            return ok;
         }
         catch (SqliteException ex) when (ex.SqliteErrorCode is 5 or 6)
         {

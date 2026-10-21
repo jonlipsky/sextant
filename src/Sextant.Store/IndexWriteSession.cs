@@ -28,13 +28,23 @@ public sealed class IndexWriteSession : IDisposable
     private int _pendingRows;
     private bool _disposed;
     private bool _poisoned;
+    private readonly WriteLockTracker _tracker;
+    private readonly string _owner;
+    private readonly string? _detail;
+    private WriteLockHold? _hold;
 
     public IndexWriteSession(
         SqliteConnection connection,
         IndexWriteOptions? options = null,
         Action? onConnectionPoisoned = null,
-        Func<bool>? isWriterLost = null)
+        Func<bool>? isWriterLost = null,
+        WriteLockTracker? tracker = null,
+        string owner = "index-write-session",
+        string? detail = null)
     {
+        _tracker = tracker ?? WriteLockTracker.Untracked;
+        _owner = owner;
+        _detail = detail;
         _connection = connection;
         _options = options ?? IndexWriteOptions.Default;
         _onConnectionPoisoned = onConnectionPoisoned;
@@ -55,7 +65,17 @@ public sealed class IndexWriteSession : IDisposable
                 "The write session's connection is in an unknown transaction state after a failed rollback " +
                 "and must be reset before further writes.");
         if (_open) return;
-        ExecuteWithRetry("BEGIN IMMEDIATE;");
+        var waitStarted = _tracker.BeginAcquire();
+        try
+        {
+            ExecuteWithRetry("BEGIN IMMEDIATE;");
+        }
+        catch
+        {
+            _tracker.AcquireFailed(_owner, _detail, waitStarted);
+            throw;
+        }
+        _hold = _tracker.Acquired(_owner, _detail, waitStarted);
         _open = true;
         _pendingRows = 0;
     }
@@ -78,6 +98,7 @@ public sealed class IndexWriteSession : IDisposable
         if (!_open) return;
         AbortIfWriterLost();
         ExecuteWithRetry("COMMIT;");
+        EndHold();
         _open = false;
         _pendingRows = 0;
         CommittedBatches++;
@@ -90,9 +111,17 @@ public sealed class IndexWriteSession : IDisposable
         if (!_open) return;
         AbortIfWriterLost();
         ExecuteWithRetry("COMMIT;");
+        EndHold();
         _open = false;
         _pendingRows = 0;
         CommittedBatches++;
+    }
+
+    private void EndHold()
+    {
+        if (_hold is not { } hold) return;
+        _hold = null;
+        _tracker.Released(hold);
     }
 
     // Fail closed BETWEEN batches when this process lost the single-writer lease (issue #38): roll the
@@ -134,6 +163,7 @@ public sealed class IndexWriteSession : IDisposable
             _poisoned = true;
             _onConnectionPoisoned?.Invoke();
         }
+        EndHold();
         _open = false;
         _pendingRows = 0;
     }
