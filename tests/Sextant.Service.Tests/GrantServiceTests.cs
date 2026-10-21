@@ -41,6 +41,40 @@ public class GrantServiceTests
     // ==== principals and scopes =====================================================================
 
     [TestMethod]
+    public async Task Put_WhileTheCatalogIsWriteLockedPastTheConfiguredWait_ThrowsUnavailable_AndWritesNothing()
+    {
+        var service = Start(o => o with { GrantWriteBusyTimeout = TimeSpan.FromSeconds(1) });
+        using var holder = new Microsoft.Data.Sqlite.SqliteConnection(
+            new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder { DataSource = _dbPath, Pooling = false }.ToString());
+        holder.Open();
+        using (var begin = holder.CreateCommand())
+        {
+            begin.CommandText = "BEGIN IMMEDIATE;";
+            begin.ExecuteNonQuery();
+        }
+
+        var started = System.Diagnostics.Stopwatch.StartNew();
+        await Assert.ThrowsExactlyAsync<GrantStoreUnavailableException>(
+            () => service.PutGrantAsync(App("tenant-a"), GrantScope.Tenant, Widgets, Key(Widgets), ""));
+
+        Assert.IsTrue(started.Elapsed < TimeSpan.FromSeconds(10), "the wait follows the configured bound, not 30 s");
+        Assert.AreEqual(0, Grants().Count);
+    }
+
+    [TestMethod]
+    public void GrantWriteOptions_AreValidated()
+    {
+        Assert.AreEqual(TimeSpan.FromSeconds(10), ServiceTestFixtures.NewOptions(_dbPath).GrantWriteBusyTimeout);
+        Assert.AreEqual(TimeSpan.FromSeconds(5), ServiceTestFixtures.NewOptions(_dbPath).WriteLockWarnThreshold);
+        Assert.AreEqual(TimeSpan.FromSeconds(7), ServiceOptions.ParsePositiveSeconds("X", "7", 10));
+        Assert.AreEqual(TimeSpan.FromSeconds(10), ServiceOptions.ParsePositiveSeconds("X", null, 10));
+        foreach (var bad in new[] { "0", "-1", "abc", "", "99999" })
+            Assert.ThrowsExactly<InvalidOperationException>(() => ServiceOptions.ParsePositiveSeconds("X", bad, 10), bad);
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(
+            () => Start(o => o with { GrantWriteBusyTimeout = TimeSpan.Zero }));
+    }
+
+    [TestMethod]
     public async Task Put_Self_WritesTheCallersExactSubject_Tenant_WritesTheTenantWidePrincipal()
     {
         var service = Start();

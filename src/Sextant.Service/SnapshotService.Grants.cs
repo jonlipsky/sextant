@@ -12,9 +12,6 @@ namespace Sextant.Service;
 // held, and commits its limit check, row change and audit row in ONE transaction. Grant READS go through ReadCatalog.
 public sealed partial class SnapshotService
 {
-    // How long a grant write waits for SQLite's write lock (a production commits at batch boundaries well inside it).
-    private const int GrantWriteBusyTimeoutMs = 30_000;
-
     /// <summary>
     /// Creates (or refreshes) a grant for <paramref name="caller"/> on a repository branch (SVC-4,
     /// <c>PUT /control/grants/{self|tenant}</c>). The principal comes only from <paramref name="caller"/>: its exact
@@ -321,7 +318,17 @@ public sealed partial class SnapshotService
     {
         ThrowIfGrantLeaseLost();
         using var conn = OpenGrantWriteConnection();
-        ExecOn(conn, "BEGIN IMMEDIATE;");
+        var waitStarted = _writeLocks.BeginAcquire();
+        try
+        {
+            ExecOn(conn, "BEGIN IMMEDIATE;");
+        }
+        catch
+        {
+            _writeLocks.AcquireFailed("grant-write", null, waitStarted);
+            throw;
+        }
+        var hold = _writeLocks.Acquired("grant-write", null, waitStarted);
         var committed = false;
         try
         {
@@ -336,6 +343,7 @@ public sealed partial class SnapshotService
         {
             if (!committed)
                 TryRollback(conn);
+            _writeLocks.Released(hold);
         }
     }
 
@@ -364,11 +372,14 @@ public sealed partial class SnapshotService
         {
             DataSource = _options.CatalogDbPath,
             Mode = SqliteOpenMode.ReadWrite,
-            Pooling = true
+            Pooling = true,
+            // Microsoft.Data.Sqlite re-steps a busy statement until the command timeout (default 30 s) whatever
+            // busy_timeout says, so the wait bound must be set here too (issue #342).
+            DefaultTimeout = Math.Max(1, (int)Math.Ceiling(_options.GrantWriteBusyTimeout.TotalSeconds))
         }.ToString();
         var conn = new SqliteConnection(connectionString);
         conn.Open();
-        ExecOn(conn, $"PRAGMA busy_timeout = {GrantWriteBusyTimeoutMs};");
+        ExecOn(conn, $"PRAGMA busy_timeout = {(int)_options.GrantWriteBusyTimeout.TotalMilliseconds};");
         return conn;
     }
 

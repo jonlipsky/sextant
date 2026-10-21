@@ -275,8 +275,22 @@ internal static class GrantEndpoints
         || ex is OperationCanceledException && !ct.IsCancellationRequested;
 
     private static IResult Unavailable() =>
-        Results.Json(new { status = "unavailable", reason = "the index service cannot record grants right now; retry the request" },
-            ServiceJson.Options, statusCode: StatusCodes.Status503ServiceUnavailable);
+        new RetryAfterResult(
+            Results.Json(new { status = "unavailable", reason = "the index service cannot record grants right now; retry the request" },
+                ServiceJson.Options, statusCode: StatusCodes.Status503ServiceUnavailable),
+            RetryAfterSeconds);
+
+    // Seconds a caller should wait before retrying a refused grant write (issue #342).
+    internal const int RetryAfterSeconds = 5;
+
+    private sealed class RetryAfterResult(IResult inner, int seconds) : IResult
+    {
+        public Task ExecuteAsync(HttpContext httpContext)
+        {
+            httpContext.Response.Headers.RetryAfter = seconds.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            return inner.ExecuteAsync(httpContext);
+        }
+    }
 }
 
 /// <summary>

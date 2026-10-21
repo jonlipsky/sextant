@@ -101,6 +101,7 @@ public sealed class WriterLease : IDisposable
     private Timer? _heartbeat;
     private bool _released;
     private volatile bool _lost;
+    private WriteLockTracker? _tracker;
 
     public string OwnerToken { get; }
     public string Holder { get; }
@@ -138,7 +139,7 @@ public sealed class WriterLease : IDisposable
     /// </summary>
     public static WriterLease? TryAcquire(
         string dbPath, string holder, TimeSpan? ttl = null, bool autoHeartbeat = true,
-        IProcessInspector? inspector = null, string kind = WriterKind.Cli)
+        IProcessInspector? inspector = null, string kind = WriterKind.Cli, WriteLockTracker? tracker = null)
     {
         var ttlMs = (long)(ttl ?? DefaultTtl).TotalMilliseconds;
         var token = Guid.NewGuid().ToString("N");
@@ -147,7 +148,7 @@ public sealed class WriterLease : IDisposable
         WriterLeaseAcquisition? acquisition;
         try
         {
-            acquisition = TryAcquireRow(connection, token, holder, ttlMs, inspector ?? ProcessInspector.Instance, kind);
+            acquisition = TryAcquireRow(connection, token, holder, ttlMs, inspector ?? ProcessInspector.Instance, kind, tracker);
             if (acquisition is null)
             {
                 connection.Dispose();
@@ -160,7 +161,7 @@ public sealed class WriterLease : IDisposable
             throw;
         }
 
-        var lease = new WriterLease(connection, token, holder, ttlMs, acquisition);
+        var lease = new WriterLease(connection, token, holder, ttlMs, acquisition) { _tracker = tracker };
         if (autoHeartbeat)
         {
             var period = Math.Max(1000, ttlMs / 3);
@@ -239,7 +240,7 @@ public sealed class WriterLease : IDisposable
         {
             if (_released) return false;
             var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            var renewed = WithImmediate(_connection, () =>
+            var renewed = WithImmediate(_connection, _tracker, () =>
             {
                 using var cmd = _connection.CreateCommand();
                 cmd.CommandText = """
@@ -275,7 +276,7 @@ public sealed class WriterLease : IDisposable
             _heartbeat = null;
             try
             {
-                WithImmediate(_connection, () =>
+                WithImmediate(_connection, _tracker, () =>
                 {
                     using var cmd = _connection.CreateCommand();
                     cmd.CommandText = "DELETE FROM writer_lease WHERE id = 1 AND owner_token = @token;";
@@ -330,7 +331,7 @@ public sealed class WriterLease : IDisposable
     {
         try
         {
-            WithImmediate(_connection, () =>
+            WithImmediate(_connection, _tracker, () =>
             {
                 TouchRunState(_connection, OwnerToken, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), reason);
                 return true;
@@ -361,10 +362,10 @@ public sealed class WriterLease : IDisposable
     }
 
     private static WriterLeaseAcquisition? TryAcquireRow(
-        SqliteConnection connection, string token, string holder, long ttlMs, IProcessInspector inspector, string kind)
+        SqliteConnection connection, string token, string holder, long ttlMs, IProcessInspector inspector, string kind, WriteLockTracker? tracker)
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        return WithImmediate(connection, () =>
+        return WithImmediate(connection, tracker, () =>
         {
             var current = GetCurrent(connection);
             var previous = ReadRunState(connection);
@@ -536,19 +537,29 @@ public sealed class WriterLease : IDisposable
     // Runs a unit of work inside an explicit BEGIN IMMEDIATE/COMMIT on the coordination connection so the
     // read-then-write acquire/renew is atomic across processes (the second process blocks on the write
     // lock until the first commits). Rolls back and rethrows on failure.
-    private static T WithImmediate<T>(SqliteConnection connection, Func<T> work)
+    private static T WithImmediate<T>(SqliteConnection connection, WriteLockTracker? tracker, Func<T> work)
     {
-        using (var begin = connection.CreateCommand())
+        tracker ??= WriteLockTracker.Untracked;
+        var waitStarted = tracker.BeginAcquire();
+        try
         {
+            using var begin = connection.CreateCommand();
             begin.CommandText = "BEGIN IMMEDIATE;";
             begin.ExecuteNonQuery();
         }
+        catch
+        {
+            tracker.AcquireFailed("writer-lease", null, waitStarted);
+            throw;
+        }
+        var hold = tracker.Acquired("writer-lease", null, waitStarted);
         try
         {
             var result = work();
             using var commit = connection.CreateCommand();
             commit.CommandText = "COMMIT;";
             commit.ExecuteNonQuery();
+            tracker.Released(hold);
             return result;
         }
         catch
@@ -563,6 +574,7 @@ public sealed class WriterLease : IDisposable
             {
                 // Ignore rollback failure; the primary exception is what matters.
             }
+            tracker.Released(hold);
             throw;
         }
     }

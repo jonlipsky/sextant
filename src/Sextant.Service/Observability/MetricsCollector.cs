@@ -18,7 +18,8 @@ public sealed class MetricsCollector(
     string catalogDbPath,
     ServiceMetrics metrics,
     bool hasWorkerCapacity,
-    TimeProvider? timeProvider = null)
+    TimeProvider? timeProvider = null,
+    WriteLockTracker? writeLocks = null)
 {
     // Bound the latency window so a very long-lived service never scans an unbounded job history.
     private const int LatencyWindow = 1000;
@@ -66,6 +67,7 @@ public sealed class MetricsCollector(
             QueryErrors = metrics.QueryErrors,
             Maintenance = metrics.Maintenance,
             Crash = CollectCrash(),
+            WriteLock = writeLocks?.Snapshot() ?? new WriteLockMetrics(),
             CostByRepository = cost
         };
 

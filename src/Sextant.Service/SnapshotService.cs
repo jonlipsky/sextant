@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Microsoft.Data.Sqlite;
 using Sextant.Core;
 using Sextant.Core.Platform;
@@ -43,6 +44,8 @@ public sealed partial class SnapshotService : IDisposable
     private readonly SqliteConnection _conn;
     private readonly WriterLease _lease;
     private readonly WriteGate _writeGate;
+    private readonly WriteLockTracker _writeLocks;
+    private WriteLockHold? _rawHold;
     private readonly bool _ownsDatabase;
     private readonly IContributionAuthorizer _authorizer;
     private readonly IGitContentProvider _gitContent;
@@ -108,8 +111,10 @@ public sealed partial class SnapshotService : IDisposable
         ServiceOptions options, ISnapshotWorker worker, ServicePaths paths,
         IndexDatabase db, WriterLease lease, bool ownsDatabase,
         IContributionAuthorizer authorizer, IGitContentProvider gitContent, ContributionPolicy contributionPolicy,
-        IRemoteDefaultBranchResolver? remoteDefaults, TimeProvider? timeProvider, IRemoteBranchLister? remoteBranches)
+        IRemoteDefaultBranchResolver? remoteDefaults, TimeProvider? timeProvider, IRemoteBranchLister? remoteBranches,
+        WriteLockTracker writeLocks)
     {
+        _writeLocks = writeLocks;
         _options = options;
         _worker = worker;
         _paths = paths;
@@ -201,11 +206,18 @@ public sealed partial class SnapshotService : IDisposable
         var paths = new ServicePaths(options.Volumes);
         var ownsDatabase = database is null;
         var db = database ?? new IndexDatabase(options.CatalogDbPath, IndexWriteOptions.Default);
+        if (options.GrantWriteBusyTimeout <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(options), "GrantWriteBusyTimeout must be positive.");
+        if (options.WriteLockWarnThreshold <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(options), "WriteLockWarnThreshold must be positive.");
+        var writeLocks = new WriteLockTracker(
+            options.WriteLockWarnThreshold, e => Console.Error.WriteLine("warn: " + e.Describe()), timeProvider);
+        db.WriteLockTracker = writeLocks;
         try
         {
             db.RunMigrations(recover: false);
 
-            var lease = WriterLease.TryAcquire(options.CatalogDbPath, options.Holder, options.LeaseTtl, kind: WriterKind.Service)
+            var lease = WriterLease.TryAcquire(options.CatalogDbPath, options.Holder, options.LeaseTtl, kind: WriterKind.Service, tracker: writeLocks)
                 ?? throw new InvalidOperationException(
                     $"Another writer holds the single-writer lease on '{options.CatalogDbPath}'. " +
                     "Retention/publish/GC must not race a live daemon/service (issue #38). A lease whose holder is " +
@@ -221,7 +233,7 @@ public sealed partial class SnapshotService : IDisposable
                 db.Recover();
                 var service = new SnapshotService(
                     options, worker ?? new UnavailableSnapshotWorker(), paths, db, lease, ownsDatabase,
-                    effectiveAuthorizer, effectiveGitContent, effectivePolicy, remoteDefaults, timeProvider, remoteBranches);
+                    effectiveAuthorizer, effectiveGitContent, effectivePolicy, remoteDefaults, timeProvider, remoteBranches, writeLocks);
                 service._jobIds.Load();
                 service.ReconcileOnStartup();
                 service.StartMaintenanceLoop();
@@ -323,7 +335,7 @@ public sealed partial class SnapshotService : IDisposable
         int coalesced = 0, cancelled = 0;
         for (var offset = 0; offset < queued.Count; offset += StartupSettleBatchSize)
         {
-            ExecRaw("BEGIN IMMEDIATE;");
+            BeginRaw("settle-orphaned-queued");
             try
             {
                 var last = offset + StartupSettleBatchSize >= queued.Count;
@@ -918,7 +930,7 @@ public sealed partial class SnapshotService : IDisposable
     {
         var jobs = new SnapshotJobStore(_conn);
         // One transaction (raw BEGIN IMMEDIATE so the store commands enrol): the handover never outlives a failed settle.
-        ExecRaw("BEGIN IMMEDIATE;");
+        BeginRaw("coalesce");
         try
         {
             jobs.RecordHandover(RemoteUrlIdentity.Normalize(request.RepositoryRemoteUrl), request.BranchName!,
@@ -1353,7 +1365,7 @@ public sealed partial class SnapshotService : IDisposable
         SqliteConnection payloadConn, IngestContributionRequest request)
     {
         EnsureLeaseHeld();
-        ExecRaw("BEGIN IMMEDIATE;");
+        BeginRaw("ingest-contribution");
         try
         {
             var result = IngestBody(artifact, manifest, assemblyIdentity, identityHash, contentHash, payloadConn, request);
@@ -1659,7 +1671,7 @@ public sealed partial class SnapshotService : IDisposable
     // #104). Raw DB write — callers must already hold the write gate.
     private bool? AdvanceOrAttachBranchPointer(EnsureSnapshotRequest request, long? snapshotId)
     {
-        ExecRaw("BEGIN IMMEDIATE;");
+        BeginRaw("advance-branch-pointer");
         try
         {
             var advanced = AdvanceOrAttachBranchPointerCore(request, snapshotId);
@@ -1793,7 +1805,7 @@ public sealed partial class SnapshotService : IDisposable
     private (bool Reselected, SnapshotCoverage? Coverage, bool? BranchAdvanced) ReselectOrDemoteSupersededSnapshot(
         EnsureSnapshotRequest request, long jobId, long snapshotId, SnapshotJobStore jobs, SnapshotStore snapshots)
     {
-        ExecRaw("BEGIN IMMEDIATE;");
+        BeginRaw("reselect-snapshot");
         try
         {
             if (!snapshots.IsReselectable(snapshotId))
@@ -1840,8 +1852,43 @@ public sealed partial class SnapshotService : IDisposable
     {
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = sql;
-        cmd.ExecuteNonQuery();
+        try
+        {
+            cmd.ExecuteNonQuery();
+        }
+        finally
+        {
+            // COMMIT/ROLLBACK ends the raw write transaction BeginRaw opened (one at a time: the single writer connection).
+            if (_rawHold is { } hold && sql is "COMMIT;" or "ROLLBACK;"
+                && SQLitePCL.raw.sqlite3_get_autocommit(_conn.Handle) != 0)
+            {
+                _rawHold = null;
+                _writeLocks.Released(hold);
+            }
+        }
     }
+
+    // BEGIN IMMEDIATE on the writer connection, timing the wait and starting the hold that the matching COMMIT/ROLLBACK ends.
+    private void BeginRaw(string operation)
+    {
+        // Raw transactions run under the write gate or single-threaded startup, so _rawHold has one owner at a time.
+        Debug.Assert(_rawHold is null);
+        var owner = "snapshot-service:" + operation;
+        var waitStarted = _writeLocks.BeginAcquire();
+        try
+        {
+            ExecRaw("BEGIN IMMEDIATE;");
+        }
+        catch
+        {
+            _writeLocks.AcquireFailed(owner, null, waitStarted);
+            throw;
+        }
+        _rawHold = _writeLocks.Acquired(owner, null, waitStarted);
+    }
+
+    /// <summary>The writer-lock holds and waits this service recorded (issue #342).</summary>
+    public WriteLockMetrics WriteLockMetrics => _writeLocks.Snapshot();
 
     private static SqliteConnection OpenReadOnly(string path)
     {
@@ -2152,7 +2199,7 @@ public sealed partial class SnapshotService : IDisposable
         RetireBranchRequest request, AuditCaller principal, IdleRetireGuard? idle, bool advanceAdmitted = false)
     {
         var snapshots = new SnapshotStore(_conn);
-        ExecRaw("BEGIN IMMEDIATE;");
+        BeginRaw("retire-branch");
         try
         {
             var repositoryId = snapshots.GetRepositoryId(request.Repository);
@@ -2642,7 +2689,7 @@ public sealed partial class SnapshotService : IDisposable
                     var remaining = limit - timer.BudgetElapsed();
                     batchPassBound = remaining < RetentionService.BatchTimeLimit;
                     var batchLimit = batchPassBound ? remaining : RetentionService.BatchTimeLimit;
-                    var retention = new RetentionService(_conn, _options.Retention);
+                    var retention = new RetentionService(_conn, _options.Retention) { WriteLockTracker = _writeLocks };
                     return Task.FromResult(retention.ExecuteBatch(plan, pass.Token, batchLimit, () =>
                     {
                         EnsureLeaseHeld();
@@ -2722,7 +2769,7 @@ public sealed partial class SnapshotService : IDisposable
                     {
                         pass.Token.ThrowIfCancellationRequested();
                         EnsureLeaseHeld();
-                        var freed = IncrementalVacuum.Step(_conn);
+                        var freed = IncrementalVacuum.Step(_conn, _writeLocks);
                         return Task.FromResult((Freed: freed, Left: IncrementalVacuum.FreelistPages(_conn)));
                     }, ms => timer.VacuumMs += ms, pass.Token).ConfigureAwait(false);
                     pagesVacuumed += step.Freed;
@@ -2775,7 +2822,7 @@ public sealed partial class SnapshotService : IDisposable
         try
         {
             var complete = await timer.WriteAsync(
-                this, () => Task.FromResult(IncrementalVacuum.CheckpointTruncate(_conn)),
+                this, () => Task.FromResult(IncrementalVacuum.CheckpointTruncate(_conn, _writeLocks)),
                 ms => timer.VacuumMs += ms, wait.Token).ConfigureAwait(false);
             if (!complete)
                 await Console.Error.WriteLineAsync("maintenance: WAL checkpoint after vacuum was busy; it is retried next pass.").ConfigureAwait(false);
@@ -2801,7 +2848,7 @@ public sealed partial class SnapshotService : IDisposable
     {
         using var conn = OpenReadConnection();
         var collector = new MetricsCollector(
-            conn, _paths, _options.CatalogDbPath, _metrics, HasWorkerCapacity, _timeProvider);
+            conn, _paths, _options.CatalogDbPath, _metrics, HasWorkerCapacity, _timeProvider, _writeLocks);
         return collector.Collect(thresholds);
     }
 

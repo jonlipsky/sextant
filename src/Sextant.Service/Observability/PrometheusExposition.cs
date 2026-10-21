@@ -85,6 +85,14 @@ public static class PrometheusExposition
         Gauge(sb, "sextant_query_errors", "Query-plane 5xx count.", s.QueryErrors);
 
         Gauge(sb, "sextant_alerts_active", "Active alerts.", s.Alerts.Count);
+
+        // Issue #342: catalog write-lock holds and waits.
+        Gauge(sb, "sextant_write_lock_longest_hold_ms", "Longest catalog write-lock hold since start, in milliseconds.",
+            s.WriteLock.LongestHoldMs);
+        Counter(sb, "sextant_write_lock_holds_over_threshold_total", "Write-lock holds over the warning threshold since start.",
+            s.WriteLock.HoldsOverThreshold);
+        Gauge(sb, "sextant_write_lock_longest_wait_ms", "Longest wait to acquire the catalog write lock since start, in milliseconds.",
+            s.WriteLock.LongestWaitMs);
         Gauge(sb, "sextant_alerts_critical", "Active critical alerts.",
             s.Alerts.Count(a => a.Level == AlertLevel.Critical));
 

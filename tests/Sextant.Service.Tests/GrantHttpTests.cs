@@ -673,6 +673,28 @@ public class GrantHttpTests
     }
 
     [TestMethod]
+    public async Task GrantWrite_WhileTheCatalogIsWriteLocked_Is503WithRetryAfter_AndTheWaitIsRecorded()
+    {
+        await using var host = await Harness.StartAsync(configure: o => o with { GrantWriteBusyTimeout = TimeSpan.FromSeconds(1) });
+        using var holder = new Microsoft.Data.Sqlite.SqliteConnection(
+            new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder { DataSource = host.DbPath, Pooling = false }.ToString());
+        holder.Open();
+        using (var begin = holder.CreateCommand())
+        {
+            begin.CommandText = "BEGIN IMMEDIATE;";
+            begin.ExecuteNonQuery();
+        }
+
+        using var response = await host.ControlAsync(HttpMethod.Put, TenantPath, ControlToken, AppAssertion(host), Body(Gadgets));
+        var raw = await response.Content.ReadAsStringAsync();
+
+        Assert.AreEqual(HttpStatusCode.ServiceUnavailable, response.StatusCode, raw);
+        Assert.AreEqual("5", response.Headers.GetValues("Retry-After").Single());
+        Assert.AreEqual("grant-write", host.Service.WriteLockMetrics.LongestWaitOwner);
+        Assert.IsTrue(host.Service.WriteLockMetrics.LongestWaitMs > 0, host.Service.WriteLockMetrics.LongestWaitMs.ToString());
+    }
+
+    [TestMethod]
     public async Task VisibilityReadFailure_FailsClosed_OnEveryReadSurface()
     {
         await using var host = await Harness.StartAsync();

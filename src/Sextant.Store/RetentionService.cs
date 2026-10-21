@@ -458,6 +458,11 @@ internal sealed record ApiHistoryPlan(List<(string Commit, long Newest)> Window,
 public sealed class RetentionService
 {
     private readonly SqliteConnection _connection;
+
+    /// <summary>Records each batch's write-lock wait and hold (issue #342); unset leaves them untracked.</summary>
+    public WriteLockTracker? WriteLockTracker { get; init; }
+
+    private WriteLockTracker Tracker => WriteLockTracker ?? Sextant.Store.WriteLockTracker.Untracked;
     private readonly RetentionPolicy _policy;
     private readonly IReadOnlyList<IRetentionProtectionProvider> _providers;
     private readonly FileSweepCursor? _fileSweep;
@@ -684,10 +689,21 @@ public sealed class RetentionService
         string? tailStep = null;
         string? tailCommit = null;
         var tailRan = false;
+        WriteLockHold? lockHold = null;
         try
         {
             budget.Check();
-            Exec("BEGIN IMMEDIATE;");
+            var waitStarted = Tracker.BeginAcquire();
+            try
+            {
+                Exec("BEGIN IMMEDIATE;");
+            }
+            catch
+            {
+                Tracker.AcquireFailed("retention-batch", null, waitStarted);
+                throw;
+            }
+            lockHold = Tracker.Acquired("retention-batch", null, waitStarted);
             held.Restart();
             var protections = BuildProtections();
             var runStore = new IndexRunStore(_connection);
@@ -821,6 +837,11 @@ public sealed class RetentionService
             beforeCommit?.Invoke();
             budget.Check();
             Exec("COMMIT;");
+            if (lockHold is { } committed)
+            {
+                lockHold = null;
+                Tracker.Released(committed);
+            }
             plan.PublishFileSweep();
             if (tailRan) plan.Tuning.NoteCleanTailBatch();
             held.Stop();
@@ -875,7 +896,15 @@ public sealed class RetentionService
             budget.Dispose();
             _budget = null;
             // SQLITE_INTERRUPT can roll back a write transaction itself.
-            if (SQLitePCL.raw.sqlite3_get_autocommit(_connection.Handle) == 0) Exec("ROLLBACK;");
+            try
+            {
+                if (SQLitePCL.raw.sqlite3_get_autocommit(_connection.Handle) == 0) Exec("ROLLBACK;");
+            }
+            finally
+            {
+                if (lockHold is { } open)
+                    Tracker.Released(open);
+            }
         }
     }
 

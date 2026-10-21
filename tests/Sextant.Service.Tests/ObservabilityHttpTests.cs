@@ -81,6 +81,30 @@ public class ObservabilityHttpTests
     }
 
     [TestMethod]
+    public async Task Metrics_ReportsWriteLockHoldsAndWaits()
+    {
+        await using var host = await Harness.StartAsync();
+        await EnsureViaControl(host);
+
+        var body = await (await Send(host, "/control/metrics", ControlToken)).Content.ReadAsStringAsync();
+        using var json = System.Text.Json.JsonDocument.Parse(body);
+        var lockMetrics = json.RootElement.GetProperty("write_lock");
+        foreach (var key in new[]
+        {
+            "holds_total", "holds_over_threshold", "longest_hold_ms", "longest_hold_owner", "longest_hold_at_unix_ms",
+            "waits_over_threshold", "longest_wait_ms", "threshold_ms"
+        })
+            Assert.IsTrue(lockMetrics.TryGetProperty(key, out _), $"write_lock.{key} in {lockMetrics}");
+        Assert.IsTrue(lockMetrics.GetProperty("holds_total").GetInt64() > 0, "the ensure's writes were counted");
+        Assert.AreEqual(5000, lockMetrics.GetProperty("threshold_ms").GetDouble());
+
+        var prometheus = await (await Send(host, "/control/metrics?format=prometheus", ControlToken)).Content.ReadAsStringAsync();
+        StringAssert.Contains(prometheus, "sextant_write_lock_longest_hold_ms");
+        StringAssert.Contains(prometheus, "sextant_write_lock_holds_over_threshold_total");
+        StringAssert.Contains(prometheus, "sextant_write_lock_longest_wait_ms");
+    }
+
+    [TestMethod]
     public async Task Metrics_PrometheusFormat_IsTextExposition()
     {
         await using var host = await Harness.StartAsync();
