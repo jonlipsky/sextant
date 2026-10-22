@@ -752,6 +752,7 @@ public sealed partial class SnapshotService
     // does continue (issue #321, #329) does so at most MaxScheduledNoProgressContinues times in a row.
     internal const int MaxScheduledNoProgressContinues = 3;
     private int _scheduledNoProgressContinues;
+    private int _scheduledPlanBudgetStops;
 
     // Whether the scheduled day stays open after this pass. Bounded: a pass that only ever runs out of budget must not
     // re-plan every tick for the rest of the day.
@@ -761,18 +762,25 @@ public sealed partial class SnapshotService
     internal bool ScheduledPassContinues(RetentionReport report)
     {
         var continues = ScheduledRetentionContinues(report);
+        _scheduledPlanBudgetStops = report.StopReason == RetentionService.PlanBudgetStopReason ? _scheduledPlanBudgetStops : 0;
         // A pass that never got the writer did nothing, so it says nothing about whether the catalog can move: it neither
         // counts toward the cap nor resets it. Only the UTC day bounds it (the day rolls over and the pass is due again).
         if (continues && report.StopReason == StarvedStopReason)
             return true;
         if (continues && !MadeStopReasonProgress(report))
         {
+            if (report.StopReason == RetentionService.PlanBudgetStopReason)
+                _scheduledPlanBudgetStops++;
             if (++_scheduledNoProgressContinues > MaxScheduledNoProgressContinues)
+            {
                 continues = false;
+                if (report.StopReason == RetentionService.PlanBudgetStopReason)
+                    Log($"maintenance: retention planning did not finish within the pass budget on {_scheduledPlanBudgetStops} consecutive passes; the day is closed.");
+            }
         }
         else
             _scheduledNoProgressContinues = 0;
-        if (!continues) _scheduledNoProgressContinues = 0;
+        if (!continues) { _scheduledNoProgressContinues = 0; _scheduledPlanBudgetStops = 0; }
         return continues;
     }
 
@@ -789,7 +797,7 @@ public sealed partial class SnapshotService
     // Stops that are about a budget or a busy writer, not a catalog that cannot move: they may continue without progress,
     // but only a bounded number of times in a row (ScheduledPassContinues).
     private static bool IsRetryableStop(string? reason) =>
-        reason is "unit_budget" or "batch_budget" or "sweep_budget" or "api_deferred" or "sqlite_busy" or StarvedStopReason
+        reason is "unit_budget" or RetentionService.PlanBudgetStopReason or "batch_budget" or "sweep_budget" or "api_deferred" or "sqlite_busy" or StarvedStopReason
             or RetentionService.KeysBudgetStopReason;
 
     // A pass that never got the writer (starved by productions until the tick deadline) did not run at all: the day stays

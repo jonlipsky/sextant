@@ -506,9 +506,18 @@ public static class ServiceApp
         // refused with 403 caller_not_allowed (retention and backup audit the refusal); see ControlCallerRules.
         control.MapPost("/retention", async (bool? execute, int? seconds, HttpRequest req, SnapshotService service, CancellationToken ct) =>
         {
-            var report = await service.RunRetentionAsync(execute ?? false, AuditActor(req), ct,
-                service.InteractiveRetentionLimit(seconds));
-            return Results.Json(report, ServiceJson.Options);
+            try
+            {
+                var report = await service.RunRetentionAsync(execute ?? false, AuditActor(req), ct,
+                    service.InteractiveRetentionLimit(seconds, dryRun: !(execute ?? false)));
+                return Results.Json(report, ServiceJson.Options);
+            }
+            catch (RetentionDryRunBusyException)
+            {
+                // A dry run pins the WAL for its whole budget, so only one runs at a time (issue #335).
+                return Results.Json(new { status = "busy", reason = "retention_dry_run_running" }, ServiceJson.Options,
+                    statusCode: StatusCodes.Status409Conflict);
+            }
         }).AuditsRefusedUserCallsAs(AuditAction.Retention);
 
         // SVC-4: repository grants (per-caller visibility and reconcile targets).

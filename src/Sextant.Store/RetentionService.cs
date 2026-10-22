@@ -78,6 +78,21 @@ public sealed record RetentionReport
     public string? StopReason { get; init; }
 
     /// <summary>
+    /// How long planning (classification, API-history discovery, file-sweep planning) ran, in milliseconds (issue #335),
+    /// so an operator can see where a dry run's budget went. Set by <see cref="RetentionService.Plan"/> and by a plan
+    /// that did not finish; for an executed service pass it is set on every path where planning ran (the same figure as
+    /// <c>timings.plan_ms</c>), and null where it did not (a source-text sweep slice).
+    /// </summary>
+    public double? PlanMs { get; init; }
+
+    /// <summary>
+    /// False when planning was cut off (its budget or a busy reader ended it, or API-history discovery was deferred), so
+    /// the counts are lower bounds and nothing is known to be (in)eligible beyond them (issue #335); true when
+    /// planning finished.
+    /// </summary>
+    public bool PlanComplete { get; init; } = true;
+
+    /// <summary>
     /// The source-text sweep moved on the backlog this pass: it deleted a blob, advanced its cursor or finished a cycle
     /// (issue #336). False on a dry run and for a slice that spent its budget before handling a blob.
     /// </summary>
@@ -479,6 +494,12 @@ public sealed class RetentionService
     /// <summary>The default pass budget (an interactive run); the service passes its own.</summary>
     public static TimeSpan PassTimeLimit { get; } = TimeSpan.FromSeconds(10);
 
+    /// <summary>
+    /// Default budget of a dry run (issue #335). A dry run reads on its own connection and holds no writer, so it may
+    /// plan longer than an executed pass; the service caps it with the configured retention pass seconds.
+    /// </summary>
+    public static TimeSpan DryRunTimeLimit { get; } = TimeSpan.FromSeconds(60);
+
     /// <summary>The longest one write batch may run, which bounds how long it holds the writer.</summary>
     public static TimeSpan BatchTimeLimit { get; } = TimeSpan.FromSeconds(2);
     public const int BatchRowLimit = 256;
@@ -510,6 +531,18 @@ public sealed class RetentionService
     /// <summary>Test seam: runs inside a batch's transaction right before a snapshot unit is deleted.</summary>
     internal Action<long>? BeforeUnitDelete { get; set; }
 
+    /// <summary>Test seam: runs after each planning stage ("classified") on the plan's budget.</summary>
+    public Action<string>? PlanStageHook { get; set; }
+
+    /// <summary>Test seam: makes the planning stage that is running count as out of budget.</summary>
+    public void ExpirePlanBudget() => _budget?.Expire();
+
+    private void PlanStageDone(string stage, RetentionWorkBudget budget)
+    {
+        PlanStageHook?.Invoke(stage);
+        budget.Check();
+    }
+
     public RetentionService(
         SqliteConnection connection,
         RetentionPolicy policy,
@@ -531,16 +564,24 @@ public sealed class RetentionService
     /// <summary>Reports what retention would do without modifying the database.</summary>
     public RetentionReport Plan(CancellationToken cancellationToken = default, TimeSpan? timeLimit = null)
     {
-        using var budget = new RetentionWorkBudget(_connection, timeLimit ?? PassTimeLimit, cancellationToken);
+        var started = Stopwatch.GetTimestamp();
+        RetentionReport? classified = null;
+        int? snapshotCount = null, projectCount = null, apiCount = null;
+        using var budget = new RetentionWorkBudget(_connection, timeLimit ?? DryRunTimeLimit, cancellationToken);
         _budget = budget;
         try
         {
             budget.Check();
             Exec("BEGIN;");
             var (report, snapshots, _, protections) = ClassifyCore();
+            classified = report;
+            snapshotCount = snapshots.Count;
+            PlanStageDone("classified", budget);
             var (commits, _) = DeletableApiCommits(protections);
             var projects = snapshots.Sum(id => CountRows(RetentionCount.ProjectVersions, id));
+            projectCount = projects;
             var apiRows = commits.Sum(commit => CountRows(RetentionCount.ApiRows, commit));
+            apiCount = apiRows;
             var files = _policy.PruneSupersededSourceBlobs ? OrphanFileVersionIds(protections).Count : 0;
             return report with
             {
@@ -548,13 +589,25 @@ public sealed class RetentionService
                 SnapshotsDeleted = snapshots.Count,
                 SnapshotProjectVersionsDeleted = projects,
                 ApiSnapshotsDeleted = apiRows,
-                FileVersionsDeleted = files
+                FileVersionsDeleted = files,
+                PlanMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds
             };
         }
         catch (Exception ex) when (IsBudgetOrBusy(ex, budget))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            return new RetentionReport { DryRun = true, MoreRemaining = true, StopReason = StopReason(ex) };
+            // Planning did not finish: say so, with the counts known so far (they are lower bounds).
+            return (classified ?? new RetentionReport { DryRun = true }) with
+            {
+                DryRun = true,
+                MoreRemaining = true,
+                StopReason = PlanStopReason(ex),
+                SnapshotsDeleted = snapshotCount ?? 0,
+                SnapshotProjectVersionsDeleted = projectCount ?? 0,
+                ApiSnapshotsDeleted = apiCount ?? 0,
+                PlanComplete = false,
+                PlanMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds
+            };
         }
         finally
         {
@@ -587,12 +640,16 @@ public sealed class RetentionService
                 Exec("BEGIN;");
                 (report, snapshots, deletableRuns, _) = ClassifyCore();
                 planRunIds = RunIdsOf(snapshots);
+                PlanStageDone("classified", budget);
             }
             catch (Exception ex) when (IsBudgetOrBusy(ex, budget))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                return new RetentionPlan(new RetentionReport { DryRun = false, MoreRemaining = true },
-                    [], [], [], false, StopReason(ex));
+                return new RetentionPlan(new RetentionReport
+                    {
+                        DryRun = false, MoreRemaining = true, PlanComplete = false,
+                        PlanMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds
+                    }, [], [], [], false, PlanStopReason(ex));
             }
             finally
             {
@@ -633,7 +690,8 @@ public sealed class RetentionService
             }
         }
 
-        return new RetentionPlan(report with { DryRun = false, Deleted = [] }, snapshots, runs, commits, apiDeferred,
+        var planMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+        return new RetentionPlan(report with { DryRun = false, Deleted = [], PlanComplete = !apiDeferred, PlanMs = planMs }, snapshots, runs, commits, apiDeferred,
             deletableRunIds: deletableRuns, planRunIds: planRunIds, apiHistory: apiHistory,
             pruneFileVersions: _policy.PruneSupersededSourceBlobs && _sweepFileVersions, fileSweep: _fileSweep, sweepSpans: SweepSpansPerPass);
     }
@@ -1020,6 +1078,17 @@ public sealed class RetentionService
          sql.SqliteErrorCode == 9 && (budget?.ShouldStop == true || other?.ShouldStop == true));
 
     private sealed class UnitStartBudgetException() : TimeoutException("Not enough pass budget left to start a deletion unit.");
+
+    /// <summary>
+    /// Stop reason of a plan that did not finish within its budget (issue #335): classification, API-history discovery
+    /// or file-sweep planning ran out of time, so nothing is known to be (in)eligible. Distinct from <c>time_budget</c>,
+    /// which means planning finished and the deleting ran out of time.
+    /// </summary>
+    public const string PlanBudgetStopReason = "plan_budget";
+
+    // A time-budget stop while PLANNING is plan_budget; a busy writer keeps its own reason.
+    private static string PlanStopReason(Exception ex) =>
+        StopReason(ex) == "time_budget" ? PlanBudgetStopReason : StopReason(ex);
 
     private static string StopReason(Exception ex) =>
         ex is UnitStartBudgetException ? "unit_budget" :

@@ -1027,7 +1027,7 @@ The host deliberately **separates control endpoints from query endpoints**, and 
 | `GET /control/status/{jobId}` | control | control token | Job status + per-project diagnostics (criterion 5) + checkout `coverage` (#119) + phase `timings` (#267, see [Job phase timings](#observability-criterion-5)). For a user caller, a job on a repository it cannot read is the same `404` as an unknown id (SVC-4). |
 | `GET /control/resolve` | control | control token | Resolve a repository branch (`?branch=`, else the default) to its current published snapshot (+ its `coverage`, #119), plus `commit_sha`, the resolved `branch` name, `is_default` and `head_sequence` (SVC-7; a null `commit_sha`/`head_sequence` is omitted), and `current_identity_hash` + `identity_current`: whether the snapshot is what an ensure of its commit would build on this node now (both omitted when there is no `commit_sha` or the head is a contribution; see [Identity currency](#branch-pointer-guards-head-cas-branch_update-none-retire-svc-67)). For a user caller, a repository it cannot read is the same bare `404` as an absent one (SVC-4). |
 | `POST /control/branches/retire` | control | control token | Delete a branch pointer (`{repository, branch, expected_head_commit?}`, SVC-6); its snapshots stay for retention. The service's idle-branch rule retires idle non-default branches through the same path (issue #299, see [Maintenance loop](#maintenance-loop-idle-branch-retirement--scheduled-retention-issue-299)). `200 {"retired":true}`, or `{"retired":false}` for a missing branch (idempotent). The default branch or a head-CAS mismatch is `409 {"status":"rejected","reason":"default_branch"\|"head_mismatch"}`; a refused URL or blank branch is `400`. When the retirement has not applied within `CONTROL_WRITE_WAIT_SECONDS` (a production holds the writer), the answer is `202 {"status":"accepted"}`: it applies once the writer frees, with both guards evaluated then (issue #158, see [Queued control writes](#queued-control-writes-issue-158)). `503 {"status":"unavailable"}` once shutdown began (nothing queued). Audited `retire`. A user caller is refused with `403 {"error":"caller_not_allowed"}` (issue #193, see [User callers on the control plane](#user-callers-on-the-control-plane-issue-193)). |
-| `POST /control/retention` | control | control token | Run the service-owned retention/GC pass (`?execute=true` to apply, `?seconds=N` for a longer budget up to `SEXTANT_SERVICE_RETENTION_PASS_SECONDS`, default 10 s). A user caller is refused (`403 caller_not_allowed`). |
+| `POST /control/retention` | control | control token | Run the service-owned retention/GC pass (`?execute=true` to apply, `?seconds=N` for a longer budget up to `SEXTANT_SERVICE_RETENTION_PASS_SECONDS`; default 10 s, or 60 s for a dry run, which holds no writer). A user caller is refused (`403 caller_not_allowed`). |
 | `PUT`/`DELETE`/`GET /control/grants/self` | control | control token + `act=user` assertion | The caller's own repository grants (see [Repository grants](#repository-grants-and-visibility-svc-4)). |
 | `PUT`/`DELETE /control/grants/tenant` | control | control token + `act=application` assertion | The tenant-wide repository grants. |
 | `GET /control/grants?scope=tenant` | control | control token + `act=application` assertion | The tenant's distinct reconcile targets, with counts and no user ids. |
@@ -2421,11 +2421,28 @@ scheduled pass ends within budget + 10 s (`RetentionPassMargin`, the sum of thos
 in `maintenance.retention_audit_skipped` / `sextant_retention_audit_skipped_total`. An interactive
 `POST /control/retention?execute=true` waits up to 30 s for the audit row (a human is waiting anyway), so it may run up to
 budget + 30 s + the other two terms. `timings` splits writer wait from work for every step, including the audit and the
-post-vacuum checkpoint. A pass that stops on its budget or the unit-start rule before deleting anything reports
-`stop_reason: unit_budget`; the scheduler continues it on the next tick, at most 3 times in a row, then closes the day.
+post-vacuum checkpoint. A pass whose planning finished but that stops on its budget or the unit-start rule before deleting anything reports
+`stop_reason: unit_budget`; a pass cut off while still planning reports `plan_budget` instead (below). The scheduler continues
+either on the next tick, at most 3 times in a row, then closes the day (a day closed after `plan_budget` stops logs
+`retention planning did not finish within the pass budget on N consecutive passes; the day is closed`).
+
+**Dry run (issue #335).** `POST /control/retention` without `execute` plans on its own read connection and holds no writer,
+so its default budget is **60 s** (an executed pass keeps 10 s), settable with `?seconds=N` and capped by
+`SEXTANT_SERVICE_RETENTION_PASS_SECONDS` like an executed pass (a ceiling below 60 lowers the default to it). Because it holds no
+writer it never blocks indexing, but it does hold **one read transaction for up to its whole budget**, which pins the WAL (a checkpoint
+cannot truncate past it) for that long; so only one dry run runs at a time, and a second concurrent one is refused with
+`409 {"status":"busy","reason":"retention_dry_run_running"}`. Give the client a timeout above the dry-run budget (at least 70 s for the
+default).
+Every report carries `plan_complete` (`true` when planning finished, `false` when it was cut off) and `plan_ms`, how long planning ran
+(set on every path where planning ran, dry run or executed; absent only where it did not, such as a source-text sweep slice), so you can see where the budget went.
+A dry run that finishes planning with nothing eligible reports `more_remaining: false` and no `stop_reason`. If planning does not
+finish, the report says `plan_complete: false`, `more_remaining: true`, `stop_reason: plan_budget` and the counts known so far, which are
+lower bounds (the CLI prints `planning did not finish; counts are lower bounds`): raise `?seconds=`.
+An executed pass whose plan does not finish reports `plan_budget` too (instead of `time_budget`); the scheduler treats it like the other
+budget stops (it continues, bounded by the no-progress cap).
 
 `more_remaining: true` means another pass may be needed, and every such response names a `stop_reason`:
-`time_budget` (the pass budget), `unit_budget` (see above), `batch_budget` (one batch hit its own 2 s cap while the pass still
+`plan_budget` (planning itself, i.e. the classification, API-history discovery or file-sweep planning, did not finish within the budget, so nothing is known to be eligible or not; see below), `time_budget` (planning finished and the pass budget ran out while deleting), `unit_budget` (see above), `batch_budget` (one batch hit its own 2 s cap while the pass still
 had time), `sweep_budget` (the blob sweep did), `api_deferred` (API-history candidates could not be planned or verified in
 time; the next pass does them), `sqlite_busy`, `vacuum_budget` (free pages are left; wins over `api_deferred`,
 `sweep_budget` and `work_remaining` when pages were vacuumed), `source_text_cap` (more orphan source-text blobs than one
@@ -2486,7 +2503,7 @@ dependencies: no migration, repair, or destructive inference from a stale pointe
 
 These are cooperative work bounds, not real-time guarantees on filesystem I/O or SQLite rollback.
 A single project cascade that cannot finish within the deadline is deferred rather than partially
-deleting a potentially servable snapshot. Repeated `more_remaining`/`time_budget` responses require
+deleting a potentially servable snapshot. Repeated `more_remaining`/`time_budget`/`plan_budget` responses require
 operator investigation; do not loop blindly. Since issue #299 the service's own [maintenance loop](#maintenance-loop-idle-branch-retirement--scheduled-retention-issue-299)
 submits **one** bounded `execute=true` pass a day (budget `SEXTANT_SERVICE_RETENTION_PASS_SECONDS`, default 600) (from `SEXTANT_SERVICE_RETENTION_SCHEDULE_HOUR_UTC`, default
 03:00 UTC; `SEXTANT_SERVICE_RETENTION_SCHEDULE=false` turns it off) and records its report in the logs and

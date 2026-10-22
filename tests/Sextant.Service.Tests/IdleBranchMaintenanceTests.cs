@@ -504,6 +504,36 @@ public class IdleBranchMaintenanceTests
             "a stuck catalog with no budget cut stays done for the day");
     }
 
+    // Issue #335: a plan that never finishes is a retryable stop; the cap closes the day and says why.
+    [TestMethod]
+    public async Task ScheduledPass_PlanBudgetWithoutProgress_Continues_ThenClosesTheDay_WithADistinctWarning()
+    {
+        await using var h = Harness.Create(maintenance: NoLoop() with { BranchIdleRetireDays = 0 });
+        h.Start();
+        var cut = new RetentionReport
+        {
+            DryRun = false, MoreRemaining = true, StopReason = RetentionService.PlanBudgetStopReason, PlanComplete = false
+        };
+        Assert.IsTrue(SnapshotService.ScheduledRetentionContinues(cut));
+
+        var original = Console.Error;
+        var captured = new StringWriter();
+        Console.SetError(captured);
+        try
+        {
+            for (var i = 0; i < SnapshotService.MaxScheduledNoProgressContinues; i++)
+                Assert.IsTrue(h.Service.ScheduledPassContinues(cut), $"continue {i + 1}");
+            Assert.IsFalse(h.Service.ScheduledPassContinues(cut), "the day closes after the cap");
+        }
+        finally
+        {
+            Console.SetError(original);
+        }
+
+        StringAssert.Contains(captured.ToString(),
+            $"retention planning did not finish within the pass budget on {SnapshotService.MaxScheduledNoProgressContinues + 1} consecutive passes; the day is closed");
+    }
+
     [TestMethod]
     public async Task ScheduledRetention_WhileIndexingHoldsTheWriter_WaitsForItsPriorityTurn_InsteadOfSkipping()
     {

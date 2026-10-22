@@ -401,6 +401,85 @@ public class RetentionProtectedSetEquivalenceTests
         Assert.AreEqual(1, fits.SnapshotsDeleted);
     }
 
+    // Issue #335: a plan that ran out of budget is not "nothing eligible".
+    [TestMethod]
+    public void Plan_OutOfBudget_ReportsPlanBudget_AndMoreRemaining()
+    {
+        Seed(new Random(11), snapshots: 400, runs: 14, repositories: 4);
+        var service = new RetentionService(_conn, new RetentionPolicy { KeepCompleteGenerations = 0 });
+
+        // A zero budget is spent on entry, before classification starts.
+        var report = service.Plan(timeLimit: TimeSpan.Zero);
+
+        Assert.IsTrue(report.DryRun);
+        Assert.IsTrue(report.MoreRemaining);
+        Assert.AreEqual(RetentionService.PlanBudgetStopReason, report.StopReason);
+        Assert.IsFalse(report.PlanComplete);
+        Assert.IsNotNull(report.PlanMs);
+    }
+
+    // Classification finished and a later stage was cut off: the counts known so far are kept, as lower bounds.
+    [TestMethod]
+    public void Plan_CutOffAfterClassification_KeepsTheCandidateCount_AndIsIncomplete()
+    {
+        Seed(new Random(11), snapshots: 400, runs: 14, repositories: 4);
+        var service = new RetentionService(_conn, new RetentionPolicy { KeepCompleteGenerations = 0 });
+        var full = service.Plan();
+        Assert.IsTrue(full.PlanComplete);
+        Assert.IsTrue(full.SnapshotsDeleted > 0);
+
+        service.PlanStageHook = stage => { if (stage == "classified") service.ExpirePlanBudget(); };
+        var cut = service.Plan();
+
+        Assert.AreEqual(RetentionService.PlanBudgetStopReason, cut.StopReason);
+        Assert.IsTrue(cut.MoreRemaining);
+        Assert.IsFalse(cut.PlanComplete);
+        Assert.AreEqual(full.SnapshotsDeleted, cut.SnapshotsDeleted);
+        Assert.AreEqual(0, cut.SnapshotProjectVersionsDeleted, "the stage after classification did not run");
+        Assert.IsNotNull(cut.PlanMs);
+    }
+
+    [TestMethod]
+    public void CreatePlan_OutOfBudget_ReportsPlanBudget_AndExecuteSurfacesIt()
+    {
+        Seed(new Random(12), snapshots: 400, runs: 14, repositories: 4);
+        var service = new RetentionService(_conn, new RetentionPolicy { KeepCompleteGenerations = 0 });
+
+        service.PlanStageHook = stage => { if (stage == "classified") service.ExpirePlanBudget(); };
+        var plan = service.CreatePlan();
+        var executed = service.Execute();
+
+        Assert.AreEqual(RetentionService.PlanBudgetStopReason, plan.StopReason);
+        Assert.IsTrue(plan.Report.MoreRemaining);
+        Assert.IsNotNull(plan.Report.PlanMs);
+        Assert.IsFalse(plan.Report.PlanComplete);
+        Assert.AreEqual(RetentionService.PlanBudgetStopReason, executed.StopReason);
+        Assert.IsTrue(executed.MoreRemaining);
+    }
+
+    [TestMethod]
+    public void Plan_WithNothingEligible_Finishes_WithNoMoreRemainingAndNoStopReason()
+    {
+        Exec($"INSERT INTO repositories (id, remote_url, created_at) VALUES (1, 'https://github.com/org/app', {_now});");
+        var service = new RetentionService(_conn, new RetentionPolicy());
+
+        var report = service.Plan();
+
+        Assert.IsFalse(report.MoreRemaining);
+        Assert.IsTrue(report.PlanComplete);
+        Assert.IsNull(report.StopReason);
+        Assert.AreEqual(0, report.SnapshotsDeleted);
+        Assert.IsNotNull(report.PlanMs);
+        Assert.IsTrue(report.PlanMs >= 0);
+    }
+
+    [TestMethod]
+    public void Plan_DefaultBudget_IsTheLongerDryRunLimit()
+    {
+        Assert.AreEqual(TimeSpan.FromSeconds(60), RetentionService.DryRunTimeLimit);
+        Assert.IsTrue(RetentionService.DryRunTimeLimit > RetentionService.PassTimeLimit);
+    }
+
     // Issue #321: a pass whose planning ate its budget must still delete: the unit-start rule is off until it has progressed.
     [TestMethod]
     public void AFirstUnit_StartsRegardlessOfTheRemainingBudget_WhenTheRuleIsNotEnforced()
