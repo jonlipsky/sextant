@@ -41,6 +41,23 @@ public sealed record IndexWriteOptions
     /// </summary>
     public int MmapMib { get; init; } = 256;
 
+    /// <summary>
+    /// Longest an open batch may hold the catalog write lock (issue #344): once it has, the next
+    /// <see cref="IndexWriteSession.RowsWritten"/> commits it and begins a new one, like the row threshold. The
+    /// commit lands at a row boundary, so one row can run past the cap. It is a backstop for long write-only
+    /// stretches: the orchestrator releases the batch before every compile, extraction and wait. Zero or negative
+    /// (the default, so the local CLI/daemon are unchanged) disables the cap; the index service turns it on.
+    /// </summary>
+    public TimeSpan MaxBatchHold { get; init; } = TimeSpan.Zero;
+
+    /// <summary>
+    /// After a commit, when other in-process writers are waiting for the lock (grant writes, the lease renewal, raw
+    /// service transactions), the session holds off its next <c>BEGIN IMMEDIATE</c> until none is left waiting, at
+    /// most this long (issue #344). Zero or negative (the default, so the local CLI/daemon are unchanged) disables
+    /// yielding; the index service turns it on.
+    /// </summary>
+    public TimeSpan YieldToWaitersCap { get; init; } = TimeSpan.Zero;
+
     /// <summary>Maximum retries for a transient busy/locked failure on BEGIN/COMMIT.</summary>
     public int MaxRetries { get; init; } = 5;
 

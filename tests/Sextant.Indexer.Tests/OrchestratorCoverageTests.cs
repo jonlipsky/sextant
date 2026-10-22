@@ -1,3 +1,4 @@
+using Microsoft.Data.Sqlite;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Text;
 using Sextant.Core;
@@ -119,6 +120,37 @@ public class OrchestratorCoverageTests
         Assert.IsNotNull(selected);
         Assert.IsNull(new SnapshotCoverageStore(conn).Get(selected.Value),
             "a local (CLI/daemon) index computes no coverage, so none is recorded");
+    }
+
+    private sealed class AutocommitProbe(SqliteConnection connection) : IProgress<IndexingProgress>
+    {
+        public List<string> OpenDuring { get; } = [];
+        public List<string> Seen { get; } = [];
+
+        public void Report(IndexingProgress value)
+        {
+            Seen.Add(value.Phase);
+            // Reported synchronously on the indexing thread, right before the project is compiled and extracted
+            // (symbol phase) or before the consumer's batch begins (occurrence phase). No transaction may be open.
+            if (value.Phase is IndexPhaseNames.ExtractingSymbols or IndexPhaseNames.ExtractingOccurrences
+                && SQLitePCL.raw.sqlite3_get_autocommit(connection.Handle) == 0)
+                OpenDuring.Add(value.Phase);
+        }
+    }
+
+    [TestMethod]
+    public async Task NoWriteTransactionIsOpen_WhileAProjectIsCompiledOrExtracted()
+    {
+        var probe = new AutocommitProbe(_db.GetConnection());
+        var orchestrator = new IndexOrchestrator(_db, useDocumentExtractor: true);
+
+        await orchestrator.IndexSolutionAsync(BuildSolution(), progress: probe, snapshotContext: Context("nolock", null));
+
+        CollectionAssert.Contains(probe.Seen, IndexPhaseNames.ExtractingSymbols);
+        CollectionAssert.Contains(probe.Seen, IndexPhaseNames.ExtractingOccurrences);
+        Assert.AreEqual(0, probe.OpenDuring.Count,
+            "a write transaction was open at: " + string.Join(", ", probe.OpenDuring));
+        Assert.IsNotNull(_db.GetConnection());
     }
 
     private Solution BuildSolution()

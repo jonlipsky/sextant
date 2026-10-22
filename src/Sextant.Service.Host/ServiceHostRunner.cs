@@ -57,7 +57,7 @@ public static class ServiceHostRunner
                 "reads every repository. Set a query token or a read policy.");
 
         var paths = new ServicePaths(options.Volumes);
-        var database = new IndexDatabase(options.CatalogDbPath, IndexWriteOptions.FromConfiguration(config));
+        var database = new IndexDatabase(options.CatalogDbPath, options.ApplyTo(IndexWriteOptions.FromConfiguration(config)));
 
         // Phase 15: the default (Linux, in-process) placement — the node's own capability — behind the
         // routing seam. With no native placements registered this behaves exactly like the Phase-13 direct

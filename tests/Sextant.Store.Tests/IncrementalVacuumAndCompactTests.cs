@@ -94,6 +94,62 @@ public class IncrementalVacuumAndCompactTests
     }
 
     [TestMethod]
+    public void RunStep_ReleasesTheRequestedPages_AndReportsThem()
+    {
+        var path = SeededDb("INCREMENTAL", rows: 15000, pageSize: 512, blobBytes: 400);
+        using var c = Open(path);
+        var free = IncrementalVacuum.FreelistPages(c);
+
+        var result = IncrementalVacuum.RunStep(c, 300);
+
+        Assert.AreEqual(300, result.Freed);
+        Assert.AreEqual(300, result.Pages);
+        Assert.AreEqual(free - 300, IncrementalVacuum.FreelistPages(c));
+        Assert.AreEqual(IncrementalVacuum.MinStepPages, IncrementalVacuum.RunStep(c, -5).Freed, "a bad count is clamped, never formatted");
+        Assert.AreEqual(IncrementalVacuum.MaxStepPages, IncrementalVacuum.RunStep(c, int.MaxValue).Pages);
+    }
+
+    [TestMethod]
+    public void RunStep_CountsNoWaitingWriter()
+    {
+        var path = SeededDb("INCREMENTAL");
+        using var c = Open(path);
+        var tracker = new WriteLockTracker();
+
+        IncrementalVacuum.RunStep(c, 64, tracker);
+        IncrementalVacuum.CheckpointTruncate(c, tracker);
+
+        Assert.AreEqual(0, tracker.WaitingWriters);
+    }
+
+    [TestMethod]
+    [DataRow(256, 100, 1000, 512, "well under the target doubles")]
+    [DataRow(256, 0, 1000, 512, "an unmeasurable step doubles")]
+    [DataRow(256, 800, 1000, 256, "near the target keeps its size")]
+    [DataRow(256, 1400, 1000, 256, "within 1.5x keeps its size")]
+    [DataRow(1000, 2000, 1000, 500, "twice the target halves")]
+    [DataRow(1000, 10000, 1000, 100, "ten times the target shrinks tenfold")]
+    [DataRow(8192, 140000, 1000, 58, "the production 140 s step shrinks to the target")]
+    [DataRow(32, 100000, 1000, 16, "never below the floor")]
+    [DataRow(6000, 10, 1000, 8192, "never above the cap")]
+    [DataRow(1, 100, 1000, 32, "a below-floor input is clamped first")]
+    public void NextStepPages_AdaptsTowardTheTarget_WithinBounds(int pages, int measuredMs, int targetMs, int expected, string why)
+    {
+        Assert.AreEqual(expected,
+            IncrementalVacuum.NextStepPages(pages, TimeSpan.FromMilliseconds(measuredMs), TimeSpan.FromMilliseconds(targetMs)), why);
+    }
+
+    [TestMethod]
+    public void NextStepPages_ConvergesWithinAFewSteps_OnASlowCatalog()
+    {
+        // A catalog that frees one page per 17 ms (140 s per 8192 pages): the step size settles near 1 s / 17 ms.
+        var pages = IncrementalVacuum.InitialStepPages;
+        for (var i = 0; i < 12; i++)
+            pages = IncrementalVacuum.NextStepPages(pages, TimeSpan.FromMilliseconds(pages * 17.0), IncrementalVacuum.DefaultTargetHold);
+        Assert.IsTrue(pages is >= 30 and <= 90, pages.ToString());
+    }
+
+    [TestMethod]
     public void Step_RecordsOneHoldOwnedByIncrementalVacuum_AndNoWait()
     {
         var path = SeededDb("INCREMENTAL");

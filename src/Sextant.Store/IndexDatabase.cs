@@ -64,7 +64,7 @@ public sealed class IndexDatabase : IDisposable
     {
         var conn = GetConnection();
         var tracker = WriteLockTracker ?? Sextant.Store.WriteLockTracker.Untracked;
-        var started = tracker.BeginAcquire();
+        var started = tracker.Timestamp();
         try
         {
             using var cmd = conn.CreateCommand();

@@ -41,10 +41,14 @@ public sealed partial class SnapshotService : IDisposable
     private readonly ISnapshotWorker _worker;
     private readonly ServicePaths _paths;
     private readonly IndexDatabase _db;
+    /// <summary>The write-session options of the catalog database this service (and its worker) writes through.</summary>
+    internal IndexWriteOptions WriteOptions => _db.WriteOptions;
     private readonly SqliteConnection _conn;
     private readonly WriterLease _lease;
     private readonly WriteGate _writeGate;
     private readonly WriteLockTracker _writeLocks;
+    // Persisted across maintenance passes so each pass starts at the step size the last one converged on.
+    private int _vacuumStepPages = IncrementalVacuum.InitialStepPages;
     private WriteLockHold? _rawHold;
     private readonly bool _ownsDatabase;
     private readonly IContributionAuthorizer _authorizer;
@@ -205,11 +209,13 @@ public sealed partial class SnapshotService : IDisposable
 
         var paths = new ServicePaths(options.Volumes);
         var ownsDatabase = database is null;
-        var db = database ?? new IndexDatabase(options.CatalogDbPath, IndexWriteOptions.Default);
+        var db = database ?? new IndexDatabase(options.CatalogDbPath, options.ApplyTo(IndexWriteOptions.Default));
         if (options.GrantWriteBusyTimeout <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(options), "GrantWriteBusyTimeout must be positive.");
         if (options.WriteLockWarnThreshold <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(options), "WriteLockWarnThreshold must be positive.");
+        if (options.VacuumTargetHold <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(options), "VacuumTargetHold must be positive.");
         var writeLocks = new WriteLockTracker(
             options.WriteLockWarnThreshold, e => Console.Error.WriteLine("warn: " + e.Describe()), timeProvider);
         db.WriteLockTracker = writeLocks;
@@ -2753,6 +2759,7 @@ public sealed partial class SnapshotService : IDisposable
             // Vacuuming stops a safety margin before the pass limit, so the final checkpoint and the report never run
             // on a cancelled pass token; whatever happens, the pages vacuumed so far stay in the report.
             long pagesVacuumed = 0;
+            var vacuumPages = _vacuumStepPages;
             var vacuumLeft = false;
             var vacuumStop = limit - TimeSpan.FromTicks(Math.Min(limit.Ticks / 4, VacuumSafetyMargin.Ticks));
             try
@@ -2769,10 +2776,13 @@ public sealed partial class SnapshotService : IDisposable
                     {
                         pass.Token.ThrowIfCancellationRequested();
                         EnsureLeaseHeld();
-                        var freed = IncrementalVacuum.Step(_conn, _writeLocks);
-                        return Task.FromResult((Freed: freed, Left: IncrementalVacuum.FreelistPages(_conn)));
+                        var result = IncrementalVacuum.RunStep(_conn, vacuumPages, _writeLocks);
+                        return Task.FromResult((Freed: result.Freed, result.Elapsed, Left: IncrementalVacuum.FreelistPages(_conn)));
                     }, ms => timer.VacuumMs += ms, pass.Token).ConfigureAwait(false);
                     pagesVacuumed += step.Freed;
+                    // Aim each step's lock hold at the target: a catalog's per-page cost is only known by measuring.
+                    vacuumPages = IncrementalVacuum.NextStepPages(vacuumPages, step.Elapsed, _options.VacuumTargetHold);
+                    _vacuumStepPages = vacuumPages;
                     if (step.Freed == 0 || step.Left == 0) break;
                 }
             }
