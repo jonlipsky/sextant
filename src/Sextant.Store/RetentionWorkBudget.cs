@@ -31,7 +31,12 @@ internal sealed class RetentionWorkBudget : IDisposable
         raw.sqlite3_progress_handler(connection.Handle, 1000, _ => ShouldStop ? 1 : 0, null);
     }
 
-    internal bool ShouldStop => _cancellationToken.IsCancellationRequested ||
+    private volatile bool _expired;
+
+    /// <summary>Test seam: the budget counts as spent from now on.</summary>
+    internal void Expire() => _expired = true;
+
+    internal bool ShouldStop => _expired || _cancellationToken.IsCancellationRequested ||
         Stopwatch.GetElapsedTime(_started) >= (_unitEnd ?? _duration);
 
     /// <summary>True while a unit runs and its own cap has passed (cancellation is not an expired unit).</summary>

@@ -225,6 +225,56 @@ public class ObservabilityHttpTests
         Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
     }
 
+    [TestMethod]
+    public async Task RetentionDryRun_OnAnEmptyCatalog_FinishedPlanning_HasNoStopReason_AndReportsPlanMs()
+    {
+        await using var host = await Harness.StartAsync();
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/control/retention");
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", ControlToken);
+
+        using var response = await host.Client.SendAsync(request);
+
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+        using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        var root = json.RootElement;
+        Assert.IsTrue(root.GetProperty("dry_run").GetBoolean());
+        Assert.IsFalse(root.GetProperty("more_remaining").GetBoolean());
+        Assert.IsFalse(root.TryGetProperty("stop_reason", out var reason) && reason.ValueKind != JsonValueKind.Null,
+            "a finished plan names no stop reason");
+        Assert.IsTrue(root.GetProperty("plan_ms").GetDouble() >= 0);
+        Assert.IsTrue(root.GetProperty("plan_complete").GetBoolean());
+    }
+
+    [TestMethod]
+    public async Task RetentionDryRun_WhileAnotherRuns_IsRefused_With409Busy()
+    {
+        await using var host = await Harness.StartAsync();
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        host.Service.RetentionPlanStageHook = (_, stage) =>
+        {
+            if (stage != "classified") return;
+            entered.Set();
+            release.Wait(TimeSpan.FromSeconds(10));
+        };
+        using var firstRequest = new HttpRequestMessage(HttpMethod.Post, "/control/retention");
+        firstRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", ControlToken);
+        var first = Task.Run(() => host.Client.SendAsync(firstRequest));
+        Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(5)));
+
+        using var second = new HttpRequestMessage(HttpMethod.Post, "/control/retention");
+        second.Headers.Authorization = new AuthenticationHeaderValue("Bearer", ControlToken);
+        using var refused = await host.Client.SendAsync(second);
+
+        Assert.AreEqual(HttpStatusCode.Conflict, refused.StatusCode);
+        using var json = JsonDocument.Parse(await refused.Content.ReadAsStringAsync());
+        Assert.AreEqual("busy", json.RootElement.GetProperty("status").GetString());
+        Assert.AreEqual("retention_dry_run_running", json.RootElement.GetProperty("reason").GetString());
+        release.Set();
+        using var ok = await first;
+        Assert.AreEqual(HttpStatusCode.OK, ok.StatusCode);
+    }
+
     private static async Task<HttpResponseMessage> Send(Harness host, string url, string? token)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
@@ -237,7 +287,7 @@ public class ObservabilityHttpTests
     {
         public HttpClient Client { get; init; } = null!;
         private WebApplication App { get; init; } = null!;
-        private SnapshotService Service { get; init; } = null!;
+        internal SnapshotService Service { get; init; } = null!;
         private IndexDatabase Db { get; init; } = null!;
         private string DbPath { get; init; } = "";
 

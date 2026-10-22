@@ -2288,13 +2288,15 @@ public sealed partial class SnapshotService : IDisposable
     /// <see cref="RetentionService.PassTimeLimit"/>, never above the configured pass seconds
     /// (<c>SEXTANT_SERVICE_RETENTION_PASS_SECONDS</c>, itself capped at 3600) and at least one second.
     /// </summary>
-    public TimeSpan InteractiveRetentionLimit(int? seconds)
-        => ClampInteractiveRetention(seconds, _options.Maintenance.RetentionPassSeconds);
+    public TimeSpan InteractiveRetentionLimit(int? seconds, bool dryRun = false)
+        => ClampInteractiveRetention(seconds, _options.Maintenance.RetentionPassSeconds, dryRun);
 
-    internal static TimeSpan ClampInteractiveRetention(int? seconds, int configuredSeconds)
+    // A dry run holds no writer, so its default is the longer RetentionService.DryRunTimeLimit (issue #335); the same
+    // ceiling applies to both.
+    internal static TimeSpan ClampInteractiveRetention(int? seconds, int configuredSeconds, bool dryRun = false)
     {
         var ceiling = Math.Clamp(configuredSeconds, 1, MaintenancePolicy.MaxRetentionPassSeconds);
-        var asked = seconds ?? (int)RetentionService.PassTimeLimit.TotalSeconds;
+        var asked = seconds ?? (int)(dryRun ? RetentionService.DryRunTimeLimit : RetentionService.PassTimeLimit).TotalSeconds;
         return TimeSpan.FromSeconds(Math.Clamp(asked, 1, ceiling));
     }
 
@@ -2339,6 +2341,28 @@ public sealed partial class SnapshotService : IDisposable
         TimeSpan? passLimit = null, TimeSpan? auditWait = null, bool maintenancePriority = false,
         CancellationToken passBound = default)
     {
+        if (!execute)
+        {
+            if (Interlocked.CompareExchange(ref _dryRunRunning, 1, 0) != 0)
+                throw new RetentionDryRunBusyException();
+            try
+            {
+                return await RunRetentionCoreAsync(false, principal, cancellationToken, passLimit, auditWait, maintenancePriority, passBound)
+                    .ConfigureAwait(false);
+            }
+            finally
+            {
+                Volatile.Write(ref _dryRunRunning, 0);
+            }
+        }
+        return await RunRetentionCoreAsync(true, principal, cancellationToken, passLimit, auditWait, maintenancePriority, passBound)
+            .ConfigureAwait(false);
+    }
+
+    private async Task<RetentionReport> RunRetentionCoreAsync(
+        bool execute, AuditCaller principal, CancellationToken cancellationToken,
+        TimeSpan? passLimit, TimeSpan? auditWait, bool maintenancePriority, CancellationToken passBound)
+    {
         var passStartedMs = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
         var timer = new RetentionPassTimer
         {
@@ -2382,6 +2406,18 @@ public sealed partial class SnapshotService : IDisposable
 
     /// <summary>Stop reason of a scheduled pass that never got the writer before the tick deadline (issue #333).</summary>
     internal const string StarvedStopReason = "starved";
+
+    // How long past its own budget a dry run's pass token waits (a backstop); settable so a test can make it fire first.
+    internal TimeSpan DryRunGrace { get; set; } = TimeSpan.FromSeconds(2);
+
+    // A dry run holds one read transaction for up to its whole budget, which pins the WAL: one at a time (issue #335).
+    private int _dryRunRunning;
+
+    /// <summary>Test seam: runs after each planning stage of a retention plan (dry run or executed pass), with its planner.</summary>
+    internal Action<RetentionService, string>? RetentionPlanStageHook { get; set; }
+
+    /// <summary>Test seam: runs once an executed pass's plan finished, with the pass's cancellation source.</summary>
+    internal Action<CancellationTokenSource>? AfterRetentionPlanHook { get; set; }
 
     internal static bool MadeRetentionProgress(RetentionReport report) =>
         MadeDeletionProgress(report) || report.PagesVacuumed > 0;
@@ -2624,7 +2660,9 @@ public sealed partial class SnapshotService : IDisposable
         {
             var report = await RunRetentionPassCoreAsync(execute, principal, cancellationToken, passLimit, timer, scope, passBound)
                 .ConfigureAwait(false);
-            return scope.Plan is { } plan ? report with { FileSweepAdvanced = plan.FileSweepAdvanced } : report;
+            return scope.Plan is { } plan
+                ? report with { FileSweepAdvanced = plan.FileSweepAdvanced, PlanMs = plan.Report.PlanMs, PlanComplete = plan.Report.PlanComplete }
+                : report;
         }
         finally
         {
@@ -2652,16 +2690,21 @@ public sealed partial class SnapshotService : IDisposable
         using var pass = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, passBound);
         // A priority pass spends only its writer-HELD time (timer.BudgetElapsed), never the wall time it waited for turns;
         // passBound (the tick deadline) is what ends such a wait.
+        // A dry run's own planning budget reports first (with its partial counts); the pass token only backstops it.
         if (!timer.Priority)
-            pass.CancelAfter(limit);
+            pass.CancelAfter(execute ? limit : limit + DryRunGrace);
         var report = new RetentionReport { DryRun = !execute };
+        var planning = true;
+        var passStarted = System.Diagnostics.Stopwatch.GetTimestamp();
         try
         {
             if (!execute)
             {
                 // No writer admission, lease acquisition, audit write, or speculative delete.
                 using var dryReader = OpenReadConnection();
-                return new RetentionService(dryReader, _options.Retention).Plan(pass.Token, limit);
+                var dryPlanner = new RetentionService(dryReader, _options.Retention);
+                dryPlanner.PlanStageHook = stage => RetentionPlanStageHook?.Invoke(dryPlanner, stage);
+                return dryPlanner.Plan(pass.Token, limit);
             }
 
             RetentionPlan plan;
@@ -2673,6 +2716,7 @@ public sealed partial class SnapshotService : IDisposable
                 var planner = new RetentionService(reader, _options.Retention, fileSweep: timer.Priority ? _scheduledFileCursor : _fileSweepCursor,
                     sweepFileVersions: !scheduledDay.FilesDone);
                 if (RetentionSweepSpansPerPass is { } spans) planner.SweepSpansPerPass = spans;
+                planner.PlanStageHook = stage => RetentionPlanStageHook?.Invoke(planner, stage);
                 plan = planner.CreatePlan(pass.Token, limit);
             }
             finally
@@ -2680,8 +2724,10 @@ public sealed partial class SnapshotService : IDisposable
                 timer.PlanMs = System.Diagnostics.Stopwatch.GetElapsedTime(planStarted).TotalMilliseconds;
             }
             if (plan.StopReason != null)
-                return new RetentionReport { DryRun = false, MoreRemaining = true, StopReason = plan.StopReason };
+                return plan.Report with { DryRun = false, MoreRemaining = true, StopReason = plan.StopReason };
+            planning = false;
             scope.Plan = plan;
+            AfterRetentionPlanHook?.Invoke(pass);
             var deferred = OversizedToDeferToday();
             var deferredNow = deferred.Count == 0 ? [] : plan.ExcludeSnapshots(deferred);
             report = plan.Report with { OversizedDeferredSnapshotIds = deferredNow };
@@ -2814,7 +2860,18 @@ public sealed partial class SnapshotService : IDisposable
         }
         catch (OperationCanceledException) when (!lifetime.IsCancellationRequested && pass.IsCancellationRequested)
         {
-            return report with { MoreRemaining = true, StopReason = "time_budget" };
+            // The budget ended while still planning (issue #335): nothing is known to be eligible or not. The pass token is
+            // only a backstop here: the planner's own budget normally reports first, with its partial counts; when this
+            // token fires first (a dry run's grace window lost) the report is empty and says so.
+            return planning
+                ? report with
+                {
+                    MoreRemaining = true,
+                    StopReason = RetentionService.PlanBudgetStopReason,
+                    PlanComplete = false,
+                    PlanMs = System.Diagnostics.Stopwatch.GetElapsedTime(passStarted).TotalMilliseconds
+                }
+                : report with { MoreRemaining = true, StopReason = "time_budget" };
         }
         return report;
     }

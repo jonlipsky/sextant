@@ -284,18 +284,114 @@ public class BoundedRetentionTests
         }
     }
 
-    [TestMethod]
-    public async Task Execute_PassSpentBeforeAnyDeletion_ReportsUnitBudget_AndAsksToContinue()
+    private void PublishTwo()
     {
         ServiceTestFixtures.PublishComplete(_db, ServiceTestFixtures.Request(commit: "old-A"));
         ServiceTestFixtures.PublishComplete(_db, ServiceTestFixtures.Request(commit: "current"));
+    }
+
+    [TestMethod]
+    public async Task DryRun_PlanCutOffAfterClassification_ReportsPlanBudget_WithLowerBoundCounts_AndPlanIncomplete()
+    {
+        PublishTwo();
+        var service = Start(new FakeSnapshotWorker(_db));
+        service.RetentionPlanStageHook = (planner, stage) => { if (stage == "classified") planner.ExpirePlanBudget(); };
+
+        var report = await service.RunRetentionAsync(false);
+
+        Assert.IsTrue(report.DryRun);
+        Assert.IsTrue(report.MoreRemaining);
+        Assert.AreEqual(RetentionService.PlanBudgetStopReason, report.StopReason);
+        Assert.IsFalse(report.PlanComplete);
+        Assert.IsTrue(report.SnapshotsDeleted > 0, "the classification finished, so its candidates are counted");
+        Assert.IsNotNull(report.PlanMs);
+    }
+
+    [TestMethod]
+    public async Task DryRun_FinishedPlan_IsPlanComplete_WithPlanMs()
+    {
+        PublishTwo();
         var service = Start(new FakeSnapshotWorker(_db));
 
-        var report = await service.RunRetentionAsync(true, passLimit: TimeSpan.FromMilliseconds(1));
+        var report = await service.RunRetentionAsync(false);
+
+        Assert.IsTrue(report.PlanComplete);
+        Assert.IsFalse(report.MoreRemaining);
+        Assert.IsNotNull(report.PlanMs);
+    }
+
+    [TestMethod]
+    public async Task Execute_PlanCutOff_ReportsPlanBudget_NotUnitBudget()
+    {
+        PublishTwo();
+        var service = Start(new FakeSnapshotWorker(_db));
+        service.RetentionPlanStageHook = (planner, stage) => { if (stage == "classified") planner.ExpirePlanBudget(); };
+
+        var report = await service.RunRetentionAsync(true);
+
+        Assert.IsTrue(report.MoreRemaining);
+        Assert.AreEqual(RetentionService.PlanBudgetStopReason, report.StopReason);
+        Assert.IsFalse(report.PlanComplete);
+        Assert.IsNotNull(report.PlanMs);
+        Assert.IsTrue(SnapshotService.ScheduledRetentionContinues(report));
+    }
+
+    [TestMethod]
+    public async Task Execute_PassCutOffAfterPlanning_BeforeTheFirstUnit_ReportsUnitBudget_AndAsksToContinue()
+    {
+        PublishTwo();
+        var service = Start(new FakeSnapshotWorker(_db));
+        service.AfterRetentionPlanHook = pass => pass.Cancel();
+
+        var report = await service.RunRetentionAsync(true);
 
         Assert.IsTrue(report.MoreRemaining);
         Assert.AreEqual("unit_budget", report.StopReason);
+        Assert.IsTrue(report.PlanComplete);
+        Assert.IsNotNull(report.PlanMs, "planning ran, so its time is reported");
         Assert.IsTrue(SnapshotService.ScheduledRetentionContinues(report));
+    }
+
+    [TestMethod]
+    public async Task DryRun_PassTokenFiringBeforeThePlanBudget_ReportsAnEmptyPlanIncompleteReport()
+    {
+        PublishTwo();
+        var service = Start(new FakeSnapshotWorker(_db));
+        // The backstop token fires at 0.5 s, the planner's own budget at 2 s; the hook outlasts the former.
+        service.DryRunGrace = TimeSpan.FromMilliseconds(-1500);
+        service.RetentionPlanStageHook = (_, stage) => { if (stage == "classified") Thread.Sleep(900); };
+
+        var report = await service.RunRetentionAsync(false, passLimit: TimeSpan.FromSeconds(2));
+
+        Assert.IsTrue(report.MoreRemaining);
+        Assert.AreEqual(RetentionService.PlanBudgetStopReason, report.StopReason);
+        Assert.IsFalse(report.PlanComplete);
+        Assert.IsTrue(report.PlanMs > 0);
+    }
+
+    [TestMethod]
+    public async Task DryRun_IsSingleFlight_ASecondConcurrentOneIsRefused_AndTheNextRuns()
+    {
+        PublishTwo();
+        var service = Start(new FakeSnapshotWorker(_db));
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        service.RetentionPlanStageHook = (_, stage) =>
+        {
+            if (stage != "classified") return;
+            entered.Set();
+            release.Wait(TimeSpan.FromSeconds(10));
+        };
+        var first = Task.Run(() => service.RunRetentionAsync(false));
+        Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(5)));
+
+        await Assert.ThrowsExactlyAsync<RetentionDryRunBusyException>(() => service.RunRetentionAsync(false));
+        release.Set();
+        var report = await first;
+        Assert.IsTrue(report.PlanComplete);
+
+        service.RetentionPlanStageHook = null;
+        Assert.IsTrue((await service.RunRetentionAsync(false)).PlanComplete, "the guard is released when a dry run ends");
     }
 
     [TestMethod]

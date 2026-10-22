@@ -29,6 +29,17 @@ public class RetentionBudgetConfigTests
     }
 
     [TestMethod]
+    public void DryRunRetention_DefaultsTo60Seconds_AndIsCappedLikeAnExecutedPass()
+    {
+        Assert.AreEqual(TimeSpan.FromSeconds(60), SnapshotService.ClampInteractiveRetention(null, 600, dryRun: true));
+        Assert.AreEqual(TimeSpan.FromSeconds(10), SnapshotService.ClampInteractiveRetention(null, 600, dryRun: false));
+        Assert.AreEqual(TimeSpan.FromSeconds(30), SnapshotService.ClampInteractiveRetention(null, 30, dryRun: true));
+        Assert.AreEqual(TimeSpan.FromSeconds(5), SnapshotService.ClampInteractiveRetention(null, 5, dryRun: true));
+        Assert.AreEqual(TimeSpan.FromSeconds(20), SnapshotService.ClampInteractiveRetention(20, 600, dryRun: true));
+        Assert.AreEqual(TimeSpan.FromSeconds(600), SnapshotService.ClampInteractiveRetention(5000, 600, dryRun: true));
+    }
+
+    [TestMethod]
     [DataRow(0, 60)]
     [DataRow(-5, 60)]
     [DataRow(1, 1)]
