@@ -72,7 +72,7 @@ public static class TestTempRoot
             if (_root != null || _cleanedUp)
                 return;
 
-            _realTemp = Path.GetTempPath();
+            _realTemp = Path.GetTempPath(); // NOSONAR S5443: reads the shared temp path only to sweep stale run roots and snapshot legacy entries; the run root is created with CreateTempSubdirectory (unique, owner-only)
             _startedUtc = DateTime.UtcNow;
             _snapshot = TakeLegacySnapshot(_realTemp);
             SweepStale(_realTemp);
