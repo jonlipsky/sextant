@@ -535,7 +535,36 @@ never embed credentials (use `SEXTANT_SERVICE_PACKAGE_SOURCE_CREDENTIALS` instea
   `no-macos.slnx`, restored per solution because both declare platforms) on a loaded 14-core host, fresh checkout
   each time: 72 s with an empty package folder and HTTP cache, 48-52 s from a warm package folder. A job's `timings.restore` (`GET /control/status`) records the restore `mode` (`solution`,
   `union`, `per_solution`, `off`), the `fallback_reason` when several solutions could not be restored as one
-  union, and whether the `package_folder` was `persistent` or `scratch`.
+  union, and whether the `package_folder` was `persistent` or `scratch`. `mode` can also be `reused` (see below).
+
+#### Restore state reuse (issue #272)
+
+When a repository's restore inputs are unchanged since its last clean restore, the next job replays that restore's
+output (`project.assets.json`, `project.nuget.cache`, `*.nuget.g.props/.targets`, taken from each project's real
+restore output path, e.g. a `BaseIntermediateOutputPath` set in `Directory.Build.props`) instead of running
+`dotnet restore`. The rule is: when in doubt, restore in full; a replay never produces different index results.
+The fingerprint covers every restore input in the checkout (project files, `Directory.Build.*`,
+`Directory.Packages.props`, `global.json`, `NuGet.Config`, `packages.lock.json`, ... found anywhere, including under
+`bin/`, `obj/` and `node_modules/`), the `NuGet.Config` and `Directory.*` files in every parent directory of the
+checkout, the user and machine-wide NuGet config, the restore argument lists, the `NUGET_*`/`DOTNET_*`/`MSBuild*`
+environment (names and value hashes, never logged), the installed SDKs and workload manifests, the indexer analyzer
+version and `PackageRestoreRunner.RunnerPolicy` (bump it whenever the restore arguments or traversal logic change).
+
+A job restores in full, and never saves, when: a `packages.config`, `*.nuspec` or `paket.*` input exists
+(`legacy_restore`); a restore input is a symlink pointing outside the checkout (`symlink_outside`); a package
+reference uses a floating version (`floating_versions`); the checkout already holds restore output
+(`checkout_not_clean`/`stale_outputs`); or a package named in an assets file (`libraries` of type package,
+`downloadDependencies`, `packageFolders`) or in a `project.nuget.cache` is missing from the package folder
+(`packages_missing`). A state is saved only after a clean restore in which every declared project produced both an
+assets file and a `project.nuget.cache` (`save_skipped=incomplete` otherwise). Replay writes each file through a
+temp file and a rename; on any failure it removes what it wrote and restores in full (`replay_failed`).
+`timings.restore.reuse` records the decision, reason and fingerprint prefix; `passes[].up_to_date_approx` is an
+**approximate** per-pass count of projects NuGet left untouched (estimated from assets timestamps at the default
+`obj/` location; telemetry only).
+
+Known limit: a package republished under an unchanged id and version (same-version overwrite on a feed) is not
+detected; the fingerprint contains no feed content. A restore of the same inputs would normally read the cached
+package from the package folder as well.
 
 #### Static-graph restore (issue #272)
 

@@ -26,6 +26,7 @@ internal sealed class RepositoryReclaimer(ServicePaths paths, Action<string>? lo
         yield return ("checkout", paths.CheckoutRoot);
         yield return ("git object store", paths.GitObjectStoreRoot);
         yield return ("package folder", paths.PackageCacheRoot);
+        yield return ("restore state", paths.RestoreStateRoot);
     }
 
     /// <summary>The existing directories of <paramref name="repositoryRemoteUrl"/> that pass the guards.</summary>

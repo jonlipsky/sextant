@@ -289,11 +289,15 @@ public sealed class LocalIndexerSnapshotWorker(
                 // resolves the same SDK the load will. A failed or partial restore never fails the job.
                 using (timings.Phase(IndexPhaseNames.Restore))
                 {
+                    var reuse = packagesDir is not null && packageCache?.RestoreStateDirectory(request.RepositoryRemoteUrl) is { } stateDir
+                        ? new RestoreReuse(stateDir, packagesDir)
+                        : null;
                     restore = await _packageRestore.RunAsync(
-                            checkoutDir, resolution.SelectedSolutions, plan?.RestoreLimit, token, scratchDir)
+                            checkoutDir, resolution.SelectedSolutions, plan?.RestoreLimit, token, scratchDir, reuse)
                         .ConfigureAwait(false);
                 }
                 timings.RecordRestore(restore, persistentPackageFolder: packagesDir is not null);
+                log?.Invoke(restore.Summary());
 
                 // Load the DETERMINISTIC selected solution set into ONE workspace (union of projects,
                 // de-duplicated by project path/identity). A single selected solution keeps the byte-identical

@@ -103,7 +103,8 @@ public sealed record JobRestoreTimings
 {
     /// <summary>
     /// <c>off</c> (restore disabled), <c>solution</c> (one selected solution), <c>union</c> (one traversal over the
-    /// selected solutions' project union) or <c>per_solution</c> (the fallback: one restore per selected solution).
+    /// selected solutions' project union), <c>per_solution</c> (the fallback: one restore per selected solution) or
+    /// <c>reused</c> (no restore ran: the repository's saved assets were replayed because no restore input changed).
     /// </summary>
     public required string Mode { get; init; }
 
@@ -118,6 +119,18 @@ public sealed record JobRestoreTimings
 
     /// <summary>Wall-clock time of the restore, in milliseconds.</summary>
     public long WallMs { get; init; }
+
+    /// <summary>True when the restore ran out of time (the bound is <see cref="TimeoutMs"/>) and was killed.</summary>
+    public bool TimedOut { get; init; }
+
+    /// <summary>The bound the restore ran under, in milliseconds.</summary>
+    public long TimeoutMs { get; init; }
+
+    /// <summary>Every restore process the job ran, in order: kind, solution, projects, up-to-date projects, time, result (issue #272).</summary>
+    public IReadOnlyList<Restore.RestorePassTiming> Passes { get; init; } = [];
+
+    /// <summary>The restore-state cache decision (<c>reused</c>/<c>miss</c>/<c>unavailable</c>), or null when not in play (issue #272).</summary>
+    public Restore.RestoreReuseOutcome? Reuse { get; init; }
 
     /// <summary>True when at least one restore pass ran with static-graph evaluation (issue #272); see <see cref="StaticGraphFallbacks"/>.</summary>
     public bool StaticGraph { get; init; }
@@ -214,12 +227,17 @@ public sealed class JobTimingsRecorder
         var timings = new JobRestoreTimings
         {
             Mode = !restore.Enabled ? "off"
+                : restore.Reuse is { Decision: "reused" } ? "reused"
                 : restore.UsedProjectUnion ? "union"
                 : restore.SolutionsSelected > 1 ? "per_solution"
                 : "solution",
             FallbackReason = restore.UnionFallbackReason,
             PackageFolder = persistentPackageFolder ? "persistent" : "scratch",
             WallMs = (long)restore.Elapsed.TotalMilliseconds,
+            TimedOut = restore.TimedOut,
+            TimeoutMs = (long)restore.Timeout.TotalMilliseconds,
+            Passes = restore.Passes,
+            Reuse = restore.Reuse,
             StaticGraph = restore.StaticGraphPasses > 0,
             StaticGraphFallbacks = restore.StaticGraphFallbacks,
             SolutionsRetriedPerProject = restore.SolutionsRetriedPerProject,

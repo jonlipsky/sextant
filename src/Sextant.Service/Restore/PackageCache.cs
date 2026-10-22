@@ -90,6 +90,13 @@ public sealed class PackageCache
     }
 
     /// <summary>
+    /// The directory holding <paramref name="repositoryRemoteUrl"/>'s restore state (<see cref="ServicePaths.RestoreStateRoot"/>),
+    /// or null when the cache is disabled. The directory is created by the first save, never here.
+    /// </summary>
+    public string? RestoreStateDirectory(string repositoryRemoteUrl)
+        => Enabled ? Path.Combine(_paths.RestoreStateRoot, ServicePaths.RepoDirectoryName(repositoryRemoteUrl)) : null;
+
+    /// <summary>
     /// Records the size of the folder a job used (<paramref name="packagesDir"/>, from <see cref="Acquire"/>) and
     /// evicts least recently used folders until the cache fits <see cref="MaxBytes"/>. Never throws: a cache that
     /// cannot be measured or trimmed is logged and left for the next job.

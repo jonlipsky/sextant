@@ -44,6 +44,13 @@ public sealed class ServicePaths
     public string GitObjectStoreRoot => Path.Combine(_cacheRoot, "git-objects");
 
     /// <summary>
+    /// The per-repository restore state on the cache volume (issue #272): one <see cref="RepoDirectoryName"/>
+    /// directory per repository, holding the NuGet assets files of its last clean restore, keyed by a fingerprint of
+    /// every restore input. Everything under it is rebuildable.
+    /// </summary>
+    public string RestoreStateRoot => Path.Combine(_cacheRoot, "restore-state");
+
+    /// <summary>
     /// True when <paramref name="path"/> is exactly one repository's package folder: a direct child of
     /// <see cref="PackageCacheRoot"/>. The evaluation sandbox refuses to point <c>NUGET_PACKAGES</c> anywhere else.
     /// </summary>

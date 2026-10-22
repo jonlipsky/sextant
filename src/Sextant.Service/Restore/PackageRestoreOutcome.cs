@@ -1,5 +1,35 @@
 namespace Sextant.Service.Restore;
 
+/// <summary>One restore process of a job (issue #272).</summary>
+public sealed record RestorePassTiming
+{
+    /// <summary><c>solution</c> (whole-solution restore), <c>union</c> (traversal over the project union), <c>partial</c> (a solution's uncovered projects only) or <c>retry</c> (per-project retry of a failed solution).</summary>
+    public required string Kind { get; init; }
+
+    /// <summary>The solution file name, or <c>union</c> for the project union. Never a path.</summary>
+    public required string Target { get; init; }
+
+    /// <summary>Projects the pass was asked to restore.</summary>
+    public int Projects { get; init; }
+
+    /// <summary>
+    /// APPROXIMATE count of projects whose assets file the pass left untouched (NuGet's up-to-date check passed, so the
+    /// pass only evaluated them). Estimated from the file's last-write time at the default <c>obj/</c> location (older
+    /// than the pass start minus one second), so a project with a custom intermediate path reads as not up to date.
+    /// Telemetry only; nothing decides on it.
+    /// </summary>
+    public int ProjectsUpToDateApprox { get; init; }
+
+    /// <summary>Wall time of the process, in milliseconds.</summary>
+    public long WallMs { get; init; }
+
+    /// <summary>True when the pass ran with static-graph evaluation.</summary>
+    public bool StaticGraph { get; init; }
+
+    /// <summary><c>succeeded</c>, <c>failed</c>, <c>timed_out</c> or <c>not_started</c>.</summary>
+    public required string Result { get; init; }
+}
+
 /// <summary>One project's restore failure, as reduced by <see cref="RestoreOutputParser"/>.</summary>
 public sealed record PackageRestoreProjectIssue
 {
@@ -101,6 +131,46 @@ public sealed record PackageRestoreOutcome
 
     /// <summary>File names of the solutions counted in <see cref="SolutionsPartiallySkipped"/>.</summary>
     public IReadOnlyList<string> PartiallySkippedSolutionNames { get; init; } = [];
+
+    /// <summary>Every restore process this job ran, in order (issue #272): where the restore time went.</summary>
+    public IReadOnlyList<RestorePassTiming> Passes { get; init; } = [];
+
+    /// <summary>What the restore-state cache did (issue #272); null when it was not in play (no persistent package folder).</summary>
+    public RestoreReuseOutcome? Reuse { get; init; }
+
+    /// <summary>The one log line describing this job's restore: mode, wall time, cache decision and every pass.</summary>
+    public string Summary()
+    {
+        if (!Enabled)
+            return "package restore summary: off.";
+        var mode = Reuse is { Decision: "reused" } ? "reused"
+            : UsedProjectUnion ? "union" : SolutionsSelected > 1 ? "per_solution" : "solution";
+        var text = new System.Text.StringBuilder("package restore summary: ")
+            .Append("mode=").Append(mode)
+            .Append(" wall_ms=").Append((long)Elapsed.TotalMilliseconds)
+            .Append(" timed_out=").Append(TimedOut ? "true" : "false")
+            .Append(" passes=").Append(Passes.Count);
+        if (Reuse is { } reuse)
+        {
+            text.Append(" cache=").Append(reuse.Decision);
+            if (reuse.Reason is not null)
+                text.Append('(').Append(reuse.Reason).Append(')');
+            text.Append(" cache_projects=").Append(reuse.Projects)
+                .Append(" fingerprint_ms=").Append(reuse.FingerprintMs)
+                .Append(" state_ms=").Append(reuse.StateMs);
+            if (reuse.Saved)
+                text.Append(" saved=true");
+            else if (reuse.SaveSkipped is not null)
+                text.Append(" save_skipped=").Append(reuse.SaveSkipped);
+        }
+        foreach (var pass in Passes)
+        {
+            text.Append(" [").Append(pass.Kind).Append(' ').Append(pass.Target).Append(" projects=").Append(pass.Projects)
+                .Append(" up_to_date_approx=").Append(pass.ProjectsUpToDateApprox).Append(" ms=").Append(pass.WallMs)
+                .Append(pass.StaticGraph ? " static_graph" : string.Empty).Append(' ').Append(pass.Result).Append(']');
+        }
+        return text.Append('.').ToString();
+    }
 
     /// <summary>Distinct projects explicitly restored by a project-union traversal.</summary>
     public int ProjectsAttempted { get; init; }
