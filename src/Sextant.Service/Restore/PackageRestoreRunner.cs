@@ -79,8 +79,9 @@ public sealed class PackageRestoreRunner(
     // KEEP IN SYNC WITH THE RESTORE STATE CACHE (issue #272): RestoreStateStore replays one job's restore output into a
     // later job. The restore arguments and environment are hashed into its fingerprint, but a change to HOW the restore
     // runs that the arguments do not show (this list, the union traversal in RunProjectUnionAsync/RunTraversalAsync, the
-    // retry/partial-skip logic, the static-graph fallback) must bump RunnerPolicy so no older output is replayed.
-    internal const string RunnerPolicy = "1";
+    // retry/partial-skip logic, the static-graph fallback, which projects a partial replay leaves to the traversals)
+    // must bump RunnerPolicy so no older output is replayed. "2": a not-clean restore saves its clean projects (#349).
+    internal const string RunnerPolicy = "2";
 
     /// <summary>
     /// Global properties only the restore passes (never the workspace load, whose <see cref="EvaluationGlobalProperties"/>
@@ -165,6 +166,8 @@ public sealed class PackageRestoreRunner(
         // Issue #272: skip the restore when nothing it reads changed since the repository's last clean restore.
         RestoreStateStore.Inputs? inputs = null;
         RestoreReuseOutcome? reuseOutcome = null;
+        HashSet<string>? replayed = null;
+        RestoreMemo? memo = null;
         if (reuse is not null)
         {
             var fingerprintWatch = Stopwatch.StartNew();
@@ -182,8 +185,19 @@ public sealed class PackageRestoreRunner(
             else
             {
                 var replayWatch = Stopwatch.StartNew();
-                var (missReason, projectCount, written) = RestoreStateStore.TryReplay(reuse, checkoutDir, inputs, log);
-                if (missReason is null)
+                var replay = RestoreStateStore.TryReplay(reuse, checkoutDir, inputs, log, solutions);
+                var (missReason, projectCount, written) = (replay.MissReason, replay.Projects, replay.FilesWritten);
+                if (missReason is null && replay.Remaining.Count > 0)
+                {
+                    // Issue #349: the state holds only the projects that restored cleanly; the rest are restored below.
+                    replayed = new HashSet<string>(replay.Replayed, CheckoutInventory.PathComparer);
+                    reuseOutcome = new RestoreReuseOutcome
+                    {
+                        Decision = "partial", Projects = projectCount, ProjectsRemaining = replay.Remaining.Count, FilesWritten = written,
+                        FingerprintMs = fingerprintMs, StateMs = replayWatch.ElapsedMilliseconds, FingerprintPrefix = prefix
+                    };
+                }
+                else if (missReason is null)
                 {
                     return new PackageRestoreOutcome
                     {
@@ -198,18 +212,27 @@ public sealed class PackageRestoreRunner(
                         }
                     };
                 }
-                reuseOutcome = new RestoreReuseOutcome
-                    { Decision = "miss", Reason = missReason, FingerprintMs = fingerprintMs, FingerprintPrefix = prefix };
+                else
+                    reuseOutcome = new RestoreReuseOutcome
+                        { Decision = "miss", Reason = missReason, FingerprintMs = fingerprintMs, FingerprintPrefix = prefix };
+
+                // Static-graph failures remembered for exactly these inputs (the memo is keyed by the fingerprint).
+                memo = new RestoreMemo(RestoreStateStore.LoadStaticGraphFailures(reuse, inputs.Fingerprint));
             }
         }
 
-        var outcome = await RunCoreAsync(checkoutDir, solutions, globals, deadline, stopwatch, cancellationToken, scratchDir)
+        var outcome = await RunCoreAsync(checkoutDir, solutions, globals, deadline, stopwatch, cancellationToken, scratchDir, replayed, memo)
             .ConfigureAwait(false);
         if (reuseOutcome is null)
+        {
+            LogRestoreErrors(outcome);
             return outcome;
-        if (reuse is not null && inputs is not null && reuseOutcome.Decision == "miss" && reuseOutcome.SaveSkipped is null)
-            reuseOutcome = SaveState(reuse, checkoutDir, solutions, globals, inputs, outcome, reuseOutcome, cancellationToken);
-        return outcome with { Reuse = reuseOutcome };
+        }
+        if (reuse is not null && inputs is not null && reuseOutcome.Decision is "miss" or "partial" && reuseOutcome.SaveSkipped is null)
+            reuseOutcome = SaveState(reuse, checkoutDir, solutions, globals, inputs, outcome, reuseOutcome, memo, replayed, cancellationToken);
+        outcome = outcome with { Reuse = reuseOutcome };
+        LogRestoreErrors(outcome);
+        return outcome;
     }
 
     // The restore context the state fingerprint binds (see RestoreStateStore.Context): the exact argument lists and the
@@ -227,29 +250,51 @@ public sealed class PackageRestoreRunner(
             IndexConfigurationHash.AnalyzerVersion, RunnerPolicy);
     }
 
-    // Saves the state of a CLEAN restore whose inputs did not change while it ran (a restore can rewrite a lock file).
+    // One Information line per job with the top restore error codes (issue #349).
+    private void LogRestoreErrors(PackageRestoreOutcome outcome)
+    {
+        if (outcome.ErrorSummaryLine() is { } line)
+            log?.Invoke(line);
+    }
+
+    // Saves the state of a restore whose inputs did not change while it ran (a restore can rewrite a lock file). A clean
+    // restore saves every project; a not-clean one (issue #349) saves the projects that restored cleanly and lists the
+    // rest as remaining, so the next job replays those and restores only the others. A failing project is never saved,
+    // known-failing or otherwise: a failed restore's assets cannot be shown identical to a later failed restore's, so its
+    // failure is reproduced by restoring it again, whatever its error codes (a transient one included).
     private RestoreReuseOutcome SaveState(
         RestoreReuse reuse, string checkoutDir, IReadOnlyList<string> solutions, IReadOnlyList<KeyValuePair<string, string>> globals,
-        RestoreStateStore.Inputs before, PackageRestoreOutcome outcome, RestoreReuseOutcome miss, CancellationToken cancellationToken)
+        RestoreStateStore.Inputs before, PackageRestoreOutcome outcome, RestoreReuseOutcome miss, RestoreMemo? memo,
+        HashSet<string>? replayed, CancellationToken cancellationToken)
     {
-        if (!outcome.Clean)
+        // Only a restore that ended with every failure attributed to a named project can be told apart per project.
+        if (outcome.TimedOut || outcome.ProjectsDropped > 0 || outcome.GeneralCodes.Count > 0 || outcome.SourceUnreachableGeneral
+            || outcome.CredentialsUnavailable || outcome.SolutionsNotStarted > 0
+            || (!outcome.Clean && outcome.Projects.Count == 0))
             return miss with { SaveSkipped = outcome.TimedOut ? "timed_out" : "restore_not_clean" };
         var watch = Stopwatch.StartNew();
         var after = RestoreStateStore.Compute(checkoutDir, StateContext(checkoutDir, reuse, solutions, globals), cancellationToken);
         if (after is null || !string.Equals(after.Fingerprint, before.Fingerprint, StringComparison.Ordinal))
             return miss with { SaveSkipped = "inputs_changed_during_restore", FingerprintMs = miss.FingerprintMs + watch.ElapsedMilliseconds };
-        // The checkout's restore output BEFORE the restore decides whether the output now is this restore's own.
-        var saved = RestoreStateStore.Save(reuse, checkoutDir, before, solutions, log, out var skipReason);
+        if (memo is { Added.Count: > 0 })
+            RestoreStateStore.SaveStaticGraphFailures(reuse, before.Fingerprint, memo.Added, log);
+        // A partial replay's own output is not "stale" (the checkout held none before it) and is what the state holds, so
+        // saving after one stores the replayed projects plus whatever this job restored cleanly.
+        var failed = new HashSet<string>(
+            outcome.Projects.Select(p => Path.GetFullPath(Path.Combine(checkoutDir, p.Project))), CheckoutInventory.PathComparer);
+        var saved = RestoreStateStore.Save(
+            reuse, checkoutDir, before, solutions, log, out var skipReason, partial: !outcome.Clean, failed: failed);
         return miss with
         {
-            Saved = saved is not null, Projects = saved ?? 0, SaveSkipped = skipReason,
+            Saved = saved is not null, Projects = saved?.Saved ?? 0, ProjectsRemaining = saved?.Remaining ?? 0, SaveSkipped = skipReason,
             FingerprintMs = miss.FingerprintMs + watch.ElapsedMilliseconds, StateMs = watch.ElapsedMilliseconds
         };
     }
 
     private async Task<PackageRestoreOutcome> RunCoreAsync(
         string checkoutDir, IReadOnlyList<string> solutions, IReadOnlyList<KeyValuePair<string, string>> globals,
-        TimeSpan deadline, Stopwatch stopwatch, CancellationToken cancellationToken, string? scratchDir)
+        TimeSpan deadline, Stopwatch stopwatch, CancellationToken cancellationToken, string? scratchDir,
+        IReadOnlySet<string>? replayed = null, RestoreMemo? memo = null)
     {
         var credentialsDir = PrepareCredentials(scratchDir, out var environment);
         var credentialsUnavailable = _sourceCredentials.Count > 0 && credentialsDir is null;
@@ -260,6 +305,10 @@ public sealed class PackageRestoreRunner(
             {
                 if (TryCreateProjectUnion(checkoutDir, solutions, cancellationToken, out var projects, out var fallbackReason))
                 {
+                    // The union traversal restores each project on its own (not recursive), so a project whose saved
+                    // assets were replayed is simply left out; an empty remainder restores them all.
+                    if (replayed is { Count: > 0 } && projects.Where(p => !replayed.Contains(p.ProjectPath)).ToList() is { Count: > 0 } left)
+                        projects = left;
                     var union = await RunProjectUnionAsync(
                             checkoutDir, solutions.Count, projects, globals, Remaining(deadline, stopwatch), cancellationToken,
                             scratchDir, environment)
@@ -275,7 +324,8 @@ public sealed class PackageRestoreRunner(
             }
 
             var fallback = await RunPerSolutionAsync(
-                    checkoutDir, solutions, globals, Remaining(deadline, stopwatch), cancellationToken, environment, scratchDir)
+                    checkoutDir, solutions, globals, Remaining(deadline, stopwatch), cancellationToken, environment, scratchDir,
+                    replayed, memo)
                 .ConfigureAwait(false);
             return fallback with
             {
@@ -346,12 +396,13 @@ public sealed class PackageRestoreRunner(
     private async Task<PackageRestoreOutcome> RunPerSolutionAsync(
         string checkoutDir, IReadOnlyList<string> solutions, IReadOnlyList<KeyValuePair<string, string>> globals,
         TimeSpan deadline, CancellationToken cancellationToken,
-        IReadOnlyDictionary<string, string> environment, string? scratchDir)
+        IReadOnlyDictionary<string, string> environment, string? scratchDir,
+        IReadOnlySet<string>? replayed = null, RestoreMemo? memo = null)
     {
         var parser = new RestoreOutputParser(checkoutDir);
         var stopwatch = Stopwatch.StartNew();
         int attempted = 0, succeeded = 0, notStarted = 0, retried = 0, retriedProjects = 0;
-        int staticPasses = 0, staticFallbacks = 0;
+        int staticPasses = 0, staticFallbacks = 0, staticMemoSkips = 0, coveredByReplay = 0;
         var timedOut = false;
         var startedUtc = DateTime.UtcNow;
         var passes = new List<RestorePassTiming>();
@@ -396,14 +447,22 @@ public sealed class PackageRestoreRunner(
             var sensitive = sensitiveByDir.TryGetValue(solutionDir, out var sensitiveHere)
                 ? sensitiveHere
                 : new Dictionary<string, string>();
-            bool Covered(string project) => !sensitive.ContainsKey(project)
+            // Issue #349: a project whose clean assets were replayed from the restore state is covered too, unless it is
+            // solution-sensitive (then the solution restores it itself, over the replayed file). The replay wrote and
+            // verified its files, wherever the project's intermediate output is configured to be.
+            bool Replayed(string project) => replayed is { Count: > 0 } && !sensitive.ContainsKey(project)
+                && replayed.Contains(project);
+            bool Covered(string project) => Replayed(project) || (!sensitive.ContainsKey(project)
                 && lastAttemptDir.TryGetValue(project, out var lastDir) && CheckoutInventory.PathComparer.Equals(lastDir, solutionDir)
                 && ((restoredBy.TryGetValue(project, out var dirs) && dirs.Contains(solutionDir) && File.Exists(AssetsFile(project)))
-                    || (failedBy.TryGetValue(project, out var failedDirs) && failedDirs.Contains(solutionDir)));
+                    || (failedBy.TryGetValue(project, out var failedDirs) && failedDirs.Contains(solutionDir))));
             var uncovered = declared.Where(project => !Covered(project)).ToList();
+            var replayDriven = declared.Any(Replayed);
             if (declared.Count > 0 && uncovered.Count == 0)
             {
                 skippedNames.Add(Path.GetFileName(solution));
+                if (replayDriven)
+                    coveredByReplay++;
                 continue;
             }
 
@@ -412,11 +471,12 @@ public sealed class PackageRestoreRunner(
             // maps every project to its own default configuration, so a traversal restoring a project on its own
             // (Debug|AnyCPU, recursive like the solution restore) writes what the solution would have written, also for
             // the covered projects it recurses into. An unreadable mapping or any doubt restores the whole solution.
-            var solutionImports = declared.Count > 0 && uncovered.Count * 2 < declared.Count
+            var solutionImports = declared.Count > 0 && (uncovered.Count * 2 < declared.Count || replayDriven)
                 && HasSolutionLevelImports(solutionDir, checkoutDir);
             if (solutionImports)
                 partialDeclinedNames.Add(Path.GetFileName(solution));
-            if (declared.Count > 0 && uncovered.Count * 2 < declared.Count && attemptedDirs.Contains(solutionDir) && !solutionImports
+            if (declared.Count > 0 && ((uncovered.Count * 2 < declared.Count && attemptedDirs.Contains(solutionDir)) || replayDriven)
+                && !solutionImports
                 && !declared.Any(sensitive.ContainsKey) && SolutionSensitivity.FindNotDefaultMapped(solution).Count == 0
                 && SafeForMsBuildProperty(Path.GetFullPath(solution)) && uncovered.All(project => SafeForMsBuildProperty(project)))
             {
@@ -441,6 +501,8 @@ public sealed class PackageRestoreRunner(
                     attempted++;
                     partialSkipped++;
                     partialProjects += uncovered.Count;
+                    if (replayDriven)
+                        coveredByReplay++;
                     partialSkippedNames.Add(Path.GetFileName(solution));
                     foreach (var project in uncovered)
                         lastAttemptDir[project] = solutionDir;
@@ -497,7 +559,11 @@ public sealed class PackageRestoreRunner(
                 lastAttemptDir[project] = solutionDir;
             var attempt = new RestoreOutputParser(checkoutDir);
             var memoKey = (Path.GetFullPath(solution), File.GetLastWriteTimeUtc(solution).Ticks);
-            var useStaticGraph = staticGraphRestore && !FellBackSolutions.ContainsKey(memoKey);
+            var memoName = Path.GetRelativePath(checkoutDir, Path.GetFullPath(solution)).Replace('\\', '/');
+            var rememberedFailure = staticGraphRestore && memo is not null && memo.Knows(memoName);
+            if (rememberedFailure)
+                staticMemoSkips++;
+            var useStaticGraph = staticGraphRestore && !rememberedFailure && !FellBackSolutions.ContainsKey(memoKey);
             var passStarted = DateTime.UtcNow;
             var passWatch = Stopwatch.StartNew();
             var result = await RunOneAsync(solution, globals, remaining, attempt, cancellationToken, environment, useStaticGraph)
@@ -513,6 +579,7 @@ public sealed class PackageRestoreRunner(
                 // A timeout or cancellation is not re-run either (the default restore would hit it too).
                 if (result == RunResult.Failed && attempt.Projects().Count == 0)
                 {
+                    var staticAttempt = attempt;
                     staticFallbacks++;
                     FellBackSolutions[memoKey] = 0;
                     log?.Invoke(
@@ -529,6 +596,10 @@ public sealed class PackageRestoreRunner(
                             .ConfigureAwait(false);
                         passes.Add(Pass("solution", Path.GetFileName(solution), declared, false, passStarted, passWatch.ElapsedMilliseconds, result));
                     }
+
+                    // Remember it only when the failure looks like the graph's own, never a network or time-out one.
+                    if (memo is not null && result is RunResult.Succeeded or RunResult.Failed && StaticFailureIsDeterministic(staticAttempt))
+                        memo.Add(memoName);
                 }
             }
             var retrySucceeded = false;
@@ -597,6 +668,8 @@ public sealed class PackageRestoreRunner(
             ProjectsRetried = retriedProjects,
             StaticGraphPasses = staticPasses,
             StaticGraphFallbacks = staticFallbacks,
+            StaticGraphSkippedByMemo = staticMemoSkips,
+            SolutionsCoveredByReplay = coveredByReplay,
             Passes = passes,
             SolutionsSkippedRedundant = skippedNames.Count,
             SkippedSolutionNames = skippedNames,
@@ -615,6 +688,8 @@ public sealed class PackageRestoreRunner(
             $"package restore: {succeeded}/{attempted} solution(s) restored cleanly in {outcome.Elapsed.TotalSeconds:0.#}s" +
             (retried > 0 ? $"; {retried} solution(s) retried per project ({retriedProjects} project(s))" : string.Empty) +
             (staticPasses > 0 ? $"; static-graph evaluation on {staticPasses} pass(es), {staticFallbacks} fell back" : string.Empty) +
+            (staticMemoSkips > 0 ? $"; static-graph evaluation skipped for {staticMemoSkips} solution(s) it failed for under the same inputs" : string.Empty) +
+            (coveredByReplay > 0 ? $"; {coveredByReplay} solution(s) covered by replayed projects" : string.Empty) +
             (skippedNames.Count > 0
                 ? $"; {skippedNames.Count} solution(s) skipped as already restored ({string.Join(", ", skippedNames)})"
                 : string.Empty) +
@@ -869,6 +944,14 @@ public sealed class PackageRestoreRunner(
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<(string Path, long LastWriteTicks), byte> FellBackSolutions = new();
 
     internal static void ResetStaticGraphMemo() => FellBackSolutions.Clear();
+
+    // The static pass failed as a whole with at least one recognised code, every code deterministic and no source
+    // unreachable. A code-less failure (OOM kill, crash, full disk, uncoded error line) proves nothing.
+    private static bool StaticFailureIsDeterministic(RestoreOutputParser staticAttempt)
+    {
+        var codes = staticAttempt.GeneralCodes();
+        return codes.Count > 0 && codes.All(RestoreErrorClassifier.IsDeterministicCode) && !staticAttempt.SourceUnreachableGeneral;
+    }
 
     private enum RunResult { Succeeded, Failed, NotStarted, TimedOut }
 
@@ -1309,6 +1392,17 @@ public sealed class PackageRestoreRunner(
     private static string Xml(string value) => SecurityElement.Escape(value) ?? string.Empty;
 
     private sealed record UnionProject(string ProjectPath, string SolutionPath);
+
+    // Static-graph failures per solution for one fingerprint (issue #349): Known are loaded from the restore state,
+    // Added are the ones this job learned. Keys are checkout-relative solution paths with '/' separators.
+    private sealed class RestoreMemo(HashSet<string> known)
+    {
+        private readonly object _gate = new();
+        public HashSet<string> Known { get; } = known;
+        public HashSet<string> Added { get; } = new(StringComparer.Ordinal);
+        public bool Knows(string solution) { lock (_gate) return Known.Contains(solution); }
+        public void Add(string solution) { lock (_gate) Added.Add(solution); }
+    }
 
     internal ProcessStartInfo CreateStartInfo(
         string solution, IReadOnlyList<KeyValuePair<string, string>> globals, IReadOnlyDictionary<string, string>? environment = null,

@@ -95,7 +95,7 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
                 if (package.Success && package.Groups["id"].Value.Length <= MaxPackageIdLength)
                     packageId = package.Groups["id"].Value;
             }
-            Record(Relativize(projectMatch.Groups["path"].Value), code, packageId);
+            Record(Relativize(projectMatch.Groups["path"].Value), code, packageId, projectMatch.Groups["msg"].Value);
             return;
         }
 
@@ -107,7 +107,9 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
             var trailing = TrailingProject().Match(line);
             if (trailing.Success)
             {
-                Record(Relativize(trailing.Groups["path"].Value), generalMatch.Groups["code"].Value.ToUpperInvariant(), null);
+                Record(
+                    Relativize(trailing.Groups["path"].Value), generalMatch.Groups["code"].Value.ToUpperInvariant(), null,
+                    line[(generalMatch.Index + generalMatch.Length)..]);
                 return;
             }
             lock (_gate)
@@ -148,10 +150,7 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
                     accumulator = new Accumulator();
                     _projects[issue.Project] = accumulator;
                 }
-                foreach (var code in issue.Codes)
-                    accumulator.Codes.Add(code);
-                foreach (var package in issue.MissingPackages)
-                    accumulator.MissingPackages.Add(package);
+                Absorb(accumulator, issue);
             }
             foreach (var code in general)
                 if (_generalCodes.Count < MaxGeneralCodes)
@@ -159,6 +158,45 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
             _projectsDropped += dropped;
             _sourceUnreachable |= unreachable;
         }
+    }
+
+    /// <summary>
+    /// Adds findings recorded by an earlier job (issue #349: the failure of a whole-solution restore the restore state
+    /// remembers, so a later job does not run it again to learn the same thing).
+    /// </summary>
+    public void AddFindings(IEnumerable<PackageRestoreProjectIssue> issues, IEnumerable<string> generalCodes)
+    {
+        lock (_gate)
+        {
+            foreach (var issue in issues)
+            {
+                if (!_projects.TryGetValue(issue.Project, out var accumulator))
+                {
+                    if (_projects.Count >= MaxProjects)
+                    {
+                        _projectsDropped++;
+                        continue;
+                    }
+                    accumulator = new Accumulator();
+                    _projects[issue.Project] = accumulator;
+                }
+                Absorb(accumulator, issue);
+            }
+            foreach (var code in generalCodes)
+                if (_generalCodes.Count < MaxGeneralCodes)
+                    _generalCodes.Add(code);
+        }
+    }
+
+    private static void Absorb(Accumulator accumulator, PackageRestoreProjectIssue issue)
+    {
+        foreach (var code in issue.Codes)
+            accumulator.Codes.Add(code);
+        foreach (var package in issue.MissingPackages)
+            accumulator.MissingPackages.Add(package);
+        foreach (var (code, message) in issue.Messages)
+            accumulator.Messages.TryAdd(code, message);
+        accumulator.TransientMessage |= issue.TransientMessage;
     }
 
     /// <summary>The per-project restore failures seen so far, ordered by project path.</summary>
@@ -173,6 +211,8 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
                     Project = p.Key,
                     Codes = [.. p.Value.Codes],
                     MissingPackages = [.. p.Value.MissingPackages],
+                    Messages = new Dictionary<string, string>(p.Value.Messages),
+                    TransientMessage = p.Value.TransientMessage,
                     SourceUnreachable = p.Value.Codes.Overlaps(SourceUnreachableCodes)
                 })
                 .ToList();
@@ -209,8 +249,10 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
         return true;
     }
 
-    private void Record(string project, string code, string? packageId)
+    private void Record(string project, string code, string? packageId, string? message = null)
     {
+        var sanitized = string.IsNullOrWhiteSpace(message) ? null : RestoreErrorClassifier.Sanitize(message, _checkoutDir);
+        var transient = RestoreErrorClassifier.IsTransientMessage(sanitized);
         lock (_gate)
         {
             if (!_projects.TryGetValue(project, out var accumulator))
@@ -227,6 +269,9 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
                 accumulator.Codes.Add(code);
             if (packageId is not null && accumulator.MissingPackages.Count < MaxValuesPerProject)
                 accumulator.MissingPackages.Add(packageId);
+            if (!string.IsNullOrEmpty(sanitized) && accumulator.Messages.Count < MaxValuesPerProject)
+                accumulator.Messages.TryAdd(code, sanitized);
+            accumulator.TransientMessage |= transient;
         }
     }
 
@@ -258,7 +303,7 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
 
     // "<project path> : error NU1101: <message> [<solution path>]", the console logger's shape for a
     // project-scoped restore error. The path stops at the first project extension followed by " : error".
-    [GeneratedRegex(@"^\s*(?<path>[^\r\n]+?\.(?:cs|vb|fs)proj)\s*:\s*error\s+(?<code>NU\d{4})\s*:\s*(?<msg>.*)$",
+    [GeneratedRegex(@"^\s*(?<path>[^\r\n]+?\.(?:cs|vb|fs)proj)\s*:\s*error\s+(?<code>(?:NU|NETSDK|MSB)\d{4})\s*:\s*(?<msg>.*)$",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, matchTimeoutMilliseconds: 1000)]
     private static partial Regex ProjectError();
 
@@ -292,5 +337,7 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
     {
         public SortedSet<string> Codes { get; } = new(StringComparer.Ordinal);
         public SortedSet<string> MissingPackages { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public SortedDictionary<string, string> Messages { get; } = new(StringComparer.Ordinal);
+        public bool TransientMessage { get; set; }
     }
 }

@@ -23,6 +23,9 @@ public sealed class RestoreStateIntegrationTests : IDisposable
     private string State => Path.Combine(_root, "state");
     private string Calls => Path.Combine(_root, "restore-calls.txt");
     private string Wrapper => Path.Combine(_root, "dotnet-wrapper.sh");
+    private bool _withBad;
+    private bool _unreachableFeed;
+    private bool _withDependent;
 
     public void Dispose()
     {
@@ -145,6 +148,96 @@ public sealed class RestoreStateIntegrationTests : IDisposable
         CollectionAssert.AreEqual(expected.Documents, actual.Documents);
     }
 
+    // Issue #349: a project that depends on a package no source has fails its restore (NU1101) while Lib and App restore
+    // cleanly, so the restore is not clean but two of the three projects are.
+    [TestMethod]
+    public async Task DeterministicallyFailingProject_OnlyTheCleanProjectsAreReplayed_AndTheFailingOneIsRestoredAgain()
+    {
+        RequireUnix();
+        _withBad = true;
+        Arrange();
+        var first = await Restore();
+        Assert.IsFalse(first.Clean, first.Summary());
+        Assert.IsTrue(first.Reuse!.Saved, first.Reuse.SaveSkipped);
+        Assert.AreEqual(2, first.Reuse.Projects, first.Summary());
+        Assert.AreEqual(1, first.Reuse.ProjectsRemaining);
+        Assert.AreEqual("NU1101", first.ErrorCodes()[0].Code, first.Summary());
+        Assert.IsTrue(first.ErrorCodes()[0].Deterministic);
+        Assert.IsFalse(SavedText(Path.Combine(State, "current", RestoreStateStore.ManifestName)).Contains("Bad", StringComparison.Ordinal), "a failing project is never saved");
+        var expected = await Load();
+
+        RecreateCheckout();
+        var callsBefore = RestoreCalls();
+        var second = await Restore();
+        Assert.AreEqual("partial", second.Reuse!.Decision, second.Summary());
+        Assert.AreEqual(callsBefore, RestoreCalls(), "no whole-solution restore process: only the failing project is restored again");
+        Assert.AreEqual("NU1101", second.ErrorCodes()[0].Code, "the failure is reproduced");
+        var actual = await Load();
+
+        static bool Clean(string item) => !item.StartsWith("Bad|", StringComparison.Ordinal);
+        CollectionAssert.AreEqual(expected.References.Where(Clean).ToList(), actual.References.Where(Clean).ToList());
+        CollectionAssert.AreEqual(expected.Documents.Where(Clean).ToList(), actual.Documents.Where(Clean).ToList());
+        Assert.IsTrue(actual.References.Any(r => r.StartsWith("Lib|", StringComparison.Ordinal) && r.Contains("dep", StringComparison.OrdinalIgnoreCase)));
+    }
+
+    // A project with a ProjectReference to the deterministically failing one: whether it is replayed or restored again,
+    // the index it produces after a partial replay equals the one a full restore produced.
+    [TestMethod]
+    public async Task ProjectReferencingTheFailingProject_IndexesTheSameAfterAPartialReplay()
+    {
+        RequireUnix();
+        _withBad = true;
+        _withDependent = true;
+        Arrange();
+        var first = await Restore();
+        Assert.IsFalse(first.Clean, first.Summary());
+        Assert.IsTrue(first.Reuse!.Saved, first.Reuse.SaveSkipped);
+        var expected = await Load();
+
+        RecreateCheckout();
+        var second = await Restore();
+        Assert.AreEqual("partial", second.Reuse!.Decision, second.Summary());
+        var actual = await Load();
+
+        static bool NotBad(string item) => !item.StartsWith("Bad|", StringComparison.Ordinal);
+        CollectionAssert.AreEqual(expected.References.Where(NotBad).ToList(), actual.References.Where(NotBad).ToList());
+        CollectionAssert.AreEqual(expected.Documents.Where(NotBad).ToList(), actual.Documents.Where(NotBad).ToList());
+        Assert.IsTrue(actual.Documents.Any(d => d.StartsWith("Dependent|", StringComparison.Ordinal)));
+        Assert.AreEqual(expected.Errors, actual.Errors);
+    }
+
+    [TestMethod]
+    public async Task TransientFailure_NeverCachesTheFailingProject()
+    {
+        RequireUnix();
+        _withBad = true;
+        _unreachableFeed = true;
+        Arrange();
+        var first = await Restore();
+        Assert.IsFalse(first.Clean, first.Summary());
+        Assert.IsTrue(first.HasNonDeterministicFailure, first.Summary());
+        var manifestPath = Path.Combine(State, "current", RestoreStateStore.ManifestName);
+        if (File.Exists(manifestPath))
+            Assert.IsFalse(SavedText(manifestPath).Contains("Bad", StringComparison.Ordinal));
+
+        RecreateCheckout();
+        var callsBefore = RestoreCalls();
+        var second = await Restore();
+        Assert.IsFalse(second.Clean, second.Summary());
+        Assert.AreNotEqual("reused", second.Reuse!.Decision);
+        Assert.IsTrue(second.Projects.Any(p => p.Project.StartsWith("Bad/", StringComparison.Ordinal)), "the failing project is restored again");
+        Assert.IsTrue(RestoreCalls() >= callsBefore);
+    }
+
+    // The manifest without its list of projects left to restore (which names the failing ones by design).
+    private static string SavedText(string manifestPath)
+    {
+        var node = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(manifestPath))!.AsObject();
+        foreach (var key in node.Select(kv => kv.Key).Where(k => k.Equals("remaining", StringComparison.OrdinalIgnoreCase)).ToList())
+            node.Remove(key);
+        return node.ToJsonString();
+    }
+
     private void Arrange()
     {
         Directory.CreateDirectory(Packages);
@@ -171,7 +264,9 @@ public sealed class RestoreStateIntegrationTests : IDisposable
         Directory.CreateDirectory(Path.Combine(Checkout, "Lib"));
         Directory.CreateDirectory(Path.Combine(Checkout, "App"));
         File.WriteAllText(Path.Combine(Checkout, "nuget.config"),
-            $"<configuration><packageSources><clear /><add key=\"feed\" value=\"{Feed}\" /></packageSources></configuration>");
+            $"<configuration><packageSources><clear /><add key=\"feed\" value=\"{Feed}\" />"
+            + (_unreachableFeed ? "<add key=\"down\" value=\"http://127.0.0.1:1/index.json\" allowInsecureConnections=\"true\" />" : string.Empty)
+            + "</packageSources></configuration>");
         File.WriteAllText(Path.Combine(Checkout, "Directory.Build.props"),
             "<Project><PropertyGroup><BaseIntermediateOutputPath>$(MSBuildThisFileDirectory)artifacts/obj/$(MSBuildProjectName)/</BaseIntermediateOutputPath></PropertyGroup></Project>");
         File.WriteAllText(Path.Combine(Checkout, "Lib", "Lib.csproj"),
@@ -180,7 +275,25 @@ public sealed class RestoreStateIntegrationTests : IDisposable
         File.WriteAllText(Path.Combine(Checkout, "App", "App.csproj"),
             $"<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>{Tfm}</TargetFramework></PropertyGroup><ItemGroup><ProjectReference Include=\"../Lib/Lib.csproj\" /></ItemGroup></Project>");
         File.WriteAllText(Path.Combine(Checkout, "App", "Use.cs"), "namespace App; public static class Use { public static string Go() => Lib.Class1.Hi(); }");
-        File.WriteAllText(Path.Combine(Checkout, "All.slnx"), "<Solution><Project Path=\"Lib/Lib.csproj\" /><Project Path=\"App/App.csproj\" /></Solution>");
+        var bad = string.Empty;
+        if (_withBad)
+        {
+            Directory.CreateDirectory(Path.Combine(Checkout, "Bad"));
+            File.WriteAllText(Path.Combine(Checkout, "Bad", "Bad.csproj"),
+                $"<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>{Tfm}</TargetFramework></PropertyGroup><ItemGroup><PackageReference Include=\"No.Such.Package.Sextant349\" Version=\"9.9.9\" /></ItemGroup></Project>");
+            File.WriteAllText(Path.Combine(Checkout, "Bad", "Bad.cs"), "namespace Bad; public static class Bad { }");
+            bad = "<Project Path=\"Bad/Bad.csproj\" />";
+            if (_withDependent)
+            {
+                Directory.CreateDirectory(Path.Combine(Checkout, "Dependent"));
+                File.WriteAllText(Path.Combine(Checkout, "Dependent", "Dependent.csproj"),
+                    $"<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>{Tfm}</TargetFramework></PropertyGroup><ItemGroup><ProjectReference Include=\"../Bad/Bad.csproj\" /><ProjectReference Include=\"../Lib/Lib.csproj\" /></ItemGroup></Project>");
+                File.WriteAllText(Path.Combine(Checkout, "Dependent", "Dep.cs"), "namespace Dependent; public static class Dep { public static string Go() => Lib.Class1.Hi() + nameof(Bad.Bad); }");
+                bad += "<Project Path=\"Dependent/Dependent.csproj\" />";
+            }
+        }
+
+        File.WriteAllText(Path.Combine(Checkout, "All.slnx"), "<Solution><Project Path=\"Lib/Lib.csproj\" /><Project Path=\"App/App.csproj\" />" + bad + "</Solution>");
     }
 
     private void PackDep()

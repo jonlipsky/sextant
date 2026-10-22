@@ -300,6 +300,232 @@ public class RestoreStateTests
         Assert.IsTrue(RestoreStateStore.HasFloatingVersion(text, fast, slow));
     }
 
+    // ==== Issue #349: an unclean restore still saves what restored cleanly ==============================================
+
+    private static string FailingBBody(string error)
+        => RestoreBody.Replace("done; exit 0", "done; echo \"$(pwd)/B/B.csproj : error " + error + " [$(pwd)/All.slnx]\" >&2; exit 1");
+
+    private const string RecordTraversal = "cp \"$2\" \"$(dirname \"$0\")/traversal-$$.proj\"; echo \"$(pwd)/B/B.csproj : error NU1202: still failing [$(pwd)/All.slnx]\" >&2; exit 1";
+
+    [TestMethod]
+    [DataRow("NU1202: Package X 1.0.0 is not compatible with net10.0.")]
+    [DataRow("NU1301: Unable to load the service index for source ******feed.example.test/index.json.")]
+    [DataRow("NU4242: Something unrecognised happened.")]
+    public async Task UncleanRestore_SavesTheCleanProjects_ReplaysThem_AndRestoresOnlyTheFailingOne(string error)
+    {
+        RequireUnix();
+        using var env = new Env(restoreBody: FailingBBody(error), msbuildBody: RecordTraversal);
+        var first = await env.Run();
+        Assert.IsFalse(first.Clean);
+        Assert.IsTrue(first.Reuse!.Saved, first.Reuse.SaveSkipped);
+        Assert.AreEqual(1, first.Reuse.Projects);
+        Assert.AreEqual(1, first.Reuse.ProjectsRemaining);
+        StringAssert.Contains(first.Summary(), "saved=partial");
+        var manifest = File.ReadAllText(Path.Combine(env.State, "current", RestoreStateStore.ManifestName));
+        StringAssert.Contains(manifest, "A/obj/project.assets.json");
+        // Never a failing project: its failed-restore assets are not saved, whatever the error was.
+        Assert.IsFalse(manifest.Contains("B/obj", StringComparison.Ordinal), manifest);
+        var assetsOfA = File.ReadAllText(env.Assets("A"));
+        var callsAfterFirst = env.Calls;
+
+        env.ResetCheckout();
+        var second = await env.Run();
+        Assert.AreEqual("partial", second.Reuse!.Decision);
+        Assert.AreEqual(1, second.Reuse.Projects);
+        Assert.AreEqual(1, second.Reuse.ProjectsRemaining);
+        Assert.AreEqual(callsAfterFirst, env.Calls, "no whole-solution restore runs when the state covers the clean projects");
+        Assert.AreEqual(1, second.SolutionsCoveredByReplay);
+        Assert.AreEqual(assetsOfA, File.ReadAllText(env.Assets("A")), "the replayed assets are byte-identical");
+        Assert.IsTrue(env.Traversals.Contains("B.csproj", StringComparison.Ordinal), "the failing project is restored again");
+        Assert.IsFalse(env.Traversals.Contains("A.csproj", StringComparison.Ordinal), "the clean project is not restored again");
+        StringAssert.Contains(second.Summary(), "cache=partial");
+    }
+
+    [TestMethod]
+    public async Task FailureWithNoProjectAttributed_IsNotSavedAtAll()
+    {
+        RequireUnix();
+        using var env = new Env(restoreBody: RestoreBody.Replace("done; exit 0", "done; echo 'error MSB1009: bad' >&2; exit 1"));
+        var outcome = await env.Run();
+        Assert.IsFalse(outcome.Clean);
+        Assert.IsFalse(outcome.Reuse!.Saved);
+        Assert.AreEqual("restore_not_clean", outcome.Reuse.SaveSkipped);
+        Assert.IsFalse(Directory.Exists(Path.Combine(env.State, "current")));
+    }
+
+    [TestMethod]
+    public async Task ErrorCodes_AreRecordedInTheJobTimings_AndLogged()
+    {
+        RequireUnix();
+        using var env = new Env(restoreBody: FailingBBody("NETSDK1147: workloads must be installed: ios"), msbuildBody: RecordTraversal);
+        var outcome = await env.Run();
+        Assert.AreEqual("NETSDK1147", outcome.ErrorCodes()[0].Code);
+        Assert.IsTrue(outcome.ErrorCodes()[0].Deterministic);
+        Assert.IsFalse(outcome.HasNonDeterministicFailure);
+        var recorder = new JobTimingsRecorder();
+        recorder.RecordRestore(outcome, persistentPackageFolder: true);
+        var restore = recorder.Build().Restore!;
+        Assert.AreEqual(1, restore.ProjectsFailed);
+        Assert.AreEqual("NETSDK1147", restore.ErrorCodes[0].Code);
+        Assert.IsFalse(restore.FailuresNotProvablyDeterministic);
+    }
+
+    private const string StaticGraphFails = "case \"$*\" in *RestoreUseStaticGraphEvaluation*) echo 'error NETSDK1147: static graph failed' >&2; exit 1;; esac\n";
+    private const string StaticGraphFailsWithoutCode = "case \"$*\" in *RestoreUseStaticGraphEvaluation*) echo 'error : killed' >&2; exit 1;; esac\n";
+
+    [TestMethod]
+    public async Task StaticGraphFailure_IsRememberedPerSolutionAndFingerprint_AndInvalidatedByTheFingerprint()
+    {
+        RequireUnix();
+        using var env = new Env(restoreBody: StaticGraphFails + RestoreBody);
+        PackageRestoreRunner.ResetStaticGraphMemo();
+        var first = await env.Run(staticGraph: true);
+        Assert.AreEqual(1, first.StaticGraphFallbacks, "the first job pays for the failed static-graph attempt");
+        Assert.AreEqual(0, first.StaticGraphSkippedByMemo);
+        Assert.AreEqual(2, env.Calls);
+        Assert.IsTrue(File.Exists(Path.Combine(env.State, RestoreStateStore.MemoName)));
+
+        // Same inputs, no usable state (so a restore runs) and no in-process memory: the persisted memo skips the attempt.
+        env.RemoveSavedState();
+        env.ResetCheckout();
+        PackageRestoreRunner.ResetStaticGraphMemo();
+        var second = await env.Run(staticGraph: true);
+        Assert.AreEqual(1, second.StaticGraphSkippedByMemo);
+        Assert.AreEqual(0, second.StaticGraphPasses);
+        Assert.AreEqual(0, second.StaticGraphFallbacks);
+        Assert.AreEqual(3, env.Calls, "one restore, without static-graph evaluation");
+
+        // A changed input changes the fingerprint: the memo is not applied.
+        File.AppendAllText(Path.Combine(env.Checkout, "B", "B.csproj"), "<!-- changed -->");
+        env.RemoveSavedState();
+        env.ResetCheckout();
+        PackageRestoreRunner.ResetStaticGraphMemo();
+        var third = await env.Run(staticGraph: true);
+        Assert.AreEqual(0, third.StaticGraphSkippedByMemo);
+        Assert.AreEqual(1, third.StaticGraphFallbacks);
+        Assert.AreEqual(5, env.Calls);
+    }
+
+    [TestMethod]
+    public async Task CodelessStaticGraphFailure_IsNeverRemembered()
+    {
+        RequireUnix();
+        using var env = new Env(restoreBody: StaticGraphFailsWithoutCode + RestoreBody);
+        PackageRestoreRunner.ResetStaticGraphMemo();
+        var first = await env.Run(staticGraph: true);
+        Assert.AreEqual(1, first.StaticGraphFallbacks);
+        Assert.IsFalse(File.Exists(Path.Combine(env.State, RestoreStateStore.MemoName)), "no recognised code: nothing is proven");
+
+        env.RemoveSavedState();
+        env.ResetCheckout();
+        PackageRestoreRunner.ResetStaticGraphMemo();
+        var second = await env.Run(staticGraph: true);
+        Assert.AreEqual(0, second.StaticGraphSkippedByMemo);
+        Assert.AreEqual(1, second.StaticGraphFallbacks, "static graph is tried again");
+    }
+
+    [TestMethod]
+    public async Task TransientFlip_RestoresThePreviouslyFailingProject_AndSavesTheFullState()
+    {
+        RequireUnix();
+        // Job 1 fails B; once the flag exists the same script restores everything cleanly.
+        var body = "if [ -f \"$PKG_DIR/ok.flag\" ]; then\n" + RestoreBody + "\nelse\n"
+            + FailingBBody("NU1202: Package X 1.0.0 is not compatible with net10.0.") + "\nfi";
+        using var env = new Env(restoreBody: body, msbuildBody: RecordTraversal);
+        var first = await env.Run();
+        Assert.IsFalse(first.Clean);
+        Assert.AreEqual(1, first.Reuse!.ProjectsRemaining);
+
+        File.WriteAllText(Path.Combine(env.Packages, "ok.flag"), "1");
+        env.ResetCheckout();
+        var second = await env.Run();
+        Assert.AreEqual("partial", second.Reuse!.Decision);
+        Assert.IsTrue(env.Traversals.Contains("B.csproj", StringComparison.Ordinal), "the previously failing project is restored");
+        Assert.IsTrue(File.Exists(env.Assets("A")));
+    }
+
+    [TestMethod]
+    public async Task CorruptManifest_IsRefused_AndFallsBackToAFullRestore()
+    {
+        RequireUnix();
+        using var env = new Env();
+        await env.Run();
+        var manifestPath = Path.Combine(env.State, "current", RestoreStateStore.ManifestName);
+        var good = File.ReadAllText(manifestPath);
+        var node = System.Text.Json.Nodes.JsonNode.Parse(good)!.AsObject();
+        var projectPaths = node["project_paths"]!.AsArray();
+
+        foreach (var mutate in new Action<System.Text.Json.Nodes.JsonObject>[]
+        {
+            o => o["outputs"]!.AsObject().Remove("A/A.csproj"),
+            o => o["remaining"]!.AsArray().Add("A/A.csproj"),
+            o => { o["project_paths"]!.AsArray().Add("Ghost/Ghost.csproj"); o["projects"] = 3; o["outputs"]!.AsObject()["Ghost/Ghost.csproj"] = new System.Text.Json.Nodes.JsonObject { ["assets"] = "Ghost/obj/project.assets.json", ["cache"] = "Ghost/obj/project.nuget.cache" }; },
+            o => o["outputs"]!.AsObject()["A/A.csproj"]!["cache"] = "A/obj/missing.cache"
+        })
+        {
+            Assert.IsNotNull(projectPaths);
+            var copy = System.Text.Json.Nodes.JsonNode.Parse(good)!.AsObject();
+            mutate(copy);
+            File.WriteAllText(manifestPath, copy.ToJsonString());
+            env.ResetCheckout();
+            var decision = RestoreStateStore.TryReplay(new RestoreReuse(env.State, env.Packages), env.Checkout, env.SavedInputs(),
+                null, [Path.Combine(env.Checkout, "All.slnx")]);
+            Assert.IsNotNull(decision.MissReason, copy.ToJsonString());
+            Assert.IsFalse(File.Exists(env.Assets("A")), "nothing is left behind");
+        }
+    }
+
+    [TestMethod]
+    public void StaleMemoTemps_AreSweptWhenTheMemoIsWritten()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"sextant-memo-sweep-{Guid.NewGuid():N}");
+        try
+        {
+            var reuse = new RestoreReuse(Path.Combine(dir, "state"), Path.Combine(dir, "packages"));
+            Directory.CreateDirectory(reuse.StateDirectory);
+            var stale = Path.Combine(reuse.StateDirectory, ".memo-stale.tmp");
+            var fresh = Path.Combine(reuse.StateDirectory, ".memo-fresh.tmp");
+            File.WriteAllText(stale, "x");
+            File.WriteAllText(fresh, "x");
+            File.SetLastWriteTimeUtc(stale, DateTime.UtcNow.AddHours(-3));
+            RestoreStateStore.SaveStaticGraphFailures(reuse, "fp", new HashSet<string> { "a.sln" }, null);
+            Assert.IsFalse(File.Exists(stale));
+            Assert.IsTrue(File.Exists(fresh));
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+    }
+
+    [TestMethod]
+    public void StaticGraphMemo_IsBoundToItsFingerprint()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"sextant-memo-{Guid.NewGuid():N}");
+        try
+        {
+            var reuse = new RestoreReuse(Path.Combine(dir, "state"), Path.Combine(dir, "packages"));
+            Assert.AreEqual(0, RestoreStateStore.LoadStaticGraphFailures(reuse, "fp1").Count, "miss: nothing remembered");
+            RestoreStateStore.SaveStaticGraphFailures(reuse, "fp1", new HashSet<string> { "a.sln" }, null);
+            RestoreStateStore.SaveStaticGraphFailures(reuse, "fp1", new HashSet<string> { "b.sln" }, null);
+            CollectionAssert.AreEquivalent(new[] { "a.sln", "b.sln" }, RestoreStateStore.LoadStaticGraphFailures(reuse, "fp1").ToArray());
+            Assert.AreEqual(0, RestoreStateStore.LoadStaticGraphFailures(reuse, "fp2").Count, "another fingerprint: invalidated");
+            RestoreStateStore.SaveStaticGraphFailures(reuse, "fp2", new HashSet<string> { "c.sln" }, null);
+            CollectionAssert.AreEqual(new[] { "c.sln" }, RestoreStateStore.LoadStaticGraphFailures(reuse, "fp2").ToArray());
+            Assert.AreEqual(0, RestoreStateStore.LoadStaticGraphFailures(reuse, "fp1").Count, "the memo holds one fingerprint");
+            File.WriteAllText(Path.Combine(reuse.StateDirectory, RestoreStateStore.MemoName), "{ not json");
+            Assert.AreEqual(0, RestoreStateStore.LoadStaticGraphFailures(reuse, "fp2").Count, "an unreadable memo is a miss");
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+    }
+
     private static void RequireUnix()
     {
         if (OperatingSystem.IsWindows())
@@ -312,7 +538,7 @@ public class RestoreStateTests
         private readonly string _fake;
         private readonly string _callLog;
 
-        public Env(string? restoreBody = null)
+        public Env(string? restoreBody = null, string? msbuildBody = null)
         {
             Directory.CreateDirectory(_root);
             Checkout = Path.Combine(_root, "checkout");
@@ -323,7 +549,7 @@ public class RestoreStateTests
             _callLog = Path.Combine(_root, "calls.txt");
             _fake = Path.Combine(_root, "dotnet");
             File.WriteAllText(_fake, ("#!/bin/sh\necho \"$@\" >> \"" + _callLog + "\"\ncase \"$1\" in\n  restore) PKG_FILE=\"" + PackageFile + "\"; PKG_DIR=\"" + Packages + "\"\n"
-                + (restoreBody ?? RestoreBody) + "\n ;;\n  msbuild) exit 1 ;;\nesac\n").Replace("\r\n", "\n"));
+                + (restoreBody ?? RestoreBody) + "\n ;;\n  msbuild) " + (msbuildBody ?? "exit 1") + " ;;\nesac\n").Replace("\r\n", "\n"));
             if (!OperatingSystem.IsWindows())
                 File.SetUnixFileMode(_fake, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
             Populate();
@@ -371,7 +597,12 @@ public class RestoreStateTests
 
         public string Obj(string project) => Path.Combine(Checkout, project, "obj");
 
-        public Task<PackageRestoreOutcome> Run(TimeSpan? timeout = null, string? stateName = null, bool createPackage = true)
+        // The generated traversal projects the fake msbuild copied (its $2 is the traversal), one file per call.
+        public string Traversals => string.Concat(Directory.EnumerateFiles(_root, "traversal-*.proj").Order().Select(File.ReadAllText));
+
+        public void RemoveSavedState() => Directory.Delete(Path.Combine(State, "current"), recursive: true);
+
+        public Task<PackageRestoreOutcome> Run(TimeSpan? timeout = null, string? stateName = null, bool createPackage = true, bool staticGraph = false)
         {
             if (createPackage && !File.Exists(PackageFile))
             {
@@ -381,7 +612,7 @@ public class RestoreStateTests
                 File.WriteAllText(Path.Combine(Packages, "y", "2.0.0", ".nupkg.metadata"), "y");
             }
             var state = stateName is null ? State : Path.Combine(_root, "state", stateName);
-            return new PackageRestoreRunner(timeout: timeout ?? TimeSpan.FromSeconds(60), staticGraphRestore: false) { DotnetPath = _fake }
+            return new PackageRestoreRunner(timeout: timeout ?? TimeSpan.FromSeconds(60), staticGraphRestore: staticGraph) { DotnetPath = _fake }
                 .RunAsync(Checkout, [Path.Combine(Checkout, "All.slnx")], limit: null, CancellationToken.None,
                     Path.Combine(_root, "scratch"), new RestoreReuse(state, Packages));
         }

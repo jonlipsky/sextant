@@ -129,7 +129,7 @@ public sealed record JobRestoreTimings
     /// <summary>Every restore process the job ran, in order: kind, solution, projects, up-to-date projects, time, result (issue #272).</summary>
     public IReadOnlyList<Restore.RestorePassTiming> Passes { get; init; } = [];
 
-    /// <summary>The restore-state cache decision (<c>reused</c>/<c>miss</c>/<c>unavailable</c>), or null when not in play (issue #272).</summary>
+    /// <summary>The restore-state cache decision (<c>reused</c>/<c>partial</c>/<c>miss</c>/<c>unavailable</c>), or null when not in play (issue #272).</summary>
     public Restore.RestoreReuseOutcome? Reuse { get; init; }
 
     /// <summary>True when at least one restore pass ran with static-graph evaluation (issue #272); see <see cref="StaticGraphFallbacks"/>.</summary>
@@ -158,6 +158,21 @@ public sealed record JobRestoreTimings
 
     /// <summary>File names of the partially skipped solutions (issue #290).</summary>
     public IReadOnlyList<string> PartiallySkippedSolutionNames { get; init; } = [];
+
+    /// <summary>Projects that reported restore errors (issue #349).</summary>
+    public int ProjectsFailed { get; init; }
+
+    /// <summary>The top restore error codes with the number of projects reporting each, whether it reproduces, and a sanitized sample message (issue #349).</summary>
+    public IReadOnlyList<Restore.RestoreErrorSummary> ErrorCodes { get; init; } = [];
+
+    /// <summary>True when a failure is transient or unrecognised, so the failing set was not cached as failing (issue #349).</summary>
+    public bool FailuresNotProvablyDeterministic { get; init; }
+
+    /// <summary>Per-solution passes that skipped static-graph evaluation because it failed for that solution under the same inputs (issue #349).</summary>
+    public int StaticGraphSkippedByMemo { get; init; }
+
+    /// <summary>Solutions covered by projects replayed from the restore state (issue #349).</summary>
+    public int SolutionsCoveredByReplay { get; init; }
 }
 
 /// <summary>The solution load of a job (issue #267).</summary>
@@ -246,7 +261,12 @@ public sealed class JobTimingsRecorder
             SkippedSolutionNames = restore.SkippedSolutionNames,
             SolutionsPartiallySkipped = restore.SolutionsPartiallySkipped,
             ProjectsRestoredPartially = restore.ProjectsRestoredPartially,
-            PartiallySkippedSolutionNames = restore.PartiallySkippedSolutionNames
+            PartiallySkippedSolutionNames = restore.PartiallySkippedSolutionNames,
+            ProjectsFailed = restore.Projects.Count,
+            ErrorCodes = restore.ErrorCodes(),
+            FailuresNotProvablyDeterministic = restore.HasNonDeterministicFailure,
+            StaticGraphSkippedByMemo = restore.StaticGraphSkippedByMemo,
+            SolutionsCoveredByReplay = restore.SolutionsCoveredByReplay
         };
         lock (_gate) _restore = timings;
     }
