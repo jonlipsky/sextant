@@ -14,7 +14,7 @@ public class McpTestFixture : IDisposable
 
     public McpTestFixture()
     {
-        DbPath = Path.Combine(Path.GetTempPath(), $"sextant_mcp_test_{Guid.NewGuid():N}.db");
+        DbPath = TestTempRoot.NewFilePath("sextant_mcp_test", ".db");
         Db = new IndexDatabase(DbPath);
         Db.RunMigrations();
 

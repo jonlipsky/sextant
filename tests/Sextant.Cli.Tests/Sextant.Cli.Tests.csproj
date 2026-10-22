@@ -25,4 +25,9 @@
     <ProjectReference Include="..\..\src\Sextant.Cli\Sextant.Cli.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Include="..\Shared\TestTempRoot.cs" Link="Shared\TestTempRoot.cs" />
+    <Compile Include="..\Shared\TestRunLifecycle.cs" Link="Shared\TestRunLifecycle.cs" />
+  </ItemGroup>
+
 </Project>
