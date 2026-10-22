@@ -3,7 +3,7 @@ using System.Diagnostics;
 namespace Sextant.TestSupport;
 
 /// <summary>
-/// One temp directory per test run and assembly (issue #324): <c>&lt;temp&gt;/sxt-&lt;pid&gt;-&lt;6 hex&gt;/</c>.
+/// One temp directory per test run and assembly (issue #324): <c>&lt;temp&gt;/sxt-&lt;pid&gt;-&lt;random&gt;/</c> (via CreateTempSubdirectory).
 /// <see cref="Initialize"/> creates it and points the process temp location (<c>TMPDIR</c> on Unix, <c>TMP</c>/<c>TEMP</c> on
 /// Windows) at it, so every <c>Path.GetTempPath()</c> in the tests, and in the child processes they start, lands inside it.
 /// <see cref="Cleanup"/> deletes it. Initialize also sweeps roots left by earlier runs whose process is gone, and takes a
@@ -77,8 +77,8 @@ public static class TestTempRoot
             _snapshot = TakeLegacySnapshot(_realTemp);
             SweepStale(_realTemp);
 
-            var root = Path.Combine(_realTemp, $"{RootPrefix}{Environment.ProcessId}-{Guid.NewGuid().ToString("N")[..6]}");
-            Directory.CreateDirectory(root);
+            // Atomic, unique, and owner-only (0700) on Unix; appends a random suffix to the prefix.
+            var root = Directory.CreateTempSubdirectory($"{RootPrefix}{Environment.ProcessId}-").FullName;
             _root = root;
 
             _savedEnv = EnvNames.Select(Environment.GetEnvironmentVariable).ToArray()!;
@@ -194,7 +194,7 @@ public static class TestTempRoot
         }
     }
 
-    // Names: sxt-<pid>-<hex>, or the older sextant-tests-<assembly>-<pid>-<guid> (the assembly part has no '-').
+    // Names: sxt-<pid>-<random suffix> (a 6-hex or CreateTempSubdirectory suffix), or the older sextant-tests-<assembly>-<pid>-<guid> (the assembly part has no '-').
     private static bool TryParsePid(string name, out int pid)
     {
         pid = 0;
@@ -204,7 +204,7 @@ public static class TestTempRoot
             return old.Length == 3 && int.TryParse(old[1], out pid) && pid > 0;
         }
         var parts = name[RootPrefix.Length..].Split('-');
-        return parts.Length == 2 && int.TryParse(parts[0], out pid) && pid > 0;
+        return parts.Length == 2 && parts[1].Length > 0 && int.TryParse(parts[0], out pid) && pid > 0;
     }
 
     private static bool IsAlive(int pid)
