@@ -290,6 +290,16 @@ public class RestoreStateTests
         Assert.IsFalse(RestoreStateStore.HasFloatingVersion("<Project><PropertyGroup><AssemblyVersion>1.0.*</AssemblyVersion></PropertyGroup></Project>"));
     }
 
+    [TestMethod]
+    public void HasFloatingVersion_RegexTimeout_CountsAsFloating()
+    {
+        var slow = new System.Text.RegularExpressions.Regex(@"^(a+)+$", System.Text.RegularExpressions.RegexOptions.None, TimeSpan.FromMilliseconds(1));
+        var fast = new System.Text.RegularExpressions.Regex("nomatch");
+        var text = new string('a', 60) + "!";
+        Assert.IsTrue(RestoreStateStore.HasFloatingVersion(text, slow, fast));
+        Assert.IsTrue(RestoreStateStore.HasFloatingVersion(text, fast, slow));
+    }
+
     private static void RequireUnix()
     {
         if (OperatingSystem.IsWindows())

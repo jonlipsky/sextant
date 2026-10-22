@@ -118,10 +118,10 @@ internal static class RestoreStateStore
 
     // A version that can resolve differently tomorrow: a wildcard, or a range with no lower bound.
     private static readonly Regex FloatingAttribute = new(
-        @"\bVersion(?:Override)?\s*=\s*""(?:[^""]*\*|\s*[\[(]\s*,)", RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.CultureInvariant);
+        @"\bVersion(?:Override)?\s*=\s*""(?:[^""]*\*|\s*[\[(]\s*,)", RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
 
     private static readonly Regex FloatingElement = new(
-        @"<([A-Za-z0-9_.]*Version(?:Override)?)>\s*(?:[^<]*\*|[\[(]\s*,)", RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.CultureInvariant);
+        @"<([A-Za-z0-9_.]*Version(?:Override)?)>\s*(?:[^<]*\*|[\[(]\s*,)", RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
 
     private static readonly HashSet<string> NonPackageVersionElements = new(StringComparer.OrdinalIgnoreCase)
         { "AssemblyVersion", "FileVersion", "ApplicationVersion", "InformationalVersion", "AssemblyInformationalVersion", "ProductVersion" };
@@ -382,16 +382,26 @@ internal static class RestoreStateStore
 
     private static string Sha(string file) => Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(file)));
 
-    internal static bool HasFloatingVersion(string text)
+    internal static bool HasFloatingVersion(string text) => HasFloatingVersion(text, FloatingAttribute, FloatingElement);
+
+    // A match timeout cannot prove the text stable, so it counts as floating (a full restore).
+    internal static bool HasFloatingVersion(string text, Regex attribute, Regex element)
     {
-        if (FloatingAttribute.IsMatch(text))
-            return true;
-        foreach (Match match in FloatingElement.Matches(text))
+        try
         {
-            if (!NonPackageVersionElements.Contains(match.Groups[1].Value))
+            if (attribute.IsMatch(text))
                 return true;
+            foreach (Match match in element.Matches(text))
+            {
+                if (!NonPackageVersionElements.Contains(match.Groups[1].Value))
+                    return true;
+            }
+            return false;
         }
-        return false;
+        catch (RegexMatchTimeoutException)
+        {
+            return true;
+        }
     }
 
     private static bool IsInput(string name) => InputNames.Contains(name) || InputExtensions.Contains(Path.GetExtension(name));
