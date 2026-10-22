@@ -19,12 +19,20 @@ public static class AssemblySetup
     [AssemblyInitialize]
     public static async Task AssemblyInit(TestContext _)
     {
+        Sextant.TestSupport.TestTempRoot.Initialize();
         await IntegrationFixture.InitializeAsync();
     }
 
     [AssemblyCleanup]
     public static async Task AssemblyCleanup()
     {
-        await IntegrationFixture.DisposeAsync();
+        try
+        {
+            await IntegrationFixture.DisposeAsync();
+        }
+        finally
+        {
+            Sextant.TestSupport.TestTempRoot.Cleanup();
+        }
     }
 }

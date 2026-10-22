@@ -15,7 +15,7 @@ public class IntegrationFixture
     {
         var fixture = new IntegrationFixture();
         var solutionPath = FindSolutionFile();
-        fixture.DbPath = Path.Combine(Path.GetTempPath(), $"sextant-integration-{Guid.NewGuid():N}.db");
+        fixture.DbPath = Sextant.TestSupport.TestTempRoot.NewFilePath("integration", ".db");
 
         var solution = await SolutionLoader.LoadSolutionAsync(solutionPath);
         var db = new IndexDatabase(fixture.DbPath);

@@ -44,4 +44,8 @@
     <Using Include="Sextant.TestSupport" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Include="..\Shared\TestTempRoot.cs" Link="Shared\TestTempRoot.cs" />
+  </ItemGroup>
+
 </Project>

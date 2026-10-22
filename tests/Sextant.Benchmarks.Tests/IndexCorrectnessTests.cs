@@ -536,8 +536,6 @@ public sealed class IndexCorrectnessTests
 
     private static string NewTempDir(string tag)
     {
-        var dir = Path.Combine(Path.GetTempPath(), $"sextant-correctness-{tag}-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(dir);
-        return dir;
+        return Sextant.TestSupport.TestTempRoot.CreateDirectory("correctness-" + tag);
     }
 }

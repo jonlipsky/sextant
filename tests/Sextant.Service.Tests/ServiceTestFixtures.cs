@@ -13,10 +13,11 @@ namespace Sextant.Service.Tests;
 internal static class ServiceTestFixtures
 {
     public static string NewDbPath() =>
-        Path.Combine(Path.GetTempPath(), $"sextant_svc_{Guid.NewGuid():N}.db");
+        Sextant.TestSupport.TestTempRoot.NewFilePath("svc", ".db");
 
+    // Not created here: the service creates its volumes. The run root removes it at assembly cleanup.
     public static string NewDataRoot() =>
-        Path.Combine(Path.GetTempPath(), $"sextant_svcdata_{Guid.NewGuid():N}");
+        Sextant.TestSupport.TestTempRoot.NewFilePath("svcdata");
 
     public static ServiceOptions NewOptions(
         string dbPath,

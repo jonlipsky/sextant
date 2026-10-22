@@ -17,7 +17,7 @@ public class McpToolTests
     [TestInitialize]
     public void Setup()
     {
-        _dbPath = Path.Combine(Path.GetTempPath(), $"sextant_mcp_test_{Guid.NewGuid():N}.db");
+        _dbPath = TestTempRoot.NewFilePath("sextant_mcp_test", ".db");
         _db = new IndexDatabase(_dbPath);
         _db.RunMigrations();
 

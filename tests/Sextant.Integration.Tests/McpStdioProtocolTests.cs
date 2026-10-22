@@ -150,6 +150,7 @@ public class McpStdioProtocolTests
             WorkingDirectory = _repoRoot
         };
 
+        Sextant.TestSupport.BoundedProcess.ApplyDotnetEnvironment(psi);
         var process = Process.Start(psi)!;
         return new StdioServerHandle(process);
     }
