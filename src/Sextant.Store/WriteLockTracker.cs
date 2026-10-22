@@ -49,6 +49,15 @@ public sealed record WriteLockMetrics
 
     /// <summary>The threshold the over-threshold counters use, in milliseconds.</summary>
     public double ThresholdMs { get; init; }
+
+    /// <summary>In-process writers waiting to acquire the lock right now.</summary>
+    public int WaitingWriters { get; init; }
+
+    /// <summary>Times an index write session held off its next <c>BEGIN IMMEDIATE</c> so a waiting writer could take the lock (issue #344).</summary>
+    public long YieldsToWaiters { get; init; }
+
+    /// <summary>Yields that gave up at the cap with a writer still waiting.</summary>
+    public long YieldTimeouts { get; init; }
 }
 
 /// <summary>
@@ -74,6 +83,10 @@ public sealed class WriteLockTracker
     private long _waitsOver;
     private double _longestWaitMs;
     private string? _longestWaitOwner;
+    private int _waiting;
+    private long _acquisitions;
+    private long _yields;
+    private long _yieldTimeouts;
 
     public WriteLockTracker(TimeSpan? threshold = null, Action<WriteLockEvent>? sink = null, TimeProvider? timeProvider = null)
     {
@@ -83,24 +96,112 @@ public sealed class WriteLockTracker
     }
 
     /// <summary>A tracker that reports nothing; the default of every site that was given none.</summary>
-    public static WriteLockTracker Untracked { get; } = new();
+    public static WriteLockTracker Untracked { get; } = new(waiters: false);
+
+    // The shared untracked instance serves unrelated databases, so it must not turn one's wait into another's yield.
+    private readonly bool _countWaiters = true;
+
+    private WriteLockTracker(bool waiters) : this() => _countWaiters = waiters;
 
     public TimeSpan Threshold { get; }
 
-    /// <summary>Call right before <c>BEGIN IMMEDIATE</c>; pass the result to <see cref="Acquired"/> or <see cref="AcquireFailed"/>.</summary>
-    public long BeginAcquire() => _time.GetTimestamp();
+    /// <summary>The clock this tracker measures with.</summary>
+    public TimeProvider TimeProvider => _time;
+
+    /// <summary>
+    /// Call right before <c>BEGIN IMMEDIATE</c>; pass the result to <see cref="Acquired"/> or <see cref="AcquireFailed"/>
+    /// (exactly one of them, always). The caller counts as a waiting writer until then.
+    /// </summary>
+    public long BeginAcquire()
+    {
+        if (_countWaiters)
+            lock (_gate)
+                _waiting++;
+        return _time.GetTimestamp();
+    }
+
+    /// <summary>
+    /// A bare timestamp for a hold that is not a lock wait to other writers (a PRAGMA that waits and holds in one
+    /// call): pass it to <see cref="Released"/> via a <see cref="WriteLockHold"/>. Counts no waiting writer.
+    /// </summary>
+    public long Timestamp() => _time.GetTimestamp();
+
+    /// <summary>Time elapsed since a <see cref="Timestamp"/>/<see cref="BeginAcquire"/>/hold start.</summary>
+    public TimeSpan ElapsedSince(long timestamp) => _time.GetElapsedTime(timestamp);
+
+    /// <summary>Writers (other than the caller, who is not waiting) currently between <see cref="BeginAcquire"/> and its outcome.</summary>
+    public int WaitingWriters
+    {
+        get
+        {
+            lock (_gate)
+                return _waiting;
+        }
+    }
+
+    /// <summary>
+    /// Lets a writer that is about to start its next transaction give way: while writers are waiting, blocks until none
+    /// is left (each acquires the lock or gives up) or <paramref name="cap"/> passes, whichever is first, so a second
+    /// waiter is not starved by the first. Returns false when nobody was waiting (nothing was done); true when it
+    /// yielded. The cap runs on this tracker's <see cref="TimeProvider"/> (a fake clock drives it); wakeups are a
+    /// monitor signal, not a spin.
+    /// </summary>
+    public bool YieldToWaiters(TimeSpan cap)
+    {
+        if (cap <= TimeSpan.Zero) return false;
+        lock (_gate)
+            if (_waiting == 0) return false;
+
+        var expired = false;
+        using var timer = _time.CreateTimer(_ =>
+        {
+            lock (_gate)
+            {
+                expired = true;
+                Monitor.PulseAll(_gate);
+            }
+        }, null, cap, Timeout.InfiniteTimeSpan);
+        lock (_gate)
+        {
+            if (_waiting == 0) return false;
+            _yields++;
+            while (_waiting > 0 && !expired)
+                Monitor.Wait(_gate);
+            if (_waiting > 0) _yieldTimeouts++;
+            return true;
+        }
+    }
 
     /// <summary>The <c>BEGIN IMMEDIATE</c> succeeded: records the wait and starts the hold.</summary>
     public WriteLockHold Acquired(string owner, string? detail, long waitStartedAt)
     {
         var now = _time.GetTimestamp();
+        EndWait(acquired: true);
         RecordWait(owner, detail, _time.GetElapsedTime(waitStartedAt, now));
         return new WriteLockHold(owner, detail, now);
     }
 
     /// <summary>The <c>BEGIN IMMEDIATE</c> failed (busy/locked): the wait still counts, there is no hold.</summary>
-    public void AcquireFailed(string owner, string? detail, long waitStartedAt) =>
+    public void AcquireFailed(string owner, string? detail, long waitStartedAt)
+    {
+        EndWait(acquired: false);
         RecordWait(owner, detail, _time.GetElapsedTime(waitStartedAt));
+    }
+
+    /// <summary>A lock failure of a hold started with <see cref="Timestamp"/> (no waiter was counted): records the wait only.</summary>
+    public void AcquireFailedAt(string owner, string? detail, long timestamp) =>
+        RecordWait(owner, detail, _time.GetElapsedTime(timestamp));
+
+    private void EndWait(bool acquired)
+    {
+        if (!_countWaiters) return;
+        lock (_gate)
+        {
+            if (_waiting > 0) _waiting--;
+            if (acquired) _acquisitions++;
+            Monitor.PulseAll(_gate);
+        }
+    }
 
     /// <summary>The transaction ended (COMMIT or ROLLBACK): records the hold.</summary>
     public void Released(WriteLockHold hold)
@@ -136,7 +237,10 @@ public sealed class WriteLockTracker
                 WaitsOverThreshold = _waitsOver,
                 LongestWaitMs = _longestWaitMs,
                 LongestWaitOwner = _longestWaitOwner,
-                ThresholdMs = Threshold.TotalMilliseconds
+                ThresholdMs = Threshold.TotalMilliseconds,
+                WaitingWriters = _waiting,
+                YieldsToWaiters = _yields,
+                YieldTimeouts = _yieldTimeouts
             };
     }
 

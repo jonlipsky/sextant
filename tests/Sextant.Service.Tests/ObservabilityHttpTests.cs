@@ -92,7 +92,8 @@ public class ObservabilityHttpTests
         foreach (var key in new[]
         {
             "holds_total", "holds_over_threshold", "longest_hold_ms", "longest_hold_owner", "longest_hold_at_unix_ms",
-            "waits_over_threshold", "longest_wait_ms", "threshold_ms"
+            "waits_over_threshold", "longest_wait_ms", "threshold_ms",
+            "waiting_writers", "yields_to_waiters", "yield_timeouts"
         })
             Assert.IsTrue(lockMetrics.TryGetProperty(key, out _), $"write_lock.{key} in {lockMetrics}");
         Assert.IsTrue(lockMetrics.GetProperty("holds_total").GetInt64() > 0, "the ensure's writes were counted");
@@ -102,6 +103,9 @@ public class ObservabilityHttpTests
         StringAssert.Contains(prometheus, "sextant_write_lock_longest_hold_ms");
         StringAssert.Contains(prometheus, "sextant_write_lock_holds_over_threshold_total");
         StringAssert.Contains(prometheus, "sextant_write_lock_longest_wait_ms");
+        StringAssert.Contains(prometheus, "sextant_write_lock_yields_total");
+        StringAssert.Contains(prometheus, "sextant_write_lock_yield_timeouts_total");
+        StringAssert.Contains(prometheus, "sextant_write_lock_waiting_writers");
     }
 
     [TestMethod]

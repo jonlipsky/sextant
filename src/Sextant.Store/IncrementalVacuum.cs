@@ -10,8 +10,42 @@ namespace Sextant.Store;
 /// </summary>
 public static class IncrementalVacuum
 {
-    /// <summary>The pages one step returns (32 MiB at the default 4 KiB page size).</summary>
+    /// <summary>The most pages one step returns (32 MiB at the default 4 KiB page size); also the fixed size of <see cref="Step"/> without a count.</summary>
     public const int DefaultStepPages = 8192;
+
+    /// <summary>The fewest pages an adaptive step shrinks to.</summary>
+    public const int MinStepPages = 16;
+
+    /// <summary>The cap an adaptive step grows to.</summary>
+    public const int MaxStepPages = DefaultStepPages;
+
+    /// <summary>Where the adaptive steps of a pass start (issue #344): small, because a step's cost depends on the catalog.</summary>
+    public const int InitialStepPages = 256;
+
+    /// <summary>The write-lock hold one adaptive step aims for.</summary>
+    public static readonly TimeSpan DefaultTargetHold = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// The page count of the next step, from the last step's count and how long it held the lock (issue #344). Pure.
+    /// A step well under the target doubles, one well over it shrinks in proportion to how far it overshot (at least
+    /// halving), anything near the target keeps its size; always within <see cref="MinStepPages"/>..<see cref="MaxStepPages"/>.
+    /// </summary>
+    public static int NextStepPages(int currentPages, TimeSpan measured, TimeSpan target)
+    {
+        var current = Math.Clamp(currentPages, MinStepPages, MaxStepPages);
+        if (target <= TimeSpan.Zero) return current;
+        double next;
+        if (measured <= TimeSpan.Zero || measured.TotalMilliseconds < target.TotalMilliseconds / 2)
+            next = current * 2.0;
+        else if (measured.TotalMilliseconds > target.TotalMilliseconds * 1.5)
+            next = current * Math.Min(0.5, target.TotalMilliseconds / measured.TotalMilliseconds);
+        else
+            next = current;
+        return (int)Math.Clamp(Math.Floor(next), MinStepPages, MaxStepPages);
+    }
+
+    /// <summary>What one <see cref="RunStep"/> did.</summary>
+    public readonly record struct StepResult(long Freed, int Pages, TimeSpan Elapsed);
 
     public const long AutoVacuumNone = 0;
     public const long AutoVacuumFull = 1;
@@ -24,28 +58,34 @@ public static class IncrementalVacuum
 
     public static long FreelistPages(SqliteConnection connection) => Scalar(connection, "PRAGMA freelist_count;");
 
+    /// <summary>Releases up to <see cref="DefaultStepPages"/> free pages in one step; see <see cref="RunStep"/>.</summary>
+    public static long Step(SqliteConnection connection, WriteLockTracker? tracker = null) =>
+        RunStep(connection, DefaultStepPages, tracker).Freed;
+
     /// <summary>
-    /// Releases up to <see cref="DefaultStepPages"/> free pages (the count is a literal in the constant SQL: a PRAGMA
-    /// takes no bound parameter). Returns the pages released: zero on a database that is not incremental (nothing is
-    /// attempted) or has no free pages.
+    /// Releases up to <paramref name="pages"/> free pages (clamped to <see cref="MinStepPages"/>..<see cref="MaxStepPages"/>;
+    /// the count is formatted into the SQL from that validated integer, since a PRAGMA takes no bound parameter).
+    /// <c>Freed</c> is zero on a database that is not incremental (nothing is attempted) or has no free pages;
+    /// <c>Elapsed</c> is the time the step held the write lock (it may include the busy wait).
     /// </summary>
-    public static long Step(SqliteConnection connection, WriteLockTracker? tracker = null)
+    public static StepResult RunStep(SqliteConnection connection, int pages, WriteLockTracker? tracker = null)
     {
-        if (!IsIncremental(connection)) return 0;
+        pages = Math.Clamp(pages, MinStepPages, MaxStepPages);
+        if (!IsIncremental(connection)) return new StepResult(0, pages, TimeSpan.Zero);
         var before = FreelistPages(connection);
-        if (before == 0) return 0;
+        if (before == 0) return new StepResult(0, pages, TimeSpan.Zero);
         tracker ??= WriteLockTracker.Untracked;
-        var started = tracker.BeginAcquire();
+        // Not BeginAcquire: the PRAGMA waits and holds in one call, so this is no waiting writer for others to yield to.
+        var started = tracker.Timestamp();
         try
         {
             using var cmd = connection.CreateCommand();
-            // Keep this literal equal to DefaultStepPages.
-            cmd.CommandText = "PRAGMA incremental_vacuum(8192);";
+            cmd.CommandText = string.Create(System.Globalization.CultureInfo.InvariantCulture, $"PRAGMA incremental_vacuum({pages});");
             cmd.ExecuteNonQuery();
         }
         catch (SqliteException ex) when (ex.SqliteErrorCode is 5 or 6)
         {
-            tracker.AcquireFailed("incremental-vacuum", null, started);
+            tracker.AcquireFailedAt("incremental-vacuum", null, started);
             throw;
         }
         catch
@@ -56,8 +96,9 @@ public static class IncrementalVacuum
         }
         // The PRAGMA waits for and holds the write lock in one call, so the two cannot be separated: the whole
         // duration is recorded as a hold and may include the busy wait.
+        var elapsed = tracker.ElapsedSince(started);
         tracker.Released(new WriteLockHold("incremental-vacuum", null, started));
-        return Math.Max(0, before - FreelistPages(connection));
+        return new StepResult(Math.Max(0, before - FreelistPages(connection)), pages, elapsed);
     }
 
     /// <summary>
@@ -69,7 +110,7 @@ public static class IncrementalVacuum
     public static bool CheckpointTruncate(SqliteConnection connection, WriteLockTracker? tracker = null)
     {
         tracker ??= WriteLockTracker.Untracked;
-        var started = tracker.BeginAcquire();
+        var started = tracker.Timestamp();
         var ran = CheckpointTruncateCore(connection, out var completed);
         // A checkpoint that returned busy at once held nothing; recording it would pollute hold metrics.
         if (ran) tracker.Released(new WriteLockHold("wal-checkpoint", null, started));

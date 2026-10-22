@@ -93,6 +93,12 @@ public static class PrometheusExposition
             s.WriteLock.HoldsOverThreshold);
         Gauge(sb, "sextant_write_lock_longest_wait_ms", "Longest wait to acquire the catalog write lock since start, in milliseconds.",
             s.WriteLock.LongestWaitMs);
+        Counter(sb, "sextant_write_lock_yields_total", "Times an index write session held off its next batch for a waiting writer (issue #344).",
+            s.WriteLock.YieldsToWaiters);
+        Counter(sb, "sextant_write_lock_yield_timeouts_total", "Yields that reached their cap without a waiter acquiring the lock.",
+            s.WriteLock.YieldTimeouts);
+        Gauge(sb, "sextant_write_lock_waiting_writers", "In-process writers waiting for the catalog write lock now.",
+            s.WriteLock.WaitingWriters);
         Gauge(sb, "sextant_alerts_critical", "Active critical alerts.",
             s.Alerts.Count(a => a.Level == AlertLevel.Critical));
 

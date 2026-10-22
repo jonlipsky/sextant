@@ -272,6 +272,45 @@ public sealed record ServiceOptions
 
     internal const int DefaultWriteLockWarnSeconds = 5;
 
+    /// <summary>
+    /// The write-lock hold the incremental vacuum steps aim for (issue #344): each step's page count adapts toward it,
+    /// starting small. <c>SEXTANT_SERVICE_VACUUM_TARGET_HOLD_MS</c> (default 1000); 10 to 60000.
+    /// </summary>
+    public TimeSpan VacuumTargetHold { get; init; } = Sextant.Store.IncrementalVacuum.DefaultTargetHold;
+
+    /// <summary>
+    /// Longest an index write batch holds the catalog write lock before it is committed at the next row (issue #344).
+    /// <c>SEXTANT_SERVICE_INDEX_BATCH_MAX_HOLD_MS</c> (default 2000); 0 disables the cap, otherwise 100 to 600000.
+    /// </summary>
+    public TimeSpan IndexBatchMaxHold { get; init; } = TimeSpan.FromMilliseconds(DefaultIndexBatchMaxHoldMs);
+
+    /// <summary>
+    /// How long an index write session lets a waiting in-process writer (grant write, lease renewal) take the lock
+    /// between two batches (issue #344). <c>SEXTANT_SERVICE_INDEX_YIELD_TO_WAITERS_MS</c> (default 500); 0 disables,
+    /// otherwise 10 to 60000.
+    /// </summary>
+    public TimeSpan IndexYieldToWaitersCap { get; init; } = TimeSpan.FromMilliseconds(DefaultIndexYieldToWaitersMs);
+
+    internal const int DefaultIndexBatchMaxHoldMs = 2000;
+    internal const int DefaultIndexYieldToWaitersMs = 500;
+
+    /// <summary>Applies the service's write-session tunables to <paramref name="options"/>.</summary>
+    public Sextant.Store.IndexWriteOptions ApplyTo(Sextant.Store.IndexWriteOptions options) =>
+        options with { MaxBatchHold = IndexBatchMaxHold, YieldToWaitersCap = IndexYieldToWaitersCap };
+
+    internal static TimeSpan ParseMillis(string name, string? value, int defaultMs, int minMs, int maxMs, bool zeroAllowed)
+    {
+        if (value is null)
+            return TimeSpan.FromMilliseconds(defaultMs);
+        if (!int.TryParse(value.Trim(), System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out var ms)
+            || !((zeroAllowed && ms == 0) || (ms >= minMs && ms <= maxMs)))
+            throw new InvalidOperationException(
+                $"Environment variable {EnvPrefix}{name} has an invalid value '{value}'. Use a whole number of milliseconds " +
+                (zeroAllowed ? $"(0 turns it off) from {minMs} to {maxMs}." : $"from {minMs} to {maxMs}."));
+        return TimeSpan.FromMilliseconds(ms);
+    }
+
     internal static TimeSpan ParsePositiveSeconds(string name, string? value, int defaultSeconds)
     {
         if (value is null)
@@ -564,7 +603,13 @@ public sealed record ServiceOptions
             GrantWriteBusyTimeout = ParsePositiveSeconds(
                 "GRANT_WRITE_BUSY_TIMEOUT_SECONDS", Env("GRANT_WRITE_BUSY_TIMEOUT_SECONDS"), DefaultGrantWriteBusyTimeoutSeconds),
             WriteLockWarnThreshold = ParsePositiveSeconds(
-                "WRITE_LOCK_WARN_SECONDS", Env("WRITE_LOCK_WARN_SECONDS"), DefaultWriteLockWarnSeconds)
+                "WRITE_LOCK_WARN_SECONDS", Env("WRITE_LOCK_WARN_SECONDS"), DefaultWriteLockWarnSeconds),
+            VacuumTargetHold = ParseMillis(
+                "VACUUM_TARGET_HOLD_MS", Env("VACUUM_TARGET_HOLD_MS"), 1000, 10, 60_000, zeroAllowed: false),
+            IndexBatchMaxHold = ParseMillis(
+                "INDEX_BATCH_MAX_HOLD_MS", Env("INDEX_BATCH_MAX_HOLD_MS"), DefaultIndexBatchMaxHoldMs, 100, 600_000, zeroAllowed: true),
+            IndexYieldToWaitersCap = ParseMillis(
+                "INDEX_YIELD_TO_WAITERS_MS", Env("INDEX_YIELD_TO_WAITERS_MS"), DefaultIndexYieldToWaitersMs, 10, 60_000, zeroAllowed: true)
         };
         options.ValidateCallerIdentity();
         return options;

@@ -103,6 +103,19 @@ public sealed class WriterLease : IDisposable
     private volatile bool _lost;
     private WriteLockTracker? _tracker;
 
+    /// <summary>Where a failed (busy) renewal is reported; the service log by default. Test hook.</summary>
+    internal Action<string> Warn { get; set; } = message => Console.Error.WriteLine("warn: " + message);
+
+    /// <summary>
+    /// The longest a renewal waits for the write lock: a sixth of the TTL (at least 1 s; 5 s at the 30 s TTL), so a
+    /// renewal that cannot get the lock fails and several heartbeats (one per third of the TTL) retry before the lease
+    /// expires (issue #344). Microsoft.Data.Sqlite
+    /// would otherwise re-step a busy statement for its 30 s default command timeout, past a 30 s TTL.
+    /// </summary>
+    internal TimeSpan RenewalWait => RenewalWaitFor(_ttlMs);
+
+    internal static TimeSpan RenewalWaitFor(long ttlMs) => TimeSpan.FromMilliseconds(Math.Max(1000, ttlMs / 6));
+
     public string OwnerToken { get; }
     public string Holder { get; }
 
@@ -240,7 +253,7 @@ public sealed class WriterLease : IDisposable
         {
             if (_released) return false;
             var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            var renewed = WithImmediate(_connection, _tracker, () =>
+            var renewed = WithImmediate(_connection, _tracker, RenewalWait, () =>
             {
                 using var cmd = _connection.CreateCommand();
                 cmd.CommandText = """
@@ -276,7 +289,7 @@ public sealed class WriterLease : IDisposable
             _heartbeat = null;
             try
             {
-                WithImmediate(_connection, _tracker, () =>
+                WithImmediate(_connection, _tracker, null, () =>
                 {
                     using var cmd = _connection.CreateCommand();
                     cmd.CommandText = "DELETE FROM writer_lease WHERE id = 1 AND owner_token = @token;";
@@ -331,7 +344,7 @@ public sealed class WriterLease : IDisposable
     {
         try
         {
-            WithImmediate(_connection, _tracker, () =>
+            WithImmediate(_connection, _tracker, null, () =>
             {
                 TouchRunState(_connection, OwnerToken, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), reason);
                 return true;
@@ -348,16 +361,25 @@ public sealed class WriterLease : IDisposable
         _connection.Dispose();
     }
 
-    private void SafeRenew()
+    internal void SafeRenew()
     {
         try
         {
             // Renew() itself flags a stolen lease via IsLost; a false return here needs no extra handling.
             Renew();
         }
-        catch (SqliteException)
+        catch (Exception e) when (e is SqliteException or InvalidOperationException or ObjectDisposedException)
         {
-            // A transient busy/locked heartbeat is non-fatal; the next tick retries before expiry.
+            // A busy/locked heartbeat is non-fatal and never marks the lease lost (only a 0-row update does):
+            // say so and let the next tick retry before expiry. An unhandled exception on the timer would end the process.
+            try
+            {
+                Warn($"writer lease renewal failed ({e.GetType().Name}: {e.Message}); retrying at the next heartbeat " +
+                     $"(waited at most {RenewalWait.TotalSeconds:0.#} s for the write lock).");
+            }
+            catch (Exception)
+            {
+            }
         }
     }
 
@@ -365,7 +387,7 @@ public sealed class WriterLease : IDisposable
         SqliteConnection connection, string token, string holder, long ttlMs, IProcessInspector inspector, string kind, WriteLockTracker? tracker)
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        return WithImmediate(connection, tracker, () =>
+        return WithImmediate(connection, tracker, null, () =>
         {
             var current = GetCurrent(connection);
             var previous = ReadRunState(connection);
@@ -537,7 +559,41 @@ public sealed class WriterLease : IDisposable
     // Runs a unit of work inside an explicit BEGIN IMMEDIATE/COMMIT on the coordination connection so the
     // read-then-write acquire/renew is atomic across processes (the second process blocks on the write
     // lock until the first commits). Rolls back and rethrows on failure.
-    private static T WithImmediate<T>(SqliteConnection connection, WriteLockTracker? tracker, Func<T> work)
+    // A bounded lock wait (renewal) makes the native busy handler the only waiter: busy_timeout is set to the bound and
+    // the command timeout to its minimum, so the ADO layer never re-steps a busy statement for its 30 s default.
+    private static T WithImmediate<T>(SqliteConnection connection, WriteLockTracker? tracker, TimeSpan? lockWait, Func<T> work)
+    {
+        var previousBusy = lockWait is null ? 0 : ReadBusyTimeout(connection);
+        if (lockWait is { } bound)
+            SQLitePCL.raw.sqlite3_busy_timeout(connection.Handle, (int)bound.TotalMilliseconds);
+        try
+        {
+            return WithImmediateCore(connection, tracker, lockWait is not null, work);
+        }
+        finally
+        {
+            if (lockWait is not null)
+            {
+                // Restoring the timeout must never replace the exception that is already propagating.
+                try
+                {
+                    SQLitePCL.raw.sqlite3_busy_timeout(connection.Handle, previousBusy);
+                }
+                catch (Exception)
+                {
+                }
+            }
+        }
+    }
+
+    private static int ReadBusyTimeout(SqliteConnection connection)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "PRAGMA busy_timeout;";
+        return Convert.ToInt32(cmd.ExecuteScalar());
+    }
+
+    private static T WithImmediateCore<T>(SqliteConnection connection, WriteLockTracker? tracker, bool bounded, Func<T> work)
     {
         tracker ??= WriteLockTracker.Untracked;
         var waitStarted = tracker.BeginAcquire();
@@ -545,6 +601,7 @@ public sealed class WriterLease : IDisposable
         {
             using var begin = connection.CreateCommand();
             begin.CommandText = "BEGIN IMMEDIATE;";
+            if (bounded) begin.CommandTimeout = 1;
             begin.ExecuteNonQuery();
         }
         catch

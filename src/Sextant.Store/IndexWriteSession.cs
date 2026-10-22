@@ -57,7 +57,11 @@ public sealed class IndexWriteSession : IDisposable
     /// <summary>Number of batches committed so far (auto-commits, boundary commits, and the final commit).</summary>
     public long CommittedBatches { get; private set; }
 
-    /// <summary>Opens a transaction if one is not already open. Idempotent.</summary>
+    /// <summary>
+    /// Opens a transaction if one is not already open. Idempotent. After an earlier commit it first lets any in-process
+    /// writer waiting for the lock take it (up to <see cref="IndexWriteOptions.YieldToWaitersCap"/>); SQLite's busy
+    /// handler only polls, so without this a waiter almost never wins against an immediate re-BEGIN (issue #344).
+    /// </summary>
     public void Begin()
     {
         if (_poisoned)
@@ -65,6 +69,8 @@ public sealed class IndexWriteSession : IDisposable
                 "The write session's connection is in an unknown transaction state after a failed rollback " +
                 "and must be reset before further writes.");
         if (_open) return;
+        if (CommittedBatches > 0)
+            _tracker.YieldToWaiters(_options.YieldToWaitersCap);
         var waitStarted = _tracker.BeginAcquire();
         try
         {
@@ -82,17 +88,33 @@ public sealed class IndexWriteSession : IDisposable
 
     /// <summary>
     /// Records that <paramref name="count"/> rows were written and forces a commit if the safety-net
-    /// threshold is reached, so an abnormally large unit cannot build an unbounded transaction.
+    /// threshold is reached, so an abnormally large unit cannot build an unbounded transaction. Rows are only ever
+    /// written inside the session's transaction (autocommit would be one WAL frame set per row), so calling this with
+    /// no open transaction is a bug in the caller: it must <see cref="Begin"/> before writing.
     /// </summary>
     public void RowsWritten(int count = 1)
     {
-        if (!_open || count <= 0) return;
+        if (count <= 0) return;
+        if (!_open)
+            throw new InvalidOperationException(
+                "Rows were written with no open write transaction (autocommit). Call Begin() before writing; " +
+                "Release() ends the batch and the next write must Begin() again.");
         _pendingRows += count;
         if (_options.BatchRowThreshold > 0 && _pendingRows >= _options.BatchRowThreshold)
             CommitBatch();
+        else if (HeldTooLong())
+            CommitBatch();
     }
 
-    /// <summary>Commits the current batch at a document/project boundary and immediately begins a new one.</summary>
+    // The open batch has held the write lock past MaxBatchHold (issue #344).
+    private bool HeldTooLong() =>
+        _hold is { } hold && _options.MaxBatchHold > TimeSpan.Zero && _tracker.ElapsedSince(hold.StartedAt) >= _options.MaxBatchHold;
+
+    /// <summary>
+    /// Commits the current batch and immediately begins a new one (after the yield in <see cref="Begin"/>). Only for
+    /// write-only stretches; before a compile, an extraction or a wait use <see cref="Release"/>, which leaves no
+    /// transaction (and so no write lock) open.
+    /// </summary>
     public void CommitBatch()
     {
         if (!_open) return;
@@ -105,8 +127,11 @@ public sealed class IndexWriteSession : IDisposable
         Begin();
     }
 
-    /// <summary>Commits the final batch. Does not begin a new transaction.</summary>
-    public void Complete()
+    /// <summary>
+    /// Commits the open batch, if any, WITHOUT beginning another, so no write lock is held while the caller compiles,
+    /// extracts or waits (issue #344). The next write must <see cref="Begin"/> again. Idempotent.
+    /// </summary>
+    public void Release()
     {
         if (!_open) return;
         AbortIfWriterLost();
@@ -116,6 +141,9 @@ public sealed class IndexWriteSession : IDisposable
         _pendingRows = 0;
         CommittedBatches++;
     }
+
+    /// <summary>Commits the final batch (the publish). Does not begin a new transaction.</summary>
+    public void Complete() => Release();
 
     private void EndHold()
     {

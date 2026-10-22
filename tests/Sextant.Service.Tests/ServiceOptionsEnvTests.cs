@@ -28,6 +28,26 @@ public class ServiceOptionsEnvTests
     private static SextantConfiguration Config() => new() { DbPath = ServiceTestFixtures.NewDbPath() };
 
     [TestMethod]
+    public void ServiceDefaults_ReachTheCatalogDatabase_WhileTheLibraryDefaultStaysOff()
+    {
+        Assert.AreEqual(TimeSpan.Zero, Sextant.Store.IndexWriteOptions.Default.MaxBatchHold);
+        Assert.AreEqual(TimeSpan.Zero, Sextant.Store.IndexWriteOptions.Default.YieldToWaitersCap);
+
+        var dbPath = ServiceTestFixtures.NewDbPath();
+        var dataRoot = Path.Combine(Path.GetTempPath(), $"sextant_wiring_{Guid.NewGuid():N}");
+        try
+        {
+            using var service = SnapshotService.Start(ServiceTestFixtures.NewOptions(dbPath, dataRoot));
+            Assert.AreEqual(TimeSpan.FromSeconds(2), service.WriteOptions.MaxBatchHold);
+            Assert.AreEqual(TimeSpan.FromMilliseconds(500), service.WriteOptions.YieldToWaitersCap);
+        }
+        finally
+        {
+            if (Directory.Exists(dataRoot)) Directory.Delete(dataRoot, recursive: true);
+        }
+    }
+
+    [TestMethod]
     public void PackageCacheBound_DefaultsTo10GiB_IsGivenInMiB_ZeroDisables_AndAMalformedValueFailsStartup()
     {
         // Issue #272: the bound on the per-repository package folders.
@@ -49,6 +69,45 @@ public class ServiceOptionsEnvTests
         finally
         {
             Environment.SetEnvironmentVariable(name, null);
+        }
+    }
+
+    [TestMethod]
+    public void WriteLockHoldOptions_HaveDefaults_ZeroDisablesTheBatchOnes_AndInvalidValuesFailStartup()
+    {
+        // Issue #344.
+        const string vacuum = "SEXTANT_SERVICE_VACUUM_TARGET_HOLD_MS";
+        const string hold = "SEXTANT_SERVICE_INDEX_BATCH_MAX_HOLD_MS";
+        const string yield = "SEXTANT_SERVICE_INDEX_YIELD_TO_WAITERS_MS";
+        try
+        {
+            foreach (var n in new[] { vacuum, hold, yield }) Environment.SetEnvironmentVariable(n, null);
+            var o = ServiceOptions.FromEnvironment(Config());
+            Assert.AreEqual(TimeSpan.FromSeconds(1), o.VacuumTargetHold);
+            Assert.AreEqual(TimeSpan.FromSeconds(2), o.IndexBatchMaxHold);
+            Assert.AreEqual(TimeSpan.FromMilliseconds(500), o.IndexYieldToWaitersCap);
+
+            Environment.SetEnvironmentVariable(vacuum, "250");
+            Environment.SetEnvironmentVariable(hold, "0");
+            Environment.SetEnvironmentVariable(yield, "0");
+            o = ServiceOptions.FromEnvironment(Config());
+            Assert.AreEqual(TimeSpan.FromMilliseconds(250), o.VacuumTargetHold);
+            var write = o.ApplyTo(Sextant.Store.IndexWriteOptions.Default);
+            Assert.IsTrue(write.MaxBatchHold <= TimeSpan.Zero);
+            Assert.IsTrue(write.YieldToWaitersCap <= TimeSpan.Zero);
+
+            foreach (var (name, bad) in new[] { (vacuum, "0"), (vacuum, "abc"), (hold, "5"), (hold, "-1"), (yield, "1") })
+            {
+                Environment.SetEnvironmentVariable(vacuum, null);
+                Environment.SetEnvironmentVariable(hold, null);
+                Environment.SetEnvironmentVariable(yield, null);
+                Environment.SetEnvironmentVariable(name, bad);
+                Assert.ThrowsExactly<InvalidOperationException>(() => ServiceOptions.FromEnvironment(Config()), $"{name}={bad}");
+            }
+        }
+        finally
+        {
+            foreach (var n in new[] { vacuum, hold, yield }) Environment.SetEnvironmentVariable(n, null);
         }
     }
 

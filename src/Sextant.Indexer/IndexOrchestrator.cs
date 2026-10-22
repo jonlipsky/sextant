@@ -208,7 +208,9 @@ public sealed class IndexOrchestrator
         var returnFlowStore = new ReturnFlowStore(conn);
         using var argumentFlowInsert = argumentFlowStore.CreateInsertCommand();
         using var returnFlowInsert = returnFlowStore.CreateInsertCommand();
-        session.Begin();
+        // No transaction is open yet: the git probes below run outside the write lock. Every write section Begin()s
+        // and ends with Release() (or Complete() at the publish), so the lock is held only while rows are written
+        // (issue #344).
 
         // Discover submodules from the repo root
         var submodules = new List<SubmoduleInfo>();
@@ -280,6 +282,9 @@ public sealed class IndexOrchestrator
                 "over the stable tree will publish the correct snapshot (issue #49).");
         }
 
+        // Everything from here to the end of registration writes (snapshot/project rows). The batch is released before
+        // the first compilation.
+        session.Begin();
         SnapshotStore? snapshotStore = null;
         long? repositoryId = null;
         long? commitId = null;
@@ -652,7 +657,7 @@ public sealed class IndexOrchestrator
         }
         else if (solutionMembership is { Count: > 0 })
             RecordSolutionMembership(solution, solutionMembership, projectRoslynToId, solutionStore, now);
-        session.CommitBatch();
+        session.Release();
 
         // Phase 2: Extract symbols from all projects
         StartPhase(IndexPhaseNames.ExtractingSymbols);
@@ -742,9 +747,10 @@ public sealed class IndexOrchestrator
                     budgetNotIndexed.Add(project.Id);
                     // Clear whatever an earlier generation of this identity left in the row, so the project
                     // is published empty rather than with stale content.
+                    session.Begin();
                     symbolStore.DeleteByProject(projectId);
                     fileStore.DeleteByProject(projectId);
-                    session.CommitBatch();
+                    session.Release();
                     continue;
                 }
                 symbolProjectsAdmitted++;
@@ -762,40 +768,40 @@ public sealed class IndexOrchestrator
                 ProjectCount = totalProjects
             });
 
-            // Reset this logical (per-TFM) project's contributions before re-extracting. Deleting the
-            // project's symbols cascades its relationships, its outbound call occurrences, and every
-            // inbound occurrence that targets them (target_symbol_id cascade); deleting the project's
-            // files cascades its file_versions and, through them, the pure-reference occurrences and
-            // comments located in this project's files (the outbound usages this project owns) and
-            // clears fingerprints for files deleted/renamed away since the last run. Together the two
-            // deletes clear exactly this project's owned rows — the usage-site production domain — so
-            // they are all rebuilt from scratch below.
-            symbolStore.DeleteByProject(projectId);
-            fileStore.DeleteByProject(projectId);
-
             // Issue #267: time compilation apart from the symbol walk. The compilation is held until the walk ends,
             // so the extractor's own GetCompilationAsync returns this one rather than building it again.
             var projectWatch = Stopwatch.StartNew();
             Compilation? timedCompilation = null;
             long walkStartedMs = 0, walkEndedMs = 0;
-            if (metrics != null)
-            {
-                walkStartedMs = prefetch.NowMs;
-                timedCompilation = await project.GetCompilationAsync(cancellationToken);
-                walkEndedMs = prefetch.NowMs;
-            }
+            if (metrics != null) walkStartedMs = prefetch.NowMs;
+            timedCompilation = await project.GetCompilationAsync(cancellationToken);
+            if (metrics != null) walkEndedMs = prefetch.NowMs;
             var compileMs = projectWatch.ElapsedMilliseconds;
 
             var (symbols, compilationAvailable) = await SymbolExtractor.ExtractFromProjectWithStatusAsync(
                 project, projectId, includeDocComments: _profile.Has(IndexFeature.DocumentationSearch),
                 maxParallelism: _parallelism.MaxParallelism, cancellationToken: cancellationToken);
-            GC.KeepAlive(timedCompilation);
             var analyzedAt = projectWatch.ElapsedMilliseconds;
             if (!compilationAvailable)
             {
                 compilationFailures++;
                 _log?.Invoke($"    WARNING: {project.Name} produced no compilation; generation will be marked partial.");
             }
+
+            // Compiling and walking the project take no write lock: the batch opens only now, so the lock is held for the
+            // delete and the inserts alone (issue #344). Reset this logical (per-TFM) project's contributions before
+            // inserting the fresh ones. Deleting the
+            // project's symbols cascades its relationships, its outbound call occurrences, and every
+            // inbound occurrence that targets them (target_symbol_id cascade); deleting the project's
+            // files cascades its file_versions and, through them, the pure-reference occurrences and
+            // comments located in this project's files (the outbound usages this project owns) and
+            // clears fingerprints for files deleted/renamed away since the last run. Together the two
+            // deletes clear exactly this project's owned rows — the usage-site production domain — so
+            // they are all rebuilt from scratch below. The delete also drops the analyzed-hash captures,
+            // so the capture below runs after it.
+            session.Begin();
+            symbolStore.DeleteByProject(projectId);
+            fileStore.DeleteByProject(projectId);
 
             // Issue #35 (TOCTOU): capture each analyzed on-disk source file's raw-disk hash NOW, before
             // any symbol/occurrence resolves its file_version row, so the persisted content hash is the
@@ -817,10 +823,11 @@ public sealed class IndexOrchestrator
             // Fingerprint every indexed (non-generated, on-disk) file so an unchanged daemon restart
             // short-circuits to zero work, and record the project's evaluation fingerprint so a later
             // catch-up can detect config/props/global.json/assets changes.
-            await SeedFileIndexAsync(project, projectId, fileStore, session, now, cancellationToken);
+            SeedFileIndex(timedCompilation, projectId, fileStore, session, now);
+            GC.KeepAlive(timedCompilation);
             projectStore.SetEvaluationFingerprint(projectId, EvaluationFingerprint.Compute(project.FilePath, repoRoot));
 
-            session.CommitBatch();
+            session.Release();
 
             var compileWindow = metrics != null
                 ? prefetch.CompileWindow(project.Id, reachedAtMs, walkStartedMs, walkEndedMs)
@@ -978,6 +985,9 @@ public sealed class IndexOrchestrator
                 long ownerProjectId = project.OwnerProjectId;
                 var contributions = project.Contributions;
                 long candidateOccurrences = 0;
+                // The consumer idles on the channel between projects with no transaction open; each project's rows are
+                // one batch, released below (issue #344).
+                session.Begin();
 
                 foreach (var rel in contributions.Relationships)
                 {
@@ -1087,7 +1097,7 @@ public sealed class IndexOrchestrator
                 // Honour cancellation before publishing this project's batch so a mid-run cancel drops
                 // the uncommitted rows (rolled back on session dispose) instead of committing them.
                 persistToken.ThrowIfCancellationRequested();
-                session.CommitBatch();
+                session.Release();
                 // Issue #267: compile and analyze ran on the producer (overlapping earlier projects' persistence);
                 // persistence is this consumer's time for the project.
                 metrics?.RecordProject(new ProjectTiming
@@ -1160,6 +1170,7 @@ public sealed class IndexOrchestrator
                             if (catalog.TryResolveEdge(fromKey, relProjectId, out var fromId) &&
                                 catalog.TryResolveEdge(toKey, relProjectId, out var toId))
                             {
+                                session.Begin();
                                 relationshipStore.Insert(relationshipInsert, new RelationshipInfo
                                 {
                                     FromSymbolId = fromId,
@@ -1173,7 +1184,7 @@ public sealed class IndexOrchestrator
                     }
                 }
             }
-            session.CommitBatch();
+            session.Release();
         }
 
         // Phase 4: Extract references
@@ -1235,6 +1246,7 @@ public sealed class IndexOrchestrator
 
                     foreach (var refInfo in refs)
                     {
+                        session.Begin();
                         referenceStore.Insert(referenceInsert, refInfo);
                         session.RowsWritten();
                     }
@@ -1242,7 +1254,7 @@ public sealed class IndexOrchestrator
             }
 
             _log?.Invoke($"  {project.Name}: references extracted");
-            session.CommitBatch();
+            session.Release();
         }
         }
 
@@ -1278,6 +1290,7 @@ public sealed class IndexOrchestrator
             // file_version, and the project's file_versions were deleted there). Re-clear defensively
             // so a comment-only re-run still drops stale rows (files deleted/renamed away) before
             // re-extract; it is project-scoped (file_version → file → project_id), never cross-project.
+            session.Begin();
             commentStore.DeleteByProject(commentProjectId);
 
             foreach (var syntaxTree in compilation.SyntaxTrees)
@@ -1297,7 +1310,7 @@ public sealed class IndexOrchestrator
             }
 
             _log?.Invoke($"  {project.Name}: comments extracted");
-            session.CommitBatch();
+            session.Release();
         }
         }
 
@@ -1357,6 +1370,7 @@ public sealed class IndexOrchestrator
                     {
                         if (catalog.TryResolveEdge(edge.CalleeKey, callProjectId, out var calleeSymbolId))
                         {
+                            session.Begin();
                             var edgeId = callGraphStore.Insert(callGraphInsert, new CallGraphEdge
                             {
                                 CallerSymbolId = callerSymbolId,
@@ -1394,7 +1408,7 @@ public sealed class IndexOrchestrator
             }
 
             _log?.Invoke($"  {project.Name}: call graph extracted");
-            session.CommitBatch();
+            session.Release();
         }
         }
 
@@ -1423,6 +1437,7 @@ public sealed class IndexOrchestrator
                 if (processSet.Contains(project.Id) && projectRoslynToId.TryGetValue(project.Id, out var procId))
                     processedProjectIds.Add(procId);
 
+            session.Begin();
             foreach (var pid in processedProjectIds)
                 dependencyStore.DeleteByConsumer(pid);
             foreach (var dep in deps)
@@ -1473,7 +1488,7 @@ public sealed class IndexOrchestrator
                 }
             }
 
-            session.CommitBatch();
+            session.Release();
         }
 
         // Phase 7: Capture API surface snapshots for projects with inbound dependencies
@@ -1509,6 +1524,7 @@ public sealed class IndexOrchestrator
                 }
             }
 
+            session.Begin();
             foreach (var pid in rebuiltProjectIds)
                 apiSurfaceStore.DeleteByProjectAndCommit(pid, gitCommit);
 
@@ -1535,6 +1551,8 @@ public sealed class IndexOrchestrator
             }
             _log?.Invoke($"  API surface captured for {projectsWithConsumers.Count} project(s)");
         }
+        // The pinned-state re-verification below runs git; it must not hold the write lock.
+        session.Release();
 
         FinishPhase();
 
@@ -1572,6 +1590,8 @@ public sealed class IndexOrchestrator
         // or this one — never a "complete" pointer without its committed data. If the guarded update
         // publishes no row (e.g. recovery abandoned this run under an unsupported second writer), abort
         // before committing so disposal rolls back the final batch and leaves the ledger consistent.
+        // The publish is ONE transaction: it opens here, after the git re-verification, and only Complete() commits it.
+        session.Begin();
         var completedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
         // Completeness gate (criterion 3): if any processed project failed to produce a compilation, this
@@ -1748,15 +1768,13 @@ public sealed class IndexOrchestrator
     /// per-file baseline to diff against. Files that are not present on disk (e.g. an in-memory
     /// ad-hoc workspace used in tests) are skipped — no stable content hash can be taken for them.
     /// </summary>
-    private static async Task SeedFileIndexAsync(
-        Project project,
+    private static void SeedFileIndex(
+        Compilation? compilation,
         long projectId,
         FileStore fileStore,
         IndexWriteSession session,
-        long now,
-        CancellationToken cancellationToken)
+        long now)
     {
-        var compilation = await project.GetCompilationAsync(cancellationToken);
         if (compilation == null) return;
 
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
