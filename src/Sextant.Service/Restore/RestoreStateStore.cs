@@ -14,7 +14,10 @@ public sealed record RestoreReuse(string StateDirectory, string PackagesDirector
 /// <summary>What the restore-state cache did for one job (issue #272).</summary>
 public sealed record RestoreReuseOutcome
 {
-    /// <summary><c>reused</c> (restore skipped, assets replayed), <c>miss</c> (restore ran) or <c>unavailable</c> (could not decide).</summary>
+    /// <summary>
+    /// <c>reused</c> (restore skipped, assets replayed), <c>partial</c> (the clean projects' assets replayed, the rest restored,
+    /// issue #349), <c>miss</c> (restore ran) or <c>unavailable</c> (could not decide).
+    /// </summary>
     public required string Decision { get; init; }
 
     /// <summary>
@@ -25,6 +28,9 @@ public sealed record RestoreReuseOutcome
 
     /// <summary>Projects whose assets files the state holds (replayed on a reuse, saved after a miss).</summary>
     public int Projects { get; init; }
+
+    /// <summary>Declared projects a <c>partial</c> state held nothing for, so they were restored (or, after a miss, were left out of the saved state).</summary>
+    public int ProjectsRemaining { get; init; }
 
     /// <summary>Files written into the checkout on a reuse.</summary>
     public int FilesWritten { get; init; }
@@ -74,8 +80,11 @@ public sealed record RestoreReuseOutcome
 /// </summary>
 internal static class RestoreStateStore
 {
-    internal const string FormatVersion = "2";
+    internal const string FormatVersion = "4";
     internal const string ManifestName = "state.json";
+    internal const string MemoName = "restore-memo.json";
+    private const long MaxMemoBytes = 1024 * 1024;
+    private const int MaxMemoEntries = 256;
     private const string CurrentName = "current";
     private const string FilesName = "files";
     private const string GitName = ".git";
@@ -85,6 +94,9 @@ internal static class RestoreStateStore
 
     private static readonly StringComparison PathComparison =
         OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+
+    private static readonly StringComparer PathComparer =
+        OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
 
     private static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
 
@@ -144,7 +156,111 @@ internal static class RestoreStateStore
         public string Fingerprint { get; set; } = string.Empty;
         public int Projects { get; set; }
         public List<string> Files { get; set; } = [];
+
+        // Checkout-relative project files whose assets the state holds, and the declared projects it does not
+        // (they restored with errors, or not at all): a replay writes the first and a restore does the second (issue #349).
+        public List<string> ProjectPaths { get; set; } = [];
+        public List<string> Remaining { get; set; } = [];
+
+        // Per replayed project (checkout-relative): the assets and cache files it owns, verified again after a replay.
+        public Dictionary<string, ProjectOutput> Outputs { get; set; } = new(StringComparer.Ordinal);
     }
+
+    private sealed class ProjectOutput
+    {
+        public string Assets { get; set; } = string.Empty;
+        public string Cache { get; set; } = string.Empty;
+    }
+
+    /// <summary>The result of <see cref="TryReplay"/>: a miss reason, or the projects replayed and the ones still to restore.</summary>
+    internal sealed record ReplayDecision(string? MissReason, int Projects, int FilesWritten)
+    {
+        /// <summary>Full paths of the project files whose saved assets were written back.</summary>
+        public IReadOnlyList<string> Replayed { get; init; } = [];
+
+        /// <summary>Full paths of the declared projects the state holds nothing for (a partial state); empty for a complete one.</summary>
+        public IReadOnlyList<string> Remaining { get; init; } = [];
+    }
+
+    private sealed class Memo
+    {
+        public string Version { get; set; } = string.Empty;
+        public string Fingerprint { get; set; } = string.Empty;
+        public List<string> StaticGraphFailed { get; set; } = [];
+    }
+
+    /// <summary>
+    /// The checkout-relative solutions whose static-graph restore failed as a whole under exactly this fingerprint
+    /// (issue #349); empty when nothing is remembered, the memo is for other inputs, or it cannot be read.
+    /// </summary>
+    internal static HashSet<string> LoadStaticGraphFailures(RestoreReuse reuse, string fingerprint)
+    {
+        var result = new HashSet<string>(StringComparer.Ordinal);
+        try
+        {
+            var path = Path.Combine(reuse.StateDirectory, MemoName);
+            if (!File.Exists(path) || new FileInfo(path).Length > MaxMemoBytes)
+                return result;
+            var memo = JsonSerializer.Deserialize<Memo>(File.ReadAllText(path), Json);
+            if (memo is null || memo.Version != FormatVersion || !string.Equals(memo.Fingerprint, fingerprint, StringComparison.Ordinal))
+                return result;
+            foreach (var solution in memo.StaticGraphFailed.Take(MaxMemoEntries))
+                result.Add(solution);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        {
+            result.Clear();
+        }
+        return result;
+    }
+
+    /// <summary>Remembers <paramref name="solutions"/> (checkout-relative) as static-graph failures under <paramref name="fingerprint"/>. Never throws.</summary>
+    internal static void SaveStaticGraphFailures(RestoreReuse reuse, string fingerprint, IReadOnlySet<string> solutions, Action<string>? log)
+    {
+        string? temp = null;
+        try
+        {
+            var merged = LoadStaticGraphFailures(reuse, fingerprint);
+            merged.UnionWith(solutions);
+            Directory.CreateDirectory(reuse.StateDirectory);
+            var memo = new Memo { Version = FormatVersion, Fingerprint = fingerprint, StaticGraphFailed = [.. merged.Order(StringComparer.Ordinal).Take(MaxMemoEntries)] };
+            SweepStaleMemoTemps(reuse.StateDirectory);
+            temp = Path.Combine(reuse.StateDirectory, $".memo-{Guid.NewGuid():N}.tmp");
+            File.WriteAllText(temp, JsonSerializer.Serialize(memo, Json));
+            File.Move(temp, Path.Combine(reuse.StateDirectory, MemoName), overwrite: true);
+            temp = null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        {
+            log?.Invoke($"package restore memo could not be saved: {ex.GetType().Name}.");
+        }
+        finally
+        {
+            if (temp is not null)
+                try { File.Delete(temp); } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { /* left behind */ }
+        }
+    }
+
+    // A crash between the write and the move leaves a temp file behind; remove the ones older than an hour.
+    private static void SweepStaleMemoTemps(string directory)
+    {
+        try
+        {
+            var cutoff = DateTime.UtcNow.AddHours(-1);
+            foreach (var file in Directory.EnumerateFiles(directory, ".memo-*.tmp", SearchOption.TopDirectoryOnly))
+            {
+                if (File.GetLastWriteTimeUtc(file) < cutoff)
+                    File.Delete(file);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Best effort.
+        }
+    }
+
+    /// <summary>The result of <see cref="Save"/>.</summary>
+    internal sealed record SaveResult(int Saved, int Remaining);
 
     /// <summary>
     /// Hashes every restore input under <paramref name="checkoutDir"/> together with <paramref name="context"/> (the
@@ -452,8 +568,8 @@ internal static class RestoreStateStore
     /// saved assets file names is present. Writes are staged (a temp file per target, then renamed); any failure removes
     /// what was written. Null reason = replayed.
     /// </summary>
-    internal static (string? MissReason, int Projects, int FilesWritten) TryReplay(
-        RestoreReuse reuse, string checkoutDir, Inputs inputs, Action<string>? log)
+    internal static ReplayDecision TryReplay(
+        RestoreReuse reuse, string checkoutDir, Inputs inputs, Action<string>? log, IReadOnlyList<string>? solutions = null)
     {
         var temps = new List<string>();
         var renamed = new List<string>();
@@ -461,16 +577,16 @@ internal static class RestoreStateStore
         try
         {
             if (inputs.Refusal is not null)
-                return (inputs.Refusal, 0, 0);
+                return new ReplayDecision(inputs.Refusal, 0, 0);
             var current = Path.Combine(reuse.StateDirectory, CurrentName);
             var manifestPath = Path.Combine(current, ManifestName);
             if (!File.Exists(manifestPath))
-                return ("no_state", 0, 0);
+                return new ReplayDecision("no_state", 0, 0);
             var manifest = JsonSerializer.Deserialize<Manifest>(File.ReadAllText(manifestPath), Json);
             if (manifest is null || manifest.Version != FormatVersion || manifest.Files.Count == 0)
-                return ("no_state", 0, 0);
+                return new ReplayDecision("no_state", 0, 0);
             if (!string.Equals(manifest.Fingerprint, inputs.Fingerprint, StringComparison.Ordinal))
-                return ("inputs_changed", 0, 0);
+                return new ReplayDecision("inputs_changed", 0, 0);
 
             var root = TrimRoot(Path.GetFullPath(checkoutDir));
             var filesRoot = Path.Combine(current, FilesName);
@@ -480,37 +596,75 @@ internal static class RestoreStateStore
                 var target = ConfinedTarget(root, relative);
                 var blob = Path.Combine(filesRoot, relative.Replace('/', Path.DirectorySeparatorChar));
                 if (target is null || !File.Exists(blob))
-                    return ("state_unreadable", 0, 0);
+                    return new ReplayDecision("state_unreadable", 0, 0);
                 plan.Add((relative, blob, target));
+            }
+
+            var replayed = new List<string>();
+            foreach (var project in manifest.ProjectPaths)
+            {
+                if (ConfinedTarget(root, project) is not { } full)
+                    return new ReplayDecision("state_unreadable", 0, 0);
+                replayed.Add(full);
+            }
+            var remaining = new List<string>();
+            foreach (var project in manifest.Remaining)
+            {
+                if (ConfinedTarget(root, project) is not { } full)
+                    return new ReplayDecision("state_unreadable", 0, 0);
+                remaining.Add(full);
+            }
+            if (replayed.Count != manifest.Projects || replayed.Distinct(PathComparer).Count() != replayed.Count
+                || replayed.Intersect(remaining, PathComparer).Any())
+                return new ReplayDecision("state_unreadable", 0, 0);
+            if (solutions is not null)
+            {
+                var declared = solutions.SelectMany(SolutionProjectEnumerator.Enumerate).Select(Path.GetFullPath)
+                    .ToHashSet(PathComparer);
+                if (replayed.Concat(remaining).Any(project => !declared.Contains(project)))
+                    return new ReplayDecision("state_unreadable", 0, 0);
+            }
+
+            var verify = new List<string>();
+            foreach (var project in manifest.ProjectPaths)
+            {
+                if (!manifest.Outputs.TryGetValue(project, out var output)
+                    || ConfinedTarget(root, output.Assets) is not { } assetsFile
+                    || ConfinedTarget(root, output.Cache) is not { } cacheFile
+                    || !plan.Any(p => p.Target.Equals(assetsFile, PathComparison))
+                    || !plan.Any(p => p.Target.Equals(cacheFile, PathComparison)))
+                    return new ReplayDecision("state_unreadable", 0, 0);
+                verify.Add(assetsFile);
+                verify.Add(cacheFile);
             }
 
             // Every saved project needs its assets and its cache; no project, no state.
             var assets = plan.Where(p => Path.GetFileName(p.Target).Equals(AssetsName, StringComparison.OrdinalIgnoreCase)).ToList();
             if (assets.Count == 0 || assets.Count != manifest.Projects)
-                return ("state_unreadable", 0, 0);
+                return new ReplayDecision("state_unreadable", 0, 0);
             if (assets.Any(a => !plan.Any(p => p.Target.Equals(Path.Combine(Path.GetDirectoryName(a.Target)!, CacheName), PathComparison))))
-                return ("state_unreadable", 0, 0);
+                return new ReplayDecision("state_unreadable", 0, 0);
 
             // A checkout that already holds restore output (a reused one) is restored in full: a replay only ever goes
             // into a clean obj state, so it never mixes with files an earlier restore left.
             if (inputs.ExistingOutputs.Count > 0)
-                return ("checkout_not_clean", 0, 0);
+                return new ReplayDecision("checkout_not_clean", 0, 0);
 
             foreach (var item in plan)
             {
                 if (HasLinkBetween(root, item.Target))
-                    return ("link_in_checkout", 0, 0);
+                    return new ReplayDecision("link_in_checkout", 0, 0);
             }
 
             foreach (var (_, blob, _) in plan.Where(p => Path.GetFileName(p.Target).Equals(AssetsName, StringComparison.OrdinalIgnoreCase)))
             {
                 if (!PackagesPresent(blob))
-                    return ("packages_missing", 0, 0);
+                    return new ReplayDecision("packages_missing", 0, 0);
             }
             foreach (var (_, blob, _) in plan.Where(p => Path.GetFileName(p.Target).Equals(CacheName, StringComparison.OrdinalIgnoreCase)))
             {
                 if (!ExpectedPackageFilesPresent(blob))
-                    return ("packages_missing", 0, 0);
+                    return new ReplayDecision("packages_missing", 0, 0);
             }
 
             foreach (var (_, blob, target) in plan)
@@ -526,14 +680,23 @@ internal static class RestoreStateStore
                 File.Move(temps[i], plan[i].Target, overwrite: true);
                 renamed.Add(plan[i].Target);
             }
-            return (null, manifest.Projects, plan.Count);
+            if (verify.Any(file => !File.Exists(file)))
+            {
+                Rollback(temps, renamed, createdDirectories);
+                return new ReplayDecision("replay_failed", 0, 0);
+            }
+            return new ReplayDecision(null, manifest.Projects, plan.Count)
+            {
+                Replayed = replayed,
+                Remaining = remaining
+            };
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
         {
             var written = renamed.Count > 0 || temps.Count > 0 || createdDirectories.Count > 0;
             Rollback(temps, renamed, createdDirectories);
             log?.Invoke($"package restore state could not be replayed: {ex.GetType().Name}.");
-            return (written ? "replay_failed" : "state_unreadable", 0, 0);
+            return new ReplayDecision(written ? "replay_failed" : "state_unreadable", 0, 0);
         }
     }
 
@@ -641,11 +804,15 @@ internal static class RestoreStateStore
     /// Saves the restore result of <paramref name="checkoutDir"/> as the repository's state. Every project the
     /// <paramref name="solutions"/> declare must have an assets file (located through its own
     /// <c>project.restore.outputPath</c>, wherever the restore wrote it) next to a <c>project.nuget.cache</c>; the
-    /// checkout must have held no restore output before the restore. Returns the number of projects saved, or null
-    /// (with <paramref name="skipReason"/>) when nothing was saved. Never throws.
+    /// checkout must have held no restore output before the restore. With <paramref name="partial"/> (issue #349) a
+    /// declared project that did not restore cleanly (named in <paramref name="failed"/>, no assets or cache, a cache
+    /// that records failure, or an error in its assets log) is left out and listed as remaining, so a replay writes only
+    /// the clean ones and a restore redoes the rest; nothing about a failing project is ever saved. Returns the number
+    /// of projects saved and left out, or null (with <paramref name="skipReason"/>) when nothing was saved. Never throws.
     /// </summary>
-    internal static int? Save(
-        RestoreReuse reuse, string checkoutDir, Inputs inputs, IReadOnlyList<string> solutions, Action<string>? log, out string? skipReason)
+    internal static SaveResult? Save(
+        RestoreReuse reuse, string checkoutDir, Inputs inputs, IReadOnlyList<string> solutions, Action<string>? log, out string? skipReason,
+        bool partial = false, IReadOnlySet<string>? failed = null)
     {
         skipReason = null;
         string? temp = null;
@@ -683,19 +850,35 @@ internal static class RestoreStateStore
                     return null;
                 }
             }
+            var saved = new Dictionary<string, string>(StringComparer.Ordinal);
+            var remaining = new List<string>();
             foreach (var project in declared)
             {
-                if (!located.TryGetValue(project, out var assets)
-                    || !File.Exists(Path.Combine(Path.GetDirectoryName(assets)!, CacheName)))
+                var hasState = located.TryGetValue(project, out var assets)
+                    && File.Exists(Path.Combine(Path.GetDirectoryName(assets)!, CacheName));
+                if (!partial)
                 {
-                    skipReason = "incomplete";
-                    return null;
+                    if (!hasState)
+                    {
+                        skipReason = "incomplete";
+                        return null;
+                    }
+                    saved[project] = assets!;
                 }
+                else if (hasState && failed?.Contains(project) != true && RestoredCleanly(assets!))
+                    saved[project] = assets!;
+                else
+                    remaining.Add(project);
+            }
+            if (saved.Count == 0)
+            {
+                skipReason = "no_clean_projects";
+                return null;
             }
 
             var files = new List<string>();
             long bytes = 0;
-            foreach (var assets in located.Values)
+            foreach (var assets in saved.Values)
             {
                 foreach (var file in Directory.EnumerateFiles(Path.GetDirectoryName(assets)!, "*", SearchOption.TopDirectoryOnly))
                 {
@@ -720,7 +903,15 @@ internal static class RestoreStateStore
             Directory.CreateDirectory(reuse.StateDirectory);
             temp = Path.Combine(reuse.StateDirectory, $".saving-{Guid.NewGuid():N}");
             var filesRoot = Path.Combine(temp, FilesName);
-            var manifest = new Manifest { Version = FormatVersion, Fingerprint = inputs.Fingerprint, Projects = located.Count };
+            var manifest = new Manifest { Version = FormatVersion, Fingerprint = inputs.Fingerprint, Projects = saved.Count };
+            manifest.ProjectPaths.AddRange(saved.Keys.Select(k => Relative(root, k)).Order(StringComparer.Ordinal));
+            foreach (var (project, assetsFile) in saved)
+                manifest.Outputs[Relative(root, project)] = new ProjectOutput
+                {
+                    Assets = Relative(root, assetsFile),
+                    Cache = Relative(root, Path.Combine(Path.GetDirectoryName(assetsFile)!, CacheName))
+                };
+            manifest.Remaining.AddRange(remaining.Select(k => Relative(root, k)).Order(StringComparer.Ordinal));
             foreach (var file in files.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal))
             {
                 var relative = Relative(root, file);
@@ -745,7 +936,7 @@ internal static class RestoreStateStore
                 Directory.Move(temp, current);
                 temp = null;
             }
-            return located.Count;
+            return new SaveResult(saved.Count, remaining.Count);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
         {
@@ -757,6 +948,36 @@ internal static class RestoreStateStore
         {
             if (temp is not null)
                 TryDelete(temp);
+        }
+    }
+
+    // A project restored cleanly when its cache does not record failure and its assets log holds no error
+    // (a failed restore still writes both, with the error in them).
+    private static bool RestoredCleanly(string assets)
+    {
+        try
+        {
+            var cache = Path.Combine(Path.GetDirectoryName(assets)!, CacheName);
+            using (var document = JsonDocument.Parse(File.ReadAllText(cache)))
+            {
+                if (document.RootElement.TryGetProperty("success", out var success) && success.ValueKind == JsonValueKind.False)
+                    return false;
+            }
+            using var assetsDocument = JsonDocument.Parse(File.ReadAllText(assets));
+            if (assetsDocument.RootElement.TryGetProperty("logs", out var logs) && logs.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var entry in logs.EnumerateArray())
+                {
+                    if (entry.TryGetProperty("level", out var level)
+                        && string.Equals(level.GetString(), "Error", StringComparison.OrdinalIgnoreCase))
+                        return false;
+                }
+            }
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        {
+            return false;
         }
     }
 

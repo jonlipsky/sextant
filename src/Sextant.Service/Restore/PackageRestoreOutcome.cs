@@ -45,6 +45,19 @@ public sealed record PackageRestoreProjectIssue
     /// <summary>A configured package source could not be reached while restoring the project.</summary>
     public bool SourceUnreachable { get; init; }
 
+    /// <summary>The first message of each code, sanitized (no URL, no checkout path, at most <see cref="RestoreErrorClassifier.MaxMessageLength"/> characters), keyed by code (issue #349).</summary>
+    public IReadOnlyDictionary<string, string> Messages { get; init; } = new Dictionary<string, string>();
+
+    /// <summary>A message of this project's errors reads like a network or server failure (issue #349).</summary>
+    public bool TransientMessage { get; init; }
+
+    /// <summary>
+    /// True when the same restore inputs fail the same way every time (issue #349): every code is a deterministic one
+    /// (<see cref="RestoreErrorClassifier.IsDeterministicCode"/>), no source was unreachable and no message reads like a
+    /// network failure. A project with no recognised code is not deterministic.
+    /// </summary>
+    public bool Deterministic => Codes.Count > 0 && !SourceUnreachable && !TransientMessage && Codes.All(RestoreErrorClassifier.IsDeterministicCode);
+
     /// <summary>A one-line description for <see cref="Sextant.Core.ProjectBindingHealth.LoadIssue"/>.</summary>
     public string Describe()
     {
@@ -132,6 +145,57 @@ public sealed record PackageRestoreOutcome
     /// <summary>File names of the solutions counted in <see cref="SolutionsPartiallySkipped"/>.</summary>
     public IReadOnlyList<string> PartiallySkippedSolutionNames { get; init; } = [];
 
+    /// <summary>Per-solution passes that did not try static-graph evaluation because the restore state remembers it failing for this solution and fingerprint (issue #349).</summary>
+    public int StaticGraphSkippedByMemo { get; init; }
+
+    /// <summary>Selected solutions not restored (or restored only for their remaining projects) because the replayed state already covers their projects (issue #349).</summary>
+    public int SolutionsCoveredByReplay { get; init; }
+
+    /// <summary>
+    /// The restore error codes of this job, most affected projects first, at most <paramref name="max"/> (issue #349).
+    /// <see cref="RestoreErrorSummary.Deterministic"/> is true only when every project that reported the code is deterministic.
+    /// </summary>
+    public IReadOnlyList<RestoreErrorSummary> ErrorCodes(int max = 8)
+    {
+        var byCode = new Dictionary<string, (int Projects, bool Deterministic, string? Message)>(StringComparer.Ordinal);
+        foreach (var project in Projects)
+        {
+            foreach (var code in project.Codes)
+            {
+                project.Messages.TryGetValue(code, out var message);
+                byCode[code] = byCode.TryGetValue(code, out var seen)
+                    ? (seen.Projects + 1, seen.Deterministic && project.Deterministic, seen.Message ?? message)
+                    : (1, project.Deterministic, message);
+            }
+        }
+        foreach (var code in GeneralCodes)
+            if (!byCode.ContainsKey(code))
+                byCode[code] = (0, false, null);
+        return [.. byCode
+            .OrderByDescending(e => e.Value.Projects).ThenBy(e => e.Key, StringComparer.Ordinal)
+            .Take(max)
+            .Select(e => new RestoreErrorSummary(e.Key, e.Value.Projects, e.Value.Deterministic, e.Value.Message))];
+    }
+
+    /// <summary>True when any project's failure is not provably deterministic (transient, an unreachable source, or an unrecognised code), so it must never be cached as failing.</summary>
+    public bool HasNonDeterministicFailure => Projects.Any(p => !p.Deterministic) || GeneralCodes.Count > 0 || SourceUnreachableGeneral;
+
+    /// <summary>One Information line: the top restore error codes with counts (issue #349); null when none were reported.</summary>
+    public string? ErrorSummaryLine(int max = 8)
+    {
+        var codes = ErrorCodes(max);
+        if (codes.Count == 0)
+            return null;
+        var text = new System.Text.StringBuilder("package restore errors: ")
+            .Append(Projects.Count).Append(" project(s) failed");
+        if (HasNonDeterministicFailure)
+            text.Append(" (not provably deterministic: never cached as failing)");
+        text.Append("; ");
+        text.Append(string.Join("; ", codes.Select(c =>
+            $"{c.Code} x{c.Projects}{(c.Deterministic ? string.Empty : " transient_or_unknown")}{(string.IsNullOrEmpty(c.Message) ? string.Empty : ": " + c.Message)}")));
+        return text.Append('.').ToString();
+    }
+
     /// <summary>Every restore process this job ran, in order (issue #272): where the restore time went.</summary>
     public IReadOnlyList<RestorePassTiming> Passes { get; init; } = [];
 
@@ -150,6 +214,11 @@ public sealed record PackageRestoreOutcome
             .Append(" wall_ms=").Append((long)Elapsed.TotalMilliseconds)
             .Append(" timed_out=").Append(TimedOut ? "true" : "false")
             .Append(" passes=").Append(Passes.Count);
+        if (StaticGraphSkippedByMemo > 0)
+            text.Append(" static_graph_skipped_by_memo=").Append(StaticGraphSkippedByMemo);
+        if (Projects.Count > 0)
+            text.Append(" projects_failed=").Append(Projects.Count)
+                .Append(" error_codes=").Append(string.Join(',', ErrorCodes(5).Select(c => c.Code + "x" + c.Projects)));
         if (Reuse is { } reuse)
         {
             text.Append(" cache=").Append(reuse.Decision);
@@ -158,8 +227,10 @@ public sealed record PackageRestoreOutcome
             text.Append(" cache_projects=").Append(reuse.Projects)
                 .Append(" fingerprint_ms=").Append(reuse.FingerprintMs)
                 .Append(" state_ms=").Append(reuse.StateMs);
+            if (reuse.ProjectsRemaining > 0)
+                text.Append(" cache_projects_remaining=").Append(reuse.ProjectsRemaining);
             if (reuse.Saved)
-                text.Append(" saved=true");
+                text.Append(reuse.ProjectsRemaining > 0 ? " saved=partial" : " saved=true");
             else if (reuse.SaveSkipped is not null)
                 text.Append(" save_skipped=").Append(reuse.SaveSkipped);
         }
@@ -313,3 +384,6 @@ public sealed record PackageRestoreOutcome
             ? string.Join(", ", values)
             : string.Join(", ", values.Take(cap)) + $", +{values.Count - cap} more";
 }
+
+/// <summary>One restore error code of a job (issue #349): how many projects reported it, whether it reproduces for the same inputs, and a sanitized sample message.</summary>
+public sealed record RestoreErrorSummary(string Code, int Projects, bool Deterministic, string? Message);
