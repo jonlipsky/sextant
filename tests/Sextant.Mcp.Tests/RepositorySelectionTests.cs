@@ -402,6 +402,77 @@ public class RepositorySelectionTests
     }
 
     [TestMethod]
+    public void ProbeWithin_APastBudget_AbandonsInference_AndACancelledCallerStillThrows()
+    {
+        using var provider = new DatabaseProvider(_dbPath, new AllowingEnforcingAuthorizer());
+        var clock = new ManualClock();
+        var probed = 0;
+        Func<IndexDatabase, FederatedReadContext, int?> probe = (_, _) =>
+        {
+            probed++;
+            clock.Advance(TimeSpan.FromMilliseconds(60));
+            return RepositoryInference.ExactRank;
+        };
+
+        var late = RepositoryInference.ProbeWithin(
+            provider, [RepoA, RepoB], probe, TimeSpan.FromMilliseconds(20), default, clock);
+        Assert.IsNull(late, "the budget ran out after the first repository");
+        Assert.AreEqual(1, probed);
+
+        var inTime = RepositoryInference.ProbeWithin(
+            provider, [RepoA, RepoB], probe, TimeSpan.FromSeconds(30), default, clock);
+        Assert.AreEqual(2, inTime!.Count);
+
+        using var cancelled = new CancellationTokenSource(0);
+        Assert.ThrowsExactly<OperationCanceledException>(() =>
+            RepositoryInference.ProbeWithin(provider, [RepoA, RepoB], probe, TimeSpan.FromSeconds(30), cancelled.Token, clock));
+    }
+
+    [TestMethod]
+    [DataRow("...")]
+    [DataRow("global::")]
+    public void ProbeFor_AFuzzyNameWithNoSafeQuery_IsNotProbed(string name)
+    {
+        var arguments = new Dictionary<string, JsonElement>
+        {
+            ["name"] = JsonDocument.Parse(JsonSerializer.Serialize(name)).RootElement,
+            ["fuzzy"] = JsonDocument.Parse("true").RootElement
+        };
+
+        Assert.IsNull(RepositoryInference.ProbeFor("find_symbol", arguments));
+    }
+
+    [TestMethod]
+    public void ProbeWithin_ASlowRunningQuery_IsInterruptedAtTheBudget()
+    {
+        using var provider = new DatabaseProvider(_dbPath, new AllowingEnforcingAuthorizer());
+        var probed = 0;
+        // Minutes of work on its own: only an interrupt can end it within the budget.
+        Func<IndexDatabase, FederatedReadContext, int?> slow = (db, _) =>
+        {
+            probed++;
+            using var conn = db.OpenReadConnection();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText =
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 3000000000) SELECT count(*) FROM c;";
+            cmd.ExecuteScalar();
+            return RepositoryInference.ExactRank;
+        };
+
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        var result = RepositoryInference.ProbeWithin(provider, [RepoA, RepoB], slow, TimeSpan.FromMilliseconds(300), default);
+
+        Assert.IsNull(result);
+        Assert.AreEqual(1, probed, "the second repository is never probed");
+        Assert.IsTrue(watch.Elapsed < TimeSpan.FromSeconds(10), $"the running query was not interrupted: {watch.Elapsed}");
+
+        using var cancelled = new CancellationTokenSource();
+        cancelled.CancelAfter(300);
+        Assert.ThrowsExactly<OperationCanceledException>(() =>
+            RepositoryInference.ProbeWithin(provider, [RepoA, RepoB], slow, TimeSpan.FromSeconds(60), cancelled.Token));
+    }
+
+    [TestMethod]
     public void Holders_AreTheRepositoriesAtTheBestRank_InInputOrder()
     {
         CollectionAssert.AreEqual(new[] { "b", "c" }, RepositoryInference.Holders(

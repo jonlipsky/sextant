@@ -51,7 +51,10 @@ public class RepositoryInferencePerformanceTests
                 await Measure(host, "explicit repository", $$"""{"name":"Repo{{last}}.Type7","repository":"acme/repo{{last:D2}}"}""", expectError: false),
                 await Measure(host, $"inferred, 1 of {Repositories} holds it", $$"""{"name":"Repo{{last}}.Type7"}""", expectError: false),
                 await Measure(host, $"inferred, {Repositories} of {Repositories} hold it", """{"name":"Common.Shared"}""", expectError: true),
-                await Measure(host, $"inferred, 0 of {Repositories} hold it", """{"name":"Nowhere.Missing"}""", expectError: true)
+                await Measure(host, $"inferred, 0 of {Repositories} hold it", """{"name":"Nowhere.Missing"}""", expectError: true),
+                await Measure(host, $"fuzzy inferred, 1 of {Repositories}", $$"""{"name":"Unique{{last}}","fuzzy":true}""", expectError: false),
+                await Measure(host, $"fuzzy inferred, {Repositories} of {Repositories}", """{"name":"Shared","fuzzy":true}""", expectError: true),
+                await Measure(host, $"fuzzy inferred, 0 of {Repositories}", """{"name":"Nowhere.Missing","fuzzy":true}""", expectError: true)
             };
             foreach (var (scenario, median, p95) in results)
                 TestContext.WriteLine($"{scenario,-34} median {median,8:F2} ms   p95 {p95,8:F2} ms");
@@ -90,7 +93,7 @@ public class RepositoryInferencePerformanceTests
         return
         [
             ("Types.cs", $"namespace Repo{repository}\n{{\n{types}\n}}\n"),
-            ("Shared.cs", "namespace Common\n{\n    public class Shared { }\n}\n")
+            ("Shared.cs", $"namespace Common\n{{\n    public class Shared {{ }}\n}}\nnamespace Uniq\n{{\n    public class Unique{repository} {{ }}\n}}\n")
         ];
     }
 }

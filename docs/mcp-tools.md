@@ -181,6 +181,9 @@ repositories are not inferred. A caller past 25 is never looked up in any of the
 gets the ordinary `repository_required`, which lists its first 20 repositories by name and how many more there are.
 Fuzzy `find_symbol` probes the same scoped FTS query, result limit and kind filter as the tool. One repository
 with matches is inferred; matches in several repositories require explicit selection, regardless of relevance.
+Probing is bounded in time as well as count: listing and probing the repositories share a hard 5 second budget; past
+it a probe query still running is interrupted and the call goes on without inference (the ordinary
+`repository_required`) rather than naming holders from a partial look.
 A caller that can read exactly one repository keeps the implicit selection
 (`"repository_selection": "implicit"`).
 
@@ -355,7 +358,7 @@ Exact or fuzzy symbol lookup by name.
 | `project_id` | string | no | Filter by project canonical ID |
 | `fuzzy` | bool | no | Use FTS5 fuzzy search (default: false) |
 
-When `fuzzy` is false, matches exactly on `fully_qualified_name`. When true, uses the FTS5 `symbols_fts` table to search `display_name`, ranked by relevance.
+When `fuzzy` is false, matches exactly on `fully_qualified_name`. When true, uses the FTS5 `symbols_fts` table to search `display_name`, ranked by relevance. A query FTS5 accepts as written (`Polyg*`, `IShape OR Perimeter`) keeps its operators. Any other spelling (`Process.Runner`, `ProcessStack.Process.ProcessRunner`, `IStore<T>`, `Run(int)`, `global::A.B`) is searched as the identifier tokens in it, each a prefix that must match: a leading `global::` and any `<...>` or `(...)` part are dropped first (`IStore<T>` searches `IStore`). When all the tokens together match nothing (the index holds display names, never namespaces) the last token is tried alone (`ProcessStack.Process.ProcessRunner` finds `ProcessRunner`), then all tokens joined into one (`Process.Runner` finds `ProcessRunner`). A name with no letter or digit is `invalid_argument`; a raw SQLite error is never returned for a query-syntax problem. `semantic_search` is unchanged and still passes its query to FTS5 as written.
 
 ### find_references
 

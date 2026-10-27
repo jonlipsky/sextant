@@ -39,6 +39,11 @@ public static class FindSymbolTool
         if (!SymbolKindNames.TryParse(kind, out var kinds, out var kindDescription, out var kindError))
             return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode, kindError!, readContext.Provenance);
 
+        if (fuzzy && FtsQueryText.ToSafeQuery(name) is null)
+            return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode,
+                "A fuzzy search needs a name with at least one letter or digit, e.g. 'ProcessRunner' or 'Process.Runner'.",
+                readContext.Provenance);
+
         // Resolve scope to project filter. An unknown project/solution or an unrecognized scope is an error, never
         // a silently unfiltered query.
         var scopeFilter = ScopeResolver.Resolve(scope, conn, readContext.Scope, readContext.Paths);
@@ -224,7 +229,7 @@ public static class FindSymbolTool
         SymbolStore symbols, string name, int maxResults, IReadOnlySet<SymbolKind>? kinds)
     {
         // Inference must use the same bounded, scoped FTS evidence as the eventual tool read.
-        var results = symbols.SearchFts(name, maxResults, kinds is { Count: 1 } ? kinds.First().ToString() : null);
+        var results = symbols.SearchFtsTolerant(name, maxResults, kinds is { Count: 1 } ? kinds.First().ToString() : null);
         return kinds is { Count: > 1 } ? results.Where(s => kinds.Contains(s.Kind)).ToList() : results;
     }
 

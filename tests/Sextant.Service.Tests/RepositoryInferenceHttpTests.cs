@@ -300,6 +300,67 @@ public class RepositoryInferenceHttpTests
     }
 
     [TestMethod]
+    [DataRow("""{"name":"Polygon.","fuzzy":true}""", "geometry", "global::Geometry.Polygon")]
+    [DataRow("""{"name":"global::Polygon","fuzzy":true}""", "geometry", "global::Geometry.Polygon")]
+    [DataRow("""{"name":"Perimeter(int)","fuzzy":true}""", "geometry", "global::Geometry.Polygon.Perimeter()")]
+    [DataRow("""{"name":"IShape<T>","fuzzy":true}""", "library", "global::Library.Shapes.IShape")]
+    [DataRow("""{"name":"Geometry.Polygon","fuzzy":true}""", "geometry", "global::Geometry.Polygon")]
+    [DataRow("""{"name":"Acme.Geometry.Polygon","fuzzy":true}""", "geometry", "global::Geometry.Polygon")]
+    [DataRow("""{"name":"Poly.gon","fuzzy":true}""", "geometry", "global::Geometry.Polygon")]
+    [DataRow("""{"name":"Polygon.Perimeter","fuzzy":true}""", "geometry", "global::Geometry.Polygon.Perimeter()")]
+    [DataRow("""{"name":"Library.Shapes.IShape","fuzzy":true}""", "library", "global::Library.Shapes.IShape")]
+    [DataRow("""{"name":"global::Geometry.Polygon","fuzzy":true}""", "geometry", "global::Geometry.Polygon")]
+    public async Task FuzzySearch_DottedGenericOrParenthesizedName_IsASearchAndIsInferred(
+        string arguments, string repository, string symbol)
+    {
+        var call = await CallAsync("find_symbol", arguments, Reader);
+
+        Assert.IsFalse(call.IsError, call.Body.ToString());
+        CollectionAssert.Contains(Names(call.Body), symbol, call.Body.ToString());
+        AssertInferred(call.Body, repository);
+    }
+
+    [TestMethod]
+    [DataRow("Geometry.Polygon", "global::Geometry.Polygon")]
+    [DataRow("Acme.Geometry.Polygon", "global::Geometry.Polygon")]
+    [DataRow("Poly.gon", "global::Geometry.Polygon")]
+    [DataRow("Polygon.Perimeter", "global::Geometry.Polygon.Perimeter()")]
+    [DataRow("Perimeter(int)", "global::Geometry.Polygon.Perimeter()")]
+    [DataRow("global::Geometry.Polygon", "global::Geometry.Polygon")]
+    public async Task FuzzySearch_FtsSyntaxSpellings_FindTheSymbol_WithANamedRepository(string name, string symbol)
+    {
+        var call = await CallAsync("find_symbol", Json(new { name, fuzzy = true, repository = "acme/geometry" }), Reader);
+
+        Assert.IsFalse(call.IsError, call.Body.ToString());
+        CollectionAssert.Contains(Names(call.Body), symbol, call.Body.ToString());
+        Assert.IsFalse(call.Body.ToString().Contains("fts5", StringComparison.OrdinalIgnoreCase), call.Body.ToString());
+    }
+
+    [TestMethod]
+    [DataRow("...")]
+    [DataRow("<>")]
+    [DataRow("global::")]
+    public async Task FuzzySearch_NameWithNoLettersOrDigits_IsInvalidArgument(string name)
+    {
+        var call = await CallAsync("find_symbol", Json(new { name, fuzzy = true, repository = "acme/geometry" }), Reader);
+
+        Assert.IsTrue(call.IsError, call.Body.ToString());
+        Assert.AreEqual("invalid_argument", ErrorCode(call.Body));
+    }
+
+    [TestMethod]
+    [DataRow("...")]
+    [DataRow("<>")]
+    public async Task FuzzySearch_NameWithNoLettersOrDigits_NamingNoRepository_IsTheOrdinaryRepositoryRequired(string name)
+    {
+        // The selection gate runs before the tool, so the name is never probed (no safe query) and the call gets today's answer.
+        var call = await CallAsync("find_symbol", Json(new { name, fuzzy = true }), Reader);
+
+        Assert.IsTrue(call.IsError, call.Body.ToString());
+        Assert.AreEqual("repository_required", ErrorCode(call.Body));
+    }
+
+    [TestMethod]
     [DataRow(false)]
     [DataRow(true)]
     public async Task FuzzySearch_ExplicitRepositoryIsPreserved(bool header)

@@ -3344,6 +3344,7 @@ public sealed partial class SnapshotService : IDisposable
         using var pragma = conn.CreateCommand();
         pragma.CommandText = "PRAGMA busy_timeout = 5000;";
         pragma.ExecuteNonQuery();
+        ReadInterrupt.Attach(conn);
         return conn;
     }
 
