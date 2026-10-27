@@ -17,7 +17,7 @@ public static class FindCommentsTool
         string? search = null,
         [Description(ToolText.ProjectId)]
         string? project_id = null,
-        [Description("Enclosing method or type.")]
+        [Description("Enclosing method or type; a type includes its members and nested types.")]
         string? in_symbol = null,
         [Description(ToolText.Limit)] int? limit = null,
         [Description(ToolText.Cursor)] string? cursor = null)
@@ -69,7 +69,11 @@ public static class FindCommentsTool
             ambiguity = lookup.Ambiguity;
             note = SymbolResolver.ResolutionNote(symbolStore, lookup);
             warning = lookup.Warning;
-            comments = commentStore.GetBySymbol(lookup.Symbol!.Id);
+            var target = lookup.Symbol!;
+            var ids = new List<long> { target.Id };
+            if (SymbolQuery.TypeKinds.Contains(target.Kind))
+                ids.AddRange(SymbolResolver.MembersAndNested(symbolStore, target).Select(m => m.Id));
+            comments = commentStore.GetBySymbols(ids);
             if (projectDbId != null)
                 comments = comments.Where(c => c.ProjectId == projectDbId.Value).ToList();
         }
