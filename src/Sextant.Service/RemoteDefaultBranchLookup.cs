@@ -145,6 +145,9 @@ internal sealed class RemoteDefaultBranchLookup(
             // The resolvers answer null for a remote they cannot read; a throw means the same.
             answer = null;
         }
+        // Every waiter left: an abandoned lookup never reports a verdict, whatever the resolver returned.
+        if (entry.Cancellation.IsCancellationRequested)
+            answer = null;
         lock (_lock)
         {
             entry.ExpiresAt = _time.GetUtcNow() + lifetime;
