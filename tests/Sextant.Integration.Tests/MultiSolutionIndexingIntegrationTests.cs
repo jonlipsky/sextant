@@ -124,7 +124,8 @@ public sealed class MultiSolutionIndexingIntegrationTests : IDisposable
         // Coordinator dedup ask: one stored logical project per identity. Core is shared by BOTH heads yet
         // stored ONCE; A and B are stored; the unloadable Broken contributes no project row at all.
         Assert.AreEqual(3, ScalarInt(conn, "SELECT COUNT(*) FROM projects;"),
-            "exactly three projects are stored — Core (shared, deduped), A and B; Broken is skipped, not stored");
+            "exactly three projects are stored — Core (shared, deduped), A and B; Broken is skipped, not stored. Rows: " +
+            StoredProjects(conn));
         Assert.AreEqual(1, ScalarInt(conn,
             "SELECT COUNT(*) FROM projects WHERE repo_relative_path LIKE '%Core.csproj';"),
             "the project shared by both heads is stored ONCE (union dedup by project identity, not once per head)");
@@ -149,6 +150,17 @@ public sealed class MultiSolutionIndexingIntegrationTests : IDisposable
         Assert.AreEqual(2, callsIntoCore,
             "both heads' cross-project calls into the shared method are recorded exactly once each " +
             "(union coverage of both heads, no duplicate occurrences)");
+    }
+
+    private static string StoredProjects(SqliteConnection conn)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT repo_relative_path, target_framework FROM projects ORDER BY id;";
+        using var r = cmd.ExecuteReader();
+        var rows = new List<string>();
+        while (r.Read())
+            rows.Add($"{r.GetString(0)}|{(r.IsDBNull(1) ? "" : r.GetString(1))}");
+        return string.Join("; ", rows);
     }
 
     private static int ScalarInt(SqliteConnection conn, string sql)
