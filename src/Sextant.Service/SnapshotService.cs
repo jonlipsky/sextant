@@ -241,6 +241,7 @@ public sealed partial class SnapshotService : IDisposable
                     options, worker ?? new UnavailableSnapshotWorker(), paths, db, lease, ownsDatabase,
                     effectiveAuthorizer, effectiveGitContent, effectivePolicy, remoteDefaults, timeProvider, remoteBranches, writeLocks);
                 service._jobIds.Load();
+                service.LogTenantGrantLease();
                 service.ReconcileOnStartup();
                 service.StartMaintenanceLoop();
                 return service;

@@ -70,6 +70,15 @@ public sealed class RepositoryGrantStore(SqliteConnection connection)
     /// <summary>The branch of a grant on the repository's default branch.</summary>
     public const string DefaultBranch = "";
 
+    /// <summary>
+    /// The SQL predicate that drops a lapsed tenant-wide grant (issue #179): a '*' grant counts only while its
+    /// <c>updated_at</c> (refreshed by every re-PUT) is at or after <c>@lease_cutoff</c>; a user grant always counts.
+    /// A null cutoff binds as SQL NULL and disables the lease. A write stamped after <c>@lease_ceiling</c> (a clock
+    /// that rolled back) is not trusted either: it counts as lapsed until the next re-PUT restamps it.
+    /// </summary>
+    private const string LeasePredicate =
+        "(principal <> @wide OR @lease_cutoff IS NULL OR (updated_at >= @lease_cutoff AND updated_at <= @lease_ceiling))";
+
     /// <summary>The <c>branch</c> filter of <see cref="Delete"/> that removes every branch of the repository.</summary>
     public const string AllBranches = "*";
 
@@ -160,6 +169,16 @@ public sealed class RepositoryGrantStore(SqliteConnection connection)
         return Convert.ToInt32(cmd.ExecuteScalar()!);
     }
 
+    /// <summary>How many tenant-wide grants were last written before <paramref name="leaseCutoff"/> (unix ms).</summary>
+    public int CountLapsedTenantWide(long leaseCutoff)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT COUNT(*) FROM repository_grants WHERE principal = @wide AND updated_at < @cutoff;";
+        cmd.Parameters.AddWithValue("@wide", TenantWide);
+        cmd.Parameters.AddWithValue("@cutoff", leaseCutoff);
+        return Convert.ToInt32(cmd.ExecuteScalar()!);
+    }
+
     /// <summary>How many grants the tenant holds, across every principal.</summary>
     public int CountForTenant(string tenantId)
     {
@@ -183,32 +202,33 @@ public sealed class RepositoryGrantStore(SqliteConnection connection)
     }
 
     /// <summary>
-    /// The grants that make repositories visible to a caller: the tenant-wide grants plus, for a user
+    /// The grants that make repositories visible to a caller: the tenant-wide grants (unless their lease lapsed before
+    /// <paramref name="leaseCutoff"/>, unix ms) plus, for a user
     /// (<paramref name="userSubject"/> non-null), that exact subject's own grants. Ordered by key, branch, then
     /// tenant-wide first.
     /// </summary>
-    public IReadOnlyList<RepositoryGrantRow> ListVisible(string tenantId, string? userSubject)
+    public IReadOnlyList<RepositoryGrantRow> ListVisible(string tenantId, string? userSubject, long? leaseCutoff = null, long? leaseCeiling = null)
     {
         using var cmd = connection.CreateCommand();
         // An application caller (no subject) matches the tenant-wide principal twice, i.e. only '*'.
         cmd.CommandText = $"""
             SELECT {Columns} FROM repository_grants
-            WHERE tenant_id = @tenant AND (principal = @wide OR principal = @principal)
+            WHERE tenant_id = @tenant AND (principal = @wide OR principal = @principal) AND {LeasePredicate}
             ORDER BY repository_key, branch, principal <> @wide, created_at, id;
             """;
-        BindVisible(cmd, tenantId, userSubject);
+        BindVisible(cmd, tenantId, userSubject, leaseCutoff, leaseCeiling);
         return ReadAll(cmd);
     }
 
     /// <summary>The distinct repository keys visible to a caller (see <see cref="ListVisible"/>).</summary>
-    public IReadOnlySet<string> VisibleKeys(string tenantId, string? userSubject)
+    public IReadOnlySet<string> VisibleKeys(string tenantId, string? userSubject, long? leaseCutoff = null, long? leaseCeiling = null)
     {
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = """
+        cmd.CommandText = $"""
             SELECT DISTINCT repository_key FROM repository_grants
-            WHERE tenant_id = @tenant AND (principal = @wide OR principal = @principal);
+            WHERE tenant_id = @tenant AND (principal = @wide OR principal = @principal) AND {LeasePredicate};
             """;
-        BindVisible(cmd, tenantId, userSubject);
+        BindVisible(cmd, tenantId, userSubject, leaseCutoff, leaseCeiling);
         var keys = new HashSet<string>(StringComparer.Ordinal);
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
@@ -216,8 +236,10 @@ public sealed class RepositoryGrantStore(SqliteConnection connection)
         return keys;
     }
 
-    private static void BindVisible(SqliteCommand cmd, string tenantId, string? userSubject)
+    private static void BindVisible(SqliteCommand cmd, string tenantId, string? userSubject, long? leaseCutoff, long? leaseCeiling)
     {
+        cmd.Parameters.AddWithValue("@lease_cutoff", leaseCutoff.HasValue ? leaseCutoff.Value : DBNull.Value);
+        cmd.Parameters.AddWithValue("@lease_ceiling", leaseCeiling.HasValue ? leaseCeiling.Value : long.MaxValue);
         cmd.Parameters.AddWithValue("@tenant", tenantId);
         cmd.Parameters.AddWithValue("@wide", TenantWide);
         cmd.Parameters.AddWithValue("@principal", userSubject ?? TenantWide);

@@ -198,7 +198,14 @@ public sealed partial class RepositoryUrlPolicy
         var colon = authority.LastIndexOf(':');
         if (colon >= 0 && authority[(colon + 1)..] != "443")
             return false;
-        host = (colon >= 0 ? authority[..colon] : authority).ToLowerInvariant();
+        var rawHost = colon >= 0 ? authority[..colon] : authority;
+        // Folding first would let U+212A (KELVIN SIGN) read as 'k' and match an allow-listed host.
+        if (!System.Text.Ascii.IsValid(rawHost))
+        {
+            reason = RepositoryUrlRejection.HostNotAllowed;
+            return false;
+        }
+        host = rawHost.ToLowerInvariant();
         return true;
     }
 
@@ -216,8 +223,8 @@ public sealed partial class RepositoryUrlPolicy
                 anyHost = true;
                 continue;
             }
-            var host = entry.ToLowerInvariant();
-            if (!IsAllowedHostShape(host))
+            var host = System.Text.Ascii.IsValid(entry) ? entry.ToLowerInvariant() : entry;
+            if (!System.Text.Ascii.IsValid(entry) || !IsAllowedHostShape(host))
                 throw new FormatException(
                     $"Repository host entry '{raw}' is invalid. Use '{Wildcard}' or a DNS host name with at least two " +
                     "labels (e.g. 'github.com'): no scheme, port, path, credentials, trailing dot, IP literal or 'localhost'.");
@@ -316,8 +323,12 @@ public sealed partial class RepositoryUrlPolicy
         var slash = entry.IndexOf('/');
         if (slash <= 0)
             return null;
-        var host = entry[..slash].ToLowerInvariant();
+        var rawHost = entry[..slash];
         var owner = entry[(slash + 1)..];
+        // Folding first would let U+212A (KELVIN SIGN) read as 'k'.
+        if (!System.Text.Ascii.IsValid(rawHost))
+            return null;
+        var host = rawHost.ToLowerInvariant();
         if (!IsAllowedHostShape(host))
             return null;
         if (owner == Wildcard)

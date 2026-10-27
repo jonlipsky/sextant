@@ -31,6 +31,19 @@ public class RepositoryUrlPolicyTests
     }
 
     [TestMethod]
+    [DataRow("https://\u212Aernel.org/org/app")]
+    [DataRow("https://git.\u212Aernel.org:443/org/app")]
+    public void NonAsciiHost_IsRefusedBeforeCaseFolding(string url)
+    {
+        // U+212A (KELVIN SIGN) lower-cases to 'k', so folding first would match the allow-listed host.
+        Assert.IsTrue(new RepositoryUrlPolicy(["kernel.org", "git.kernel.org"]).Evaluate("https://kernel.org/org/app").Ok);
+        var d = new RepositoryUrlPolicy(["kernel.org", "git.kernel.org"]).Evaluate(url);
+        Assert.IsFalse(d.Ok);
+        Assert.AreEqual(RepositoryUrlRejection.HostNotAllowed, d.Reason);
+        Assert.AreEqual(RepositoryUrlRejection.HostNotAllowed, AnyHost.Evaluate(url).Reason);
+    }
+
+    [TestMethod]
     public void CaseSensitiveHost_PreservesPathCase()
     {
         var policy = new RepositoryUrlPolicy(["git.example.com"]);
@@ -162,6 +175,16 @@ public class RepositoryUrlPolicyTests
         Assert.IsNull(d.Repo);
         Assert.AreEqual(RepositoryUrlRejection.SchemeNotAllowed, testing.Evaluate("http://github.com/org/app").Reason,
             "the flag only admits file://, never any other non-https scheme");
+    }
+
+    [TestMethod]
+    public void NonAsciiOperatorConfig_IsRefusedAtStartup()
+    {
+        // U+212A (KELVIN SIGN) lower-cases to 'k': folding operator config first would turn it into 'kernel.org'.
+        Assert.ThrowsExactly<FormatException>(() => new RepositoryUrlPolicy(["\u212Aernel.org"]));
+        Assert.ThrowsExactly<FormatException>(() => new RepositoryUrlPolicy(["kernel.org", "git.\u212Aernel.org"]));
+        Assert.ThrowsExactly<FormatException>(() => new RepositoryUrlPolicy(["kernel.org"], ["\u212Aernel.org/org"]));
+        Assert.ThrowsExactly<FormatException>(() => new RepositoryUrlPolicy(["kernel.org"], ["kernel.org/\u212Arg"]));
     }
 
     [TestMethod]
