@@ -17,12 +17,13 @@ public static class GetTypeDependentsTool
         [Description("inherits, implements, returns, parameter_of, instantiates or all.")]
         string dependency_kind = "all",
         [Description(ToolText.Limit)] int? limit = null,
-        [Description(ToolText.Cursor)] string? cursor = null)
+        [Description(ToolText.Cursor)] string? cursor = null,
+        [Description(ToolText.ProjectId)] string? project_id = null)
     {
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
         if (!Paging.TryBegin("get_type_dependents", limit, cursor, readContext, out var page, out var cursorError,
-                symbol_fqn, dependency_kind))
+                symbol_fqn, dependency_kind, project_id))
             return cursorError;
 
         using var conn = db.OpenReadConnection();
@@ -42,7 +43,10 @@ public static class GetTypeDependentsTool
             kindFilter = parsed;
         }
 
-        var lookup = SymbolResolver.Lookup(symbolStore, projectStore, symbol_fqn, SymbolLookupOptions.Types);
+        if (!ProjectArgument.TryRestrict(project_id, projectStore, SymbolLookupOptions.Types, readContext.Provenance,
+                out var options, out var projectError))
+            return projectError!;
+        var lookup = SymbolResolver.Lookup(symbolStore, projectStore, symbol_fqn, options);
         if (lookup.Status != SymbolLookupStatus.Resolved)
             return SymbolResolver.ErrorResponse(symbolStore, projectStore, lookup, readContext.Provenance);
         var targetSymbol = lookup.Symbol!;

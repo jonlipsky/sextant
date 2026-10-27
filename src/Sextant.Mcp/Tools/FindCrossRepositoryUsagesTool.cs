@@ -20,7 +20,8 @@ public static class FindCrossRepositoryUsagesTool
         string? branch = null,
         string? consumer_commit = null,
         [Description(ToolText.Limit)] int? limit = null,
-        [Description(ToolText.Cursor)] string? cursor = null)
+        [Description(ToolText.Cursor)] string? cursor = null,
+        [Description(ToolText.ProjectId)] string? project_id = null)
     {
         // Honour the Phase-17 fail-closed top-level read gate before touching any cross-repo data: a
         // denied read surfaces the uniform not-found, never an empty successful result.
@@ -28,7 +29,11 @@ public static class FindCrossRepositoryUsagesTool
             return authError;
 
         using var conn = db.OpenReadConnection();
-        var scope = new CrossRepoUsageScope { Branch = branch, ConsumerCommitSha = consumer_commit };
+        var scope = new CrossRepoUsageScope
+        {
+            Branch = branch, ConsumerCommitSha = consumer_commit,
+            ProviderProjectCanonicalId = string.IsNullOrWhiteSpace(project_id) ? null : project_id.Trim()
+        };
 
         var outcome = CrossRepositoryUsageResolver.Resolve(
             conn, provider_repository_url, symbol_fqn, scope, dbProvider.Authorizer);
@@ -61,7 +66,7 @@ public static class FindCrossRepositoryUsagesTool
         // The rows come from each consumer's own branch head, not the selected snapshot, so the cursor is also bound
         // to the consumer commits it paged: a consumer that moved between pages makes it invalid_cursor.
         if (!Paging.TryBegin("find_cross_repository_usages", limit, cursor, readContext, out var page, out var cursorError,
-                provider_repository_url, symbol_fqn, branch, consumer_commit, ConsumerHeads(outcome.Usages)))
+                provider_repository_url, symbol_fqn, branch, consumer_commit, ConsumerHeads(outcome.Usages), project_id))
             return cursorError;
 
         object? Summary() => new { ByRepository = Paging.CountBy(outcome.Usages, u => u.ConsumerRepositoryUrl) };

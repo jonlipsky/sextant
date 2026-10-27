@@ -181,7 +181,122 @@ public static class SymbolResolver
         }
         if (attempt.Invalid)
             return new SymbolLookup { Status = SymbolLookupStatus.Invalid, Query = attempt.Query, Options = options };
+        if (ExplicitImplementation(store, projects, attempt.Query, options) is { } explicitImplementation)
+            return explicitImplementation;
+        if (IndexerByItemName(attempt.Query) is { } indexerQuery
+            && Evaluate(store, projects, indexerQuery, options, exactKeys: false).Found is { } indexer)
+            return indexer;
         return ByTrailingName(store, projects, attempt, options);
+    }
+
+    // `Type.Item(int)` (the documentation-ID-like spelling of an indexer) read as `Type.this[int]`; only tried once the
+    // argument matched nothing as written, so a real method named Item always wins.
+    private static SymbolQuery? IndexerByItemName(SymbolQuery query)
+    {
+        var raw = query.Raw.Trim();
+        if (query.Parameters is null || !raw.EndsWith(')') || raw.Length > SymbolQuery.MaxLength)
+            return null;
+        var open = raw.IndexOf('(');
+        if (open <= 0 || SymbolTypeTerm.MatchingClose(raw, open) != raw.Length - 1)
+            return null;
+        var head = raw[..open];
+        if (!head.EndsWith(".Item", StringComparison.Ordinal) || head.Length == ".Item".Length)
+            return null;
+        var read = SymbolQuery.Parse(head[..^".Item".Length] + ".this[" + raw[(open + 1)..^1] + "]");
+        return read.Error is null ? read : null;
+    }
+
+    // An explicit interface implementation spelled `Ns.C.IDisposable.Dispose` or `Ns.C.System.IDisposable.Dispose`: the
+    // leading qualifier segments name the type, the trailing ones the implemented interface, matched against the key
+    // `M:Ns.C.System#IDisposable#Dispose`. Tried only when the argument matched nothing as written.
+    private static SymbolLookup? ExplicitImplementation(
+        SymbolStore store, ProjectStore projects, SymbolQuery query, SymbolLookupOptions options)
+    {
+        var form = query.Forms.FirstOrDefault(f => f.NameKind == SymbolNameKind.Plain && f.Qualifier.Count >= 2);
+        if (form is null)
+            return null;
+        var found = new Dictionary<long, SymbolInfo>();
+        for (var split = 1; split < form.Qualifier.Count; split++)
+        {
+            var wanted = form.Qualifier.Skip(split).Select(s => s.Name).ToList();
+            foreach (var type in FindContainers(store, form.Qualifier.Take(split).ToList()))
+            {
+                var prefixLength = TypeDocPath(type).Length + 3;
+                foreach (var member in Members(store, type))
+                {
+                    if (member.SymbolKey.Length > prefixLength && IsExplicitImplementation(
+                            member, prefixLength, form.Name.Name, wanted, query.Parameters?.Count)
+                        && KindAllowed(member.Kind, options.Kinds) && KindAllowed(member.Kind, query.KindConstraint)
+                        && InRestriction(member, options))
+                        found.TryAdd(member.Id, member);
+                }
+            }
+        }
+        if (found.Count == 0)
+            return null;
+
+        var ordered = found.Values.OrderBy(r => r.ProjectId).ThenBy(r => r.Id).ToList();
+        var byKey = ordered.GroupBy(r => r.SymbolKey, StringComparer.Ordinal).ToList();
+        if (byKey.Count > 1)
+        {
+            return new SymbolLookup
+            {
+                Status = SymbolLookupStatus.Ambiguous, Query = query, Options = options,
+                Matches = byKey.Select(g => g.First()).ToList(), TopMatchCount = byKey.Count
+            };
+        }
+        var sameKey = byKey[0].ToList();
+        var symbol = sameKey[0];
+        return new SymbolLookup
+        {
+            Status = SymbolLookupStatus.Resolved, Query = query, Options = options, Symbol = symbol, Matches = [symbol],
+            TopMatchCount = 1, Ambiguity = sameKey.Count > 1 ? SameKeyAmbiguity(store, projects, symbol, sameKey) : null
+        };
+    }
+
+    // Whether the member key (its type's path and a dot being the first `start` characters) is an explicit
+    // implementation `Iface#Path#Name` of `name` whose interface path ends with `wantedInterface`.
+    private static bool IsExplicitImplementation(
+        SymbolInfo member, int start, string name, IReadOnlyList<string> wantedInterface, int? parameterCount)
+    {
+        var rest = member.SymbolKey[start..];
+        var open = rest.IndexOf('(');
+        var head = open >= 0 ? rest[..open] : rest;
+        var parts = SplitOutsideBraces(head);
+        if (parts.Count < 2 || !string.Equals(parts[^1], name, StringComparison.Ordinal))
+            return false;
+        var iface = parts.Take(parts.Count - 1).Select(p =>
+        {
+            var cut = p.IndexOfAny(['{', '`']);
+            return cut >= 0 ? p[..cut] : p;
+        }).ToList();
+        if (wantedInterface.Count > iface.Count
+            || !iface.Skip(iface.Count - wantedInterface.Count).SequenceEqual(wantedInterface, StringComparer.Ordinal))
+            return false;
+        return parameterCount is null || RowShape.Of(member).Parameters is not { } parameters
+            || parameters.Count == parameterCount;
+    }
+
+    // Splits a key on '#' only outside `{...}`: a constructed generic interface keeps its type arguments' own '#'s.
+    private static List<string> SplitOutsideBraces(string text)
+    {
+        var parts = new List<string>();
+        var depth = 0;
+        var start = 0;
+        for (var i = 0; i < text.Length; i++)
+        {
+            if (text[i] == '{')
+                depth++;
+            else if (text[i] == '}')
+                depth--;
+            else if (text[i] == '#' && depth == 0)
+            {
+                parts.Add(text[start..i]);
+                start = i + 1;
+            }
+        }
+        parts.Add(text[start..]);
+        return parts;
     }
 
     // One reading of the argument, before the forgiving steps: what it found (resolved or ambiguous), or why not.

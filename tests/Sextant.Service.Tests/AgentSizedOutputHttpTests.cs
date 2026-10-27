@@ -21,8 +21,10 @@ public sealed partial class AgentSizedOutputHttpTests
     // with a required selection / delegate callers: the eight agent tools of S12, 4719 / 4929 (616 per tool); nine
     // (+get_type_dependents), 5322 / 5562; twelve (+semantic_search, find_by_attribute, find_unreferenced), 7207 /
     // 7537 (628 per tool). The budget scales with ServiceApp.RemoteQueryTools, so a change to the set needs no edit
-    // here; a tool whose description or schema grows well past the average still fails it.
-    private const int ToolsListBudgetPerTool = 640;
+    // here; a tool whose description or schema grows well past the average still fails it. #224 added an optional
+    // project_id to four of the eight tools (4929 -> 5176 with delegate callers); the budget went from 640 to 650 per
+    // tool (5120 -> 5200 for eight) by decision, rather than leaving the parameter undescribed.
+    private const int ToolsListBudgetPerTool = 650;
     private static int ToolsListBudget => ToolsListBudgetPerTool * ExpectedTools.Length;
     private const int InstructionsBudget = 600;
     private const int UnboundedChars = 10_000_000;

@@ -12,11 +12,13 @@ public static class GetImpactTool
         DatabaseProvider dbProvider,
         [Description(ToolText.SymbolFqn)] string symbol_fqn,
         [Description(ToolText.Limit)] int? limit = null,
-        [Description(ToolText.Cursor)] string? cursor = null)
+        [Description(ToolText.Cursor)] string? cursor = null,
+        [Description(ToolText.ProjectId)] string? project_id = null)
     {
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
-        if (!Paging.TryBegin("get_impact", limit, cursor, readContext, out var page, out var cursorError, symbol_fqn))
+        if (!Paging.TryBegin("get_impact", limit, cursor, readContext, out var page, out var cursorError, symbol_fqn,
+                project_id))
             return cursorError;
 
         using var conn = db.OpenReadConnection();
@@ -27,7 +29,10 @@ public static class GetImpactTool
         var apiSurfaceStore = new ApiSurfaceStore(conn);
         var projectStore = new ProjectStore(conn) { Scope = readContext.Scope };
 
-        var lookup = SymbolResolver.Lookup(symbolStore, projectStore, symbol_fqn);
+        if (!ProjectArgument.TryRestrict(project_id, projectStore, SymbolLookupOptions.Any, readContext.Provenance,
+                out var options, out var projectError))
+            return projectError!;
+        var lookup = SymbolResolver.Lookup(symbolStore, projectStore, symbol_fqn, options);
         if (lookup.Status != SymbolLookupStatus.Resolved)
             return SymbolResolver.ErrorResponse(symbolStore, projectStore, lookup, readContext.Provenance);
         var symbol = lookup.Symbol!;

@@ -20,7 +20,8 @@ public static class TraceValueTool
         string? parameter = null,
         int depth = 2,
         [Description(ToolText.Limit)] int? limit = null,
-        [Description(ToolText.Cursor)] string? cursor = null)
+        [Description(ToolText.Cursor)] string? cursor = null,
+        [Description(ToolText.ProjectId)] string? project_id = null)
     {
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
@@ -29,7 +30,7 @@ public static class TraceValueTool
                 readContext.SelectedSnapshotId, dbProvider.Authorizer.IsEnforcing))
             return unavailable;
         if (!Paging.TryBegin("trace_value", limit, cursor, readContext, out var page, out var cursorError,
-                method_fqn, direction, parameter, depth))
+                method_fqn, direction, parameter, depth, project_id))
             return cursorError;
 
         using var conn = db.OpenReadConnection();
@@ -45,7 +46,10 @@ public static class TraceValueTool
             return ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode,
                 $"Unknown direction '{direction}'. Use 'origins' or 'destinations'.", readContext.Provenance);
 
-        var lookup = SymbolResolver.Lookup(symbolStore, projectStore, method_fqn, MethodOptions);
+        if (!ProjectArgument.TryRestrict(project_id, projectStore, MethodOptions, readContext.Provenance,
+                out var options, out var projectError))
+            return projectError!;
+        var lookup = SymbolResolver.Lookup(symbolStore, projectStore, method_fqn, options);
         if (lookup.Status != SymbolLookupStatus.Resolved)
             return SymbolResolver.ErrorResponse(symbolStore, projectStore, lookup, readContext.Provenance);
         var methodSymbol = lookup.Symbol!;
