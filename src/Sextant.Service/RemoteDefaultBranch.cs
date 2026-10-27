@@ -55,3 +55,66 @@ public static class RemoteDefaultBranch
         name.Length is > 0 and <= MaxBranchNameLength
         && !name.Any(c => char.IsWhiteSpace(c) || char.IsControl(c));
 }
+
+/// <summary>
+/// Looks up the commit a branch of a repository points at on the REMOTE itself (issue #203). The service consults it
+/// only to check the target of a user caller's branch advance. Implemented by the clone-mode checkout provider;
+/// without an implementation (locate mode) the check is skipped.
+/// </summary>
+public interface IRemoteBranchHeadResolver
+{
+    /// <summary>
+    /// The commit id <c>refs/heads/&lt;branch&gt;</c> names on the remote, or <c>null</c> when it cannot be determined
+    /// (unreachable, unauthorized, no such branch, a refused URL or branch name). A throw is treated like <c>null</c>.
+    /// Cancelling <paramref name="cancellationToken"/> stops the remote call.
+    /// </summary>
+    string? ResolveBranchHead(string repositoryRemoteUrl, string branch, CancellationToken cancellationToken = default);
+}
+
+/// <summary>
+/// Decides whether a commit is reachable from a <c>refs/heads/*</c> branch of a repository as the REMOTE holds it
+/// (issue #209). The service consults it for a user caller's <c>branch_update: none</c> ensure, so fork-network
+/// commits (reachable only through <c>refs/pull/*</c> or shared objects) are never fetched into an evaluated checkout.
+/// Implemented by the clone-mode checkout provider; without an implementation (locate mode) the check is skipped.
+/// </summary>
+public interface IRemoteCommitBranchChecker
+{
+    /// <summary>
+    /// <c>true</c> only when <paramref name="commit"/> (a full object id) is reachable from a branch of the remote.
+    /// Unreachable, unauthorized, unparseable or a refused URL is <c>false</c>. A throw is treated like <c>false</c>.
+    /// Cancelling <paramref name="cancellationToken"/> stops the remote call.
+    /// </summary>
+    bool IsCommitOnBranch(string repositoryRemoteUrl, string commit, CancellationToken cancellationToken = default);
+}
+
+/// <summary>Parsing of <c>git ls-remote &lt;url&gt; refs/heads/&lt;branch&gt;</c> for <see cref="IRemoteBranchHeadResolver"/>.</summary>
+public static class RemoteBranchHead
+{
+    /// <summary>
+    /// The object id of exactly <c>refs/heads/&lt;branch&gt;</c> in the output, or <c>null</c> when it is absent, listed
+    /// more than once, or any line is not <c>&lt;object id&gt;&#9;&lt;ref&gt;</c>.
+    /// </summary>
+    public static string? Parse(string lsRemoteOutput, string branch)
+    {
+        var wanted = "refs/heads/" + branch;
+        string? head = null;
+        foreach (var raw in lsRemoteOutput.Split('\n'))
+        {
+            var line = raw.TrimEnd('\r');
+            if (line.Length == 0)
+                continue;
+            var tab = line.IndexOf('\t');
+            if (tab < 1)
+                return null;
+            var id = line[..tab];
+            if (id.Length is not (40 or 64) || !id.All(Uri.IsHexDigit))
+                return null;
+            if (!string.Equals(line[(tab + 1)..], wanted, StringComparison.Ordinal))
+                continue;
+            if (head is not null)
+                return null;
+            head = id;
+        }
+        return head;
+    }
+}

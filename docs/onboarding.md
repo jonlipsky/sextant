@@ -107,7 +107,8 @@ Other tools use the same URL and header, only the config file and root key diffe
 - the service's eight query tools under their own names: `list_repositories`, `find_symbol`,
   `find_references`, `get_call_hierarchy`, `get_implementors`, `get_type_hierarchy`, `get_type_members` and
   `get_file_symbols` (the other index tools are local-only and are not offered);
-- the app's own tools: `start-indexing` (index an exact commit of a repository you watch),
+- the app's own tools: `start-indexing` (index an exact commit of a repository you watch; the commit must be on a branch of that
+  repository, otherwise the service refuses it with `commit_not_on_branch`, issue #209),
   `get-indexing-status` (poll the job it returns) and `import-legacy-watches` (below).
 
 ### A3. Watch the repositories you need

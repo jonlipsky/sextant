@@ -130,7 +130,8 @@ public sealed partial class SnapshotService : IDisposable
         _authorizer = authorizer;
         _gitContent = gitContent;
         _contributionPolicy = contributionPolicy;
-        _remoteDefaults = remoteDefaults is null ? null : new RemoteDefaultBranchLookup(remoteDefaults);
+        _remoteDefaults = remoteDefaults is null ? null : new RemoteDefaultBranchLookup(
+            remoteDefaults, null, remoteDefaults as IRemoteBranchHeadResolver, remoteDefaults as IRemoteCommitBranchChecker);
         _remoteBranches = remoteBranches;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _writeGate = new WriteGate(_timeProvider);
@@ -819,12 +820,77 @@ public sealed partial class SnapshotService : IDisposable
             return unverified;
         try
         {
-            var branch = await lookup.ResolveAsync(request.RepositoryRemoteUrl).WaitAsync(_lifetime.Token).ConfigureAwait(false);
+            var branch = await lookup.ResolveAsync(request.RepositoryRemoteUrl, request.LookupTenant).WaitAsync(_lifetime.Token).ConfigureAwait(false);
             return request with { VerifiedRemoteDefaultBranch = branch };
         }
         catch (Exception ex) when (ex is not OperationCanceledException || _lifetime.IsCancellationRequested)
         {
             return unverified;
+        }
+    }
+
+    /// <summary>
+    /// Issue #203: the intake reason code when a user caller's branch advance targets a commit that is not the
+    /// remote's current <c>refs/heads/&lt;branch&gt;</c>, or <c>null</c> when it may proceed. The check is the
+    /// service's own <c>git ls-remote</c> (never the request), so a user CAS cannot move a branch to an older commit or a
+    /// <c>refs/pull/*</c> head. It applies only in clone mode (an <see cref="IRemoteBranchHeadResolver"/> exists) and
+    /// only to an ensure that may move a pointer; a failed or unavailable lookup fails closed, except that a full lookup
+    /// slot is the retryable <see cref="BranchGuardReason.LookupBusy"/>, never a verdict on the commit. Like the #199
+    /// lookup, it can make the ensure wait up to the lookup timeout (30 s), a <c>wait=false</c> caller included; the
+    /// <c>branch_update: none</c> reachability check (#209) can hold it up to 2 minutes, because it runs before the job is
+    /// registered. Cancelling the caller's token stops the remote call.
+    /// </summary>
+    public async Task<string?> UserAdvanceProblemAsync(EnsureSnapshotRequest request, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        if (request.SuppressesBranchUpdate)
+            return await UserPinnedCommitProblemAsync(request, cancellationToken).ConfigureAwait(false);
+        if (_remoteDefaults is not { HasBranchHeadResolver: true } lookup)
+            return null;
+        if (string.IsNullOrWhiteSpace(request.BranchName) || string.IsNullOrWhiteSpace(request.CommitSha))
+            return BranchGuardReason.CommitNotRemoteHead;
+        try
+        {
+            var head = await lookup.ResolveBranchHeadAsync(request.RepositoryRemoteUrl, request.BranchName, request.LookupTenant, cancellationToken)
+                .WaitAsync(cancellationToken).ConfigureAwait(false);
+            return string.Equals(head, request.CommitSha, StringComparison.OrdinalIgnoreCase)
+                ? null
+                : BranchGuardReason.CommitNotRemoteHead;
+        }
+        catch (RemoteLookupBusyException)
+        {
+            return BranchGuardReason.LookupBusy;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return BranchGuardReason.CommitNotRemoteHead;
+        }
+    }
+
+    // Issue #209: a user's `branch_update: none` ensure pins a caller-chosen commit that the worker fetches and
+    // evaluates. On GitHub a base repository serves fork-network commits (refs/pull/*, shared objects), so the commit
+    // must be reachable from a refs/heads/* branch as the service itself fetches the branches (clone mode only; in
+    // locate mode nothing is fetched). A blank commit or any failed/unavailable check is refused (fail closed).
+    private async Task<string?> UserPinnedCommitProblemAsync(EnsureSnapshotRequest request, CancellationToken cancellationToken)
+    {
+        if (_remoteDefaults is not { HasCommitBranchChecker: true } lookup)
+            return null;
+        if (string.IsNullOrWhiteSpace(request.CommitSha))
+            return BranchGuardReason.CommitNotOnBranch;
+        try
+        {
+            return await lookup.IsCommitOnBranchAsync(request.RepositoryRemoteUrl, request.CommitSha.Trim(), request.LookupTenant, cancellationToken)
+                .WaitAsync(cancellationToken).ConfigureAwait(false)
+                ? null
+                : BranchGuardReason.CommitNotOnBranch;
+        }
+        catch (RemoteLookupBusyException)
+        {
+            return BranchGuardReason.LookupBusy;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return BranchGuardReason.CommitNotOnBranch;
         }
     }
 

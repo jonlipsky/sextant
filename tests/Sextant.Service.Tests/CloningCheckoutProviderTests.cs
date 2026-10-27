@@ -376,7 +376,117 @@ public class CloningCheckoutProviderTests
             "a URL that embeds credentials is refused before git runs");
     }
 
+    // ---- commits must be on a branch (issue #209) -------------------------------------------------
+
+    [TestMethod]
+    public void IsCommitOnBranch_AcceptsBranchCommits_AndRefusesForkNetworkCommits()
+    {
+        var (remoteUrl, mainCommit) = NewRemoteRepo(out var repoDir);
+        var paths = NewPaths();
+        var provider = NewCloneProvider(paths);
+        var olderMain = mainCommit;
+        var newerMain = CommitMore(repoDir);
+
+        Git(repoDir, "checkout", "--quiet", "-b", "feature");
+        var featureOnly = CommitFile(repoDir, "Feature.cs");
+        Git(repoDir, "checkout", "--quiet", "main");
+
+        // A fork commit fetched into the canonical repository only through a pull ref, as GitHub serves them.
+        var fork = Path.Combine(Path.GetTempPath(), $"sextant_fork_{Guid.NewGuid():N}");
+        _tempDirs.Add(fork);
+        Git(repoDir, "clone", "--quiet", repoDir, fork);
+        File.WriteAllText(Path.Combine(fork, "Evil.cs"), "namespace App; public class Evil { }");
+        Git(fork, "add", "-A");
+        Git(fork, "-c", "user.email=f@example.com", "-c", "user.name=Fork", "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "fork");
+        var forkCommit = GitHead(fork);
+        Git(repoDir, "fetch", "--quiet", fork, "HEAD:refs/pull/1/head");
+
+        // Sanity: the remote really does serve that commit by id, which is the exposure #209 closes.
+        var probe = Path.Combine(Path.GetTempPath(), $"sextant_probe_{Guid.NewGuid():N}");
+        _tempDirs.Add(probe);
+        Directory.CreateDirectory(probe);
+        Git(probe, "init", "--quiet");
+        Git(probe, "fetch", "--quiet", "--depth", "1", remoteUrl, forkCommit);
+
+        Assert.IsTrue(provider.IsCommitOnBranch(remoteUrl, newerMain), "a branch head");
+        Assert.IsTrue(provider.IsCommitOnBranch(remoteUrl, olderMain), "an ancestor of a branch head");
+        Assert.IsTrue(provider.IsCommitOnBranch(remoteUrl, newerMain.ToUpperInvariant()), "object ids are case-insensitive");
+        Assert.IsTrue(provider.IsCommitOnBranch(remoteUrl, featureOnly), "a commit only on a non-default branch");
+        Assert.IsFalse(provider.IsCommitOnBranch(remoteUrl, forkCommit), "a fork commit reachable only through refs/pull/*");
+        Assert.IsFalse(Directory.EnumerateDirectories(paths.CheckoutRoot, ".tmp-clone-*").Any(), "no temp directory is left behind");
+
+        // Once a branch contains the fork commit (it was merged), it is on a branch.
+        Git(repoDir, "-c", "user.email=m@example.com", "-c", "user.name=M", "-c", "commit.gpgsign=false", "merge", "--quiet", "--no-edit", forkCommit);
+        Assert.IsTrue(provider.IsCommitOnBranch(remoteUrl, forkCommit), "a merged fork commit");
+    }
+
+    [TestMethod]
+    [DataRow("")]
+    [DataRow("main")]
+    [DataRow("abc123")]
+    [DataRow("0000000000000000000000000000000000000000")]
+    public void IsCommitOnBranch_FailsClosed(string commit)
+    {
+        var (remoteUrl, _) = NewRemoteRepo();
+        var provider = NewCloneProvider(NewPaths());
+
+        Assert.IsFalse(provider.IsCommitOnBranch(remoteUrl, commit), "not a full id, or no such commit");
+    }
+
+    [TestMethod]
+    public void IsCommitOnBranch_WhenTheRemoteCannotBeRead_IsFalse()
+    {
+        var (_, commit) = NewRemoteRepo();
+        var paths = NewPaths();
+        var missing = new Uri(Path.Combine(Path.GetTempPath(), $"sextant_missing_{Guid.NewGuid():N}")).AbsoluteUri;
+
+        Assert.IsFalse(NewCloneProvider(paths).IsCommitOnBranch(missing, commit), "an unreachable remote");
+        Assert.IsFalse(new CloningCheckoutProvider(new PersistentVolumeCheckoutProvider(paths), paths, gitExecutable: "definitely-not-git")
+            .IsCommitOnBranch("https://github.com/acme/widgets", commit), "git cannot run");
+        Assert.IsFalse(NewCloneProvider(paths).IsCommitOnBranch("******github.com/acme/widgets", commit),
+            "a URL that embeds credentials is refused before git runs");
+    }
+
+    [TestMethod]
+    public void CancellingARemoteLookup_KillsTheGitProcess_InsteadOfWaitingForItsTimeout()
+    {
+        if (!OperatingSystem.IsLinux())
+            Assert.Inconclusive("uses a shell script as the git executable");
+        var (remoteUrl, commit) = NewRemoteRepo();
+        var paths = NewPaths();
+        var scriptDir = Path.Combine(Path.GetTempPath(), $"sextant_slowgit_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(scriptDir);
+        _tempDirs.Add(scriptDir);
+        var git = Path.Combine(scriptDir, "git");
+        File.WriteAllText(git, "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in fetch|ls-remote) exec sleep 120;; esac; done\nexec git \"$@\"\n");
+        File.SetUnixFileMode(git, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        var provider = new CloningCheckoutProvider(new PersistentVolumeCheckoutProvider(paths), paths, gitExecutable: git);
+
+        foreach (var lookup in new Func<CancellationToken, object?>[]
+                 {
+                     ct => provider.IsCommitOnBranch(remoteUrl, commit, ct),
+                     ct => provider.ResolveBranchHead(remoteUrl, "main", ct)
+                 })
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            var watch = Stopwatch.StartNew();
+            var answer = lookup(cts.Token);
+
+            Assert.IsTrue(watch.Elapsed < TimeSpan.FromSeconds(20), $"the git call was killed on cancel, not run to its timeout ({watch.Elapsed})");
+            Assert.IsTrue(answer is null or false, "a cancelled lookup answers nothing");
+        }
+        Assert.IsFalse(Directory.EnumerateDirectories(paths.CheckoutRoot, ".tmp-clone-*").Any(), "no temp directory is left behind");
+    }
+
     // ---- helpers ---------------------------------------------------------------------------------
+
+    private static string CommitFile(string repoDir, string file)
+    {
+        File.WriteAllText(Path.Combine(repoDir, file), "namespace App; public class Extra { }");
+        Git(repoDir, "add", "-A");
+        Git(repoDir, "commit", "--quiet", "-m", file);
+        return GitHead(repoDir);
+    }
 
     private ServicePaths NewPaths()
     {

@@ -37,6 +37,9 @@ public static class ServiceApp
     /// <summary>The request header that names the repository a query-plane read selects.</summary>
     internal const string RepositoryHeader = "X-Sextant-Repository";
 
+    /// <summary>The <c>Retry-After</c> a user ensure gets when no remote-lookup slot is free (<c>lookup_busy</c>).</summary>
+    internal const int LookupBusyRetryAfterSeconds = 5;
+
     /// <summary>Registers the service, MCP tools, and read database provider into the builder's container.</summary>
     public static void RegisterServices(WebApplicationBuilder builder, ServiceOptions options, SnapshotService service)
     {
@@ -383,7 +386,23 @@ public static class ServiceApp
                 // Issue #199: nor may a user pick the repository's default by being its first branch: the #104
                 // first-branch default goes only to the branch the remote itself names as its default.
                 if (user is not null)
-                    request = request with { RestrictsImplicitDefault = true };
+                {
+                    request = request with { RestrictsImplicitDefault = true, LookupTenant = user.TenantId };
+                    // Issue #203: nor may a user's CAS move a branch to any commit but the remote's current head of
+                    // it (clone mode; the service looks it up itself, fail closed). `branch_update: none` is exempt.
+                    if (await service.UserAdvanceProblemAsync(request, ct) is { } headProblem)
+                    {
+                        await service.RecordUserEnsureDeniedAsync(RepositoryGrantKey.Of(request.RepositoryRemoteUrl), headProblem, AuditActor(req), ct);
+                        if (headProblem == BranchGuardReason.LookupBusy)
+                        {
+                            req.HttpContext.Response.Headers.RetryAfter = LookupBusyRetryAfterSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                            return Results.Json(new { status = "rejected", reason = headProblem }, ServiceJson.Options,
+                                statusCode: StatusCodes.Status503ServiceUnavailable);
+                        }
+                        return Results.Json(new { status = "rejected", reason = headProblem }, ServiceJson.Options,
+                            statusCode: StatusCodes.Status409Conflict);
+                    }
+                }
                 result = wait == false
                     ? await service.BeginEnsureSnapshotAsync(request, AuditActor(req), ct)
                     : await service.EnsureSnapshotAsync(request, ct, AuditActor(req));

@@ -181,6 +181,13 @@ public sealed record EnsureSnapshotRequest
     public bool RestrictsImplicitDefault { get; init; }
 
     /// <summary>
+    /// Set by the host — never bound from the wire — to the verified caller's tenant, so the service's outbound
+    /// remote lookups (issue #199/#203) are capped per tenant. <c>null</c> shares one anonymous bucket.
+    /// </summary>
+    [JsonIgnore]
+    public string? LookupTenant { get; init; }
+
+    /// <summary>
     /// The remote's default branch as the service itself resolved it for a <see cref="RestrictsImplicitDefault"/>
     /// ensure, or <c>null</c> when it was not needed or could not be determined. Set by <see cref="SnapshotService"/>
     /// only (internal + ignored), which overwrites any value a direct caller supplied.
@@ -294,6 +301,15 @@ public static class BranchGuardReason
 
     /// <summary>The idle-branch rule skipped a branch whose head commit is unknown (issue #299).</summary>
     public const string NoHeadCommit = "no_head_commit";
+
+    /// <summary>A user caller's advance targets a commit that is not the remote's current branch head (issue #203).</summary>
+    public const string CommitNotRemoteHead = "commit_not_remote_head";
+
+    /// <summary>A user caller's <c>branch_update: none</c> ensure pins a commit not reachable from a branch of the repository (issue #209).</summary>
+    public const string CommitNotOnBranch = "commit_not_on_branch";
+
+    /// <summary>No remote-lookup slot was free for the #203/#209 check; retryable (HTTP 503 with <c>Retry-After</c>), not a verdict on the commit.</summary>
+    public const string LookupBusy = "lookup_busy";
 
     /// <summary>A user caller's ensure sent <c>default_branch: true</c> (SX-6d).</summary>
     public const string DefaultBranchNotAllowed = "default_branch_not_allowed";
