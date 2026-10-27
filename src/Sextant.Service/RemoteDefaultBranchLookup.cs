@@ -106,7 +106,7 @@ internal sealed class RemoteDefaultBranchLookup(
             if (lifetime == TimeSpan.Zero)
                 Watch(entry, caller);
         }
-        _ = Task.Run(() => Run(lookup, tenant, lifetime, entry));
+        entry.Worker = Task.Run(() => Run(lookup, tenant, lifetime, entry));
         return entry.Answer.Task;
     }
 
@@ -130,7 +130,7 @@ internal sealed class RemoteDefaultBranchLookup(
             if (cancel)
                 entry.Cancellation.Cancel();
         });
-        _ = entry.Answer.Task.ContinueWith(_ => registration.Dispose(), TaskScheduler.Default);
+        entry.Unregister = entry.Answer.Task.ContinueWith(_ => registration.Dispose(), TaskScheduler.Default);
     }
 
     private void Run(Func<CancellationToken, string?> lookup, string tenant, TimeSpan lifetime, Entry entry)
@@ -179,6 +179,12 @@ internal sealed class RemoteDefaultBranchLookup(
         public CancellationTokenSource Cancellation { get; } = new();
 
         public int Waiters { get; set; }
+
+        /// <summary>The task running the lookup; <see cref="Run"/> catches everything, so it never faults.</summary>
+        public Task? Worker { get; set; }
+
+        /// <summary>The continuation that disposes the last registered waiter's cancellation registration.</summary>
+        public Task? Unregister { get; set; }
 
         /// <summary>Every waiter was cancelled; no new caller may join the (cancelled) lookup.</summary>
         public bool Abandoned { get; set; }
