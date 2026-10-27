@@ -16,7 +16,8 @@ public static class GetCallHierarchyTool
         int depth = 5,
         bool include_source = false,
         [Description(ToolText.Limit)] int? limit = null,
-        [Description(ToolText.Cursor)] string? cursor = null)
+        [Description(ToolText.Cursor)] string? cursor = null,
+        [Description(ToolText.ProjectId)] string? project_id = null)
     {
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
@@ -25,7 +26,7 @@ public static class GetCallHierarchyTool
         depth = Math.Min(depth, config.MaxCallHierarchyDepth);
         // include_source only adds each call site's surrounding lines, so a cursor carries over when it is toggled.
         if (!Paging.TryBegin("get_call_hierarchy", limit, cursor, readContext, out var page, out var cursorError,
-                symbol_fqn, direction, depth))
+                symbol_fqn, direction, depth, project_id))
             return cursorError;
 
         using var conn = db.OpenReadConnection();
@@ -40,7 +41,10 @@ public static class GetCallHierarchyTool
                 $"Unknown direction '{direction}'. Use 'callers' or 'callees'.", readContext.Provenance);
         var callees = directionName == "callees";
 
-        var lookup = SymbolResolver.Lookup(symbolStore, projectStore, symbol_fqn, CallableOptions);
+        if (!ProjectArgument.TryRestrict(project_id, projectStore, CallableOptions, readContext.Provenance,
+                out var options, out var projectError))
+            return projectError!;
+        var lookup = SymbolResolver.Lookup(symbolStore, projectStore, symbol_fqn, options);
         if (lookup.Status != SymbolLookupStatus.Resolved)
             return SymbolResolver.ErrorResponse(symbolStore, projectStore, lookup, readContext.Provenance);
         var rootSymbol = lookup.Symbol!;

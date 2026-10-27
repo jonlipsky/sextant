@@ -130,6 +130,8 @@ developer types, with or without Roslyn's `global::` alias:
 | A member qualified by its type (and optionally its namespace) | `UserService.GetById`, `MyApp.Services.UserService.GetById` |
 | A member with its parameter list (C# keywords or framework names) | `UserService.GetById(int)`, `global::MyApp.Services.UserService.GetById(System.Int32)` |
 | A Roslyn documentation ID (the stored `symbol_key`) | `M:MyApp.Services.UserService.GetById(System.Int32)`, `T:MyApp.Services.UserService` |
+| An explicit interface implementation, by its type, the interface (with or without its namespace) and the member | `MyApp.Services.UserService.IDisposable.Dispose`, `UserService.System.IDisposable.Dispose` |
+| An indexer | `UserService.this[int]`, `UserService.Item[int]`, `UserService.Item(int)` |
 
 Ranking prefers an exact symbol key, then a full path over a path suffix over a bare name, then a name spelled
 without type arguments for a non-generic symbol over a generic namesake (`Result` is `Result`, not `Result<T>`;
@@ -156,6 +158,13 @@ that already resolves:
   `symbol_not_found` names that symbol and why.
 
 Both are query-time readings over the stored data, so they need no re-index.
+
+Two more readings also run only when the argument matched nothing as written. `Type.Interface.Member` (the interface
+with or without its namespace, an optional parameter list) is read as the explicit interface implementation of that
+interface's member in the type; Roslyn stores it as `Ns.Type.System#IDisposable#Dispose`, which is also what
+`get_type_members` prints and every tool accepts. An interface the type does not implement is `symbol_not_found`,
+and several implementations that tie (two interfaces of the same name) are `ambiguous_symbol`. `Type.Item(int)`
+is read as the indexer `Type.this[int]`; a real method named `Item` is never shadowed.
 
 The `fully_qualified_name` a tool prints for a symbol is in one of those accepted forms (a type's
 `global::Ns.Type`, a method's `global::Ns.Type.Method(int)`, a field's `global::Ns.Type.Field`, else its
@@ -228,7 +237,12 @@ frameworks), the tool answers for one of them and discloses the others in `meta`
 ```
 
 These fields are omitted when the symbol is declared once. To pin a specific project version, re-issue the call with
-a narrowing `project_id`.
+a narrowing `project_id` (a canonical id from `meta.candidates` or `find_symbol`). Every tool that takes a symbol
+accepts it as its last, optional parameter: `get_call_hierarchy`, `get_impact`, `get_implementors`,
+`get_type_dependents`, `get_type_hierarchy`, `get_type_members`, `trace_value` and `find_cross_repository_usages`
+(where it pins the provider symbol's project version), as `find_symbol` and `find_references` already did. Without it
+the answer is for the first version, as above. An unknown id is `invalid_argument`; a project that does not declare
+the symbol is `symbol_not_found`. It is part of a cursor's binding, so a cursor is not reusable across versions.
 
 ### Feature availability (Phase 8)
 
@@ -395,6 +409,7 @@ Members of a type with their signatures.
 | `symbol_fqn` | string | yes | Fully qualified name of the type |
 | `include_inherited` | bool | no | Include members from base types |
 | `limit` / `cursor` | int / string | no | Paging (see [Paged results](#paged-results)); declared members in source order, then inherited ones |
+| `project_id` | string | no | Answer for this project version of a multi-targeted type (see [Tool errors](#tool-errors)) |
 
 ### get_file_symbols
 

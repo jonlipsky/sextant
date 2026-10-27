@@ -167,6 +167,117 @@ public class CrossRepositoryUsageResolverTests
     }
 
     [TestMethod]
+    public void Resolve_ProviderProjectId_ReadsOnlyThatProjectVersionsUsages()
+    {
+        // The provider symbol is declared in two project versions (net10.0 and net8.0) that different consumers pin
+        // and use (#224). Without a provider project the usages of both are unioned (today's answer); naming one
+        // version reads only its own, and a version no consumer pins has no stable identity.
+        var (providerSnap, net10Project, providerRepo, net10Symbol) = SeedProvider();
+        var store = new SnapshotStore(_conn);
+        var logicalId = store.EnsureLogicalProject(providerRepo, "logical_mix_net8", "lib/Mix.csproj", "net8.0", now: 1);
+        var net8Project = new ProjectStore(_conn).UpsertSnapshotProject(
+            new ProjectIdentity { CanonicalId = "logical_mix_net8", GitRemoteUrl = ProviderUrl, RepoRelativePath = "lib/Mix.csproj", TargetFramework = "net8.0" },
+            providerSnap, logicalId, lastIndexedAt: 1);
+        store.MapProject(providerSnap, net8Project);
+        var net8Symbol = InsertSymbol(net8Project, ProviderKey, "Mix.Combiner.Combine()");
+        SeedConsumer(AppAUrl, "appA_head", "logical_appA", "src/A/UseA.cs", 10,
+            providerSnap, net10Project, providerRepo, net10Symbol);
+        SeedConsumer(AppBUrl, "appB_head", "logical_appB", "src/B/UseB.cs", 20,
+            providerSnap, net8Project, providerRepo, net8Symbol);
+
+        var all = CrossRepositoryUsageResolver.Resolve(
+            _conn, ProviderUrl, ProviderFqn, CrossRepoUsageScope.DefaultHeads, AllowAllReadAuthorizer.Instance);
+        var net10 = CrossRepositoryUsageResolver.Resolve(
+            _conn, ProviderUrl, ProviderFqn, new CrossRepoUsageScope { ProviderProjectCanonicalId = "logical_mix" },
+            AllowAllReadAuthorizer.Instance);
+        var net8 = CrossRepositoryUsageResolver.Resolve(
+            _conn, ProviderUrl, ProviderFqn, new CrossRepoUsageScope { ProviderProjectCanonicalId = "logical_mix_net8" },
+            AllowAllReadAuthorizer.Instance);
+        var unpinned = CrossRepositoryUsageResolver.Resolve(
+            _conn, ProviderUrl, ProviderFqn, new CrossRepoUsageScope { ProviderProjectCanonicalId = "no_such_project" },
+            AllowAllReadAuthorizer.Instance);
+
+        CollectionAssert.AreEquivalent(new[] { AppAUrl, AppBUrl }, all.Usages.Select(u => u.ConsumerRepositoryUrl).ToArray());
+        CollectionAssert.AreEqual(new[] { AppAUrl }, net10.Usages.Select(u => u.ConsumerRepositoryUrl).ToArray());
+        CollectionAssert.AreEqual(new[] { AppBUrl }, net8.Usages.Select(u => u.ConsumerRepositoryUrl).ToArray());
+        Assert.IsFalse(unpinned.StableIdentityResolved);
+        Assert.AreEqual(0, unpinned.Usages.Count);
+    }
+
+    [TestMethod]
+    public void Tool_ProjectId_NamesAProviderProjectInAnotherRepository_AndAnUnknownIdIsNoOracle()
+    {
+        // Through the tool, with the provider in a different repository than the selected snapshot (#224): the
+        // project_id is read among the versions consumers pin, never the selected snapshot's. An unknown id answers
+        // exactly as an id of a provider the caller may not read.
+        var (providerSnap, net10Project, providerRepo, net10Symbol) = SeedProvider();
+        var store = new SnapshotStore(_conn);
+        var logicalId = store.EnsureLogicalProject(providerRepo, "logical_mix_net8", "lib/Mix.csproj", "net8.0", now: 1);
+        var net8Project = new ProjectStore(_conn).UpsertSnapshotProject(
+            new ProjectIdentity { CanonicalId = "logical_mix_net8", GitRemoteUrl = ProviderUrl, RepoRelativePath = "lib/Mix.csproj", TargetFramework = "net8.0" },
+            providerSnap, logicalId, lastIndexedAt: 1);
+        store.MapProject(providerSnap, net8Project);
+        var net8Symbol = InsertSymbol(net8Project, ProviderKey, "Mix.Combiner.Combine()");
+        SeedConsumer(AppAUrl, "appA_head", "logical_appA", "src/A/UseA.cs", 10,
+            providerSnap, net10Project, providerRepo, net10Symbol);
+        SeedConsumer(AppBUrl, "appB_head", "logical_appB", "src/B/UseB.cs", 20,
+            providerSnap, net8Project, providerRepo, net8Symbol);
+
+        using var provider = new DatabaseProvider(_dbPath);
+        string Call(string? projectId) =>
+            Sextant.Mcp.Tools.FindCrossRepositoryUsagesTool.FindCrossRepositoryUsages(
+                provider, ProviderUrl, ProviderFqn, project_id: projectId);
+
+        var all = Call(null);
+        var net8 = Call("logical_mix_net8");
+        var net10 = Call("logical_mix");
+        var unknown = Call("no_such_project");
+
+        StringAssert.Contains(all, AppAUrl);
+        StringAssert.Contains(all, AppBUrl);
+        StringAssert.Contains(net8, AppBUrl);
+        Assert.IsFalse(net8.Contains(AppAUrl), net8);
+        StringAssert.Contains(net10, AppAUrl);
+        Assert.IsFalse(net10.Contains(AppBUrl), net10);
+        StringAssert.Contains(unknown, "stable identity");
+        Assert.IsFalse(unknown.Contains("Unknown project_id"), unknown);
+    }
+
+    [TestMethod]
+    public void Tool_ProjectId_WithOneConsumerRepository_ReadsTheProvidersPinnedVersion_NotTheSelectedSnapshots()
+    {
+        // With a single consumer repository its snapshot is THE selected one, and it holds no provider project: the
+        // project_id still names the provider project version the consumer pins (#224), and an id of an unpinned
+        // version answers like an unknown one.
+        var (providerSnap, net10Project, providerRepo, _) = SeedProvider();
+        var store = new SnapshotStore(_conn);
+        var logicalId = store.EnsureLogicalProject(providerRepo, "logical_mix_net8", "lib/Mix.csproj", "net8.0", now: 1);
+        var net8Project = new ProjectStore(_conn).UpsertSnapshotProject(
+            new ProjectIdentity { CanonicalId = "logical_mix_net8", GitRemoteUrl = ProviderUrl, RepoRelativePath = "lib/Mix.csproj", TargetFramework = "net8.0" },
+            providerSnap, logicalId, lastIndexedAt: 1);
+        store.MapProject(providerSnap, net8Project);
+        var net8Symbol = InsertSymbol(net8Project, ProviderKey, "Mix.Combiner.Combine()");
+        SeedConsumer(AppBUrl, "appB_head", "logical_appB", "src/B/UseB.cs", 20,
+            providerSnap, net8Project, providerRepo, net8Symbol);
+
+        using var provider = new DatabaseProvider(_dbPath);
+        string Call(string projectId) =>
+            Sextant.Mcp.Tools.FindCrossRepositoryUsagesTool.FindCrossRepositoryUsages(
+                provider, ProviderUrl, ProviderFqn, project_id: projectId);
+
+        var net8 = Call("logical_mix_net8");
+        var unpinned = Call("logical_mix");
+        var unknown = Call("no_such_project");
+
+        StringAssert.Contains(net8, AppBUrl);
+        StringAssert.Contains(unpinned, "stable identity");
+        Assert.AreEqual(
+            System.Text.Json.JsonDocument.Parse(unpinned).RootElement.GetProperty("message").GetString(),
+            System.Text.Json.JsonDocument.Parse(unknown).RootElement.GetProperty("message").GetString());
+        Assert.AreNotEqual(0, net10Project);
+    }
+
+    [TestMethod]
     public void Resolve_SymbolOutsideTheProviderRepository_IsNotResolved()
     {
         // The name is resolved only among the provider's pinned projects: the same name in a consumer repository is

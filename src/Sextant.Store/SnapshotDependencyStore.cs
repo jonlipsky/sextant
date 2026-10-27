@@ -18,6 +18,16 @@ public sealed record CrossRepoUsageScope
     /// <summary>Restrict to a specific consumer commit (historical, criterion 5). Null = branch-head scope.</summary>
     public string? ConsumerCommitSha { get; init; }
 
+    /// <summary>
+    /// Restrict to the usages of the symbol's declaration in the provider project named by this canonical id (issue
+    /// #224). The resolver turns it into <see cref="ProviderProjectIds"/> among the versions consumers pin.
+    /// Null = every pinned provider project version declaring the key (the default; its SQL is unchanged).
+    /// </summary>
+    public string? ProviderProjectCanonicalId { get; init; }
+
+    /// <summary>The provider project versions the usage query is restricted to; set by the resolver, null = all.</summary>
+    public IReadOnlyCollection<long>? ProviderProjectIds { get; init; }
+
     /// <summary>The default scope: each authorized consumer repository's current default-branch head.</summary>
     public static CrossRepoUsageScope DefaultHeads { get; } = new();
 }
@@ -105,6 +115,27 @@ public sealed class SnapshotDependencyStore(SqliteConnection connection)
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
             ids.Add(reader.GetInt64(0));
+        return ids;
+    }
+
+    /// <summary>The pinned provider project versions of a repository whose logical canonical id is <paramref name="canonicalId"/>.</summary>
+    public HashSet<long> GetPinnedProviderProjectIds(string providerRepositoryUrl, string canonicalId)
+    {
+        var pinned = GetPinnedProviderProjectIds(providerRepositoryUrl);
+        var ids = new HashSet<long>();
+        if (pinned.Count == 0)
+            return ids;
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT p.id FROM projects p
+            LEFT JOIN logical_projects lp ON lp.id = p.logical_project_id
+            WHERE COALESCE(lp.canonical_id, p.canonical_id) = @canon;
+            """;
+        cmd.Parameters.AddWithValue("@canon", canonicalId);
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            if (pinned.Contains(reader.GetInt64(0)))
+                ids.Add(reader.GetInt64(0));
         return ids;
     }
 
@@ -365,7 +396,7 @@ public sealed class SnapshotDependencyStore(SqliteConnection connection)
               AND psym.project_id IN (
                   SELECT pd.provider_project_id FROM snapshot_dependencies pd
                   WHERE pd.provider_repository_id = @provider_repo_id)
-              AND cs.status IN (@published_complete, @published_superseded)
+              AND cs.status IN (@published_complete, @published_superseded){(scope.ProviderProjectIds != null ? $"\n  AND psym.project_id IN ({string.Join(",", scope.ProviderProjectIds.Select(id => id.ToString(System.Globalization.CultureInfo.InvariantCulture)))})" : "")}
             """;
     }
 

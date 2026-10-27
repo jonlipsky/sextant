@@ -84,8 +84,20 @@ public static class CrossRepositoryUsageResolver
         var providerProjects = store.GetPinnedProviderProjectIds(providerRepositoryUrl);
         if (providerProjects.Count == 0)
             return new CrossRepositoryUsageResult(StableIdentityResolved: false, ResolvedSymbolKeys: [], Usages: []);
+        var lookupOptions = SymbolLookupOptions.Any;
+        if (!string.IsNullOrWhiteSpace(scope.ProviderProjectCanonicalId))
+        {
+            // The provider project named by canonical id (#224), as the versions consumers pin: the selected
+            // snapshot's own versions are not the provider's. An id no consumer pins has no stable identity to
+            // report, the same answer as an unauthorized provider (checked above).
+            var versions = store.GetPinnedProviderProjectIds(providerRepositoryUrl, scope.ProviderProjectCanonicalId.Trim());
+            if (versions.Count == 0)
+                return new CrossRepositoryUsageResult(StableIdentityResolved: false, ResolvedSymbolKeys: [], Usages: []);
+            lookupOptions = lookupOptions with { ProjectIds = versions };
+            scope = scope with { ProviderProjectIds = versions };
+        }
         var lookup = SymbolResolver.Lookup(
-            new SymbolStore(conn) { ProjectRestriction = providerProjects }, new ProjectStore(conn), symbolFqn);
+            new SymbolStore(conn) { ProjectRestriction = providerProjects }, new ProjectStore(conn), symbolFqn, lookupOptions);
         if (lookup.Status == SymbolLookupStatus.Ambiguous)
         {
             return new CrossRepositoryUsageResult(StableIdentityResolved: false, ResolvedSymbolKeys: [], Usages: [])

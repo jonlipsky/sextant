@@ -12,7 +12,8 @@ public static class GetTypeHierarchyTool
     public static string GetTypeHierarchy(
         DatabaseProvider dbProvider,
         [Description("Type, fully qualified.")] string symbol_fqn,
-        [Description("up, down or both.")] string direction = "both")
+        [Description("up, down or both.")] string direction = "both",
+        [Description(ToolText.ProjectId)] string? project_id = null)
     {
         if (!dbProvider.TryBeginRead(out var db, out var readContext, out var authError))
             return authError;
@@ -28,7 +29,10 @@ public static class GetTypeHierarchyTool
                 $"Unknown direction '{direction}'. Use 'up' (base types), 'down' (derived types) or 'both'.",
                 readContext.Provenance);
 
-        var lookup = SymbolResolver.Lookup(symbolStore, projectStore, symbol_fqn, SymbolLookupOptions.Types);
+        if (!ProjectArgument.TryRestrict(project_id, projectStore, SymbolLookupOptions.Types, readContext.Provenance,
+                out var options, out var projectError))
+            return projectError!;
+        var lookup = SymbolResolver.Lookup(symbolStore, projectStore, symbol_fqn, options);
         if (lookup.Status != SymbolLookupStatus.Resolved)
             return SymbolResolver.ErrorResponse(symbolStore, projectStore, lookup, readContext.Provenance);
         var rootSymbol = lookup.Symbol!;
