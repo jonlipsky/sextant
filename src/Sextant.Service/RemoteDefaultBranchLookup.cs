@@ -106,7 +106,9 @@ internal sealed class RemoteDefaultBranchLookup(
             if (lifetime == TimeSpan.Zero)
                 Watch(entry, caller);
         }
-        entry.Worker = Task.Run(() => Run(lookup, tenant, lifetime, entry));
+        // The shared lookup is cancelled through entry.Cancellation once every waiter has left (Watch), never by one
+        // caller's token.
+        entry.Worker = Task.Run(() => Run(lookup, tenant, lifetime, entry), CancellationToken.None);
         return entry.Answer.Task;
     }
 
