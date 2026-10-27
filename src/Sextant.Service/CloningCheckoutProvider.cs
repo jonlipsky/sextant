@@ -727,7 +727,7 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
     }
 
     /// <summary>How a git invocation failed, so a caller can tell a TRANSIENT transport failure from a permanent one.</summary>
-    internal enum GitFailureKind { None, NonZeroExit, Timeout, SpawnFailure }
+    internal enum GitFailureKind { None, NonZeroExit, Timeout, SpawnFailure, Cancelled }
 
     /// <summary>The git subcommand a failure occurred at (drives transient-vs-deterministic classification).</summary>
     internal enum GitStage { Init, RemoteAdd, Fetch, Checkout, RevParse, Configure }
@@ -848,7 +848,14 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
         RunGit(workingDir, environment, GitTimeout, args);
 
     /// <summary><see cref="RunGit(string, GitEnvironment, string[])"/> under a caller-chosen deadline.</summary>
-    private GitResult RunGit(string workingDir, GitEnvironment environment, TimeSpan timeout, params string[] args)
+    private GitResult RunGit(string workingDir, GitEnvironment environment, TimeSpan timeout, params string[] args) =>
+        RunGit(workingDir, environment, timeout, CancellationToken.None, args);
+
+    /// <summary>
+    /// <see cref="RunGit(string, GitEnvironment, TimeSpan, string[])"/> that also kills the process tree when
+    /// <paramref name="cancellationToken"/> is cancelled (kind <see cref="GitFailureKind.Cancelled"/>).
+    /// </summary>
+    private GitResult RunGit(string workingDir, GitEnvironment environment, TimeSpan timeout, CancellationToken cancellationToken, params string[] args)
     {
         Process? process = null;
         try
@@ -903,6 +910,8 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
 
             process.StandardInput.Close();
 
+            var started = process;
+            using var killOnCancel = cancellationToken.Register(() => KillTree(started));
             using var cts = new CancellationTokenSource(timeout);
             var stdoutTask = process.StandardOutput.ReadToEndAsync(cts.Token);
             var stderrTask = process.StandardError.ReadToEndAsync(cts.Token);
@@ -914,6 +923,8 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
                 return new GitResult(false, GitFailureKind.Timeout, string.Empty, string.Empty);
             }
 
+            if (cancellationToken.IsCancellationRequested)
+                return new GitResult(false, GitFailureKind.Cancelled, string.Empty, string.Empty);
             var stdout = SafeResult(stdoutTask);
             var stderr = SafeResult(stderrTask);
             return process.ExitCode == 0

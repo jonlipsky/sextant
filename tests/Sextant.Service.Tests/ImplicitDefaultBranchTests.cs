@@ -196,7 +196,7 @@ public class ImplicitDefaultBranchTests
     }
 
     [TestMethod]
-    [DataRow(false, null, "main", null)]
+    [DataRow(false, null, "main", true)]
     [DataRow(true, null, "main", false)]
     [DataRow(true, "main", "main", true)]
     [DataRow(true, "main", "feature", false)]

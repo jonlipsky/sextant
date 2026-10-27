@@ -1018,10 +1018,10 @@ public sealed class LocalIndexerSnapshotWorker(
         ExpectedHeadCommit = request.ExpectedHeadCommit,
         SuppressBranchUpdate = request.SuppressesBranchUpdate ? true : null,
         // Issue #199: a caller that may not pick the default gets the first-branch default only for the remote's own
-        // default branch, as the service verified it. Null for every other ensure, so its advance is unchanged.
-        AllowImplicitDefault = request.RestrictsImplicitDefault
-            ? request.AllowsImplicitDefault(EffectiveBranchName(request))
-            : null,
+        // default branch, as the service verified it. True for every other ensure, so its advance is unchanged.
+        // Always explicit (issue #203): the restriction is [JsonIgnore], so a null here would fall back to
+        // the orchestrator's "allowed" across any future serialization boundary.
+        AllowImplicitDefault = request.AllowsImplicitDefault(EffectiveBranchName(request)),
         // Issue #113: must equal the service's ServiceOptions.SdkPinIdentityComponent, or the service's
         // ValidateWorkerResult fails the job closed (published identity != requested identity).
         SdkPinPolicy = sdkPinPolicy,

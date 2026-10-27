@@ -1447,9 +1447,40 @@ checked in this order, reading nothing but the body:
 A user's CAS (`expected_head_commit` plus `branch_name`) moves only the branch it names, and only while that
 branch still points at the expected commit. A stale CAS attaches without moving anything. `default_branch: false`
 and `forced` are allowed. A body that also trips an SVC-6+7 conflict (`conflicting_branch_guards`,
-`invalid_branch_update`) keeps that code. The service cannot verify the upstream head, so a user CAS can still
-move its branch, the default included, from the head it observed to a commit it names. The calling app is
-expected to check the head upstream first.
+`invalid_branch_update`) keeps that code.
+
+**A user's advance targets the remote's current head (issue #203).** In clone mode, after the body checks, a user
+ensure that may move a pointer (not `branch_update: none`) is refused with `409
+{"status":"rejected","reason":"commit_not_remote_head"}` unless its `commit_sha` is the commit `refs/heads/<branch>`
+names on the remote right now. The service asks the remote itself (`git ls-remote <url> refs/heads/<branch>`, same
+credential scoping and 30 s timeout as the #199 lookup; the request never supplies it), so a user CAS cannot move a
+branch to an older commit or a `refs/pull/*` head. It fails closed: an unreachable remote, a missing branch, an
+unparseable answer is the same `409`, audited `ensure`/`denied` with the repository scope. A full lookup
+slot (per tenant or global) is not a verdict on the commit: it is `503 {"status":"rejected","reason":"lookup_busy"}`
+with `Retry-After: 5`, also audited, and safe to retry. If the caller disconnects, the `git` call is killed so it
+does not hold its slot.
+Head answers are shared between concurrent callers but never remembered, because a push moves the head. In locate
+mode (no clone) there is nothing to ask and the check is skipped. Application and assertion-less callers are
+unchanged.
+
+**A user's pinned commit must be on a branch (issue #209).** On GitHub a base repository also serves fork-network
+commits (`refs/pull/*` heads and objects shared across the fork network), and the worker evaluates what it fetches
+with MSBuild, so a user could otherwise get untrusted fork code evaluated by pinning its SHA with `branch_update:
+none`. In clone mode a user ensure with `branch_update: none` is therefore refused with `409
+{"status":"rejected","reason":"commit_not_on_branch"}` unless `commit_sha` (a full 40/64-hex id) is reachable from a
+`refs/heads/*` branch of the canonical repository. The service decides this itself, before any job row or
+evaluation: it fetches only `+refs/heads/*` (commits and trees, no blobs, no tags, no pull refs) into a throwaway
+repository with the #199 credential scoping and a 2 minute bound, then asks `git for-each-ref --contains`. A commit
+present in the remote only through a pull ref is never transferred, so it is not found. It fails closed: a blank
+commit, an abbreviated id, an unreachable remote or a git failure is the same `409`, audited
+`ensure`/`denied` with the repository scope; a full lookup slot is the retryable `503 lookup_busy` described above, never
+`commit_not_on_branch`. Concurrent checks of one commit share a call; answers are not
+remembered. A user CAS (`expected_head_commit`) is unaffected: its #203 check already requires the commit to be a
+branch head. **Contract change:** a user can no longer index a commit that is on no branch (an unmerged pull
+request head, a force-pushed-away commit); an application caller still can, and a user can index such a commit
+once it is merged to a branch. Locate mode fetches nothing, so the check is skipped there. Application and
+assertion-less callers are unchanged. The MCP `start-indexing` tool (`commitSha`) of the ProcessStack app is
+subject to this refusal for user runs.
 
 **No implicit default for a user (issue #199).** A repository's first branch normally becomes its default (the
 #104 safety net). For a user caller it does so only when that branch is the one the remote's `HEAD` names. The
@@ -1458,9 +1489,14 @@ as a clone and a 30 s timeout. The request never supplies it. The lookup happens
 default and only for an ensure that may move a pointer, never under `branch_update: none`. Lookups are bounded:
 - concurrent lookups of one repository share one call;
 - an answer is remembered for 60 s;
-- at most 4 run at once.
+- at most 4 run at once per tenant (the verified caller's tenant), and 32 in all, so one tenant's slow remotes
+  cannot hold the slots other tenants need (issue #203).
 
-Such an ensure, `?wait=false` included, is registered only after its lookup finishes. The branch is created
+**Latency (issue #203).** Such an ensure, `?wait=false` included, is registered only after its lookup finishes
+(and a user advance only after the #203 head check above), so the call can block for up to about 30 s per lookup
+(a slow remote) before it returns; a user `branch_update: none` ensure waits for the #209 reachability check, which can
+hold it for up to 2 minutes. A fast remote adds one `ls-remote` round trip. The wait is deliberate: the
+fail-closed answer decides how the branch is created, so it cannot run after registration. The branch is created
 non-default when the lookup is unavailable: in locate mode, when every lookup slot is busy, or when the remote is
 unreachable or its answer is unparseable. The repository then gets a default from an application
 ensure (a push or reconcile) or from a user ensure of the remote's default branch. Application and

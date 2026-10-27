@@ -360,20 +360,20 @@ public class UserEnsureBoundsHttpTests
         """{"expected_head_commit":""}"""
     ];
 
-    private static void Seed(IndexDatabase db)
+    internal static void Seed(IndexDatabase db)
     {
         foreach (var commit in new[] { "commit-w2", "commit-w3" })
             ServiceTestFixtures.PublishComplete(db, ServiceTestFixtures.Request(repo: Widgets, commit: commit), symbolCount: 1, recordCommit: true);
     }
 
-    private static async Task GrantAsync(Harness host, string repository)
+    internal static async Task GrantAsync(Harness host, string repository)
     {
         using var grant = await host.ControlAsync(HttpMethod.Put, "/control/grants/self", ControlToken, host.UserAssertion(),
             JsonSerializer.Serialize(new { repository }));
         Assert.AreEqual(HttpStatusCode.OK, grant.StatusCode, await grant.Content.ReadAsStringAsync());
     }
 
-    private static string EnsureOf(string repository, string commit, string fields)
+    internal static string EnsureOf(string repository, string commit, string fields)
     {
         var body = JsonSerializer.SerializeToNode(
             new EnsureSnapshotRequest { RepositoryRemoteUrl = repository, CommitSha = commit }, ServiceJson.Options)!.AsObject();
@@ -382,7 +382,7 @@ public class UserEnsureBoundsHttpTests
         return body.ToJsonString();
     }
 
-    private static async Task<JsonElement> EnsureOkAsync(Harness host, string? assertion, string repository, string commit, string fields)
+    internal static async Task<JsonElement> EnsureOkAsync(Harness host, string? assertion, string repository, string commit, string fields)
     {
         using var response = await host.ControlAsync(HttpMethod.Post, Ensure, ControlToken, assertion, EnsureOf(repository, commit, fields));
         var raw = await response.Content.ReadAsStringAsync();
@@ -390,7 +390,7 @@ public class UserEnsureBoundsHttpTests
         return JsonDocument.Parse(raw).RootElement.Clone();
     }
 
-    private static async Task<string> AssertRejectedAsync(HttpResponseMessage response, HttpStatusCode status, string reason)
+    internal static async Task<string> AssertRejectedAsync(HttpResponseMessage response, HttpStatusCode status, string reason)
     {
         var raw = await response.Content.ReadAsStringAsync();
         Assert.AreEqual(status, response.StatusCode, raw);
