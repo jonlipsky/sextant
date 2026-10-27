@@ -51,16 +51,23 @@ internal static class RepositoryInferenceFilter
                 || RepositoryInference.ProbeFor(name, parameters.Arguments) is not { } probe)
                 return await next(context, cancellationToken);
 
-            var candidates = service.ListSelectableRepositories(keys, MaxRepositories + 1);
-            if (candidates.Count is < 2 or > MaxRepositories)
-                return await next(context, cancellationToken);
-
             var provider = services.GetRequiredService<DatabaseProvider>();
-            var holders = RepositoryInference.Holders(provider.ProbeRepositories(candidates, (db, read) =>
+            // Listing the candidates and probing them share one hard budget; running out (or too few or too many
+            // candidates) leaves the call unchanged.
+            var hits = RepositoryInference.RunWithin<IReadOnlyList<(string Repository, int Rank)>>(RepositoryInference.ProbeBudget, cancellationToken, token =>
             {
-                probes.Increment();
-                return probe(db, read);
-            }, cancellationToken));
+                var candidates = service.ListSelectableRepositories(keys, MaxRepositories + 1);
+                if (candidates.Count is < 2 or > MaxRepositories)
+                    return null;
+                return provider.ProbeRepositories(candidates, (db, read) =>
+                {
+                    probes.Increment();
+                    return probe(db, read);
+                }, token);
+            });
+            if (hits is null)
+                return await next(context, cancellationToken);
+            var holders = RepositoryInference.Holders(hits);
             if (holders.Count == 1)
             {
                 ToolCallSelection.Set(http, new ToolCallSelection(holders[0], null, ToolSelectionSource.Inferred));

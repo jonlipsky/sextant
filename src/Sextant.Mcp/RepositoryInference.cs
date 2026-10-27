@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Microsoft.Data.Sqlite;
 using Sextant.Mcp.Tools;
 using Sextant.Store;
 
@@ -55,6 +56,9 @@ public static class RepositoryInference
                     return null;
                 if (Flag(arguments, "fuzzy"))
                 {
+                    // No safe query: the call falls through, and the tool reports invalid_argument.
+                    if (FtsQueryText.ToSafeQuery(value) is null)
+                        return null;
                     var maxResults = Sextant.Core.SextantConfiguration.FromEnvironment().FtsMaxResults;
                     return (db, context) =>
                     {
@@ -72,6 +76,55 @@ public static class RepositoryInference
             default:
                 return (db, context) => SymbolRank(db, context, value, SymbolLookupOptions.Any);
         }
+    }
+
+    /// <summary>The time one call may spend probing repositories before inference is abandoned.</summary>
+    public static readonly TimeSpan ProbeBudget = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Runs <paramref name="work"/> under a hard bound of <paramref name="budget"/> and returns its result, or null when
+    /// the budget ran out: read connections opened inside <paramref name="work"/> are interrupted
+    /// (<see cref="ReadInterrupt"/>) so a query still running at that moment fails at once instead of finishing. A
+    /// partial answer is never returned. <paramref name="clock"/> (default the system clock) times the budget.
+    /// </summary>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public static T? RunWithin<T>(
+        TimeSpan budget, CancellationToken cancellationToken, Func<CancellationToken, T> work, TimeProvider? clock = null)
+        where T : class
+    {
+        ArgumentNullException.ThrowIfNull(work);
+        using var timeout = new CancellationTokenSource(budget, clock ?? TimeProvider.System);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
+        using var interrupt = ReadInterrupt.Begin(linked.Token);
+        try
+        {
+            return work(linked.Token);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && timeout.IsCancellationRequested)
+        {
+            return null;
+        }
+        catch (SqliteException e) when (e.SqliteErrorCode == ReadInterrupt.InterruptedErrorCode && linked.IsCancellationRequested)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Probes <paramref name="repositories"/> like <see cref="DatabaseProvider.ProbeRepositories"/>, but gives up once
+    /// <paramref name="budget"/> has passed, interrupting a probe query that is still running (see
+    /// <see cref="RunWithin{T}"/>), and returns null: a partial answer would name the wrong holders, so the call then
+    /// goes on without inference, as when nothing is inferred.
+    /// </summary>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public static IReadOnlyList<(string Repository, int Rank)>? ProbeWithin(
+        DatabaseProvider provider, IReadOnlyList<string> repositories,
+        Func<IndexDatabase, FederatedReadContext, int?> probe, TimeSpan budget, CancellationToken cancellationToken,
+        TimeProvider? clock = null)
+    {
+        ArgumentNullException.ThrowIfNull(provider);
+        return RunWithin(budget, cancellationToken, token => provider.ProbeRepositories(repositories, probe, token), clock);
     }
 
     /// <summary>

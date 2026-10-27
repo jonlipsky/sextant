@@ -350,6 +350,14 @@ public class McpToolTests
     }
 
     [TestMethod]
+    public void SemanticSearch_AnFtsSyntaxQuery_StillFailsAsBefore_NeverTakingTheFuzzyFindSymbolFallback()
+    {
+        var e = Assert.ThrowsExactly<Microsoft.Data.Sqlite.SqliteException>(
+            () => SemanticSearchTool.SemanticSearch(_dbProvider, "Test.Foo", max_results: 10));
+        StringAssert.Contains(e.Message, "fts5:");
+    }
+
+    [TestMethod]
     public void GetImpact_ReturnsConsumersWithReferenceCounts()
     {
         // Set up: projectB depends on _projectId (test project)

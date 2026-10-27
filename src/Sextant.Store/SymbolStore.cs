@@ -268,7 +268,44 @@ public sealed class SymbolStore(SqliteConnection connection)
         return ReadAll(cmd);
     }
 
-    public List<SymbolInfo> SearchFts(string query, int maxResults, string? kindFilter = null)
+    /// <summary>
+    /// A full-text search with the query handed to FTS5 as written: a query FTS5 rejects throws its
+    /// <see cref="SqliteException"/>. <see cref="SearchFtsTolerant"/> is the forgiving variant.
+    /// </summary>
+    public List<SymbolInfo> SearchFts(string query, int maxResults, string? kindFilter = null) =>
+        RunFts(query, maxResults, kindFilter);
+
+    /// <summary>
+    /// A full-text search that keeps the operators of a query FTS5 accepts as written (<c>Polyg*</c>, <c>A OR B</c>).
+    /// For one it rejects as query syntax (<c>Process.Runner</c>, <c>IStore&lt;T&gt;</c>, <c>global::A.B</c>) it tries the
+    /// identifier-token queries of <see cref="FtsQueryText.SafeQueries"/> in order and returns the first that finds
+    /// anything (empty when none does, or when the name has no token). Only a query-syntax error is absorbed; any other
+    /// SQLite error propagates.
+    /// </summary>
+    public List<SymbolInfo> SearchFtsTolerant(string query, int maxResults, string? kindFilter = null)
+    {
+        try
+        {
+            return RunFts(query, maxResults, kindFilter);
+        }
+        catch (SqliteException e) when (IsQuerySyntaxError(e))
+        {
+            foreach (var safe in FtsQueryText.SafeQueries(query))
+            {
+                var found = RunFts(safe, maxResults, kindFilter);
+                if (found.Count > 0)
+                    return found;
+            }
+            return [];
+        }
+    }
+
+    private static bool IsQuerySyntaxError(SqliteException e) =>
+        e.SqliteErrorCode == 1
+        && (e.Message.Contains("fts5:", StringComparison.Ordinal)
+            || e.Message.Contains("no such column", StringComparison.Ordinal));
+
+    private List<SymbolInfo> RunFts(string query, int maxResults, string? kindFilter)
     {
         using var cmd = connection.CreateCommand();
         var kindClause = kindFilter != null ? " AND s.kind = @kind" : "";

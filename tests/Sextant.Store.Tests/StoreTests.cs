@@ -111,6 +111,36 @@ public class StoreTests
         var results = _symbolStore.SearchFts("Customer", 10);
         Assert.AreEqual(1, results.Count);
         Assert.AreEqual("CustomerService", results[0].DisplayName);
+
+        Assert.AreEqual(1, _symbolStore.SearchFtsTolerant("Cust*", 10).Count, "FTS operators keep working");
+        foreach (var spelling in new[] { "Customer.", "global::Customer", "Customer<T>", "Customer(int)", "Ns.Cust.Customer", "Customer.Service" })
+            Assert.AreEqual(1, _symbolStore.SearchFtsTolerant(spelling, 10).Count, spelling);
+        Assert.AreEqual(1, _symbolStore.SearchFtsTolerant("Customer.Service", 10).Count, "joined tokens: CustomerService");
+        Assert.AreEqual(0, _symbolStore.SearchFtsTolerant("...", 10).Count);
+        Assert.AreEqual(0, _symbolStore.SearchFtsTolerant("Nope.Missing", 10).Count);
+
+        // The plain search is unchanged: FTS5's own error for a query it rejects (semantic_search relies on it).
+        var raw = Assert.ThrowsExactly<Microsoft.Data.Sqlite.SqliteException>(() => _symbolStore.SearchFts("Customer.Service", 10));
+        StringAssert.Contains(raw.Message, "fts5:");
+
+        Assert.AreEqual("\"Process\"* \"Runner\"*", FtsQueryText.ToSafeQuery("global::Process.Runner"));
+        Assert.AreEqual("\"IStore\"*", FtsQueryText.ToSafeQuery("IStore<T>"));
+        Assert.IsNull(FtsQueryText.ToSafeQuery("<>"));
+        CollectionAssert.AreEqual(
+            new[] { "\"ProcessStack\"* \"Process\"* \"ProcessRunner\"*", "\"ProcessRunner\"*", "\"ProcessStackProcessProcessRunner\"*" },
+            FtsQueryText.SafeQueries("ProcessStack.Process.ProcessRunner").ToArray());
+    }
+
+    [TestMethod]
+    public void SearchFtsTolerant_AnErrorThatIsNotQuerySyntax_Propagates()
+    {
+        using var empty = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
+        empty.Open();
+        var store = new SymbolStore(empty);
+
+        Assert.ThrowsExactly<Microsoft.Data.Sqlite.SqliteException>(() => store.SearchFtsTolerant("Customer", 10));
+        Assert.ThrowsExactly<Microsoft.Data.Sqlite.SqliteException>(() => store.SearchFtsTolerant("Customer.Service", 10));
+        Assert.ThrowsExactly<Microsoft.Data.Sqlite.SqliteException>(() => store.SearchFtsTolerant("...", 10));
     }
 
     [TestMethod]
