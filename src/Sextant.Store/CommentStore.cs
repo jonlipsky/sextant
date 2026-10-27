@@ -108,6 +108,17 @@ public sealed class CommentStore(SqliteConnection connection)
         return ReadAll(cmd);
     }
 
+    public List<CommentInfo> GetBySymbols(IReadOnlyCollection<long> symbolIds)
+    {
+        if (symbolIds.Count == 0)
+            return [];
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = SelectPrefix
+            + " WHERE c.enclosing_symbol_id IN (SELECT value FROM json_each(@ids)) ORDER BY c.line;";
+        cmd.Parameters.AddWithValue("@ids", System.Text.Json.JsonSerializer.Serialize(symbolIds));
+        return ReadAll(cmd);
+    }
+
     public List<CommentInfo> Search(string query, long? projectId = null)
     {
         using var cmd = connection.CreateCommand();

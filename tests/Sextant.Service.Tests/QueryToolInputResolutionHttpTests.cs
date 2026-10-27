@@ -100,6 +100,30 @@ public class QueryToolInputResolutionHttpTests
     }
 
     [TestMethod]
+    public async Task TypeHierarchy_Up_ListsBaseClassesAndInterfaces_Down_ListsImplementingTypes()
+    {
+        var up = await CallAsync("get_type_hierarchy",
+            WithRepository("""{"symbol_fqn":"Library.Shapes.UnitCircle","direction":"up"}"""), Solo);
+        var down = await CallAsync("get_type_hierarchy",
+            WithRepository("""{"symbol_fqn":"Library.Shapes.IShape","direction":"down"}"""), Solo);
+
+        Assert.IsFalse(up.IsError, up.Body.ToString());
+        Assert.IsFalse(down.IsError, down.Body.ToString());
+        var upRows = Relationships(up.Body);
+        Assert.AreEqual("inherits", upRows["global::Library.Shapes.Circle"]);
+        Assert.AreEqual("implements", upRows["global::Library.Shapes.IShape"]);
+        var downRows = Relationships(down.Body);
+        Assert.AreEqual("implements", downRows["global::Library.Shapes.Circle"]);
+        Assert.AreEqual("implements", downRows["global::Library.Shapes.Square"]);
+        Assert.AreEqual("inherits", downRows["global::Library.Shapes.UnitCircle"]);
+    }
+
+    private static Dictionary<string, string> Relationships(JsonElement body) =>
+        body.GetProperty("results").EnumerateArray().ToDictionary(
+            r => r.GetProperty("fully_qualified_name").GetString()!,
+            r => r.GetProperty("relationship").GetString()!);
+
+    [TestMethod]
     public async Task ToolsList_TheRepositoryArgument_IsNotAdvertisedAsOptional()
     {
         var list = await _host.RpcAsync("tools/list", "{}", DelegateToken);

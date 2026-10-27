@@ -432,7 +432,9 @@ Types implementing an interface or overriding a virtual member.
 
 ### get_type_hierarchy
 
-Base and derived type chains.
+Base and derived type chains. Both follow base-class (`inherits`) and implemented-interface (`implements`)
+edges: `up` on a class lists its base classes and the interfaces it implements, `down` on an interface lists the
+types that implement or extend it. Each row carries `relationship: inherits | implements`.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
@@ -609,7 +611,7 @@ Finds TODO, HACK, FIXME, BUG, and NOTE comments in the codebase.
 | `tag` | string | no | Filter by tag: `TODO`, `HACK`, `FIXME`, `BUG`, `NOTE`, or `all` |
 | `search` | string | no | Search within comment text |
 | `project_id` | string | no | Filter by project canonical ID |
-| `in_symbol` | string | no | FQN of enclosing symbol |
+| `in_symbol` | string | no | FQN of enclosing symbol; a type also returns comments in its members and nested types |
 | `limit` / `cursor` | int / string | no | Paging (see [Paged results](#paged-results)) |
 
 ### trace_value

@@ -187,7 +187,7 @@ public sealed partial class RemoteToolSurfaceGuardTests
             {
                 ["symbol_fqn"] = AgentOutputFixture.TargetMethod, ["direction"] = "sideways", ["repository"] = repoA
             }),
-            ("hierarchy", Answered, "get_type_hierarchy", new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetInterface, ["repository"] = repoA }),
+            ("hierarchy", SizeCut, "get_type_hierarchy", new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetInterface, ["repository"] = repoA }),
             ("implementors", SizeCut, "get_implementors", new JsonObject { ["symbol_fqn"] = AgentOutputFixture.TargetInterface, ["repository"] = repoA }),
             ("ambiguous member", "ambiguous_symbol", "get_call_hierarchy", new JsonObject { ["symbol_fqn"] = "Get", ["direction"] = "callers", ["repository"] = repoA }),
             ("list_repositories without a caller", "caller_required", "list_repositories", new JsonObject()),

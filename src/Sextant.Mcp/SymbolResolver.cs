@@ -484,6 +484,22 @@ public static class SymbolResolver
         return MemberKeyPrefixes.SelectMany(prefix => ImmediateMembers(store, prefix + path + ".", type.ProjectId)).ToList();
     }
 
+    /// <summary>
+    /// Every member declared in <paramref name="type"/> or in any type nested in it, at any depth (one key-prefix seek
+    /// per member/type kind). Empty for a type whose key is not a documentation ID.
+    /// </summary>
+    public static List<SymbolInfo> MembersAndNested(SymbolStore store, SymbolInfo type)
+    {
+        if (!type.SymbolKey.StartsWith("T:", StringComparison.Ordinal))
+            return [];
+        var path = TypeDocPath(type);
+        return NestedKeyPrefixes
+            .SelectMany(prefix => store.GetByKeyPrefix(type.ProjectId, prefix + path + ".", MemberScanLimit))
+            .ToList();
+    }
+
+    private static readonly string[] NestedKeyPrefixes = ["M:", "P:", "F:", "E:", "T:"];
+
     // The rows of the project whose key starts with `keyPrefix` and that belong to the type itself (nothing after the
     // prefix names a nested type's member).
     private static IEnumerable<SymbolInfo> ImmediateMembers(SymbolStore store, string keyPrefix, long projectId) =>
