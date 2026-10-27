@@ -47,7 +47,7 @@ public sealed partial class SnapshotService
             }
 
             var (row, created) = grants.Upsert(
-                caller.TenantId, principal, repositoryKey, remoteUrl, branch, source, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                caller.TenantId, principal, repositoryKey, remoteUrl, branch, source, _timeProvider.GetUtcNow().ToUnixTimeMilliseconds());
             audit.Append(AuditAction.Grant, AuditOutcome.Accepted, actor: auditor.Actor,
                 repositoryScope: repositoryKey, detail: auditor.Detail($"{operation};{(created ? "created" : "updated")}"));
             return new GrantWriteResult { Grant = row, Created = created };
@@ -162,14 +162,14 @@ public sealed partial class SnapshotService
     public IReadOnlySet<string> GetVisibleRepositoryKeys(CallerPrincipal caller)
     {
         ArgumentNullException.ThrowIfNull(caller);
-        return ReadCatalog(conn => new RepositoryGrantStore(conn).VisibleKeys(caller.TenantId, VisibilitySubject(caller)));
+        return ReadCatalog(conn => new RepositoryGrantStore(conn).VisibleKeys(caller.TenantId, VisibilitySubject(caller), LeaseCutoff(), LeaseCeiling()));
     }
 
     /// <summary>The grant rows that make repositories visible to the caller (see <see cref="GetVisibleRepositoryKeys"/>).</summary>
     public IReadOnlyList<RepositoryGrantRow> GetVisibleGrants(CallerPrincipal caller)
     {
         ArgumentNullException.ThrowIfNull(caller);
-        return ReadCatalog(conn => new RepositoryGrantStore(conn).ListVisible(caller.TenantId, VisibilitySubject(caller)));
+        return ReadCatalog(conn => new RepositoryGrantStore(conn).ListVisible(caller.TenantId, VisibilitySubject(caller), LeaseCutoff(), LeaseCeiling()));
     }
 
     /// <summary>Whether the caller may read <paramref name="remoteUrl"/> (any spelling of the repository).</summary>
@@ -227,7 +227,7 @@ public sealed partial class SnapshotService
         return ReadCatalog(conn =>
         {
             var catalog = new GrantCatalogReader(conn);
-            return new RepositoryGrantStore(conn).ListVisible(caller.TenantId, VisibilitySubject(caller))
+            return new RepositoryGrantStore(conn).ListVisible(caller.TenantId, VisibilitySubject(caller), LeaseCutoff(), LeaseCeiling())
                 .GroupBy(g => g.RepositoryKey, StringComparer.Ordinal)
                 .Select(group => catalog.Describe(group.Key, group.ToList()))
                 .ToList();
@@ -268,6 +268,42 @@ public sealed partial class SnapshotService
 
     private static string GrantOperation(string verb, GrantScope scope) =>
         $"{verb}_{(scope == GrantScope.Self ? "self" : "tenant")}";
+
+    /// <summary>Logs the effective tenant-grant lease; when on, warns about tenant grants already past it (issue #179).</summary>
+    internal void LogTenantGrantLease(TextWriter? output = null)
+    {
+        var writer = output ?? Console.Error;
+        if (LeaseCutoff() is not { } cutoff)
+        {
+            writer.WriteLine("Tenant-wide grant lease: disabled (SEXTANT_SERVICE_TENANT_GRANT_LEASE_HOURS=0); tenant grants never lapse.");
+            return;
+        }
+        writer.WriteLine($"Tenant-wide grant lease: {_options.TenantGrantLease.TotalHours:0} h.");
+        try
+        {
+            var lapsed = ReadCatalog(conn => new RepositoryGrantStore(conn).CountLapsedTenantWide(cutoff));
+            if (lapsed > 0)
+                writer.WriteLine(
+                    $"WARNING: {lapsed} tenant-wide grant(s) were last written more than {_options.TenantGrantLease.TotalHours:0} h ago " +
+                    "and already lapsed: reads through them are denied until the application re-PUTs them.");
+        }
+        catch (Exception ex) when (ex is SqliteException or InvalidOperationException)
+        {
+            writer.WriteLine("warn: could not count lapsed tenant-wide grants: " + ex.Message);
+        }
+    }
+
+    /// <summary>The unix-ms instant before which a tenant-wide grant's last write has lapsed (issue #179); null = no lease.</summary>
+    private long? LeaseCutoff() =>
+        _options.TenantGrantLease > TimeSpan.Zero
+            ? _timeProvider.GetUtcNow().Subtract(_options.TenantGrantLease).ToUnixTimeMilliseconds()
+            : null;
+
+    /// <summary>The latest plausible last-write instant (unix ms): one lease ahead of now, so a clock rollback cannot stamp a grant that never lapses.</summary>
+    private long? LeaseCeiling() =>
+        _options.TenantGrantLease > TimeSpan.Zero
+            ? _timeProvider.GetUtcNow().Add(_options.TenantGrantLease).ToUnixTimeMilliseconds()
+            : null;
 
     private bool OverLimit(RepositoryGrantStore grants, string tenantId, string principal) =>
         (principal != RepositoryGrantStore.TenantWide

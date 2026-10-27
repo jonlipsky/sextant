@@ -97,6 +97,19 @@ public sealed record ServiceOptions
     /// </summary>
     public int MaxGrantsPerTenant { get; init; } = DefaultMaxGrantsPerTenant;
 
+    /// <summary>
+    /// The lease of a tenant-wide ('*') grant (issue #179): it authorizes reads only while it was last written
+    /// (<c>PUT /control/grants/tenant</c>, which the application's reconcile repeats) within this window, so a tenant
+    /// whose application deployment is gone stops authorizing reads without any platform hook. Keep it comfortably
+    /// longer than the reconcile interval (nightly). Per-user grants are not leased. <see cref="TimeSpan.Zero"/> =
+    /// tenant grants never lapse. <c>SEXTANT_SERVICE_TENANT_GRANT_LEASE_HOURS</c> (whole hours, <c>0</c>-<c>8760</c>;
+    /// default 0 = disabled until the application renews grants; see docs/service.md for the rollout order);
+    /// anything else fails startup.
+    /// </summary>
+    public TimeSpan TenantGrantLease { get; init; } = TimeSpan.FromHours(DefaultTenantGrantLeaseHours);
+
+    internal const int DefaultTenantGrantLeaseHours = 0;
+
     internal const int DefaultMaxGrantsPerPrincipal = 200;
     internal const int DefaultMaxGrantsPerTenant = 5000;
 
@@ -323,6 +336,18 @@ public sealed record ServiceOptions
         return TimeSpan.FromSeconds(seconds);
     }
 
+    internal static TimeSpan ParseTenantGrantLeaseHours(string? value)
+    {
+        if (value is null)
+            return TimeSpan.FromHours(DefaultTenantGrantLeaseHours);
+        if (!int.TryParse(value.Trim(), System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out var hours) || hours > 8760)
+            throw new InvalidOperationException(
+                $"Environment variable {EnvPrefix}TENANT_GRANT_LEASE_HOURS has an invalid value '{value}'. Use a whole " +
+                "number of hours from 0 (no lease) to 8760.");
+        return TimeSpan.FromHours(hours);
+    }
+
     /// <summary>The largest <see cref="ControlWriteWait"/> the environment can set, in seconds.</summary>
     public const int MaxControlWriteWaitSeconds = 25;
 
@@ -532,6 +557,7 @@ public sealed record ServiceOptions
                 ? perPrincipal : DefaultMaxGrantsPerPrincipal,
             MaxGrantsPerTenant = EnvInt("MAX_GRANTS_PER_TENANT") is int perTenant and > 0
                 ? perTenant : DefaultMaxGrantsPerTenant,
+            TenantGrantLease = ParseTenantGrantLeaseHours(Env("TENANT_GRANT_LEASE_HOURS")),
             MaxResponseChars = Sextant.Mcp.ResponseBudget.Clamp(EnvInt("MAX_RESPONSE_CHARS")),
             BindAddress = EnvHost("BIND_ADDRESS") ?? "localhost",
             ControlPort = EnvInt("CONTROL_PORT") ?? 3011,

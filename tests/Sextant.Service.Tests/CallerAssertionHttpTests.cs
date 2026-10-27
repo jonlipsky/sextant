@@ -809,6 +809,21 @@ public class CallerAssertionHttpTests
         /// <summary>How many branch rows the catalog holds (read on its own connection).</summary>
         public long BranchRows() => CatalogScalar("SELECT COUNT(*) FROM branches;");
 
+        /// <summary>Ages every grant row's last write by <paramref name="age"/> (a lease lapse without waiting).</summary>
+        public void AgeGrants(TimeSpan age)
+        {
+            using var conn = new Microsoft.Data.Sqlite.SqliteConnection(new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder
+            {
+                DataSource = DbPath,
+                Pooling = false
+            }.ToString());
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE repository_grants SET updated_at = updated_at - @ms;";
+            cmd.Parameters.AddWithValue("@ms", (long)age.TotalMilliseconds);
+            cmd.ExecuteNonQuery();
+        }
+
         private long CatalogScalar(string sql)
         {
             using var conn = new Microsoft.Data.Sqlite.SqliteConnection(new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder

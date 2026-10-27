@@ -89,6 +89,7 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_CALLER_APPS` | Optional comma-separated allow-list on the signed `app` claim (exact, case-sensitive match). ProcessStack fills `app` with the calling application's **id** (a ULID such as `01M389V5MBGQKSF18HC2EGC3FY`; see [Production deployment checklist](#production-deployment-checklist-gateways) for how to find it), not its slug or name, so list ids here. A slug makes every assertion-bearing call fail with `caller_not_allowed`, while health, discovery and connection tests still succeed | none (any app) |
 | `SEXTANT_SERVICE_MAX_GRANTS_PER_PRINCIPAL` | Most repository grants one user caller may hold in a tenant (see [Repository grants](#repository-grants-and-visibility-svc-4)); creating one more is `409 grant_limit`. The tenant-wide `'*'` grants are not counted. A missing or non-positive value uses the default | `200` |
 | `SEXTANT_SERVICE_MAX_GRANTS_PER_TENANT` | Most repository grant rows a tenant may hold, tenant-wide grants included; creating one more is `409 grant_limit` | `5000` |
+| `SEXTANT_SERVICE_TENANT_GRANT_LEASE_HOURS` | Lease of a tenant-wide `'*'` grant, in whole hours: it authorizes reads only while its last `PUT /control/grants/tenant` (the app's reconcile re-PUTs it) is within this window (see [Repository grants](#repository-grants-and-visibility-svc-4)). `0` = never lapses; an invalid value **fails startup**. Keep it longer than the reconcile interval | `0` (disabled) |
 | `SEXTANT_SERVICE_MAX_RESPONSE_CHARS` | Character budget of one `/mcp` tool result, measured on the text the caller receives. A paged tool cuts its page at the last row that fits and returns `meta.next_cursor` with `meta.page_truncated_by: "size"`; an unpaged one keeps the leading rows and says to narrow the query (see [mcp-tools.md](mcp-tools.md#response-size-budget)). At least `1000`; a missing or non-positive value uses the default. | `20000` |
 | `SEXTANT_SERVICE_BIND_ADDRESS` | Network interface the HTTP surface binds to | `localhost` |
 | `SEXTANT_SERVICE_CONTROL_PORT` | HTTP port | `3011` |
@@ -1271,7 +1272,35 @@ migration `024`), keyed by `(tenant, principal, repository, branch)`:
 or its tenant holds a `'*'` grant. An application caller sees only the tenant's `'*'` grants. Every indexed
 branch of a visible repository is readable; the grant's branch only drives indexing and reconcile. The same
 `sub` under another tenant's key sees nothing. Visibility is read once per HTTP request and never cached
-across requests, so a revocation takes effect on the next call. Once a request has a verified caller:
+across requests, so a revocation takes effect on the next call.
+
+**Tenant-wide grants are leased (issue #179).** A `'*'` grant authorizes reads only while its last write
+(`updated_at`, refreshed by every `PUT /control/grants/tenant`, which the application's reconcile repeats) is
+within `SEXTANT_SERVICE_TENANT_GRANT_LEASE_HOURS` (default `0` = **disabled**, grants never lapse; anything other than
+a whole number `0`-`8760` fails startup). **Rollout order:** (1) deploy an application whose nightly reconcile re-PUTs
+every tenant grant; (2) confirm renewals (`updated_at` advancing nightly for every tenant grant); (3) only then set the
+lease, recommended at least 168 hours (7 days) so a multi-day outage of the app's scheduler does not cut reads. Enabling
+it earlier would lapse every grant not written within the window and deny reads. At startup the service logs the
+effective lease and, when enabled, a WARNING with the count of tenant grants already older than it. A lapsed grant is ignored at read time on every surface (reads,
+`list_repositories`, implicit selection, repository inference, snapshot pages), so a tenant whose application
+deployment was deleted stops authorizing reads without any platform hook; a re-PUT renews it. The row is not
+deleted, and `GET /control/grants?scope=tenant` still lists it as a reconcile target. Keep the lease comfortably
+longer than the app's reconcile interval (nightly). Per-user grants are not leased. No migration: the lease
+reuses `updated_at`.
+
+- `GET /control/grants?scope=tenant` lists lapsed grants on purpose: they are the reconcile targets, and the
+  application renews one by re-PUTting it (until then reads through it are denied).
+- Lapsed grants still count toward `MAX_GRANTS_PER_TENANT` (deliberately unchanged); the application should DELETE
+  grants it no longer wants.
+- A grant whose `updated_at` is in the future (the service clock rolled back) is treated as written now, so it
+  lapses one lease after the current time and never outlives the lease.
+
+Trust model (issue #181): grants are the read boundary and are bound to the asserted `tid`, so another tenant
+cannot read by naming a repository, even though content-addressed snapshots are shared. Only `act=application`
+creates tenant grants; a user's self grant is bound to the asserted `sub`. The service does not check that a
+user can reach the repository on GitHub: that check belongs to the app at watch time, and within a tenant a self
+grant for a connection-visible repository is trusted. Once visible, every indexed branch is readable. Once a
+request has a verified caller:
 
 - **Reads:** a delegate read of a repository the caller cannot see is indistinguishable from a repository that
   does not exist.
@@ -1388,6 +1417,13 @@ route added later refuses user callers too unless it opts in with its own rule (
   user caller, with no repository scope (the refusal precedes reading the request).
 - **`/control/audit`** is never readable by a user caller, so a user can never read another caller's audit
   rows, and `metrics`/`pilot` (cross-tenant counts and cost) stay operator data.
+- **Application and control-token callers are tenant-unscoped by design (issue #181).** On `/control/*` a trusted
+  application (`act=application`) or a control-token call with no assertion is not narrowed to its tenant's
+  grants: `/control/status`, `/control/resolve`, `/control/ensure` and the rest read and write job and snapshot
+  metadata for any repository by URL or job id, and the control token is the only protection. Only `act=user` is
+  grant-scoped there. `/control/audit`, `/control/pilot` and `/control/metrics` are operator routes: they take no
+  tenant rule and a user caller is refused. Tenant isolation of repository DATA holds on the read surfaces
+  (`/mcp`, `/query/*`) through grants, not on the control plane. Keep the control token out of tenant hands.
 - An application caller and an assertion-less control call are unchanged, and a deployment without
   `CALLER_KEYS` never has a verified caller on `/control/*` (an assertion there is `401 assertion_not_allowed`).
 - **Request targets are normalized before these rules.** On a real Kestrel socket, `%2e%2e`, `./`,

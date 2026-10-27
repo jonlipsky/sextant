@@ -928,6 +928,177 @@ public class GrantHttpTests
         Assert.IsTrue(grants.All(r => r.Actor == AuditLogStore.HashActor("tenant-a/user-1")));
     }
 
+    // ==== tenant grant lease (issue #179) ===========================================================
+
+    private const string LeaseArgs = """{"name":"global::App.Type0","repository":"acme/widgets"}""";
+
+    [TestMethod]
+    public async Task TenantGrant_LapsedWithoutRenewal_StopsAuthorizingReads_OnEverySurface()
+    {
+        await using var host = await Harness.StartAsync(configure: o => o with { TenantGrantLease = TimeSpan.FromHours(24) });
+        using (var tenant = await host.ControlAsync(HttpMethod.Put, TenantPath, ControlToken, AppAssertion(host), Body(Widgets)))
+            Assert.AreEqual(HttpStatusCode.OK, tenant.StatusCode);
+        host.AgeGrants(TimeSpan.FromHours(25));
+
+        foreach (var assertion in new[] { host.UserAssertion(sub: "user-2"), AppAssertion(host) })
+        {
+            var read = await host.CallAsync("find_symbol", LeaseArgs, DelegateToken, assertion);
+            var listed = await host.CallAsync("list_repositories", "{}", DelegateToken, assertion);
+            using var page = await host.SnapshotPageAsync(DelegateToken, host.WidgetsHash, assertion);
+            Assert.AreEqual(NotFound, WithoutTimestamp(read.Body), "a lapsed tenant grant no longer authorizes the read");
+            Assert.AreEqual(0, listed.Body.GetProperty("repositories").GetArrayLength());
+            Assert.AreEqual(HttpStatusCode.NotFound, page.StatusCode);
+        }
+    }
+
+    [TestMethod]
+    public async Task TenantGrant_WithinTheLease_Authorizes()
+    {
+        await using var host = await Harness.StartAsync(configure: o => o with { TenantGrantLease = TimeSpan.FromHours(24) });
+        using (var tenant = await host.ControlAsync(HttpMethod.Put, TenantPath, ControlToken, AppAssertion(host), Body(Widgets)))
+            Assert.AreEqual(HttpStatusCode.OK, tenant.StatusCode);
+        host.AgeGrants(TimeSpan.FromHours(23));
+
+        var read = await host.CallAsync("find_symbol", LeaseArgs, DelegateToken, host.UserAssertion(sub: "user-2"));
+
+        Assert.IsTrue(read.Body.GetProperty("results").GetArrayLength() > 0, read.Body.ToString());
+    }
+
+    [TestMethod]
+    public async Task TenantGrant_RenewedByTheApplicationsReput_KeepsAuthorizing_AndARevivesALapsedOne()
+    {
+        await using var host = await Harness.StartAsync(configure: o => o with { TenantGrantLease = TimeSpan.FromHours(24) });
+        using (var first = await host.ControlAsync(HttpMethod.Put, TenantPath, ControlToken, AppAssertion(host), Body(Widgets)))
+            Assert.AreEqual(HttpStatusCode.OK, first.StatusCode);
+        host.AgeGrants(TimeSpan.FromHours(20));
+        using (var renew = await host.ControlAsync(HttpMethod.Put, TenantPath, ControlToken, AppAssertion(host), Body(Widgets)))
+            Assert.IsFalse((await JsonAsync(renew, HttpStatusCode.OK)).GetProperty("created").GetBoolean());
+        host.AgeGrants(TimeSpan.FromHours(20));
+
+        var renewed = await host.CallAsync("find_symbol", LeaseArgs, DelegateToken, host.UserAssertion(sub: "user-2"));
+        host.AgeGrants(TimeSpan.FromHours(10));
+        var lapsed = await host.CallAsync("find_symbol", LeaseArgs, DelegateToken, host.UserAssertion(sub: "user-2"));
+        using (var revive = await host.ControlAsync(HttpMethod.Put, TenantPath, ControlToken, AppAssertion(host), Body(Widgets)))
+            Assert.AreEqual(HttpStatusCode.OK, revive.StatusCode);
+        var revived = await host.CallAsync("find_symbol", LeaseArgs, DelegateToken, host.UserAssertion(sub: "user-2"));
+
+        Assert.IsTrue(renewed.Body.GetProperty("results").GetArrayLength() > 0, "40h after creation but 20h after the renewal");
+        Assert.AreEqual(NotFound, WithoutTimestamp(lapsed.Body));
+        Assert.IsTrue(revived.Body.GetProperty("results").GetArrayLength() > 0, "a re-PUT of a lapsed grant renews it");
+    }
+
+    [TestMethod]
+    public async Task TenantGrant_StampedInTheFuture_ByAClockRollback_DoesNotOutliveTheLease()
+    {
+        await using var host = await Harness.StartAsync(configure: o => o with { TenantGrantLease = TimeSpan.FromHours(24) });
+        using (var tenant = await host.ControlAsync(HttpMethod.Put, TenantPath, ControlToken, AppAssertion(host), Body(Widgets)))
+            Assert.AreEqual(HttpStatusCode.OK, tenant.StatusCode);
+
+        host.AgeGrants(TimeSpan.FromHours(-10));
+        var plausible = await host.CallAsync("find_symbol", LeaseArgs, DelegateToken, host.UserAssertion(sub: "user-2"));
+        host.AgeGrants(TimeSpan.FromHours(-30));
+        var implausible = await host.CallAsync("find_symbol", LeaseArgs, DelegateToken, host.UserAssertion(sub: "user-2"));
+        using (var renew = await host.ControlAsync(HttpMethod.Put, TenantPath, ControlToken, AppAssertion(host), Body(Widgets)))
+            Assert.AreEqual(HttpStatusCode.OK, renew.StatusCode);
+        var renewed = await host.CallAsync("find_symbol", LeaseArgs, DelegateToken, host.UserAssertion(sub: "user-2"));
+
+        Assert.IsTrue(plausible.Body.GetProperty("results").GetArrayLength() > 0, "a small skew is tolerated");
+        Assert.AreEqual(NotFound, WithoutTimestamp(implausible.Body), "a stamp more than a lease ahead is not trusted");
+        Assert.IsTrue(renewed.Body.GetProperty("results").GetArrayLength() > 0, "a re-PUT restamps it");
+    }
+
+    [TestMethod]
+    public async Task SelfGrant_IsNotLeased()
+    {
+        await using var host = await Harness.StartAsync(configure: o => o with { TenantGrantLease = TimeSpan.FromHours(24) });
+        await PutSelfAsync(host, host.UserAssertion(sub: "user-1"), Widgets);
+        host.AgeGrants(TimeSpan.FromDays(400));
+
+        var read = await host.CallAsync("find_symbol", LeaseArgs, DelegateToken, host.UserAssertion(sub: "user-1"));
+
+        Assert.IsTrue(read.Body.GetProperty("results").GetArrayLength() > 0, read.Body.ToString());
+    }
+
+    [TestMethod]
+    public async Task TenantGrant_LapsedOne_DoesNotHideAUsersOwnGrant()
+    {
+        await using var host = await Harness.StartAsync(configure: o => o with { TenantGrantLease = TimeSpan.FromHours(24) });
+        using (var tenant = await host.ControlAsync(HttpMethod.Put, TenantPath, ControlToken, AppAssertion(host), Body(Widgets)))
+            Assert.AreEqual(HttpStatusCode.OK, tenant.StatusCode);
+        await PutSelfAsync(host, host.UserAssertion(sub: "user-1"), Widgets);
+        host.AgeGrants(TimeSpan.FromHours(25));
+        await PutSelfAsync(host, host.UserAssertion(sub: "user-1"), Widgets);
+
+        var own = await host.CallAsync("find_symbol", LeaseArgs, DelegateToken, host.UserAssertion(sub: "user-1"));
+        var other = await host.CallAsync("find_symbol", LeaseArgs, DelegateToken, host.UserAssertion(sub: "user-2"));
+        var app = await host.CallAsync("find_symbol", LeaseArgs, DelegateToken, AppAssertion(host));
+
+        Assert.IsTrue(own.Body.GetProperty("results").GetArrayLength() > 0);
+        Assert.AreEqual(NotFound, WithoutTimestamp(other.Body));
+        Assert.AreEqual(NotFound, WithoutTimestamp(app.Body));
+    }
+
+    [TestMethod]
+    public async Task TenantGrant_ZeroLease_NeverLapses()
+    {
+        await using var host = await Harness.StartAsync(configure: o => o with { TenantGrantLease = TimeSpan.Zero });
+        using (var tenant = await host.ControlAsync(HttpMethod.Put, TenantPath, ControlToken, AppAssertion(host), Body(Widgets)))
+            Assert.AreEqual(HttpStatusCode.OK, tenant.StatusCode);
+        host.AgeGrants(TimeSpan.FromDays(4000));
+
+        var read = await host.CallAsync("find_symbol", LeaseArgs, DelegateToken, AppAssertion(host));
+
+        Assert.IsTrue(read.Body.GetProperty("results").GetArrayLength() > 0, read.Body.ToString());
+    }
+
+    [TestMethod]
+    public async Task StartupLog_ReportsLeaseAndAlreadyLapsedTenantGrants()
+    {
+        await using var host = await Harness.StartAsync(configure: o => o with { TenantGrantLease = TimeSpan.FromHours(24) });
+        using (var tenant = await host.ControlAsync(HttpMethod.Put, TenantPath, ControlToken, AppAssertion(host), Body(Widgets)))
+            Assert.AreEqual(HttpStatusCode.OK, tenant.StatusCode);
+
+        var fresh = new StringWriter();
+        host.Service.LogTenantGrantLease(fresh);
+        StringAssert.Contains(fresh.ToString(), "24 h");
+        Assert.IsFalse(fresh.ToString().Contains("WARNING"), fresh.ToString());
+
+        host.AgeGrants(TimeSpan.FromHours(25));
+        var aged = new StringWriter();
+        host.Service.LogTenantGrantLease(aged);
+        StringAssert.Contains(aged.ToString(), "WARNING: 1 tenant-wide grant(s)");
+    }
+
+    [TestMethod]
+    public async Task StartupLog_DisabledLease_IsReported()
+    {
+        await using var host = await Harness.StartAsync();
+        var log = new StringWriter();
+        host.Service.LogTenantGrantLease(log);
+        StringAssert.Contains(log.ToString(), "disabled");
+    }
+
+    [TestMethod]
+    public void TenantGrantLease_DefaultsToDisabled() =>
+        Assert.AreEqual(TimeSpan.Zero, ServiceOptions.ParseTenantGrantLeaseHours(null));
+
+    [TestMethod]
+    [DataRow(null, 0)]
+    [DataRow("0", 0)]
+    [DataRow(" 48 ", 48 * 3600)]
+    [DataRow("8760", 8760 * 3600)]
+    public void TenantGrantLeaseHours_Parses(string? value, int expectedSeconds) =>
+        Assert.AreEqual(TimeSpan.FromSeconds(expectedSeconds), ServiceOptions.ParseTenantGrantLeaseHours(value));
+
+    [TestMethod]
+    [DataRow("")]
+    [DataRow("-1")]
+    [DataRow("8761")]
+    [DataRow("1.5")]
+    [DataRow("abc")]
+    public void TenantGrantLeaseHours_Invalid_FailsStartup(string value) =>
+        Assert.ThrowsExactly<InvalidOperationException>(() => ServiceOptions.ParseTenantGrantLeaseHours(value));
+
     // ==== helpers ===================================================================================
 
     // The status of a request whose handler may throw (the test server then surfaces the failure to the client).
