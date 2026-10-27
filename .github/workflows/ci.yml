@@ -52,9 +52,8 @@ jobs:
         run: dotnet build Sextant.slnx --configuration Debug --no-restore
 
       # Runs the default correctness suite across all assemblies (~1080 tests).
-      # The env-gated real-MSBuild integration tests stay skipped because
-      # SEXTANT_RUN_MULTISLN is left unset — they're too slow/nondeterministic
-      # for the required gate. Any test failure fails the job (default behavior).
+      # The env-gated multi-solution tests (SEXTANT_RUN_MULTISLN) run in their
+      # own step below. Any test failure fails the job (default behavior).
       #
       # Hang guards (issue #144): a single test that makes no progress for 10
       # minutes gets its test host (and child processes) mini-dumped and killed,
@@ -69,6 +68,21 @@ jobs:
           DOTNET_CLI_USE_MSBUILD_SERVER: '0'
         run: >-
           dotnet test Sextant.slnx --no-build --configuration Debug
+          --blame-hang-timeout 10m --blame-hang-dump-type mini
+          --results-directory TestResults
+
+      # The opt-in real-MSBuild multi-solution tests (issue #249: they rotted
+      # while skipped). Only this class runs here (~4 min locally); the
+      # step above leaves them Inconclusive.
+      - name: Test (multi-solution, real MSBuild)
+        timeout-minutes: 15
+        env:
+          SEXTANT_RUN_MULTISLN: '1'
+          MSBUILDDISABLENODEREUSE: '1'
+          DOTNET_CLI_USE_MSBUILD_SERVER: '0'
+        run: >-
+          dotnet test tests/Sextant.Integration.Tests --no-build --configuration Debug
+          --filter "FullyQualifiedName~MultiSolutionIndexingIntegrationTests"
           --blame-hang-timeout 10m --blame-hang-dump-type mini
           --results-directory TestResults
 
