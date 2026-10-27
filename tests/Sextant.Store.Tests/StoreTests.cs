@@ -118,6 +118,150 @@ public class StoreTests
         Assert.AreEqual(1, _symbolStore.SearchFtsTolerant("Customer.Service", 10).Count, "joined tokens: CustomerService");
         Assert.AreEqual(0, _symbolStore.SearchFtsTolerant("...", 10).Count);
         Assert.AreEqual(0, _symbolStore.SearchFtsTolerant("Nope.Missing", 10).Count);
+    }
+
+    [TestMethod]
+    public void SearchFtsTolerant_QualifiedName_UsesNameLookupsAndWholeSegmentQualifiers()
+    {
+        var projectId = InsertTestProject();
+        long n = 0;
+        void Add(string fqn, string name, SymbolKind kind) => _symbolStore.Insert(new SymbolInfo
+        {
+            ProjectId = projectId, SymbolKey = $"k{++n}", FullyQualifiedName = fqn, DisplayName = name, Kind = kind,
+            Accessibility = Accessibility.Public, FilePath = "src/A.cs", LineStart = 1, LineEnd = 2, LastIndexedAt = 1000
+        });
+
+        Add("ProcessStack.Process.ProcessRunner", "ProcessRunner", SymbolKind.Class);
+        // Members are stored with a bare name as their fully qualified name; the documentation-ID key holds the path.
+        _symbolStore.Insert(new SymbolInfo
+        {
+            ProjectId = projectId, SymbolKey = "M:ProcessStack.Process.ProcessRunner.RunAsync", FullyQualifiedName = "RunAsync",
+            DisplayName = "RunAsync", Kind = SymbolKind.Method, Accessibility = Accessibility.Public,
+            FilePath = "src/A.cs", LineStart = 1, LineEnd = 2, LastIndexedAt = 1000
+        });
+        Add("ProcessStack.Process.ProcessRunnerTests.RunningOwner", "RunningOwner", SymbolKind.Class);
+        Add("ProcessStack.Process.Execution.IActivityExecutorRouter", "IActivityExecutorRouter", SymbolKind.Interface);
+        Add("ExecuteAsync", "ExecuteAsync", SymbolKind.Method);
+        _symbolStore.Insert(new SymbolInfo
+        {
+            ProjectId = projectId, SymbolKey = "M:ProcessStack.Core.Tests.Process.Execution.SomeTests.Runner", FullyQualifiedName = "Runner",
+            DisplayName = "Runner", Kind = SymbolKind.Method, Accessibility = Accessibility.Public,
+            FilePath = "src/A.cs", LineStart = 1, LineEnd = 2, LastIndexedAt = 1000
+        });
+        Add("ProcessStack.Versioning.IVersionedAssetStore", "IVersionedAssetStore", SymbolKind.Interface);
+        for (var i = 0; i < 300; i++)
+        {
+            Add($"ProcessStack.Activities.Activity{i}._processRunner", "_processRunner", SymbolKind.Field);
+            Add($"ProcessStack.Web.Controller{i}._router", "_router", SymbolKind.Field);
+            Add($"ProcessStack.Web.Controller{i}.RoutePrefix", "RoutePrefix", SymbolKind.Property);
+        }
+
+        string First(string q, string? kind = null) =>
+            _symbolStore.SearchFtsTolerant(q, 10, kind).FirstOrDefault()?.FullyQualifiedName ?? "";
+
+        Assert.AreEqual("ProcessStack.Process.ProcessRunner", First("ProcessStack.Process.ProcessRunner"));
+        Assert.AreEqual("ProcessStack.Process.ProcessRunner", First("Process.Runner"));
+        Assert.AreEqual("RunAsync", First("ProcessRunner.Run"));
+        var wrongNamespace = _symbolStore.SearchFtsTolerantDetailed("ProcessStack.Core.Versioning.IVersionedAssetStore", 10);
+        Assert.AreEqual("ProcessStack.Versioning.IVersionedAssetStore", wrongNamespace.Symbols.FirstOrDefault()?.FullyQualifiedName);
+        Assert.AreEqual(SymbolStore.FtsMatchWarning.NameOnly, wrongNamespace.Warning);
+        Assert.AreEqual(SymbolStore.FtsMatchWarning.None, _symbolStore.SearchFtsTolerantDetailed("Process.Runner", 10).Warning);
+        Assert.AreEqual("ProcessStack.Process.Execution.IActivityExecutorRouter", First("IActivityExecutorRouter.Route"));
+        Assert.IsFalse(_symbolStore.SearchFtsTolerant("IActivityExecutorRouter.Route", 10)
+            .Any(s => s.DisplayName is "RoutePrefix" or "_router"));
+        Assert.AreEqual("ProcessStack.Process.ProcessRunner", First("ProcessStack.Process.ProcessRunner", "Class"));
+        Assert.AreEqual(0, _symbolStore.SearchFtsTolerant("Process.Runner", 10, "Method").Count(s => s.Kind != SymbolKind.Method));
+    }
+
+    [TestMethod]
+    public void SearchFtsTolerant_QualifiedName_RanksTheDeclaredMemberAboveAJoinedNameClass()
+    {
+        var projectId = InsertTestProject();
+        var n = 0;
+        void Add(string key, string fqn, string name, SymbolKind kind) => _symbolStore.Insert(new SymbolInfo
+        {
+            ProjectId = projectId, SymbolKey = key, FullyQualifiedName = fqn, DisplayName = name, Kind = kind,
+            Accessibility = Accessibility.Public, FilePath = "src/A.cs", LineStart = ++n, LineEnd = n + 1, LastIndexedAt = 1000
+        });
+
+        Add("T:FooBar", "FooBar", "FooBar", SymbolKind.Class);
+        Add("T:Foo", "Foo", "Foo", SymbolKind.Class);
+        Add("M:Foo.Bar", "Bar", "Bar", SymbolKind.Method);
+
+        var hits = _symbolStore.SearchFtsTolerant("Foo.Bar", 10);
+        Assert.AreEqual("M:Foo.Bar", hits[0].SymbolKey);
+        Assert.AreEqual("T:FooBar", hits[1].SymbolKey);
+    }
+
+    [TestMethod]
+    public void SearchFtsTolerant_QualifiedName_ProductionShape_ClassBeatsATestMethodInAnotherContainer()
+    {
+        var projectId = InsertTestProject();
+        void Add(string key, string fqn, string name, SymbolKind kind) => _symbolStore.Insert(new SymbolInfo
+        {
+            ProjectId = projectId, SymbolKey = key, FullyQualifiedName = fqn, DisplayName = name, Kind = kind,
+            Accessibility = Accessibility.Public, FilePath = "src/A.cs", LineStart = 1, LineEnd = 2, LastIndexedAt = 1000
+        });
+
+        Add("M:ProcessStack.Process.Tests.DispatchedHttpConnectionResolutionTests.Runner(System.Int32)", "Runner", "Runner", SymbolKind.Method);
+        Add("T:ProcessStack.Process.ProcessRunner", "ProcessStack.Process.ProcessRunner", "ProcessRunner", SymbolKind.Class);
+
+        var hits = _symbolStore.SearchFtsTolerant("Process.Runner", 10);
+        Assert.AreEqual("T:ProcessStack.Process.ProcessRunner", hits[0].SymbolKey);
+        Assert.AreEqual(2, hits.Count);
+    }
+
+    [TestMethod]
+    public void SearchFtsTolerant_QualifiedName_FindsTypeMembersPastTheGlobalPrefixLimit()
+    {
+        var early = InsertTestProject();
+        for (var i = 0; i < 1200; i++)
+        {
+            _symbolStore.Insert(new SymbolInfo
+            {
+                ProjectId = early, SymbolKey = $"M:Other.Thing{i}.Get{i}", FullyQualifiedName = "Get" + i, DisplayName = "Get" + i,
+                Kind = SymbolKind.Method, Accessibility = Accessibility.Public, FilePath = "src/B.cs", LineStart = 1, LineEnd = 2, LastIndexedAt = 1000
+            });
+        }
+        var late = InsertTestProject();
+        _symbolStore.Insert(new SymbolInfo
+        {
+            ProjectId = late, SymbolKey = "T:Lib.Store", FullyQualifiedName = "Lib.Store", DisplayName = "Store",
+            Kind = SymbolKind.Class, Accessibility = Accessibility.Public, FilePath = "src/C.cs", LineStart = 1, LineEnd = 9, LastIndexedAt = 1000
+        });
+        _symbolStore.Insert(new SymbolInfo
+        {
+            ProjectId = late, SymbolKey = "M:Lib.Store.GetAsync", FullyQualifiedName = "GetAsync", DisplayName = "GetAsync",
+            Kind = SymbolKind.Method, Accessibility = Accessibility.Public, FilePath = "src/C.cs", LineStart = 2, LineEnd = 3, LastIndexedAt = 1000
+        });
+
+        var hits = _symbolStore.SearchFtsTolerant("Store.Get", 10);
+        Assert.AreEqual("M:Lib.Store.GetAsync", hits.FirstOrDefault()?.SymbolKey);
+    }
+
+    [TestMethod]
+    public void SearchFtsTolerant_QualifiedName_OnlyTheOwnerTypeMatches_WarnsContainingTypeOnly()
+    {
+        var projectId = InsertTestProject();
+        _symbolStore.Insert(new SymbolInfo
+        {
+            ProjectId = projectId, SymbolKey = "T:Ns.IActivityExecutorRouter", FullyQualifiedName = "Ns.IActivityExecutorRouter",
+            DisplayName = "IActivityExecutorRouter", Kind = SymbolKind.Interface, Accessibility = Accessibility.Public,
+            FilePath = "src/A.cs", LineStart = 1, LineEnd = 2, LastIndexedAt = 1000
+        });
+
+        var result = _symbolStore.SearchFtsTolerantDetailed("IActivityExecutorRouter.Route", 10);
+        Assert.AreEqual("Ns.IActivityExecutorRouter", result.Symbols.Single().FullyQualifiedName);
+        Assert.AreEqual(SymbolStore.FtsMatchWarning.ContainingTypeOnly, result.Warning);
+    }
+
+    [TestMethod]
+    public void NameFirst_IsOnlyForQualifiedNames()
+    {
+        Assert.IsNull(FtsQueryText.NameFirst("ProcessRunner"));
+        Assert.IsNull(FtsQueryText.NameFirst("IStore<System.String>"));
+        var q = FtsQueryText.NameFirst("global::A.B.C(int)")!;
+        CollectionAssert.AreEqual(new[] { "A", "B" }, q.Qualifiers.ToArray());
 
         // The plain search is unchanged: FTS5's own error for a query it rejects (semantic_search relies on it).
         var raw = Assert.ThrowsExactly<Microsoft.Data.Sqlite.SqliteException>(() => _symbolStore.SearchFts("Customer.Service", 10));
