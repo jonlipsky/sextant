@@ -53,6 +53,31 @@ public static class FtsQueryText
         return queries;
     }
 
+    /// <summary>
+    /// For a qualified name (<c>A.B.C</c>, <c>Type.Member</c>; arguments and a leading <c>global::</c> ignored) the
+    /// queries that match the symbol NAME only (the <c>display_name</c> column, never doc comments) and the qualifier
+    /// segments a hit's fully qualified name must contain in order; null for an unqualified name.
+    /// </summary>
+    public static NameFirstQuery? NameFirst(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return null;
+        var span = text.AsSpan().Trim();
+        if (span.StartsWith("global::", StringComparison.Ordinal))
+            span = span["global::".Length..];
+
+        var stripped = WithoutArguments(span);
+        if (!stripped.Contains('.'))
+            return null;
+        var tokens = TokenList(stripped);
+        if (tokens.Count < 2)
+            return null;
+        return new NameFirstQuery(tokens.Take(tokens.Count - 1).ToList(), tokens);
+    }
+
+    /// <summary>A qualified name split into its qualifier segments and all its tokens (see <see cref="NameFirst"/>).</summary>
+    public sealed record NameFirstQuery(IReadOnlyList<string> Qualifiers, IReadOnlyList<string> Tokens);
+
     private static string? Query(List<string> tokens) =>
         tokens.Count == 0 ? null : string.Join(' ', tokens.Select(t => $"\"{t}\"*"));
 

@@ -282,22 +282,235 @@ public sealed class SymbolStore(SqliteConnection connection)
     /// anything (empty when none does, or when the name has no token). Only a query-syntax error is absorbed; any other
     /// SQLite error propagates.
     /// </summary>
-    public List<SymbolInfo> SearchFtsTolerant(string query, int maxResults, string? kindFilter = null)
+    public List<SymbolInfo> SearchFtsTolerant(string query, int maxResults, string? kindFilter = null) =>
+        SearchFtsTolerantDetailed(query, maxResults, kindFilter).Symbols;
+
+    /// <summary>
+    /// <see cref="SearchFtsTolerant"/>, also reporting whether the hits matched only through documentation text. A
+    /// qualified name FTS5 rejects (<c>A.B.C</c>, <c>Type.Member</c>) is matched against symbol names first (the last
+    /// segment, then every segment joined), keeping the hits whose fully qualified name holds the qualifier segments in
+    /// order; doc comments are searched only when no name matches.
+    /// </summary>
+    public (List<SymbolInfo> Symbols, FtsMatchWarning Warning) SearchFtsTolerantDetailed(
+        string query, int maxResults, string? kindFilter = null)
     {
         try
         {
-            return RunFts(query, maxResults, kindFilter);
+            return (RunFts(query, maxResults, kindFilter), FtsMatchWarning.None);
         }
         catch (SqliteException e) when (IsQuerySyntaxError(e))
         {
+            if (FtsQueryText.NameFirst(query) is { } nameFirst)
+            {
+                var (named, nameWarning) = SearchQualifiedByName(nameFirst, maxResults, kindFilter);
+                if (named.Count > 0)
+                    return (named, nameWarning);
+            }
+
             foreach (var safe in FtsQueryText.SafeQueries(query))
             {
                 var found = RunFts(safe, maxResults, kindFilter);
                 if (found.Count > 0)
-                    return found;
+                    return (found, FtsQueryText.NameFirst(query) is not null ? FtsMatchWarning.Documentation : FtsMatchWarning.None);
             }
-            return [];
+            return ([], FtsMatchWarning.None);
         }
+    }
+
+    private const int NameLookupLimit = 1000;
+
+    private const int OwnerTypeLimit = 20;
+    private const int MemberScanLimit = 5000;
+    private static readonly string[] MemberKeyPrefixes = ["M:", "P:", "F:", "E:"];
+
+    // The name ladder of a qualified query over the indexed, scoped name lookups, merged into one ranked list:
+    // tier 0 the last segment exactly inside the qualifier's own container, 1 every segment joined, 2 the last segment
+    // exactly with the qualifiers elsewhere in the path, 3 its prefix with the qualifiers in order. Then the
+    // qualifier's own type, then the name alone.
+    private (List<SymbolInfo>, FtsMatchWarning) SearchQualifiedByName(FtsQueryText.NameFirstQuery q, int maxResults, string? kindFilter)
+    {
+        IReadOnlyCollection<SymbolKind>? kinds = null;
+        if (kindFilter != null)
+            kinds = Enum.TryParse<SymbolKind>(kindFilter, true, out var k) ? [k] : null;
+        IReadOnlyCollection<SymbolKind> typeKinds = kinds is null ? TypeKinds : kinds.Where(TypeKinds.Contains).ToList();
+
+        List<SymbolInfo> Rank(IEnumerable<SymbolInfo> hits, string last, IReadOnlyList<string> qualifiers) =>
+            hits.Where(s => HasQualifierSegmentsInOrder(s, qualifiers))
+                .GroupBy(s => s.Id).Select(g => g.First())
+                .OrderBy(s => string.Equals(s.DisplayName, last, StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+                .ThenBy(s => s.FullyQualifiedName.Length)
+                .ThenBy(s => s.Id)
+                .Take(maxResults).ToList();
+
+        var last = q.Tokens[^1];
+        var joined = string.Concat(q.Tokens);
+
+        var candidates = new List<SymbolInfo>();
+        if (q.Qualifiers.Count > 0 && typeKinds.Count > 0)
+        {
+            var owners = GetByDisplayName(q.Qualifiers[^1], typeKinds, null, NameLookupLimit)
+                .Where(t => HasQualifierSegmentsInOrder(t, q.Qualifiers.Take(q.Qualifiers.Count - 1).ToList())
+                            && t.SymbolKey.StartsWith("T:", StringComparison.Ordinal))
+                .OrderBy(t => t.ProjectId).ThenBy(t => t.Id)
+                .Take(OwnerTypeLimit);
+            foreach (var owner in owners)
+            {
+                foreach (var prefix in MemberKeyPrefixes)
+                {
+                    var keyPrefix = prefix + owner.SymbolKey[2..] + ".";
+                    candidates.AddRange(GetByKeyPrefix(owner.ProjectId, keyPrefix, MemberScanLimit).Where(m =>
+                        IsImmediateMember(m.SymbolKey, keyPrefix.Length) && (kinds is null || kinds.Contains(m.Kind))
+                        && m.DisplayName.StartsWith(last, StringComparison.OrdinalIgnoreCase)));
+                }
+            }
+        }
+        if (q.Tokens.Count > 1)
+            candidates.AddRange(GetByDisplayName(joined, kinds, null, NameLookupLimit));
+        candidates.AddRange(GetByDisplayName(last, kinds, null, NameLookupLimit));
+        candidates.AddRange(GetByDisplayNamePrefix(last, kinds, null, NameLookupLimit));
+
+        var found = candidates
+            .GroupBy(s => s.Id).Select(g => g.First())
+            .Select(s => (Symbol: s, Rank: QualifiedRank(s, last, joined, q.Qualifiers)))
+            .Where(x => x.Rank is not null)
+            .OrderBy(x => x.Rank)
+            .ThenBy(x => x.Symbol.FullyQualifiedName.Length)
+            .ThenBy(x => x.Symbol.Id)
+            .Take(maxResults).Select(x => x.Symbol).ToList();
+        if (found.Count > 0)
+            return (found, FtsMatchWarning.None);
+
+        if (q.Qualifiers.Count == 0)
+            return ([], FtsMatchWarning.None);
+        if (typeKinds.Count > 0)
+        {
+            var owner = q.Qualifiers[^1];
+            found = Rank(GetByDisplayName(owner, typeKinds, null, NameLookupLimit), owner, q.Qualifiers.Take(q.Qualifiers.Count - 1).ToList());
+            if (found.Count > 0)
+                return (found, FtsMatchWarning.ContainingTypeOnly);
+        }
+
+        found = Rank(GetByDisplayName(last, kinds, null, NameLookupLimit), last, []);
+        return (found, found.Count > 0 ? FtsMatchWarning.NameOnly : FtsMatchWarning.None);
+    }
+
+    // The tier of a hit (see SearchQualifiedByName) scaled so that a prefix hit in the immediate container comes before
+    // other prefix hits; null when it is no hit.
+    private static int? QualifiedRank(SymbolInfo s, string last, string joined, IReadOnlyList<string> qualifiers)
+    {
+        var name = s.DisplayName;
+        var exact = string.Equals(name, last, StringComparison.OrdinalIgnoreCase);
+        if (exact && HasQualifierSegmentsInOrder(s, qualifiers))
+            return IsInImmediateContainer(s, qualifiers) ? 0 : 2;
+        if (qualifiers.Count > 0 && string.Equals(name, joined, StringComparison.OrdinalIgnoreCase))
+            return 1;
+        if (!exact && name.StartsWith(last, StringComparison.OrdinalIgnoreCase) && HasQualifierSegmentsInOrder(s, qualifiers))
+            return IsInImmediateContainer(s, qualifiers) ? 3 : 4;
+        return null;
+    }
+
+    private static bool IsInImmediateContainer(SymbolInfo symbol, IReadOnlyList<string> qualifiers)
+    {
+        var key = symbol.SymbolKey;
+        var segments = SplitSegments(key.Length > 2 && key[1] == ':' ? key[2..] : symbol.FullyQualifiedName);
+        var container = segments.Count - 1;
+        if (container < qualifiers.Count)
+            return false;
+        for (var i = 0; i < qualifiers.Count; i++)
+        {
+            if (!string.Equals(segments[container - qualifiers.Count + i], qualifiers[i], StringComparison.OrdinalIgnoreCase))
+                return false;
+        }
+        return true;
+    }
+
+    // A documentation-ID key past its container prefix names a member of that type, not of a nested type.
+    private static bool IsImmediateMember(string key, int start)
+    {
+        var depth = 0;
+        for (var i = start; i < key.Length; i++)
+        {
+            var c = key[i];
+            if (c == '(' && depth == 0)
+                return true;
+            if (c == '{')
+                depth++;
+            else if (c == '}')
+                depth--;
+            else if (c == '.' && depth == 0)
+                return false;
+        }
+        return true;
+    }
+
+    /// <summary>What a tolerant full-text search's hits matched on, when it is less than the query asked for.</summary>
+    public enum FtsMatchWarning
+    {
+        None,
+        Documentation,
+        NameOnly,
+        ContainingTypeOnly,
+    }
+
+    private static readonly SymbolKind[] TypeKinds =
+        [SymbolKind.Class, SymbolKind.Interface, SymbolKind.Struct, SymbolKind.Enum, SymbolKind.Delegate, SymbolKind.Record];
+
+    // Each qualifier equals, ignoring case, a whole dot-separated segment of the hit's containing path (the name itself
+    // excluded), in order; `global::` and argument lists are ignored.
+    private static bool HasQualifierSegmentsInOrder(SymbolInfo symbol, IReadOnlyList<string> qualifiers)
+    {
+        if (qualifiers.Count == 0)
+            return true;
+        // A member's fully qualified name may be only its own name; its documentation-ID key carries the container path.
+        var key = symbol.SymbolKey;
+        var segments = SplitSegments(key.Length > 2 && key[1] == ':' ? key[2..] : symbol.FullyQualifiedName);
+        var at = 0;
+        foreach (var qualifier in qualifiers)
+        {
+            while (at < segments.Count - 1 && !string.Equals(segments[at], qualifier, StringComparison.OrdinalIgnoreCase))
+                at++;
+            if (at >= segments.Count - 1)
+                return false;
+            at++;
+        }
+        return true;
+    }
+
+    private static List<string> SplitSegments(string name)
+    {
+        var span = name.AsSpan();
+        if (span.StartsWith("global::", StringComparison.Ordinal))
+            span = span["global::".Length..];
+        var segments = new List<string>();
+        var start = 0;
+        var depth = 0;
+        for (var i = 0; i < span.Length; i++)
+        {
+            var c = span[i];
+            if (c == '<' || c == '[' || c == '{')
+                depth++;
+            else if (c == '>' || c == ']' || c == '}')
+                depth--;
+            else if (c == '(' && depth == 0)
+            {
+                segments.Add(Segment(span[start..i]));
+                return segments;
+            }
+            else if (c == '.' && depth == 0)
+            {
+                segments.Add(Segment(span[start..i]));
+                start = i + 1;
+            }
+        }
+        segments.Add(Segment(span[start..]));
+        return segments;
+    }
+
+    // A segment without its generic arity or type arguments (`List`1`, `List<T>` -> `List`).
+    private static string Segment(ReadOnlySpan<char> segment)
+    {
+        var cut = segment.IndexOfAny('`', '<', '{');
+        return (cut < 0 ? segment : segment[..cut]).ToString();
     }
 
     private static bool IsQuerySyntaxError(SqliteException e) =>

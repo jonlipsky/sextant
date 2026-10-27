@@ -84,7 +84,14 @@ public static class FindSymbolTool
         if (fuzzy)
         {
             var config = SextantConfiguration.FromEnvironment();
-            var results = SearchFuzzy(symbolStore, name, config.FtsMaxResults, kinds);
+            var (results, matchWarning) = SearchFuzzyDetailed(symbolStore, name, config.FtsMaxResults, kinds);
+            var docWarning = results.Count == 0 ? null : matchWarning switch
+            {
+                SymbolStore.FtsMatchWarning.Documentation => DocumentationMatchWarning,
+                SymbolStore.FtsMatchWarning.NameOnly => NameOnlyMatchWarning,
+                SymbolStore.FtsMatchWarning.ContainingTypeOnly => ContainingTypeOnlyMatchWarning,
+                _ => null,
+            };
             if (projectDbId != null)
                 results = results.Where(s => s.ProjectId == projectDbId.Value).ToList();
 
@@ -102,7 +109,8 @@ public static class FindSymbolTool
             var freshness = results.Count > 0 ? results.Min(s => s.LastIndexedAt) : 0L;
 
             if (!isRemoteBaseOverlay)
-                return ResponseBuilder.BuildBounded(mapped, readContext, freshness, provenance: readContext.Provenance);
+                return ResponseBuilder.BuildBounded(mapped, readContext, freshness, provenance: readContext.Provenance,
+                    warning: docWarning);
 
             RemoteBaseSymbolFederation.Outcome? outcome = null;
             if (federateRemote && mapped.Count < config.FtsMaxResults)
@@ -125,7 +133,8 @@ public static class FindSymbolTool
             // base was federated in), not 0 — mirroring the exact branch, which stamps provenance.Freshness
             // for a remote hit. Pure-local (non-overlay) freshness is untouched (criterion 4).
             var effectiveFreshness = results.Count > 0 ? freshness : provenance.Freshness;
-            return ResponseBuilder.BuildBounded(mapped, readContext, effectiveFreshness, provenance: provenance);
+            return ResponseBuilder.BuildBounded(mapped, readContext, effectiveFreshness, provenance: provenance,
+                warning: docWarning);
         }
         else
         {
@@ -226,12 +235,26 @@ public static class FindSymbolTool
     private const int MaxAmbiguousResults = 25;
 
     internal static List<SymbolInfo> SearchFuzzy(
+        SymbolStore symbols, string name, int maxResults, IReadOnlySet<SymbolKind>? kinds) =>
+        SearchFuzzyDetailed(symbols, name, maxResults, kinds).Symbols;
+
+    internal static (List<SymbolInfo> Symbols, SymbolStore.FtsMatchWarning Warning) SearchFuzzyDetailed(
         SymbolStore symbols, string name, int maxResults, IReadOnlySet<SymbolKind>? kinds)
     {
         // Inference must use the same bounded, scoped FTS evidence as the eventual tool read.
-        var results = symbols.SearchFtsTolerant(name, maxResults, kinds is { Count: 1 } ? kinds.First().ToString() : null);
-        return kinds is { Count: > 1 } ? results.Where(s => kinds.Contains(s.Kind)).ToList() : results;
+        var (results, warning) = symbols.SearchFtsTolerantDetailed(
+            name, maxResults, kinds is { Count: 1 } ? kinds.First().ToString() : null);
+        return (kinds is { Count: > 1 } ? results.Where(s => kinds.Contains(s.Kind)).ToList() : results, warning);
     }
+
+    private const string DocumentationMatchWarning =
+        "No symbol name matched; these results matched documentation text only. Check the name or drop the qualifier.";
+
+    private const string ContainingTypeOnlyMatchWarning =
+        "No member matched the last segment; showing the containing type. Use get_type_members to list its members.";
+
+    private const string NameOnlyMatchWarning =
+        "No symbol matched the qualifier; these match the name only. Check the namespace or containing type.";
 
     private static bool Contains(string? haystack, string needle)
         => haystack != null && haystack.Contains(needle, StringComparison.OrdinalIgnoreCase);

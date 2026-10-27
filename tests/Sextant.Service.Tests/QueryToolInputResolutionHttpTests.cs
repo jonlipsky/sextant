@@ -51,6 +51,78 @@ public class QueryToolInputResolutionHttpTests
         try { Directory.Delete(_root, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
     }
 
+    // ==== issue #366: a qualified fuzzy name matches the symbol name first ===========================
+
+    [TestMethod]
+    [DataRow("ProcessStack.Process.ProcessRunner", "global::ProcessStack.Process.ProcessRunner")]
+    [DataRow("Process.Runner", "global::ProcessStack.Process.ProcessRunner")]
+    [DataRow("ProcessRunner.Run", "global::ProcessStack.Process.ProcessRunner.Run()")]
+    public async Task FuzzyQualifiedName_FindsTheNamedSymbolFirst_NotSymbolsWhoseDocCommentsMentionIt(
+        string name, string expected)
+    {
+        var call = await CallAsync("find_symbol",
+            WithRepository($$"""{"name":{{JsonSerializer.Serialize(name)}},"fuzzy":true}"""), Solo);
+
+        Assert.IsFalse(call.IsError, call.Body.ToString());
+        var names = Names(call.Body);
+        Assert.AreEqual(expected, names.FirstOrDefault(), call.Body.ToString());
+        Assert.IsFalse(names.Any(n => n.Contains("Library.Engine", StringComparison.Ordinal)), call.Body.ToString());
+        Assert.IsFalse(call.Body.GetProperty("meta").TryGetProperty("warning", out _), call.Body.ToString());
+    }
+
+    [TestMethod]
+    [DataRow("Process.Runner", "global::ProcessStack.Process.ProcessRunner")]
+    public async Task FuzzyQualifiedName_NeverReturnsNamesWhoseQualifierDoesNotMatch(string name, string expected)
+    {
+        var call = await CallAsync("find_symbol",
+            WithRepository($$"""{"name":{{JsonSerializer.Serialize(name)}},"fuzzy":true}"""), Solo);
+
+        Assert.IsFalse(call.IsError, call.Body.ToString());
+        var names = Names(call.Body);
+        Assert.AreEqual(expected, names.FirstOrDefault(), call.Body.ToString());
+        Assert.IsFalse(names.Any(n => n.Contains("RoutePrefix", StringComparison.Ordinal)
+            || n.Contains("_router", StringComparison.Ordinal)), call.Body.ToString());
+    }
+
+    [TestMethod]
+    public async Task FuzzyQualifiedName_OnlyTheOwnerTypeMatches_ShowsItAndSaysSo()
+    {
+        var call = await CallAsync("find_symbol",
+            WithRepository("""{"name":"IActivityExecutorRouter.Route","fuzzy":true}"""), Solo);
+
+        Assert.IsFalse(call.IsError, call.Body.ToString());
+        var names = Names(call.Body);
+        Assert.AreEqual("global::ProcessStack.Process.Execution.IActivityExecutorRouter", names.FirstOrDefault(), call.Body.ToString());
+        Assert.IsFalse(names.Any(n => n.Contains("RoutePrefix", StringComparison.Ordinal)
+            || n.Contains("_router", StringComparison.Ordinal)), call.Body.ToString());
+        Assert.AreEqual(
+            "No member matched the last segment; showing the containing type. Use get_type_members to list its members.",
+            call.Body.GetProperty("meta").GetProperty("warning").GetString());
+    }
+
+    [TestMethod]
+    public async Task FuzzyQualifiedName_NoNameMatches_FallsBackToDocComments_AndSaysSo()
+    {
+        var call = await CallAsync("find_symbol",
+            WithRepository("""{"name":"Telemetry.Executor","fuzzy":true}"""), Solo);
+
+        Assert.IsFalse(call.IsError, call.Body.ToString());
+        Assert.IsTrue(Names(call.Body).Count > 0, call.Body.ToString());
+        StringAssert.Contains(call.Body.GetProperty("meta").GetProperty("warning").GetString(), "documentation");
+    }
+
+    [TestMethod]
+    public async Task FuzzyQualifiedName_WrongNamespace_FindsTheNameOnly_AndSaysSo()
+    {
+        var call = await CallAsync("find_symbol",
+            WithRepository("""{"name":"ProcessStack.Core.Versioning.IVersionedAssetStore","fuzzy":true}"""), Solo);
+
+        Assert.IsFalse(call.IsError, call.Body.ToString());
+        Assert.AreEqual("global::ProcessStack.Versioning.IVersionedAssetStore", Names(call.Body).FirstOrDefault(), call.Body.ToString());
+        Assert.AreEqual("No symbol matched the qualifier; these match the name only. Check the namespace or containing type.",
+            call.Body.GetProperty("meta").GetProperty("warning").GetString());
+    }
+
     // ==== repository selection =======================================================================
 
     [TestMethod]
@@ -582,6 +654,50 @@ public class QueryToolInputResolutionHttpTests
 
     private static readonly (string Path, string Source)[] LibrarySources =
     [
+        ("src/Library/Engine/Engine.cs", """
+            namespace ProcessStack.Process
+            {
+                public class ProcessRunner
+                {
+                    public void Run() { }
+                }
+            }
+
+            namespace ProcessStack.Process.Execution
+            {
+                public interface IActivityExecutorRouter
+                {
+                    void ExecuteAsync();
+                }
+            }
+
+            namespace ProcessStack.Versioning
+            {
+                public interface IVersionedAssetStore { }
+            }
+
+            namespace ProcessStack.Web
+            {
+                public class Routes
+                {
+                    public string RoutePrefix { get; set; }
+                    private object _router;
+                    private object _processRunner;
+                }
+            }
+
+            namespace Library.Engine
+            {
+                /// <summary>Telemetry for the ProcessStack Process ProcessRunner executor.</summary>
+                public class EngineMetrics { }
+
+                /// <summary>The ProcessStack Process ProcessRunner activity source.</summary>
+                public class EngineActivitySource { }
+
+                /// <summary>Runs an activity for the ProcessStack Process ProcessRunner.</summary>
+                public class InProcessActivityExecutor { }
+            }
+            """),
         ("src/Library/Shapes/Shapes.cs", """
             namespace Library.Shapes
             {
