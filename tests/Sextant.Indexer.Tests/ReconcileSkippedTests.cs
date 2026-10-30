@@ -281,6 +281,172 @@ public sealed class ReconcileSkippedTests
         Assert.AreEqual(a, result.DegradedProjects.Single().ProjectPath);
     }
 
+    private const string TransitiveWarning = "PackageReference X will not be pruned.";
+
+    private static (LoadReconciliationProbe Probe, string Declared, string Transitive) RunTransitive(
+        string assets, bool transitiveHasDocument, Func<string, string, SolutionLoader.LoadFailure[]>? failures = null)
+    {
+        var dir = "Transitive-" + Guid.NewGuid().ToString("N");
+        var declared = Abs(dir + "/App", "App.csproj");
+        var transitive = Abs(dir + "/Mcp", "Sextant.Mcp.csproj");
+        Directory.CreateDirectory(Path.Combine(Path.GetDirectoryName(transitive)!, "obj"));
+        File.WriteAllText(Path.Combine(Path.GetDirectoryName(transitive)!, "obj", "project.assets.json"), assets);
+        try
+        {
+            var solution = SolutionWith((declared, true), (transitive, transitiveHasDocument));
+            var list = failures?.Invoke(declared, transitive) ?? new[]
+            {
+                new SolutionLoader.LoadFailure(null, null,
+                    $"Msbuild failed when processing the file '{transitive}' with message: {TransitiveWarning}")
+            };
+            var diagnostics = new List<string>();
+            var result = SolutionLoader.ReconcileLoads([declared], solution, list, [], diagnostics.Add);
+            return (new LoadReconciliationProbe(result, diagnostics), declared, transitive);
+        }
+        finally
+        {
+            Directory.Delete(Path.Combine(Root, dir), recursive: true);
+        }
+    }
+
+    private sealed record LoadReconciliationProbe(SolutionLoader.LoadReconciliation Result, List<string> Diagnostics);
+
+    [TestMethod]
+    public void ATransitiveProjectsReplayedWarning_IsNotAFailureOfAnyProject()
+    {
+        var (probe, _, _) = RunTransitive(
+            $$"""{"version":3,"logs":[{"level":"Warning","message":"{{TransitiveWarning}}"}]}""", true);
+
+        Assert.AreEqual(0, probe.Result.DegradedProjects.Count);
+        Assert.AreEqual(0, probe.Result.SkippedProjects.Count);
+        Assert.AreEqual(0, probe.Result.UnattributedFailureCount);
+        Assert.AreEqual(1, probe.Diagnostics.Count(d => d.Contains("replayed", StringComparison.Ordinal)));
+    }
+
+    [TestMethod]
+    public void ATransitiveProjectsReplayedWarning_AlsoRecordedAsAnError_IsKept()
+    {
+        var (probe, _, _) = RunTransitive(
+            $$"""{"version":3,"logs":[{"level":"Warning","message":"{{TransitiveWarning}}"},{"level":"Error","message":"{{TransitiveWarning}}"}]}""", true);
+
+        Assert.AreEqual(1, probe.Result.UnattributedFailureCount);
+        Assert.AreEqual(0, probe.Diagnostics.Count(d => d.Contains("replayed", StringComparison.Ordinal)));
+    }
+
+    [TestMethod]
+    public void ATransitiveProjectThatLoadedNoDocuments_KeepsItsFailure()
+    {
+        var (probe, _, _) = RunTransitive(
+            $$"""{"version":3,"logs":[{"level":"Warning","message":"{{TransitiveWarning}}"}]}""", false);
+
+        Assert.AreEqual(1, probe.Result.UnattributedFailureCount);
+        Assert.AreEqual(0, probe.Diagnostics.Count(d => d.Contains("replayed", StringComparison.Ordinal)));
+    }
+
+    [TestMethod]
+    public void ATransitiveProjectsReplayedWarning_TypedToTheDeclaredProject_IsStillNotThatProjectsFailure()
+    {
+        var (probe, _, _) = RunTransitive(
+            $$"""{"version":3,"logs":[{"level":"Warning","message":"{{TransitiveWarning}}"}]}""", true,
+            (declared, transitive) =>
+            [
+                new SolutionLoader.LoadFailure(null, Path.GetFullPath(declared),
+                    $"Msbuild failed when processing the file '{transitive}' with message: {TransitiveWarning}")
+            ]);
+
+        Assert.AreEqual(0, probe.Result.DegradedProjects.Count);
+        Assert.AreEqual(0, probe.Result.UnattributedFailureCount);
+    }
+
+    [TestMethod]
+    public void APathOnlyFailure_IsNotAttributedToADeclaredProjectWhoseNameItMerelyEndsWith()
+    {
+        var mcp = Abs("Mcp", "Mcp.csproj");
+        var solution = SolutionWith((mcp, true));
+        var failures = new[]
+        {
+            new SolutionLoader.LoadFailure(null, null,
+                $"Msbuild failed when processing the file '{Abs("Other", "Sextant.Mcp.csproj")}' with message: boom")
+        };
+
+        var result = SolutionLoader.ReconcileLoads([mcp], solution, failures, [], null);
+
+        Assert.AreEqual(0, result.DegradedProjects.Count);
+        Assert.AreEqual(1, result.UnattributedFailureCount);
+    }
+
+    [TestMethod]
+    public void ANameFollowedByASentenceEndingPeriod_IsStillMentioned()
+    {
+        var a = Abs("A", "Foo.csproj");
+        var solution = SolutionWith((a, withDocument: false));
+        var failures = new[] { new SolutionLoader.LoadFailure(null, null, $"Unable to load {a}.") };
+
+        var skipped = SolutionLoader.ReconcileLoads([a], solution, failures, [], null).SkippedProjects;
+
+        Assert.AreEqual(1, skipped.Count);
+    }
+
+    [TestMethod]
+    public void AFailureNamingAnUnloadedFile_IsNotReclassifiedAsItsTypedOwnersWarning()
+    {
+        var dir = "Typed-" + Guid.NewGuid().ToString("N");
+        var declared = Abs(dir + "/App", "App.csproj");
+        var owner = Abs(dir + "/Owner", "Owner.csproj");
+        var unloaded = Abs(dir + "/Gone", "Gone.csproj");
+        Directory.CreateDirectory(Path.Combine(Path.GetDirectoryName(owner)!, "obj"));
+        File.WriteAllText(Path.Combine(Path.GetDirectoryName(owner)!, "obj", "project.assets.json"),
+            $$"""{"version":3,"logs":[{"level":"Warning","message":"{{TransitiveWarning}}"}]}""");
+        try
+        {
+            var solution = SolutionWith((declared, true), (owner, true));
+            var failures = new[]
+            {
+                new SolutionLoader.LoadFailure(null, Path.GetFullPath(owner),
+                    $"Msbuild failed when processing the file '{unloaded}' with message: {TransitiveWarning}")
+            };
+
+            var result = SolutionLoader.ReconcileLoads([declared], solution, failures, [], null);
+
+            Assert.AreEqual(1, result.UnattributedFailureCount);
+        }
+        finally
+        {
+            Directory.Delete(Path.Combine(Root, dir), recursive: true);
+        }
+    }
+
+    [TestMethod]
+    public void AReplayedWarning_IsKeptWhenTheTypedVariantOrAnyVariantHasNoDocuments()
+    {
+        var dir = "Variants-" + Guid.NewGuid().ToString("N");
+        var declared = Abs(dir + "/App", "App.csproj");
+        var transitive = Abs(dir + "/Mcp", "Mcp.csproj");
+        Directory.CreateDirectory(Path.Combine(Path.GetDirectoryName(transitive)!, "obj"));
+        File.WriteAllText(Path.Combine(Path.GetDirectoryName(transitive)!, "obj", "project.assets.json"),
+            $$"""{"version":3,"logs":[{"level":"Warning","message":"{{TransitiveWarning}}"}]}""");
+        try
+        {
+            var built = BuildSolution([(declared, true), (transitive, true), (transitive, false)]);
+            var message = $"Msbuild failed when processing the file '{transitive}' with message: {TransitiveWarning}";
+
+            var typed = SolutionLoader.ReconcileLoads([declared], built.Solution,
+                [new SolutionLoader.LoadFailure(built.ProjectIds[2], null, message)], [], null);
+            var untyped = SolutionLoader.ReconcileLoads([declared], built.Solution,
+                [new SolutionLoader.LoadFailure(null, null, message)], [], null);
+            var typedHealthy = SolutionLoader.ReconcileLoads([declared], built.Solution,
+                [new SolutionLoader.LoadFailure(built.ProjectIds[1], null, message)], [], null);
+
+            Assert.AreEqual(1, typed.UnattributedFailureCount);
+            Assert.AreEqual(1, untyped.UnattributedFailureCount);
+            Assert.AreEqual(0, typedHealthy.UnattributedFailureCount);
+        }
+        finally
+        {
+            Directory.Delete(Path.Combine(Root, dir), recursive: true);
+        }
+    }
+
     private static string Abs(string dir, string file) => Path.Combine(Root, dir, file);
 
     private static Solution SolutionWith(params (string Path, bool WithDocument)[] projects) =>

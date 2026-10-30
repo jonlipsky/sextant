@@ -421,7 +421,8 @@ public static class SolutionLoader
         var ambiguousFileNames = AmbiguousFileNames(declared);
         // A diagnostic may fire before its project is in CurrentSolution, so resolve any typed ProjectId
         // to a path against the FINAL solution here rather than only at event time.
-        var resolvedFailures = ResolveFailurePaths(failures, solution);
+        var resolvedFailures = ReclassifyTransitiveRestoreWarnings(
+            ResolveFailurePaths(failures, solution), declared, loaded, onDiagnostic);
         var attributed = new HashSet<LoadFailure>();
         var result = new List<SkippedProject>(knownSkipped);
         var degraded = new List<DegradedProject>();
@@ -500,6 +501,50 @@ public static class SolutionLoader
         foreach (var project in degradedVersions)
             onDiagnostic?.Invoke($"Degraded project '{Path.GetFileName(project.ProjectPath)}' ({project.TargetFramework ?? "unknown TFM"}): {project.Reason}");
         return new LoadReconciliation(skips, degradedVersions, resolvedFailures.Count(f => !attributed.Contains(f)));
+    }
+
+    // A loaded project the solution does not declare (reached through a project reference) replays its own
+    // restore warnings too. Such a failure is owned by the project it names ("processing the file '<path>'")
+    // or by its typed owner; it is dropped, with a diagnostic, only when that project loaded documents and the
+    // text is a Warning-only entry of that project's own assets file. Everything else is left for attribution.
+    private static List<LoadFailure> ReclassifyTransitiveRestoreWarnings(
+        List<LoadFailure> failures, IReadOnlyList<string> declared,
+        Dictionary<string, List<Project>> loaded, Action<string>? onDiagnostic)
+    {
+        var declaredPaths = declared.Select(NormalizePath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var kept = new List<LoadFailure>(failures.Count);
+        foreach (var failure in failures)
+        {
+            // A message that names a file is owned by that file alone; the typed owner is only for messages naming none.
+            var owner = ProcessedFilePath(failure.Message) is { } named ? NormalizePath(named) : failure.ProjectPath;
+            if (owner != null && !declaredPaths.Contains(owner)
+                && loaded.TryGetValue(owner, out var variants) && HasDocuments(variants, failure.ProjectId)
+                && IsReplayedRestoreWarning(failure.Message, ReadRestoreWarnings(owner)))
+            {
+                onDiagnostic?.Invoke(
+                    $"Restore warning replayed by the load of '{Path.GetFileName(owner)}' (not a load failure): {failure.Message}");
+                continue;
+            }
+            kept.Add(failure);
+        }
+        return kept;
+    }
+
+    // A typed ProjectId must name a variant with documents; without one every loaded variant must have them.
+    private static bool HasDocuments(List<Project> variants, ProjectId? typed) =>
+        typed != null && variants.FirstOrDefault(v => v.Id == typed) is { } variant
+            ? variant.Documents.Any()
+            : variants.All(v => v.Documents.Any());
+
+    private static string? ProcessedFilePath(string message)
+    {
+        const string marker = "processing the file '";
+        var start = message.IndexOf(marker, StringComparison.Ordinal);
+        if (start < 0)
+            return null;
+        start += marker.Length;
+        var end = message.IndexOf('\'', start);
+        return end > start ? message[start..end] : null;
     }
 
     // MSBuildWorkspace reports an MSBuild WARNING raised during the design-time load as a Failure diagnostic
@@ -669,16 +714,35 @@ public static class SolutionLoader
 
         foreach (var failure in failures)
             if (failure.ProjectPath == null && failure.ProjectId == null &&
-                failure.Message.Contains(fullPath, StringComparison.OrdinalIgnoreCase))
+                MentionsName(failure.Message, fullPath))
                 return Attribute(failure, attributed);
 
         if (!ambiguousFileNames.Contains(fileName))
             foreach (var failure in failures)
                 if (failure.ProjectPath == null && failure.ProjectId == null &&
-                    failure.Message.Contains(fileName, StringComparison.OrdinalIgnoreCase))
+                    MentionsName(failure.Message, fileName))
                     return Attribute(failure, attributed);
 
         return null;
+    }
+
+    // A name counts only as a whole token: 'Mcp.csproj' is not mentioned by '.../Sextant.Mcp.csproj'.
+    private static bool MentionsName(string message, string name)
+    {
+        for (var i = message.IndexOf(name, StringComparison.OrdinalIgnoreCase); i >= 0;
+             i = message.IndexOf(name, i + 1, StringComparison.OrdinalIgnoreCase))
+        {
+            var before = i == 0 ? ' ' : message[i - 1];
+            var end = i + name.Length;
+            var after = end >= message.Length ? ' ' : message[end];
+            // A '.' ending a sentence (followed by nothing or whitespace) is a boundary, not part of a longer name.
+            var sentenceEnd = after == '.' && (end + 1 >= message.Length || char.IsWhiteSpace(message[end + 1]));
+            if (!IsNameChar(before) && (sentenceEnd || !IsNameChar(after)))
+                return true;
+        }
+        return false;
+
+        static bool IsNameChar(char ch) => char.IsLetterOrDigit(ch) || ch is '.' or '_' or '-';
     }
 
     private static LoadFailure Attribute(LoadFailure failure, HashSet<LoadFailure> attributed)
