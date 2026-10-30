@@ -30,6 +30,9 @@ public sealed class SolutionEvaluationProbe(ICheckoutProvider checkoutProvider) 
         // Config-error state (issue #109): the checkout resolved but its own sextant.json expressed a
         // scoping intent that could not be honored, so no solution was selected. Nothing to probe — surface
         // the reason as unavailable rather than loading an empty union.
+        if (resolution.NoSupportedCode)
+            return ProbeResult.Unavailable(
+                $"Commit {request.CommitSha} of '{request.RepositoryRemoteUrl}' contains no solution (.sln/.slnx) file, so there is nothing to index.");
         if (!resolution.HasSelectedSolutions)
             return ProbeResult.Unavailable(
                 resolution.ConfigurationError

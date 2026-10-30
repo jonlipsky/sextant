@@ -619,6 +619,35 @@ public class GrantHttpTests
     }
 
     [TestMethod]
+    public async Task ListRepositories_ShowsNoSupportedCode_ForAGrantWhoseLastJobFoundNoCSharp()
+    {
+        const string sha = "0123456789abcdef0123456789abcdef01234567";
+        await using var host = await Harness.StartAsync(seed: db =>
+        {
+            using var cmd = db.GetConnection().CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO snapshot_jobs (identity_hash, repository_url, commit_sha, branch_name, status, created_at, updated_at, completed_at, last_error)
+                VALUES ('hash-kit', @url, @sha, 'main', @status, 1, 1, 1, @error);
+                """;
+            cmd.Parameters.AddWithValue("@url", Gizmos);
+            cmd.Parameters.AddWithValue("@sha", sha);
+            cmd.Parameters.AddWithValue("@status", SnapshotJobStatus.Unsupported);
+            cmd.Parameters.AddWithValue("@error", SnapshotJobStore.NoSupportedCodeDefaultBranchPrefix + "contains no solution (.sln/.slnx) file");
+            cmd.ExecuteNonQuery();
+        });
+        await PutSelfAsync(host, host.UserAssertion(), Gizmos);
+
+        var call = await host.CallAsync("list_repositories", "{}", DelegateToken, host.UserAssertion());
+
+        Assert.IsFalse(call.IsError, call.Body.ToString());
+        var gizmos = call.Body.GetProperty("repositories").EnumerateArray()
+            .Single(r => r.GetProperty("repository").GetString() == Gizmos);
+        var branch = gizmos.GetProperty("branches").EnumerateArray().Single();
+        Assert.AreEqual(("main", GrantSnapshotStatus.NoSupportedCode, sha),
+            (branch.GetProperty("branch").GetString(), branch.GetProperty("status").GetString(), branch.GetProperty("commit_sha").GetString()));
+    }
+
+    [TestMethod]
     public async Task ListRepositories_WithoutAVerifiedCaller_IsCallerRequired()
     {
         await using var host = await Harness.StartAsync();

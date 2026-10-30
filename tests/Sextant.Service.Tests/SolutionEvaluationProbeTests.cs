@@ -43,6 +43,30 @@ public class SolutionEvaluationProbeTests
         Assert.AreEqual(0, result.LinuxOutcomes.Count);
     }
 
+    private sealed class NoCodeCheckoutProvider : ICheckoutProvider
+    {
+        public bool TryResolve(EnsureSnapshotRequest request, out CheckoutResolution resolution)
+        {
+            resolution = new CheckoutResolution
+            {
+                CheckoutDir = "/checkouts/app", SelectedSolutions = [], Source = SolutionSelectionSource.None, NoSupportedCode = true
+            };
+            return true;
+        }
+    }
+
+    [TestMethod]
+    public async Task NoSupportedCode_ReportsUnavailableWithTheNoSolutionMessage()
+    {
+        var probe = new SolutionEvaluationProbe(new NoCodeCheckoutProvider());
+
+        var result = await probe.ProbeAsync(ServiceTestFixtures.Request(commit: "abc123"), "/scratch", CancellationToken.None);
+
+        Assert.IsFalse(result.CheckoutAvailable);
+        StringAssert.Contains(result.UnavailableReason, "contains no solution (.sln/.slnx) file, so there is nothing to index.");
+        Assert.IsFalse(result.UnavailableReason!.Contains("project files", StringComparison.Ordinal));
+    }
+
     [DataTestMethod]
     [DataRow("Foo (net8.0-windows)", "windows")]
     [DataRow("Foo (net8.0-windows10.0.19041)", "windows")]

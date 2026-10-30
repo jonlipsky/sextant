@@ -1356,7 +1356,9 @@ request has a verified caller:
 | `GET /control/grants?scope=tenant` | application | — | `{targets:[{repository, branch, sources, watchers}], result_count}`: the distinct targets to keep indexed, with counts and **no user ids** |
 
 - **`status`** is `{resolved_branch?, snapshot_status, commit_sha?, published_at?, identity_hash?}`.
-  `snapshot_status` is `complete`, `partial`, `pending` (an ensure is queued or running) or `missing`.
+  `snapshot_status` is `complete`, `partial`, `pending` (an ensure is queued or running), `no_supported_code` (the
+  branch's most recent finished ensure was `unsupported` because the commit contains no solution (.sln/.slnx) file;
+  `resolved_branch` and `commit_sha` are that job's, #353) or `missing` (never indexed, or the last attempt failed).
 - **Re-PUT:** re-PUT of an existing grant returns `created: false` and keeps its first spelling and source.
 
 **Refusals:**
@@ -1372,7 +1374,8 @@ Every PUT and DELETE, accepted or refused, is audited as action `grant` with a d
 
 **`list_repositories`** is an MCP tool on the service `/mcp` only. For the verified caller it returns
 `{repositories:[{repository, sources, branches:[{branch, is_default, status, commit_sha?, published_at?}]}], meta}`:
-every visible repository, with its catalog branches plus any granted branch not indexed yet. It takes no
+every visible repository, with its catalog branches plus any granted branch not indexed yet. A branch `status` is one
+of the grant `snapshot_status` values above, including `no_supported_code`. It takes no
 arguments and is exempt from the reserved `repository`/`branch` arguments. A request with no verified caller
 gets the tool error `caller_required`.
 

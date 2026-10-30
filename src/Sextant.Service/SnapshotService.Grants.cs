@@ -427,6 +427,10 @@ public sealed partial class SnapshotService
         private List<(string Key, long Id, string Url)>? _repositories;
         private Dictionary<string, long>? _repositoryIds;
         private List<(string Key, string? Branch)>? _activeJobs;
+        private List<FinishedJob>? _finishedJobs;
+
+        // The most recent finished job of one (repository, branch) and whether it ended unsupported for no C# code.
+        private sealed record FinishedJob(string Key, string? Branch, string CommitSha, long At, long Id, bool NoSupportedCode, bool DefaultMarked);
 
         // Every consumer (non-provider) repository with its key, in id order.
         public IEnumerable<(string Key, string Url)> ConsumerRepositories() =>
@@ -437,12 +441,12 @@ public sealed partial class SnapshotService
             var repositoryId = RepositoryId(key);
             var row = repositoryId is long id ? BranchFor(id, branch) : null;
             var resolved = row?.Name ?? (branch.Length == 0 ? null : branch);
-            var (status, snapshot) = BranchState(key, row, resolved, branch.Length == 0 || row?.IsDefault == true);
+            var (status, snapshot, noCode) = BranchState(key, row, resolved, branch.Length == 0 || row?.IsDefault == true);
             return new GrantStatus
             {
-                ResolvedBranch = resolved,
+                ResolvedBranch = noCode?.Branch ?? resolved,
                 SnapshotStatus = status,
-                CommitSha = snapshot is null ? null : _snapshots.GetCommitSha(snapshot.CommitId),
+                CommitSha = noCode?.CommitSha ?? (snapshot is null ? null : _snapshots.GetCommitSha(snapshot.CommitId)),
                 PublishedAt = snapshot?.PublishedAt,
                 IdentityHash = snapshot?.IdentityHash
             };
@@ -463,7 +467,10 @@ public sealed partial class SnapshotService
                     continue;
                 if (branches.Any(b => b.Branch == granted))
                     continue;
-                branches.Add(Listed(key, null, granted, isDefault: granted.Length == 0));
+                var listed = Listed(key, null, granted, isDefault: granted.Length == 0);
+                if (branches.Any(b => b.Branch == listed.Branch))
+                    continue;
+                branches.Add(listed);
             }
             return new VisibleRepository
             {
@@ -475,29 +482,92 @@ public sealed partial class SnapshotService
 
         private VisibleBranch Listed(string key, BranchRow? row, string name, bool isDefault)
         {
-            var (status, snapshot) = BranchState(key, row, name.Length == 0 ? null : name, isDefault);
+            var (status, snapshot, noCode) = BranchState(key, row, name.Length == 0 ? null : name, isDefault);
             return new VisibleBranch
             {
-                Branch = name,
+                Branch = noCode?.Branch ?? name,
                 IsDefault = isDefault,
                 Status = status,
-                CommitSha = snapshot is null ? null : _snapshots.GetCommitSha(snapshot.CommitId),
+                CommitSha = noCode?.CommitSha ?? (snapshot is null ? null : _snapshots.GetCommitSha(snapshot.CommitId)),
                 PublishedAt = snapshot?.PublishedAt
             };
         }
 
         // complete/partial from the branch's complete snapshot; else pending when an ensure for the branch is queued
-        // or running (a default-branch grant also matches an ensure that named no branch); else missing.
-        private (string Status, SnapshotRow? Snapshot) BranchState(string key, BranchRow? row, string? name, bool isDefault)
+        // or running (a default-branch grant also matches an ensure that named no branch); else no_supported_code when
+        // the most recent finished ensure for the branch found no solution (issue #353); else missing. A default grant
+        // with no catalog branch matches only no-branch jobs and jobs marked as default-branch ones, never a plain
+        // feature-branch job. A marked job's branch B only counts while it is also the latest finished job on B.
+        private (string Status, SnapshotRow? Snapshot, FinishedJob? NoCode) BranchState(string key, BranchRow? row, string? name, bool isDefault)
         {
             if (row is { SnapshotId: long snapshotId } && _snapshots.GetById(snapshotId) is { Status: SnapshotStatus.Complete } snapshot)
             {
                 var partial = CoverageOn(conn, snapshot.Id) is { IsPartial: true };
-                return (partial ? GrantSnapshotStatus.Partial : GrantSnapshotStatus.Complete, snapshot);
+                return (partial ? GrantSnapshotStatus.Partial : GrantSnapshotStatus.Complete, snapshot, null);
             }
             var pending = ActiveJobs().Any(j => j.Key == key
                 && (name is not null && j.Branch == name || isDefault && string.IsNullOrEmpty(j.Branch)));
-            return (pending ? GrantSnapshotStatus.Pending : GrantSnapshotStatus.Missing, null);
+            if (pending)
+                return (GrantSnapshotStatus.Pending, null, null);
+
+            var jobs = FinishedJobs().Where(j => j.Key == key).ToList();
+            FinishedJob? finished;
+            if (name is not null)
+            {
+                finished = jobs.Where(j => j.Branch == name).OrderByDescending(j => j.At).ThenByDescending(j => j.Id).FirstOrDefault();
+            }
+            else
+            {
+                finished = isDefault
+                    ? jobs.Where(j => j.DefaultMarked || string.IsNullOrEmpty(j.Branch))
+                        .OrderByDescending(j => j.At).ThenByDescending(j => j.Id).FirstOrDefault()
+                    : null;
+                if (finished is { DefaultMarked: true, Branch: { Length: > 0 } defaultBranch })
+                {
+                    var latestOnBranch = jobs.Where(j => j.Branch == defaultBranch)
+                        .OrderByDescending(j => j.At).ThenByDescending(j => j.Id).FirstOrDefault();
+                    if (latestOnBranch?.Id != finished.Id)
+                        finished = null;
+                }
+            }
+            return finished is { NoSupportedCode: true }
+                ? (GrantSnapshotStatus.NoSupportedCode, null, finished)
+                : (GrantSnapshotStatus.Missing, null, null);
+        }
+
+        private List<FinishedJob> FinishedJobs()
+        {
+            if (_finishedJobs is not null)
+                return _finishedJobs;
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT repository_url, branch_name, commit_sha, at, status, last_error, id FROM (
+                    SELECT repository_url, branch_name, commit_sha, status, last_error, id,
+                           COALESCE(completed_at, updated_at) AS at,
+                           ROW_NUMBER() OVER (PARTITION BY repository_url, COALESCE(branch_name, '')
+                                              ORDER BY COALESCE(completed_at, updated_at) DESC, id DESC) AS rn
+                    FROM snapshot_jobs
+                    WHERE status NOT IN (@queued, @running)
+                      AND repository_url IN (SELECT repository_url FROM snapshot_jobs WHERE status = @unsupported))
+                WHERE rn = 1;
+                """;
+            cmd.Parameters.AddWithValue("@queued", SnapshotJobStatus.Queued);
+            cmd.Parameters.AddWithValue("@running", SnapshotJobStatus.Running);
+            cmd.Parameters.AddWithValue("@unsupported", SnapshotJobStatus.Unsupported);
+            var jobs = new List<FinishedJob>();
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                var unsupported = reader.GetString(4) == SnapshotJobStatus.Unsupported;
+                var error = reader.IsDBNull(5) ? "" : reader.GetString(5);
+                var marked = unsupported && error.StartsWith(SnapshotJobStore.NoSupportedCodeDefaultBranchPrefix, StringComparison.Ordinal);
+                var noCode = marked
+                    || unsupported && error.StartsWith(SnapshotJobStore.NoSupportedCodePrefix, StringComparison.Ordinal);
+                jobs.Add(new FinishedJob(
+                    RepositoryGrantKey.Of(reader.GetString(0)), reader.IsDBNull(1) ? null : reader.GetString(1),
+                    reader.GetString(2), reader.GetInt64(3), reader.GetInt64(6), noCode, marked));
+            }
+            return _finishedJobs = jobs;
         }
 
         // How a repository is spelled back to the caller: the tenant-wide grant's spelling first, then the oldest grant's.

@@ -196,6 +196,11 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
                         allowReplace = true;
                         upgrade = true;
                         break;
+                    case CommitState.Match:
+                        // Verified at the requested commit, nothing to upgrade, and the locate provider found no
+                        // solution: the one case where "no code" is a fact (issue #353).
+                        resolution = WithProvisioning(NoSupportedCode(target));
+                        return true;
                     default:
                         return false;
                 }
@@ -231,12 +236,20 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
             }
 
             // Publish succeeded → the inner provider now locates the freshly-cloned checkout + solution.
-            if (!_inner.TryResolve(request, out resolution))
-                return false;
+            // A fresh clone that holds no solution is a verified "no code" (issue #353).
+            resolution = _inner.TryResolve(request, out resolution) ? resolution : NoSupportedCode(target);
             resolution = WithProvisioning(resolution);
             return true;
         }
     }
+
+    private static CheckoutResolution NoSupportedCode(string checkoutDir) => new()
+    {
+        CheckoutDir = checkoutDir,
+        SelectedSolutions = [],
+        Source = Sextant.Indexer.SolutionSelectionSource.None,
+        NoSupportedCode = true
+    };
 
     /// <summary>
     /// Whether a located checkout may be served as-is: never at a VERIFIED different commit; always when its

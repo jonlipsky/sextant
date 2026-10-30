@@ -326,6 +326,129 @@ public class GrantServiceTests
         Assert.AreEqual(0, service.ListVisibleRepositories(User("tenant-b", "user-1")).Count);
     }
 
+    [TestMethod]
+    public async Task ListGrants_NoCodeJobOnMain_ReportsNoSupportedCodeWithRealBranchAndCommit()
+    {
+        const string sha = "0123456789abcdef0123456789abcdef01234567";
+        var noCode = SnapshotWorkResult.Unsupported(
+            SnapshotJobStore.NoSupportedCodeDefaultBranchPrefix + $"Commit {sha} of '{Gadgets}' contains no solution (.sln/.slnx) file, so there is nothing to index.");
+        var service = Start(worker: new FakeSnapshotWorker(_db, (_, _) => noCode));
+        var user = User("tenant-a", "user-1");
+        await service.PutGrantAsync(user, GrantScope.Self, Gadgets, Key(Gadgets), "");
+        await service.EnsureSnapshotAsync(ServiceTestFixtures.Request(repo: Gadgets, commit: sha, branch: "main"));
+
+        var status = service.ListGrants(user, GrantScope.Self).Single().Status;
+        Assert.AreEqual(GrantSnapshotStatus.NoSupportedCode, status.SnapshotStatus);
+        Assert.AreEqual("main", status.ResolvedBranch);
+        Assert.AreEqual(sha, status.CommitSha);
+
+        var branch = service.ListVisibleRepositories(user).Single().Branches.Single();
+        Assert.AreEqual(("main", GrantSnapshotStatus.NoSupportedCode, sha), (branch.Branch, branch.Status, branch.CommitSha));
+    }
+
+    [TestMethod]
+    public async Task ListGrants_NoCodeJob_StaysPendingWhileANewEnsureIsInFlight()
+    {
+        var noCode = SnapshotWorkResult.Unsupported(SnapshotJobStore.NoSupportedCodeDefaultBranchPrefix + "nothing to index");
+        var gated = new FakeSnapshotWorker(_db, (_, _) => noCode) { UseGate = true };
+        var service = Start(worker: gated);
+        var user = User("tenant-a", "user-1");
+        await service.PutGrantAsync(user, GrantScope.Self, Gadgets, Key(Gadgets), "");
+        var queued = await service.BeginEnsureSnapshotAsync(ServiceTestFixtures.Request(repo: Gadgets, commit: "commit-g1"));
+        Assert.IsFalse(SnapshotJobStatus.IsTerminal(queued.Status));
+        try
+        {
+            Assert.AreEqual(GrantSnapshotStatus.Pending, service.ListGrants(user, GrantScope.Self).Single().Status.SnapshotStatus);
+        }
+        finally
+        {
+            gated.Gate.SetResult();
+        }
+    }
+
+    [TestMethod]
+    public async Task ListGrants_DefaultGrant_IgnoresAPlainFeatureBranchNoCodeJob()
+    {
+        var noCode = SnapshotWorkResult.Unsupported(SnapshotJobStore.NoSupportedCodePrefix + "nothing to index");
+        var service = Start(worker: new FakeSnapshotWorker(_db, (_, _) => noCode));
+        var user = User("tenant-a", "user-1");
+        await service.PutGrantAsync(user, GrantScope.Self, Gadgets, Key(Gadgets), "");
+        await service.EnsureSnapshotAsync(ServiceTestFixtures.Request(repo: Gadgets, commit: "commit-g1", branch: "feature/x"));
+
+        var status = service.ListGrants(user, GrantScope.Self).Single().Status;
+        Assert.AreEqual(GrantSnapshotStatus.Missing, status.SnapshotStatus);
+        Assert.IsTrue(string.IsNullOrEmpty(status.ResolvedBranch));
+        var branch = service.ListVisibleRepositories(user).Single().Branches.Single();
+        Assert.AreEqual(("", GrantSnapshotStatus.Missing), (branch.Branch, branch.Status));
+    }
+
+    [TestMethod]
+    public async Task ListGrants_DefaultGrant_ReportsAMarkedDefaultBranchNoCodeJob()
+    {
+        var marked = SnapshotWorkResult.Unsupported(SnapshotJobStore.NoSupportedCodeDefaultBranchPrefix + "nothing to index");
+        var service = Start(worker: new FakeSnapshotWorker(_db, (_, request) => request.BranchName == "main"
+            ? marked : SnapshotWorkResult.Unsupported(SnapshotJobStore.NoSupportedCodePrefix + "nothing to index")));
+        var user = User("tenant-a", "user-1");
+        await service.PutGrantAsync(user, GrantScope.Self, Gadgets, Key(Gadgets), "");
+        await service.EnsureSnapshotAsync(ServiceTestFixtures.Request(repo: Gadgets, commit: "commit-g1", branch: "main"));
+        await service.EnsureSnapshotAsync(ServiceTestFixtures.Request(repo: Gadgets, commit: "commit-g2", branch: "feature/x"));
+
+        var status = service.ListGrants(user, GrantScope.Self).Single().Status;
+        Assert.AreEqual(GrantSnapshotStatus.NoSupportedCode, status.SnapshotStatus);
+        Assert.AreEqual("main", status.ResolvedBranch);
+    }
+
+    [TestMethod]
+    public async Task ListGrants_DefaultGrant_ANewerFailureOnTheDefaultBranch_IsMissing()
+    {
+        var calls = 0;
+        var service = Start(worker: new FakeSnapshotWorker(_db, (_, _) => ++calls == 1
+            ? SnapshotWorkResult.Unsupported(SnapshotJobStore.NoSupportedCodeDefaultBranchPrefix + "nothing to index")
+            : SnapshotWorkResult.Failed("boom")));
+        var user = User("tenant-a", "user-1");
+        await service.PutGrantAsync(user, GrantScope.Self, Gadgets, Key(Gadgets), "");
+        await service.EnsureSnapshotAsync(ServiceTestFixtures.Request(repo: Gadgets, commit: "commit-g1", branch: "main"));
+        Assert.AreEqual(GrantSnapshotStatus.NoSupportedCode, service.ListGrants(user, GrantScope.Self).Single().Status.SnapshotStatus);
+        await service.EnsureSnapshotAsync(ServiceTestFixtures.Request(repo: Gadgets, commit: "commit-g2", branch: "main"));
+
+        Assert.AreEqual(GrantSnapshotStatus.Missing, service.ListGrants(user, GrantScope.Self).Single().Status.SnapshotStatus);
+    }
+
+    [TestMethod]
+    public async Task ListGrants_AQueuedFeatureBranchJob_DoesNotMakeADefaultGrantPending()
+    {
+        var gated = new FakeSnapshotWorker(_db, (_, _) => SnapshotWorkResult.Failed("boom")) { UseGate = true };
+        var service = Start(worker: gated);
+        var user = User("tenant-a", "user-1");
+        await service.PutGrantAsync(user, GrantScope.Self, Gadgets, Key(Gadgets), "");
+        await service.BeginEnsureSnapshotAsync(ServiceTestFixtures.Request(repo: Gadgets, commit: "commit-g1", branch: "feature/x"));
+        try
+        {
+            Assert.AreEqual(GrantSnapshotStatus.Missing, service.ListGrants(user, GrantScope.Self).Single().Status.SnapshotStatus);
+        }
+        finally
+        {
+            gated.Gate.SetResult();
+        }
+    }
+
+    [TestMethod]
+    public async Task ListGrants_UnsupportedForAnotherReason_StaysMissing()
+    {
+        var service = Start(worker: new FakeSnapshotWorker(_db, (_, request) => request.RepositoryRemoteUrl == Gadgets
+            ? SnapshotWorkResult.Unsupported("unsupported target framework")
+            : SnapshotWorkResult.Failed("boom")));
+        var user = User("tenant-a", "user-1");
+        await service.PutGrantAsync(user, GrantScope.Self, Gadgets, Key(Gadgets), "");
+        await service.PutGrantAsync(user, GrantScope.Self, Gizmos, Key(Gizmos), "");
+        await service.EnsureSnapshotAsync(ServiceTestFixtures.Request(repo: Gadgets, commit: "commit-g1", branch: "main"));
+        await service.EnsureSnapshotAsync(ServiceTestFixtures.Request(repo: Gizmos, commit: "commit-z1", branch: "main"));
+
+        var grants = service.ListGrants(user, GrantScope.Self);
+        Assert.AreEqual(GrantSnapshotStatus.Missing, grants.Single(g => g.Repository == Gadgets).Status.SnapshotStatus);
+        Assert.AreEqual(GrantSnapshotStatus.Missing, grants.Single(g => g.Repository == Gizmos).Status.SnapshotStatus);
+    }
+
     // ==== audit =====================================================================================
 
     [TestMethod]

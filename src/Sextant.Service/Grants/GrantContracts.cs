@@ -49,7 +49,14 @@ public static class GrantSnapshotStatus
     /// <summary>No complete snapshot yet, but an ensure for the branch is queued or running.</summary>
     public const string Pending = "pending";
 
-    /// <summary>No complete snapshot and no ensure in flight.</summary>
+    /// <summary>
+    /// No complete snapshot and no ensure in flight, and the branch's most recent finished ensure was unsupported
+    /// because the commit contains no solution (.sln/.slnx) file (issue #353). The branch and commit are those of
+    /// that job.
+    /// </summary>
+    public const string NoSupportedCode = "no_supported_code";
+
+    /// <summary>No complete snapshot and no ensure in flight (never indexed, or the last attempt failed).</summary>
     public const string Missing = "missing";
 }
 
