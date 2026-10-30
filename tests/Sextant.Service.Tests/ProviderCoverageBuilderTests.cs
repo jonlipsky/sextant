@@ -85,6 +85,7 @@ public class ProviderCoverageBuilderTests
     {
         var resolution = Resolution([At("App.slnx"), At("libs/mix/Mix.slnx")]);
         var mix = At("libs/mix/src/Mix/Mix.csproj");
+        SdkProjectStubs.Create(mix);
         var load = Load([At("src/App/App.csproj"), mix], loaded: [At("src/App/App.csproj")],
             skipped: [new SkippedProject(mix, "evaluation failed")]);
         var inventory = Inventory([At("src/App/App.csproj"), mix], [Mix], solutions: [At("libs/mix/Mix.slnx")]);
@@ -102,6 +103,7 @@ public class ProviderCoverageBuilderTests
     {
         var mix = At("libs/mix/src/Mix/Mix.csproj");
         var solution = At("libs/mix/Mix.slnx");
+        SdkProjectStubs.Create(mix);
         var load = Load([mix]) with
         {
             DegradedProjects = [new DegradedProject(mix, "net10.0", "NETSDK1100: evaluation failed")]
@@ -267,10 +269,11 @@ public class ProviderCoverageBuilderTests
     // ---- helpers --------------------------------------------------------------------------------
 
     [TestMethod]
-    public void PlatformPackBinding_IsPartial_WithAReasonAndDiagnostic_ForRootAndProviderSubtree()
+    public void PlatformPackBinding_OnAWorkerThatCannotBuildThePlatform_IsAnExclusion_ForRootAndProviderSubtree()
     {
         var resolution = Resolution([At("App.slnx"), At("libs/mix/Mix.slnx")]);
         var projects = new[] { At("src/App/App.csproj"), At("libs/mix/src/Mix/Mix.csproj") };
+        SdkProjectStubs.Create(projects);
         var load = Load(projects) with
         {
             PlatformPackBindings =
@@ -284,18 +287,15 @@ public class ProviderCoverageBuilderTests
         var root = SnapshotCoverageBuilder.Build(CheckoutDir, resolution, load, inventory);
         var provider = SnapshotCoverageBuilder.BuildProviders(CheckoutDir, resolution, load, inventory)["libs/mix"];
 
-        Assert.AreEqual(SnapshotCoverageVerdict.Partial, root.Coverage.Verdict);
-        var rootReason = root.Coverage.Reasons.Single(r => r.Contains("platform reference pack", StringComparison.Ordinal));
-        StringAssert.StartsWith(rootReason, "2 Apple-platform project version(s)");
-        StringAssert.Contains(rootReason, "src/App/App.csproj");
-        Assert.AreEqual(2, root.Diagnostics.Count(d => d.Code == "platform_reference_pack"));
+        // Apple platforms cannot be built on a Linux worker: the bindings are exclusions, not a partial reason (#351).
+        Assert.IsFalse(root.Coverage.Reasons.Any(r => r.Contains("platform reference pack", StringComparison.Ordinal)));
+        Assert.AreEqual(2, root.Coverage.ProjectVersionsExcluded);
+        Assert.IsFalse(root.Diagnostics.Any(d => d.Code == "platform_reference_pack"));
 
-        Assert.AreEqual(SnapshotCoverageVerdict.Partial, provider.Verdict);
-        var providerReason = provider.Reasons.Single(r => r.Contains("platform reference pack", StringComparison.Ordinal));
-        StringAssert.StartsWith(providerReason, "1 Apple-platform project version(s)");
-        StringAssert.Contains(providerReason, "src/Mix/Mix.csproj", "provider-relative");
-        Assert.IsFalse(providerReason.Contains("libs/mix", StringComparison.Ordinal));
-        Assert.IsFalse(providerReason.Contains("src/App", StringComparison.Ordinal));
+        Assert.AreEqual(SnapshotCoverageVerdict.Complete, provider.Verdict, string.Join(" | ", provider.Reasons));
+        var exclusion = provider.Exclusions!.Single();
+        Assert.AreEqual("src/Mix/Mix.csproj", exclusion.Project, "provider-relative");
+        Assert.AreEqual("tvos; platform_pack_binding", exclusion.Detail);
     }
 
     private static CheckoutResolution Resolution(

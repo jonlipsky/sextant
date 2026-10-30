@@ -15,7 +15,7 @@ namespace Sextant.Service.Tests;
 [TestClass]
 public sealed class SdkPinSurfaceTests
 {
-    private const string CheckoutDir = "/checkout/repo";
+    private static readonly string CheckoutDir = Path.Combine(Path.GetTempPath(), "sextant_sdkpin_surface_checkout");
 
     // The coverage store's wire options (snake_case, nulls omitted).
     private static readonly JsonSerializerOptions CoverageJson = new()
@@ -138,6 +138,7 @@ public sealed class SdkPinSurfaceTests
     {
         var reason = "Error while calling hostfxr function hostfxr_resolve_sdk2. Error code: -2147450725 Detailed " +
                      "error: No .NET SDKs were found.";
+        SdkProjectStubs.Create($"{CheckoutDir}/tools/Tool/Tool.csproj");
         var skipped = new[] { new SkippedProject($"{CheckoutDir}/tools/Tool/Tool.csproj", reason) };
         var load = new MultiSolutionLoadResult(new AdhocWorkspace().CurrentSolution, skipped,
         [
@@ -212,6 +213,7 @@ public sealed class SdkPinSurfaceTests
     {
         // Multi-solution isolation (#90 parity): only tools/ pins a missing band, so its project is skipped
         // with the hostfxr failure and the rest of the checkout still publishes — as PARTIAL, with the cause.
+        SdkProjectStubs.Create($"{CheckoutDir}/tools/Tool/Tool.csproj");
         var skipped = new[]
         {
             new SkippedProject($"{CheckoutDir}/tools/Tool/Tool.csproj", HostFxrMessage($"{CheckoutDir}/tools/global.json"))
@@ -240,6 +242,7 @@ public sealed class SdkPinSurfaceTests
     [TestMethod]
     public void NonSdkSkip_KeepsTheExistingCoverageReason()
     {
+        SdkProjectStubs.Create($"{CheckoutDir}/src/Ios/Ios.csproj");
         var skipped = new[] { new SkippedProject($"{CheckoutDir}/src/Ios/Ios.csproj", "iOS workload not available") };
         var load = new MultiSolutionLoadResult(new AdhocWorkspace().CurrentSolution, skipped,
             [new SolutionCoverage($"{CheckoutDir}/App.slnx", 2, 1, skipped)]);

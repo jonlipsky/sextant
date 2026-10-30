@@ -62,13 +62,13 @@ public sealed record SnapshotCoverage
     /// </summary>
     public int ProjectsLoaded { get; init; }
 
-    /// <summary>Declared project files that failed to load on this worker.</summary>
+    /// <summary>Declared project files that failed to load on this worker; excluded versions (#351) are not counted.</summary>
     public int ProjectsSkipped { get; init; }
 
     /// <summary>Skipped project files with at least one surviving document-bearing TFM; overlaps loaded/skipped.</summary>
     public int ProjectsPartiallyLoaded { get; init; }
 
-    /// <summary>Distinct project files whose failed evaluation still exposed documents.</summary>
+    /// <summary>Distinct project files whose failed evaluation still exposed documents; excluded versions (#351) are not counted.</summary>
     public int ProjectsDegraded { get; init; }
 
     /// <summary>Selected solutions that could not be fully read, excluding valid empty solutions.</summary>
@@ -126,6 +126,29 @@ public sealed record SnapshotCoverage
     /// </summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public IReadOnlyList<string>? Notes { get; init; }
+
+    /// <summary>
+    /// Project versions this worker structurally cannot build (an unavailable platform, a missing project file, a
+    /// legacy non-SDK project; issue #351). They are exclusions, not gaps: they never make the verdict partial. Capped
+    /// at <see cref="MaxExclusions"/> and ordered deterministically; <see cref="ProjectVersionsExcluded"/> is the
+    /// uncapped count. Null when there are none; omitted from the JSON.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IReadOnlyList<ProjectExclusion>? Exclusions { get; init; }
+
+    /// <summary>
+    /// Every exclusion, uncapped, for in-process decisions at publish (binding health, restore) that must not
+    /// depend on <see cref="MaxExclusions"/>. Never serialized.
+    /// </summary>
+    [JsonIgnore]
+    public IReadOnlyList<ProjectExclusion>? AllExclusions { get; init; }
+
+    /// <summary>The cap on <see cref="Exclusions"/>.</summary>
+    public const int MaxExclusions = 50;
+
+    /// <summary>How many project versions were excluded, uncapped; omitted from the JSON when zero.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public int ProjectVersionsExcluded { get; init; }
 
     /// <summary>
     /// What the service worker left out because its evaluation time budget ran out: projects not loaded, not
@@ -256,6 +279,13 @@ public sealed record ProjectBindingHealth
 
     /// <summary>True when the project's binding failures exceed the degraded threshold.</summary>
     public bool Degraded { get; init; }
+
+    /// <summary>
+    /// True when the version is a project exclusion (issue #351): this worker cannot build it, so a degraded
+    /// version of it does not make the coverage verdict partial.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool Excluded { get; init; }
 
     /// <summary>The design-time build or restore failure the loader reported for the project, when any.</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]

@@ -82,7 +82,9 @@ public static class SnapshotCoverageBuilder
     }
 
     /// <summary>The computed coverage plus the diagnostics that explain every gap it records.</summary>
-    public sealed record Result(SnapshotCoverage Coverage, IReadOnlyList<ProjectOutcome> Diagnostics);
+    public sealed record Result(
+        SnapshotCoverage Coverage, IReadOnlyList<ProjectOutcome> Diagnostics,
+        IReadOnlyList<ProjectExclusion>? Exclusions = null, ProjectVersionIndex? Versions = null);
 
     public static Result Build(
         string checkoutDir, CheckoutResolution resolution, MultiSolutionLoadResult load, Inventory inventory,
@@ -107,6 +109,33 @@ public static class SnapshotCoverageBuilder
         var unpopulated = inventory.Submodules.Where(s => !s.Populated).ToList();
         var scanErrors = inventory.ScanErrors ?? [];
 
+        // Project versions this worker structurally cannot build, with the evidence, are exclusions (issue #351);
+        // everything else stays a gap.
+        var excluded = new List<ProjectExclusion>();
+        var unpopulatedDirs = unpopulated.Select(s => Path.GetFullPath(Path.Combine(checkoutDir, s.Path))).ToList();
+        var packBound = load.PlatformPackBindings
+            .Select(b => (Path.GetFullPath(b.ProjectPath), NormalizeTfm(b.TargetFramework)))
+            .ToHashSet(new VersionKeyComparer(comparer));
+        List<T> Exclude<T>(IReadOnlyList<T> versions, Func<T, string> file, Func<T, string?> tfm, Func<T, string?> reason)
+        {
+            var kept = new List<T>();
+            foreach (var version in versions)
+            {
+                var path = file(version);
+                var bound = packBound.Contains((Path.GetFullPath(path), NormalizeTfm(tfm(version))));
+                if (ProjectExclusionClassifier.Classify(
+                        ReasonPath(checkoutDir, path), tfm(version), path, reason(version), bound,
+                        unpopulatedDirs, checkoutDir) is { } exclusion)
+                    excluded.Add(exclusion);
+                else
+                    kept.Add(version);
+            }
+            return kept;
+        }
+        var skippedProjects = Exclude(load.SkippedProjects, p => p.ProjectPath, p => p.TargetFramework, p => p.Reason);
+        var degradedProjects = Exclude(load.DegradedProjects, p => p.ProjectPath, p => p.TargetFramework, p => p.Reason);
+        var packBindings = Exclude(load.PlatformPackBindings, p => p.ProjectPath, p => p.TargetFramework, _ => null);
+
         // Defensive invariant: the no-config default selects the UNION of every discovered solution (#124)
         // and an explicit config records no discovery, so this is empty today. It is still honored so that a
         // future narrowing selector can never silently hide an unselected solution.
@@ -130,16 +159,16 @@ public static class SnapshotCoverageBuilder
         if (resolution.SkippedSolutions.Count > 0)
             reasons.Add($"{resolution.SkippedSolutions.Count} configured solution(s) could not be used.");
 
-        if (load.SkippedProjects.Count > 0)
+        if (skippedProjects.Count > 0)
         {
             // A project skipped because hostfxr could not resolve the SDK its global.json pins (issue #113) is
             // named as such, with the pin, so the operator sees the actionable cause rather than a generic skip
             // (its per-project detail is an `sdk_resolution_failed` diagnostic).
-            var sdkSkips = load.SkippedProjects
+            var sdkSkips = skippedProjects
                 .Select(s => (Skip: s, Ok: HostFxrSdkResolutionError.TryParse(s.Reason, out var e), Error: e))
                 .Where(x => x.Ok)
                 .ToList();
-            var otherSkips = load.SkippedProjects
+            var otherSkips = skippedProjects
                 .Where(s => !HostFxrSdkResolutionError.TryParse(s.Reason, out _))
                 .ToList();
             if (otherSkips.Count > 0)
@@ -172,13 +201,13 @@ public static class SnapshotCoverageBuilder
             }
         }
 
-        if (load.DegradedProjects.Count > 0)
+        if (degradedProjects.Count > 0)
         {
             reasons.Add(
-                $"{load.DegradedProjects.Count} project version(s) failed evaluation but exposed documents " +
-                $"({NameSample(load.DegradedProjects.Select(p => VersionName(ReasonPath(checkoutDir, p.ProjectPath), p.TargetFramework)).ToList())}); " +
+                $"{degradedProjects.Count} project version(s) failed evaluation but exposed documents " +
+                $"({NameSample(degradedProjects.Select(p => VersionName(ReasonPath(checkoutDir, p.ProjectPath), p.TargetFramework)).ToList())}); " +
                 "their references may be incomplete; see the `project_evaluation_degraded` diagnostics.");
-            AddCapped(diagnostics, load.DegradedProjects, p => new ProjectOutcome
+            AddCapped(diagnostics, degradedProjects, p => new ProjectOutcome
             {
                 Severity = JobDiagnosticSeverity.Warning,
                 Code = "project_evaluation_degraded",
@@ -188,13 +217,13 @@ public static class SnapshotCoverageBuilder
             }, "project_evaluation_degraded", "project versions failed evaluation");
         }
 
-        if (load.PlatformPackBindings.Count > 0)
+        if (packBindings.Count > 0)
         {
             reasons.Add(
-                $"{load.PlatformPackBindings.Count} Apple-platform project version(s) were compiled against the platform " +
-                $"reference pack without the workload ({NameSample(load.PlatformPackBindings.Select(b => VersionName(ReasonPath(checkoutDir, b.ProjectPath), b.TargetFramework)).ToList())}); " +
+                $"{packBindings.Count} Apple-platform project version(s) were compiled against the platform " +
+                $"reference pack without the workload ({NameSample(packBindings.Select(b => VersionName(ReasonPath(checkoutDir, b.ProjectPath), b.TargetFramework)).ToList())}); " +
                 "their package references may still be missing; see the `platform_reference_pack` diagnostics.");
-            AddCapped(diagnostics, load.PlatformPackBindings, b => new ProjectOutcome
+            AddCapped(diagnostics, packBindings, b => new ProjectOutcome
             {
                 Severity = JobDiagnosticSeverity.Warning,
                 Code = "platform_reference_pack",
@@ -290,6 +319,9 @@ public static class SnapshotCoverageBuilder
             }, "coverage_scan_incomplete", "part(s) of the checkout could not be inspected");
         }
 
+        AddCapped(diagnostics, ProjectExclusionClassifier.Distinct(excluded), e => ExclusionDiagnostic(e),
+            "project_excluded", "project version(s) were excluded", JobDiagnosticSeverity.Info);
+
         var coverage = new SnapshotCoverage
         {
             Verdict = reasons.Count > 0 ? SnapshotCoverageVerdict.Partial : SnapshotCoverageVerdict.Complete,
@@ -303,13 +335,13 @@ public static class SnapshotCoverageBuilder
             SolutionsSkipped = resolution.SkippedSolutions.Count,
             ProjectsDeclared = load.DeclaredProjects.Count,
             ProjectsLoaded = loadedFiles.Count,
-            ProjectsSkipped = load.SkippedProjects.Select(p => p.ProjectPath).Distinct(comparer).Count(),
-            ProjectsPartiallyLoaded = load.SkippedProjects.Select(p => Path.GetFullPath(p.ProjectPath))
+            ProjectsSkipped = skippedProjects.Select(p => p.ProjectPath).Distinct(comparer).Count(),
+            ProjectsPartiallyLoaded = skippedProjects.Select(p => Path.GetFullPath(p.ProjectPath))
                 .Distinct(comparer).Count(loadedFiles.Contains),
-            ProjectsDegraded = load.DegradedProjects.Select(p => p.ProjectPath).Distinct(comparer).Count(),
+            ProjectsDegraded = degradedProjects.Select(p => p.ProjectPath).Distinct(comparer).Count(),
             SolutionsUnreadable = unreadableSolutions,
             UnattributedLoadFailures = load.UnattributedFailureCount,
-            EvaluationGaps = EvaluationGaps(load.SkippedProjects, load.DegradedProjects, p => ReasonPath(checkoutDir, p)),
+            EvaluationGaps = EvaluationGaps(skippedProjects, degradedProjects, p => ReasonPath(checkoutDir, p)),
             ProjectFilesOnDisk = inventory.ProjectFilesOnDisk.Count,
             ProjectFilesUnreferenced = unreferenced.Count,
             SubmodulesDeclared = inventory.Submodules.Count,
@@ -319,8 +351,19 @@ public static class SnapshotCoverageBuilder
             Notes = notes.Count > 0 ? notes : null
         };
 
-        return new Result(coverage, diagnostics);
+        var distinctExcluded = ProjectExclusionClassifier.Distinct(excluded);
+        return new Result(ProjectExclusionClassifier.Record(coverage, distinctExcluded), diagnostics, distinctExcluded,
+            new ProjectVersionIndex(checkoutDir, load));
     }
+
+    private static ProjectOutcome ExclusionDiagnostic(ProjectExclusion e) => new()
+    {
+        Severity = JobDiagnosticSeverity.Info,
+        Code = "project_excluded",
+        ProjectPath = e.Project,
+        Message = $"{VersionName(e.Project, e.TargetFramework)} was excluded ({e.Reason}" +
+                  $"{(e.Detail is { Length: > 0 } d ? ": " + d : string.Empty)}); this worker cannot build it."
+    };
 
     /// <summary>
     /// Appends <paramref name="notes"/> to <paramref name="coverage"/>'s notes. Notes never change the verdict.
@@ -335,8 +378,11 @@ public static class SnapshotCoverageBuilder
 
     /// <summary>
     /// Records best-effort restore diagnostics and makes an incomplete restore an explicit coverage gap.
+    /// <paramref name="versions"/> lists every version of each project; without it nothing is excluded.
     /// </summary>
-    public static SnapshotCoverage WithRestoreOutcome(SnapshotCoverage coverage, PackageRestoreOutcome restore)
+    public static SnapshotCoverage WithRestoreOutcome(
+        SnapshotCoverage coverage, PackageRestoreOutcome restore, IReadOnlyList<ProjectExclusion>? exclusions = null,
+        ProjectVersionIndex? versions = null)
     {
         ArgumentNullException.ThrowIfNull(coverage);
         ArgumentNullException.ThrowIfNull(restore);
@@ -345,11 +391,59 @@ public static class SnapshotCoverageBuilder
         if (restore.Clean)
             return result;
 
+        // Issue #351: when every project that failed to restore is an exclusion (and nothing else went wrong), the
+        // restore notes stay but the restore is not a gap.
+        if (!RestoreGapRemains(restore, exclusions ?? coverage.AllExclusions ?? coverage.Exclusions ?? [], versions))
+            return result;
+
         var reason = restore.UsedProjectUnion
             ? $"package restore was incomplete for the union of {restore.ProjectsAttempted} distinct project(s) " +
               $"from {restore.SolutionsSelected} selected solution(s); code binding may be incomplete."
             : $"package restore was incomplete for {restore.SolutionsSelected} selected solution(s); code binding may be incomplete.";
         return WithRestoreFailure(result, reason);
+    }
+
+    /// <summary>
+    /// True when the restore left a gap beyond the project exclusions. A restore failure is excluded only when every
+    /// version of the project is excluded and every error code is explained by the exclusion (<c>NU1012</c> and
+    /// <c>NETSDK1084</c> for platform exclusions, <c>MSB3202</c> for a missing project file). A timeout, a restore
+    /// that could not start, errors that name no project, a failed solution that reported no project error, or any
+    /// other code keeps the gap.
+    /// </summary>
+    public static bool RestoreGapRemains(
+        PackageRestoreOutcome restore, IReadOnlyList<ProjectExclusion> exclusions, ProjectVersionIndex? versions = null)
+        => !restore.Clean && (HasUnattributedRestoreGap(restore) || restore.Projects.Count == 0
+            || restore.Projects.Any(p => !IsRestoreFailureExcluded(p, exclusions, versions)));
+
+    /// <summary>A restore problem that no per-project issue can explain.</summary>
+    internal static bool HasUnattributedRestoreGap(PackageRestoreOutcome restore)
+        => restore.TimedOut || restore.SolutionsNotStarted > 0 || restore.ProjectsDropped > 0
+           || restore.GeneralCodes.Count > 0 || restore.SourceUnreachableGeneral || restore.CredentialsUnavailable
+           || restore.SolutionsFailed > restore.SolutionsFailedAttributed;
+
+    /// <summary>True when <paramref name="issue"/> is fully explained by exclusions of every version of its project.</summary>
+    public static bool IsRestoreFailureExcluded(
+        PackageRestoreProjectIssue issue, IReadOnlyList<ProjectExclusion> exclusions, ProjectVersionIndex? versions = null)
+    {
+        if (versions is null || issue.Codes.Count == 0 || issue.SourceUnreachable || issue.MissingPackages.Count > 0)
+            return false;
+        var all = versions.VersionsOf(issue.Project);
+        if (all.Count == 0)
+            return false;
+        var projectExclusions = exclusions.Where(e => string.Equals(e.Project, issue.Project, StringComparison.Ordinal)).ToList();
+
+        bool Explained(string code, string? tfm)
+        {
+            var reason = projectExclusions
+                .FirstOrDefault(e => ProjectExclusionClassifier.SameFramework(e.TargetFramework, tfm))?.Reason;
+            return code switch
+            {
+                "NU1012" or "NETSDK1084" => reason == ProjectExclusionReason.PlatformUnavailable,
+                "MSB3202" => reason == ProjectExclusionReason.ProjectFileMissing,
+                _ => false
+            };
+        }
+        return issue.Codes.All(code => all.All(tfm => Explained(code, tfm)));
     }
 
     /// <summary>Marks a snapshot partial for a restore gap that applies to its project set.</summary>
@@ -430,17 +524,42 @@ public static class SnapshotCoverageBuilder
             var unreadableOwn = load.Solutions
                 .Count(c => !c.IsReadable && InSubtree(Path.GetFullPath(c.SolutionPath)));
             var degraded = load.DegradedProjects.Where(p => InSubtree(Path.GetFullPath(p.ProjectPath))).ToList();
+            var packBound = load.PlatformPackBindings.Where(b => InSubtree(Path.GetFullPath(b.ProjectPath))).ToList();
+
+            // Issue #351: structurally unbuildable versions are exclusions, never gaps.
+            var excluded = new List<ProjectExclusion>();
+            var unpopulatedDirs = inventory.Submodules.Where(u => !u.Populated)
+                .Select(u => Path.GetFullPath(Path.Combine(root, u.Path))).ToList();
+            var bound = packBound.Select(b => (Path.GetFullPath(b.ProjectPath), NormalizeTfm(b.TargetFramework)))
+                .ToHashSet(new VersionKeyComparer(comparer));
+            List<T> Exclude<T>(List<T> versions, Func<T, string> file, Func<T, string?> tfm, Func<T, string?> reason)
+            {
+                var kept = new List<T>();
+                foreach (var version in versions)
+                {
+                    var path = Path.GetFullPath(file(version));
+                    if (ProjectExclusionClassifier.Classify(
+                            Rel(path), tfm(version), path, reason(version),
+                            bound.Contains((path, NormalizeTfm(tfm(version)))), unpopulatedDirs, subtree) is { } exclusion)
+                        excluded.Add(exclusion);
+                    else
+                        kept.Add(version);
+                }
+                return kept;
+            }
+            var skippedGaps = Exclude(skipped, p => p.ProjectPath, p => p.TargetFramework, p => p.Reason);
+            var degradedGaps = Exclude(degraded, p => p.ProjectPath, p => p.TargetFramework, p => p.Reason);
+            packBound = Exclude(packBound, p => p.ProjectPath, p => p.TargetFramework, _ => null);
 
             var reasons = new List<string>();
-            if (skipped.Count > 0)
+            if (skippedGaps.Count > 0)
                 reasons.Add(
-                    $"{skipped.Count} project(s) of this repository could not be loaded while indexing the checkout " +
-                    $"that pins it ({NameSample(skipped.Select(s => VersionName(Rel(Path.GetFullPath(s.ProjectPath)), s.TargetFramework)).ToList())}).");
-            if (degraded.Count > 0)
+                    $"{skippedGaps.Count} project(s) of this repository could not be loaded while indexing the checkout " +
+                    $"that pins it ({NameSample(skippedGaps.Select(s => VersionName(Rel(Path.GetFullPath(s.ProjectPath)), s.TargetFramework)).ToList())}).");
+            if (degradedGaps.Count > 0)
                 reasons.Add(
-                    $"{degraded.Count} project version(s) failed evaluation but exposed documents " +
-                    $"({NameSample(degraded.Select(p => VersionName(Rel(Path.GetFullPath(p.ProjectPath)), p.TargetFramework)).ToList())}); their references may be incomplete.");
-            var packBound = load.PlatformPackBindings.Where(b => InSubtree(Path.GetFullPath(b.ProjectPath))).ToList();
+                    $"{degradedGaps.Count} project version(s) failed evaluation but exposed documents " +
+                    $"({NameSample(degradedGaps.Select(p => VersionName(Rel(Path.GetFullPath(p.ProjectPath)), p.TargetFramework)).ToList())}); their references may be incomplete.");
             if (packBound.Count > 0)
                 reasons.Add(
                     $"{packBound.Count} Apple-platform project version(s) were compiled against the platform reference pack " +
@@ -494,7 +613,7 @@ public static class SnapshotCoverageBuilder
                     .ToList();
                 budget = TimeBudgetCoverageBuilder.Build(timeBudget ?? TimeSpan.Zero, deferred.Count, 0, 0, unfinished);
             }
-            result[submodule.Path] = new SnapshotCoverage
+            var providerCoverage = new SnapshotCoverage
             {
                 Verdict = reasons.Count > 0 ? SnapshotCoverageVerdict.Partial : SnapshotCoverageVerdict.Complete,
                 Reasons = reasons,
@@ -505,13 +624,13 @@ public static class SnapshotCoverageBuilder
                 SolutionsSkipped = 0,
                 ProjectsDeclared = declared.Count,
                 ProjectsLoaded = loaded.Count,
-                ProjectsSkipped = skipped.Select(p => p.ProjectPath).Distinct(comparer).Count(),
-                ProjectsPartiallyLoaded = skipped.Select(p => Path.GetFullPath(p.ProjectPath))
+                ProjectsSkipped = skippedGaps.Select(p => p.ProjectPath).Distinct(comparer).Count(),
+                ProjectsPartiallyLoaded = skippedGaps.Select(p => Path.GetFullPath(p.ProjectPath))
                     .Distinct(comparer).Count(loadedFiles.Contains),
-                ProjectsDegraded = degraded.Select(p => p.ProjectPath).Distinct(comparer).Count(),
+                ProjectsDegraded = degradedGaps.Select(p => p.ProjectPath).Distinct(comparer).Count(),
                 SolutionsUnreadable = unreadableOwn,
                 UnattributedLoadFailures = load.UnattributedFailureCount,
-                EvaluationGaps = EvaluationGaps(skipped, degraded, p => Rel(Path.GetFullPath(p))),
+                EvaluationGaps = EvaluationGaps(skippedGaps, degradedGaps, p => Rel(Path.GetFullPath(p))),
                 ProjectFilesOnDisk = onDisk.Count,
                 ProjectFilesUnreferenced = unreferenced.Count,
                 SubmodulesDeclared = nested.Count,
@@ -520,6 +639,7 @@ public static class SnapshotCoverageBuilder
                 SdkPinOverrides = pins.Count > 0 ? pins : null,
                 TimeBudget = budget
             };
+            result[submodule.Path] = ProjectExclusionClassifier.Record(providerCoverage, excluded);
         }
 
         return result;
@@ -537,6 +657,16 @@ public static class SnapshotCoverageBuilder
         return load.Solution.Projects.Where(p => !string.IsNullOrEmpty(p.FilePath) &&
                 (p.Documents.Any() || !skipped.Contains(Path.GetFullPath(p.FilePath))))
             .Select(p => Path.GetFullPath(p.FilePath!)).ToHashSet(comparer);
+    }
+
+    private static string? NormalizeTfm(string? tfm) => string.IsNullOrWhiteSpace(tfm) ? null : tfm;
+
+    private sealed class VersionKeyComparer(StringComparer paths) : IEqualityComparer<(string Path, string? Tfm)>
+    {
+        public bool Equals((string Path, string? Tfm) x, (string Path, string? Tfm) y)
+            => paths.Equals(x.Path, y.Path) && string.Equals(x.Tfm, y.Tfm, StringComparison.Ordinal);
+
+        public int GetHashCode((string Path, string? Tfm) k) => HashCode.Combine(paths.GetHashCode(k.Path), k.Tfm);
     }
 
     private static string VersionName(string project, string? tfm) => $"{project} (TFM {tfm ?? "unknown"})";
@@ -638,7 +768,7 @@ public static class SnapshotCoverageBuilder
     // A coverage reason is persisted in the immutable record and surfaced to query clients (MCP meta,
     // /control/resolve), so it must never carry a worker volume path. A declared project OUTSIDE the
     // checkout (a solution entry like `../../other/X.csproj`) is named by its file name only.
-    private static string ReasonPath(string checkoutDir, string fullPath)
+    internal static string ReasonPath(string checkoutDir, string fullPath)
     {
         var relative = RepoRelative(checkoutDir, fullPath);
         return Path.IsPathRooted(relative) ? $"<outside checkout>/{Path.GetFileName(fullPath)}" : relative;

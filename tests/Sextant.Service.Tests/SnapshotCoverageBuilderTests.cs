@@ -193,6 +193,7 @@ public class SnapshotCoverageBuilderTests
         var skipped = Enumerable.Range(0, SnapshotCoverageBuilder.MaxNamedInReason + 3)
             .Select(i => new SkippedProject(At($"heads/H{i:D2}.iOS/H{i:D2}.iOS.csproj"), "workload missing"))
             .ToList();
+        SdkProjectStubs.Create(skipped.Select(s => s.ProjectPath).ToArray());
         var load = new MultiSolutionLoadResult(new AdhocWorkspace().CurrentSolution, skipped,
             [new SolutionCoverage(At("App.slnx"), skipped.Count + 1, 1, skipped)])
         {
@@ -221,6 +222,7 @@ public class SnapshotCoverageBuilderTests
         // A solution entry may point outside the checkout (`../../other/X.csproj`); the reason is persisted and
         // surfaced to query clients, so it names only the file — never the worker's absolute volume layout.
         var outside = Path.GetFullPath(Path.Combine(CheckoutDir, "..", "sibling-checkout", "Ext", "Ext.iOS.csproj"));
+        SdkProjectStubs.Create(outside);
         var skipped = new List<SkippedProject> { new(outside, "project not found") };
         var load = new MultiSolutionLoadResult(new AdhocWorkspace().CurrentSolution, skipped,
             [new SolutionCoverage(At("App.slnx"), 2, 1, skipped)])

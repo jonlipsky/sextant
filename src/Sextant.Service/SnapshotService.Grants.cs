@@ -441,14 +441,15 @@ public sealed partial class SnapshotService
             var repositoryId = RepositoryId(key);
             var row = repositoryId is long id ? BranchFor(id, branch) : null;
             var resolved = row?.Name ?? (branch.Length == 0 ? null : branch);
-            var (status, snapshot, noCode) = BranchState(key, row, resolved, branch.Length == 0 || row?.IsDefault == true);
+            var (status, snapshot, noCode, excluded) = BranchState(key, row, resolved, branch.Length == 0 || row?.IsDefault == true);
             return new GrantStatus
             {
                 ResolvedBranch = noCode?.Branch ?? resolved,
                 SnapshotStatus = status,
                 CommitSha = noCode?.CommitSha ?? (snapshot is null ? null : _snapshots.GetCommitSha(snapshot.CommitId)),
                 PublishedAt = snapshot?.PublishedAt,
-                IdentityHash = snapshot?.IdentityHash
+                IdentityHash = snapshot?.IdentityHash,
+                ExcludedProjectVersions = excluded > 0 ? excluded : null
             };
         }
 
@@ -482,14 +483,15 @@ public sealed partial class SnapshotService
 
         private VisibleBranch Listed(string key, BranchRow? row, string name, bool isDefault)
         {
-            var (status, snapshot, noCode) = BranchState(key, row, name.Length == 0 ? null : name, isDefault);
+            var (status, snapshot, noCode, excluded) = BranchState(key, row, name.Length == 0 ? null : name, isDefault);
             return new VisibleBranch
             {
                 Branch = noCode?.Branch ?? name,
                 IsDefault = isDefault,
                 Status = status,
                 CommitSha = noCode?.CommitSha ?? (snapshot is null ? null : _snapshots.GetCommitSha(snapshot.CommitId)),
-                PublishedAt = snapshot?.PublishedAt
+                PublishedAt = snapshot?.PublishedAt,
+                ExcludedProjectVersions = excluded > 0 ? excluded : null
             };
         }
 
@@ -498,17 +500,18 @@ public sealed partial class SnapshotService
         // the most recent finished ensure for the branch found no solution (issue #353); else missing. A default grant
         // with no catalog branch matches only no-branch jobs and jobs marked as default-branch ones, never a plain
         // feature-branch job. A marked job's branch B only counts while it is also the latest finished job on B.
-        private (string Status, SnapshotRow? Snapshot, FinishedJob? NoCode) BranchState(string key, BranchRow? row, string? name, bool isDefault)
+        private (string Status, SnapshotRow? Snapshot, FinishedJob? NoCode, int Excluded) BranchState(string key, BranchRow? row, string? name, bool isDefault)
         {
             if (row is { SnapshotId: long snapshotId } && _snapshots.GetById(snapshotId) is { Status: SnapshotStatus.Complete } snapshot)
             {
-                var partial = CoverageOn(conn, snapshot.Id) is { IsPartial: true };
-                return (partial ? GrantSnapshotStatus.Partial : GrantSnapshotStatus.Complete, snapshot, null);
+                var coverage = CoverageOn(conn, snapshot.Id);
+                return (coverage is { IsPartial: true } ? GrantSnapshotStatus.Partial : GrantSnapshotStatus.Complete,
+                    snapshot, null, coverage?.ProjectVersionsExcluded ?? 0);
             }
             var pending = ActiveJobs().Any(j => j.Key == key
                 && (name is not null && j.Branch == name || isDefault && string.IsNullOrEmpty(j.Branch)));
             if (pending)
-                return (GrantSnapshotStatus.Pending, null, null);
+                return (GrantSnapshotStatus.Pending, null, null, 0);
 
             var jobs = FinishedJobs().Where(j => j.Key == key).ToList();
             FinishedJob? finished;
@@ -531,8 +534,8 @@ public sealed partial class SnapshotService
                 }
             }
             return finished is { NoSupportedCode: true }
-                ? (GrantSnapshotStatus.NoSupportedCode, null, finished)
-                : (GrantSnapshotStatus.Missing, null, null);
+                ? (GrantSnapshotStatus.NoSupportedCode, null, finished, 0)
+                : (GrantSnapshotStatus.Missing, null, null, 0);
         }
 
         private List<FinishedJob> FinishedJobs()

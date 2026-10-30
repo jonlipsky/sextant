@@ -46,10 +46,13 @@ public static class BindingHealthBuilder
     /// <summary>
     /// Builds the snapshot's binding health from per-project counts (one entry per indexed project version;
     /// entries for the same project file and framework are summed) and the producer's per-project load issues,
-    /// keyed by the same repository-relative project path.
+    /// keyed by the same repository-relative project path. A degraded version is left out of the gaps only when the
+    /// coverage excludes exactly that (project, target framework) version (<paramref name="exclusions"/>, the full
+    /// uncapped set); the target framework alone never decides it.
     /// </summary>
     public static BindingHealth Build(
-        IEnumerable<ProjectBindingCounts> projects, IReadOnlyDictionary<string, string>? loadIssues = null)
+        IEnumerable<ProjectBindingCounts> projects, IReadOnlyDictionary<string, string>? loadIssues = null,
+        IReadOnlyList<ProjectExclusion>? exclusions = null)
     {
         ArgumentNullException.ThrowIfNull(projects);
         var merged = projects
@@ -61,6 +64,7 @@ public static class BindingHealthBuilder
             .ToList();
 
         var issues = loadIssues ?? new Dictionary<string, string>(StringComparer.Ordinal);
+        var excludedVersions = ProjectExclusionClassifier.VersionKeys(exclusions);
         var entries = merged
             .Select(p => new ProjectBindingHealth
             {
@@ -71,6 +75,7 @@ public static class BindingHealthBuilder
                 UnboundInvocations = p.UnboundInvocations,
                 CandidateOccurrences = p.CandidateOccurrences,
                 Degraded = IsDegraded(p.NamesExamined, p.UnboundNames),
+                Excluded = ProjectExclusionClassifier.IsVersionExcluded(excludedVersions, p.Project, p.TargetFramework),
                 LoadIssue = issues.TryGetValue(p.Project, out var issue) ? issue : null
             })
             .ToList();
@@ -86,7 +91,8 @@ public static class BindingHealthBuilder
 
         var listed = entries
             .Where(e => e.UnboundNames > 0 || e.UnboundInvocations > 0 || e.LoadIssue is not null)
-            .OrderByDescending(e => e.Degraded)
+            .OrderByDescending(e => e.Degraded && !e.Excluded)
+            .ThenByDescending(e => e.Degraded)
             .ThenByDescending(e => e.UnboundNames)
             .ThenByDescending(e => e.UnboundInvocations)
             .ThenBy(e => e.Project, StringComparer.Ordinal)
@@ -100,7 +106,7 @@ public static class BindingHealthBuilder
             UnboundNames = merged.Sum(p => p.UnboundNames),
             UnboundInvocations = merged.Sum(p => p.UnboundInvocations),
             CandidateOccurrences = merged.Sum(p => p.CandidateOccurrences),
-            ProjectsDegraded = entries.Count(e => e.Degraded),
+            ProjectsDegraded = entries.Count(e => e.Degraded && !e.Excluded),
             Projects = listed
         };
     }
@@ -116,7 +122,7 @@ public static class BindingHealthBuilder
         if (health.ProjectsDegraded == 0)
             return coverage with { Binding = health };
 
-        var degraded = health.Projects.Where(p => p.Degraded).ToList();
+        var degraded = health.Projects.Where(p => p.Degraded && !p.Excluded).ToList();
         var named = degraded.Take(MaxNamedInReason)
             .Select(p => $"{p.Project}{(p.TargetFramework is { Length: > 0 } tfm ? $" ({tfm})" : string.Empty)}: " +
                          $"{p.UnboundNames} unbound name(s)")

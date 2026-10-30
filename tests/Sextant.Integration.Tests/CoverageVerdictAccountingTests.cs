@@ -39,7 +39,7 @@ public sealed class CoverageVerdictAccountingTests
     public async Task FailedTfm_DoesNotHideBehindHealthySibling_PublishedSymbolsRemainPartial()
     {
         var path = Write("Lib.csproj",
-            "<Project><PropertyGroup><TargetFrameworks>net10.0;net9.0</TargetFrameworks></PropertyGroup></Project>");
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFrameworks>net10.0;net9.0</TargetFrameworks></PropertyGroup></Project>");
         var solution = AddProject(_workspace.CurrentSolution, path, "Lib(net10.0)", withDocument: true);
         solution = AddProject(solution, path, "Lib(net9.0)", withDocument: false);
         var failed = solution.Projects.Single(p => p.Name == "Lib(net9.0)");
@@ -65,7 +65,7 @@ public sealed class CoverageVerdictAccountingTests
     public async Task MissingDeclaredTfm_WithoutAStub_IsStillAPublishedCoverageGap()
     {
         var path = Write("Lib.csproj",
-            "<Project><PropertyGroup><TargetFrameworks>net10.0;net9.0</TargetFrameworks></PropertyGroup></Project>");
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFrameworks>net10.0;net9.0</TargetFrameworks></PropertyGroup></Project>");
         var solution = AddProject(_workspace.CurrentSolution, path, "Lib(net10.0)", withDocument: true);
         var load = Reconcile(solution, path, []);
 
@@ -77,7 +77,7 @@ public sealed class CoverageVerdictAccountingTests
     [TestMethod]
     public async Task FailedEvaluation_WithSurvivingDocuments_StaysPartialAfterPublicationAndReuse()
     {
-        var path = Write("Lib.csproj", "<Project />");
+        var path = Write("Lib.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />");
         var solution = AddProject(_workspace.CurrentSolution, path, "Lib", withDocument: true);
         var load = Reconcile(solution, path,
             [new SolutionLoader.LoadFailure(solution.ProjectIds.Single(), null,
@@ -97,8 +97,8 @@ public sealed class CoverageVerdictAccountingTests
     [TestMethod]
     public async Task AmbiguousFailure_IsNotAssignedToASibling_AndCannotPublishHealthyCoverage()
     {
-        var a = Write("one/Lib.csproj", "<Project />");
-        var b = Write("two/Lib.csproj", "<Project />");
+        var a = Write("one/Lib.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />");
+        var b = Write("two/Lib.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />");
         var solution = AddProject(_workspace.CurrentSolution, a, "One", withDocument: true);
         solution = AddProject(solution, b, "Two", withDocument: true);
         var reconciled = SolutionLoader.ReconcileLoads([a, b], solution,
@@ -112,9 +112,46 @@ public sealed class CoverageVerdictAccountingTests
     }
 
     [TestMethod]
+    public async Task LegacyProjectThatFailedEvaluation_IsAnExclusion_AndTheSnapshotPublishesComplete()
+    {
+        var path = Write("Lib.csproj",
+            "<Project ToolsVersion=\"15.0\" xmlns=\"http://schemas.microsoft.com/developer/msbuild/2003\" />");
+        var solution = AddProject(_workspace.CurrentSolution, path, "Lib", withDocument: true);
+        var load = Reconcile(solution, path,
+            [new SolutionLoader.LoadFailure(solution.ProjectIds.Single(), null,
+                "The imported project \"/x/Xamarin.iOS.CSharp.targets\" was not found.")]);
+
+        Assert.AreEqual(1, load.DegradedProjects.Count, "the load still reports it, exactly as before");
+        var coverage = await PublishAndRead(load, expectedPartial: false);
+
+        Assert.AreEqual(1, coverage.ProjectVersionsExcluded);
+        var exclusion = coverage.Exclusions!.Single();
+        Assert.AreEqual("Lib.csproj", exclusion.Project);
+        Assert.AreEqual(ProjectExclusionReason.LegacyProjectFormat, exclusion.Reason);
+        Assert.AreEqual(0, coverage.Reasons.Count);
+        Assert.IsTrue(coverage.Notes!.Any(n => n.Contains("excluded", StringComparison.Ordinal)));
+    }
+
+    [TestMethod]
+    public async Task LegacyProjectWithAnUnrelatedFailure_StaysAGap_AndTheSnapshotPublishesPartial()
+    {
+        var path = Write("Lib.csproj",
+            "<Project ToolsVersion=\"15.0\" xmlns=\"http://schemas.microsoft.com/developer/msbuild/2003\" />");
+        var solution = AddProject(_workspace.CurrentSolution, path, "Lib", withDocument: true);
+        var load = Reconcile(solution, path,
+            [new SolutionLoader.LoadFailure(solution.ProjectIds.Single(), null, "MSB4025: the project file could not be loaded")]);
+
+        var coverage = await PublishAndRead(load, expectedPartial: true);
+
+        Assert.AreEqual(0, coverage.ProjectVersionsExcluded);
+        Assert.AreEqual(1, coverage.ProjectsDegraded);
+        Assert.AreEqual(1, coverage.EvaluationGaps!.Count);
+    }
+
+    [TestMethod]
     public async Task UnresolvedTypedFailure_NamingASurvivor_IsUnattributedAndPartial()
     {
-        var path = Write("Lib.csproj", "<Project />");
+        var path = Write("Lib.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />");
         var solution = AddProject(_workspace.CurrentSolution, path, "Lib", withDocument: true);
         var load = Reconcile(solution, path,
             [new SolutionLoader.LoadFailure(ProjectId.CreateNewId(), null, $"failed reference to {path}")]);
@@ -234,7 +271,9 @@ public sealed class CoverageVerdictAccountingTests
         var result = LocalIndexerSnapshotWorker.BuildResult(id, _root, resolution, load, computed with { Coverage = recorded });
         Assert.AreEqual(expectedPartial ? SnapshotJobStatus.Partial : SnapshotJobStatus.Complete, result.Status);
         Assert.IsFalse(System.Text.Json.JsonSerializer.Serialize(recorded).Contains("secret", StringComparison.Ordinal));
-        if (recorded.ProjectsDegraded > 0)
+        if (recorded.ProjectVersionsExcluded > 0)
+            Assert.IsTrue(result.Projects.Any(p => p.Code == "project_excluded"));
+        else if (recorded.ProjectsDegraded > 0)
             Assert.IsTrue(result.Projects.Any(p => p.Code == "project_evaluation_degraded"));
         if (recorded.SolutionsUnreadable > 0)
             Assert.IsTrue(result.Projects.Any(p => p.Code == "solution_no_projects"));

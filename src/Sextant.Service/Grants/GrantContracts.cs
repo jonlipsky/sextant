@@ -85,6 +85,9 @@ public sealed record GrantStatus
     public string? CommitSha { get; init; }
     public long? PublishedAt { get; init; }
     public string? IdentityHash { get; init; }
+
+    /// <summary>Project versions the snapshot excludes because the worker cannot build them (issue #351); null when none.</summary>
+    public int? ExcludedProjectVersions { get; init; }
 }
 
 /// <summary>One of the caller's own grants with its catalog status.</summary>
@@ -114,6 +117,9 @@ public sealed record VisibleBranch
 
     public string? CommitSha { get; init; }
     public long? PublishedAt { get; init; }
+
+    /// <summary>Project versions the snapshot excludes because the worker cannot build them (issue #351); null when none.</summary>
+    public int? ExcludedProjectVersions { get; init; }
 }
 
 /// <summary>One repository visible to a caller, listed by <c>list_repositories</c>.</summary>

@@ -98,11 +98,6 @@ public static partial class PlatformReferencePacks
         RegexOptions.CultureInvariant, matchTimeoutMilliseconds: 1000)]
     private static partial Regex PackNamePattern();
 
-    // What the SDK and MSBuild report for a project whose platform workload is not installed (or not installable).
-    [GeneratedRegex(@"NETSDK1147|NETSDK1139|NETSDK1178|isn't supported on this platform|Platform version is not present",
-        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, matchTimeoutMilliseconds: 1000)]
-    private static partial Regex WorkloadFailurePattern();
-
     /// <summary>Splits <paramref name="tfm"/> into .NET version and Apple platform; null for any other framework.</summary>
     public static PlatformTarget? ParseTarget(string? tfm)
     {
@@ -127,7 +122,7 @@ public static partial class PlatformReferencePacks
     public static bool IsAllowedPackId(string? id) => id is not null && PackNamePattern().IsMatch(id);
 
     /// <summary>True when an evaluation failure message is the missing-workload failure.</summary>
-    public static bool IsWorkloadFailure(string? reason) => reason is not null && WorkloadFailurePattern().IsMatch(reason);
+    public static bool IsWorkloadFailure(string? reason) => ProjectExclusionClassifier.IsWorkloadFailure(reason);
 
     /// <summary>The .NET installation directory of the running runtime (<c>.../shared/Microsoft.NETCore.App/&lt;v&gt;/</c> three levels up).</summary>
     public static string? DefaultDotnetRoot()
