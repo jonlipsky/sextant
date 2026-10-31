@@ -7,13 +7,19 @@ namespace Sextant.Core;
 /// <param name="UnboundNames">Names that did not bind to any symbol.</param>
 /// <param name="UnboundInvocations">Invocations that did not bind to one method.</param>
 /// <param name="CandidateOccurrences">References and call edges stored against candidate symbols.</param>
+/// <param name="CheckoutProject">
+/// The project file relative to the CHECKOUT root, the spelling coverage exclusions and load issues use. It differs
+/// from <paramref name="Project"/> for a project of a submodule (whose own path is relative to its repository);
+/// null means the two are the same.
+/// </param>
 public sealed record ProjectBindingCounts(
     string Project,
     string? TargetFramework,
     long NamesExamined,
     long UnboundNames,
     long UnboundInvocations,
-    long CandidateOccurrences);
+    long CandidateOccurrences,
+    string? CheckoutProject = null);
 
 /// <summary>
 /// Turns per-project binding counts into the <see cref="BindingHealth"/> of a snapshot's coverage and folds it
@@ -56,33 +62,39 @@ public static class BindingHealthBuilder
     {
         ArgumentNullException.ThrowIfNull(projects);
         var merged = projects
-            .GroupBy(p => (p.Project, TargetFramework: string.IsNullOrEmpty(p.TargetFramework) ? null : p.TargetFramework))
+            .GroupBy(p => (p.Project, p.CheckoutProject, TargetFramework: string.IsNullOrEmpty(p.TargetFramework) ? null : p.TargetFramework))
             .Select(g => new ProjectBindingCounts(
                 g.Key.Project, g.Key.TargetFramework,
                 g.Sum(p => p.NamesExamined), g.Sum(p => p.UnboundNames),
-                g.Sum(p => p.UnboundInvocations), g.Sum(p => p.CandidateOccurrences)))
+                g.Sum(p => p.UnboundInvocations), g.Sum(p => p.CandidateOccurrences), g.Key.CheckoutProject))
             .ToList();
 
         var issues = loadIssues ?? new Dictionary<string, string>(StringComparer.Ordinal);
         var excludedVersions = ProjectExclusionClassifier.VersionKeys(exclusions);
         var entries = merged
-            .Select(p => new ProjectBindingHealth
+            .Select(p =>
             {
-                Project = p.Project,
-                TargetFramework = p.TargetFramework,
-                NamesExamined = p.NamesExamined,
-                UnboundNames = p.UnboundNames,
-                UnboundInvocations = p.UnboundInvocations,
-                CandidateOccurrences = p.CandidateOccurrences,
-                Degraded = IsDegraded(p.NamesExamined, p.UnboundNames),
-                Excluded = ProjectExclusionClassifier.IsVersionExcluded(excludedVersions, p.Project, p.TargetFramework),
-                LoadIssue = issues.TryGetValue(p.Project, out var issue) ? issue : null
+                // Exclusions and load issues are keyed by the checkout-relative path, so a submodule project is looked
+                // up by that spelling alone: its provider-relative path may equal a root project's.
+                var key = p.CheckoutProject ?? p.Project;
+                return new ProjectBindingHealth
+                {
+                    Project = p.Project,
+                    TargetFramework = p.TargetFramework,
+                    NamesExamined = p.NamesExamined,
+                    UnboundNames = p.UnboundNames,
+                    UnboundInvocations = p.UnboundInvocations,
+                    CandidateOccurrences = p.CandidateOccurrences,
+                    Degraded = IsDegraded(p.NamesExamined, p.UnboundNames),
+                    Excluded = ProjectExclusionClassifier.IsVersionExcluded(excludedVersions, key, p.TargetFramework),
+                    LoadIssue = issues.TryGetValue(key, out var issue) ? issue : null
+                };
             })
             .ToList();
 
         // A load issue for a project no indexed version matched (it did not load, or was not extracted) is
         // still listed, so the restore failure behind a missing project is not lost.
-        var indexed = new HashSet<string>(merged.Select(p => p.Project), StringComparer.Ordinal);
+        var indexed = new HashSet<string>(merged.Select(p => p.CheckoutProject ?? p.Project), StringComparer.Ordinal);
         foreach (var (project, issue) in issues.OrderBy(i => i.Key, StringComparer.Ordinal))
         {
             if (!indexed.Contains(project))

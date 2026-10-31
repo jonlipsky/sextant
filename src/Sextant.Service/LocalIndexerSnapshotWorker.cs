@@ -393,6 +393,7 @@ public sealed class LocalIndexerSnapshotWorker(
             {
                 Coverage = coverage.Coverage,
                 ProviderCoverage = providerCoverage,
+                CheckoutDir = checkoutDir,
                 ProjectLoadIssues = restore.Projects.Count > 0 ? restore.ProjectLoadIssues() : null,
                 TimeBudget = plan?.ForIndexing(checkoutDir, load.DeferredProjects)
             };

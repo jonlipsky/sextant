@@ -355,12 +355,36 @@ public static class DocumentSemanticExtractor
     /// type is an error type (an unresolved type or member).
     /// </summary>
     private static bool IsBindingFailure(SimpleNameSyntax name, SemanticModel model, CandidateReason reason)
-        => reason switch
+        => !IsKeywordUse(name, model) && reason switch
         {
             CandidateReason.MemberGroup or CandidateReason.LateBound => false,
             CandidateReason.None => model.GetTypeInfo(name).Type is IErrorTypeSymbol,
             _ => true
         };
+
+    /// <summary>
+    /// True for an identifier that is a contextual keyword at this position and so never binds to a symbol: the
+    /// <c>nameof</c> of a <c>nameof(...)</c> the compiler reads as the operator (its argument is still examined),
+    /// and the <c>notnull</c>/<c>unmanaged</c> of a type constraint. A method or type of that name binds to a
+    /// symbol and never reaches this check; a <c>nameof(...)</c> that is an ordinary invocation is not exempt.
+    /// </summary>
+    private static bool IsKeywordUse(SimpleNameSyntax name, SemanticModel model)
+    {
+        if (name is not IdentifierNameSyntax identifier)
+            return false;
+        switch (identifier.Identifier.ValueText)
+        {
+            case "nameof":
+                return identifier.Parent is InvocationExpressionSyntax invocation
+                    && invocation.Expression == identifier
+                    && (model.GetOperation(invocation) is INameOfOperation || model.GetConstantValue(invocation).HasValue);
+            case "notnull":
+            case "unmanaged":
+                return identifier.Parent is TypeConstraintSyntax;
+            default:
+                return false;
+        }
+    }
 
     /// <summary>
     /// The stored declarations among a failed bind's candidate symbols, canonicalized like an exact target

@@ -453,7 +453,7 @@ public static class SolutionLoader
             // A failure that only replays a restore warning is not a load failure, but only for a variant that
             // actually loaded documents: an empty stub (presence is not success) keeps every failure as its skip.
             var restoreWarnings = projectFailures.Count > 0 && variants!.Any(v => v.Documents.Any())
-                ? ReadRestoreWarnings(projectPath)
+                ? ReadRestoreWarnings(projectPath, OutputPaths(variants))
                 : [];
             var replayed = projectFailures.Where(f => IsReplayedRestoreWarning(f.Message, restoreWarnings)).ToHashSet();
             foreach (var warning in replayed)
@@ -519,7 +519,7 @@ public static class SolutionLoader
             var owner = ProcessedFilePath(failure.Message) is { } named ? NormalizePath(named) : failure.ProjectPath;
             if (owner != null && !declaredPaths.Contains(owner)
                 && loaded.TryGetValue(owner, out var variants) && HasDocuments(variants, failure.ProjectId)
-                && IsReplayedRestoreWarning(failure.Message, ReadRestoreWarnings(owner)))
+                && IsReplayedRestoreWarning(failure.Message, ReadRestoreWarnings(owner, OutputPaths(variants))))
             {
                 onDiagnostic?.Invoke(
                     $"Restore warning replayed by the load of '{Path.GetFileName(owner)}' (not a load failure): {failure.Message}");
@@ -560,41 +560,141 @@ public static class SolutionLoader
         return restoreWarnings.Any(warning => text.EndsWith(": " + warning, StringComparison.Ordinal));
     }
 
-    // The messages recorded ONLY at Warning level in '<project dir>/obj/project.assets.json' (the default restore
-    // output path; a repository that moves it keeps today's behavior: no reclassification).
-    internal static IReadOnlyCollection<string> ReadRestoreWarnings(string projectPath)
+    private static IEnumerable<string> OutputPaths(IEnumerable<Project> variants) =>
+        variants.Select(v => v.CompilationOutputInfo.AssemblyPath).OfType<string>().Where(p => p.Length > 0);
+
+    // The messages recorded ONLY at Warning level in the project's assets file. The default location is
+    // '<project dir>/obj/project.assets.json'; a repository that moves its output (UseArtifactsOutput, or a
+    // BaseIntermediateOutputPath) keeps the file in MSBuildProjectExtensionsPath, an ancestor of the intermediate
+    // output the load reports for each variant (<paramref name="intermediateOutputs"/>: its compilation output paths).
+    // A file found there, or at the artifacts location a literal Directory.Build.props setting names, counts only
+    // when it records this very project.
+    internal static IReadOnlyCollection<string> ReadRestoreWarnings(
+        string projectPath, IEnumerable<string>? intermediateOutputs = null)
     {
-        var assets = Path.Combine(Path.GetDirectoryName(projectPath) ?? ".", "obj", "project.assets.json");
         try
         {
-            if (!File.Exists(assets))
-                return [];
-            using var stream = File.OpenRead(assets);
-            using var document = System.Text.Json.JsonDocument.Parse(stream);
-            if (!document.RootElement.TryGetProperty("logs", out var logs) || logs.ValueKind != System.Text.Json.JsonValueKind.Array)
-                return [];
-            var warnings = new HashSet<string>(StringComparer.Ordinal);
-            var others = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var entry in logs.EnumerateArray())
+            foreach (var assets in AssetsFileCandidates(projectPath, intermediateOutputs))
             {
-                if (entry.ValueKind == System.Text.Json.JsonValueKind.Object
-                    && entry.TryGetProperty("message", out var text) && text.ValueKind == System.Text.Json.JsonValueKind.String
-                    && text.GetString()?.Trim() is { Length: > 0 } message)
-                {
-                    var isWarning = entry.TryGetProperty("level", out var level)
-                        && level.ValueKind == System.Text.Json.JsonValueKind.String
-                        && string.Equals(level.GetString(), "Warning", StringComparison.OrdinalIgnoreCase);
-                    (isWarning ? warnings : others).Add(message);
-                }
+                if (!File.Exists(assets))
+                    continue;
+                using var stream = File.OpenRead(assets);
+                using var document = System.Text.Json.JsonDocument.Parse(stream);
+                if (assets != DefaultAssetsFile(projectPath) && !IsAssetsFileOf(document.RootElement, projectPath))
+                    continue;
+                return WarningsOf(document.RootElement);
             }
-            // A message also recorded at another level (an error under another target graph) is never reclassified.
-            warnings.ExceptWith(others);
-            return warnings;
+            return [];
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Text.Json.JsonException)
         {
             return [];
         }
+    }
+
+    private static string DefaultAssetsFile(string projectPath) =>
+        Path.Combine(Path.GetDirectoryName(projectPath) ?? ".", "obj", "project.assets.json");
+
+    private static IEnumerable<string> AssetsFileCandidates(string projectPath, IEnumerable<string>? intermediateOutputs)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var all = new List<string> { DefaultAssetsFile(projectPath) };
+        foreach (var output in intermediateOutputs ?? [])
+        {
+            var dir = Path.GetDirectoryName(output);
+            for (var depth = 0; dir != null && depth < 4; depth++, dir = Path.GetDirectoryName(dir))
+                all.Add(Path.Combine(dir, "project.assets.json"));
+        }
+        if (ArtifactsObjDirectory(projectPath) is { } artifacts)
+            all.Add(Path.Combine(artifacts, "project.assets.json"));
+        return all.Where(seen.Add);
+    }
+
+    // '<ArtifactsPath>/obj/<project name>' for a project under UseArtifactsOutput, read from the nearest
+    // Directory.Build.props that sets ArtifactsPath as a literal (optionally under $(MSBuildThisFileDirectory)).
+    // The repository is untrusted: the walk stops at the directory holding the checkout's .git entry (so nothing
+    // outside the repository is read), and the file is read with DTDs prohibited and a size cap.
+    private const long MaxPropsBytes = 1024 * 1024;
+
+    internal static string? ArtifactsObjDirectory(string projectPath)
+    {
+        for (var dir = Path.GetDirectoryName(projectPath); dir != null; dir = Path.GetDirectoryName(dir))
+        {
+            var props = Path.Combine(dir, "Directory.Build.props");
+            var isCheckoutRoot = Directory.Exists(Path.Combine(dir, ".git")) || File.Exists(Path.Combine(dir, ".git"));
+            if (!File.Exists(props))
+            {
+                if (isCheckoutRoot)
+                    return null;
+                continue;
+            }
+            try
+            {
+                if (new FileInfo(props).Length > MaxPropsBytes)
+                    return null;
+                var settings = new System.Xml.XmlReaderSettings
+                {
+                    DtdProcessing = System.Xml.DtdProcessing.Prohibit,
+                    XmlResolver = null,
+                    MaxCharactersFromEntities = 0,
+                    MaxCharactersInDocument = MaxPropsBytes
+                };
+                using var reader = System.Xml.XmlReader.Create(props, settings);
+                var elements = System.Xml.Linq.XDocument.Load(reader).Descendants().ToList();
+                string? Literal(string name) => elements
+                    .Where(e => e.Name.LocalName == name && !e.AncestorsAndSelf().Any(a => a.Attribute("Condition") != null))
+                    .Select(e => e.Value.Trim()).FirstOrDefault();
+                var artifacts = Literal("ArtifactsPath");
+                if (!string.Equals(Literal("UseArtifactsOutput"), "true", StringComparison.OrdinalIgnoreCase) || artifacts == null)
+                    return null;
+                const string thisDirectory = "$(MSBuildThisFileDirectory)";
+                if (artifacts.StartsWith(thisDirectory, StringComparison.Ordinal))
+                    artifacts = Path.Combine(dir, artifacts[thisDirectory.Length..]);
+                else if (artifacts.Contains("$(", StringComparison.Ordinal) || !Path.IsPathRooted(artifacts))
+                    return null;
+                return Path.Combine(Path.GetFullPath(artifacts), "obj", Path.GetFileNameWithoutExtension(projectPath));
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Xml.XmlException
+                or ArgumentException or NotSupportedException or System.Security.SecurityException)
+            {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    // A file at a moved location counts only when it records this very project.
+    private static bool IsAssetsFileOf(System.Text.Json.JsonElement root, string projectPath)
+    {
+        var recorded = root.TryGetProperty("project", out var project) && project.ValueKind == System.Text.Json.JsonValueKind.Object
+            && project.TryGetProperty("restore", out var restore) && restore.ValueKind == System.Text.Json.JsonValueKind.Object
+            && restore.TryGetProperty("projectPath", out var path) && path.ValueKind == System.Text.Json.JsonValueKind.String
+                ? path.GetString()
+                : null;
+        return recorded != null && string.Equals(NormalizePath(recorded), NormalizePath(projectPath), StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static IReadOnlyCollection<string> WarningsOf(System.Text.Json.JsonElement root)
+    {
+        if (!root.TryGetProperty("logs", out var logs) || logs.ValueKind != System.Text.Json.JsonValueKind.Array)
+            return [];
+        var warnings = new HashSet<string>(StringComparer.Ordinal);
+        var others = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var entry in logs.EnumerateArray())
+        {
+            if (entry.ValueKind == System.Text.Json.JsonValueKind.Object
+                && entry.TryGetProperty("message", out var text) && text.ValueKind == System.Text.Json.JsonValueKind.String
+                && text.GetString()?.Trim() is { Length: > 0 } message)
+            {
+                var isWarning = entry.TryGetProperty("level", out var level)
+                    && level.ValueKind == System.Text.Json.JsonValueKind.String
+                    && string.Equals(level.GetString(), "Warning", StringComparison.OrdinalIgnoreCase);
+                (isWarning ? warnings : others).Add(message);
+            }
+        }
+        // A message also recorded at another level (an error under another target graph) is never reclassified.
+        warnings.ExceptWith(others);
+        return warnings;
     }
 
     private static string? VariantFramework(Project project, IReadOnlyList<string> expected)

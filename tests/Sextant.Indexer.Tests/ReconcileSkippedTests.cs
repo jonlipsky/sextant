@@ -94,6 +94,142 @@ public sealed class ReconcileSkippedTests
         }
     }
 
+    private static string AssetsJson(string projectPath, string level) =>
+        "{\"version\":3,\"project\":{\"restore\":{\"projectPath\":" + System.Text.Json.JsonSerializer.Serialize(projectPath)
+        + "}},\"logs\":[{\"code\":\"NU1801\",\"level\":\"" + level + "\",\"message\":\"Feed was unauthorized.\"}]}";
+
+    [TestMethod]
+    public void ReadRestoreWarnings_FindsAnAssetsFileInAnArtifactsLocationNamedByDirectoryBuildProps()
+    {
+        var a = Abs("ReplayArtifacts-" + Guid.NewGuid().ToString("N") + "/src/A", "A.csproj");
+        var repo = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(a)!, "..", ".."));
+        var obj = Path.Combine(repo, "artifacts", "obj", "A");
+        Directory.CreateDirectory(obj);
+        Directory.CreateDirectory(Path.GetDirectoryName(a)!);
+        try
+        {
+            File.WriteAllText(Path.Combine(repo, "src", "Directory.Build.props"), """
+                <Project><PropertyGroup><UseArtifactsOutput>true</UseArtifactsOutput>
+                <ArtifactsPath>$(MSBuildThisFileDirectory)../artifacts</ArtifactsPath></PropertyGroup></Project>
+                """);
+            File.WriteAllText(Path.Combine(obj, "project.assets.json"), AssetsJson(a, "Warning"));
+            CollectionAssert.AreEqual(new[] { "Feed was unauthorized." }, SolutionLoader.ReadRestoreWarnings(a).ToArray());
+
+            File.WriteAllText(Path.Combine(obj, "project.assets.json"), AssetsJson(a, "Error"));
+            Assert.AreEqual(0, SolutionLoader.ReadRestoreWarnings(a).Count, "an Error-level entry is not reclassified");
+
+            File.WriteAllText(Path.Combine(obj, "project.assets.json"), AssetsJson(Path.Combine(repo, "other", "B.csproj"), "Warning"));
+            Assert.AreEqual(0, SolutionLoader.ReadRestoreWarnings(a).Count, "another project's assets file is never read");
+        }
+        finally
+        {
+            Directory.Delete(repo, recursive: true);
+        }
+    }
+
+    private static string NewRepo(string name)
+    {
+        var repo = Path.Combine(Path.GetTempPath(), name + "-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(repo, ".git"));
+        return repo;
+    }
+
+    [TestMethod]
+    public void ArtifactsObjDirectory_RefusesADtd_AnOversizedFile_AndAConditionalSetting()
+    {
+        var repo = NewRepo("ArtifactsHarden");
+        var project = Path.Combine(repo, "src", "A", "A.csproj");
+        Directory.CreateDirectory(Path.GetDirectoryName(project)!);
+        var props = Path.Combine(repo, "Directory.Build.props");
+        const string literal = "<Project><PropertyGroup><UseArtifactsOutput>true</UseArtifactsOutput>"
+            + "<ArtifactsPath>$(MSBuildThisFileDirectory)out</ArtifactsPath></PropertyGroup></Project>";
+        try
+        {
+            File.WriteAllText(props, literal);
+            Assert.AreEqual(Path.Combine(repo, "out", "obj", "A"), SolutionLoader.ArtifactsObjDirectory(project));
+
+            File.WriteAllText(props, "<!DOCTYPE Project [<!ENTITY x \"y\">]>" + literal);
+            Assert.IsNull(SolutionLoader.ArtifactsObjDirectory(project), "a DTD is refused");
+
+            File.WriteAllText(props, literal + "<!--" + new string('x', 1024 * 1024) + "-->");
+            Assert.IsNull(SolutionLoader.ArtifactsObjDirectory(project), "a file over 1 MiB is refused");
+
+            File.WriteAllText(props, "<Project><PropertyGroup Condition=\"'$(CI)' == 'true'\"><UseArtifactsOutput>true</UseArtifactsOutput>"
+                + "<ArtifactsPath>$(MSBuildThisFileDirectory)out</ArtifactsPath></PropertyGroup></Project>");
+            Assert.IsNull(SolutionLoader.ArtifactsObjDirectory(project), "a conditional setting is not a literal");
+        }
+        finally
+        {
+            Directory.Delete(repo, recursive: true);
+        }
+    }
+
+    [TestMethod]
+    public void ArtifactsObjDirectory_NeverReadsAPropsFileOutsideTheCheckout()
+    {
+        var outer = Path.Combine(Path.GetTempPath(), "ArtifactsOuter-" + Guid.NewGuid().ToString("N"));
+        var repo = Path.Combine(outer, "repo");
+        Directory.CreateDirectory(Path.Combine(repo, ".git"));
+        var project = Path.Combine(repo, "A", "A.csproj");
+        Directory.CreateDirectory(Path.GetDirectoryName(project)!);
+        try
+        {
+            File.WriteAllText(Path.Combine(outer, "Directory.Build.props"),
+                "<Project><PropertyGroup><UseArtifactsOutput>true</UseArtifactsOutput>"
+                + "<ArtifactsPath>$(MSBuildThisFileDirectory)out</ArtifactsPath></PropertyGroup></Project>");
+            Assert.IsNull(SolutionLoader.ArtifactsObjDirectory(project));
+        }
+        finally
+        {
+            Directory.Delete(outer, recursive: true);
+        }
+    }
+
+    [TestMethod]
+    public void ReadRestoreWarnings_DefaultLocationIsReadUnconditionally_MovedLocationNeedsTheRecordedProject()
+    {
+        var repo = NewRepo("AssetsDefault");
+        var a = Path.Combine(repo, "A", "A.csproj");
+        var obj = Path.Combine(repo, "A", "obj");
+        Directory.CreateDirectory(obj);
+        try
+        {
+            File.WriteAllText(Path.Combine(obj, "project.assets.json"), AssetsJson(Path.Combine(repo, "elsewhere", "Z.csproj"), "Warning"));
+            CollectionAssert.AreEqual(new[] { "Feed was unauthorized." }, SolutionLoader.ReadRestoreWarnings(a).ToArray(),
+                "the default location is read whatever project it records, as before");
+
+            File.Delete(Path.Combine(obj, "project.assets.json"));
+            var moved = Path.Combine(repo, "moved");
+            Directory.CreateDirectory(moved);
+            File.WriteAllText(Path.Combine(moved, "project.assets.json"), AssetsJson(Path.Combine(repo, "elsewhere", "Z.csproj"), "Warning"));
+            Assert.AreEqual(0, SolutionLoader.ReadRestoreWarnings(a, [Path.Combine(moved, "A.dll")]).Count);
+        }
+        finally
+        {
+            Directory.Delete(repo, recursive: true);
+        }
+    }
+
+    [TestMethod]
+    public void ReadRestoreWarnings_FindsAnAssetsFileAboveTheLoadedIntermediateOutput()
+    {
+        var a = Abs("ReplayMoved-" + Guid.NewGuid().ToString("N") + "/src/A", "A.csproj");
+        var repo = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(a)!, "..", ".."));
+        var moved = Path.Combine(repo, "build", "intermediate", "A");
+        Directory.CreateDirectory(Path.Combine(moved, "debug"));
+        try
+        {
+            File.WriteAllText(Path.Combine(moved, "project.assets.json"), AssetsJson(a, "Warning"));
+            var output = new[] { Path.Combine(moved, "debug", "A.dll") };
+            Assert.AreEqual(0, SolutionLoader.ReadRestoreWarnings(a).Count, "nothing at the default location");
+            CollectionAssert.AreEqual(new[] { "Feed was unauthorized." }, SolutionLoader.ReadRestoreWarnings(a, output).ToArray());
+        }
+        finally
+        {
+            Directory.Delete(repo, recursive: true);
+        }
+    }
+
     [TestMethod]
     public void ReadRestoreWarnings_ExcludesAMessageAlsoRecordedAtAnotherLevel()
     {
