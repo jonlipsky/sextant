@@ -280,6 +280,13 @@ public sealed record PackageRestoreOutcome
     /// </summary>
     public int SolutionsFailed => Math.Max(0, SolutionsAttempted - SolutionsSucceeded - SolutionsNotStarted - (TimedOut ? 1 : 0));
 
+    /// <summary>
+    /// Of <see cref="SolutionsFailed"/>, the solutions whose own failed restore reported at least one project error
+    /// (issue #351). A failed solution that reported none cannot be explained by project exclusions; zero (the
+    /// default) therefore claims none is explained.
+    /// </summary>
+    public int SolutionsFailedAttributed { get; init; }
+
     /// <summary>True when every attempted restore exited 0 within the bound, or restore is disabled.</summary>
     public bool Clean => !Enabled
         || (!TimedOut && SolutionsNotStarted == 0 && SolutionsSucceeded == SolutionsAttempted

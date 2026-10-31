@@ -16,7 +16,7 @@ namespace Sextant.Service.Tests;
 [TestClass]
 public class SnapshotWorkerVerdictTests
 {
-    private const string CheckoutDir = "/checkout/repo";
+    private static readonly string CheckoutDir = Path.Combine(Path.GetTempPath(), "sextant_worker_verdict_checkout");
 
     // An empty Roslyn solution is enough: BuildResult reads only the per-solution coverage + skipped sets,
     // never the Solution graph itself (that was consumed during indexing, before the verdict is built).
@@ -68,6 +68,7 @@ public class SnapshotWorkerVerdictTests
     [TestMethod]
     public void BuildResult_SkippedProject_IsPartialNotComplete()
     {
+        SdkProjectStubs.Create($"{CheckoutDir}/src/Ios/Ios.csproj");
         var skipped = new[] { new SkippedProject($"{CheckoutDir}/src/Ios/Ios.csproj", "iOS workload not available on this worker") };
         var load = Load(
             [new SolutionCoverage($"{CheckoutDir}/App.slnx", DeclaredProjectCount: 2, LoadedProjectCount: 1, skipped)],
@@ -176,6 +177,7 @@ public class SnapshotWorkerVerdictTests
         // #124 criterion: a platform head that cannot load on this worker does not fail the snapshot — it is
         // skipped-with-reason, the loadable projects are published, and the partial reason names the head.
         var head = $"{CheckoutDir}/heads/Mobile.iOS/Mobile.iOS.csproj";
+        SdkProjectStubs.Create(head);
         var skipped = new[] { new SkippedProject(head, "The imported project 'Xamarin.iOS.targets' was not found") };
         var resolution = Resolution() with
         {

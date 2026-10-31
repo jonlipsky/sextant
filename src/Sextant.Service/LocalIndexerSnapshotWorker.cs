@@ -383,12 +383,12 @@ public sealed class LocalIndexerSnapshotWorker(
                 var inventory = SnapshotCoverageBuilder.Inventory.Scan(checkoutDir);
                 pinOverrides = pins.Where(p => p.OverrideApplied).Select(p => p.ToCoverageOverride()).ToList();
                 coverage = SnapshotCoverageBuilder.Build(checkoutDir, resolution, load, inventory, pinOverrides);
-                coverage = coverage with { Coverage = SnapshotCoverageBuilder.WithRestoreOutcome(coverage.Coverage, restore) };
+                coverage = coverage with { Coverage = SnapshotCoverageBuilder.WithRestoreOutcome(coverage.Coverage, restore, coverage.Exclusions, coverage.Versions) };
                 providerCoverage = SnapshotCoverageBuilder.BuildProviders(
                         checkoutDir, resolution, load, inventory, pinOverrides, plan?.Budget)
                     .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
             }
-            AddProviderRestoreGaps(providerCoverage, restore);
+            AddProviderRestoreGaps(providerCoverage, restore, coverage.Exclusions ?? [], coverage.Versions);
             var indexContext = context with
             {
                 Coverage = coverage.Coverage,
@@ -565,20 +565,20 @@ public sealed class LocalIndexerSnapshotWorker(
     }
 
     private static void AddProviderRestoreGaps(
-        IDictionary<string, SnapshotCoverage> providerCoverage, PackageRestoreOutcome restore)
+        IDictionary<string, SnapshotCoverage> providerCoverage, PackageRestoreOutcome restore,
+        IReadOnlyList<ProjectExclusion> exclusions, ProjectVersionIndex? versions)
     {
         if (restore.Clean)
             return;
 
-        var unknownGap = restore.TimedOut || restore.SolutionsNotStarted > 0 || restore.SolutionsFailed > 0
-            || restore.ProjectsDropped > 0 || restore.GeneralCodes.Count > 0 || restore.SourceUnreachableGeneral
-            || restore.CredentialsUnavailable;
+        var unknownGap = SnapshotCoverageBuilder.HasUnattributedRestoreGap(restore) || restore.Projects.Count == 0;
         var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
         foreach (var path in providerCoverage.Keys.ToArray())
         {
             var prefix = path.Replace('\\', '/').TrimEnd('/') + "/";
             var hasProjectFailure = restore.Projects.Any(project =>
-                project.Project.Replace('\\', '/').StartsWith(prefix, comparison));
+                project.Project.Replace('\\', '/').StartsWith(prefix, comparison)
+                && !SnapshotCoverageBuilder.IsRestoreFailureExcluded(project, exclusions, versions));
             if (unknownGap || hasProjectFailure)
             {
                 providerCoverage[path] = SnapshotCoverageBuilder.WithRestoreFailure(
@@ -609,8 +609,10 @@ public sealed class LocalIndexerSnapshotWorker(
         diagnostics.AddRange(coverage.Diagnostics);
         if (restore is { Clean: false })
         {
+            var exclusions = coverage.Exclusions ?? [];
+            var gap = SnapshotCoverageBuilder.RestoreGapRemains(restore, exclusions, coverage.Versions);
             // Package ids and codes only: a raw restore message can name a package source URL.
-            foreach (var issue in restore.Projects)
+            foreach (var issue in restore.Projects.Where(p => !SnapshotCoverageBuilder.IsRestoreFailureExcluded(p, exclusions, coverage.Versions)))
             {
                 diagnostics.Add(new ProjectOutcome
                 {
@@ -624,7 +626,7 @@ public sealed class LocalIndexerSnapshotWorker(
             {
                 diagnostics.Add(new ProjectOutcome
                 {
-                    Severity = JobDiagnosticSeverity.Warning,
+                    Severity = gap ? JobDiagnosticSeverity.Warning : JobDiagnosticSeverity.Info,
                     Code = PackageRestoreIncompleteCode,
                     Message = note
                 });

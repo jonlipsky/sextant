@@ -2060,7 +2060,7 @@ public sealed class IndexOrchestrator
                     path, tfm, c.Value.NamesExamined, c.Value.UnboundNames, c.Value.UnboundInvocations,
                     c.Value.CandidateOccurrences);
             });
-        var health = BindingHealthBuilder.Build(projects, ctx.ProjectLoadIssues);
+        var health = BindingHealthBuilder.Build(projects, ctx.ProjectLoadIssues, coverage.AllExclusions ?? coverage.Exclusions);
         return ctx with { Coverage = BindingHealthBuilder.Apply(coverage, health) };
     }
 

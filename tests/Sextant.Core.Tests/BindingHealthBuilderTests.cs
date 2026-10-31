@@ -123,4 +123,95 @@ public class BindingHealthBuilderTests
             "src/P4/P4.csproj: 96 unbound name(s); +2 more). Calls that failed to bind are kept as candidate matches.",
             result.Reasons[1]);
     }
+
+    private static ProjectExclusion Platform(string project, string tfm)
+        => new(project, tfm, ProjectExclusionReason.PlatformUnavailable, "android; workload_missing");
+
+    [TestMethod]
+    public void Apply_DegradedPlatformVersion_WithNoMatchingExclusion_IsAGap()
+    {
+        var health = BindingHealthBuilder.Build(
+            [Counts("src/Droid/Droid.csproj", 4000, 3126, tfm: "net10.0-android")]);
+        var result = BindingHealthBuilder.Apply(Complete, health);
+
+        Assert.AreEqual(SnapshotCoverageVerdict.Partial, result.Verdict);
+        Assert.AreEqual(1, health.ProjectsDegraded);
+        Assert.IsFalse(health.Projects.Single().Excluded);
+    }
+
+    [TestMethod]
+    public void Apply_DegradedPlatformVersion_WithItsExclusion_IsKeptAndMarkedExcluded_ButIsNotAGap()
+    {
+        var health = BindingHealthBuilder.Build(
+            [Counts("src/Droid/Droid.csproj", 4000, 3126, tfm: "net10.0-android")],
+            exclusions: [Platform("src/Droid/Droid.csproj", "net10.0-android")]);
+        var result = BindingHealthBuilder.Apply(Complete, health);
+
+        Assert.AreEqual(SnapshotCoverageVerdict.Complete, result.Verdict);
+        Assert.AreEqual(0, result.Reasons.Count);
+        Assert.AreEqual(0, health.ProjectsDegraded);
+        var entry = health.Projects.Single();
+        Assert.IsTrue(entry.Degraded);
+        Assert.IsTrue(entry.Excluded);
+    }
+
+    [TestMethod]
+    public void Apply_ASiblingVersionsExclusion_DoesNotCoverAnotherVersion()
+    {
+        var health = BindingHealthBuilder.Build(
+            [Counts("src/Droid/Droid.csproj", 4000, 3126, tfm: "net10.0")],
+            exclusions: [Platform("src/Droid/Droid.csproj", "net10.0-android")]);
+
+        Assert.AreEqual(SnapshotCoverageVerdict.Partial, BindingHealthBuilder.Apply(Complete, health).Verdict);
+    }
+
+    [TestMethod]
+    public void Build_MoreThanTheListCapOfExclusions_StillExcludesTheLastVersion()
+    {
+        var exclusions = Enumerable.Range(0, SnapshotCoverage.MaxExclusions + 1)
+            .Select(i => Platform($"src/P{i:D3}/P{i:D3}.csproj", "net10.0-android")).ToList();
+        var last = exclusions[^1];
+        var health = BindingHealthBuilder.Build([Counts(last.Project, 4000, 3126, tfm: last.TargetFramework)], exclusions: exclusions);
+
+        Assert.AreEqual(0, health.ProjectsDegraded);
+        Assert.IsTrue(health.Projects.Single().Excluded);
+    }
+
+    [TestMethod]
+    public void Apply_DegradedPlainVersion_StillMakesItPartial_NamingOnlyIt()
+    {
+        var health = BindingHealthBuilder.Build(
+        [
+            Counts("src/Droid/Droid.csproj", 4000, 3126, tfm: "net10.0-android"),
+            Counts("src/Lib/Lib.csproj", 4000, 900, tfm: "net10.0"),
+        ], exclusions: [Platform("src/Droid/Droid.csproj", "net10.0-android")]);
+        var result = BindingHealthBuilder.Apply(Complete, health);
+
+        Assert.AreEqual(SnapshotCoverageVerdict.Partial, result.Verdict);
+        Assert.AreEqual(1, health.ProjectsDegraded);
+        StringAssert.Contains(result.Reasons[0], "src/Lib/Lib.csproj");
+        Assert.IsFalse(result.Reasons[0].Contains("Droid", StringComparison.Ordinal), result.Reasons[0]);
+    }
+
+    [TestMethod]
+    public void Apply_DegradedVersionListedInTheCoverageExclusions_IsNotAGap()
+    {
+        var health = BindingHealthBuilder.Build(
+            [Counts("src/Old/Old.csproj", 1000, 500)],
+            exclusions: [new ProjectExclusion("src/Old/Old.csproj", null, ProjectExclusionReason.LegacyProjectFormat)]);
+        var result = BindingHealthBuilder.Apply(Complete, health);
+
+        Assert.AreEqual(SnapshotCoverageVerdict.Complete, result.Verdict);
+        Assert.IsTrue(health.Projects.Single().Excluded);
+    }
+
+    [TestMethod]
+    public void Build_ANullFrameworkExclusion_CoversOnlyANullFrameworkVersion()
+    {
+        var exclusions = new[] { new ProjectExclusion("src/Old/Old.csproj", null, ProjectExclusionReason.LegacyProjectFormat) };
+        var health = BindingHealthBuilder.Build(
+            [Counts("src/Old/Old.csproj", 1000, 500, tfm: "net10.0")], exclusions: exclusions);
+
+        Assert.IsFalse(health.Projects.Single().Excluded);
+    }
 }

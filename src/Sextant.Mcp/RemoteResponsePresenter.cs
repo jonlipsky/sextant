@@ -94,6 +94,10 @@ public static class RemoteResponsePresenter
 
         var partial = provenance.Completeness != SnapshotStatus.Complete;
         lean["coverage"] = partial ? SnapshotStatus.Partial : SnapshotStatus.Complete;
+        // Project versions the worker cannot build (#351) are not gaps, but an agent should see they are absent; the
+        // list is in the recorded coverage.
+        if (provenance.Coverage is { ProjectVersionsExcluded: > 0 } excluded)
+            lean["excluded_project_versions"] = excluded.ProjectVersionsExcluded;
 
         var warnings = new List<string>();
         if (partial)

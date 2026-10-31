@@ -302,6 +302,33 @@ and fell back to grep. Under an explicit `solutions` list the same files were al
 does not scope another repository. Per-item diagnostics are capped at 200 per code
 with a summary row; the coverage counts are never capped. Diagnostic paths are checkout-relative.
 
+**Project exclusions (issue #351).** Some project versions are not gaps: this worker cannot build them, and
+that is proven, not assumed. They are listed in `coverage.exclusions` (`project`, `target_framework`,
+`reason`, `detail`; the serialized list holds the first 50, the count `coverage.project_versions_excluded`
+is exact) and a `complete` snapshot may carry them. `complete` therefore means "every project version this
+worker can build is indexed", and `ProjectsSkipped`/`ProjectsPartiallyLoaded`/`ProjectsDegraded` count only
+gaps. A version is excluded only with evidence; anything else stays a gap:
+
+- `platform_unavailable`: the target framework has an OS suffix (`-ios`, `-android`, `-windows`, ...) **and**
+  its failure text is a missing workload (`NETSDK1147/1139/1178`, "isn't supported on this platform",
+  "Platform version is not present", also for a `-macos` version blocked by a sibling's platform failure),
+  "There is no application host available for the specified RuntimeIdentifier" (Apple/Android), or, for
+  `-windows` only, `WindowsAppSDKSelfContained requires a supported Windows architecture`, `XamlCompiler
+  output file` or a Windows-only tool (`mt.exe`); a platform-pack binding is evidence too. `detail` is
+  `<platform>; workload_missing|no_application_host|windows_tooling|platform_pack_binding`. A plain `net10.0`
+  version with the same text, or an SDK-pin failure (`sdk_resolution_failed`), stays a gap.
+- `project_file_missing`: a path inside the checkout (not in an unpopulated submodule) that provably is not
+  on disk, also not as a case-only variant (bounded directory read).
+- `legacy_project_format`: a project with no `Sdk` (at most 1 MiB, parsed without DTDs) whose failure says an
+  imported project was not found, or "Project does not contain 'Compile' target" with an `Import` of a
+  `$(...)` path.
+
+Binding health excludes a degraded version only when that exact (project, target framework) version is
+excluded. A restore failure of a project (`NU1012`/`NETSDK1084` for a platform exclusion, `MSB3202` for a
+missing file) is excluded only when **every** version of the project is excluded, and only when every failed
+solution reported a project error; otherwise the restore stays a gap. `get_index_status` and the grants
+status carry `excluded_project_versions` (the exact count) next to the verdict.
+
 **Evaluation accounting (#130/#132/#150).** A readable empty `.sln` or `.slnx` contributes zero projects
 without a coverage gap; a parse/read failure discards all declarations and increments `solutions_unreadable`.
 Per-TFM failures are never erased by a healthy sibling or by surviving documents. A typed workspace

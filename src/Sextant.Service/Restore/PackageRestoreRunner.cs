@@ -401,7 +401,7 @@ public sealed class PackageRestoreRunner(
     {
         var parser = new RestoreOutputParser(checkoutDir);
         var stopwatch = Stopwatch.StartNew();
-        int attempted = 0, succeeded = 0, notStarted = 0, retried = 0, retriedProjects = 0;
+        int attempted = 0, succeeded = 0, notStarted = 0, retried = 0, retriedProjects = 0, failedAttributed = 0;
         int staticPasses = 0, staticFallbacks = 0, staticMemoSkips = 0, coveredByReplay = 0;
         var timedOut = false;
         var startedUtc = DateTime.UtcNow;
@@ -646,6 +646,8 @@ public sealed class PackageRestoreRunner(
                     timedOut = true;
                     break;
                 case RunResult.Failed:
+                    if (outcomeParser.Projects().Count > 0)
+                        failedAttributed++;
                     foreach (var project in DeterministicallyAttempted(declared, outcomeParser, startedUtc, solutionDir, restoredBy))
                     {
                         if (!failedBy.TryGetValue(project, out var dirs))
@@ -664,6 +666,7 @@ public sealed class PackageRestoreRunner(
             SolutionsSelected = solutions.Count,
             SolutionsSucceeded = succeeded,
             SolutionsNotStarted = notStarted,
+            SolutionsFailedAttributed = failedAttributed,
             SolutionsRetriedPerProject = retried,
             ProjectsRetried = retriedProjects,
             StaticGraphPasses = staticPasses,
@@ -842,6 +845,7 @@ public sealed class PackageRestoreRunner(
             SolutionsSelected = solutionCount,
             SolutionsSucceeded = result == RunResult.Succeeded ? 1 : 0,
             SolutionsNotStarted = result == RunResult.NotStarted ? 1 : 0,
+            SolutionsFailedAttributed = result == RunResult.Failed && parser.Projects().Count > 0 ? 1 : 0,
             TimedOut = timedOut,
             Timeout = deadline,
             Elapsed = stopwatch.Elapsed,
