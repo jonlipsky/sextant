@@ -1,4 +1,6 @@
+using Sextant.Core;
 using Sextant.Indexer;
+using Sextant.Store;
 
 namespace Sextant.Service.Tests;
 
@@ -164,18 +166,89 @@ public class CheckoutProviderTests
     }
 
     [TestMethod]
-    public void TryResolve_NoConfigAndNoSolution_ReturnsFalse()
+    public void TryResolve_BareProvider_NoSolution_IsNotResolved_AsBefore()
     {
         _dataRoot = ServiceTestFixtures.NewDataRoot();
         var paths = new ServicePaths(ServiceVolumes.Rooted(_dataRoot));
 
         var request = ServiceTestFixtures.Request() with { RepositoryRemoteUrl = "https://github.com/org/app.git" };
         var checkout = Path.Combine(paths.CheckoutRoot, ServicePaths.RepoDirectoryName(request.RepositoryRemoteUrl));
-        Directory.CreateDirectory(checkout); // a checkout with no solution and no config
+        Directory.CreateDirectory(checkout);
 
-        var provider = new PersistentVolumeCheckoutProvider(paths);
-        Assert.IsFalse(provider.TryResolve(request, out var resolution),
-            "a checkout with neither a config nor any discoverable solution is genuinely unsupported");
-        Assert.IsNull(resolution);
+        Assert.IsFalse(new PersistentVolumeCheckoutProvider(paths).TryResolve(request, out _),
+            "the bare provider cannot verify the commit, so it never claims no code");
+    }
+
+    [TestMethod]
+    public async Task Worker_ProvisionedCheckoutWithNoCSharp_IsUnsupportedWithTheNoCodeMessage()
+    {
+        _dataRoot = ServiceTestFixtures.NewDataRoot();
+        var paths = new ServicePaths(ServiceVolumes.Rooted(_dataRoot));
+        var request = ServiceTestFixtures.Request() with
+        {
+            RepositoryRemoteUrl = "https://github.com/org/kit.git", CommitSha = new string('a', 40)
+        };
+        var checkout = Path.Combine(paths.CheckoutRoot, ServicePaths.RepoDirectoryName(request.RepositoryRemoteUrl));
+        Directory.CreateDirectory(Path.Combine(checkout, "src", "App"));
+        File.WriteAllText(Path.Combine(checkout, "src", "App", "App.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\" />");
+
+        var result = await ProduceAsync(paths, request, new NoCodeProvider(checkout));
+
+        Assert.AreEqual(SnapshotJobStatus.Unsupported, result.Status);
+        StringAssert.StartsWith(result.Error, SnapshotJobStore.NoSupportedCodeDefaultBranchPrefix, "a request with no branch is the default");
+        StringAssert.Contains(result.Error, $"Commit {request.CommitSha} of 'https://github.com/org/kit.git' contains no solution (.sln/.slnx) file, so there is nothing to index.");
+        Assert.IsFalse(result.Error!.Contains("project files", StringComparison.Ordinal), "a .csproj-only repository is not described as having no project files");
+        Assert.IsFalse(result.Error!.Contains("No provisioned checkout", StringComparison.Ordinal));
+    }
+
+    [TestMethod]
+    public async Task Worker_CheckoutNotProvisioned_KeepsTheOldMessage()
+    {
+        _dataRoot = ServiceTestFixtures.NewDataRoot();
+        var paths = new ServicePaths(ServiceVolumes.Rooted(_dataRoot));
+
+        var result = await ProduceAsync(paths, ServiceTestFixtures.Request());
+
+        Assert.AreEqual(SnapshotJobStatus.Unsupported, result.Status);
+        StringAssert.Contains(result.Error, "No provisioned checkout with a solution found");
+        Assert.IsFalse(result.Error!.StartsWith(SnapshotJobStore.NoSupportedCodePrefix, StringComparison.Ordinal));
+    }
+
+    private sealed class NoCodeProvider(string checkout) : ICheckoutProvider
+    {
+        public bool TryResolve(EnsureSnapshotRequest request, out CheckoutResolution resolution)
+        {
+            resolution = new CheckoutResolution
+            {
+                CheckoutDir = checkout, SelectedSolutions = [], Source = SolutionSelectionSource.None, NoSupportedCode = true
+            };
+            return true;
+        }
+    }
+
+    [TestMethod]
+    public async Task Worker_NoCode_RecordsTheDefaultBranchMarker_OnlyForTheEffectiveDefault()
+    {
+        _dataRoot = ServiceTestFixtures.NewDataRoot();
+        var paths = new ServicePaths(ServiceVolumes.Rooted(_dataRoot));
+        var checkout = Path.Combine(paths.CheckoutRoot, "kit");
+        Directory.CreateDirectory(checkout);
+        var request = ServiceTestFixtures.Request(branch: "main");
+
+        var plain = await ProduceAsync(paths, request, new NoCodeProvider(checkout));
+        StringAssert.StartsWith(plain.Error, SnapshotJobStore.NoSupportedCodePrefix);
+
+        var marked = await ProduceAsync(paths, request with { IsDefaultBranch = true }, new NoCodeProvider(checkout));
+        StringAssert.StartsWith(marked.Error, SnapshotJobStore.NoSupportedCodeDefaultBranchPrefix);
+        Assert.IsFalse(SnapshotJobStore.NoSupportedCodeDefaultBranchPrefix.StartsWith(SnapshotJobStore.NoSupportedCodePrefix, StringComparison.Ordinal));
+        Assert.IsFalse(SnapshotJobStore.NoSupportedCodePrefix.StartsWith(SnapshotJobStore.NoSupportedCodeDefaultBranchPrefix, StringComparison.Ordinal));
+    }
+
+    private async Task<SnapshotWorkResult> ProduceAsync(ServicePaths paths, EnsureSnapshotRequest request, ICheckoutProvider? provider = null)
+    {
+        using var db = new IndexDatabase(Path.Combine(_dataRoot, "catalog.db"), IndexWriteOptions.Default);
+        db.RunMigrations();
+        var worker = new LocalIndexerSnapshotWorker(db, new SextantConfiguration(), provider ?? new PersistentVolumeCheckoutProvider(paths));
+        return await worker.ProduceAsync(request, "identity-hash", paths.AllocateScratch("job"), CancellationToken.None);
     }
 }

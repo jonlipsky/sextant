@@ -68,7 +68,13 @@ public sealed record CheckoutResolution
     /// </summary>
     public IReadOnlyList<SubmoduleProvisioningOutcome> SubmoduleProvisioning { get; init; } = [];
 
-    /// <summary>True when a solution was selected to index (false only in the config-error state).</summary>
+    /// <summary>
+    /// True when the checkout is verified at the requested commit (or was just provisioned) but contains no
+    /// solution (.sln/.slnx) file, so there is nothing to index, and no configuration asked for one (issue #353). <see cref="SelectedSolutions"/> is empty and <see cref="ConfigurationError"/> is null.
+    /// </summary>
+    public bool NoSupportedCode { get; init; }
+
+    /// <summary>True when a solution was selected to index (false only in the config-error and no-code states).</summary>
     public bool HasSelectedSolutions => SelectedSolutions.Count > 0;
 
     /// <summary>The first selected solution — the provisioning/probe signal that a solution exists.</summary>
@@ -80,7 +86,8 @@ public sealed record CheckoutResolution
 /// then selects the DETERMINISTIC solution set to index via <see cref="SolutionSelector"/> — honoring the
 /// checkout's own <c>sextant.json</c> <c>solutions</c> list, else the deterministic UNION of every
 /// discovered solution (issues #109, #124). Returns false (→ the job is <see cref="SnapshotJobStatus.Unsupported"/>) when no checkout
-/// or solution is present, so a query-only node degrades cleanly instead of failing hard.
+/// or solution is present, so a query-only node degrades cleanly instead of failing hard. It never claims
+/// <see cref="CheckoutResolution.NoSupportedCode"/>: it cannot verify the checkout's commit (issue #353).
 /// </summary>
 public sealed class PersistentVolumeCheckoutProvider(ServicePaths paths) : ICheckoutProvider
 {
@@ -225,6 +232,16 @@ public sealed class LocalIndexerSnapshotWorker(
             return SnapshotWorkResult.Unsupported(
                 $"No provisioned checkout with a solution found for '{request.RepositoryRemoteUrl}'. " +
                 "Checkout provisioning is orchestrated separately (Phase 14); this node indexes existing checkouts only.");
+        }
+
+        if (resolution.NoSupportedCode)
+        {
+            return SnapshotWorkResult.Unsupported(
+                (IsEffectiveDefault(request)
+                    ? SnapshotJobStore.NoSupportedCodeDefaultBranchPrefix
+                    : SnapshotJobStore.NoSupportedCodePrefix) +
+                $"Commit {request.CommitSha} of '{request.RepositoryRemoteUrl}' contains no solution (.sln/.slnx) file, " +
+                "so there is nothing to index.");
         }
 
         var checkoutDir = resolution.CheckoutDir;
@@ -996,6 +1013,10 @@ public sealed class LocalIndexerSnapshotWorker(
     /// <paramref name="restorePolicy"/> is the restore runner's identity component, folded the same way.
     /// </summary>
     /// <summary>The branch a job is recorded and published under: the requested one, else <c>main</c>.</summary>
+    // Whether the request's branch is the repository's default (the answer the branch advance uses).
+    private static bool IsEffectiveDefault(EnsureSnapshotRequest request) =>
+        request.ResolveIsDefaultBranch() && request.AllowsImplicitDefault(EffectiveBranchName(request));
+
     internal static string EffectiveBranchName(EnsureSnapshotRequest request) => request.BranchName ?? "main";
 
     internal static SnapshotContext CreateSnapshotContext(

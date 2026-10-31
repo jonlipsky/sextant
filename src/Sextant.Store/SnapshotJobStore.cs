@@ -328,6 +328,18 @@ public sealed class SnapshotJobStore(SqliteConnection connection)
     /// </summary>
     public const string StartupSettledReasonPrefix = "not produced:";
 
+    /// <summary>
+    /// The <c>last_error</c> prefix of an <c>unsupported</c> job whose checkout was provisioned but holds no solution
+    /// (.sln/.slnx) file (issue #353). Grant listings read it to tell that cause from every other unsupported one.
+    /// </summary>
+    public const string NoSupportedCodePrefix = "no_supported_code: ";
+
+    /// <summary>
+    /// Like <see cref="NoSupportedCodePrefix"/>, for a request whose branch was the repository's default branch.
+    /// Neither prefix starts with the other (<c>_</c> versus <c>:</c> after <c>no_supported_code</c>).
+    /// </summary>
+    public const string NoSupportedCodeDefaultBranchPrefix = "no_supported_code_default: ";
+
     /// <summary>SQL predicate (on <c>snapshot_jobs</c>) true for a row that was NOT settled at startup.</summary>
     public const string NotStartupSettledSql =
         "(last_error IS NULL OR substr(last_error, 1, 13) <> 'not produced:')";

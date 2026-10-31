@@ -455,6 +455,76 @@ public class CloningCheckoutProviderSubmoduleTests
             + string.Join(", ", Directory.EnumerateFileSystemEntries(dir).Select(Path.GetFileName)));
     }
 
+    // ---- issue #353: "no code" is claimed only for a checkout verified at the commit ----------------
+
+    private (string dir, string url, string commit) NewRepoWithoutSolution(string name, params (string Name, string Path, string Url, string Sha)[] submodules)
+    {
+        var dir = InitRepo(name);
+        Write(dir, "README.md", "# no code");
+        Write(dir, "src/App/App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />\n");
+        var gitmodules = new StringBuilder();
+        foreach (var m in submodules)
+            gitmodules.Append($"[submodule \"{m.Name}\"]\n\tpath = {m.Path}\n\turl = {m.Url}\n");
+        if (gitmodules.Length > 0)
+            Write(dir, ".gitmodules", gitmodules.ToString());
+        Git(dir, "add", "-A");
+        foreach (var m in submodules)
+            Git(dir, "update-index", "--add", "--cacheinfo", $"160000,{m.Sha},{m.Path}");
+        Git(dir, "commit", "--quiet", "-m", name);
+        return (dir, new Uri(dir).AbsoluteUri, GitHead(dir));
+    }
+
+    [TestMethod]
+    public void TryResolve_EmptyOrNonGitDirectory_IsNotResolved_NeverNoCode()
+    {
+        var (_, appUrl, appCommit) = NewRepoWithoutSolution("app");
+        var paths = NewPaths();
+        var canonical = Path.Combine(paths.CheckoutRoot, ServicePaths.RepoDirectoryName(appUrl));
+        Directory.CreateDirectory(canonical);
+        Assert.IsFalse(NewProvider(paths).TryResolve(ServiceTestFixtures.Request(appUrl, appCommit), out _), "empty directory");
+
+        File.WriteAllText(Path.Combine(canonical, "README.md"), "not a git tree");
+        Assert.IsFalse(NewProvider(paths).TryResolve(ServiceTestFixtures.Request(appUrl, appCommit), out _), "non-git tree");
+        Assert.IsFalse(NewProvider(paths).TryResolve(ServiceTestFixtures.Request(appUrl, "not-hex"), out _), "non-hex commit");
+    }
+
+    [TestMethod]
+    public void TryResolve_VerifiedCheckoutAtTheCommitWithNoSolution_IsNoCode()
+    {
+        var (_, appUrl, appCommit) = NewRepoWithoutSolution("app");
+        var paths = NewPaths();
+        PreChangeCheckout(paths, appUrl, appCommit);
+
+        Assert.IsTrue(NewProvider(paths).TryResolve(ServiceTestFixtures.Request(appUrl, appCommit), out var resolution));
+        Assert.IsTrue(resolution.NoSupportedCode);
+        Assert.IsFalse(resolution.HasSelectedSolutions);
+    }
+
+    [TestMethod]
+    public void TryResolve_FreshCloneWithNoSolution_IsNoCode()
+    {
+        var (_, appUrl, appCommit) = NewRepoWithoutSolution("app");
+        var paths = NewPaths();
+
+        Assert.IsTrue(NewProvider(paths).TryResolve(ServiceTestFixtures.Request(appUrl, appCommit), out var resolution),
+            string.Join(Environment.NewLine, _log));
+        Assert.IsTrue(resolution.NoSupportedCode);
+        Assert.AreEqual(appCommit, GitHead(resolution.CheckoutDir));
+    }
+
+    [TestMethod]
+    public void TryResolve_FailedSubmoduleUpgradeWhoseOnlyCodeIsInTheSubmodule_IsNotClaimedAsNoCode()
+    {
+        var (_, libUrl, libPinned, _) = NewLibRepo("lib");
+        var (app, appUrl, appCommit) = NewRepoWithoutSolution("app", ("abs", "libs/abs", libUrl, libPinned));
+        var paths = NewPaths();
+        PreChangeCheckout(paths, appUrl, appCommit);
+        DeleteTree(app); // the upgrade can no longer fetch
+
+        Assert.IsFalse(NewProvider(paths).TryResolve(ServiceTestFixtures.Request(appUrl, appCommit), out _),
+            "an unpopulated submodule means the checkout was not fully seen");
+    }
+
     // ---- fixtures --------------------------------------------------------------------------------
 
     private ServicePaths NewPaths() => new(ServiceVolumes.Rooted(Temp("sextant_subfix_data")));
