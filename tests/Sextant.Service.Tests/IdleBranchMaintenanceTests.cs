@@ -363,6 +363,22 @@ public class IdleBranchMaintenanceTests
         Assert.AreEqual(1, h.Service.CollectMetrics().Maintenance.Ticks);
     }
 
+    // Issue #302: a tick that meets a disposed service because shutdown began is the shutdown, not a failure.
+    [TestMethod]
+    public async Task ObjectDisposedDuringShutdown_IsNotCountedAsAFailedTick()
+    {
+        await using var h = Harness.Create(maintenance: Loop() with { ScheduledRetention = false });
+        h.Start(service => service.BeforeMaintenanceTick = () =>
+        {
+            service.StopProduction();
+            throw new ObjectDisposedException(nameof(SnapshotService));
+        });
+
+        await h.TickAsync();
+
+        Assert.AreEqual(0, h.Service.CollectMetrics().Maintenance.Failures);
+    }
+
     [TestMethod]
     public async Task ScheduledRetention_LogLineCarriesTheStepTimings_OnOneLine()
     {

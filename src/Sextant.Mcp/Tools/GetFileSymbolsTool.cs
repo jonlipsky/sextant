@@ -34,6 +34,8 @@ public static class GetFileSymbolsTool
             : symbolStore.GetByStoredRelativePaths(PathPresenter.StoredCandidates(file_path))
                 .Where(s => readContext.Paths.Matches(s.FilePath, file_path))
                 .ToList();
+        if (symbols.Count == 0 && SubmodulePaths.Find(conn, readContext.Scope, file_path) is { } submodule)
+            return SubmodulePaths.Error(file_path, submodule, readContext.Provenance);
         symbols = symbols.OrderBy(s => s.LineStart).ThenBy(s => s.Id).ToList();
 
         var mapped = page.Slice(symbols)

@@ -240,6 +240,46 @@ public sealed class SnapshotDependencyStore(SqliteConnection connection)
     }
 
     /// <summary>
+    /// The submodule pins recorded by the given consumer project versions (the parent's own pins, the same facts
+    /// its <c>.gitmodules</c> and gitlinks reveal): the provider repository URL, the pinned commit and the on-disk
+    /// roots of the consumer and provider projects, from which the submodule's path in the parent derives.
+    /// </summary>
+    internal const string SubmodulePinsSql = """
+        SELECT DISTINCT r.remote_url, d.provider_commit_sha, cp.disk_path, cp.repo_relative_path,
+               pp.disk_path, pp.repo_relative_path
+        FROM json_each(@pids) j
+        JOIN snapshot_dependencies d ON d.consumer_project_id = j.value
+        JOIN projects cp ON cp.id = d.consumer_project_id
+        JOIN projects pp ON pp.id = d.provider_project_id
+        JOIN repositories r ON r.id = d.provider_repository_id
+        WHERE d.reference_kind = 'submodule_ref';
+        """;
+
+    public List<SubmodulePin> GetSubmodulePins(IReadOnlyCollection<long> consumerProjectIds)
+    {
+        if (consumerProjectIds.Count == 0)
+            return [];
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = SubmodulePinsSql;
+        cmd.Parameters.AddWithValue("@pids", System.Text.Json.JsonSerializer.Serialize(consumerProjectIds));
+        var pins = new List<SubmodulePin>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            pins.Add(new SubmodulePin
+            {
+                ProviderRepositoryUrl = reader.GetString(0),
+                ProviderCommitSha = reader.GetString(1),
+                ConsumerDiskPath = reader.IsDBNull(2) ? null : reader.GetString(2),
+                ConsumerRepoRelativePath = reader.IsDBNull(3) ? null : reader.GetString(3),
+                ProviderDiskPath = reader.IsDBNull(4) ? null : reader.GetString(4),
+                ProviderRepoRelativePath = reader.IsDBNull(5) ? null : reader.GetString(5)
+            });
+        }
+        return pins;
+    }
+
+    /// <summary>
     /// Authorized cross-repository usages of a provider (submodule) symbol identified by its stable
     /// <c>symbol_key</c>. Narrows to consumer snapshots in the scope (default = default-branch heads),
     /// restricts to <paramref name="authorizedConsumerRepositoryIds"/> when provided (fail-closed:

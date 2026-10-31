@@ -16,7 +16,7 @@ namespace Sextant.Mcp;
 /// </summary>
 public sealed class PathPresenter
 {
-    private static readonly StringComparison PathComparison =
+    internal static readonly StringComparison PathComparison =
         OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
 
     private readonly IndexDatabase? _db;

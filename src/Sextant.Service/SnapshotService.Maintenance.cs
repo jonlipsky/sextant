@@ -208,7 +208,7 @@ public sealed partial class SnapshotService
                     await Task.Delay(MinReTickDelay(soon, last), _timeProvider, lifetime).ConfigureAwait(false);
             }
         }
-        catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
+        catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException && lifetime.IsCancellationRequested)
         {
             // Shutdown.
         }
@@ -247,8 +247,9 @@ public sealed partial class SnapshotService
             LastMaintenanceTick = await RunMaintenanceTickAsync(lifetime).ConfigureAwait(false);
             return true;
         }
-        catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
+        catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException && lifetime.IsCancellationRequested)
         {
+            // A disposed service during shutdown is the same shutdown as a cancelled one, not a failed tick.
             throw;
         }
         catch (Exception ex)

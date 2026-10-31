@@ -178,7 +178,20 @@ public sealed class GitCheckoutContentVerifierTests
     [TestMethod]
     public void AGitThatDoesNotAnswerInTime_IsAProblem()
     {
-        var verifier = new GitCheckoutContentVerifier(timeout: TimeSpan.FromMilliseconds(1));
+        // A git that never answers within the timeout, so no real git can race the deadline.
+        string script;
+        if (OperatingSystem.IsWindows())
+        {
+            script = Path.Combine(_root, "slowgit.cmd");
+            File.WriteAllText(script, "@echo off\r\nping -n 60 127.0.0.1 >nul\r\n");
+        }
+        else
+        {
+            script = Path.Combine(_root, "slowgit.sh");
+            File.WriteAllText(script, "#!/bin/sh\nexec sleep 60\n");
+            File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+        var verifier = new GitCheckoutContentVerifier(script, timeout: TimeSpan.FromMilliseconds(500));
 
         StringAssert.Contains(verifier.Problem(_checkout, _head, OnDisk(GlobalJson)), "timed out");
     }

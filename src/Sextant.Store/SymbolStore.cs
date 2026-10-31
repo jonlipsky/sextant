@@ -294,27 +294,86 @@ public sealed class SymbolStore(SqliteConnection connection)
     public (List<SymbolInfo> Symbols, FtsMatchWarning Warning) SearchFtsTolerantDetailed(
         string query, int maxResults, string? kindFilter = null)
     {
+        if (kindFilter == null)
+            return SearchTolerant(query, maxResults, null);
+        if (Enum.TryParse<SymbolKind>(kindFilter, true, out var kind))
+            return SearchTolerant(query, maxResults, [kind]);
+        // A kind that names nothing matches nothing; it never widens the search.
         try
         {
             return (RunFts(query, maxResults, kindFilter), FtsMatchWarning.None);
         }
         catch (SqliteException e) when (IsQuerySyntaxError(e))
         {
+            return ([], FtsMatchWarning.None);
+        }
+    }
+
+    /// <summary><see cref="SearchFtsTolerantDetailed(string,int,string)"/> narrowed to any of <paramref name="kinds"/>
+    /// in every rung, so rows of other kinds never fill the cap (null or empty = every kind).</summary>
+    public (List<SymbolInfo> Symbols, FtsMatchWarning Warning) SearchFtsTolerantDetailed(
+        string query, int maxResults, IReadOnlyCollection<SymbolKind>? kinds) =>
+        SearchTolerant(query, maxResults, kinds is { Count: > 0 } ? kinds : null);
+
+    private (List<SymbolInfo> Symbols, FtsMatchWarning Warning) SearchTolerant(
+        string query, int maxResults, IReadOnlyCollection<SymbolKind>? kinds)
+    {
+        try
+        {
+            var fts = RunFts(query, maxResults, kinds);
+            return (IsPlainIdentifier(query) ? PromoteNameMatches(query.Trim(), fts, maxResults, kinds) : fts, FtsMatchWarning.None);
+        }
+        catch (SqliteException e) when (IsQuerySyntaxError(e))
+        {
             if (FtsQueryText.NameFirst(query) is { } nameFirst)
             {
-                var (named, nameWarning) = SearchQualifiedByName(nameFirst, maxResults, kindFilter);
+                var (named, nameWarning) = SearchQualifiedByName(nameFirst, maxResults, kinds);
                 if (named.Count > 0)
                     return (named, nameWarning);
             }
 
             foreach (var safe in FtsQueryText.SafeQueries(query))
             {
-                var found = RunFts(safe, maxResults, kindFilter);
+                var found = RunFts(safe, maxResults, kinds);
                 if (found.Count > 0)
                     return (found, FtsQueryText.NameFirst(query) is not null ? FtsMatchWarning.Documentation : FtsMatchWarning.None);
             }
             return ([], FtsMatchWarning.None);
         }
+    }
+
+    // A query that is one identifier (no FTS5 operator, quote, wildcard or qualifier dot).
+    private static bool IsPlainIdentifier(string query)
+    {
+        var q = query.Trim();
+        if (q.Length == 0 || char.IsDigit(q[0]))
+            return false;
+        foreach (var c in q)
+            if (!(char.IsAsciiLetterOrDigit(c) || c == '_'))
+                return false;
+        return !q.Equals("AND", StringComparison.OrdinalIgnoreCase) && !q.Equals("OR", StringComparison.OrdinalIgnoreCase)
+            && !q.Equals("NOT", StringComparison.OrdinalIgnoreCase) && !q.Equals("NEAR", StringComparison.OrdinalIgnoreCase);
+    }
+
+    // Issue #367: bm25 does not prefer a symbol named like the query, so the symbols whose display_name equals it
+    // (ignoring case) come first, then those it prefixes (shortest names first, so the cap keeps the nearest), then the
+    // other full-text hits in rank order. Both name rungs are seeks of ix_symbols_project_name_nocase bounded by
+    // maxResults; the result is deduplicated and capped.
+    private List<SymbolInfo> PromoteNameMatches(string name, List<SymbolInfo> fts, int maxResults, IReadOnlyCollection<SymbolKind>? kinds)
+    {
+        var seen = new HashSet<long>();
+        var ranked = new List<SymbolInfo>();
+        void Add(IEnumerable<SymbolInfo> rows)
+        {
+            foreach (var row in rows)
+                if (ranked.Count < maxResults && seen.Add(row.Id))
+                    ranked.Add(row);
+        }
+
+        Add(GetByDisplayName(name, kinds, null, maxResults));
+        Add(GetByDisplayNamePrefix(name, kinds, null, maxResults, shortestFirst: true));
+        Add(fts);
+        return ranked;
     }
 
     private const int NameLookupLimit = 1000;
@@ -327,11 +386,8 @@ public sealed class SymbolStore(SqliteConnection connection)
     // tier 0 the last segment exactly inside the qualifier's own container, 1 every segment joined, 2 the last segment
     // exactly with the qualifiers elsewhere in the path, 3 its prefix with the qualifiers in order. Then the
     // qualifier's own type, then the name alone.
-    private (List<SymbolInfo>, FtsMatchWarning) SearchQualifiedByName(FtsQueryText.NameFirstQuery q, int maxResults, string? kindFilter)
+    private (List<SymbolInfo>, FtsMatchWarning) SearchQualifiedByName(FtsQueryText.NameFirstQuery q, int maxResults, IReadOnlyCollection<SymbolKind>? kinds)
     {
-        IReadOnlyCollection<SymbolKind>? kinds = null;
-        if (kindFilter != null)
-            kinds = Enum.TryParse<SymbolKind>(kindFilter, true, out var k) ? [k] : null;
         IReadOnlyCollection<SymbolKind> typeKinds = kinds is null ? TypeKinds : kinds.Where(TypeKinds.Contains).ToList();
 
         List<SymbolInfo> Rank(IEnumerable<SymbolInfo> hits, string last, IReadOnlyList<string> qualifiers) =>
@@ -536,6 +592,22 @@ public sealed class SymbolStore(SqliteConnection connection)
         return ReadAll(cmd);
     }
 
+    private List<SymbolInfo> RunFts(string query, int maxResults, IReadOnlyCollection<SymbolKind>? kinds)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = $"""
+            {SelectPrefix}
+            JOIN symbols_fts fts ON fts.rowid = s.id
+            WHERE symbols_fts MATCH @query{KindFilter}
+            ORDER BY rank
+            LIMIT @max_results;
+            """;
+        cmd.Parameters.AddWithValue("@query", query);
+        cmd.Parameters.AddWithValue("@max_results", maxResults);
+        BindKinds(cmd, kinds);
+        return ReadAll(cmd);
+    }
+
     // ==== symbol lookup by name / key (the MCP symbol resolver) ========================================
 
     // The SelectBase columns and joins after `FROM symbols s`, for queries that must drive the symbols table through a
@@ -612,11 +684,12 @@ public sealed class SymbolStore(SqliteConnection connection)
     /// <summary>
     /// The symbols whose <c>display_name</c> starts with <paramref name="prefix"/> ignoring ASCII case (the
     /// <see cref="NoCasePrefixRange"/> of the prefix, one index range per project), narrowed like
-    /// <see cref="GetByDisplayName"/>; at most <paramref name="limit"/> rows.
+    /// <see cref="GetByDisplayName"/>; at most <paramref name="limit"/> rows (the first by id, or with
+    /// <paramref name="shortestFirst"/> the shortest names first, so a cap keeps the nearest prefix hits).
     /// </summary>
     public List<SymbolInfo> GetByDisplayNamePrefix(
         string prefix, IReadOnlyCollection<SymbolKind>? kinds = null, IReadOnlyCollection<long>? projectIds = null,
-        int limit = 50)
+        int limit = 50, bool shortestFirst = false)
     {
         ArgumentNullException.ThrowIfNull(prefix);
         var pids = ProjectIdsJson(projectIds);
@@ -624,7 +697,13 @@ public sealed class SymbolStore(SqliteConnection connection)
             return [];
         var range = NoCasePrefixRange.Of(prefix);
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = range.Hi is null ? ByDisplayNameFromSql : ByDisplayNameRangeSql;
+        cmd.CommandText = (range.Hi is null, shortestFirst) switch
+        {
+            (true, false) => ByDisplayNameFromSql,
+            (false, false) => ByDisplayNameRangeSql,
+            (true, true) => ByDisplayNameFromShortestSql,
+            _ => ByDisplayNameRangeShortestSql
+        };
         cmd.Parameters.AddWithValue("@pids", pids);
         cmd.Parameters.AddWithValue("@lo", range.Lo);
         if (range.Hi is not null)
@@ -655,6 +734,17 @@ public sealed class SymbolStore(SqliteConnection connection)
         ORDER BY s.project_id, s.id
         LIMIT @limit;
         """;
+
+    private const string ShortestFirstOrder = "ORDER BY length(s.display_name), s.project_id, s.id";
+
+    private static readonly string ByDisplayNameRangeShortestSql =
+        ByDisplayNameRangeSql.Replace("ORDER BY s.project_id, s.id", ShortestFirstOrder, StringComparison.Ordinal);
+
+    private static readonly string ByDisplayNameFromShortestSql =
+        ByDisplayNameFromSql.Replace("ORDER BY s.project_id, s.id", ShortestFirstOrder, StringComparison.Ordinal);
+
+    internal static string PrefixSqlForPlan(bool shortestFirst) =>
+        shortestFirst ? ByDisplayNameRangeShortestSql : ByDisplayNameRangeSql;
 
     /// <summary>
     /// The symbols of <paramref name="projectId"/> whose <c>symbol_key</c> starts with <paramref name="keyPrefix"/>
