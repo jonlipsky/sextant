@@ -24,6 +24,15 @@ internal static class ScopeResolver
             var file = scope[5..];
             if (paths.Refuses(file))
                 return ScopeFilter.Invalid(PathPresenter.AbsolutePathMessage("scope"));
+            // A path under a populated submodule that holds no rows here is a pointer, not an empty scope (issue #228).
+            // The pins are read only when the file has no rows.
+            if (!new SymbolStore(conn) { Scope = pinnedScope }.GetByStoredRelativePaths(PathPresenter.StoredCandidates(file))
+                    .Any(s => paths.Matches(s.FilePath, file))
+                && SubmodulePaths.Find(conn, pinnedScope, file) is { } hit)
+                return new ScopeFilter
+                {
+                    Error = SubmodulePaths.Message(file, hit), ErrorCode = ResponseBuilder.PathInSubmoduleCode
+                };
             return new ScopeFilter { FilePath = file, Paths = paths };
         }
 
@@ -107,6 +116,9 @@ internal sealed class ScopeFilter
     /// absolute path), or null.</summary>
     public string? Error { get; init; }
 
+    /// <summary>The <c>meta.error.code</c> of <see cref="Error"/>.</summary>
+    public string ErrorCode { get; init; } = ResponseBuilder.InvalidArgumentCode;
+
     /// <summary>How <see cref="FilePath"/> is matched against stored paths.</summary>
     public PathPresenter Paths { get; init; } = PathPresenter.Local;
 
@@ -116,7 +128,7 @@ internal sealed class ScopeFilter
 
     /// <summary>The <c>invalid_argument</c> response for <see cref="Error"/>.</summary>
     public string ErrorResponse(SnapshotProvenance? provenance) =>
-        ResponseBuilder.BuildError(ResponseBuilder.InvalidArgumentCode, Error!, provenance);
+        ResponseBuilder.BuildError(ErrorCode, Error!, provenance);
 
     /// <summary>True when <paramref name="storedPath"/> is the file a <c>file:</c> scope names.</summary>
     public bool MatchesFile(string? storedPath) => FilePath != null && Paths.Matches(storedPath, FilePath);

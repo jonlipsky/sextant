@@ -226,6 +226,17 @@ public sealed class CrossRepositoryUsage
     public bool SubmoduleDirty { get; init; }
 }
 
+/// <summary>A parent project's pin of a submodule provider, with the roots that locate the submodule in the parent.</summary>
+public sealed class SubmodulePin
+{
+    public required string ProviderRepositoryUrl { get; init; }
+    public required string ProviderCommitSha { get; init; }
+    public string? ConsumerDiskPath { get; init; }
+    public string? ConsumerRepoRelativePath { get; init; }
+    public string? ProviderDiskPath { get; init; }
+    public string? ProviderRepoRelativePath { get; init; }
+}
+
 /// <summary>
 /// One authorized reverse-dependency of a shared submodule (provider) repository: a consumer repository /
 /// project that pins the provider at a specific commit. Returned by the Phase-12 reverse-dependency query

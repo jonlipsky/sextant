@@ -267,6 +267,12 @@ public static class ResponseBuilder
     /// <summary>The <c>meta.error.code</c> when an argument is malformed or names nothing the tool accepts.</summary>
     public const string InvalidArgumentCode = "invalid_argument";
 
+    /// <summary>
+    /// A repository-relative path under a populated submodule of the selected snapshot, which has no rows for it: the
+    /// submodule is indexed as its own repository (issue #228).
+    /// </summary>
+    public const string PathInSubmoduleCode = "path_in_submodule";
+
     private const string RepositoryRequiredMessage =
         "This request must select a repository to read. Name the repository and retry.";
 

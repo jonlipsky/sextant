@@ -242,9 +242,7 @@ public static class FindSymbolTool
         SymbolStore symbols, string name, int maxResults, IReadOnlySet<SymbolKind>? kinds)
     {
         // Inference must use the same bounded, scoped FTS evidence as the eventual tool read.
-        var (results, warning) = symbols.SearchFtsTolerantDetailed(
-            name, maxResults, kinds is { Count: 1 } ? kinds.First().ToString() : null);
-        return (kinds is { Count: > 1 } ? results.Where(s => kinds.Contains(s.Kind)).ToList() : results, warning);
+        return symbols.SearchFtsTolerantDetailed(name, maxResults, (IReadOnlyCollection<SymbolKind>?)kinds);
     }
 
     private const string DocumentationMatchWarning =

@@ -211,6 +211,150 @@ public class StoreTests
         Assert.AreEqual(2, hits.Count);
     }
 
+    // Issue #367: bm25 alone ranks a short field whose doc repeats the query above the type named like it.
+    private long AddNamed(long projectId, string name, SymbolKind kind = SymbolKind.Class, string? doc = null) =>
+        _symbolStore.Insert(new SymbolInfo
+        {
+            ProjectId = projectId, SymbolKey = (kind == SymbolKind.Field ? "F:Ns.Host." : "T:Ns.") + name,
+            FullyQualifiedName = "Ns." + name, DisplayName = name, Kind = kind, DocComment = doc,
+            Accessibility = Accessibility.Public, FilePath = "src/A.cs", LineStart = 1, LineEnd = 2, LastIndexedAt = 1000
+        });
+
+    [TestMethod]
+    public void SearchFtsTolerant_UnqualifiedName_ExactThenPrefixThenOtherFtsHits_IgnoringCase()
+    {
+        var projectId = InsertTestProject();
+        var fieldA = AddNamed(projectId, "_processRunner", SymbolKind.Field, "processrunner ProcessRunner processrunner");
+        var fieldB = AddNamed(projectId, "_processRunner2", SymbolKind.Field, "processrunner ProcessRunner processrunner");
+        var prefix = AddNamed(projectId, "ProcessRunnerFactory");
+        var exact = AddNamed(projectId, "ProcessRunner");
+        var lower = AddNamed(projectId, "processrunner", SymbolKind.Method);
+
+        Assert.IsTrue(_symbolStore.SearchFts("ProcessRunner", 10).First().Id is var first && first != exact && first != lower,
+            "precondition: bm25 alone does not rank the exact name first");
+
+        var ids = _symbolStore.SearchFtsTolerant("PROCESSRUNNER", 10).Select(s => s.Id).ToList();
+
+        CollectionAssert.AreEqual(new[] { exact, lower }, ids.Take(2).OrderBy(i => i == exact ? 0 : 1).ToArray());
+        Assert.AreEqual(prefix, ids[2]);
+        CollectionAssert.AreEquivalent(new[] { fieldA, fieldB }, ids.Skip(3).ToArray());
+        Assert.AreEqual(ids.Count, ids.Distinct().Count(), "no duplicates");
+    }
+
+    [TestMethod]
+    public void SearchFtsTolerant_UnqualifiedName_APrefixOfNoFtsToken_IsFound()
+    {
+        var projectId = InsertTestProject();
+        var exact = AddNamed(projectId, "ProcessRunner");
+
+        Assert.AreEqual(exact, _symbolStore.SearchFtsTolerant("processrun", 10).Single().Id);
+    }
+
+    [TestMethod]
+    public void SearchFtsTolerant_UnqualifiedName_TheCapCutsTheRungsInOrder_WithoutGapsOrDuplicates()
+    {
+        var projectId = InsertTestProject();
+        var others = Enumerable.Range(0, 4)
+            .Select(i => AddNamed(projectId, $"_processRunner{i}", SymbolKind.Field, "processrunner ProcessRunner")).ToList();
+        var prefixes = Enumerable.Range(0, 3).Select(i => AddNamed(projectId, $"ProcessRunnerX{i}")).ToList();
+        var exact = AddNamed(projectId, "ProcessRunner");
+
+        var all = _symbolStore.SearchFtsTolerant("ProcessRunner", 100).Select(s => s.Id).ToList();
+        Assert.AreEqual(1 + prefixes.Count + others.Count, all.Count);
+        Assert.AreEqual(all.Count, all.Distinct().Count());
+        Assert.AreEqual(exact, all[0]);
+        CollectionAssert.AreEquivalent(prefixes, all.Skip(1).Take(3).ToList());
+
+        var capped = _symbolStore.SearchFtsTolerant("ProcessRunner", 3).Select(s => s.Id).ToList();
+        CollectionAssert.AreEqual(all.Take(3).ToList(), capped, "a cap is a prefix of the uncapped order");
+    }
+
+    [TestMethod]
+    public void SearchFtsTolerant_UnqualifiedName_KeepsFtsOperatorsAsWritten()
+    {
+        var projectId = InsertTestProject();
+        AddNamed(projectId, "ProcessRunner");
+        AddNamed(projectId, "Process");
+
+        Assert.AreEqual(1, _symbolStore.SearchFtsTolerant("ProcessRunner NOT Process", 10).Count);
+    }
+
+    private List<string> PlanOf(string sql, params (string Name, object Value)[] args)
+    {
+        using var cmd = _db.GetConnection().CreateCommand();
+        cmd.CommandText = "EXPLAIN QUERY PLAN " + sql;
+        foreach (var (name, value) in args)
+            cmd.Parameters.AddWithValue(name, value);
+        var plan = new List<string>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            plan.Add(reader.GetString(3));
+        return plan;
+    }
+
+    [TestMethod]
+    public void SearchFtsTolerant_ThePrefixRungKeepsTheShortestNamesUnderTheCap()
+    {
+        var projectId = InsertTestProject();
+        for (var i = 0; i < 5; i++)
+            AddNamed(projectId, $"ProcessRunnerLongerName{i}");
+        var nearest = AddNamed(projectId, "ProcessRunnerX");
+
+        var ids = _symbolStore.SearchFtsTolerant("ProcessRunner", 2).Select(s => s.Id).ToList();
+
+        Assert.AreEqual(nearest, ids[0], "the shortest prefix hit survives the cap although it has the highest id");
+    }
+
+    [TestMethod]
+    public void PrefixRung_ShortestFirstStaysAnIndexRangeSeek()
+    {
+        var plan = PlanOf(SymbolStore.PrefixSqlForPlan(shortestFirst: true),
+            ("@pids", "[1]"), ("@lo", "Pro"), ("@hi", "Prp"), ("@kinds", DBNull.Value), ("@limit", 5));
+        Console.WriteLine(string.Join(Environment.NewLine, plan));
+        Assert.IsTrue(plan.Any(l => l.Contains("ix_symbols_project_name_nocase") && l.Contains("display_name")
+            && l.Contains("SEARCH", StringComparison.Ordinal)), string.Join(" | ", plan));
+    }
+
+    [TestMethod]
+    public void SubmodulePins_AreServedByTheConsumerProjectIndex()
+    {
+        var plan = PlanOf(SnapshotDependencyStore.SubmodulePinsSql, ("@pids", "[1]"));
+        Console.WriteLine(string.Join(Environment.NewLine, plan));
+        Assert.IsTrue(plan.Any(l => l.Contains("SEARCH d") && l.Contains("ix_snapdep_consumer_project")
+            || l.Contains("SEARCH d") && l.Contains("consumer_project_id")), string.Join(" | ", plan));
+    }
+
+    [TestMethod]
+    public void SearchFtsTolerant_SeveralKinds_AreAppliedInEveryRung()
+    {
+        var projectId = InsertTestProject();
+        var type = AddNamed(projectId, "Widget");
+        for (var i = 0; i < 25; i++)
+            _symbolStore.Insert(new SymbolInfo
+            {
+                ProjectId = projectId, SymbolKey = $"M:Ns.Host.Widget{i}", FullyQualifiedName = $"Ns.Host.Widget",
+                DisplayName = "Widget", Kind = SymbolKind.Method, Accessibility = Accessibility.Public,
+                FilePath = "src/A.cs", LineStart = 1, LineEnd = 2, LastIndexedAt = 1000
+            });
+        var iface = AddNamed(projectId, "IWidget", SymbolKind.Interface);
+
+        var (hits, _) = _symbolStore.SearchFtsTolerantDetailed(
+            "Widget", 5, new[] { SymbolKind.Class, SymbolKind.Interface });
+
+        Assert.AreEqual(type, hits[0].Id);
+        Assert.IsTrue(hits.All(s => s.Kind is SymbolKind.Class or SymbolKind.Interface), "only the asked kinds");
+    }
+
+    [TestMethod]
+    public void SearchFtsTolerant_AnUnparseableKind_IsNotWidened()
+    {
+        var projectId = InsertTestProject();
+        AddNamed(projectId, "Widget");
+
+        Assert.AreEqual(0, _symbolStore.SearchFtsTolerant("Widget", 10, "NotAKind").Count);
+        Assert.AreEqual(0, _symbolStore.SearchFtsTolerant("Wid", 10, "NotAKind").Count);
+    }
+
     [TestMethod]
     public void SearchFtsTolerant_QualifiedName_FindsTypeMembersPastTheGlobalPrefixLimit()
     {
