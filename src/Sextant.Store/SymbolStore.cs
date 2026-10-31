@@ -605,7 +605,7 @@ public sealed class SymbolStore(SqliteConnection connection)
     private List<SymbolInfo> RunFts(string query, int maxResults, IReadOnlyCollection<SymbolKind>? kinds)
     {
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = SelectPrefix + FtsKindsSuffix;
+        cmd.CommandText = SelectPrefix + FtsKindsSuffix; // NOSONAR S2077: constants only; query, kinds and limit are bound parameters.
         cmd.Parameters.AddWithValue("@query", query);
         cmd.Parameters.AddWithValue("@max_results", maxResults);
         BindKinds(cmd, kinds);
