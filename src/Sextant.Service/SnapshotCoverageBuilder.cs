@@ -218,20 +218,21 @@ public static class SnapshotCoverageBuilder
         }
 
         if (packBindings.Count > 0)
-        {
             reasons.Add(
                 $"{packBindings.Count} Apple-platform project version(s) were compiled against the platform " +
                 $"reference pack without the workload ({NameSample(packBindings.Select(b => VersionName(ReasonPath(checkoutDir, b.ProjectPath), b.TargetFramework)).ToList())}); " +
                 "their package references may still be missing; see the `platform_reference_pack` diagnostics.");
-            AddCapped(diagnostics, packBindings, b => new ProjectOutcome
+        // Provenance for every pack-bound version; an excluded one is informational.
+        var keptBindings = packBindings.ToHashSet();
+        foreach (var (group, severity) in new[] { (packBindings, JobDiagnosticSeverity.Warning), (load.PlatformPackBindings.Where(b => !keptBindings.Contains(b)).ToList(), JobDiagnosticSeverity.Info) })
+            AddCapped(diagnostics, group, b => new ProjectOutcome
             {
-                Severity = JobDiagnosticSeverity.Warning,
+                Severity = severity,
                 Code = "platform_reference_pack",
                 ProjectPath = ReasonPath(checkoutDir, b.ProjectPath),
                 Message = $"{VersionName(ReasonPath(checkoutDir, b.ProjectPath), b.TargetFramework)} was compiled against the " +
                     $"{b.PackId} {b.PackVersion} reference pack without the platform workload; package references may still be missing."
-            }, "platform_reference_pack", "project versions compiled against a platform reference pack");
-        }
+            }, "platform_reference_pack", "project versions compiled against a platform reference pack", severity);
 
         if (load.UnattributedFailureCount > 0)
         {

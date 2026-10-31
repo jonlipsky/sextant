@@ -290,7 +290,7 @@ public class ProviderCoverageBuilderTests
         // Apple platforms cannot be built on a Linux worker: the bindings are exclusions, not a partial reason (#351).
         Assert.IsFalse(root.Coverage.Reasons.Any(r => r.Contains("platform reference pack", StringComparison.Ordinal)));
         Assert.AreEqual(2, root.Coverage.ProjectVersionsExcluded);
-        Assert.IsFalse(root.Diagnostics.Any(d => d.Code == "platform_reference_pack"));
+        Assert.IsTrue(root.Diagnostics.Where(d => d.Code == "platform_reference_pack").All(d => d.Severity == Sextant.Store.JobDiagnosticSeverity.Info));
 
         Assert.AreEqual(SnapshotCoverageVerdict.Complete, provider.Verdict, string.Join(" | ", provider.Reasons));
         var exclusion = provider.Exclusions!.Single();

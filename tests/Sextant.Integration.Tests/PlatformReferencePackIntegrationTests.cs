@@ -65,7 +65,7 @@ public sealed class PlatformReferencePackIntegrationTests : IDisposable
     }
 
     [TestMethod]
-    public async Task Worker_RecordsADistinctCoverageReasonForAnIosProjectBoundToTheReferencePack()
+    public async Task Worker_RecordsAnExcludedIosProjectBoundToTheReferencePackAsProvenance()
     {
         if (OperatingSystem.IsMacOS() || OperatingSystem.IsWindows())
             Assert.Inconclusive("the iOS workload may be installable on this host; the missing-workload path is Linux-specific.");
@@ -93,9 +93,13 @@ public sealed class PlatformReferencePackIntegrationTests : IDisposable
             Assert.Inconclusive("nuget.org is unreachable: " + diagnostics);
         Assert.IsTrue(result.Projects.Any(p => p.Code == "platform_reference_pack"), diagnostics);
         var coverage = new SnapshotCoverageStore(db.GetConnection()).Get(result.SnapshotId.Value)!;
-        Assert.AreEqual(SnapshotCoverageVerdict.Partial, coverage.Verdict);
-        Assert.IsTrue(coverage.Reasons.Any(r => r.Contains("reference pack without the workload", StringComparison.Ordinal)),
+        Assert.AreEqual(JobDiagnosticSeverity.Info, result.Projects.First(p => p.Code == "platform_reference_pack").Severity);
+        Assert.IsTrue(result.Projects.Any(p => p.Code == "project_excluded"), diagnostics);
+        Assert.IsTrue(coverage.Exclusions!.Any(e => e.Detail.EndsWith("platform_pack_binding", StringComparison.Ordinal)),
+            string.Join("; ", coverage.Exclusions!.Select(e => e.Detail)));
+        Assert.IsFalse(coverage.Reasons.Any(r => r.Contains("reference pack without the workload", StringComparison.Ordinal)),
             string.Join(" ", coverage.Reasons));
+        Assert.AreEqual(SnapshotCoverageVerdict.Complete, coverage.Verdict, string.Join(" | ", coverage.Reasons));
         Assert.IsTrue(coverage.Binding is null || coverage.Binding.Projects.All(p => p.UnboundNames == 0),
             "the platform types bind: " + string.Join("; ", coverage.Binding?.Projects.Select(p => $"{p.Project}: {p.UnboundNames}") ?? []));
     }

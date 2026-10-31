@@ -95,7 +95,8 @@ public class ProjectExclusionCoverageTests
             result.Coverage.Exclusions!.Select(e => e.Detail).OrderBy(d => d, StringComparer.Ordinal).ToArray());
         StringAssert.Contains(result.Coverage.Notes!.Single(), "4 project version(s) were excluded");
         Assert.AreEqual(4, result.Diagnostics.Count(d => d.Code == "project_excluded"));
-        Assert.IsFalse(result.Diagnostics.Any(d => d.Code is "project_evaluation_degraded" or "platform_reference_pack"));
+        Assert.IsFalse(result.Diagnostics.Any(d => d.Code == "project_evaluation_degraded"));
+        Assert.AreEqual(JobDiagnosticSeverity.Info, result.Diagnostics.Single(d => d.Code == "platform_reference_pack").Severity);
     }
 
     [TestMethod]
