@@ -132,6 +132,7 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_PACKAGE_RESTORE_TIMEOUT_SECONDS` | Bound on one job's whole project-union restore step, clamped to 3600. Under the sandbox the step also stops at a fifth of the sandbox time budget, whichever is shorter. On expiry the restore process tree is killed and the load goes ahead with whatever was restored | `300` |
 | `SEXTANT_SERVICE_PACKAGE_CACHE_MAX_MB` | Bound, in MiB, on all per-repository NuGet package folders together (see [Package and git caches between jobs](#package-and-git-caches-between-jobs-issue-272)). Over it, whole folders are evicted least recently used first. `0` disables the cache: each job restores into a cold folder in its scratch again. Anything but a non-negative whole number **fails startup** | `10240` |
 | `SEXTANT_SERVICE_GIT_OBJECT_STORE` | In `clone` mode, fetch each new commit through a per-repository bare object store on the cache volume, so only objects the store lacks cross the network (see [Package and git caches between jobs](#package-and-git-caches-between-jobs-issue-272)). `false` fetches every commit from the remote afresh. An unparseable value **fails startup** | `true` |
+| `SEXTANT_SERVICE_BUILD_GENERATOR_PROJECTS` | Build a source generator that a project references as a PROJECT (`OutputItemType="Analyzer"`) from the loaded workspace and run it in the service process, so the code it generates binds (issue #352; see [Operator-visible limits](#operator-visible-limits) and the trust note in `docs/runbooks.md`). `false` builds nothing and leaves such a generator unresolved. An unparseable value **fails startup** | `true` |
 | `SEXTANT_SERVICE_PACKAGE_SOURCE_CREDENTIALS` | **Secret.** Credentials for private package source hosts, `host[:port]=username:password` entries separated by `;` (the password may contain `:` but not `;`). The restore hands each one to NuGet only for an `https` request to exactly that host and port (443 when no port is given), through the service's own credential provider plugin; a repository's `nuget.config` cannot redirect it (see [Private package feeds](#private-package-feeds-issue-231)). Not part of the snapshot identity. A malformed value **fails startup** | unset |
 
 Boolean toggles accept `1/0`, `true/false`, `yes/no`, `on/off` (case-insensitive); any other non-empty
@@ -2897,6 +2898,18 @@ in-process sandbox that is defense in depth only (#76, see [Untrusted evaluation
 sandbox](#untrusted-evaluation-sandbox-phase-17-criterion-2)). The owner list keeps grants and ensures to
 the organisations you trust; it does not stop a fork commit under an allowed base repository (#209), which
 only #76 or a commit-reachability check closes.
+
+### Operator-visible limits
+
+Limits the service enforces silently per job or per process, with where each is reported.
+
+- **Source-generator builds: 64 per process (issue #352).** At most 64 distinct generator builds (project-referenced
+  generators compiled from the workspace, keyed by a hash of their emitted assemblies and dependency bytes) are loaded
+  by one service process, because an assembly load context is never unloaded. Only successful loads count; a failed
+  build or load does not, and a transient failure is retried by a later job. Past the cap the generator stays
+  unresolved, the snapshot reports a diagnostic, and the service logs a `WARNING:` line naming it. **The count resets
+  on restart**, and the first use after a restart also removes unused directories and `*.tmp` leftovers under
+  `<cache>/generator-projects/`. Turn the feature off with `SEXTANT_SERVICE_BUILD_GENERATOR_PROJECTS=false`.
 
 ### Known residuals
 

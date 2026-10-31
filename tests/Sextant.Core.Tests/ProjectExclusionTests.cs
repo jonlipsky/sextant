@@ -139,10 +139,43 @@ public class ProjectExclusionTests
                 "libs/mix/Mix.csproj", null, inSubmodule, null, false, [Path.Combine(dir, "libs", "other")], dir, Linux));
 
             var outside = Path.Combine(Path.GetTempPath(), "sextant_outside_" + Guid.NewGuid().ToString("N"), "X.csproj");
-            Assert.IsNull(ProjectExclusionClassifier.Classify("<outside checkout>/X.csproj", null, outside, null, checkoutRoot: dir, worker: Linux),
-                "a sibling repository's absence is a real gap");
+            Assert.AreEqual(ProjectExclusionReason.ProjectFileMissing,
+                ProjectExclusionClassifier.Classify("X.csproj", null, outside, null, checkoutRoot: dir, worker: Linux)!.Reason,
+                "a declared project outside the checkout that does not exist is a stale entry");
+
+            var sibling = Path.Combine(Path.GetTempPath(), "sextant_sibling_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sibling);
+            try
+            {
+                var existing = Path.Combine(sibling, "Y.csproj");
+                File.WriteAllText(existing, "<Project ToolsVersion=\"15.0\"><Import Project=\"x/Xamarin.iOS.targets\" /></Project>");
+                Assert.IsNull(ProjectExclusionClassifier.Classify("Y.csproj", null, existing,
+                    "Project does not contain 'Compile' target.", checkoutRoot: dir, worker: Linux),
+                    "an existing sibling repository's project is never classified");
+            }
+            finally { Directory.Delete(sibling, true); }
         }
         finally { Directory.Delete(dir, true); }
+    }
+
+    [TestMethod]
+    public void Classify_XamarinTargetFramework_NeedsTheDesktopMsbuildFailure()
+    {
+        const string failure = "The project 'RecordStack.Xamarin.iOS' targets Xamarin.iOS: you need to use desktop msbuild to build it.";
+        foreach (var tfm in new[] { "xamarin.ios", "Xamarin.Mac", "xamarinios10", "xamarin.tvos" })
+        {
+            Assert.AreEqual("xamarin", ProjectExclusionClassifier.PlatformOf(tfm), tfm);
+            var exclusion = ProjectExclusionClassifier.Classify("App.csproj", tfm, "/nowhere/App.csproj", failure, worker: Linux);
+            Assert.AreEqual(ProjectExclusionReason.PlatformUnavailable, exclusion!.Reason, tfm);
+            Assert.AreEqual($"xamarin; {PlatformEvidence.DesktopMsbuildRequired}", exclusion.Detail, tfm);
+            Assert.AreEqual("xamarin", ProjectExclusionClassifier.UnavailablePlatform(tfm, new WorkerPlatform(true, true)));
+        }
+
+        Assert.IsNull(ProjectExclusionClassifier.EvidenceFor("xamarin", "error CS0246: type not found"),
+            "the framework alone is never evidence");
+        Assert.IsNull(ProjectExclusionClassifier.EvidenceFor("xamarin", null));
+        Assert.IsNull(ProjectExclusionClassifier.EvidenceFor("ios", failure), "the message is Xamarin evidence only");
+        Assert.IsNull(ProjectExclusionClassifier.PlatformOf("net10.0"));
     }
 
     [TestMethod]

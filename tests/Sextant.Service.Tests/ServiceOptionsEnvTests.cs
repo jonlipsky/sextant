@@ -131,6 +131,25 @@ public class ServiceOptionsEnvTests
     }
 
     [TestMethod]
+    public void BuildGeneratorProjects_IsOnByDefault_AndFailsClosedOnATypo()
+    {
+        const string name = "SEXTANT_SERVICE_BUILD_GENERATOR_PROJECTS";
+        try
+        {
+            Environment.SetEnvironmentVariable(name, null);
+            Assert.IsTrue(ServiceOptions.FromEnvironment(Config()).BuildGeneratorProjects);
+            Environment.SetEnvironmentVariable(name, "false");
+            Assert.IsFalse(ServiceOptions.FromEnvironment(Config()).BuildGeneratorProjects);
+            Environment.SetEnvironmentVariable(name, "nope");
+            Assert.ThrowsExactly<InvalidOperationException>(() => ServiceOptions.FromEnvironment(Config()));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(name, null);
+        }
+    }
+
+    [TestMethod]
     public void MalformedSecurityToggle_FailsClosed_Throws()
     {
         Environment.SetEnvironmentVariable(SandboxEnabled, "tru");

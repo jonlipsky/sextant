@@ -107,7 +107,8 @@ public static class ServiceHostRunner
         // (SnapshotService.SourceTexts, the same root) reads each snapshot's own source text back.
         // Issue #272: each repository restores into its own package folder on the cache volume, kept between its
         // jobs and bounded as a whole by PACKAGE_CACHE_MAX_MB (never one shared folder: see PackageCache).
-        var packageCache = new PackageCache(paths, options.PackageCacheMaxBytes, Console.Error.WriteLine);
+        var packageCache = new PackageCache(paths, options.PackageCacheMaxBytes, Console.Error.WriteLine,
+            buildGeneratorProjects: options.BuildGeneratorProjects);
         var localWorker = new LocalIndexerSnapshotWorker(
             database, config, checkoutProvider, Console.Error.WriteLine, nodeCapability, sandbox, sdkPinGuard,
             packageRestore, new SourceTextStore(paths.SourceTextRoot, Console.Error.WriteLine),

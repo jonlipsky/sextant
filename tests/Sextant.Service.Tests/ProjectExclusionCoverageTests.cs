@@ -184,7 +184,7 @@ public class ProjectExclusionCoverageTests
     }
 
     [TestMethod]
-    public void AMissingFile_DifferingOnlyByCase_OrOutsideTheCheckout_IsAGap()
+    public void AMissingFile_DifferingOnlyByCase_IsAGap_AndOneOutsideTheCheckout_IsProjectFileMissing()
     {
         if (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS())
             Assert.Inconclusive("case-insensitive file system");
@@ -201,8 +201,8 @@ public class ProjectExclusionCoverageTests
         var result = Build(load);
 
         Assert.AreEqual(SnapshotCoverageVerdict.Partial, result.Coverage.Verdict);
-        Assert.AreEqual(2, result.Coverage.ProjectsSkipped);
-        Assert.IsNull(result.Coverage.Exclusions);
+        Assert.AreEqual(1, result.Coverage.ProjectsSkipped);
+        Assert.AreEqual(ProjectExclusionReason.ProjectFileMissing, result.Coverage.Exclusions!.Single().Reason);
     }
 
     [TestMethod]

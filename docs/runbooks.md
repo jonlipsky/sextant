@@ -340,6 +340,13 @@ time/memory/secret/filesystem limits around MSBuild evaluation of untrusted chec
   *defense-in-depth-now, durable-hardening-deferred* item — do not treat the lease as a hard cross-process
   mutual-exclusion guarantee.
 
+- **Generators built from repository source (issue #352).** MSBuild evaluation runs in the sandbox with a scrubbed
+  environment, but a source generator that a project references as a project is compiled from repository source and
+  runs **inside the service process**, as generators shipped in NuGet packages already do. This widens that existing
+  exposure to code in the repository itself and is contained only by #76. Set
+  `SEXTANT_SERVICE_BUILD_GENERATOR_PROJECTS=false` to build nothing (such a generator stays unresolved, as before).
+  `/control/pilot` already blocks untrusted workloads on #76.
+
 Both #76 and #80 are "defense-in-depth now, durable hardening deferred." Neither is a correctness
 regression; both are explicitly carried here so operators size the risk before hosting untrusted code.
 

@@ -57,6 +57,13 @@ public class PackageCacheTests
     }
 
     [TestMethod]
+    public void GeneratorProjectsDirectory_IsNullWhenBuildingGeneratorsIsOff()
+    {
+        Assert.AreEqual(_paths.GeneratorProjectsRoot, new PackageCache(_paths, 0).GeneratorProjectsDirectory);
+        Assert.IsNull(new PackageCache(_paths, 0, buildGeneratorProjects: false).GeneratorProjectsDirectory);
+    }
+
+    [TestMethod]
     public void Disabled_AcquiresNothing_SoTheJobRestoresIntoScratch()
     {
         var cache = new PackageCache(_paths, 0);

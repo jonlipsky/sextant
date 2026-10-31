@@ -38,15 +38,18 @@ public sealed class PackageCache
     private readonly ServicePaths _paths;
     private readonly Action<string>? _log;
     private readonly TimeProvider _clock;
+    private readonly bool _buildGeneratorProjects;
 
     /// <param name="paths">The service volumes; the folders live under <see cref="ServicePaths.PackageCacheRoot"/>.</param>
     /// <param name="maxBytes">The bound on all folders together; zero or less disables the cache (each job then
     /// restores into its own scratch, as before #272).</param>
     /// <param name="log">Optional log sink.</param>
     /// <param name="clock">The clock last-use times are read from; tests drive it by hand.</param>
-    public PackageCache(ServicePaths paths, long maxBytes, Action<string>? log = null, TimeProvider? clock = null)
+    public PackageCache(ServicePaths paths, long maxBytes, Action<string>? log = null, TimeProvider? clock = null,
+        bool buildGeneratorProjects = true)
     {
         _paths = paths;
+        _buildGeneratorProjects = buildGeneratorProjects;
         MaxBytes = maxBytes > 0 ? maxBytes : 0;
         _log = log;
         _clock = clock ?? TimeProvider.System;
@@ -56,6 +59,10 @@ public sealed class PackageCache
             SweepInterruptedEvictions();
         }
     }
+
+    /// <summary>The stable directory the job's built source-generator projects live in (issue #352); it outlives the job's scratch.
+    /// Null when <c>SEXTANT_SERVICE_BUILD_GENERATOR_PROJECTS</c> is false: nothing is then built.</summary>
+    public string? GeneratorProjectsDirectory => _buildGeneratorProjects ? _paths.GeneratorProjectsRoot : null;
 
     /// <summary>True when jobs restore into per-repository folders that outlive them.</summary>
     public bool Enabled => MaxBytes > 0;

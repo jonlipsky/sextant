@@ -514,6 +514,13 @@ public sealed record ServiceOptions
     public bool GitObjectStore { get; init; } = true;
 
     /// <summary>
+    /// Build a source generator that a project references as a PROJECT, from the workspace, and run it in the service process
+    /// (<c>SEXTANT_SERVICE_BUILD_GENERATOR_PROJECTS</c>, default true; issue #352). That code is repository source, so false
+    /// builds nothing and leaves such a generator unresolved.
+    /// </summary>
+    public bool BuildGeneratorProjects { get; init; } = true;
+
+    /// <summary>
     /// The <see cref="SnapshotIdentity.RestorePolicy"/> component folded into every ensure request's identity:
     /// null for the default restore-on policy and <c>off</c> when <see cref="PackageRestore"/> is disabled, so
     /// flipping the toggle rebuilds a commit instead of reusing a snapshot produced under the other policy.
@@ -626,6 +633,7 @@ public sealed record ServiceOptions
             PackageSourceCredentials = ParsePackageSourceCredentials(Env("PACKAGE_SOURCE_CREDENTIALS")),
             PackageCacheMaxBytes = ParsePackageCacheMaxBytes(Env("PACKAGE_CACHE_MAX_MB")),
             GitObjectStore = EnvBool("GIT_OBJECT_STORE") ?? true,
+            BuildGeneratorProjects = EnvBool("BUILD_GENERATOR_PROJECTS") ?? true,
             GrantWriteBusyTimeout = ParsePositiveSeconds(
                 "GRANT_WRITE_BUSY_TIMEOUT_SECONDS", Env("GRANT_WRITE_BUSY_TIMEOUT_SECONDS"), DefaultGrantWriteBusyTimeoutSeconds),
             WriteLockWarnThreshold = ParsePositiveSeconds(

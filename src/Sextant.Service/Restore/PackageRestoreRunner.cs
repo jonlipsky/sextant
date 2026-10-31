@@ -280,10 +280,14 @@ public sealed class PackageRestoreRunner(
             RestoreStateStore.SaveStaticGraphFailures(reuse, before.Fingerprint, memo.Added, log);
         // A partial replay's own output is not "stale" (the checkout held none before it) and is what the state holds, so
         // saving after one stores the replayed projects plus whatever this job restored cleanly.
+        // A repaired project (reduced targets, unlocked lock file) is never saved as clean: replaying it later would
+        // skip the repair and hide that it was repaired.
         var failed = new HashSet<string>(
-            outcome.Projects.Select(p => Path.GetFullPath(Path.Combine(checkoutDir, p.Project))), CheckoutInventory.PathComparer);
+            outcome.Projects.Select(p => p.Project).Concat(outcome.RepairedProjects)
+                .Select(p => Path.GetFullPath(Path.Combine(checkoutDir, p))), CheckoutInventory.PathComparer);
         var saved = RestoreStateStore.Save(
-            reuse, checkoutDir, before, solutions, log, out var skipReason, partial: !outcome.Clean, failed: failed);
+            reuse, checkoutDir, before, solutions, log, out var skipReason,
+            partial: !outcome.Clean || outcome.RepairedProjects.Count > 0, failed: failed);
         return miss with
         {
             Saved = saved is not null, Projects = saved?.Saved ?? 0, ProjectsRemaining = saved?.Remaining ?? 0, SaveSkipped = skipReason,
@@ -406,6 +410,7 @@ public sealed class PackageRestoreRunner(
         var timedOut = false;
         var startedUtc = DateTime.UtcNow;
         var passes = new List<RestorePassTiming>();
+        var repairs = new List<RepairOutcome>();
 
         var declaredBySolution = solutions.ToDictionary(
             solution => solution,
@@ -603,6 +608,7 @@ public sealed class PackageRestoreRunner(
                 }
             }
             var retrySucceeded = false;
+            var ranRetry = false;
             var outcomeParser = attempt;
             if (result == RunResult.Failed && AnyProjectWithoutAssets(solution))
             {
@@ -615,16 +621,39 @@ public sealed class PackageRestoreRunner(
                 var retry = await RetryPerProjectAsync(
                         solution, globals, deadline - stopwatch.Elapsed, retryParser, cancellationToken, scratchDir, environment)
                     .ConfigureAwait(false);
+                RepairOutcome? repair = null;
+                if (retry is { Result: RunResult.Failed })
+                {
+                    repair = await RepairAsync(
+                            checkoutDir, retryParser, globals, deadline - stopwatch.Elapsed, cancellationToken, scratchDir, environment)
+                        .ConfigureAwait(false);
+                    repairs.Add(repair);
+                }
                 parser.MergeFrom(retryParser);
                 if (retry is { Result: not RunResult.NotStarted } done)
                 {
                     passes.Add(Pass("retry", Path.GetFileName(solution), declared, false, retryStarted, retryWatch.ElapsedMilliseconds, done.Result));
                     retried++;
+                    ranRetry = true;
                     retriedProjects += done.Projects;
                     outcomeParser = retryParser;
                     result = done.Result;
+                    if (result == RunResult.Failed && repair?.Any == true && retryParser.Projects().Count == 0
+                        && retryParser.GeneralCodes().Count == 0 && retryParser.ProjectsDropped == 0)
+                        result = RunResult.Succeeded;
                     retrySucceeded = result == RunResult.Succeeded;
                 }
+            }
+            if (!ranRetry && result == RunResult.Failed)
+            {
+                // The failure left every project its assets file, so there was no per-project retry: the projects the
+                // attempt named may still be repaired one by one.
+                var repair = await RepairAsync(
+                        checkoutDir, attempt, globals, deadline - stopwatch.Elapsed, cancellationToken, scratchDir, environment)
+                    .ConfigureAwait(false);
+                repairs.Add(repair);
+                if (repair.Any && attempt.Projects().Count == 0 && attempt.GeneralCodes().Count == 0 && attempt.ProjectsDropped == 0)
+                    result = RunResult.Succeeded;
             }
             if (!retrySucceeded)
                 parser.MergeFrom(attempt);
@@ -632,7 +661,10 @@ public sealed class PackageRestoreRunner(
             {
                 case RunResult.Succeeded:
                     succeeded++;
-                    foreach (var project in declared)
+                    // A repaired project was restored with reduced targets or an unlocked lock file, not as this solution
+                    // would restore it, so another solution of the directory must restore it itself.
+                    var repairedHere = RepairedFullPaths(checkoutDir, repairs);
+                    foreach (var project in declared.Where(p => !repairedHere.Contains(p)))
                     {
                         if (!restoredBy.TryGetValue(project, out var dirs))
                             restoredBy[project] = dirs = new HashSet<string>(CheckoutInventory.PathComparer);
@@ -669,6 +701,10 @@ public sealed class PackageRestoreRunner(
             SolutionsFailedAttributed = failedAttributed,
             SolutionsRetriedPerProject = retried,
             ProjectsRetried = retriedProjects,
+            LockFileRetriedProjects = [.. repairs.SelectMany(r => r.LockFile)],
+            PlatformRetriedProjects = [.. repairs.SelectMany(r => r.Platform)],
+            RepairedProjects = [.. repairs.SelectMany(r => r.Projects)],
+            RepairNotAttempted = repairs.Sum(r => r.NotAttempted),
             StaticGraphPasses = staticPasses,
             StaticGraphFallbacks = staticFallbacks,
             StaticGraphSkippedByMemo = staticMemoSkips,
@@ -838,9 +874,22 @@ public sealed class PackageRestoreRunner(
         if (traversal is not { } result)
             return null;
 
+        RepairOutcome? repair = null;
+        if (result == RunResult.Failed)
+        {
+            repair = await RepairAsync(checkoutDir, parser, globals, deadline - stopwatch.Elapsed, cancellationToken, scratchDir, environment)
+                .ConfigureAwait(false);
+            if (repair.Any && parser.Projects().Count == 0 && parser.GeneralCodes().Count == 0 && parser.ProjectsDropped == 0)
+                result = RunResult.Succeeded;
+        }
+
         var timedOut = result == RunResult.TimedOut;
         var outcome = new PackageRestoreOutcome
         {
+            LockFileRetriedProjects = repair?.LockFile ?? [],
+            PlatformRetriedProjects = repair?.Platform ?? [],
+            RepairedProjects = repair?.Projects ?? [],
+            RepairNotAttempted = repair?.NotAttempted ?? 0,
             SolutionsAttempted = 1,
             SolutionsSelected = solutionCount,
             SolutionsSucceeded = result == RunResult.Succeeded ? 1 : 0,
@@ -1378,7 +1427,8 @@ public sealed class PackageRestoreRunner(
                 $"SolutionPath={project.SolutionPath}",
                 $"SolutionFileName={Path.GetFileName(project.SolutionPath)}",
                 $"SolutionExt={Path.GetExtension(project.SolutionPath)}",
-                .. globals.Select(p => $"{p.Key}={p.Value}")
+                .. globals.Select(p => $"{p.Key}={p.Value}"),
+                .. project.Extra ?? []
             ];
             xml.AppendLine(
                 $"    <MSBuild Projects=\"{Xml(project.ProjectPath)}\" Targets=\"Restore\" BuildInParallel=\"false\" " +
@@ -1393,9 +1443,212 @@ public sealed class PackageRestoreRunner(
         return xml.ToString();
     }
 
+    private static HashSet<string> RepairedFullPaths(string checkoutDir, IEnumerable<RepairOutcome> repairs)
+        => repairs.SelectMany(r => r.Projects)
+            .Select(p => Path.GetFullPath(Path.Combine(checkoutDir, p.Replace('/', Path.DirectorySeparatorChar))))
+            .ToHashSet(CheckoutInventory.PathComparer);
+
     private static string Xml(string value) => SecurityElement.Escape(value) ?? string.Empty;
 
-    private sealed record UnionProject(string ProjectPath, string SolutionPath);
+    // LockFile/Platform are the report lines; Projects the checkout-relative paths (parser keys) of every repaired
+    // project, which were restored with reduced targets or an unlocked lock file and so are not clean; NotAttempted the
+    // candidates the restore time limit left unrepaired.
+    internal sealed record RepairOutcome(
+        IReadOnlyList<string> LockFile, IReadOnlyList<string> Platform, IReadOnlyList<string> Projects, int NotAttempted = 0)
+    {
+        public bool Any => LockFile.Count > 0 || Platform.Count > 0;
+    }
+
+    // Codes a platform-only failure of a multi-target project reports: the SDK's missing-workload errors.
+    private static readonly HashSet<string> PlatformFailureCodes = new(StringComparer.Ordinal)
+        { "NETSDK1178", "NETSDK1147", "NETSDK1139", "NETSDK1084", "NU1012" };
+
+    // Two narrow second attempts for projects whose restore failed for a reason the checkout's own settings cause, not
+    // the package graph (issue #352). Each restores the project alone, without touching the checkout:
+    //  - NU1004 (a committed packages.lock.json is stale under RestoreLockedMode): restore unlocked, writing the lock
+    //    file to scratch, so the tracked file is never rewritten;
+    //  - every error is a missing platform workload of a multi-target project: restore only the targets this worker can
+    //    build (TargetFrameworks), so the buildable target gets its assets while the platform ones stay unrestored.
+    // A project whose retry restores leaves the parser's findings; anything else keeps what it had. Each probe and the
+    // retry are bounded by what is left of <paramref name="deadline"/>; candidates the limit leaves unrepaired are counted.
+    internal async Task<RepairOutcome> RepairAsync(
+        string checkoutDir, RestoreOutputParser parser, IReadOnlyList<KeyValuePair<string, string>> globals, TimeSpan deadline,
+        CancellationToken cancellationToken, string? scratchDir, IReadOnlyDictionary<string, string> environment)
+    {
+        var none = new RepairOutcome([], [], []);
+        var issues = parser.Projects();
+        if (issues.Count == 0 || parser.SourceUnreachableGeneral)
+            return none;
+
+        var watch = Stopwatch.StartNew();
+        var notAttempted = 0;
+        var lockDirectory = Path.Combine(Path.GetFullPath(scratchDir ?? Path.GetTempPath()), $"restore-lock-{Guid.NewGuid():N}");
+        var projects = new List<UnionProject>();
+        var kinds = new Dictionary<string, (string Name, bool LockFile, string? Frameworks)>(CheckoutInventory.PathComparer);
+        try
+        {
+            foreach (var issue in issues)
+            {
+                if (issue.SourceUnreachable || issue.TransientMessage)
+                    continue;
+                var isLock = issue.Codes.Contains("NU1004", StringComparer.Ordinal);
+                var isPlatform = !isLock && issue.Codes.Count > 0 && issue.Codes.All(PlatformFailureCodes.Contains);
+                if (!isLock && !isPlatform)
+                    continue;
+                var path = Path.GetFullPath(Path.Combine(checkoutDir, issue.Project.Replace('/', Path.DirectorySeparatorChar)));
+                if (!File.Exists(path) || !SafeForMsBuildProperty(path))
+                    continue;
+                if (deadline - watch.Elapsed <= TimeSpan.Zero)
+                {
+                    notAttempted++;
+                    continue;
+                }
+                if (isLock)
+                {
+                    if (!SafeForMsBuildProperty(lockDirectory))
+                        continue;
+                    Directory.CreateDirectory(lockDirectory);
+                    var lockFile = Path.Combine(lockDirectory, $"{projects.Count}.packages.lock.json");
+                    projects.Add(new UnionProject(path, path, ["RestoreLockedMode=false", $"NuGetLockFilePath={lockFile}"]));
+                    kinds[path] = (issue.Project, true, null);
+                    continue;
+                }
+
+                var (frameworks, outOfTime) = await BuildableFrameworksAsync(
+                        path, globals, environment, deadline - watch.Elapsed, cancellationToken).ConfigureAwait(false);
+                if (outOfTime)
+                    notAttempted++;
+                else if (frameworks is not null)
+                {
+                    projects.Add(new UnionProject(path, path, [$"TargetFrameworks={frameworks.Replace(";", "%3B", StringComparison.Ordinal)}"]));
+                    kinds[path] = (issue.Project, false, frameworks);
+                }
+            }
+            if (projects.Count == 0)
+                return none with { NotAttempted = notAttempted };
+
+            var left = deadline - watch.Elapsed;
+            if (left <= TimeSpan.Zero)
+                return none with { NotAttempted = notAttempted + projects.Count };
+
+            log?.Invoke($"package restore: retrying {projects.Count} project(s) whose restore failed on a stale lock file or an unavailable platform target.");
+            var repairParser = new RestoreOutputParser(checkoutDir);
+            // The solution path of a UnionProject only sets the SolutionDir properties; a project alone has none. The
+            // traversal is NOT recursive: the reduced TargetFrameworks is a global property that reaches every project
+            // reference, so a recursive restore would rewrite a multi-target sibling's assets with the reduced targets.
+            var ran = await RunTraversalAsync(
+                    checkoutDir, [.. projects.Select(p => p with { SolutionPath = Path.Combine(Path.GetDirectoryName(p.ProjectPath)!, "_.sln") })],
+                    globals, recursive: false, left, repairParser, cancellationToken, scratchDir, environment)
+                .ConfigureAwait(false);
+            if (ran is null)
+                return none with { NotAttempted = notAttempted };
+
+            var lockFiles = new List<string>();
+            var platform = new List<string>();
+            var repaired = new List<string>();
+            foreach (var (path, kind) in kinds)
+            {
+                if (!repairParser.WasRestored(path))
+                {
+                    if (ran == RunResult.TimedOut)
+                        notAttempted++;
+                    continue;
+                }
+                parser.Forget(path);
+                repaired.Add(kind.Name);
+                if (kind.LockFile)
+                    lockFiles.Add(kind.Name);
+                else
+                    platform.Add($"{kind.Name} ({kind.Frameworks})");
+            }
+            lockFiles.Sort(StringComparer.Ordinal);
+            platform.Sort(StringComparer.Ordinal);
+            repaired.Sort(StringComparer.Ordinal);
+            return new RepairOutcome(lockFiles, platform, repaired, notAttempted);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            log?.Invoke($"package restore could not prepare its repair retry: {ex.GetType().Name}.");
+            return none with { NotAttempted = notAttempted };
+        }
+        finally
+        {
+            try
+            {
+                if (Directory.Exists(lockDirectory))
+                    Directory.Delete(lockDirectory, recursive: true);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                log?.Invoke($"package restore scratch cleanup failed: {ex.GetType().Name}.");
+            }
+        }
+    }
+
+    // The project's evaluated TargetFrameworks reduced to the ones this worker can build, joined by ';'. Null unless the
+    // project is multi-target and at least one target is buildable and at least one is not (nothing to gain otherwise).
+    // The probe runs for at most min(60 s, remaining); OutOfTime is true when the restore time limit, not the probe's own
+    // bound, stopped it (or none was left).
+    internal async Task<(string? Frameworks, bool OutOfTime)> BuildableFrameworksAsync(
+        string project, IReadOnlyList<KeyValuePair<string, string>> globals, IReadOnlyDictionary<string, string> environment,
+        TimeSpan remaining, CancellationToken cancellationToken)
+    {
+        var probeLimit = TimeSpan.FromSeconds(60);
+        if (remaining <= TimeSpan.Zero)
+            return (null, true);
+        var bound = remaining < probeLimit ? remaining : probeLimit;
+        var startInfo = CreateStartInfo(
+            ["msbuild", project, "-getProperty:TargetFrameworks", "-p:DesignTimeBuild=true", .. globals.Select(p => $"-p:{p.Key}={p.Value}"),
+                "--disable-build-servers", "-nodeReuse:false", "-nologo"],
+            Path.GetDirectoryName(project) ?? Environment.CurrentDirectory, environment);
+        using var process = new Process { StartInfo = startInfo };
+        try
+        {
+            if (!process.Start())
+                return (null, false);
+        }
+        catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or PlatformNotSupportedException)
+        {
+            return (null, false);
+        }
+        try { process.StandardInput.Close(); }
+        catch (IOException) { /* already exited */ }
+
+        // The readers are cancelled when this method ends, so one abandoned after the drain grace cannot outlive it.
+        using var drain = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        try
+        {
+            var output = process.StandardOutput.ReadToEndAsync(drain.Token);
+            var error = process.StandardError.ReadToEndAsync(drain.Token);
+            using var limit = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            limit.CancelAfter(bound);
+            try
+            {
+                await process.WaitForExitAsync(limit.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                KillProcessTree(process);
+                cancellationToken.ThrowIfCancellationRequested();
+                return (null, remaining <= probeLimit);
+            }
+            var both = Task.WhenAll(output, error);
+            if (await Task.WhenAny(both, Task.Delay(DrainGrace, CancellationToken.None)).ConfigureAwait(false) != both || process.ExitCode != 0)
+                return (null, false);
+
+            // A single -getProperty prints the bare value.
+            var declared = (await output.ConfigureAwait(false)).Trim()
+                .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var buildable = declared.Where(f => ProjectExclusionClassifier.UnavailablePlatform(f) is null).ToList();
+            return (buildable.Count > 0 && buildable.Count < declared.Length ? string.Join(';', buildable) : null, false);
+        }
+        finally
+        {
+            drain.Cancel();
+        }
+    }
+
+    private sealed record UnionProject(string ProjectPath, string SolutionPath, IReadOnlyList<string>? Extra = null);
 
     // Static-graph failures per solution for one fingerprint (issue #349): Known are loaded from the restore state,
     // Added are the ones this job learned. Keys are checkout-relative solution paths with '/' separators.
