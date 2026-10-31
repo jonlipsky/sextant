@@ -592,16 +592,20 @@ public sealed class SymbolStore(SqliteConnection connection)
         return ReadAll(cmd);
     }
 
+    private const string FtsKindsSuffix = """
+
+        JOIN symbols_fts fts ON fts.rowid = s.id
+        WHERE symbols_fts MATCH @query
+        """ + KindFilter + """
+
+        ORDER BY rank
+        LIMIT @max_results;
+        """;
+
     private List<SymbolInfo> RunFts(string query, int maxResults, IReadOnlyCollection<SymbolKind>? kinds)
     {
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = $"""
-            {SelectPrefix}
-            JOIN symbols_fts fts ON fts.rowid = s.id
-            WHERE symbols_fts MATCH @query{KindFilter}
-            ORDER BY rank
-            LIMIT @max_results;
-            """;
+        cmd.CommandText = SelectPrefix + FtsKindsSuffix; // NOSONAR S2077: constants only; query, kinds and limit are bound parameters.
         cmd.Parameters.AddWithValue("@query", query);
         cmd.Parameters.AddWithValue("@max_results", maxResults);
         BindKinds(cmd, kinds);
