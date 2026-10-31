@@ -62,6 +62,13 @@ public sealed record SnapshotContext
     public IReadOnlyDictionary<string, string>? ProjectLoadIssues { get; init; }
 
     /// <summary>
+    /// The checkout's root directory as the producing worker knows it, or <c>null</c> (local CLI/daemon). Names a
+    /// project's checkout-relative path in binding health even when the solution's first project lives in a
+    /// submodule. Not part of snapshot identity.
+    /// </summary>
+    public string? CheckoutDir { get; init; }
+
+    /// <summary>
     /// An OPTIONAL monotonic per-branch head sequence for the SERVICE ensure path (issue #84). When set,
     /// <c>AdvanceBranchToSnapshot</c> advances the branch pointer only when this value is strictly greater
     /// than the sequence already recorded for the branch (forward-only), so an out-of-order/older service

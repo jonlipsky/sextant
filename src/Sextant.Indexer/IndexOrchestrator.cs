@@ -173,7 +173,7 @@ public sealed class IndexOrchestrator
         var projectRoslynToId = new Dictionary<ProjectId, long>();
         // The repository-relative path and target framework of every NON-provider project version this run
         // indexes, and the binding counts persisted for each, folded into the recorded coverage at publish.
-        var bindingProjectPaths = new Dictionary<long, (string Path, string? TargetFramework)>();
+        var bindingProjectPaths = new Dictionary<long, (string Path, string? TargetFramework, string? CheckoutPath)>();
         var bindingCounts = new Dictionary<long, BindingCounter>();
         // Logical-project rows this run is responsible for (re)building. For a full index it is every
         // registered project; for an incremental rebuild the orchestrator is handed a canonical-id
@@ -639,7 +639,7 @@ public sealed class IndexOrchestrator
                 projectId = projectStore.Insert(identity, now);
             }
             projectRoslynToId[project.Id] = projectId;
-            bindingProjectPaths[projectId] = (identity.RepoRelativePath, identity.TargetFramework);
+            bindingProjectPaths[projectId] = (identity.RepoRelativePath, identity.TargetFramework, CheckoutRelativePath(BindingCheckoutRoot(effectiveCtx, repoRoot), project.FilePath, identity.RepoRelativePath));
             if (extractThisProject)
                 processSet.Add(project.Id);
             _log?.Invoke($"  Project: {project.Name} (id={projectId}, tfm={identity.TargetFramework}, test={identity.IsTestProject})");
@@ -2045,8 +2045,24 @@ public sealed class IndexOrchestrator
     /// repository's own project versions (a Phase-12 provider's projects are not part of the parent's
     /// coverage). Unchanged when the caller computed no coverage (local CLI/daemon) or the run extracted nothing.
     /// </summary>
+    // The project's path from the checkout root, as coverage names it (SnapshotCoverageBuilder.ReasonPath), when it
+    // differs from the path relative to the project's own repository (a submodule project); otherwise null.
+    internal static string? BindingCheckoutRoot(SnapshotContext? ctx, string? repoRoot) => ctx?.CheckoutDir ?? repoRoot;
+
+    // checkoutRoot is the worker's checkout directory when known, else the first project's git root.
+    internal static string? CheckoutRelativePath(string? checkoutRoot, string projectFile, string ownRelativePath)
+    {
+        if (checkoutRoot == null)
+            return null;
+        var relative = Path.GetRelativePath(checkoutRoot, projectFile).Replace('\\', '/');
+        return relative.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relative)
+               || string.Equals(relative, ownRelativePath, StringComparison.Ordinal)
+            ? null
+            : relative;
+    }
+
     internal static SnapshotContext WithBindingHealth(
-        SnapshotContext ctx, IReadOnlyDictionary<long, (string Path, string? TargetFramework)> projectPaths,
+        SnapshotContext ctx, IReadOnlyDictionary<long, (string Path, string? TargetFramework, string? CheckoutPath)> projectPaths,
         IReadOnlyDictionary<long, BindingCounter> counts)
     {
         if (ctx.Coverage is not { } coverage || (counts.Count == 0 && ctx.ProjectLoadIssues is not { Count: > 0 }))
@@ -2055,10 +2071,10 @@ public sealed class IndexOrchestrator
             .Where(c => projectPaths.ContainsKey(c.Key))
             .Select(c =>
             {
-                var (path, tfm) = projectPaths[c.Key];
+                var (path, tfm, checkoutPath) = projectPaths[c.Key];
                 return new ProjectBindingCounts(
                     path, tfm, c.Value.NamesExamined, c.Value.UnboundNames, c.Value.UnboundInvocations,
-                    c.Value.CandidateOccurrences);
+                    c.Value.CandidateOccurrences, checkoutPath);
             });
         var health = BindingHealthBuilder.Build(projects, ctx.ProjectLoadIssues, coverage.AllExclusions ?? coverage.Exclusions);
         return ctx with { Coverage = BindingHealthBuilder.Apply(coverage, health) };

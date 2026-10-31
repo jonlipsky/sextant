@@ -214,4 +214,44 @@ public class BindingHealthBuilderTests
 
         Assert.IsFalse(health.Projects.Single().Excluded);
     }
+
+    [TestMethod]
+    public void Apply_SubmoduleVersionExcludedByItsCheckoutPath_IsNotAGap_ThoughListedByItsOwnPath()
+    {
+        var counts = new ProjectBindingCounts(
+            "src/Droid/Droid.csproj", "net10.0-android", 4000, 3126, 0, 0, "external/Sub/src/Droid/Droid.csproj");
+        var health = BindingHealthBuilder.Build(
+            [counts], exclusions: [Platform("external/Sub/src/Droid/Droid.csproj", "net10.0-android")]);
+
+        Assert.AreEqual(SnapshotCoverageVerdict.Complete, BindingHealthBuilder.Apply(Complete, health).Verdict);
+        Assert.AreEqual("src/Droid/Droid.csproj", health.Projects.Single().Project, "reports keep the project's own path");
+        Assert.IsTrue(health.Projects.Single().Excluded);
+    }
+
+    [TestMethod]
+    public void Apply_RootProjectSharingASubmodulesRelativePath_IsStillAGap()
+    {
+        var submodule = new ProjectBindingCounts(
+            "src/Droid/Droid.csproj", "net10.0-android", 4000, 3126, 0, 0, "external/Sub/src/Droid/Droid.csproj");
+        var root = Counts("src/Droid/Droid.csproj", 4000, 3126, tfm: "net10.0-android");
+
+        var rootExcluded = BindingHealthBuilder.Build(
+            [submodule], exclusions: [Platform("src/Droid/Droid.csproj", "net10.0-android")]);
+        Assert.IsFalse(rootExcluded.Projects.Single().Excluded, "the root project's exclusion never covers the submodule's version");
+
+        var submoduleExcluded = BindingHealthBuilder.Build(
+            [root], exclusions: [Platform("external/Sub/src/Droid/Droid.csproj", "net10.0-android")]);
+        var result = BindingHealthBuilder.Apply(Complete, submoduleExcluded);
+        Assert.AreEqual(SnapshotCoverageVerdict.Partial, result.Verdict);
+    }
+
+    [TestMethod]
+    public void Build_LoadIssue_IsMatchedByTheCheckoutPath()
+    {
+        var counts = new ProjectBindingCounts("src/X/X.csproj", "net10.0", 100, 0, 0, 0, "external/Sub/src/X/X.csproj");
+        var health = BindingHealthBuilder.Build(
+            [counts], new Dictionary<string, string> { ["external/Sub/src/X/X.csproj"] = "restore failed", ["src/X/X.csproj"] = "root" });
+
+        Assert.AreEqual("restore failed", health.Projects.Single(p => p.TargetFramework == "net10.0").LoadIssue);
+    }
 }
