@@ -119,6 +119,8 @@ public static class MultiSolutionLoader
     /// then the rest project by project, with per-project fault isolation. When <paramref name="deadline"/> passes during a
     /// project-by-project union load, the projects not yet opened are returned in
     /// <see cref="MultiSolutionLoadResult.DeferredProjects"/>; <paramref name="onProgress"/> receives a line per open.
+    /// <paramref name="generatorCacheDirectory"/> (a stable directory that outlives the job) enables building source-generator
+    /// projects from the workspace (<see cref="GeneratorProjects"/>); null builds none.
     /// </summary>
     public static async Task<MultiSolutionLoadResult> LoadAsync(
         IReadOnlyList<string> solutionPaths,
@@ -127,7 +129,8 @@ public static class MultiSolutionLoader
         Action<string>? onProgress = null,
         CancellationToken cancellationToken = default,
         string? scratchDirectory = null,
-        PlatformPackOptions? platformPacks = null)
+        PlatformPackOptions? platformPacks = null,
+        string? generatorCacheDirectory = null)
     {
         if (solutionPaths.Count == 0)
             throw new ArgumentException("At least one solution path is required.", nameof(solutionPaths));
@@ -187,6 +190,11 @@ public static class MultiSolutionLoader
             loaded = loaded with { Solution = withPacks };
             packBindings = bindings;
         }
+
+        var withGenerators = await GeneratorProjects.ResolveAsync(
+            loaded.Solution, generatorCacheDirectory, onDiagnostic, cancellationToken).ConfigureAwait(false);
+        if (!ReferenceEquals(withGenerators, loaded.Solution))
+            loaded = loaded with { Solution = withGenerators };
 
         var coverage = BuildCoverage(perSolutionDeclared, loaded.SkippedProjects, loaded.DeferredProjects, loaded.Solution)
             .Select((c, i) => c with { IsReadable = reads[i].IsReadable }).ToList();

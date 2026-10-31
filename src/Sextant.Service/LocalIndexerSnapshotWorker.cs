@@ -331,7 +331,8 @@ public sealed class LocalIndexerSnapshotWorker(
                         resolution.SelectedSolutions, log,
                         deadline: loadDeadline, onProgress: log, cancellationToken: token,
                         scratchDirectory: scratchDir,
-                        platformPacks: PlatformPackOptions.ForJob(packagesDir, scratchDir, plan?.RestoreLimit, loadDeadline))
+                        platformPacks: PlatformPackOptions.ForJob(packagesDir, scratchDir, plan?.RestoreLimit, loadDeadline),
+                        generatorCacheDirectory: packageCache?.GeneratorProjectsDirectory)
                         .ConfigureAwait(false);
                     timings.RecordLoad(load, buildHosts.Stop());
                 }

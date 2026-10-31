@@ -118,6 +118,18 @@ public sealed record PackageRestoreOutcome
     /// <summary>Projects the per-project retries restored one by one.</summary>
     public int ProjectsRetried { get; init; }
 
+    /// <summary>Projects whose stale-lock-file (NU1004) failure a second restore without the locked mode resolved (issue #352).</summary>
+    public IReadOnlyList<string> LockFileRetriedProjects { get; init; } = [];
+
+    /// <summary>Multi-target projects restored for their buildable targets after the platform targets failed, with those targets (issue #352).</summary>
+    public IReadOnlyList<string> PlatformRetriedProjects { get; init; } = [];
+
+    /// <summary>Checkout-relative paths of every project a repair restored with an unlocked lock file or reduced targets (issue #352): restored, but not cleanly.</summary>
+    public IReadOnlyList<string> RepairedProjects { get; init; } = [];
+
+    /// <summary>Repair candidates the restore time limit left unrepaired (issue #352).</summary>
+    public int RepairNotAttempted { get; init; }
+
     /// <summary>Per-solution restore passes run with static-graph evaluation (issue #272).</summary>
     public int StaticGraphPasses { get; init; }
 
@@ -313,6 +325,26 @@ public sealed record PackageRestoreOutcome
             notes.Add(
                 $"Package restore failed as a whole for {SolutionsRetriedPerProject} solution(s) and was retried for their " +
                 $"{ProjectsRetried} project(s) one by one, so a project that cannot restore does not leave the others unrestored.");
+        }
+        if (LockFileRetriedProjects.Count > 0)
+        {
+            notes.Add(
+                $"Package restore of {LockFileRetriedProjects.Count} project(s) failed with NU1004 because the committed lock file " +
+                $"is out of date; they were restored again without the locked mode (the lock file in the checkout is untouched): " +
+                string.Join(", ", LockFileRetriedProjects.Take(5)) + (LockFileRetriedProjects.Count > 5 ? ", ..." : string.Empty) + ".");
+        }
+        if (PlatformRetriedProjects.Count > 0)
+        {
+            notes.Add(
+                $"{PlatformRetriedProjects.Count} multi-target project(s) could not restore their platform targets on this worker; " +
+                $"they were restored for their buildable targets only: " +
+                string.Join(", ", PlatformRetriedProjects.Take(5)) + (PlatformRetriedProjects.Count > 5 ? ", ..." : string.Empty) + ".");
+        }
+        if (RepairNotAttempted > 0)
+        {
+            notes.Add(
+                $"The restore time limit cut the repair short: {RepairNotAttempted} project(s) that failed on a stale lock file " +
+                "or an unavailable platform target were not restored again, so they stay unrestored.");
         }
         if (SolutionsNotStarted > 0)
         {
