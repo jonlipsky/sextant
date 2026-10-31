@@ -127,6 +127,14 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
             return _restored.Contains(Path.GetFullPath(projectPath));
     }
 
+    /// <summary>Drops the failures recorded for a project a repair retry restored.</summary>
+    public void Forget(string projectPath)
+    {
+        var key = Relativize(projectPath);
+        lock (_gate)
+            _projects.Remove(key);
+    }
+
     /// <summary>Adds everything <paramref name="other"/> recorded (issue #296: a failed attempt's findings, kept when its retry could not run).</summary>
     public void MergeFrom(RestoreOutputParser other)
     {

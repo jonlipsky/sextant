@@ -57,6 +57,9 @@ public sealed class PackageCache
         }
     }
 
+    /// <summary>The stable directory the job's built source-generator projects live in (issue #352); it outlives the job's scratch.</summary>
+    public string GeneratorProjectsDirectory => _paths.GeneratorProjectsRoot;
+
     /// <summary>True when jobs restore into per-repository folders that outlive them.</summary>
     public bool Enabled => MaxBytes > 0;
 

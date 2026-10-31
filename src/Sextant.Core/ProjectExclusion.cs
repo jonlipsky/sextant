@@ -33,6 +33,9 @@ public static class PlatformEvidence
 
     /// <summary>The version was compiled against a platform reference pack because its workload is missing.</summary>
     public const string PlatformPackBinding = "platform_pack_binding";
+
+    /// <summary>A legacy Xamarin project reported that it needs desktop MSBuild (Visual Studio), which this worker never has.</summary>
+    public const string DesktopMsbuildRequired = "desktop_msbuild_required";
 }
 
 /// <summary>
@@ -83,6 +86,10 @@ public static partial class ProjectExclusionClassifier
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, matchTimeoutMilliseconds: 1000)]
     private static partial Regex WorkloadFailurePattern();
 
+    [GeneratedRegex(@"you need to use desktop msbuild",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, matchTimeoutMilliseconds: 1000)]
+    private static partial Regex DesktopMsbuildPattern();
+
     [GeneratedRegex(@"There is no application host available for the specified RuntimeIdentifier",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, matchTimeoutMilliseconds: 1000)]
     private static partial Regex NoApplicationHostPattern();
@@ -109,6 +116,9 @@ public static partial class ProjectExclusionClassifier
     {
         if (string.IsNullOrWhiteSpace(targetFramework))
             return null;
+        // Xamarin TFMs carry the platform in the framework name (xamarin.ios, xamarinios10), not after a dash.
+        if (targetFramework.StartsWith("xamarin", StringComparison.OrdinalIgnoreCase))
+            return "xamarin";
         var dash = targetFramework.IndexOf('-');
         if (dash < 0)
             return null;
@@ -133,7 +143,7 @@ public static partial class ProjectExclusionClassifier
         {
             "ios" or "maccatalyst" or "macos" or "tvos" or "watchos" => os.IsMacOS ? null : platform,
             "windows" => os.IsWindows ? null : platform,
-            "android" or "tizen" => platform,
+            "android" or "tizen" or "xamarin" => platform,
             _ => null
         };
     }
@@ -155,6 +165,8 @@ public static partial class ProjectExclusionClassifier
             return PlatformEvidence.WorkloadMissing;
         if ((ApplePlatforms.Contains(platform) || platform == "android") && Matches(NoApplicationHostPattern(), reason))
             return PlatformEvidence.NoApplicationHost;
+        if (platform == "xamarin" && Matches(DesktopMsbuildPattern(), reason))
+            return PlatformEvidence.DesktopMsbuildRequired;
         if (platform == "windows" && Matches(WindowsToolingPattern(), reason))
             return PlatformEvidence.WindowsTooling;
         return null;
@@ -166,7 +178,7 @@ public static partial class ProjectExclusionClassifier
     /// <paramref name="platformPackBound"/> marks a version bound against a platform reference pack.
     /// <paramref name="unpopulatedSubmodules"/> holds the full paths of declared submodules that are not checked out
     /// (a missing file inside one keeps that submodule's own gap) and <paramref name="checkoutRoot"/> the checkout
-    /// (a project file outside it is never an exclusion: a sibling repository's absence is a gap). Null when the
+    /// (an existing project file outside it is never an exclusion; a declared one that provably does not exist is missing wherever it is declared). Null when the
     /// version is not an exclusion.
     /// </summary>
     public static ProjectExclusion? Classify(
@@ -183,15 +195,16 @@ public static partial class ProjectExclusionClassifier
                 project, targetFramework, ProjectExclusionReason.PlatformUnavailable, $"{platform}; {evidence}");
         }
 
-        if (checkoutRoot is not null && !IsInside(projectFile, [checkoutRoot]))
-            return null;
-
         if (!File.Exists(projectFile))
         {
             return !IsInside(projectFile, unpopulatedSubmodules) && IsProvablyMissing(projectFile)
                 ? new ProjectExclusion(project, targetFramework, ProjectExclusionReason.ProjectFileMissing)
                 : null;
         }
+
+        // A file that exists outside the checkout is a sibling repository's: never classified as legacy.
+        if (checkoutRoot is not null && !IsInside(projectFile, [checkoutRoot]))
+            return null;
 
         return IsLegacyProjectFormat(projectFile, failureReason)
             ? new ProjectExclusion(project, targetFramework, ProjectExclusionReason.LegacyProjectFormat)

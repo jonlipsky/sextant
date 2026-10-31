@@ -37,6 +37,12 @@ public sealed class ServicePaths
     public string PackageCacheRoot => Path.Combine(_cacheRoot, "nuget-packages");
 
     /// <summary>
+    /// The emitted source-generator projects on the cache volume (issue #352): one directory per content hash, shared by
+    /// every job of the process because the generator's assemblies are loaded lazily and never unloaded. Rebuildable.
+    /// </summary>
+    public string GeneratorProjectsRoot => Path.Combine(_cacheRoot, "generator-projects");
+
+    /// <summary>
     /// The per-repository git object stores on the cache volume (issue #272): one <see cref="RepoDirectoryName"/>
     /// directory per repository, holding the bare store a new commit is fetched into incrementally. Everything under
     /// it is rebuildable.
