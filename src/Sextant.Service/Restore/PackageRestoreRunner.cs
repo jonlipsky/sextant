@@ -1614,29 +1614,38 @@ public sealed class PackageRestoreRunner(
         try { process.StandardInput.Close(); }
         catch (IOException) { /* already exited */ }
 
-        var output = process.StandardOutput.ReadToEndAsync();
-        var error = process.StandardError.ReadToEndAsync();
-        using var limit = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        limit.CancelAfter(bound);
+        // The readers are cancelled when this method ends, so one abandoned after the drain grace cannot outlive it.
+        using var drain = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         try
         {
-            await process.WaitForExitAsync(limit.Token).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            KillProcessTree(process);
-            cancellationToken.ThrowIfCancellationRequested();
-            return (null, remaining <= probeLimit);
-        }
-        var both = Task.WhenAll(output, error);
-        if (await Task.WhenAny(both, Task.Delay(DrainGrace, CancellationToken.None)).ConfigureAwait(false) != both || process.ExitCode != 0)
-            return (null, false);
+            var output = process.StandardOutput.ReadToEndAsync(drain.Token);
+            var error = process.StandardError.ReadToEndAsync(drain.Token);
+            using var limit = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            limit.CancelAfter(bound);
+            try
+            {
+                await process.WaitForExitAsync(limit.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                KillProcessTree(process);
+                cancellationToken.ThrowIfCancellationRequested();
+                return (null, remaining <= probeLimit);
+            }
+            var both = Task.WhenAll(output, error);
+            if (await Task.WhenAny(both, Task.Delay(DrainGrace, CancellationToken.None)).ConfigureAwait(false) != both || process.ExitCode != 0)
+                return (null, false);
 
-        // A single -getProperty prints the bare value.
-        var declared = (await output.ConfigureAwait(false)).Trim()
-            .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        var buildable = declared.Where(f => ProjectExclusionClassifier.UnavailablePlatform(f) is null).ToList();
-        return (buildable.Count > 0 && buildable.Count < declared.Length ? string.Join(';', buildable) : null, false);
+            // A single -getProperty prints the bare value.
+            var declared = (await output.ConfigureAwait(false)).Trim()
+                .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var buildable = declared.Where(f => ProjectExclusionClassifier.UnavailablePlatform(f) is null).ToList();
+            return (buildable.Count > 0 && buildable.Count < declared.Length ? string.Join(';', buildable) : null, false);
+        }
+        finally
+        {
+            drain.Cancel();
+        }
     }
 
     private sealed record UnionProject(string ProjectPath, string SolutionPath, IReadOnlyList<string>? Extra = null);

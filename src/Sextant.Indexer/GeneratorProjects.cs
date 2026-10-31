@@ -19,19 +19,25 @@ namespace Sextant.Indexer;
 /// projects or their <c>ProjectReference</c> closure), <see cref="ResolveAsync"/> compiles that project with Roslyn from the
 /// workspace (no <c>dotnet build</c>, no MSBuild target), emits it and the projects it references to memory with
 /// deterministic compilation, and replaces the reference with an <see cref="AnalyzerFileReference"/>. A generator that does
-/// not compile or load keeps the unresolved reference and is reported through the diagnostic callback. Generators that ship
-/// in NuGet packages already execute in this load, so this adds no new trust boundary.
+/// not compile or load keeps the unresolved reference and is reported through the diagnostic callback. TRUST: MSBuild
+/// evaluation runs in the sandbox with a scrubbed environment, but a generator built from repository source runs INSIDE the
+/// service process, as generators that ship in NuGet packages already do. This widens that existing exposure to code in the
+/// repository itself; it is contained only by #76 (out-of-process isolation) and can be turned off with
+/// <c>SEXTANT_SERVICE_BUILD_GENERATOR_PROJECTS=false</c> (a null cache directory builds nothing).
 /// </para>
 /// <para>
 /// An assembly load context is never unloaded, so a long-lived service must not make one per job. The emitted set (plus the
 /// NuGet dependency paths it resolves through) is hashed, and ONE process-wide loader and reference exist per hash, whose
 /// assemblies stay in a stable directory under <c>cacheDirectory</c> (the service's cache root), because the reference reads
-/// them lazily. The cost therefore grows only when generator SOURCE changes, bounded by <see cref="MaxCachedGenerators"/>:
-/// past it nothing is loaded and the generator is reported. Without a cache directory nothing is built.
+/// them lazily. The cost therefore grows only when generator SOURCE changes, bounded by <see cref="MaxCachedGenerators"/>
+/// SUCCESSFUL loads: past it nothing is loaded, the generator is reported and a Warning-level line is logged; the count
+/// resets on restart. A failed build or load is never counted and is retried by a later job. Without a cache directory
+/// nothing is built. The first use after a restart removes hash directories nothing holds and <c>*.tmp</c> leftovers.
 /// </para>
 /// <para>
-/// A generator's NuGet dependency (Scriban, say) is resolved from the metadata-reference paths of the compilations in its
-/// closure. Two projects of the closure that produce one assembly name fail the build rather than overwrite each other.
+/// A generator's NuGet dependency (Scriban, say) is found among the metadata-reference paths of the compilations in its
+/// closure, then COPIED into the hash directory and hashed by content, so an entry never depends on a checkout or package
+/// cache path that a later job may have removed or changed. Two projects of the closure that produce one assembly name fail the build rather than overwrite each other.
 /// </para>
 /// </remarks>
 public static class GeneratorProjects
@@ -44,15 +50,21 @@ public static class GeneratorProjects
 
     private const int MaxProblemChars = 300;
 
+    private const int MaxRememberedFailures = 1024;
+    private const string DependencyDirectory = "deps";
+
     private static readonly object Gate = new();
     private static readonly Dictionary<string, Lazy<Entry>> Entries = new(StringComparer.Ordinal);
+    // Deterministic load failures (the bytes would fail again), kept out of Entries so they never count against the cap.
+    private static readonly Dictionary<string, string> Failures = new(StringComparer.Ordinal);
+    private static readonly HashSet<string> SweptDirectories = new(PathComparer);
     private static int s_contexts;
     private static int s_cap = MaxCachedGenerators;
 
     /// <summary>Generator loaders created by this process (tests assert a repeated generator creates none).</summary>
     internal static int LoadedContexts => Volatile.Read(ref s_contexts);
 
-    /// <summary>Distinct generator builds this process holds.</summary>
+    /// <summary>Distinct successful (or in-flight) generator builds this process holds.</summary>
     internal static int CachedEntries
     {
         get { lock (Gate) return Entries.Count; }
@@ -68,13 +80,29 @@ public static class GeneratorProjects
 
     private sealed record Emitted(string Name, byte[] Bytes);
 
+    private sealed record BuildResult(AnalyzerFileReference? Reference, string Problem, bool Reused, bool CapReached = false);
+
+    // Matches the NuGet reference-assembly layout .../ref/<tfm>/<name>.dll, never a bare directory called "ref".
+    private static readonly System.Text.RegularExpressions.Regex TargetFrameworkFolder = new(
+        @"^(net|netstandard|netcoreapp)\d[\d.]*(-[a-z0-9.]+)?$",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant,
+        TimeSpan.FromSeconds(1));
+
+    internal static bool IsReferenceAssemblyPath(string path)
+    {
+        var segments = path.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return segments.Length >= 3
+            && string.Equals(segments[^3], "ref", StringComparison.OrdinalIgnoreCase)
+            && TargetFrameworkFolder.IsMatch(segments[^2]);
+    }
+
     /// <summary>
     /// Replaces each resolvable unresolved generator reference in <paramref name="solution"/>. Returns the solution unchanged
     /// when there is none, or when <paramref name="cacheDirectory"/> is null.
     /// </summary>
     public static async Task<Solution> ResolveAsync(
         Solution solution, string? cacheDirectory, Action<string>? onDiagnostic = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default, Action<string>? onWarning = null)
     {
         if (cacheDirectory is null)
             return solution;
@@ -108,10 +136,14 @@ public static class GeneratorProjects
             if (!producers.TryGetValue(path, out var generator))
                 continue;
 
-            var (reference, problem, reused) = await BuildAsync(solution, generator, cacheDirectory, cancellationToken)
+            var (reference, problem, reused, capReached) = await BuildAsync(solution, generator, cacheDirectory, cancellationToken)
                 .ConfigureAwait(false);
             if (reference is null)
             {
+                if (capReached)
+                    onWarning?.Invoke(
+                        $"Source generator project '{generator.Name}' was not built: this process already holds {CapForTests} " +
+                        "distinct generator builds and loads no more until the service restarts.");
                 onDiagnostic?.Invoke(
                     $"Source generator project '{generator.Name}' is referenced as an analyzer by {users.Count} project(s) but " +
                     $"could not be built from source ({problem}); the code it generates is missing and names that use it do not bind.");
@@ -136,7 +168,7 @@ public static class GeneratorProjects
         return solution;
     }
 
-    private static async Task<(AnalyzerFileReference? Reference, string Problem, bool Reused)> BuildAsync(
+    private static async Task<BuildResult> BuildAsync(
         Solution solution, Project generator, string cacheDirectory, CancellationToken cancellationToken)
     {
         try
@@ -147,25 +179,33 @@ public static class GeneratorProjects
             var problem = await EmitWithReferencesAsync(solution, generator.Id, emitted, owners, references, cancellationToken)
                 .ConfigureAwait(false);
             if (problem is not null)
-                return (null, problem, false);
+                return new BuildResult(null, problem, false);
 
             var primary = emitted[generator.Id];
             // Emitted assemblies shadow a NuGet reference of the same name.
             foreach (var name in owners.Keys)
                 references.Remove(name);
-            var hash = HashOf(primary.Name, emitted.Values, references);
+            // Copy what the generator loads now: the checkout or package cache may be gone, or changed, by a later job.
+            var dependencies = new List<Emitted>();
+            foreach (var (name, path) in references)
+                dependencies.Add(new Emitted(name, await File.ReadAllBytesAsync(path, cancellationToken).ConfigureAwait(false)));
+            var hash = HashOf(primary.Name, emitted.Values, dependencies);
 
             Lazy<Entry> lazy;
             var reused = true;
             lock (Gate)
             {
+                if (SweptDirectories.Add(Path.GetFullPath(cacheDirectory)))
+                    Sweep(cacheDirectory);
+                if (Failures.TryGetValue(hash, out var known))
+                    return new BuildResult(null, known, true);
                 if (!Entries.TryGetValue(hash, out var existing))
                 {
                     if (Entries.Count >= CapForTests)
-                        return (null, $"this process already holds {CapForTests} distinct generator builds and loads no more", false);
+                        return new BuildResult(
+                            null, $"this process already holds {CapForTests} distinct generator builds and loads no more", false, true);
                     reused = false;
                     var assemblies = emitted.Values.ToList();
-                    var dependencies = references.ToDictionary(p => p.Key, p => p.Value, StringComparer.OrdinalIgnoreCase);
                     existing = new Lazy<Entry>(
                         () => Materialize(hash, cacheDirectory, primary.Name, assemblies, dependencies),
                         LazyThreadSafetyMode.ExecutionAndPublication);
@@ -175,7 +215,7 @@ public static class GeneratorProjects
             }
 
             var entry = lazy.Value;
-            return (entry.Reference, entry.Problem, reused);
+            return new BuildResult(entry.Reference, entry.Problem, reused);
         }
         catch (OperationCanceledException)
         {
@@ -183,7 +223,37 @@ public static class GeneratorProjects
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or BadImageFormatException)
         {
-            return (null, $"{ex.GetType().Name}: {Cut(ex.Message)}", false);
+            return new BuildResult(null, $"{ex.GetType().Name}: {Cut(ex.Message)}", false);
+        }
+    }
+
+    // Best effort, once per cache directory per process: nothing else uses the directory and the map starts empty, so a
+    // hash directory not held by an entry, and any *.tmp file, is a leftover of an earlier run.
+    private static void Sweep(string cacheDirectory)
+    {
+        try
+        {
+            var root = Path.GetFullPath(cacheDirectory);
+            if (!Directory.Exists(root))
+                return;
+            var inUse = Entries.Keys.Select(h => h[..32]).ToHashSet(StringComparer.Ordinal);
+            foreach (var directory in Directory.EnumerateDirectories(root))
+            {
+                var name = Path.GetFileName(directory);
+                if (name.Length != 32 || !name.All(Uri.IsHexDigit) || inUse.Contains(name))
+                    continue;
+                try { Directory.Delete(directory, recursive: true); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { /* best effort */ }
+            }
+            foreach (var temp in Directory.EnumerateFiles(root, "*.tmp", SearchOption.AllDirectories))
+            {
+                try { File.Delete(temp); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { /* best effort */ }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // best effort
         }
     }
 
@@ -191,7 +261,7 @@ public static class GeneratorProjects
     // on it) and loads the generator once. An IO failure is not cached: the next job tries again.
     private static Entry Materialize(
         string hash, string cacheDirectory, string primaryName, IReadOnlyList<Emitted> assemblies,
-        IReadOnlyDictionary<string, string> dependencies)
+        IReadOnlyList<Emitted> dependencies)
     {
         try
         {
@@ -199,8 +269,12 @@ public static class GeneratorProjects
             Directory.CreateDirectory(directory);
             foreach (var assembly in assemblies)
                 WriteIfChanged(Path.Combine(directory, assembly.Name + ".dll"), assembly.Bytes);
+            if (dependencies.Count > 0)
+                Directory.CreateDirectory(Path.Combine(directory, DependencyDirectory));
+            foreach (var dependency in dependencies)
+                WriteIfChanged(Path.Combine(directory, DependencyDirectory, dependency.Name + ".dll"), dependency.Bytes);
 
-            var loader = new SiblingLoader(directory, dependencies);
+            var loader = new SiblingLoader(directory);
             Interlocked.Increment(ref s_contexts);
             var reference = new AnalyzerFileReference(Path.Combine(directory, primaryName + ".dll"), loader);
             string? loadFailure = null;
@@ -214,10 +288,23 @@ public static class GeneratorProjects
             {
                 loadFailure ??= $"{ex.GetType().Name}: {ex.Message}";
             }
-            return loadFailure is null ? new Entry(reference, string.Empty) : new Entry(null, "it did not load: " + Cut(loadFailure));
+            if (loadFailure is null)
+                return new Entry(reference, string.Empty);
+
+            // The same bytes fail the same way: remember it, outside the cap.
+            var problem = "it did not load: " + Cut(loadFailure);
+            lock (Gate)
+            {
+                Entries.Remove(hash);
+                if (Failures.Count >= MaxRememberedFailures)
+                    Failures.Clear();
+                Failures[hash] = problem;
+            }
+            return new Entry(null, problem);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            // Never cached by the Lazy: the next job builds it again.
             lock (Gate)
                 Entries.Remove(hash);
             return new Entry(null, $"{ex.GetType().Name}: {Cut(ex.Message)}");
@@ -235,11 +322,11 @@ public static class GeneratorProjects
     }
 
     private static string HashOf(
-        string primary, IEnumerable<Emitted> assemblies, IReadOnlyDictionary<string, string> references)
+        string primary, IEnumerable<Emitted> assemblies, IEnumerable<Emitted> dependencies)
     {
         var lines = new List<string> { "primary:" + primary };
         lines.AddRange(assemblies.Select(a => $"asm:{a.Name}:{Convert.ToHexString(SHA256.HashData(a.Bytes))}"));
-        lines.AddRange(references.Select(r => $"ref:{r.Key}={r.Value}"));
+        lines.AddRange(dependencies.Select(d => $"dep:{d.Name}:{Convert.ToHexString(SHA256.HashData(d.Bytes))}"));
         lines.Sort(StringComparer.Ordinal);
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(string.Join('\n', lines))));
     }
@@ -279,8 +366,7 @@ public static class GeneratorProjects
                 continue;
             var path = Path.GetFullPath(reference.FilePath);
             // Reference assemblies (the target framework's, a package's ref/ folder) carry no implementation.
-            if (path.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
-                .Any(s => string.Equals(s, "ref", StringComparison.OrdinalIgnoreCase)))
+            if (IsReferenceAssemblyPath(path))
                 continue;
             references.TryAdd(symbol.Identity.Name, path);
         }
@@ -306,19 +392,17 @@ public static class GeneratorProjects
 
     /// <summary>
     /// Loads an emitted generator and the assemblies emitted beside it, then (only when the host cannot) a NuGet dependency
-    /// by the path a compilation of the closure referenced it from. Anything else, the compiler included, comes from the
+    /// from the <c>deps</c> folder of the generator's own directory. Anything else, the compiler included, comes from the
     /// default context, so the generator binds to the host's Roslyn.
     /// </summary>
     private sealed class SiblingLoader : AssemblyLoadContext, IAnalyzerAssemblyLoader
     {
         private readonly string _directory;
-        private readonly IReadOnlyDictionary<string, string> _dependencies;
 
-        public SiblingLoader(string directory, IReadOnlyDictionary<string, string> dependencies)
+        public SiblingLoader(string directory)
             : base(isCollectible: false)
         {
             _directory = directory;
-            _dependencies = dependencies;
             Resolving += ResolveDependency;
         }
 
@@ -337,9 +421,12 @@ public static class GeneratorProjects
         }
 
         // Raised only after the default context could not resolve the name.
-        private Assembly? ResolveDependency(AssemblyLoadContext context, AssemblyName assemblyName) =>
-            assemblyName.Name is { } name && _dependencies.TryGetValue(name, out var path) && File.Exists(path)
-                ? LoadFromAssemblyPath(path)
-                : null;
+        private Assembly? ResolveDependency(AssemblyLoadContext context, AssemblyName assemblyName)
+        {
+            if (assemblyName.Name is not { } name)
+                return null;
+            var path = Path.Combine(_directory, DependencyDirectory, name + ".dll");
+            return File.Exists(path) ? LoadFromAssemblyPath(path) : null;
+        }
     }
 }

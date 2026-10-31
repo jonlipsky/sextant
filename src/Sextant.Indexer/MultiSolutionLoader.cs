@@ -192,7 +192,8 @@ public static class MultiSolutionLoader
         }
 
         var withGenerators = await GeneratorProjects.ResolveAsync(
-            loaded.Solution, generatorCacheDirectory, onDiagnostic, cancellationToken).ConfigureAwait(false);
+            loaded.Solution, generatorCacheDirectory, onDiagnostic, cancellationToken,
+            onWarning: onDiagnostic is null ? null : line => onDiagnostic("WARNING: " + line)).ConfigureAwait(false);
         if (!ReferenceEquals(withGenerators, loaded.Solution))
             loaded = loaded with { Solution = withGenerators };
 

@@ -199,13 +199,15 @@ public class GeneratorProjectsTests
             await GeneratorProjects.ResolveAsync(kept, cache);
             var contexts = GeneratorProjects.LoadedContexts;
             var messages = new List<string>();
+            var warnings = new List<string>();
 
-            var resolved = await GeneratorProjects.ResolveAsync(over, cache, messages.Add);
+            var resolved = await GeneratorProjects.ResolveAsync(over, cache, messages.Add, onWarning: warnings.Add);
 
             Assert.AreEqual(contexts, GeneratorProjects.LoadedContexts, "nothing is loaded past the cap");
             Assert.AreEqual(1, resolved.GetProject(overConsumer)!.AnalyzerReferences.OfType<UnresolvedAnalyzerReference>().Count());
             Assert.IsTrue(messages.Any(m => m.Contains("could not be built from source", StringComparison.Ordinal)
                 && m.Contains("distinct generator builds", StringComparison.Ordinal)), string.Join("; ", messages));
+            Assert.IsTrue(warnings.Any(m => m.Contains("distinct generator builds", StringComparison.Ordinal)), "a warning-level line");
         }
         finally { GeneratorProjects.CapForTests = previous; }
     }
@@ -260,5 +262,120 @@ public class GeneratorProjectsTests
 
         Assert.AreEqual(1, resolved.GetProject(consumerId)!.AnalyzerReferences.OfType<UnresolvedAnalyzerReference>().Count());
         Assert.IsTrue(messages.Any(m => m.Contains("both produce the assembly 'Gen'", StringComparison.Ordinal)), string.Join("; ", messages));
+    }
+
+    [TestMethod]
+    public async Task FailedBuilds_DoNotCountAgainstTheCap_AndAreRetried()
+    {
+        var cache = Path.Combine(_root, "cache");
+        var entries = GeneratorProjects.CachedEntries;
+        var broken = $"public class B{Guid.NewGuid():N} : NotAType {{ }}";
+        for (var i = 0; i < 3; i++)
+        {
+            var (solution, _) = Build(broken, out _, $"f{i}");
+            await GeneratorProjects.ResolveAsync(solution, cache);
+        }
+        Assert.AreEqual(entries, GeneratorProjects.CachedEntries);
+
+        // A transient failure (the cache location is a file) is not remembered: the next job succeeds.
+        var blocked = Path.Combine(_root, "blocked");
+        var marker = Guid.NewGuid().ToString("N");
+        var (retry, consumer) = Build(UniqueGenerator(marker), out _, "retry");
+        File.WriteAllText(blocked, "x");
+        var messages = new List<string>();
+        await GeneratorProjects.ResolveAsync(retry, blocked, messages.Add);
+        Assert.IsTrue(messages.Any(m => m.Contains("could not be built", StringComparison.Ordinal)), string.Join("; ", messages));
+        Assert.AreEqual(entries, GeneratorProjects.CachedEntries, "the failed entry is dropped");
+        File.Delete(blocked);
+
+        var resolved = await GeneratorProjects.ResolveAsync(retry, blocked);
+        Assert.IsTrue(await GeneratesAsync(resolved, consumer, marker));
+    }
+
+    [TestMethod]
+    public async Task ADependency_IsCopiedIntoTheEntry_SoRemovingTheOriginalDoesNotBreakIt()
+    {
+        var marker = Guid.NewGuid().ToString("N");
+        var depName = "SextantCopy" + marker;
+        var depDirectory = Path.Combine(_root, "packages", "dep", "lib", "netstandard2.0");
+        Directory.CreateDirectory(depDirectory);
+        var depPath = Path.Combine(depDirectory, depName + ".dll");
+        var depCompilation = CSharpCompilation.Create(
+            depName,
+            [CSharpSyntaxTree.ParseText($"namespace {depName} {{ public static class Dep {{ public static string Text => \"copied\"; }} }}")],
+            ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!).Split(Path.PathSeparator).Select(p => MetadataReference.CreateFromFile(p)),
+            new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
+        Assert.IsTrue(depCompilation.Emit(depPath).Success);
+        var cache = Path.Combine(_root, "cache");
+        var (solution, consumerId) = Build(
+            UniqueGenerator(marker, $"{depName}.Dep.Text"), out _, generatorReferences: [MetadataReference.CreateFromFile(depPath)]);
+
+        var resolved = await GeneratorProjects.ResolveAsync(solution, cache);
+        File.Delete(depPath);
+
+        var entryDirectory = Directory.GetDirectories(cache).Single();
+        Assert.IsTrue(File.Exists(Path.Combine(entryDirectory, "deps", depName + ".dll")), "the dependency lives in the entry");
+        var consumer = resolved.GetProject(consumerId)!;
+        var driver = CSharpGeneratorDriver.Create(consumer.AnalyzerReferences.SelectMany(r => r.GetGenerators(LanguageNames.CSharp)).ToArray());
+        driver = (CSharpGeneratorDriver)driver.RunGeneratorsAndUpdateCompilation((await consumer.GetCompilationAsync())!, out _, out _);
+        Assert.IsTrue(driver.GetRunResult().GeneratedTrees.Single().GetText().ToString().Contains("copied", StringComparison.Ordinal));
+    }
+
+    [TestMethod]
+    public async Task ADependencyWithChangedBytes_BuildsAnotherEntry()
+    {
+        var marker = Guid.NewGuid().ToString("N");
+        var depName = "SextantChg" + marker;
+        var cache = Path.Combine(_root, "cache");
+        var contexts = GeneratorProjects.LoadedContexts;
+        foreach (var text in new[] { "one", "two" })
+        {
+            var depDirectory = Path.Combine(_root, "packages-" + text, "lib", "netstandard2.0");
+            Directory.CreateDirectory(depDirectory);
+            var depPath = Path.Combine(depDirectory, depName + ".dll");
+            var depCompilation = CSharpCompilation.Create(
+                depName,
+                [CSharpSyntaxTree.ParseText($"namespace {depName} {{ public static class Dep {{ public static string Text => \"{text}\"; }} }}")],
+                ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!).Split(Path.PathSeparator).Select(p => MetadataReference.CreateFromFile(p)),
+                new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
+            Assert.IsTrue(depCompilation.Emit(depPath).Success);
+            var (solution, _) = Build(
+                UniqueGenerator(marker, $"{depName}.Dep.Text"), out _, text, generatorReferences: [MetadataReference.CreateFromFile(depPath)]);
+            await GeneratorProjects.ResolveAsync(solution, cache);
+        }
+
+        Assert.AreEqual(contexts + 2, GeneratorProjects.LoadedContexts, "the dependency's content is part of the hash");
+    }
+
+    [TestMethod]
+    public void OnlyANuGetReferenceAssemblyLayout_IsFilteredAsAReferencePath()
+    {
+        var sep = Path.DirectorySeparatorChar;
+        string P(params string[] parts) => sep + string.Join(sep, parts);
+
+        Assert.IsTrue(GeneratorProjects.IsReferenceAssemblyPath(P("packs", "Microsoft.NETCore.App.Ref", "8.0.0", "ref", "net8.0", "System.dll")));
+        Assert.IsTrue(GeneratorProjects.IsReferenceAssemblyPath(P("pkg", "ref", "netstandard2.0", "A.dll")));
+        Assert.IsFalse(GeneratorProjects.IsReferenceAssemblyPath(P("work", "ref", "src", "bin", "A.dll")));
+        Assert.IsFalse(GeneratorProjects.IsReferenceAssemblyPath(P("work", "ref", "A.dll")));
+        Assert.IsFalse(GeneratorProjects.IsReferenceAssemblyPath(P("pkg", "lib", "netstandard2.0", "A.dll")));
+    }
+
+    [TestMethod]
+    public async Task TheFirstUseAfterARestart_SweepsUnusedHashDirectories_AndTmpFiles()
+    {
+        var cache = Path.Combine(_root, "cache");
+        var stale = Path.Combine(cache, new string('a', 32));
+        Directory.CreateDirectory(stale);
+        File.WriteAllText(Path.Combine(stale, "x.dll"), "x");
+        var other = Path.Combine(cache, "keepme");
+        Directory.CreateDirectory(other);
+        File.WriteAllText(Path.Combine(cache, "left.over.tmp"), "x");
+        var (solution, _) = Build(UniqueGenerator(Guid.NewGuid().ToString("N")), out _);
+
+        await GeneratorProjects.ResolveAsync(solution, cache);
+
+        Assert.IsFalse(Directory.Exists(stale), "an unused hash directory is removed");
+        Assert.IsFalse(File.Exists(Path.Combine(cache, "left.over.tmp")));
+        Assert.IsTrue(Directory.Exists(other), "only hash-named directories are touched");
     }
 }
