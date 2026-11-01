@@ -26,6 +26,28 @@ public static class GitRemoteResolver
         return null;
     }
 
+    /// <summary>
+    /// The outermost of the git roots that contain <paramref name="paths"/> (each path's nearest root) and enclose the
+    /// first path's root, so a list whose first entry sits inside a submodule still resolves to the superproject. A root
+    /// unrelated to the first one is ignored.
+    /// </summary>
+    public static string? ResolveOutermostGitRoot(IEnumerable<string> paths)
+    {
+        var roots = new List<string>();
+        foreach (var path in paths)
+        {
+            var root = ResolveGitRoot(path);
+            if (root != null && !roots.Contains(root, StringComparer.Ordinal))
+                roots.Add(root);
+        }
+        if (roots.Count == 0) return null;
+
+        return roots
+            .Where(r => roots[0].StartsWith(Path.TrimEndingDirectorySeparator(r) + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+            .OrderBy(r => r.Length)
+            .FirstOrDefault() ?? roots[0];
+    }
+
     public static string? ReadOriginRemote(string gitRoot)
     {
         try

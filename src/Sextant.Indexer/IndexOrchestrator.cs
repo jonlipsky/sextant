@@ -214,17 +214,12 @@ public sealed class IndexOrchestrator
 
         // Discover submodules from the repo root
         var submodules = new List<SubmoduleInfo>();
-        string? repoRoot = null;
-        var firstProjectPath = solution.Projects.FirstOrDefault(p => p.FilePath != null)?.FilePath;
-        if (firstProjectPath != null)
+        var repoRoot = ResolveRepoRoot(solution, snapshotContext);
+        if (repoRoot != null)
         {
-            repoRoot = GitRemoteResolver.ResolveGitRoot(firstProjectPath);
-            if (repoRoot != null)
-            {
-                submodules = await SubmoduleDiscoverer(repoRoot);
-                if (submodules.Count > 0)
-                    _log?.Invoke($"Discovered {submodules.Count} submodule(s)");
-            }
+            submodules = await SubmoduleDiscoverer(repoRoot);
+            if (submodules.Count > 0)
+                _log?.Invoke($"Discovered {submodules.Count} submodule(s)");
         }
 
         // Phase 9 snapshot coordination. Resolve the repository/commit coordinates (git, or injected for
@@ -2038,6 +2033,18 @@ public sealed class IndexOrchestrator
                     ?? throw new InvalidOperationException("A rebuild must record its original identity.")
             }
         };
+    }
+
+    // The root submodule discovery starts at: the worker's checkout when known, else the outermost git root over the
+    // solution and its projects, so it never depends on which project is listed first (issue #373).
+    internal static string? ResolveRepoRoot(Solution solution, SnapshotContext? ctx)
+    {
+        if (!string.IsNullOrEmpty(ctx?.CheckoutDir) && GitRemoteResolver.ResolveGitRoot(ctx.CheckoutDir) is { } checkoutRoot)
+            return checkoutRoot;
+        var paths = solution.FilePath is { Length: > 0 } sln
+            ? new[] { sln }.Concat(solution.Projects.Select(p => p.FilePath).OfType<string>())
+            : solution.Projects.Select(p => p.FilePath).OfType<string>();
+        return GitRemoteResolver.ResolveOutermostGitRoot(paths);
     }
 
     /// <summary>
