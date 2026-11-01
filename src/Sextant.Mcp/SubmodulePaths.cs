@@ -45,13 +45,21 @@ internal static class SubmodulePaths
         return best;
     }
 
-    public static string Message(string path, Hit hit) =>
+    /// <summary>The pointer. A provider the caller may not read is never named (not even by URL or commit): only the
+    /// submodule path, which the caller's own checkout already shows.</summary>
+    public static string Message(string path, Hit hit, IReadAuthorizer authorizer) =>
+        authorizer.AuthorizeRepository(0, hit.ProviderRepositoryUrl).Allowed
+            ? Message(path, hit)
+            : $"'{Normalize(path)}' is inside the submodule '{hit.SubmodulePath}', which is indexed as its own repository, " +
+              "not in this one, so this repository has no rows for it.";
+
+    private static string Message(string path, Hit hit) =>
         $"'{Normalize(path)}' is inside the submodule '{hit.SubmodulePath}', which this repository pins at " +
         $"{hit.ProviderRepositoryUrl} (commit {(hit.ProviderCommitSha.Length > 12 ? hit.ProviderCommitSha[..12] : hit.ProviderCommitSha)}). " +
         $"Its files are indexed under that repository, not here: ask for '{hit.ProviderRelativePath}' in {hit.ProviderRepositoryUrl}.";
 
-    public static string Error(string path, Hit hit, SnapshotProvenance? provenance) =>
-        ResponseBuilder.BuildError(ResponseBuilder.PathInSubmoduleCode, Message(path, hit), provenance);
+    public static string Error(string path, Hit hit, IReadAuthorizer authorizer, SnapshotProvenance? provenance) =>
+        ResponseBuilder.BuildError(ResponseBuilder.PathInSubmoduleCode, Message(path, hit, authorizer), provenance);
 
     private static string Normalize(string path)
     {

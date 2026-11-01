@@ -70,7 +70,8 @@ public static class FindReferencesTool
         }
 
         // An unknown project/solution or an unrecognized scope is an error, never a silently unfiltered query.
-        var scopeFilter = ScopeResolver.Resolve(scope, conn, readContext.Scope, readContext.Paths);
+        var scopeFilter = ScopeResolver.Resolve(scope, conn, readContext.Scope, readContext.Paths,
+            dbProvider.Authorizer);
         if (scopeFilter.Error != null)
             return scopeFilter.ErrorResponse(readContext.Provenance);
 

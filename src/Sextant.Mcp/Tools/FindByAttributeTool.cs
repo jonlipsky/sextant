@@ -31,7 +31,8 @@ public static class FindByAttributeTool
 
         // An unknown project/solution, an unrecognized scope or (remote) an absolute path is an error, never a
         // silently unfiltered query.
-        var scopeFilter = ScopeResolver.Resolve(scope, conn, readContext.Scope, readContext.Paths);
+        var scopeFilter = ScopeResolver.Resolve(scope, conn, readContext.Scope, readContext.Paths,
+            dbProvider.Authorizer);
         if (scopeFilter.Error != null)
             return scopeFilter.ErrorResponse(readContext.Provenance);
 
