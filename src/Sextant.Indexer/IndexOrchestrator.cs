@@ -1264,6 +1264,31 @@ public sealed class IndexOrchestrator
                 }
             }
 
+            // The legacy path drops unbound names, so measure them with the document walk (counts only, nothing
+            // persisted) to let binding health mark a degraded project partial (issue #234).
+            if (refProjectId is { } countedProjectId &&
+                (bindingProjectPaths.ContainsKey(countedProjectId) || providerBindingPaths.ContainsKey(countedProjectId)))
+            {
+                var counter = new BindingCounter();
+                foreach (var syntaxTree in compilation.SyntaxTrees)
+                {
+                    ThrowIfCancelled();
+                    if (SymbolExtractor.IsGeneratedFile(syntaxTree.FilePath))
+                        continue;
+                    var countingSet = new DocumentContributionSet();
+                    DocumentSemanticExtractor.ExtractDocument(
+                        await syntaxTree.GetRootAsync(cancellationToken), compilation.GetSemanticModel(syntaxTree),
+                        syntaxTree.FilePath, countingSet, includeDataflow: false);
+                    counter.NamesExamined += countingSet.NamesExamined;
+                    counter.UnboundNames += countingSet.UnboundNames;
+                    counter.UnboundInvocations += countingSet.UnboundInvocations;
+                }
+                if (bindingProjectPaths.ContainsKey(countedProjectId))
+                    bindingCounts[countedProjectId] = counter;
+                else
+                    providerBindingCounts[countedProjectId] = counter;
+            }
+
             _log?.Invoke($"  {project.Name}: references extracted");
             session.Release();
         }
