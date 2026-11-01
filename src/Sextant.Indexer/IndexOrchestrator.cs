@@ -175,6 +175,10 @@ public sealed class IndexOrchestrator
         // indexes, and the binding counts persisted for each, folded into the recorded coverage at publish.
         var bindingProjectPaths = new Dictionary<long, (string Path, string? TargetFramework, string? CheckoutPath)>();
         var bindingCounts = new Dictionary<long, BindingCounter>();
+        // The same for the provider project versions this run EXTRACTS (a reused provider keeps its recorded
+        // block), kept apart so the parent's binding block never counts a provider's projects (issue #233).
+        var providerBindingPaths = new Dictionary<long, (string Path, string? TargetFramework)>();
+        var providerBindingCounts = new Dictionary<long, BindingCounter>();
         // Logical-project rows this run is responsible for (re)building. For a full index it is every
         // registered project; for an incremental rebuild the orchestrator is handed a canonical-id
         // filter naming the invalidated project closure, and only those projects are reset and
@@ -579,7 +583,10 @@ public sealed class IndexOrchestrator
                 providerProjectInfo[projectId] = (providerSnapId, providerRepoId, containingSubmodule.CommitSha, containingSubmodule.IsDirty);
                 projectRoslynToId[project.Id] = projectId;
                 if (extractThisProject)
+                {
                     processSet.Add(project.Id);
+                    providerBindingPaths[projectId] = (identity.RepoRelativePath, identity.TargetFramework);
+                }
                 _log?.Invoke($"  Submodule project: {project.Name} (id={projectId}, provider_snapshot={providerSnapId}, pin={containingSubmodule.CommitSha[..Math.Min(8, containingSubmodule.CommitSha.Length)]}, dirty={containingSubmodule.IsDirty})");
                 continue;
             }
@@ -1082,6 +1089,15 @@ public sealed class IndexOrchestrator
                 {
                     if (!bindingCounts.TryGetValue(ownerProjectId, out var counter))
                         bindingCounts[ownerProjectId] = counter = new BindingCounter();
+                    counter.NamesExamined += contributions.NamesExamined;
+                    counter.UnboundNames += contributions.UnboundNames;
+                    counter.UnboundInvocations += contributions.UnboundInvocations;
+                    counter.CandidateOccurrences += candidateOccurrences;
+                }
+                else if (providerBindingPaths.ContainsKey(ownerProjectId))
+                {
+                    if (!providerBindingCounts.TryGetValue(ownerProjectId, out var counter))
+                        providerBindingCounts[ownerProjectId] = counter = new BindingCounter();
                     counter.NamesExamined += contributions.NamesExamined;
                     counter.UnboundNames += contributions.UnboundNames;
                     counter.UnboundInvocations += contributions.UnboundInvocations;
@@ -1641,7 +1657,8 @@ public sealed class IndexOrchestrator
             // bind makes the verdict partial, because references and calls inside it may be missing. So is what the
             // time budget left out (issue #245), whose reason goes first.
             var publishCtx = WithTimeBudget(
-                WithBindingHealth(effectiveCtx, bindingProjectPaths, bindingCounts),
+                WithBindingHealth(effectiveCtx, bindingProjectPaths, bindingCounts,
+                    providerSubmodulePaths.Values.SelectMany(p => p).ToList()),
                 solution, solutionMembership, projectRoslynToId, budgetNotIndexed, budgetNotExtracted);
             if (publishCtx.Coverage is { TimeBudget: not null } budgeted)
                 _log?.Invoke($"  {budgeted.Reasons[0]}");
@@ -1695,7 +1712,15 @@ public sealed class IndexOrchestrator
                 if (effectiveCtx != null)
                     RecordProviderCoverage(conn, providerSnapshotId,
                         providerSubmodulePaths.GetValueOrDefault(providerSnapshotId), effectiveCtx, completedAt,
-                        rebuildOriginalIdentities[providerSnapshotId]);
+                        rebuildOriginalIdentities[providerSnapshotId],
+                        providerBindingCounts
+                            .Where(c => providerProjectInfo.TryGetValue(c.Key, out var info) && info.snapshotId == providerSnapshotId)
+                            .Select(c => new ProjectBindingCounts(
+                                providerBindingPaths[c.Key].Path, providerBindingPaths[c.Key].TargetFramework,
+                                c.Value.NamesExamined, c.Value.UnboundNames, c.Value.UnboundInvocations,
+                                c.Value.CandidateOccurrences))
+                            .ToList(),
+                        providerSubmodulePaths.Values.SelectMany(p => p).ToList());
             }
         }
 
@@ -2070,9 +2095,19 @@ public sealed class IndexOrchestrator
 
     internal static SnapshotContext WithBindingHealth(
         SnapshotContext ctx, IReadOnlyDictionary<long, (string Path, string? TargetFramework, string? CheckoutPath)> projectPaths,
-        IReadOnlyDictionary<long, BindingCounter> counts)
+        IReadOnlyDictionary<long, BindingCounter> counts, IReadOnlyCollection<string>? providerPaths = null)
     {
-        if (ctx.Coverage is not { } coverage || (counts.Count == 0 && ctx.ProjectLoadIssues is not { Count: > 0 }))
+        // A provider's projects belong to its own coverage row (issue #233), so a load issue under its submodule path
+        // is reported there, never again in the parent's block.
+        var loadIssues = ctx.ProjectLoadIssues;
+        if (loadIssues is { Count: > 0 } && providerPaths is { Count: > 0 })
+        {
+            var prefixes = providerPaths.Select(p => NormalizeSubmodulePath(p) + "/").ToList();
+            loadIssues = loadIssues
+                .Where(i => !prefixes.Any(p => i.Key.Replace('\\', '/').StartsWith(p, StringComparison.Ordinal)))
+                .ToDictionary(i => i.Key, i => i.Value, StringComparer.Ordinal);
+        }
+        if (ctx.Coverage is not { } coverage || (counts.Count == 0 && loadIssues is not { Count: > 0 }))
             return ctx;
         var projects = counts
             .Where(c => projectPaths.ContainsKey(c.Key))
@@ -2083,7 +2118,7 @@ public sealed class IndexOrchestrator
                     path, tfm, c.Value.NamesExamined, c.Value.UnboundNames, c.Value.UnboundInvocations,
                     c.Value.CandidateOccurrences, checkoutPath);
             });
-        var health = BindingHealthBuilder.Build(projects, ctx.ProjectLoadIssues, coverage.AllExclusions ?? coverage.Exclusions);
+        var health = BindingHealthBuilder.Build(projects, loadIssues, coverage.AllExclusions ?? coverage.Exclusions);
         return ctx with { Coverage = BindingHealthBuilder.Apply(coverage, health) };
     }
 
@@ -2152,15 +2187,24 @@ public sealed class IndexOrchestrator
     /// complete. Record-if-absent, never throws: a provider re-opened by #53 growth republishes the SAME
     /// snapshot id, and its first-publish verdict stays authoritative (coverage is immutable). A rebuilt
     /// provider had its stale row dropped when it was re-staged, so it records afresh.
+    /// Binding health (issue #233) is measured like the parent's: <paramref name="bindingCounts"/> are the provider
+    /// project versions this run extracted (provider-relative paths), the load issues under the submodule path(s)
+    /// are re-keyed provider-relative, and the provider's own exclusions decide which degraded versions are not gaps.
+    /// A provider reused from an earlier run is never in this set, so its stored block stays; one with no counts and
+    /// no issues records no block, which reads as unknown. A load issue goes to the innermost provider whose path
+    /// prefixes it (<paramref name="allProviderPaths"/>). A grown provider (#53) already has a row: the new projects'
+    /// block is merged into it and the verdict updated.
     /// </summary>
     internal static void RecordProviderCoverage(
         SqliteConnection conn, long providerSnapshotId, IEnumerable<string>? submodulePaths, SnapshotContext ctx,
-        long recordedAt, string? originalIdentityHash = null)
+        long recordedAt, string? originalIdentityHash = null, IReadOnlyList<ProjectBindingCounts>? bindingCounts = null,
+        IReadOnlyCollection<string>? allProviderPaths = null)
     {
         if (ctx.ProviderCoverage is not { } computed)
             return;
+        var paths = (submodulePaths ?? []).ToList();
         var verdicts = new List<SnapshotCoverage>();
-        foreach (var path in submodulePaths ?? [])
+        foreach (var path in paths)
             verdicts.Add(computed.TryGetValue(path, out var coverage)
                 ? coverage
                 : new SnapshotCoverage
@@ -2174,8 +2218,45 @@ public sealed class IndexOrchestrator
                 Verdict = SnapshotCoverageVerdict.Partial,
                 Reasons = ["the provider's submodule path is unknown, so its coverage cannot be proven complete."]
             });
+        var merged = WorstOf(verdicts);
+        if (bindingCounts != null)
+        {
+            var own = paths.Select(p => NormalizeSubmodulePath(p) + "/").ToList();
+            var all = (allProviderPaths ?? paths).Select(p => NormalizeSubmodulePath(p) + "/").ToList();
+            var issues = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var (key, issue) in ctx.ProjectLoadIssues ?? new Dictionary<string, string>())
+            {
+                var normalized = key.Replace('\\', '/');
+                // Only the innermost provider owning the path takes the issue (nested submodules).
+                var innermost = all
+                    .Where(p => normalized.StartsWith(p, StringComparison.Ordinal))
+                    .OrderByDescending(p => p.Length)
+                    .FirstOrDefault();
+                if (innermost != null && own.Contains(innermost))
+                    issues[normalized[innermost.Length..]] = issue;
+            }
+            if (bindingCounts.Count > 0 || issues.Count > 0)
+            {
+                var exclusions = verdicts.SelectMany(v => v.AllExclusions ?? v.Exclusions ?? []).ToList();
+                var health = BindingHealthBuilder.Build(bindingCounts, issues, exclusions);
+                var store = new SnapshotCoverageStore(conn);
+                // A provider re-opened and republished with new projects (issue #53) keeps its row, but the new
+                // projects' binding is folded in so a real unbound problem in them cannot read as complete.
+                if (store.Get(providerSnapshotId) is { } recorded)
+                {
+                    var combined = recorded.Binding is { } before ? BindingHealthBuilder.Merge(before, health) : health;
+                    var basis = recorded with
+                    {
+                        Reasons = recorded.Reasons.Where(r => !BindingHealthBuilder.IsBindingReason(r)).ToList()
+                    };
+                    store.Update(providerSnapshotId, BindingHealthBuilder.Apply(basis, combined));
+                    return;
+                }
+                merged = BindingHealthBuilder.Apply(merged, health);
+            }
+        }
         new SnapshotCoverageStore(conn).Record(providerSnapshotId,
-            WithRebuildProvenance(ctx, WorstOf(verdicts), originalIdentityHash)!, recordedAt);
+            WithRebuildProvenance(ctx, merged, originalIdentityHash)!, recordedAt);
     }
 
     // The worst of several coverage verdicts for one provider: complete only when every contributing path is

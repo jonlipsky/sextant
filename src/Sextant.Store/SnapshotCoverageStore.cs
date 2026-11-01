@@ -43,6 +43,23 @@ public sealed class SnapshotCoverageStore(SqliteConnection connection)
     }
 
     /// <summary>
+    /// Replaces the coverage of a snapshot that already has a row. Only for a provider snapshot re-opened and
+    /// republished with new projects (issue #53), whose verdict must include them. Returns true when a row changed.
+    /// </summary>
+    public bool Update(long snapshotId, SnapshotCoverage coverage)
+    {
+        if (coverage.Verdict is not (SnapshotCoverageVerdict.Complete or SnapshotCoverageVerdict.Partial))
+            throw new ArgumentException($"Unknown coverage verdict '{coverage.Verdict}'.", nameof(coverage));
+
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "UPDATE snapshot_coverage SET verdict = @verdict, summary_json = @json WHERE snapshot_id = @id;";
+        cmd.Parameters.AddWithValue("@id", snapshotId);
+        cmd.Parameters.AddWithValue("@verdict", coverage.Verdict);
+        cmd.Parameters.AddWithValue("@json", JsonSerializer.Serialize(coverage, JsonOptions));
+        return cmd.ExecuteNonQuery() == 1;
+    }
+
+    /// <summary>
     /// Drops the coverage recorded for <paramref name="snapshotId"/> — only for a snapshot identity that is
     /// about to be REBUILT from scratch (a prior non-complete generation), whose old coverage is stale.
     /// </summary>

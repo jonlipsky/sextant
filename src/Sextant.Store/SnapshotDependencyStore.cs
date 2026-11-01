@@ -88,6 +88,34 @@ public sealed class SnapshotDependencyStore(SqliteConnection connection)
         return ReadEdges(cmd);
     }
 
+    /// <summary>
+    /// How many distinct submodule providers of a consumer snapshot recorded a degraded project in their coverage
+    /// binding block (issue #233). One constant query; a catalog without the coverage table, a provider with no row,
+    /// an old row with no binding block and an unreadable summary all count as not degraded.
+    /// </summary>
+    public int CountDegradedProviders(long consumerSnapshotId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT COUNT(DISTINCT d.provider_snapshot_id)
+            FROM snapshot_dependencies d
+            JOIN snapshot_coverage c ON c.snapshot_id = d.provider_snapshot_id
+            WHERE d.consumer_snapshot_id = @id
+              AND CASE WHEN json_valid(c.summary_json)
+                       THEN json_extract(c.summary_json, '$.binding.projects_degraded') END > 0;
+            """;
+        cmd.Parameters.AddWithValue("@id", consumerSnapshotId);
+        try
+        {
+            return Convert.ToInt32(cmd.ExecuteScalar());
+        }
+        catch (SqliteException ex) when (ex.SqliteErrorCode == 1)
+        {
+            // SQLITE_ERROR: a catalog opened before migration 022 has no snapshot_coverage table.
+            return 0;
+        }
+    }
+
     /// <summary>Every consumer edge pinning a given provider project version (reverse dependency).</summary>
     public List<SnapshotDependencyEdge> GetByProviderProject(long providerProjectId)
     {

@@ -101,16 +101,7 @@ public static class BindingHealthBuilder
                 entries.Add(new ProjectBindingHealth { Project = project, LoadIssue = issue });
         }
 
-        var listed = entries
-            .Where(e => e.UnboundNames > 0 || e.UnboundInvocations > 0 || e.LoadIssue is not null)
-            .OrderByDescending(e => e.Degraded && !e.Excluded)
-            .ThenByDescending(e => e.Degraded)
-            .ThenByDescending(e => e.UnboundNames)
-            .ThenByDescending(e => e.UnboundInvocations)
-            .ThenBy(e => e.Project, StringComparer.Ordinal)
-            .ThenBy(e => e.TargetFramework, StringComparer.Ordinal)
-            .Take(BindingHealth.MaxProjects)
-            .ToList();
+        var listed = Listed(entries);
 
         return new BindingHealth
         {
@@ -122,6 +113,41 @@ public static class BindingHealthBuilder
             Projects = listed
         };
     }
+
+    private static List<ProjectBindingHealth> Listed(IEnumerable<ProjectBindingHealth> entries) => entries
+        .Where(e => e.UnboundNames > 0 || e.UnboundInvocations > 0 || e.LoadIssue is not null)
+        .OrderByDescending(e => e.Degraded && !e.Excluded)
+        .ThenByDescending(e => e.Degraded)
+        .ThenByDescending(e => e.UnboundNames)
+        .ThenByDescending(e => e.UnboundInvocations)
+        .ThenBy(e => e.Project, StringComparer.Ordinal)
+        .ThenBy(e => e.TargetFramework, StringComparer.Ordinal)
+        .Take(BindingHealth.MaxProjects)
+        .ToList();
+
+    /// <summary>
+    /// Adds the health of projects an earlier measurement did not cover (a provider grown by a later parent, issue
+    /// #53/#233) to <paramref name="existing"/>. The two cover disjoint project versions, so the counts add up.
+    /// </summary>
+    public static BindingHealth Merge(BindingHealth existing, BindingHealth added)
+    {
+        ArgumentNullException.ThrowIfNull(existing);
+        ArgumentNullException.ThrowIfNull(added);
+        return new BindingHealth
+        {
+            NamesExamined = existing.NamesExamined + added.NamesExamined,
+            UnboundNames = existing.UnboundNames + added.UnboundNames,
+            UnboundInvocations = existing.UnboundInvocations + added.UnboundInvocations,
+            CandidateOccurrences = existing.CandidateOccurrences + added.CandidateOccurrences,
+            ProjectsDegraded = existing.ProjectsDegraded + added.ProjectsDegraded,
+            Projects = Listed(existing.Projects.Concat(added.Projects))
+        };
+    }
+
+    /// <summary>True for the reason <see cref="Apply"/> adds, so a re-measurement can replace it.</summary>
+    public static bool IsBindingReason(string reason) =>
+        reason.StartsWith("Code in ", StringComparison.Ordinal) &&
+        reason.Contains(" project(s) did not fully compile on the indexer", StringComparison.Ordinal);
 
     /// <summary>
     /// Attaches <paramref name="health"/> to <paramref name="coverage"/>. When any project is degraded the verdict

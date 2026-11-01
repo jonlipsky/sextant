@@ -199,6 +199,13 @@ public sealed record SnapshotProvenance
     public SnapshotCoverage? Coverage { get; init; }
 
     /// <summary>
+    /// How many submodule providers this snapshot depends on whose own recorded coverage has a degraded, non-excluded
+    /// project (issue #233). Unknown providers (no recorded binding block, e.g. built before it existed) are not
+    /// counted. It never changes <see cref="Completeness"/>: that stays the snapshot's own verdict.
+    /// </summary>
+    public int DegradedProviders { get; init; }
+
+    /// <summary>
     /// The repository the read was served from, stamped ONLY when the request named none and the host selected one
     /// for it (<see cref="RepositorySelection"/> = "implicit" or "inferred"); null otherwise, so an explicitly selected
     /// or local read is byte-identical.
