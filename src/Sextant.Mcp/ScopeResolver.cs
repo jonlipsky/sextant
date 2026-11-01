@@ -13,7 +13,8 @@ internal static class ScopeResolver
     /// <see cref="FederatedReadContext.Paths"/>.
     /// </summary>
     public static ScopeFilter Resolve(
-        string? scope, SqliteConnection conn, SnapshotReadScope? pinnedScope = null, PathPresenter? paths = null)
+        string? scope, SqliteConnection conn, SnapshotReadScope? pinnedScope, PathPresenter? paths,
+        IReadAuthorizer authorizer)
     {
         paths ??= PathPresenter.Local;
         if (string.IsNullOrEmpty(scope) || scope == "all")
@@ -31,7 +32,7 @@ internal static class ScopeResolver
                 && SubmodulePaths.Find(conn, pinnedScope, file) is { } hit)
                 return new ScopeFilter
                 {
-                    Error = SubmodulePaths.Message(file, hit), ErrorCode = ResponseBuilder.PathInSubmoduleCode
+                    Error = SubmodulePaths.Message(file, hit, authorizer), ErrorCode = ResponseBuilder.PathInSubmoduleCode
                 };
             return new ScopeFilter { FilePath = file, Paths = paths };
         }

@@ -17,6 +17,7 @@ public class SubmodulePathHttpTests
     private const string Parent = "https://github.com/acme/parent";
     private const string Provider = "https://github.com/acme/mix";
     private const string User = "user-parent";
+    private const string ParentOnlyUser = "user-parent-only";
 
     private static Harness _host = null!;
 
@@ -26,9 +27,12 @@ public class SubmodulePathHttpTests
         _host = await Harness.StartAsync(
             configure: o => o with { RequireRepositorySelection = true },
             seed: Seed);
-        using var response = await _host.ControlAsync(HttpMethod.Put, "/control/grants/self", ControlToken,
-            _host.UserAssertion(sub: User), JsonSerializer.Serialize(new { repository = Parent }));
-        Assert.AreEqual(System.Net.HttpStatusCode.OK, response.StatusCode, await response.Content.ReadAsStringAsync());
+        foreach (var (sub, repository) in new[] { (User, Parent), (User, Provider), (ParentOnlyUser, Parent) })
+        {
+            using var response = await _host.ControlAsync(HttpMethod.Put, "/control/grants/self", ControlToken,
+                _host.UserAssertion(sub: sub), JsonSerializer.Serialize(new { repository }));
+            Assert.AreEqual(System.Net.HttpStatusCode.OK, response.StatusCode, await response.Content.ReadAsStringAsync());
+        }
     }
 
     [ClassCleanup]
@@ -50,6 +54,29 @@ public class SubmodulePathHttpTests
 
         Assert.IsTrue(call.IsError, call.Body.ToString());
         AssertPointsAtProvider(call.Body);
+    }
+
+    [TestMethod]
+    public async Task ACallerWithoutAReadOfTheProvider_IsToldOnlyTheSubmodulePath()
+    {
+        foreach (var (tool, arguments) in new[]
+                 {
+                     ("get_file_symbols", """{"file_path":"libs/mix/src/App/App.cs"}"""),
+                     ("find_symbol", """{"name":"Type0","scope":"file:libs/mix/src/App/App.cs"}""")
+                 })
+        {
+            var call = await _host.CallAsync(tool, arguments[..^1] + ",\"repository\":\"acme/parent\"}", DelegateToken,
+                _host.UserAssertion(sub: ParentOnlyUser));
+
+            Assert.IsTrue(call.IsError, call.Body.ToString());
+            var error = call.Body.GetProperty("meta").GetProperty("error");
+            Assert.AreEqual("path_in_submodule", error.GetProperty("code").GetString(), call.Body.ToString());
+            var message = error.GetProperty("message").GetString()!;
+            StringAssert.Contains(message, "libs/mix");
+            Assert.IsFalse(message.Contains("acme/mix", StringComparison.OrdinalIgnoreCase), message);
+            Assert.IsFalse(message.Contains("mixcommit", StringComparison.Ordinal), message);
+            Assert.IsFalse(message.Contains("'src/App/App.cs'", StringComparison.Ordinal), message);
+        }
     }
 
     [TestMethod]

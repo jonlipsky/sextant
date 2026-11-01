@@ -110,14 +110,15 @@ public class ScopeFilterTests
         JsonDocument.Parse(json).RootElement.GetProperty("meta").GetProperty("result_count").GetInt32();
 
     [TestMethod]
-    public void FindSymbol_InvalidScopeFormat_ReturnsResults()
+    [DataRow("invalid_format")]
+    [DataRow("project:No.Such.Project")]
+    [DataRow("solution:no/such.sln")]
+    public void FindSymbol_UnresolvableScope_IsAnInvalidArgumentError(string scope)
     {
-        // Invalid scope format should degrade gracefully (return all results)
         var result = FindSymbolTool.FindSymbol(_fixture.DbProvider, "BaseService",
-            fuzzy: true, scope: "invalid_format").GetAwaiter().GetResult();
-        var doc = JsonDocument.Parse(result);
-        var meta = doc.RootElement.GetProperty("meta");
-        // Should not crash; may return all results or empty depending on implementation
-        Assert.IsTrue(meta.TryGetProperty("result_count", out _));
+            fuzzy: true, scope: scope).GetAwaiter().GetResult();
+        var error = JsonDocument.Parse(result).RootElement.GetProperty("meta").GetProperty("error");
+        Assert.AreEqual("invalid_argument", error.GetProperty("code").GetString(), result);
+        StringAssert.Contains(error.GetProperty("message").GetString(), scope.Contains(':') ? scope[(scope.IndexOf(':') + 1)..] : scope);
     }
 }
