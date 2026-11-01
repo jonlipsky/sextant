@@ -133,10 +133,12 @@ public sealed class DefaultBranchFreshnessTracker(TimeProvider time, TimeSpan st
                 result.Add(new DefaultBranchFreshness { Repository = key, Unknown = true });
                 continue;
             }
+            var behind = !SameCommit(head.CommitSha, remoteHead!);
             result.Add(new DefaultBranchFreshness
             {
                 Repository = key,
-                LagSeconds = SameCommit(head.CommitSha, remoteHead!) ? 0
+                BehindRemote = behind,
+                LagSeconds = !behind ? 0
                     : since is long s ? Math.Max(0, (now - s) / 1000.0) : 0
             });
         }

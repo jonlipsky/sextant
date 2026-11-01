@@ -2707,6 +2707,46 @@ For the same reason a user caller (`act=user` assertion) on the control plane is
 `403 caller_not_allowed` on metrics, audit and pilot (issue #193), so it can never read other callers' audit
 rows.
 
+- **`GET /control/report`** is the operator status report the `sextant` app emails daily: which repositories are
+  indexed and how much. Authorization is exactly `/control/metrics`: the control token; an assertion-less call
+  (the operator) sees every repository; an application caller sees only the repositories its tenant holds a
+  tenant-wide grant for (`RepositoryGrantKey.IsVisible`; a granted repository the catalog has never seen is listed
+  as `none`); a caller with no tenant sees none; a user caller is `403 caller_not_allowed`. Snake_case JSON, built
+  in memory and sent whole, so it always ends in a complete object. Fields:
+  - `generated_at`, `truncated` (more repositories than `ReportMaxRepositories`, default 500, or the no-code
+    list was cut at `ReportMaxNoCodeJobs`, default 10,000), `counts_complete` (false when the time budget ended
+    before every count was measured; the unmeasured count is left out).
+  - `repositories[]`, ordered and cut by label (ordinal), one per default branch: `repository` (scheme, host, path
+    only, `DefaultBranchFreshnessTracker.LabelOf`), `branch`, `commit` (12 chars; shown for complete, partial,
+    unknown, superseded and pending), `indexed_at`, `verdict` (`complete`, `partial`, `unknown` = complete
+    snapshot with no stored coverage row, `superseded` or `pending` = the default branch's snapshot is not
+    servable, `no_supported_code`, `none`), `projects_indexed`, `projects_excluded` (from the coverage row),
+    `documents`, `symbols` (counted only for complete, partial and unknown), `lag_seconds` (explicit null when
+    unknown), `lag_unknown`, `behind_remote` (true, false or null: the indexed commit against the last remote head
+    the freshness tracker saw; `lag_seconds: 0` alone does not mean current, because the tracker counts lag from
+    when it first saw the difference and a process restart resets that clock), and `gap_reasons`: fixed
+    categories only, at most 5, empty unless partial (`projects_not_loaded`, `projects_partially_loaded`,
+    `projects_not_indexed`, `projects_not_fully_extracted`, `projects_degraded`, `solutions_unusable`,
+    `submodules_unpopulated`, `scan_errors`, `load_failures_unattributed`, `time_budget_exhausted`, `other`).
+    Coverage reason text is never reported.
+  - `totals`: `repositories`, `by_verdict`, `projects_indexed`, `documents`, `symbols` (sums of the measured
+    values) and its own `counts_complete` (false while any counted repository has an unmeasured count). There is
+    no `references` count: counting `occurrences` can stall on a large catalog.
+  - `last_24h`: `jobs_by_outcome` and `repositories_reindexed` for the listed repositories only (the same window and
+    filter as `recent_jobs`), and `truncated` (the list was cut, so these cover part of the caller's repositories).
+    Tool query counts are **not** reported: the service counts queries only since process start.
+  - `storage` (`catalog_bytes`, `catalog_free_ratio`): operator only; omitted for an application caller.
+  - **Cost and bounds.** Reads only, never the write gate. At most one report computes at once; a concurrent
+    request for the same caller scope shares its result, another scope waits its turn. A complete report is cached
+    whole per caller scope for 10 minutes; an incomplete one is not, so the next request continues counting. Each
+    count (`snapshot_projects`, `ix_files_path`, `ix_symbols_project_access`: covering index range counts) is its own
+    short read on its own connection, so no read transaction stays open across counts. A finished count is cached by
+    snapshot at once (immutable; 20,000 entries), and counting goes to the least recently attempted repository
+    first, so one that never finishes cannot starve the rest. The computation belongs to the service: it stops at
+    `ReportBudget` (default 30 s) or shutdown even if the caller is gone; an overrun of the cheap reads answers
+    `503 {"status":"unavailable","reason":"report_timeout"}`. Measured on a read-only copy of the 27 GB catalog (9
+    default snapshots, up to 152 projects, 9,071 documents, 147,732 symbols): every count was 0.00 to 0.08 s
+    (documents at most 0.08 s, symbols at most 0.03 s, projects 0.00 s), possibly with a warm page cache.
 - **`GET /control/metrics`** returns a point-in-time [`MetricsSnapshot`](../src/Sextant.Service/Observability/MetricsSnapshot.cs):
   indexing latency (worker run time), queue delay (wait before a worker claimed a job), success &
   completeness rates, worker capacity, storage (catalog + artifact + cache + checkout bytes), cache reuse

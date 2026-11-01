@@ -14,7 +14,98 @@ public sealed partial class SnapshotService
     private DefaultBranchFreshnessTracker _freshness = null!;
     private readonly DirectorySizeCache _sizeCache = new();
     private IRemoteBranchHeadResolver? _headResolver;
+    private readonly ReportCountCache _reportCounts = new();
     private PeriodicTimer? _freshnessTimer;
+
+    private static readonly TimeSpan ReportCacheTtl = TimeSpan.FromMinutes(10);
+    private const int ReportCacheMaxScopes = 64;
+    private readonly Lock _reportLock = new();
+    private readonly SemaphoreSlim _reportGate = new(1, 1);
+    private readonly Dictionary<string, (DateTimeOffset At, StatusReport Report)> _reportCache = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, Task<StatusReport>> _reportInFlight = new(StringComparer.Ordinal);
+    private int _reportComputations;
+
+    internal int ReportComputations => Volatile.Read(ref _reportComputations);
+
+    internal Action? ReportComputeHook { get; set; }
+
+    /// <summary>
+    /// The operator status report. Read-only on its own connections (never the write gate). At most one report computes
+    /// at a time: a concurrent request for the same caller scope waits for that computation and gets its result, a
+    /// request for another scope waits its turn. A report whose counts are all measured is kept per caller scope for 10
+    /// minutes (the scope is the exact set of repositories the caller sees, so a grant change is never served from the
+    /// cache); one with unmeasured counts is not, so the next request continues counting. The computation belongs to
+    /// the service: <paramref name="ct"/> only ends this caller's wait, and the work stops at
+    /// <see cref="ServiceOptions.ReportBudget"/> or at shutdown. Throws <see cref="TimeoutException"/> when the budget
+    /// ends before the cheap reads finish. The storage block is for the operator only (<paramref name="visibleKeys"/> null).
+    /// </summary>
+    public Task<StatusReport> BuildStatusReportAsync(
+        IReadOnlySet<string>? visibleKeys, IReadOnlyList<string> grantedUrls, CancellationToken ct)
+    {
+        var scope = ReportScope(visibleKeys, grantedUrls);
+        Task<StatusReport> task;
+        lock (_reportLock)
+        {
+            if (_reportCache.TryGetValue(scope, out var cached) && _timeProvider.GetUtcNow() - cached.At < ReportCacheTtl)
+                return Task.FromResult(cached.Report);
+            if (!_reportInFlight.TryGetValue(scope, out task!))
+                _reportInFlight[scope] = task = Task.Run(() => ComputeStatusReportAsync(scope, visibleKeys, grantedUrls));
+        }
+        return task.WaitAsync(ct);
+    }
+
+    private static string ReportScope(IReadOnlySet<string>? visibleKeys, IReadOnlyList<string> grantedUrls)
+    {
+        if (visibleKeys is null)
+            return "operator";
+        var text = string.Join('\n', visibleKeys.Order(StringComparer.Ordinal))
+            + "\n--\n" + string.Join('\n', grantedUrls.Order(StringComparer.Ordinal));
+        return "scope:" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(text)));
+    }
+
+    private async Task<StatusReport> ComputeStatusReportAsync(
+        string scope, IReadOnlySet<string>? visibleKeys, IReadOnlyList<string> grantedUrls)
+    {
+        try
+        {
+            await _reportGate.WaitAsync(_lifetime.Token).ConfigureAwait(false);
+            try
+            {
+                using var budget = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+                budget.CancelAfter(_options.ReportBudget);
+                var token = budget.Token;
+                var report = await Task.Run(() =>
+                {
+                    Interlocked.Increment(ref _reportComputations);
+                    ReportComputeHook?.Invoke();
+                    using var scopeGuard = ReadInterrupt.Begin(token);
+                    return StatusReportBuilder.Build(
+                        OpenReadConnection, _freshness, _reportCounts, _timeProvider, _options.CatalogDbPath, visibleKeys,
+                        grantedUrls, _options.ReportMaxRepositories, _options.ReportMaxNoCodeJobs,
+                        includeStorage: visibleKeys is null, token);
+                }, CancellationToken.None).ConfigureAwait(false);
+                lock (_reportLock)
+                {
+                    if (report.CountsComplete)
+                    {
+                        if (_reportCache.Count >= ReportCacheMaxScopes)
+                            _reportCache.Clear();
+                        _reportCache[scope] = (_timeProvider.GetUtcNow(), report);
+                    }
+                }
+                return report;
+            }
+            finally
+            {
+                _reportGate.Release();
+            }
+        }
+        finally
+        {
+            lock (_reportLock)
+                _reportInFlight.Remove(scope);
+        }
+    }
 
     private void StartObservabilityLoops()
     {
