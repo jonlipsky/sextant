@@ -133,6 +133,34 @@ public class UnresolvedBindingIndexingTests
     }
 
     [TestMethod]
+    public async Task LegacyExtractor_ReportsUnboundNames_AndADegradedProjectMakesTheVerdictPartial()
+    {
+        await new IndexOrchestrator(_db, useDocumentExtractor: false)
+            .IndexSolutionAsync(BuildSolution(appReferencesAbs: false), snapshotContext: Context("c6", CompleteCoverage));
+
+        var coverage = RecordedCoverage();
+        Assert.AreEqual(SnapshotCoverageVerdict.Partial, coverage.Verdict);
+        var binding = coverage.Binding!;
+        Assert.AreEqual(1, binding.ProjectsDegraded);
+        var app = binding.Projects.Single(p => p.Degraded);
+        Assert.AreEqual("src/App/App.csproj", app.Project);
+        Assert.IsTrue(app.UnboundNames >= BindingHealthBuilder.DegradedMinUnboundNames, $"unbound: {app.UnboundNames}");
+        Assert.AreEqual(0L, binding.CandidateOccurrences, "the legacy path keeps no candidate occurrences");
+    }
+
+    [TestMethod]
+    public async Task LegacyExtractor_CleanBinding_KeepsTheVerdict()
+    {
+        await new IndexOrchestrator(_db, useDocumentExtractor: false)
+            .IndexSolutionAsync(BuildSolution(appReferencesAbs: true), snapshotContext: Context("c7", CompleteCoverage));
+
+        var coverage = RecordedCoverage();
+        Assert.AreEqual(SnapshotCoverageVerdict.Complete, coverage.Verdict);
+        Assert.AreEqual(0L, coverage.Binding!.UnboundNames);
+        Assert.IsTrue(coverage.Binding.NamesExamined > 0);
+    }
+
+    [TestMethod]
     public async Task LoadIssues_AreAttachedToTheirProject_EvenWhenItWasNotIndexed()
     {
         var issues = new Dictionary<string, string>(StringComparer.Ordinal)
