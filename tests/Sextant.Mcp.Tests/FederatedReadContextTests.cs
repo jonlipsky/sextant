@@ -418,6 +418,104 @@ public class FederatedReadContextTests
 
     // ==== helpers =================================================================================
 
+    // ==== Issue #233: a consumer says when a submodule provider has projects that did not bind =====
+
+    [TestMethod]
+    public void ProviderWithDegradedProject_AddsAWarning_WithoutChangingTheConsumersVerdict()
+    {
+        var s = SeedBaseAndOverlay();
+        var provider = SeedProvider(s, new SnapshotCoverage
+        {
+            Verdict = SnapshotCoverageVerdict.Partial,
+            Reasons = ["Code in 1 project(s) did not fully compile on the indexer (Mix/Mix.csproj: 30 unbound name(s))."],
+            Binding = new BindingHealth { ProjectsDegraded = 1, UnboundNames = 30 }
+        });
+
+        var snap = ReadSnapshotMeta();
+
+        Assert.AreEqual(1, snap.GetProperty("degraded_providers").GetInt32());
+        Assert.AreEqual("complete", snap.GetProperty("completeness").GetString(), "the parent's own verdict is unchanged");
+        Assert.IsTrue(provider > 0);
+        StringAssert.Contains(RemoteResponsePresenter.DegradedProvidersWarning(1), "submodule dependency");
+    }
+
+    [TestMethod]
+    public void ProviderWithNoRecordedBinding_IsUnknown_NotCountedAsDegraded()
+    {
+        var s = SeedBaseAndOverlay();
+        SeedProvider(s, new SnapshotCoverage { Verdict = SnapshotCoverageVerdict.Complete });
+
+        var snap = ReadSnapshotMeta();
+
+        Assert.IsFalse(snap.TryGetProperty("degraded_providers", out _));
+    }
+
+    [TestMethod]
+    public void DegradedProviderCount_ToleratesAnOldRow_AndAMissingCoverageTable()
+    {
+        var s = SeedBaseAndOverlay();
+        var provider = SeedProvider(s, new SnapshotCoverage { Verdict = SnapshotCoverageVerdict.Complete });
+        var conn = _db.GetConnection();
+        var deps = new SnapshotDependencyStore(conn);
+
+        Exec(conn, $"UPDATE snapshot_coverage SET summary_json = 'not json' WHERE snapshot_id = {provider};");
+        Assert.AreEqual(0, deps.CountDegradedProviders(s.BaseId), "an unreadable summary is not degraded");
+        Exec(conn, $"UPDATE snapshot_coverage SET summary_json = '{{\"verdict\":\"complete\"}}' WHERE snapshot_id = {provider};");
+        Assert.AreEqual(0, deps.CountDegradedProviders(s.BaseId), "a row with no binding block is unknown");
+        Exec(conn, $"UPDATE snapshot_coverage SET summary_json = '{{\"binding\":{{\"projects_degraded\":2}}}}' WHERE snapshot_id = {provider};");
+        Assert.AreEqual(1, deps.CountDegradedProviders(s.BaseId));
+
+        Exec(conn, "DROP TABLE snapshot_coverage;");
+        Assert.AreEqual(0, deps.CountDegradedProviders(s.BaseId), "a catalog without the table reads as none");
+    }
+
+    private static void Exec(Microsoft.Data.Sqlite.SqliteConnection conn, string sql)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = sql;
+        cmd.ExecuteNonQuery();
+    }
+
+    private JsonElement ReadSnapshotMeta()
+    {
+        _dbProvider.RequestedRepository = () => RepoUrl;
+        var result = FindReferencesTool.FindReferences(_dbProvider, "global::A.Widget");
+        var meta = JsonDocument.Parse(result).RootElement.GetProperty("meta");
+        Assert.IsTrue(meta.TryGetProperty("snapshot", out var snap), result);
+        return snap.Clone();
+    }
+
+    private long SeedProvider(Scenario s, SnapshotCoverage coverage)
+    {
+        var conn = _db.GetConnection();
+        var store = new SnapshotStore(conn);
+        const string providerUrl = "https://github.com/test/fedctx-provider";
+        var repoId = store.EnsureRepository(providerUrl, now: 1);
+        var commitId = store.EnsureCommit(repoId, "commit_prov", "tree_prov", now: 1);
+        var logical = store.EnsureLogicalProject(repoId, "logical_P", "Mix/Mix.csproj", "net10.0", now: 1);
+        var identity = IdentityWith(null, false) with { RepositoryRemoteUrl = providerUrl, CommitSha = "commit_prov", TreeSha = "tree_prov" };
+        var providerId = store.BeginPending(identity, repoId, commitId, runId: null, now: 1).id;
+        var providerProject = new ProjectStore(conn).UpsertSnapshotProject(new ProjectIdentity
+        {
+            CanonicalId = "logical_P", GitRemoteUrl = providerUrl, RepoRelativePath = "Mix/Mix.csproj", TargetFramework = "net10.0"
+        }, providerId, logical, 1);
+        store.MapProject(providerId, providerProject);
+        store.MarkComplete(providerId, publishedAt: 1);
+        new SnapshotCoverageStore(conn).Record(providerId, coverage, 1);
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT project_id FROM snapshot_projects WHERE snapshot_id = @s LIMIT 1;";
+        cmd.Parameters.AddWithValue("@s", s.BaseId);
+        var consumerProject = (long)cmd.ExecuteScalar()!;
+        new SnapshotDependencyStore(conn).Insert(new SnapshotDependencyEdge
+        {
+            ConsumerSnapshotId = s.BaseId, ConsumerProjectId = consumerProject,
+            ProviderSnapshotId = providerId, ProviderProjectId = providerProject, ProviderRepositoryId = repoId,
+            ProviderCommitSha = "commit_prov", ReferenceKind = "submodule_ref", SubmoduleDirty = false, CreatedAt = 1
+        });
+        return providerId;
+    }
+
     private const string RepoUrl = "https://github.com/test/fedctx-repo";
 
     private sealed record Scenario(long RepoId, long CommitId, long BaseId, long OverlayId, long BranchId);

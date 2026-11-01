@@ -175,7 +175,7 @@ public sealed class FederatedReadContext
         var scope = ResolveScope(snapshots, selected, mode);
         var provenance = selected == null
             ? null
-            : BuildProvenance(snapshots, new SnapshotCoverageStore(conn), selected, mode, compatibility);
+            : BuildProvenance(snapshots, new SnapshotCoverageStore(conn), new SnapshotDependencyStore(conn), selected, mode, compatibility);
 
         // Issue #108: a remote-base overlay (is_overlay=1, base_snapshot_id IS NULL) pins a committed base
         // that lives only on a configured peer. Expose its recomputed identity hash so find_symbol can
@@ -238,7 +238,7 @@ public sealed class FederatedReadContext
     }
 
     private static SnapshotProvenance BuildProvenance(
-        SnapshotStore snapshots, SnapshotCoverageStore coverageStore, SnapshotRow selected, FederationMode mode,
+        SnapshotStore snapshots, SnapshotCoverageStore coverageStore, SnapshotDependencyStore dependencies, SnapshotRow selected, FederationMode mode,
         CompatibilityInputs? compatibility)
     {
         // The committed base the read rests on: the overlay's base, or the selected row itself. For a
@@ -294,7 +294,8 @@ public sealed class FederatedReadContext
             Compatible = incompatibilities.Count == 0,
             Incompatibilities = incompatibilities.Count == 0 ? null : incompatibilities,
             Freshness = selected.PublishedAt ?? selected.CreatedAt,
-            Coverage = coverage
+            Coverage = coverage,
+            DegradedProviders = baseId is long consumerId ? dependencies.CountDegradedProviders(consumerId) : 0
         };
     }
 }

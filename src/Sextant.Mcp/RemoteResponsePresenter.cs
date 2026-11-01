@@ -47,6 +47,14 @@ public static class RemoteResponsePresenter
     /// <summary>The lean meta's warning for a snapshot that includes uncommitted working-tree changes.</summary>
     public const string DirtyWarning = "The index includes uncommitted working-tree changes.";
 
+    /// <summary>
+    /// The lean meta's warning for a snapshot whose submodule dependencies include projects that did not compile
+    /// (issue #233). It counts providers and names none; the snapshot's own coverage is unaffected.
+    /// </summary>
+    public static string DegradedProvidersWarning(int providers) => providers == 1
+        ? "1 submodule dependency has projects that did not compile, so results inside it may be incomplete."
+        : $"{providers} submodule dependencies have projects that did not compile, so results inside them may be incomplete.";
+
     private const int ShortCommitLength = 12;
 
     /// <summary>
@@ -102,6 +110,8 @@ public static class RemoteResponsePresenter
         var warnings = new List<string>();
         if (partial)
             warnings.Add(PartialWarningFor(provenance.Coverage));
+        if (provenance.DegradedProviders > 0)
+            warnings.Add(DegradedProvidersWarning(provenance.DegradedProviders));
         if (!provenance.Compatible)
             warnings.Add(IncompatibleWarning);
         if (provenance.Dirty)

@@ -519,6 +519,10 @@ public sealed class SnapshotMeta
     [JsonPropertyName("coverage")]
     public Sextant.Core.SnapshotCoverage? Coverage { get; set; }
 
+    /// <summary>Submodule providers with a degraded project (issue #233); omitted when none are known to be.</summary>
+    [JsonPropertyName("degraded_providers")]
+    public int? DegradedProviders { get; set; }
+
     /// <summary>The repository the host selected for a request that named none (omitted otherwise).</summary>
     [JsonPropertyName("repository")]
     public string? Repository { get; set; }
@@ -549,6 +553,7 @@ public sealed class SnapshotMeta
             Origin = p.Origin,
             BaseIdentityHash = p.BaseIdentityHash,
             Coverage = p.Coverage,
+            DegradedProviders = p.DegradedProviders > 0 ? p.DegradedProviders : null,
             Repository = p.Repository,
             RepositorySelection = p.RepositorySelection
         };
