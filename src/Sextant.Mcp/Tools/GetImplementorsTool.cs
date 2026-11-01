@@ -50,13 +50,14 @@ public static class GetImplementorsTool
             implementors.Add((implementor, rel.Kind));
         }
 
-        // A stable order, so a cursor resumes exactly where the previous page ended.
+        // Production before test projects, then a stable order, so a cursor resumes exactly where the previous page ended.
+        var testProjects = TestProjects.IdsIn(projectStore);
         implementors = implementors
-            .OrderBy(i => i.Symbol.FilePath, StringComparer.Ordinal).ThenBy(i => i.Symbol.LineStart)
+            .OrderBy(i => testProjects.Contains(i.Symbol.ProjectId)).ThenBy(i => i.Symbol.FilePath, StringComparer.Ordinal).ThenBy(i => i.Symbol.LineStart)
             .ThenBy(i => i.Symbol.Id).ThenBy(i => i.Kind)
             .ToList();
 
-        object? Summary() => new { ByFile = Paging.CountBy(implementors, i => i.Symbol.FilePath) };
+        object? Summary() => new { ByFile = Paging.CountBy(implementors, i => i.Symbol.FilePath, i => testProjects.Contains(i.Symbol.ProjectId)) };
 
         var results = page.Slice(implementors).Select(i => (object)new
         {

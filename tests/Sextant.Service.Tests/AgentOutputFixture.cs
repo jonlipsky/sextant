@@ -166,7 +166,7 @@ internal sealed class AgentOutputFixture : IDisposable
         snapshots.SetBranchPointer(branch, snapshotId, now);
     }
 
-    private static long Project(
+    internal static long Project(
         SqliteConnection conn, SnapshotStore snapshots, long snapshotId, string checkoutRoot, string remote,
         string repoRelative, string checkoutRelative, bool isTest, long now)
     {
@@ -251,7 +251,7 @@ internal sealed class AgentOutputFixture : IDisposable
         return (long)s.ExecuteScalar()!;
     }
 
-    private static void Occurrence(
+    internal static void Occurrence(
         SqliteConnection conn, long inProjectId, long targetId, long? sourceId, long fileVersionId, int line,
         ReferenceKind kind, long now)
     {
@@ -270,7 +270,7 @@ internal sealed class AgentOutputFixture : IDisposable
         o.ExecuteNonQuery();
     }
 
-    private static void Relationship(SqliteConnection conn, long from, long to, RelationshipKind kind, long now)
+    internal static void Relationship(SqliteConnection conn, long from, long to, RelationshipKind kind, long now)
     {
         using var r = conn.CreateCommand();
         r.CommandText = "INSERT INTO relationships (from_symbol_id, to_symbol_id, kind, last_indexed_at) VALUES (@f, @t, @k, @now);";

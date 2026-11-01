@@ -56,6 +56,8 @@ or the `changes` of a comparison), `get_call_hierarchy`, `get_file_symbols`, `ge
 - A **truncated first page** leads with a `summary` (counts per project, file, kind, … — the top 10 of each,
   then a `(N more)` entry) before the rows, so an agent can narrow the query (`scope`, `project_id`, …)
   instead of paging. A result that fits its page has no summary.
+- `find_references`, `get_call_hierarchy` and `get_implementors` list production projects before test projects
+  (within a depth level for `get_call_hierarchy`).
 - `group_by` (`find_references`) groups the rows of the page; `meta.result_count` counts those rows.
 - `find_tests`, `find_comments` and `find_by_signature` replaced their former `max_results` with `limit`.
 - A page also ends early when its rows would not fit the [response budget](#response-size-budget).

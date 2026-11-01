@@ -57,6 +57,7 @@ public static class GetCallHierarchyTool
             ? new SourceContextRetriever(new FileStore(conn), dbProvider.SourceTexts)
             : null;
 
+        var testProjects = TestProjects.IdsIn(projectStore);
         var hits = new List<(SymbolInfo Target, CallGraphEdge Edge, int Depth)>();
         var visited = new HashSet<long>();
         var queue = new Queue<(long symbolId, int currentDepth)>();
@@ -73,8 +74,8 @@ public static class GetCallHierarchyTool
             else
                 edges = callGraphStore.GetByCallee(currentId);
 
-            // A stable order within each level, so a cursor resumes exactly where the previous page ended.
-            foreach (var edge in edges.OrderBy(e => e.CallSiteFile, StringComparer.Ordinal).ThenBy(e => e.CallSiteLine).ThenBy(e => e.Id))
+            // Production call sites before test ones, then a stable order within each level, so a cursor resumes exactly where the previous page ended.
+            foreach (var edge in edges.OrderBy(e => testProjects.Contains(e.InProjectId)).ThenBy(e => e.CallSiteFile, StringComparer.Ordinal).ThenBy(e => e.CallSiteLine).ThenBy(e => e.Id))
             {
                 var targetId = callees ? edge.CalleeSymbolId : edge.CallerSymbolId;
                 var targetSymbol = symbolStore.GetById(targetId);
@@ -89,10 +90,13 @@ public static class GetCallHierarchyTool
             }
         }
 
+        // Levels stay in breadth-first order; within one, production hits come first (OrderBy is stable).
+        hits = hits.OrderBy(h => h.Depth).ThenBy(h => testProjects.Contains(h.Edge.InProjectId)).ToList();
+
         object? Summary() => new
         {
             ByDepth = Paging.CountBy(hits, h => h.Depth.ToString(System.Globalization.CultureInfo.InvariantCulture)),
-            ByFile = Paging.CountBy(hits, h => h.Edge.CallSiteFile)
+            ByFile = Paging.CountBy(hits, h => h.Edge.CallSiteFile, h => testProjects.Contains(h.Edge.InProjectId))
         };
 
         var results = page.Slice(hits).Select(hit =>
