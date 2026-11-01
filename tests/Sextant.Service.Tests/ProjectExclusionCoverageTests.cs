@@ -504,4 +504,67 @@ public class ProjectExclusionCoverageTests
         Assert.AreEqual(SnapshotCoverageVerdict.Partial, partial.Verdict);
         Assert.IsFalse(string.Join(" | ", partial.Reasons).Contains("Ios", StringComparison.Ordinal));
     }
+
+    [TestMethod]
+    public void AFailingProjectWithNoLoadedVersion_AndAMissingFile_IsExcluded_AndItsRestoreIssueIsExplained()
+    {
+        var load = Load(Path.Combine(_root, "App.slnx"), []);
+        var issue = new PackageRestoreProjectIssue
+        {
+            Project = "external/Maui/Xamarin.Mac/Graphics.csproj",
+            Codes = ["MSB4025"],
+            Messages = new Dictionary<string, string> { ["MSB4025"] = "The project file could not be loaded. Could not find a part of the path." }
+        };
+
+        var result = SnapshotCoverageBuilder.Build(_root, Resolution(), load,
+            new SnapshotCoverageBuilder.Inventory([], []), restoreIssues: [issue]);
+
+        var excluded = result.Coverage.Exclusions!.Single();
+        Assert.AreEqual("external/Maui/Xamarin.Mac/Graphics.csproj", excluded.Project);
+        Assert.AreEqual(ProjectExclusionReason.ProjectFileMissing, excluded.Reason);
+
+        var restore = new PackageRestoreOutcome
+        {
+            SolutionsAttempted = 1, SolutionsFailedAttributed = 1, Projects = [issue]
+        };
+        var coverage = SnapshotCoverageBuilder.WithRestoreOutcome(result.Coverage, restore, result.Exclusions, result.Versions);
+        Assert.AreEqual(0, coverage.Reasons.Count, string.Join(" | ", coverage.Reasons));
+    }
+
+    [TestMethod]
+    public void AFailingProjectWithNoLoadedVersion_WithoutEvidence_StaysAGap()
+    {
+        Sdk("src/Real/Real.csproj");
+        var issue = new PackageRestoreProjectIssue
+        {
+            Project = "src/Real/Real.csproj",
+            Codes = ["MSB4025"],
+            Messages = new Dictionary<string, string> { ["MSB4025"] = "The project file could not be loaded." }
+        };
+        var result = SnapshotCoverageBuilder.Build(_root, Resolution(), Load(Path.Combine(_root, "App.slnx"), []),
+            new SnapshotCoverageBuilder.Inventory([], []), restoreIssues: [issue]);
+        Assert.IsNull(result.Coverage.Exclusions);
+    }
+
+    [TestMethod]
+    [DataRow("Msbuild failed when processing the file '<root>/a/A.csproj' with message: The reference assemblies for .NETFramework,Version=v4.7.2 were not found. To resolve this, install the Developer Pack (SDK/Targeting Pack) for this framework version.", "reference_assemblies_missing")]
+    [DataRow("Project file must include the .NET Framework assembly 'PresentationCore, PresentationFramework' in the reference list.", "wpf_tooling")]
+    [DataRow("Msbuild failed when processing the file with message: Platform version is not present for one or more target frameworks, even though they have specified a platform: net10.0-ios", "platform_version_missing")]
+    [DataRow("Msbuild failed when processing the file with message: Warning As Error: Detected package downgrade: Microsoft.Maui.Graphics from 10.0.50 to 9.0.120. NU1605", "package_downgrade (NU1605)")]
+    [DataRow("Project '../X.csproj' targets 'net10.0'. It cannot be referenced by a project that targets 'net7.0-windows10.0.19041.0'.", "incompatible_project_reference")]
+    [DataRow("System.Text.Encodings.Web 10.0.9 doesn't support net7.0-windows and has not been tested with it. Consider upgrading", "package_framework_unsupported")]
+    [DataRow("Unknown build error, 'Could not find a part of the path'", "unknown_build_error")]
+    public void EvaluationReason_UsesAFixedCategory_AndNeverTheRawText(string raw, string expected)
+    {
+        Assert.AreEqual(expected, SnapshotCoverageBuilder.EvaluationReason(raw));
+    }
+
+    [TestMethod]
+    public void EvaluationReason_KeepsTheOldTextForAnythingElse_AndLeaksNoCredentials()
+    {
+        Assert.AreEqual("evaluation failed or target framework missing", SnapshotCoverageBuilder.EvaluationReason("boom at https://user:hunter2@feed.example/v3"));
+        Assert.AreEqual("MSB1009", SnapshotCoverageBuilder.EvaluationReason("MSB1009: whatever https://user:hunter2@feed.example"));
+        var withCategory = SnapshotCoverageBuilder.EvaluationReason("Unknown build error, 'https://user:hunter2@feed.example/x'");
+        Assert.AreEqual("unknown_build_error", withCategory);
+    }
 }

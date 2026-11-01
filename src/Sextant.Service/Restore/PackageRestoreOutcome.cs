@@ -127,6 +127,9 @@ public sealed record PackageRestoreOutcome
     /// <summary>Projects whose stale-lock-file (NU1004) failure a second restore without the locked mode resolved (issue #352).</summary>
     public IReadOnlyList<string> LockFileRetriedProjects { get; init; } = [];
 
+    /// <summary>Projects whose only failure was a package downgrade (NU1605) raised to an error, restored again with it a warning (issue #352).</summary>
+    public IReadOnlyList<string> DowngradeRetriedProjects { get; init; } = [];
+
     /// <summary>Multi-target projects restored for their buildable targets after the platform targets failed, with those targets (issue #352).</summary>
     public IReadOnlyList<string> PlatformRetriedProjects { get; init; } = [];
 
@@ -345,6 +348,13 @@ public sealed record PackageRestoreOutcome
                 $"is out of date; they were restored again without the locked mode (the lock file in the checkout is untouched): " +
                 string.Join(", ", LockFileRetriedProjects.Take(5)) + (LockFileRetriedProjects.Count > 5 ? ", ..." : string.Empty) + ".");
         }
+        if (DowngradeRetriedProjects.Count > 0)
+        {
+            notes.Add(
+                $"Package restore of {DowngradeRetriedProjects.Count} project(s) failed only on a package downgrade (NU1605) the repository " +
+                $"treats as an error; they were restored again with it as a warning (the checkout is untouched): " +
+                string.Join(", ", DowngradeRetriedProjects.Take(5)) + (DowngradeRetriedProjects.Count > 5 ? ", ..." : string.Empty) + ".");
+        }
         if (PlatformRetriedProjects.Count > 0)
         {
             notes.Add(
@@ -355,8 +365,8 @@ public sealed record PackageRestoreOutcome
         if (RepairNotAttempted > 0)
         {
             notes.Add(
-                $"The restore time limit cut the repair short: {RepairNotAttempted} project(s) that failed on a stale lock file " +
-                "or an unavailable platform target were not restored again, so they stay unrestored.");
+                $"The restore time limit cut the repair short: {RepairNotAttempted} project(s) that failed on a stale lock file, " +
+                "a package downgrade or an unavailable platform target were not restored again, so they stay unrestored.");
         }
         if (SolutionsNotStarted > 0)
         {

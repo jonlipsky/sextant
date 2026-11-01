@@ -153,4 +153,58 @@ public class RestoreErrorClassificationTests
         var outcome = new PackageRestoreOutcome { SolutionsAttempted = 1, Projects = parser.Projects() };
         Assert.AreEqual(8, outcome.ErrorCodes().Count);
     }
+
+    [TestMethod]
+    public void Msb3202_NamesTheMissingProject_SoItIsAttributedToIt_NotAGeneralCode()
+    {
+        var parser = new RestoreOutputParser(Checkout);
+        var missing = Path.Combine(Checkout, "libs", "Gone", "Gone.csproj");
+        parser.Accept($"/usr/share/dotnet/sdk/10.0.100/NuGet.targets(521,5): error MSB3202: The project file \"{missing}\" was not found. [{Checkout}/All.sln]");
+
+        var issue = parser.Projects().Single();
+        Assert.AreEqual("libs/Gone/Gone.csproj", issue.Project);
+        CollectionAssert.AreEqual(new[] { "MSB3202" }, issue.Codes.ToArray());
+        Assert.AreEqual(0, parser.GeneralCodes().Count);
+        Assert.IsFalse(issue.Messages["MSB3202"].Contains(Checkout, StringComparison.Ordinal), issue.Messages["MSB3202"]);
+    }
+
+    [TestMethod]
+    public void Msb3202_NamingAPathOutsideTheCheckout_StaysAGeneralCode()
+    {
+        var parser = new RestoreOutputParser(Checkout);
+        var outside = Path.Combine(Path.GetTempPath(), "elsewhere", "Gone.csproj");
+        parser.Accept($"/usr/share/dotnet/sdk/10.0.100/NuGet.targets(521,5): error MSB3202: The project file \"{outside}\" was not found. [{Checkout}/All.sln]");
+        Assert.AreEqual(0, parser.Projects().Count);
+        CollectionAssert.AreEqual(new[] { "MSB3202" }, parser.GeneralCodes().ToArray());
+    }
+
+    [TestMethod]
+    public void Msb3202_WithoutANamedProject_StaysAGeneralCode()
+    {
+        var parser = new RestoreOutputParser(Checkout);
+        parser.Accept($"/usr/share/dotnet/sdk/10.0.100/NuGet.targets(521,5): error MSB3202: Something else failed. [{Checkout}/All.sln]");
+        Assert.AreEqual(0, parser.Projects().Count);
+        CollectionAssert.AreEqual(new[] { "MSB3202" }, parser.GeneralCodes().ToArray());
+    }
+
+    [TestMethod]
+    public void Msb4019_WithALineAndColumn_IsAttributedToTheProjectThatImportsTheMissingFile()
+    {
+        var parser = new RestoreOutputParser(Checkout);
+        parser.Accept($"{Project("Mac")}(104,3): error MSB4019: The imported project \"/usr/share/dotnet/sdk/10.0.100/Xamarin.Mac.CSharp.targets\" was not found. Confirm that the expression in the Import declaration is correct, and that the file exists on disk.");
+
+        var issue = parser.Projects().Single();
+        Assert.AreEqual("Mac/Mac.csproj", issue.Project);
+        CollectionAssert.AreEqual(new[] { "MSB4019" }, issue.Codes.ToArray());
+        Assert.AreEqual(0, parser.GeneralCodes().Count);
+    }
+
+    [TestMethod]
+    public void Msb4019_NamingNoProject_StaysAGeneralCode()
+    {
+        var parser = new RestoreOutputParser(Checkout);
+        parser.Accept("error MSB4019: The imported project \"/x/y.targets\" was not found.");
+        Assert.AreEqual(0, parser.Projects().Count);
+        CollectionAssert.AreEqual(new[] { "MSB4019" }, parser.GeneralCodes().ToArray());
+    }
 }

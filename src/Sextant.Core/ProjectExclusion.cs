@@ -43,6 +43,12 @@ public static class PlatformEvidence
     /// excluded on that evidence.
     /// </summary>
     public const string RestoreRepaired = "restore_repaired_reduced_targets";
+
+    /// <summary>
+    /// A .NET Framework 4.x target needs its reference assemblies (the Developer Pack, normally from Visual Studio), which
+    /// this worker does not have, and the project (legacy format) does not bring them as a package.
+    /// </summary>
+    public const string ReferenceAssembliesMissing = "reference_assemblies_missing";
 }
 
 /// <summary>
@@ -93,6 +99,11 @@ public static partial class ProjectExclusionClassifier
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, matchTimeoutMilliseconds: 1000)]
     private static partial Regex WorkloadFailurePattern();
 
+    // Only a platform target (iOS, Android, ...) produces this message.
+    [GeneratedRegex(@"Platform version is not present for one or more target frameworks",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, matchTimeoutMilliseconds: 1000)]
+    private static partial Regex PlatformVersionMissingPattern();
+
     [GeneratedRegex(@"you need to use desktop msbuild",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, matchTimeoutMilliseconds: 1000)]
     private static partial Regex DesktopMsbuildPattern();
@@ -101,9 +112,18 @@ public static partial class ProjectExclusionClassifier
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, matchTimeoutMilliseconds: 1000)]
     private static partial Regex NoApplicationHostPattern();
 
-    [GeneratedRegex(@"WindowsAppSDKSelfContained requires a supported Windows architecture|XamlCompiler output file|(?<![\w.-])mt\.exe\b",
+    // The WPF targets' own check ("Project file must include the .NET Framework assembly 'PresentationCore, ...' in the
+    // reference list"): the WPF reference assemblies ship with the Windows desktop targeting pack only.
+    [GeneratedRegex(@"WindowsAppSDKSelfContained requires a supported Windows architecture|XamlCompiler output file|XamlCompiler\.exe|(?<![\w.-])mt\.exe\b|Project file must include the \.NET Framework assembly 'Presentation",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, matchTimeoutMilliseconds: 1000)]
     private static partial Regex WindowsToolingPattern();
+
+    [GeneratedRegex(@"The reference assemblies for \.NETFramework,Version=v4\.\d+(\.\d+)? were not found",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, matchTimeoutMilliseconds: 1000)]
+    private static partial Regex FrameworkReferenceAssembliesPattern();
+
+    [GeneratedRegex(@"^net4\d{1,2}$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, matchTimeoutMilliseconds: 1000)]
+    private static partial Regex NetFramework4Pattern();
 
     // What MSBuildWorkspace reports for a non-SDK project whose imported targets are absent: the import is silently
     // dropped and the project then has no Compile target ("Project does not contain 'Compile' target.", confirmed
@@ -122,7 +142,8 @@ public static partial class ProjectExclusionClassifier
     /// </summary>
     public static bool IsExclusionEvidence(string? reason)
         => IsWorkloadFailure(reason) || Matches(NoApplicationHostPattern(), reason) || Matches(DesktopMsbuildPattern(), reason)
-           || Matches(WindowsToolingPattern(), reason) || Matches(MissingImportPattern(), reason);
+           || Matches(WindowsToolingPattern(), reason) || Matches(MissingImportPattern(), reason)
+           || Matches(FrameworkReferenceAssembliesPattern(), reason);
 
     /// <summary>
     /// The OS platform of a target framework (<c>net10.0-ios17.0</c> gives <c>ios</c>), or null for a plain framework
@@ -179,6 +200,11 @@ public static partial class ProjectExclusionClassifier
             return null;
         if (IsWorkloadFailure(reason))
             return PlatformEvidence.WorkloadMissing;
+        return NonWorkloadEvidenceFor(platform, reason);
+    }
+
+    private static string? NonWorkloadEvidenceFor(string platform, string? reason)
+    {
         if ((ApplePlatforms.Contains(platform) || platform == "android") && Matches(NoApplicationHostPattern(), reason))
             return PlatformEvidence.NoApplicationHost;
         if (platform == "xamarin" && Matches(DesktopMsbuildPattern(), reason))
@@ -230,6 +256,12 @@ public static partial class ProjectExclusionClassifier
         // A file that exists outside the checkout is a sibling repository's: never classified as legacy.
         if (checkoutRoot is not null && !IsInside(projectFile, [checkoutRoot]))
             return null;
+
+        if (DeclaredEvidence(projectFile, targetFramework, failureReason, worker) is { } declared)
+        {
+            return new ProjectExclusion(
+                project, targetFramework, ProjectExclusionReason.PlatformUnavailable, declared);
+        }
 
         return IsLegacyProjectFormat(projectFile, failureReason)
             ? new ProjectExclusion(project, targetFramework, ProjectExclusionReason.LegacyProjectFormat)
@@ -299,14 +331,9 @@ public static partial class ProjectExclusionClassifier
             using var stream = new FileStream(projectFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
             using var reader = XmlReader.Create(stream, settings);
             var root = System.Xml.Linq.XDocument.Load(reader).Root;
-            if (root is null || !string.Equals(root.Name.LocalName, "Project", StringComparison.Ordinal))
-                return false;
-            if (root.Attributes().Any(a => string.Equals(a.Name.LocalName, "Sdk", StringComparison.OrdinalIgnoreCase)))
+            if (root is null || !string.Equals(root.Name.LocalName, "Project", StringComparison.Ordinal) || !IsNonSdk(root))
                 return false;
             var imports = root.Descendants().Where(e => string.Equals(e.Name.LocalName, "Import", StringComparison.Ordinal)).ToList();
-            if (root.Descendants().Any(e => string.Equals(e.Name.LocalName, "Sdk", StringComparison.Ordinal) && e.Parent == root)
-                || imports.Any(e => e.Attributes().Any(a => string.Equals(a.Name.LocalName, "Sdk", StringComparison.OrdinalIgnoreCase))))
-                return false;
             var named = failureReason is not null && failureReason.Contains("imported project", StringComparison.OrdinalIgnoreCase);
             return named || imports.Any(e =>
                 e.Attribute("Project")?.Value.Contains("$(", StringComparison.Ordinal) == true);
@@ -316,6 +343,112 @@ public static partial class ProjectExclusionClassifier
         {
             return false;
         }
+    }
+
+    private static bool IsNonSdk(System.Xml.Linq.XElement root)
+    {
+        if (root.Attributes().Any(a => string.Equals(a.Name.LocalName, "Sdk", StringComparison.OrdinalIgnoreCase)))
+            return false;
+        return !root.Descendants().Any(e =>
+            (string.Equals(e.Name.LocalName, "Sdk", StringComparison.Ordinal) && e.Parent == root)
+            || (string.Equals(e.Name.LocalName, "Import", StringComparison.Ordinal)
+                && e.Attributes().Any(a => string.Equals(a.Name.LocalName, "Sdk", StringComparison.OrdinalIgnoreCase))));
+    }
+
+    private static System.Xml.Linq.XElement? LoadProjectRoot(string projectFile)
+    {
+        try
+        {
+            var info = new FileInfo(projectFile);
+            if (!info.Exists || info.Length > MaxProjectFileBytes)
+                return null;
+            var settings = new XmlReaderSettings
+            {
+                DtdProcessing = DtdProcessing.Prohibit,
+                XmlResolver = null,
+                MaxCharactersInDocument = MaxProjectFileBytes
+            };
+            using var stream = new FileStream(projectFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var reader = XmlReader.Create(stream, settings);
+            var root = System.Xml.Linq.XDocument.Load(reader).Root;
+            return root is not null && string.Equals(root.Name.LocalName, "Project", StringComparison.Ordinal) ? root : null;
+        }
+        catch (Exception ex) when (ex is XmlException or IOException or UnauthorizedAccessException
+                                       or InvalidOperationException or ArgumentException or NotSupportedException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The exclusion detail for a version whose own target framework names no platform (an empty one, because the
+    /// evaluation failed, or a plain sibling such as <c>netstandard2.1</c> of a multi-targeted project) but whose
+    /// project file declares one this worker cannot build, AND whose failure is that platform's own
+    /// (<see cref="EvidenceFor"/>), or a missing .NET Framework 4.x reference-assembly pack for a project that declares
+    /// such a target. Both halves are needed: neither the file nor the message alone excludes anything.
+    /// </summary>
+    private static string? DeclaredEvidence(string projectFile, string? targetFramework, string? failureReason, WorkerPlatform? worker)
+    {
+        if (string.IsNullOrEmpty(failureReason) || UnavailablePlatform(targetFramework, worker) is not null)
+            return null;
+        var versionMessage = Matches(PlatformVersionMissingPattern(), failureReason);
+        var wholeEvaluationFailed = targetFramework is null;
+        var wantsFramework = Matches(FrameworkReferenceAssembliesPattern(), failureReason)
+                             && (targetFramework is null || NetFramework4Pattern().IsMatch(targetFramework));
+        if (!versionMessage && !wholeEvaluationFailed && !wantsFramework)
+            return null;
+        var root = LoadProjectRoot(projectFile);
+        if (root is null)
+            return null;
+        var declared = DeclaredFrameworks(root);
+        if (targetFramework is not null)
+            declared.Add(targetFramework);
+        if (wantsFramework && IsNonSdk(root) && declared.Any(NetFramework4Pattern().IsMatch))
+            return $"netframework; {PlatformEvidence.ReferenceAssembliesMissing}";
+        foreach (var tfm in declared)
+        {
+            if (UnavailablePlatform(tfm, worker) is not { } platform)
+                continue;
+            if (versionMessage)
+                return $"{platform}; {PlatformEvidence.WorkloadMissing}";
+            if (wholeEvaluationFailed && NonWorkloadEvidenceFor(platform, failureReason) is { } evidence)
+                return $"{platform}; {evidence}";
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// The target frameworks a project file certainly declares (<c>TargetFramework</c>, <c>TargetFrameworks</c> split on
+    /// <c>;</c>, and a legacy <c>TargetFrameworkVersion</c> <c>v4.7.2</c> as <c>net472</c>). An element with a
+    /// <c>Condition</c>, under an ancestor with one or inside <c>Choose</c>/<c>When</c>/<c>Otherwise</c>, and a value built
+    /// from a property, are skipped whole.
+    /// </summary>
+    private static List<string> DeclaredFrameworks(System.Xml.Linq.XElement root)
+    {
+        var result = new List<string>();
+        foreach (var element in root.Descendants())
+        {
+            var name = element.Name.LocalName;
+            if (name is not ("TargetFramework" or "TargetFrameworks" or "TargetFrameworkVersion"))
+                continue;
+            if (element.AncestorsAndSelf().Any(e =>
+                    e.Attributes().Any(a => string.Equals(a.Name.LocalName, "Condition", StringComparison.OrdinalIgnoreCase))
+                    || e.Name.LocalName is "Choose" or "When" or "Otherwise"))
+                continue;
+            var value = element.Value.Trim();
+            if (value.Contains("$(", StringComparison.Ordinal))
+                continue;
+            if (name == "TargetFrameworkVersion")
+            {
+                if (value.StartsWith('v'))
+                    result.Add("net" + value[1..].Replace(".", "", StringComparison.Ordinal));
+            }
+            else
+            {
+                result.AddRange(value.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+            }
+        }
+        return result;
     }
 
     /// <summary>True when two target frameworks are the same version; a blank one is the null framework.</summary>

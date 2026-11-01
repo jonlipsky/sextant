@@ -102,6 +102,15 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
         var generalMatch = GeneralError().Match(line);
         if (generalMatch.Success)
         {
+            // MSB3202 names the missing project file in its text ("The project file "<path>" was not found."), while the
+            // line itself ends in the solution: the missing project is the one it belongs to.
+            if (string.Equals(generalMatch.Groups["code"].Value, "MSB3202", StringComparison.OrdinalIgnoreCase)
+                && MissingProjectFile().Match(line) is { Success: true } missing
+                && IsRootedInsideCheckout(missing.Groups["path"].Value))
+            {
+                Record(Relativize(missing.Groups["path"].Value), "MSB3202", null, line[(generalMatch.Index + generalMatch.Length)..]);
+                return;
+            }
             // An MSBuild error that carries no project prefix still names the project in its trailing "[<project>]"
             // (issue #296: a retried project's evaluation error, for example NETSDK1013).
             var trailing = TrailingProject().Match(line);
@@ -286,6 +295,23 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
     /// <summary>The key <see cref="Projects"/> uses for a project file (issue #290).</summary>
     internal string ProjectKey(string projectPath) => Relativize(projectPath);
 
+    private bool IsRootedInsideCheckout(string path)
+    {
+        try
+        {
+            var trimmed = path.Trim();
+            if (!Path.IsPathRooted(trimmed))
+                return false;
+            var relative = Path.GetRelativePath(_checkoutDir, Path.GetFullPath(trimmed));
+            return relative != ".." && !relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+                   && !Path.IsPathRooted(relative);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
+        }
+    }
+
     private string Relativize(string path)
     {
         var trimmed = path.Trim();
@@ -310,10 +336,17 @@ internal sealed partial class RestoreOutputParser(string checkoutDir)
     }
 
     // "<project path> : error NU1101: <message> [<solution path>]", the console logger's shape for a
-    // project-scoped restore error. The path stops at the first project extension followed by " : error".
-    [GeneratedRegex(@"^\s*(?<path>[^\r\n]+?\.(?:cs|vb|fs)proj)\s*:\s*error\s+(?<code>(?:NU|NETSDK|MSB)\d{4})\s*:\s*(?<msg>.*)$",
+    // project-scoped restore error. The path stops at the first project extension followed by " : error"; an MSBuild
+    // evaluation error carries the position of the offending line, "<project path>(104,3): error MSB4019: ...", and is
+    // the same shape (the file it names is the project that failed, never the file that is missing).
+    [GeneratedRegex(@"^\s*(?<path>[^\r\n]+?\.(?:cs|vb|fs)proj)(?:\(\d+(?:,\d+)*\))?\s*:\s*error\s+(?<code>(?:NU|NETSDK|MSB)\d{4})\s*:\s*(?<msg>.*)$",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, matchTimeoutMilliseconds: 1000)]
     private static partial Regex ProjectError();
+
+    // MSB3202: 'The project file "<path>" was not found.'
+    [GeneratedRegex(@"The project file ""(?<path>[^""\r\n]+?\.(?:cs|vb|fs)proj)"" was not found",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, matchTimeoutMilliseconds: 1000)]
+    private static partial Regex MissingProjectFile();
 
     // Any other "error XX1234:" line (an MSBuild switch error, a solution that cannot be read, ...).
     [GeneratedRegex(@"(?:^|[\s:])error\s+(?<code>[A-Za-z]{2,8}\d{3,5})\s*:",

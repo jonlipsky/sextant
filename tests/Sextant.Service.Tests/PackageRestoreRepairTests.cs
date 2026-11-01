@@ -42,6 +42,16 @@ public class PackageRestoreRepairTests
         return solution;
     }
 
+    // A second selected solution makes the restore one traversal of the project union, where the project-level
+    // WarningsAsErrors reset does not reach the SDK default that raises NU1605 to an error.
+    private static string WriteOtherSolution(string root, string project)
+    {
+        var solution = Path.Combine(root, "Other.slnx");
+        File.WriteAllText(solution,
+            $"<Solution><Project Path=\"{Path.GetRelativePath(root, project).Replace('\\', '/')}\" /></Solution>");
+        return solution;
+    }
+
     // A lock file that disagrees with a project that has no packages, so a locked restore fails with NU1004.
     private static readonly string StaleLock =
         $$"""
@@ -167,6 +177,77 @@ public class PackageRestoreRepairTests
             if (outcome.PlatformRetriedProjects.Count == 0)
                 Assert.Inconclusive("this host has the iOS workload: no repair ran");
             CollectionAssert.AreEqual(new[] { "Multi/Multi.csproj" }, outcome.RepairedProjects.ToArray());
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    private static void WritePackage(string feed, string id, string version, string? dependsOn = null, string? dependsVersion = null)
+    {
+        var deps = dependsOn is null
+            ? ""
+            : $"<dependencies><group><dependency id=\"{dependsOn}\" version=\"{dependsVersion}\" /></group></dependencies>";
+        var nuspec =
+            $"<?xml version=\"1.0\"?><package xmlns=\"http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd\"><metadata>" +
+            $"<id>{id}</id><version>{version}</version><authors>t</authors><description>t</description>{deps}</metadata></package>";
+        using var zip = System.IO.Compression.ZipFile.Open(Path.Combine(feed, $"{id}.{version}.nupkg"), System.IO.Compression.ZipArchiveMode.Create);
+        using var writer = new StreamWriter(zip.CreateEntry($"{id}.nuspec").Open());
+        writer.Write(nuspec);
+    }
+
+    // Dep needs Base 2.0.0, the project pins Base 1.0.0: a real NU1605 downgrade, the shape of the one found on
+    // MixAndMatch.WinUI (a referenced project brings the newer package).
+    private static (string Project, string Root) DowngradeProject(string name = "Down", string extra = "")
+    {
+        var root = NewRoot();
+        var feed = Path.Combine(root, "empty-feed");
+        // The repository's own build policy, as in RecordStack: warnings are errors.
+        File.WriteAllText(Path.Combine(root, "Directory.Build.props"),
+            "<Project><PropertyGroup><TreatWarningsAsErrors>true</TreatWarningsAsErrors></PropertyGroup></Project>");
+        WritePackage(feed, "Lib.Base", "1.0.0");
+        WritePackage(feed, "Lib.Base", "2.0.0");
+        AddProject(root, "Dep",
+            $"<PropertyGroup><TargetFramework>{Tfm}</TargetFramework></PropertyGroup>" +
+            "<ItemGroup><PackageReference Include=\"Lib.Base\" Version=\"2.0.0\" /></ItemGroup>");
+        var project = AddProject(root, name,
+            $"<PropertyGroup><TargetFramework>{Tfm}</TargetFramework><WarningsAsErrors>NU1605</WarningsAsErrors></PropertyGroup>{extra}" +
+            "<ItemGroup><ProjectReference Include=\"../Dep/Dep.csproj\" /><PackageReference Include=\"Lib.Base\" Version=\"1.0.0\" /></ItemGroup>");
+        // The repository pins the downgrade error in the project itself, so the restore-only reset does not reach it.
+        File.WriteAllText(project, File.ReadAllText(project).Replace("<Project Sdk=", "<Project TreatAsLocalProperty=\"WarningsAsErrors\" Sdk=", StringComparison.Ordinal));
+        return (project, root);
+    }
+
+    [TestMethod]
+    public async Task AProjectWhoseOnlyErrorIsADowngradeWarning_IsRestoredWithoutTreatingItAsAnError()
+    {
+        var (project, root) = DowngradeProject();
+        var logs = new List<string>();
+        var original = File.ReadAllText(project);
+        try
+        {
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromMinutes(3), log: logs.Add, staticGraphRestore: false)
+                .RunAsync(root, [WriteSolution(root, project)], limit: null, CancellationToken.None, Path.Combine(root, "scratch"));
+
+            CollectionAssert.AreEqual(new[] { "Down/Down.csproj" }, outcome.DowngradeRetriedProjects.ToArray(),
+                string.Join("|", logs) + string.Join(";", outcome.Projects.Select(p => p.Project + ":" + string.Join(",", p.Codes))));
+            CollectionAssert.AreEqual(new[] { "Down/Down.csproj" }, outcome.RepairedProjects.ToArray());
+            Assert.AreEqual(0, outcome.Projects.Count, string.Join(", ", outcome.Projects.SelectMany(p => p.Codes)));
+            Assert.IsTrue(File.Exists(Path.Combine(root, "Down", "obj", "project.assets.json")));
+            Assert.IsTrue(outcome.Notes().Any(n => n.Contains("NU1605", StringComparison.Ordinal)), string.Join("|", outcome.Notes()));
+            Assert.AreEqual(original, File.ReadAllText(project), "nothing is written to the checkout");
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [TestMethod]
+    public async Task ADowngradeProjectWithAnotherError_IsNotRepaired()
+    {
+        var (project, root) = DowngradeProject("Both", "<ItemGroup><PackageReference Include=\"No.Such.Package\" Version=\"1.0.0\" /></ItemGroup>");
+        try
+        {
+            var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromMinutes(3), log: _ => { }, staticGraphRestore: false)
+                .RunAsync(root, [WriteSolution(root, project), WriteOtherSolution(root, Path.Combine(root, "Dep", "Dep.csproj"))], limit: null, CancellationToken.None, Path.Combine(root, "scratch"));
+            Assert.AreEqual(0, outcome.RepairedProjects.Count);
+            Assert.AreEqual(1, outcome.Projects.Count);
         }
         finally { Directory.Delete(root, true); }
     }

@@ -83,6 +83,7 @@ public class ProjectExclusionTests
     [DataRow("net10.0-android", NoHostMessage, "android; no_application_host")]
     [DataRow("net10.0-windows10.0.19041.0", "WindowsAppSDKSelfContained requires a supported Windows architecture.", "windows; windows_tooling")]
     [DataRow("net10.0-windows10.0.19041.0", "XamlCompiler output file was not found", "windows; windows_tooling")]
+    [DataRow("net10.0-windows10.0.19041.0", "The command \"dotnet XamlCompiler.exe in.json out.json\" exited with code 126.", "windows; windows_tooling")]
     [DataRow("net10.0-windows10.0.19041.0", "The command \"C:\\sdk\\mt.exe -manifest app.manifest\" exited with code 9009.", "windows; windows_tooling")]
     public void ProductionMessages_AreExcluded_WithTheEvidenceKind(string tfm, string reason, string detail)
     {
@@ -309,4 +310,109 @@ public class ProjectExclusionTests
         File.WriteAllText(path, text);
         return path;
     }
+
+    private static ProjectExclusion? ClassifyFile(string content, string? tfm, string? reason)
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "sextant_excl_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var file = Path.Combine(dir, "App.csproj");
+            File.WriteAllText(file, content);
+            return ProjectExclusionClassifier.Classify("App/App.csproj", tfm, file, reason, checkoutRoot: dir, worker: Linux);
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    private const string XamarinFile =
+        "<Project Sdk=\"MSBuild.Sdk.Extras/3.0.44\"><PropertyGroup><TargetFrameworks>xamarin.ios10;netstandard2.1</TargetFrameworks></PropertyGroup></Project>";
+
+    [TestMethod]
+    [DataRow("")]
+    [DataRow("netstandard2.1")]
+    public void XamarinPlatformVersionMissing_WithADeclaredPlatformThisWorkerLacks_IsPlatformUnavailable(string tfm)
+    {
+        var exclusion = ClassifyFile(XamarinFile, tfm,
+            "Msbuild failed when processing the file with message: Platform version is not present for one or more target frameworks, even though they have specified a platform: xamarin.ios10");
+        Assert.IsNotNull(exclusion);
+        Assert.AreEqual(ProjectExclusionReason.PlatformUnavailable, exclusion.Reason);
+    }
+
+    [TestMethod]
+    public void PlatformVersionMissing_WithNoPlatformDeclaredInTheFile_IsNotClassified() =>
+        Assert.IsNull(ClassifyFile(
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>", "net10.0",
+            "Platform version is not present for one or more target frameworks, even though they have specified a platform"));
+
+    [TestMethod]
+    public void DesktopMsBuildMessage_OnAnEmptyTfmWithAXamarinFile_IsPlatformUnavailable()
+    {
+        var exclusion = ClassifyFile(XamarinFile, "",
+            "Msbuild failed when processing the file with message: If you are building projects that require targets from Visual Studio, you need to use desktop msbuild.");
+        Assert.IsNotNull(exclusion);
+        Assert.AreEqual(ProjectExclusionReason.PlatformUnavailable, exclusion.Reason);
+    }
+
+    [TestMethod]
+    public void WpfPresentationCore_OnAWindowsTarget_IsWindowsToolingEvidence()
+    {
+        var exclusion = ClassifyFile(
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0-windows</TargetFramework><UseWPF>true</UseWPF></PropertyGroup></Project>",
+            "net10.0-windows",
+            "Msbuild failed when processing the file with message: Project file must include the .NET Framework assembly 'PresentationCore, PresentationFramework' in the reference list.");
+        Assert.IsNotNull(exclusion);
+        Assert.AreEqual(ProjectExclusionReason.PlatformUnavailable, exclusion.Reason);
+        StringAssert.Contains(exclusion.Detail!, "windows");
+    }
+
+    private const string RefAsmMessage =
+        "Msbuild failed when processing the file with message: The reference assemblies for .NETFramework,Version=v4.7.2 were not found. To resolve this, install the Developer Pack (SDK/Targeting Pack) for this framework version.";
+    private const string LegacyNet472 =
+        "<Project ToolsVersion=\"15.0\"><PropertyGroup><TargetFrameworkVersion>v4.7.2</TargetFrameworkVersion></PropertyGroup></Project>";
+
+    [TestMethod]
+    public void NetFrameworkReferenceAssembliesMissing_OnALegacyNet4xProject_HasItsOwnEvidence()
+    {
+        var exclusion = ClassifyFile(LegacyNet472, "", RefAsmMessage);
+        Assert.IsNotNull(exclusion);
+        Assert.AreEqual(ProjectExclusionReason.PlatformUnavailable, exclusion.Reason);
+        StringAssert.Contains(exclusion.Detail!, PlatformEvidence.ReferenceAssembliesMissing);
+        Assert.IsNotNull(ClassifyFile(LegacyNet472, "net472", RefAsmMessage));
+
+        Assert.IsNull(ClassifyFile(
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>", "",
+            "The reference assemblies for .NETFramework,Version=v4.7.2 were not found."), "a net10.0 project declares no .NET Framework target");
+    }
+
+    [TestMethod]
+    public void NetFrameworkReferenceAssembliesMissing_OnAnSdkStyleNet48_IsAGap() =>
+        Assert.IsNull(ClassifyFile(
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net48</TargetFramework></PropertyGroup></Project>", "", RefAsmMessage));
+
+    [TestMethod]
+    public void NetFrameworkReferenceAssembliesMissing_OnAModernSiblingOfALegacyNet48_IsAGap() =>
+        Assert.IsNull(ClassifyFile(LegacyNet472, "net10.0", RefAsmMessage));
+
+    [TestMethod]
+    [DataRow("<Project Sdk=\"X/1\"><PropertyGroup Condition=\"'$(A)'=='b'\"><TargetFrameworks>xamarin.ios10;netstandard2.1</TargetFrameworks></PropertyGroup></Project>")]
+    [DataRow("<Project Sdk=\"X/1\"><PropertyGroup><TargetFrameworks Condition=\"'$(A)'=='b'\">xamarin.ios10;netstandard2.1</TargetFrameworks></PropertyGroup></Project>")]
+    [DataRow("<Project Sdk=\"X/1\"><Choose><When Condition=\"'$(A)'=='b'\"><PropertyGroup><TargetFrameworks>xamarin.ios10;netstandard2.1</TargetFrameworks></PropertyGroup></When></Choose></Project>")]
+    [DataRow("<Project Sdk=\"X/1\"><PropertyGroup><TargetFrameworks>$(T);net10.0-windows</TargetFrameworks></PropertyGroup></Project>")]
+    public void UncertainDeclarations_GiveNoEvidence(string file) =>
+        Assert.IsNull(ClassifyFile(file, "netstandard2.1",
+            "Platform version is not present for one or more target frameworks, even though they have specified a platform"));
+
+    [TestMethod]
+    public void GenericWorkloadFailure_OnAPlainSiblingOfAWindowsProject_IsAGap() =>
+        Assert.IsNull(ClassifyFile(
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFrameworks>net10.0;net10.0-windows</TargetFrameworks></PropertyGroup></Project>", "net10.0",
+            "NETSDK1147: To build this project, the following workloads must be installed: wasm-tools"));
+
+    [TestMethod]
+    [DataRow("Project '../X.csproj' targets 'net10.0'. It cannot be referenced by a project that targets 'net7.0-windows10.0.19041.0'.")]
+    [DataRow("System.Text.Encodings.Web 10.0.9 doesn't support net7.0-windows and has not been tested with it. Consider upgrading")]
+    [DataRow("NU1201: Project X is not compatible with net7.0-windows (.NETCoreApp,Version=v7.0)")]
+    [DataRow("Unknown build error, 'Could not find a part of the path'")]
+    public void RepositoryDefects_AreNeverClassified(string reason) =>
+        Assert.IsNull(ClassifyFile(XamarinFile, "net10.0-windows", reason));
 }
