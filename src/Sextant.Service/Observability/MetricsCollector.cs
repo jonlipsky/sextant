@@ -297,19 +297,16 @@ public sealed class MetricsCollector(
     {
         try
         {
-            return (Pragma("page_count"), Pragma("freelist_count"));
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "PRAGMA page_count;";
+            var pages = Convert.ToInt64(cmd.ExecuteScalar(), System.Globalization.CultureInfo.InvariantCulture);
+            cmd.CommandText = "PRAGMA freelist_count;";
+            return (pages, Convert.ToInt64(cmd.ExecuteScalar(), System.Globalization.CultureInfo.InvariantCulture));
         }
         catch (SqliteException)
         {
             return (0, 0);
         }
-    }
-
-    private long Pragma(string name)
-    {
-        using var cmd = connection.CreateCommand();
-        cmd.CommandText = "PRAGMA " + name + ";";
-        return Convert.ToInt64(cmd.ExecuteScalar(), System.Globalization.CultureInfo.InvariantCulture);
     }
 
     private IReadOnlyList<AuditCostAttribution> CollectCost(IReadOnlySet<string>? visibleRepositoryKeys)
