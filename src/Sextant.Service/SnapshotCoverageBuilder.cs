@@ -88,7 +88,8 @@ public static class SnapshotCoverageBuilder
 
     public static Result Build(
         string checkoutDir, CheckoutResolution resolution, MultiSolutionLoadResult load, Inventory inventory,
-        IReadOnlyList<SdkPinOverride>? sdkPinOverrides = null, IReadOnlyList<PlatformRepair>? platformRepairs = null)
+        IReadOnlyList<SdkPinOverride>? sdkPinOverrides = null, IReadOnlyList<PlatformRepair>? platformRepairs = null,
+        IReadOnlyList<PackageRestoreProjectIssue>? restoreIssues = null)
     {
         var comparer = CheckoutInventory.PathComparer;
         var reasons = new List<string>();
@@ -142,6 +143,23 @@ public static class SnapshotCoverageBuilder
         var degradedProjects = Exclude(load.DegradedProjects, p => p.ProjectPath, p => p.TargetFramework, p => p.Reason);
         var packBindings = Exclude(load.PlatformPackBindings, p => p.ProjectPath, p => p.TargetFramework, _ => null);
         var versionIndex = new ProjectVersionIndex(checkoutDir, load);
+        // Issue #352: a project that failed to restore, that the load never saw (an unselected project another one
+        // references), and whose file is provably not on disk. Only a project file that fails to load (MSB4025) or is
+        // missing (MSB3202) is judged, by the same file evidence as a loaded version; no evidence leaves it a gap.
+        foreach (var issue in restoreIssues ?? [])
+        {
+            if (versionIndex.VersionsOf(issue.Project).Count > 0 || issue.Codes.Count == 0
+                || !issue.Codes.All(c => c is "MSB4025" or "MSB3202")
+                || !issue.Project.Contains('/', StringComparison.Ordinal))
+                continue;
+            var full = Path.GetFullPath(Path.Combine(checkoutDir, issue.Project));
+            if (ProjectExclusionClassifier.Classify(
+                    issue.Project, null, full, string.Join(' ', issue.Messages.Values), false, unpopulatedDirs, checkoutDir) is { } missing)
+            {
+                excluded.Add(missing);
+                versionIndex.AddUnloaded(issue.Project);
+            }
+        }
         foreach (var repair in platformRepairs ?? [])
             foreach (var tfm in versionIndex.VersionsOf(repair.Project))
                 if (RepairedLeftOut(repair.Project, tfm)
@@ -719,13 +737,49 @@ public static class SnapshotCoverageBuilder
 
     private static string VersionName(string project, string? tfm) => $"{project} (TFM {tfm ?? "unknown"})";
 
-    private static string EvaluationReason(string reason)
+    // Fixed categories for the failures real repositories produce. The category is a constant, never matched text.
+    private static readonly (string Category, System.Text.RegularExpressions.Regex Pattern)[] EvaluationCategories =
+    [
+        ("incompatible_project_reference", Category(@"Project '[^']*' targets '[^']*'\. It cannot be referenced by")),
+        ("package_framework_unsupported", Category(@"doesn't support net\S+ and has not been tested with it")),
+        ("wpf_tooling", Category(@"Project file must include the \.NET Framework assembly 'Presentation")),
+        ("reference_assemblies_missing", Category(@"The reference assemblies for \.NETFramework,Version=v4\.\d+(\.\d+)? were not found")),
+        ("platform_version_missing", Category(@"Platform version is not present for one or more target frameworks")),
+        ("desktop_msbuild_required", Category(@"you need to use desktop msbuild")),
+        ("package_downgrade", Category(@"Detected package downgrade")),
+        ("missing_import", Category(@"The imported project .+ was not found")),
+        ("unknown_build_error", Category(@"Unknown build error"))
+    ];
+
+    private static System.Text.RegularExpressions.Regex Category(string pattern) => new(
+        pattern, System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant
+            | System.Text.RegularExpressions.RegexOptions.Singleline, TimeSpan.FromSeconds(1));
+
+    internal static string EvaluationReason(string reason)
     {
         // Raw MSBuild text can include credentials in feed URLs or arbitrary checkout contents.
         var codes = System.Text.RegularExpressions.Regex.Matches(reason, @"\b(?:MSB|NETSDK|NU)\d{4}\b",
             System.Text.RegularExpressions.RegexOptions.None, TimeSpan.FromSeconds(1))
             .Select(m => m.Value).Distinct(StringComparer.Ordinal).Take(5).ToList();
-        return codes.Count > 0 ? string.Join(", ", codes) : "evaluation failed or target framework missing";
+        string? category = null;
+        foreach (var (name, pattern) in EvaluationCategories)
+        {
+            try
+            {
+                if (pattern.IsMatch(reason))
+                {
+                    category = name;
+                    break;
+                }
+            }
+            catch (System.Text.RegularExpressions.RegexMatchTimeoutException)
+            {
+            }
+        }
+        var detail = codes.Count > 0 ? string.Join(", ", codes) : null;
+        return category is null
+            ? detail ?? "evaluation failed or target framework missing"
+            : detail is null ? category : $"{category} ({detail})";
     }
 
     private static IReadOnlyList<ProjectEvaluationGap>? EvaluationGaps(

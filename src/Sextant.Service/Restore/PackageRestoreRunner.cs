@@ -678,7 +678,7 @@ public sealed class PackageRestoreRunner(
                     timedOut = true;
                     break;
                 case RunResult.Failed:
-                    if (outcomeParser.Projects().Count > 0)
+                    if (outcomeParser.Projects().Count > 0 && outcomeParser.GeneralCodes().Count == 0 && outcomeParser.ProjectsDropped == 0)
                         failedAttributed++;
                     foreach (var project in DeterministicallyAttempted(declared, outcomeParser, startedUtc, solutionDir, restoredBy))
                     {
@@ -702,6 +702,7 @@ public sealed class PackageRestoreRunner(
             SolutionsRetriedPerProject = retried,
             ProjectsRetried = retriedProjects,
             LockFileRetriedProjects = [.. repairs.SelectMany(r => r.LockFile)],
+            DowngradeRetriedProjects = [.. repairs.SelectMany(r => r.Downgrade)],
             PlatformRetriedProjects = [.. repairs.SelectMany(r => r.Platform)],
             PlatformRepairs = [.. repairs.SelectMany(r => r.PlatformDetails ?? [])],
             RepairedProjects = [.. repairs.SelectMany(r => r.Projects)],
@@ -888,6 +889,7 @@ public sealed class PackageRestoreRunner(
         var outcome = new PackageRestoreOutcome
         {
             LockFileRetriedProjects = repair?.LockFile ?? [],
+            DowngradeRetriedProjects = repair?.Downgrade ?? [],
             PlatformRetriedProjects = repair?.Platform ?? [],
             PlatformRepairs = repair?.PlatformDetails ?? [],
             RepairedProjects = repair?.Projects ?? [],
@@ -896,7 +898,8 @@ public sealed class PackageRestoreRunner(
             SolutionsSelected = solutionCount,
             SolutionsSucceeded = result == RunResult.Succeeded ? 1 : 0,
             SolutionsNotStarted = result == RunResult.NotStarted ? 1 : 0,
-            SolutionsFailedAttributed = result == RunResult.Failed && parser.Projects().Count > 0 ? 1 : 0,
+            SolutionsFailedAttributed = result == RunResult.Failed && parser.Projects().Count > 0 && parser.GeneralCodes().Count == 0
+                && parser.ProjectsDropped == 0 ? 1 : 0,
             TimedOut = timedOut,
             Timeout = deadline,
             Elapsed = stopwatch.Elapsed,
@@ -1457,19 +1460,27 @@ public sealed class PackageRestoreRunner(
     // candidates the restore time limit left unrepaired.
     internal sealed record RepairOutcome(
         IReadOnlyList<string> LockFile, IReadOnlyList<string> Platform, IReadOnlyList<string> Projects, int NotAttempted = 0,
-        IReadOnlyList<PlatformRepair>? PlatformDetails = null)
+        IReadOnlyList<PlatformRepair>? PlatformDetails = null, IReadOnlyList<string>? Downgrade = null)
     {
-        public bool Any => LockFile.Count > 0 || Platform.Count > 0;
+        public IReadOnlyList<string> Downgrade { get; } = Downgrade ?? [];
+
+        public bool Any => LockFile.Count > 0 || Platform.Count > 0 || Downgrade.Count > 0;
     }
+
+    private const string DowngradeCode = "NU1605";
+
+    private enum RepairKind { LockFile, Downgrade, Platform }
 
     // Codes a platform-only failure of a multi-target project reports: the SDK's missing-workload errors.
     private static readonly HashSet<string> PlatformFailureCodes = new(StringComparer.Ordinal)
         { "NETSDK1178", "NETSDK1147", "NETSDK1139", "NETSDK1084", "NU1012" };
 
-    // Two narrow second attempts for projects whose restore failed for a reason the checkout's own settings cause, not
+    // Three narrow second attempts for projects whose restore failed for a reason the checkout's own settings cause, not
     // the package graph (issue #352). Each restores the project alone, without touching the checkout:
     //  - NU1004 (a committed packages.lock.json is stale under RestoreLockedMode): restore unlocked, writing the lock
     //    file to scratch, so the tracked file is never rewritten;
+    //  - NU1605 alone (a package downgrade, which NuGet raises to an error by default): restore with NU1605 a warning again.
+    //    Treating it as an error is the repository's build policy; the index only needs the packages;
     //  - every error is a missing platform workload of a multi-target project: restore only the targets this worker can
     //    build (TargetFrameworks), so the buildable target gets its assets while the platform ones stay unrestored.
     // A project whose retry restores leaves the parser's findings; anything else keeps what it had. Each probe and the
@@ -1487,7 +1498,7 @@ public sealed class PackageRestoreRunner(
         var notAttempted = 0;
         var lockDirectory = Path.Combine(Path.GetFullPath(scratchDir ?? Path.GetTempPath()), $"restore-lock-{Guid.NewGuid():N}");
         var projects = new List<UnionProject>();
-        var kinds = new Dictionary<string, (string Name, bool LockFile, string? Frameworks, IReadOnlyList<string> LeftOut)>(CheckoutInventory.PathComparer);
+        var kinds = new Dictionary<string, (string Name, RepairKind Kind, string? Frameworks, IReadOnlyList<string> LeftOut)>(CheckoutInventory.PathComparer);
         try
         {
             foreach (var issue in issues)
@@ -1495,8 +1506,9 @@ public sealed class PackageRestoreRunner(
                 if (issue.SourceUnreachable || issue.TransientMessage)
                     continue;
                 var isLock = issue.Codes.Contains("NU1004", StringComparer.Ordinal);
-                var isPlatform = !isLock && issue.Codes.Count > 0 && issue.Codes.All(PlatformFailureCodes.Contains);
-                if (!isLock && !isPlatform)
+                var isDowngrade = !isLock && issue.Codes.Count == 1 && issue.Codes[0] == DowngradeCode;
+                var isPlatform = !isLock && !isDowngrade && issue.Codes.Count > 0 && issue.Codes.All(PlatformFailureCodes.Contains);
+                if (!isLock && !isPlatform && !isDowngrade)
                     continue;
                 var path = Path.GetFullPath(Path.Combine(checkoutDir, issue.Project.Replace('/', Path.DirectorySeparatorChar)));
                 if (!File.Exists(path) || !SafeForMsBuildProperty(path))
@@ -1513,7 +1525,13 @@ public sealed class PackageRestoreRunner(
                     Directory.CreateDirectory(lockDirectory);
                     var lockFile = Path.Combine(lockDirectory, $"{projects.Count}.packages.lock.json");
                     projects.Add(new UnionProject(path, path, ["RestoreLockedMode=false", $"NuGetLockFilePath={lockFile}"]));
-                    kinds[path] = (issue.Project, true, null, []);
+                    kinds[path] = (issue.Project, RepairKind.LockFile, null, []);
+                    continue;
+                }
+                if (isDowngrade)
+                {
+                    projects.Add(new UnionProject(path, path, [$"WarningsNotAsErrors={DowngradeCode}", $"NoWarn={DowngradeCode}"]));
+                    kinds[path] = (issue.Project, RepairKind.Downgrade, null, []);
                     continue;
                 }
 
@@ -1524,7 +1542,7 @@ public sealed class PackageRestoreRunner(
                 else if (frameworks is not null)
                 {
                     projects.Add(new UnionProject(path, path, [$"TargetFrameworks={frameworks.Replace(";", "%3B", StringComparison.Ordinal)}"]));
-                    kinds[path] = (issue.Project, false, frameworks, leftOut);
+                    kinds[path] = (issue.Project, RepairKind.Platform, frameworks, leftOut);
                 }
             }
             if (projects.Count == 0)
@@ -1534,7 +1552,7 @@ public sealed class PackageRestoreRunner(
             if (left <= TimeSpan.Zero)
                 return none with { NotAttempted = notAttempted + projects.Count };
 
-            log?.Invoke($"package restore: retrying {projects.Count} project(s) whose restore failed on a stale lock file or an unavailable platform target.");
+            log?.Invoke($"package restore: retrying {projects.Count} project(s) whose restore failed on a stale lock file, a package downgrade or an unavailable platform target.");
             var repairParser = new RestoreOutputParser(checkoutDir);
             // The solution path of a UnionProject only sets the SolutionDir properties; a project alone has none. The
             // traversal is NOT recursive: the reduced TargetFrameworks is a global property that reaches every project
@@ -1548,6 +1566,7 @@ public sealed class PackageRestoreRunner(
 
             var lockFiles = new List<string>();
             var platform = new List<string>();
+            var downgrades = new List<string>();
             var repaired = new List<string>();
             var platformDetails = new List<PlatformRepair>();
             foreach (var (path, kind) in kinds)
@@ -1560,8 +1579,10 @@ public sealed class PackageRestoreRunner(
                 }
                 parser.Forget(path);
                 repaired.Add(kind.Name);
-                if (kind.LockFile)
+                if (kind.Kind == RepairKind.LockFile)
                     lockFiles.Add(kind.Name);
+                else if (kind.Kind == RepairKind.Downgrade)
+                    downgrades.Add(kind.Name);
                 else
                 {
                     platform.Add($"{kind.Name} ({kind.Frameworks})");
@@ -1569,10 +1590,11 @@ public sealed class PackageRestoreRunner(
                 }
             }
             lockFiles.Sort(StringComparer.Ordinal);
+            downgrades.Sort(StringComparer.Ordinal);
             platform.Sort(StringComparer.Ordinal);
             repaired.Sort(StringComparer.Ordinal);
             platformDetails.Sort((a, b) => StringComparer.Ordinal.Compare(a.Project, b.Project));
-            return new RepairOutcome(lockFiles, platform, repaired, notAttempted, platformDetails);
+            return new RepairOutcome(lockFiles, platform, repaired, notAttempted, platformDetails, downgrades);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
