@@ -101,8 +101,15 @@ public static class IndexConfigurationHash
     /// and records a distinct coverage reason for it. Such projects now yield platform-typed references and call edges, and
     /// their repositories publish partial with that reason.
     /// </para>
+    /// <para>
+    /// <c>"11"</c> to <c>"12"</c> (issue #373): submodule discovery starts at the checkout root (the worker's
+    /// <c>SnapshotContext.CheckoutDir</c>, else the outermost git root over the solution's projects) instead of the first
+    /// project's git root. A solution listing a submodule project first used to register every submodule project in the
+    /// parent snapshot under a submodule-relative path; they now land in their provider snapshots, so the stored parent
+    /// and provider rows change for those repositories.
+    /// </para>
     /// </remarks>
-    public const string AnalyzerVersion = "11";
+    public const string AnalyzerVersion = "12";
 
     /// <summary>
     /// Computes the configuration hash for a resolved profile. The canonical pre-image is a fixed,

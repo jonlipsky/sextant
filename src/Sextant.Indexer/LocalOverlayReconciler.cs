@@ -361,7 +361,6 @@ public sealed class LocalOverlayReconciler
 
     private static string? ResolveRepoRoot(Solution solution)
     {
-        var firstProjectPath = solution.Projects.FirstOrDefault(p => p.FilePath != null)?.FilePath;
-        return firstProjectPath != null ? GitRemoteResolver.ResolveGitRoot(firstProjectPath) : null;
+        return IndexOrchestrator.ResolveRepoRoot(solution, null);
     }
 }

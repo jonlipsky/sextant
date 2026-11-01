@@ -215,14 +215,9 @@ public sealed class IncrementalIndexer
         Solution solution)
     {
         var submodules = new List<SubmoduleInfo>();
-        string? repoRoot = null;
-        var firstProjectPath = solution.Projects.FirstOrDefault(p => p.FilePath != null)?.FilePath;
-        if (firstProjectPath != null)
-        {
-            repoRoot = GitRemoteResolver.ResolveGitRoot(firstProjectPath);
-            if (repoRoot != null)
-                submodules = await SubmoduleDiscovery.DiscoverAsync(repoRoot);
-        }
+        var repoRoot = IndexOrchestrator.ResolveRepoRoot(solution, null);
+        if (repoRoot != null)
+            submodules = await SubmoduleDiscovery.DiscoverAsync(repoRoot);
         return (repoRoot, submodules);
     }
 
