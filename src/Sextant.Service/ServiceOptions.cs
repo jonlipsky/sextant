@@ -527,6 +527,18 @@ public sealed record ServiceOptions
     /// </summary>
     public TimeSpan FreshnessCheckInterval { get; init; } = TimeSpan.FromMinutes(DefaultFreshnessCheckMinutes);
 
+    /// <summary>The most repositories <c>GET /control/report</c> lists; a longer catalog is cut and flagged <c>truncated</c>.</summary>
+    public int ReportMaxRepositories { get; init; } = 500;
+
+    /// <summary>
+    /// The wall-clock bound of one <c>GET /control/report</c>. The catalog reads are interrupted when it passes; counts
+    /// not measured by then are left out of the report and measured by a later one.
+    /// </summary>
+    public TimeSpan ReportBudget { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>The most no-supported-code repositories <c>GET /control/report</c> reads; more are cut and flagged <c>truncated</c>.</summary>
+    public int ReportMaxNoCodeJobs { get; init; } = 10_000;
+
     public const int DefaultFreshnessCheckMinutes = 5;
     public const int MaxFreshnessCheckMinutes = 1440;
 

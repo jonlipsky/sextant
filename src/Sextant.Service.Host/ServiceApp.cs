@@ -560,6 +560,27 @@ public static class ServiceApp
                 : Results.Json(snapshot, ServiceJson.Options);
         });
 
+        // Operator status report (daily email): which repositories are indexed and how much. Authorized like /metrics: an
+        // application caller sees only the repositories its tenant holds a tenant-wide grant for, the operator all, and
+        // anyone else none (a user caller is already refused by the control caller rules).
+        control.MapGet("/report", async (HttpRequest req, SnapshotService service, CancellationToken ct) =>
+        {
+            var caller = CallerRequest.Get(req.HttpContext)?.Principal;
+            var visible = MetricsRepositoryVisibility(caller, service);
+            IReadOnlyList<string> granted = caller is { Actor: CallerActor.Application, TenantId.Length: > 0 }
+                ? service.GetVisibleGrants(caller).Select(g => g.RemoteUrl).ToList()
+                : [];
+            try
+            {
+                var report = await service.BuildStatusReportAsync(visible, granted, ct);
+                return Results.Json(report, ServiceJson.Options);
+            }
+            catch (TimeoutException)
+            {
+                return Results.Json(new { status = "unavailable", reason = "report_timeout" }, ServiceJson.Options, statusCode: 503);
+            }
+        });
+
         // Durable audit trail (security + cost attribution). Optional action/repository filters.
         control.MapGet("/audit", (int? limit, string? action, string? repository, SnapshotService service) =>
         {

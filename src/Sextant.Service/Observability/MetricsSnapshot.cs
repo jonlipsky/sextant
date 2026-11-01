@@ -221,6 +221,13 @@ public sealed record DefaultBranchFreshness
     public required string Repository { get; init; }
     public double LagSeconds { get; init; }
     public bool Unknown { get; init; }
+
+    /// <summary>
+    /// Whether the indexed head differs from the last remote head observed; null when no recent remote head is known.
+    /// Not part of the metrics wire format.
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool? BehindRemote { get; init; }
 }
 
 /// <summary>
