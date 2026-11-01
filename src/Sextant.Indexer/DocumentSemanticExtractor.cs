@@ -358,9 +358,28 @@ public static class DocumentSemanticExtractor
         => !IsKeywordUse(name, model) && reason switch
         {
             CandidateReason.MemberGroup or CandidateReason.LateBound => false,
+            CandidateReason.OverloadResolutionFailure => IsOverloadFailure(name, model),
             CandidateReason.None => model.GetTypeInfo(name).Type is IErrorTypeSymbol,
             _ => true
         };
+
+    /// <summary>
+    /// True unless the name is a method group passed as an argument that the compiler accepts. A method group passed
+    /// to a <c>Delegate</c> parameter (<c>group.MapPost("/x", Handler)</c>) has no single method to bind to, so the
+    /// model reports <see cref="CandidateReason.OverloadResolutionFailure"/> although the program compiles; such a
+    /// name carries no error on its span. Any other name (a called name fails because of an unresolved type, which
+    /// the compiler does not report on a call whose argument is already an error type) stays a failure. Asked only of
+    /// a name already unbound, so the cost stays small.
+    /// </summary>
+    private static bool IsOverloadFailure(SimpleNameSyntax name, SemanticModel model)
+    {
+        SyntaxNode expression = name;
+        if (expression.Parent is MemberAccessExpressionSyntax access && access.Name == name)
+            expression = access;
+        if (expression.Parent is not ArgumentSyntax)
+            return true;
+        return model.GetDiagnostics(name.Span).Any(d => d.Severity == DiagnosticSeverity.Error);
+    }
 
     /// <summary>
     /// True for an identifier that is a contextual keyword at this position and so never binds to a symbol: the

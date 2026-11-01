@@ -88,7 +88,7 @@ public static class SnapshotCoverageBuilder
 
     public static Result Build(
         string checkoutDir, CheckoutResolution resolution, MultiSolutionLoadResult load, Inventory inventory,
-        IReadOnlyList<SdkPinOverride>? sdkPinOverrides = null)
+        IReadOnlyList<SdkPinOverride>? sdkPinOverrides = null, IReadOnlyList<PlatformRepair>? platformRepairs = null)
     {
         var comparer = CheckoutInventory.PathComparer;
         var reasons = new List<string>();
@@ -116,6 +116,11 @@ public static class SnapshotCoverageBuilder
         var packBound = load.PlatformPackBindings
             .Select(b => (Path.GetFullPath(b.ProjectPath), NormalizeTfm(b.TargetFramework)))
             .ToHashSet(new VersionKeyComparer(comparer));
+        // Issue #352: the platform targets a restore repair left out of a project are excluded on that evidence, even
+        // when the load reports nothing about them (a version that loaded against the reduced assets).
+        bool RepairedLeftOut(string project, string? tfm)
+            => platformRepairs?.Any(r => string.Equals(r.Project, project, StringComparison.Ordinal)
+                   && r.LeftOut.Any(t => SameTargetPlatform(t, tfm))) == true;
         List<T> Exclude<T>(IReadOnlyList<T> versions, Func<T, string> file, Func<T, string?> tfm, Func<T, string?> reason)
         {
             var kept = new List<T>();
@@ -123,9 +128,10 @@ public static class SnapshotCoverageBuilder
             {
                 var path = file(version);
                 var bound = packBound.Contains((Path.GetFullPath(path), NormalizeTfm(tfm(version))));
+                var key = ReasonPath(checkoutDir, path);
                 if (ProjectExclusionClassifier.Classify(
-                        ReasonPath(checkoutDir, path), tfm(version), path, reason(version), bound,
-                        unpopulatedDirs, checkoutDir) is { } exclusion)
+                        key, tfm(version), path, reason(version), bound,
+                        unpopulatedDirs, checkoutDir, restoreRepaired: RepairedLeftOut(key, tfm(version))) is { } exclusion)
                     excluded.Add(exclusion);
                 else
                     kept.Add(version);
@@ -135,6 +141,12 @@ public static class SnapshotCoverageBuilder
         var skippedProjects = Exclude(load.SkippedProjects, p => p.ProjectPath, p => p.TargetFramework, p => p.Reason);
         var degradedProjects = Exclude(load.DegradedProjects, p => p.ProjectPath, p => p.TargetFramework, p => p.Reason);
         var packBindings = Exclude(load.PlatformPackBindings, p => p.ProjectPath, p => p.TargetFramework, _ => null);
+        var versionIndex = new ProjectVersionIndex(checkoutDir, load);
+        foreach (var repair in platformRepairs ?? [])
+            foreach (var tfm in versionIndex.VersionsOf(repair.Project))
+                if (RepairedLeftOut(repair.Project, tfm)
+                    && ProjectExclusionClassifier.Classify(repair.Project, tfm, string.Empty, null, restoreRepaired: true) is { } repaired)
+                    excluded.Add(repaired);
 
         // Defensive invariant: the no-config default selects the UNION of every discovered solution (#124)
         // and an explicit config records no discovery, so this is empty today. It is still honored so that a
@@ -354,7 +366,20 @@ public static class SnapshotCoverageBuilder
 
         var distinctExcluded = ProjectExclusionClassifier.Distinct(excluded);
         return new Result(ProjectExclusionClassifier.Record(coverage, distinctExcluded), diagnostics, distinctExcluded,
-            new ProjectVersionIndex(checkoutDir, load));
+            versionIndex);
+    }
+
+    // The same platform of the same framework version: a declared "net10.0-ios" is the evaluated "net10.0-ios17.0".
+    private static bool SameTargetPlatform(string? declared, string? evaluated)
+    {
+        var platform = ProjectExclusionClassifier.PlatformOf(declared);
+        if (platform is null || platform != ProjectExclusionClassifier.PlatformOf(evaluated))
+            return false;
+        var dashD = declared!.IndexOf('-');
+        var dashE = evaluated!.IndexOf('-');
+        if (dashD < 0 || dashE < 0)
+            return string.Equals(declared, evaluated, StringComparison.OrdinalIgnoreCase);
+        return string.Equals(declared[..dashD], evaluated[..dashE], StringComparison.OrdinalIgnoreCase);
     }
 
     private static ProjectOutcome ExclusionDiagnostic(ProjectExclusion e) => new()
@@ -407,7 +432,8 @@ public static class SnapshotCoverageBuilder
     /// <summary>
     /// True when the restore left a gap beyond the project exclusions. A restore failure is excluded only when every
     /// version of the project is excluded and every error code is explained by the exclusion (<c>NU1012</c> and
-    /// <c>NETSDK1084</c> for platform exclusions, <c>MSB3202</c> for a missing project file). A timeout, a restore
+    /// <c>NETSDK1084</c> for platform exclusions, <c>MSB3202</c> for a missing project file, <c>MSB4025</c> for a missing or
+    /// legacy-format one and <c>MSB4019</c> for a legacy-format one). A timeout, a restore
     /// that could not start, errors that name no project, a failed solution that reported no project error, or any
     /// other code keeps the gap.
     /// </summary>
@@ -441,6 +467,10 @@ public static class SnapshotCoverageBuilder
             {
                 "NU1012" or "NETSDK1084" => reason == ProjectExclusionReason.PlatformUnavailable,
                 "MSB3202" => reason == ProjectExclusionReason.ProjectFileMissing,
+                // The project file could not be loaded (a missing file, or legacy content this worker cannot evaluate).
+                "MSB4025" => reason is ProjectExclusionReason.ProjectFileMissing or ProjectExclusionReason.LegacyProjectFormat,
+                // A missing import is explained only by the project being a legacy-format one.
+                "MSB4019" => reason == ProjectExclusionReason.LegacyProjectFormat,
                 _ => false
             };
         }
@@ -486,10 +516,12 @@ public static class SnapshotCoverageBuilder
     /// </summary>
     public static IReadOnlyDictionary<string, SnapshotCoverage> BuildProviders(
         string checkoutDir, CheckoutResolution resolution, MultiSolutionLoadResult load, Inventory inventory,
-        IReadOnlyList<SdkPinOverride>? sdkPinOverrides = null, TimeSpan? timeBudget = null)
+        IReadOnlyList<SdkPinOverride>? sdkPinOverrides = null, TimeSpan? timeBudget = null,
+        IReadOnlyList<PlatformRepair>? platformRepairs = null)
     {
         var comparer = CheckoutInventory.PathComparer;
         var root = Path.GetFullPath(checkoutDir);
+        var versionIndex = platformRepairs is { Count: > 0 } ? new ProjectVersionIndex(checkoutDir, load) : null;
         var result = new Dictionary<string, SnapshotCoverage>(comparer);
 
         var loadedFiles = UsableFiles(load, comparer);
@@ -533,6 +565,10 @@ public static class SnapshotCoverageBuilder
                 .Select(u => Path.GetFullPath(Path.Combine(root, u.Path))).ToList();
             var bound = packBound.Select(b => (Path.GetFullPath(b.ProjectPath), NormalizeTfm(b.TargetFramework)))
                 .ToHashSet(new VersionKeyComparer(comparer));
+            // Issue #352: the repair names the project checkout-relative; its left-out platform targets stay excluded.
+            bool RepairedLeftOut(string checkoutRelative, string? tfm)
+                => platformRepairs?.Any(r => string.Equals(r.Project, checkoutRelative, StringComparison.Ordinal)
+                       && r.LeftOut.Any(t => SameTargetPlatform(t, tfm))) == true;
             List<T> Exclude<T>(List<T> versions, Func<T, string> file, Func<T, string?> tfm, Func<T, string?> reason)
             {
                 var kept = new List<T>();
@@ -541,7 +577,8 @@ public static class SnapshotCoverageBuilder
                     var path = Path.GetFullPath(file(version));
                     if (ProjectExclusionClassifier.Classify(
                             Rel(path), tfm(version), path, reason(version),
-                            bound.Contains((path, NormalizeTfm(tfm(version)))), unpopulatedDirs, subtree) is { } exclusion)
+                            bound.Contains((path, NormalizeTfm(tfm(version)))), unpopulatedDirs, subtree,
+                            restoreRepaired: RepairedLeftOut(ReasonPath(checkoutDir, path), tfm(version))) is { } exclusion)
                         excluded.Add(exclusion);
                     else
                         kept.Add(version);
@@ -551,6 +588,16 @@ public static class SnapshotCoverageBuilder
             var skippedGaps = Exclude(skipped, p => p.ProjectPath, p => p.TargetFramework, p => p.Reason);
             var degradedGaps = Exclude(degraded, p => p.ProjectPath, p => p.TargetFramework, p => p.Reason);
             packBound = Exclude(packBound, p => p.ProjectPath, p => p.TargetFramework, _ => null);
+            foreach (var repair in platformRepairs ?? [])
+            {
+                var projectFull = Path.GetFullPath(Path.Combine(root, repair.Project.Replace('/', Path.DirectorySeparatorChar)));
+                if (!InSubtree(projectFull))
+                    continue;
+                foreach (var tfm in versionIndex!.VersionsOf(repair.Project))
+                    if (RepairedLeftOut(repair.Project, tfm)
+                        && ProjectExclusionClassifier.Classify(Rel(projectFull), tfm, string.Empty, null, restoreRepaired: true) is { } repaired)
+                        excluded.Add(repaired);
+            }
 
             var reasons = new List<string>();
             if (skippedGaps.Count > 0)

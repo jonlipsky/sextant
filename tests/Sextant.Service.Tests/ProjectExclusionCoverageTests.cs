@@ -335,6 +335,138 @@ public class ProjectExclusionCoverageTests
     }
 
     [TestMethod]
+    public void MSB4025_IsExplainedByAMissingOrLegacyExclusion_AndMSB4019OnlyByALegacyOne()
+    {
+        var excluded = new List<ProjectExclusion>
+        {
+            new("src/Gone/Gone.csproj", null, ProjectExclusionReason.ProjectFileMissing),
+            new("src/Old/Old.csproj", null, ProjectExclusionReason.LegacyProjectFormat),
+            new("src/Ios/Ios.csproj", "net10.0-ios", ProjectExclusionReason.PlatformUnavailable, "ios; workload_missing")
+        };
+        var versions = Versions(("src/Gone/Gone.csproj", null), ("src/Old/Old.csproj", null), ("src/Ios/Ios.csproj", "net10.0-ios"));
+        bool Gap(string project, string code) =>
+            SnapshotCoverageBuilder.RestoreGapRemains(Restore(false, 1, 1, (project, [code])), excluded, versions);
+
+        Assert.IsFalse(Gap("src/Gone/Gone.csproj", "MSB4025"));
+        Assert.IsFalse(Gap("src/Old/Old.csproj", "MSB4025"));
+        Assert.IsFalse(Gap("src/Old/Old.csproj", "MSB4019"));
+        Assert.IsTrue(Gap("src/Gone/Gone.csproj", "MSB4019"), "a missing import is explained only by a legacy project");
+        Assert.IsTrue(Gap("src/Ios/Ios.csproj", "MSB4025"), "MSB4025 does not explain a platform exclusion");
+        Assert.IsTrue(Gap("src/Old/Old.csproj", "NU1605"), "NU1605 is never explained");
+        Assert.IsTrue(Gap("src/Lib/Lib.csproj", "MSB4025"), "a project that is not excluded");
+    }
+
+    [TestMethod]
+    public void MSB4025_OnAMissingProject_LeavesTheSnapshotComplete_ThroughTheRestoreVerdict()
+    {
+        var coverage = SnapshotCoverageBuilder.WithRestoreOutcome(
+            new SnapshotCoverage { Verdict = SnapshotCoverageVerdict.Complete },
+            Restore(false, 1, 1, ("src/Gone/Gone.csproj", ["MSB4025"])), Excluded,
+            Versions(("src/Gone/Gone.csproj", null)));
+
+        Assert.AreEqual(SnapshotCoverageVerdict.Complete, coverage.Verdict, string.Join(" | ", coverage.Reasons));
+    }
+
+    [TestMethod]
+    public void RepairedProject_KeepsItsLeftOutPlatformVariantsExcluded_AndNothingElse()
+    {
+        var skia = Sdk("src/Skia/Skia.csproj");
+        var other = Sdk("src/Other/Other.csproj");
+        var load = Load(Path.Combine(_root, "App.slnx"), [skia, other],
+            degraded:
+            [
+                new DegradedProject(skia, "net10.0-ios17.0", Unrelated),
+                new DegradedProject(skia, "net10.0-maccatalyst17.0", Unrelated),
+                new DegradedProject(skia, "net10.0-macos14.0", Unrelated),
+                new DegradedProject(skia, "net10.0", Unrelated),
+                new DegradedProject(other, "net10.0-ios17.0", Unrelated)
+            ]);
+        PlatformRepair[] repairs =
+            [new("src/Skia/Skia.csproj", "net10.0", ["net10.0-ios", "net10.0-maccatalyst", "net10.0-macos"])];
+
+        var result = SnapshotCoverageBuilder.Build(_root, Resolution(), load,
+            new SnapshotCoverageBuilder.Inventory([skia, other], []), platformRepairs: repairs);
+
+        var excluded = result.Coverage.Exclusions!;
+        Assert.AreEqual(3, excluded.Count, string.Join(" | ", excluded.Select(e => e.Project + " " + e.TargetFramework)));
+        Assert.IsTrue(excluded.All(e => e.Reason == ProjectExclusionReason.PlatformUnavailable && e.Project == "src/Skia/Skia.csproj"));
+        Assert.IsTrue(excluded.All(e => e.Detail!.Contains(PlatformEvidence.RestoreRepaired, StringComparison.Ordinal)));
+        Assert.AreEqual(2, result.Coverage.ProjectsDegraded, "the restored net10.0 and the unrepaired project stay gaps");
+        Assert.AreEqual(SnapshotCoverageVerdict.Partial, result.Coverage.Verdict);
+    }
+
+    [TestMethod]
+    public void RepairedProject_WithAnOldStyleTargetFramework_ExcludesItsVersion_AndDoesNotThrow()
+    {
+        var old = Sdk("src/Old/Old.csproj");
+        var load = Load(Path.Combine(_root, "App.slnx"), [old],
+            degraded: [new DegradedProject(old, "xamarinios10", Unrelated), new DegradedProject(old, "net10.0", Unrelated)]);
+        PlatformRepair[] repairs = [new("src/Old/Old.csproj", "net10.0", ["XamarinIOS10"])];
+
+        var result = SnapshotCoverageBuilder.Build(_root, Resolution(), load,
+            new SnapshotCoverageBuilder.Inventory([old], []), platformRepairs: repairs);
+        Assert.AreEqual("xamarinios10", result.Coverage.Exclusions!.Single().TargetFramework);
+
+        var solution = Path.Combine(_root, "libs", "mix", "Mix.slnx");
+        var provider = Sdk("libs/mix/src/Old/Old.csproj");
+        var resolution = new CheckoutResolution
+        {
+            CheckoutDir = _root,
+            SelectedSolutions = [Path.Combine(_root, "App.slnx"), solution],
+            Source = SolutionSelectionSource.DefaultUnion
+        };
+        var providerLoad = Load(solution, [provider],
+            degraded: [new DegradedProject(provider, "xamarinios10", Unrelated)]);
+        var coverage = SnapshotCoverageBuilder.BuildProviders(_root, resolution, providerLoad,
+            new(new[] { provider }, [new DeclaredSubmodule("libs/mix", Populated: true)]) { SubmoduleSolutionFiles = [solution] },
+            platformRepairs: [new("libs/mix/src/Old/Old.csproj", "net10.0", ["XamarinIOS10"])])["libs/mix"];
+        Assert.AreEqual("xamarinios10", coverage.Exclusions!.Single().TargetFramework);
+    }
+
+    [TestMethod]
+    public void RepairedProject_WithAVersionKnownOnlyToTheIndex_IsExcludedToo()
+    {
+        var tests = Sdk("tests/Edit.Tests/Edit.Tests.csproj");
+        var skipped = new[]
+        {
+            new SkippedProject(tests, "x") { TargetFramework = "net10.0-ios17.0" },
+            new SkippedProject(tests, "x") { TargetFramework = "net10.0" }
+        };
+        var load = Load(Path.Combine(_root, "App.slnx"), [tests], skipped: skipped);
+        PlatformRepair[] repairs = [new("tests/Edit.Tests/Edit.Tests.csproj", "net10.0", ["net10.0-ios"])];
+
+        var result = SnapshotCoverageBuilder.Build(_root, Resolution(), load,
+            new SnapshotCoverageBuilder.Inventory([tests], []), platformRepairs: repairs);
+
+        Assert.AreEqual("net10.0-ios17.0", result.Coverage.Exclusions!.Single().TargetFramework);
+        Assert.AreEqual(1, result.Coverage.ProjectsSkipped, "only the restored net10.0 stays");
+    }
+
+    [TestMethod]
+    public void RepairedProject_LoadedVariantsOfTheLeftOutTargets_AreExcluded_WithEvidenceNamingTheRepair()
+    {
+        var skia = Sdk("src/Skia/Skia.csproj");
+        using var workspace = new AdhocWorkspace();
+        var solution = workspace.CurrentSolution;
+        foreach (var tfm in new[] { "net10.0", "net10.0-ios17.0", "net10.0-macos14.0" })
+            solution = solution.AddProject(ProjectInfo.Create(
+                ProjectId.CreateNewId(), VersionStamp.Default, $"Skia ({tfm})", "Skia", LanguageNames.CSharp, filePath: skia));
+        var load = new MultiSolutionLoadResult(solution, [],
+            [new SolutionCoverage(Path.Combine(_root, "App.slnx"), 1, 1, [])]) { DeclaredProjects = [skia] };
+        PlatformRepair[] repairs = [new("src/Skia/Skia.csproj", "net10.0", ["net10.0-ios", "net10.0-macos"])];
+
+        var result = SnapshotCoverageBuilder.Build(_root, Resolution(), load,
+            new SnapshotCoverageBuilder.Inventory([skia], []), platformRepairs: repairs);
+
+        CollectionAssert.AreEquivalent(new[] { "net10.0-ios17.0", "net10.0-macos14.0" },
+            result.Coverage.Exclusions!.Select(e => e.TargetFramework).ToArray());
+        Assert.IsTrue(result.Coverage.Exclusions!.All(e =>
+            e.Reason == ProjectExclusionReason.PlatformUnavailable
+            && e.Detail!.Contains(PlatformEvidence.RestoreRepaired, StringComparison.Ordinal)));
+        Assert.AreEqual(SnapshotCoverageVerdict.Complete, result.Coverage.Verdict, string.Join(" | ", result.Coverage.Reasons));
+    }
+
+    [TestMethod]
     public void Provider_PlatformDegradedAndMissingVersions_AreExclusions_AndGenuineGapsStayPartial()
     {
         var ios = Sdk("libs/mix/src/Ios/Ios.csproj");

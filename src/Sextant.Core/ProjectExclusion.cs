@@ -36,6 +36,13 @@ public static class PlatformEvidence
 
     /// <summary>A legacy Xamarin project reported that it needs desktop MSBuild (Visual Studio), which this worker never has.</summary>
     public const string DesktopMsbuildRequired = "desktop_msbuild_required";
+
+    /// <summary>
+    /// The package restore repaired the project by restoring only the targets this worker can build, after its platform
+    /// targets failed for a missing workload (<c>NU1012</c>, <c>NETSDK1147</c>, ...); the targets it left out are
+    /// excluded on that evidence.
+    /// </summary>
+    public const string RestoreRepaired = "restore_repaired_reduced_targets";
 }
 
 /// <summary>
@@ -109,6 +116,15 @@ public static partial class ProjectExclusionClassifier
     public static bool IsWorkloadFailure(string? reason) => Matches(WorkloadFailurePattern(), reason);
 
     /// <summary>
+    /// True when a failure message is evidence some exclusion rule reads (a missing workload, no application host,
+    /// desktop MSBuild, Windows tooling or a missing import), as opposed to an incidental failure. The loader keeps such
+    /// a message as the reason of a version that has several, so the order failures arrive in never loses it.
+    /// </summary>
+    public static bool IsExclusionEvidence(string? reason)
+        => IsWorkloadFailure(reason) || Matches(NoApplicationHostPattern(), reason) || Matches(DesktopMsbuildPattern(), reason)
+           || Matches(WindowsToolingPattern(), reason) || Matches(MissingImportPattern(), reason);
+
+    /// <summary>
     /// The OS platform of a target framework (<c>net10.0-ios17.0</c> gives <c>ios</c>), or null for a plain framework
     /// (<c>net10.0</c>, <c>netstandard2.0</c>, <c>net45</c>) or an unrecognised suffix.
     /// </summary>
@@ -179,14 +195,23 @@ public static partial class ProjectExclusionClassifier
     /// <paramref name="unpopulatedSubmodules"/> holds the full paths of declared submodules that are not checked out
     /// (a missing file inside one keeps that submodule's own gap) and <paramref name="checkoutRoot"/> the checkout
     /// (an existing project file outside it is never an exclusion; a declared one that provably does not exist is missing wherever it is declared). Null when the
-    /// version is not an exclusion.
+    /// version is not an exclusion. <paramref name="restoreRepaired"/> marks a version of a platform target the package
+    /// restore left out when it repaired the project (<see cref="PlatformEvidence.RestoreRepaired"/>).
     /// </summary>
     public static ProjectExclusion? Classify(
         string project, string? targetFramework, string projectFile, string? failureReason,
         bool platformPackBound = false, IReadOnlyList<string>? unpopulatedSubmodules = null,
-        string? checkoutRoot = null, WorkerPlatform? worker = null)
+        string? checkoutRoot = null, WorkerPlatform? worker = null, bool restoreRepaired = false)
     {
         targetFramework = string.IsNullOrWhiteSpace(targetFramework) ? null : targetFramework;
+
+        if (restoreRepaired && UnavailablePlatform(targetFramework, worker) is { } repairedPlatform
+            && EvidenceFor(repairedPlatform, failureReason, platformPackBound) is null)
+        {
+            return new ProjectExclusion(
+                project, targetFramework, ProjectExclusionReason.PlatformUnavailable,
+                $"{repairedPlatform}; {PlatformEvidence.RestoreRepaired}");
+        }
 
         if (UnavailablePlatform(targetFramework, worker) is { } platform
             && EvidenceFor(platform, failureReason, platformPackBound) is { } evidence)

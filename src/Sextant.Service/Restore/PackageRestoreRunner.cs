@@ -703,6 +703,7 @@ public sealed class PackageRestoreRunner(
             ProjectsRetried = retriedProjects,
             LockFileRetriedProjects = [.. repairs.SelectMany(r => r.LockFile)],
             PlatformRetriedProjects = [.. repairs.SelectMany(r => r.Platform)],
+            PlatformRepairs = [.. repairs.SelectMany(r => r.PlatformDetails ?? [])],
             RepairedProjects = [.. repairs.SelectMany(r => r.Projects)],
             RepairNotAttempted = repairs.Sum(r => r.NotAttempted),
             StaticGraphPasses = staticPasses,
@@ -888,6 +889,7 @@ public sealed class PackageRestoreRunner(
         {
             LockFileRetriedProjects = repair?.LockFile ?? [],
             PlatformRetriedProjects = repair?.Platform ?? [],
+            PlatformRepairs = repair?.PlatformDetails ?? [],
             RepairedProjects = repair?.Projects ?? [],
             RepairNotAttempted = repair?.NotAttempted ?? 0,
             SolutionsAttempted = 1,
@@ -1454,7 +1456,8 @@ public sealed class PackageRestoreRunner(
     // project, which were restored with reduced targets or an unlocked lock file and so are not clean; NotAttempted the
     // candidates the restore time limit left unrepaired.
     internal sealed record RepairOutcome(
-        IReadOnlyList<string> LockFile, IReadOnlyList<string> Platform, IReadOnlyList<string> Projects, int NotAttempted = 0)
+        IReadOnlyList<string> LockFile, IReadOnlyList<string> Platform, IReadOnlyList<string> Projects, int NotAttempted = 0,
+        IReadOnlyList<PlatformRepair>? PlatformDetails = null)
     {
         public bool Any => LockFile.Count > 0 || Platform.Count > 0;
     }
@@ -1484,7 +1487,7 @@ public sealed class PackageRestoreRunner(
         var notAttempted = 0;
         var lockDirectory = Path.Combine(Path.GetFullPath(scratchDir ?? Path.GetTempPath()), $"restore-lock-{Guid.NewGuid():N}");
         var projects = new List<UnionProject>();
-        var kinds = new Dictionary<string, (string Name, bool LockFile, string? Frameworks)>(CheckoutInventory.PathComparer);
+        var kinds = new Dictionary<string, (string Name, bool LockFile, string? Frameworks, IReadOnlyList<string> LeftOut)>(CheckoutInventory.PathComparer);
         try
         {
             foreach (var issue in issues)
@@ -1510,18 +1513,18 @@ public sealed class PackageRestoreRunner(
                     Directory.CreateDirectory(lockDirectory);
                     var lockFile = Path.Combine(lockDirectory, $"{projects.Count}.packages.lock.json");
                     projects.Add(new UnionProject(path, path, ["RestoreLockedMode=false", $"NuGetLockFilePath={lockFile}"]));
-                    kinds[path] = (issue.Project, true, null);
+                    kinds[path] = (issue.Project, true, null, []);
                     continue;
                 }
 
-                var (frameworks, outOfTime) = await BuildableFrameworksAsync(
+                var (frameworks, outOfTime, leftOut) = await BuildableFrameworksAsync(
                         path, globals, environment, deadline - watch.Elapsed, cancellationToken).ConfigureAwait(false);
                 if (outOfTime)
                     notAttempted++;
                 else if (frameworks is not null)
                 {
                     projects.Add(new UnionProject(path, path, [$"TargetFrameworks={frameworks.Replace(";", "%3B", StringComparison.Ordinal)}"]));
-                    kinds[path] = (issue.Project, false, frameworks);
+                    kinds[path] = (issue.Project, false, frameworks, leftOut);
                 }
             }
             if (projects.Count == 0)
@@ -1546,6 +1549,7 @@ public sealed class PackageRestoreRunner(
             var lockFiles = new List<string>();
             var platform = new List<string>();
             var repaired = new List<string>();
+            var platformDetails = new List<PlatformRepair>();
             foreach (var (path, kind) in kinds)
             {
                 if (!repairParser.WasRestored(path))
@@ -1559,12 +1563,16 @@ public sealed class PackageRestoreRunner(
                 if (kind.LockFile)
                     lockFiles.Add(kind.Name);
                 else
+                {
                     platform.Add($"{kind.Name} ({kind.Frameworks})");
+                    platformDetails.Add(new PlatformRepair(kind.Name, kind.Frameworks!, kind.LeftOut));
+                }
             }
             lockFiles.Sort(StringComparer.Ordinal);
             platform.Sort(StringComparer.Ordinal);
             repaired.Sort(StringComparer.Ordinal);
-            return new RepairOutcome(lockFiles, platform, repaired, notAttempted);
+            platformDetails.Sort((a, b) => StringComparer.Ordinal.Compare(a.Project, b.Project));
+            return new RepairOutcome(lockFiles, platform, repaired, notAttempted, platformDetails);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -1589,13 +1597,13 @@ public sealed class PackageRestoreRunner(
     // project is multi-target and at least one target is buildable and at least one is not (nothing to gain otherwise).
     // The probe runs for at most min(60 s, remaining); OutOfTime is true when the restore time limit, not the probe's own
     // bound, stopped it (or none was left).
-    internal async Task<(string? Frameworks, bool OutOfTime)> BuildableFrameworksAsync(
+    internal async Task<(string? Frameworks, bool OutOfTime, IReadOnlyList<string> LeftOut)> BuildableFrameworksAsync(
         string project, IReadOnlyList<KeyValuePair<string, string>> globals, IReadOnlyDictionary<string, string> environment,
         TimeSpan remaining, CancellationToken cancellationToken)
     {
         var probeLimit = TimeSpan.FromSeconds(60);
         if (remaining <= TimeSpan.Zero)
-            return (null, true);
+            return (null, true, []);
         var bound = remaining < probeLimit ? remaining : probeLimit;
         var startInfo = CreateStartInfo(
             ["msbuild", project, "-getProperty:TargetFrameworks", "-p:DesignTimeBuild=true", .. globals.Select(p => $"-p:{p.Key}={p.Value}"),
@@ -1605,11 +1613,11 @@ public sealed class PackageRestoreRunner(
         try
         {
             if (!process.Start())
-                return (null, false);
+                return (null, false, []);
         }
         catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or PlatformNotSupportedException)
         {
-            return (null, false);
+            return (null, false, []);
         }
         try { process.StandardInput.Close(); }
         catch (IOException) { /* already exited */ }
@@ -1630,17 +1638,19 @@ public sealed class PackageRestoreRunner(
             {
                 KillProcessTree(process);
                 cancellationToken.ThrowIfCancellationRequested();
-                return (null, remaining <= probeLimit);
+                return (null, remaining <= probeLimit, []);
             }
             var both = Task.WhenAll(output, error);
             if (await Task.WhenAny(both, Task.Delay(DrainGrace, CancellationToken.None)).ConfigureAwait(false) != both || process.ExitCode != 0)
-                return (null, false);
+                return (null, false, []);
 
             // A single -getProperty prints the bare value.
             var declared = (await output.ConfigureAwait(false)).Trim()
                 .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
             var buildable = declared.Where(f => ProjectExclusionClassifier.UnavailablePlatform(f) is null).ToList();
-            return (buildable.Count > 0 && buildable.Count < declared.Length ? string.Join(';', buildable) : null, false);
+            return buildable.Count > 0 && buildable.Count < declared.Length
+                ? (string.Join(';', buildable), false, declared.Except(buildable, StringComparer.OrdinalIgnoreCase).ToList())
+                : (null, false, []);
         }
         finally
         {

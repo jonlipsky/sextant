@@ -383,10 +383,10 @@ public sealed class LocalIndexerSnapshotWorker(
             {
                 var inventory = SnapshotCoverageBuilder.Inventory.Scan(checkoutDir);
                 pinOverrides = pins.Where(p => p.OverrideApplied).Select(p => p.ToCoverageOverride()).ToList();
-                coverage = SnapshotCoverageBuilder.Build(checkoutDir, resolution, load, inventory, pinOverrides);
+                coverage = SnapshotCoverageBuilder.Build(checkoutDir, resolution, load, inventory, pinOverrides, restore.PlatformRepairs);
                 coverage = coverage with { Coverage = SnapshotCoverageBuilder.WithRestoreOutcome(coverage.Coverage, restore, coverage.Exclusions, coverage.Versions) };
                 providerCoverage = SnapshotCoverageBuilder.BuildProviders(
-                        checkoutDir, resolution, load, inventory, pinOverrides, plan?.Budget)
+                        checkoutDir, resolution, load, inventory, pinOverrides, plan?.Budget, restore.PlatformRepairs)
                     .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
             }
             AddProviderRestoreGaps(providerCoverage, restore, coverage.Exclusions ?? [], coverage.Versions);
