@@ -521,6 +521,16 @@ public sealed record ServiceOptions
     public bool BuildGeneratorProjects { get; init; } = true;
 
     /// <summary>
+    /// How often the service reads each tracked default branch's head from its remote, for the index-freshness metric
+    /// (issue #355, <c>SEXTANT_SERVICE_FRESHNESS_CHECK_MINUTES</c>, default 5, clamped to 1440; 0 turns it off). Active
+    /// only in clone mode, where the service can reach remotes.
+    /// </summary>
+    public TimeSpan FreshnessCheckInterval { get; init; } = TimeSpan.FromMinutes(DefaultFreshnessCheckMinutes);
+
+    public const int DefaultFreshnessCheckMinutes = 5;
+    public const int MaxFreshnessCheckMinutes = 1440;
+
+    /// <summary>
     /// The <see cref="SnapshotIdentity.RestorePolicy"/> component folded into every ensure request's identity:
     /// null for the default restore-on policy and <c>off</c> when <see cref="PackageRestore"/> is disabled, so
     /// flipping the toggle rebuilds a commit instead of reusing a snapshot produced under the other policy.
@@ -634,6 +644,8 @@ public sealed record ServiceOptions
             PackageCacheMaxBytes = ParsePackageCacheMaxBytes(Env("PACKAGE_CACHE_MAX_MB")),
             GitObjectStore = EnvBool("GIT_OBJECT_STORE") ?? true,
             BuildGeneratorProjects = EnvBool("BUILD_GENERATOR_PROJECTS") ?? true,
+            FreshnessCheckInterval = TimeSpan.FromMinutes(EnvInt("FRESHNESS_CHECK_MINUTES") is int freshnessMinutes && freshnessMinutes >= 0
+                ? Math.Min(freshnessMinutes, MaxFreshnessCheckMinutes) : DefaultFreshnessCheckMinutes),
             GrantWriteBusyTimeout = ParsePositiveSeconds(
                 "GRANT_WRITE_BUSY_TIMEOUT_SECONDS", Env("GRANT_WRITE_BUSY_TIMEOUT_SECONDS"), DefaultGrantWriteBusyTimeoutSeconds),
             WriteLockWarnThreshold = ParsePositiveSeconds(

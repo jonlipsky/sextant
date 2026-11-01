@@ -120,16 +120,17 @@ public static class AlertEvaluator
             });
         }
 
-        // Storage pressure (only when a budget is configured).
+        // Storage pressure (only when a budget is configured and every volume size has been measured).
         var total = snapshot.Storage.TotalBytes;
-        if (t.StorageCritBytes > 0 && total >= t.StorageCritBytes)
+        var measured = snapshot.Storage.VolumesMeasured;
+        if (measured && t.StorageCritBytes > 0 && total >= t.StorageCritBytes)
             alerts.Add(new Alert
             {
                 Id = "storage_pressure",
                 Level = AlertLevel.Critical,
                 Message = $"Storage {total} bytes exceeds critical threshold {t.StorageCritBytes} bytes."
             });
-        else if (t.StorageWarnBytes > 0 && total >= t.StorageWarnBytes)
+        else if (measured && t.StorageWarnBytes > 0 && total >= t.StorageWarnBytes)
             alerts.Add(new Alert
             {
                 Id = "storage_pressure",

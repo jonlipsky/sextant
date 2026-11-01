@@ -133,7 +133,10 @@ public sealed partial class SnapshotService : IDisposable
         _remoteDefaults = remoteDefaults is null ? null : new RemoteDefaultBranchLookup(
             remoteDefaults, null, remoteDefaults as IRemoteBranchHeadResolver, remoteDefaults as IRemoteCommitBranchChecker);
         _remoteBranches = remoteBranches;
+        _headResolver = remoteDefaults as IRemoteBranchHeadResolver;
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _freshness = new DefaultBranchFreshnessTracker(
+            _timeProvider, 3 * _options.FreshnessCheckInterval + TimeSpan.FromMinutes(1));
         _writeGate = new WriteGate(_timeProvider);
         _jobIds = new JobIdReservations(
             JobIdReservations.FloorPathFor(options.CatalogDbPath),
@@ -245,6 +248,7 @@ public sealed partial class SnapshotService : IDisposable
                 service.LogTenantGrantLease();
                 service.ReconcileOnStartup();
                 service.StartMaintenanceLoop();
+                service.StartObservabilityLoops();
                 return service;
             }
             catch
@@ -2978,12 +2982,13 @@ public sealed partial class SnapshotService : IDisposable
     /// never blocks the writer or a running index. OPERATOR-ONLY data — the host exposes it on the control
     /// plane only (criterion-1 leakage guard).
     /// </summary>
-    public MetricsSnapshot CollectMetrics(AlertThresholds? thresholds = null)
+    public MetricsSnapshot CollectMetrics(AlertThresholds? thresholds = null, IReadOnlySet<string>? visibleRepositoryKeys = null)
     {
         using var conn = OpenReadConnection();
         var collector = new MetricsCollector(
-            conn, _paths, _options.CatalogDbPath, _metrics, HasWorkerCapacity, _timeProvider, _writeLocks);
-        return collector.Collect(thresholds);
+            conn, _paths, _options.CatalogDbPath, _metrics, HasWorkerCapacity, _timeProvider, _writeLocks,
+            _freshness, _sizeCache);
+        return collector.Collect(thresholds, visibleRepositoryKeys);
     }
 
     /// <summary>
@@ -3462,6 +3467,7 @@ public sealed partial class SnapshotService : IDisposable
         if (_ownsDatabase)
             _db.Dispose();
         _maintenanceTimer?.Dispose();
+        DisposeObservability();
         _maintenanceTick.Dispose();
         _maintenanceTicked.Dispose();
         _lifetime.Dispose();

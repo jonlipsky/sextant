@@ -17,6 +17,12 @@ public sealed record JobMetrics
     /// </summary>
     public long Coalesced { get; init; }
 
+    /// <summary>Seconds the oldest queued job has waited (0 when none is queued; issue #355).</summary>
+    public double OldestQueuedAgeSeconds { get; init; }
+
+    /// <summary>Seconds the longest-running job has been running (0 when none is running; issue #355).</summary>
+    public double LongestRunningAgeSeconds { get; init; }
+
     /// <summary>Total jobs that reached a terminal state.</summary>
     public long Terminal => Complete + Partial + Failed + Unsupported + Cancelled;
 
@@ -57,9 +63,24 @@ public sealed record WorkerCapacityMetrics
 public sealed record StorageMetrics
 {
     public long CatalogBytes { get; init; }
+
+    /// <summary>The catalog's <c>PRAGMA page_count</c> (issue #354).</summary>
+    public long CatalogPageCount { get; init; }
+
+    /// <summary>The catalog's <c>PRAGMA freelist_count</c>: pages the file holds but nothing uses (issue #354).</summary>
+    public long CatalogFreePages { get; init; }
+
+    public double CatalogFreePageRatio => CatalogPageCount <= 0 ? 0 : (double)CatalogFreePages / CatalogPageCount;
     public long ArtifactBytes { get; init; }
     public long CacheBytes { get; init; }
     public long CheckoutBytes { get; init; }
+
+    /// <summary>
+    /// False while any volume size has never been measured (its first walk is pending or failed); its bytes read 0 then,
+    /// so no storage-pressure verdict is drawn from them.
+    /// </summary>
+    public bool VolumesMeasured { get; init; } = true;
+
     public long TotalBytes => CatalogBytes + ArtifactBytes + CacheBytes + CheckoutBytes;
 }
 
@@ -191,6 +212,18 @@ public sealed record Alert
 }
 
 /// <summary>
+/// How far one tracked default branch's index is behind its remote (issue #355). <see cref="LagSeconds"/> is 0 while
+/// the indexed head equals the remote head; <see cref="Unknown"/> means the remote could not be read recently, so no
+/// lag is claimed.
+/// </summary>
+public sealed record DefaultBranchFreshness
+{
+    public required string Repository { get; init; }
+    public double LagSeconds { get; init; }
+    public bool Unknown { get; init; }
+}
+
+/// <summary>
 /// Whether the service's previous runs ended without releasing the writer lease (issue #320): a crash or kill such as
 /// the kernel OOM killer. <see cref="UncleanShutdownsTotal"/> is durable and monotonic (alert on its increase);
 /// <see cref="PreviousRunUnclean"/> is 1 for the current run when its predecessor never shut down cleanly.
@@ -245,6 +278,9 @@ public sealed record MetricsSnapshot
 
     /// <summary>Catalog write-lock holds and waits since start, with the owner of the longest of each (issue #342).</summary>
     public Sextant.Store.WriteLockMetrics WriteLock { get; init; } = new();
+
+    /// <summary>Index freshness per tracked default branch (issue #355). Control plane only.</summary>
+    public IReadOnlyList<DefaultBranchFreshness> Freshness { get; init; } = [];
 
     public IReadOnlyList<Alert> Alerts { get; init; } = [];
     public IReadOnlyList<Sextant.Store.AuditCostAttribution> CostByRepository { get; init; } = [];

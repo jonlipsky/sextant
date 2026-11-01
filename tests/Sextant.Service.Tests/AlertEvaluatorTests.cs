@@ -102,6 +102,23 @@ public class AlertEvaluatorTests
         Assert.IsTrue(alerts.All(a => a.Level == AlertLevel.Critical));
     }
 
+    [TestMethod]
+    public void StoragePressure_IsNotEvaluatedFromAVolumeThatWasNeverMeasured()
+    {
+        var thresholds = new AlertThresholds { StorageCritBytes = 10 };
+        var unmeasured = Snapshot(new JobMetrics()) with
+        {
+            Storage = new StorageMetrics { CatalogBytes = 5, VolumesMeasured = false }
+        };
+        Assert.IsFalse(AlertEvaluator.Evaluate(unmeasured, thresholds).Any(a => a.Id == "storage_pressure"));
+
+        var measured = Snapshot(new JobMetrics()) with
+        {
+            Storage = new StorageMetrics { CatalogBytes = 50, VolumesMeasured = true }
+        };
+        Assert.IsTrue(AlertEvaluator.Evaluate(measured, thresholds).Any(a => a.Id == "storage_pressure"));
+    }
+
     private static void AssertCompletenessAlert(
         IReadOnlyList<Alert> alerts, int expectedLevel, string? message = null)
     {

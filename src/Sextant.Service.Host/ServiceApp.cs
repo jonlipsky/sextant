@@ -548,9 +548,13 @@ public static class ServiceApp
         // reason a user caller is refused (issue #193): it must never read other callers' audit rows or metrics.
 
         // Metrics: JSON by default, or Prometheus text exposition with ?format=prometheus for a scraper.
-        control.MapGet("/metrics", (string? format, SnapshotService service) =>
+        // The per-repository freshness series name repositories of every tenant, so an application caller gets only the
+        // repositories its own tenant holds a grant for. An assertion-less call is the operator's own access (all of
+        // them); a caller whose tenant cannot be established, or that is not an application, gets none.
+        control.MapGet("/metrics", (string? format, HttpRequest req, SnapshotService service) =>
         {
-            var snapshot = service.CollectMetrics();
+            var snapshot = service.CollectMetrics(
+                visibleRepositoryKeys: MetricsRepositoryVisibility(CallerRequest.Get(req.HttpContext)?.Principal, service));
             return string.Equals(format, "prometheus", StringComparison.OrdinalIgnoreCase)
                 ? Results.Text(PrometheusExposition.Render(snapshot), "text/plain; version=0.0.4")
                 : Results.Json(snapshot, ServiceJson.Options);
@@ -822,6 +826,20 @@ public static class ServiceApp
 
     /// <summary>The most repositories a <c>repository_required</c> error lists before pointing at <c>list_repositories</c>.</summary>
     internal const int RepositoryRequiredListLimit = 20;
+
+    /// <summary>
+    /// The repository keys a <c>/control/metrics</c> caller's per-repository series may name: null (all) for the
+    /// operator's own assertion-less access; for a verified application caller its tenant's grants; empty for anything
+    /// else, including a caller with no tenant, so the series fail closed.
+    /// </summary>
+    internal static IReadOnlySet<string>? MetricsRepositoryVisibility(CallerPrincipal? caller, SnapshotService service)
+    {
+        if (caller is null)
+            return null;
+        return caller is { Actor: CallerActor.Application, TenantId.Length: > 0 }
+            ? service.GetVisibleRepositoryKeys(caller)
+            : new HashSet<string>(StringComparer.Ordinal);
+    }
 
     /// <summary>
     /// The guidance appended to a <c>repository_required</c> error: how to name a repository and, for a verified

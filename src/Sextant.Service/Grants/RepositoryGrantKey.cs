@@ -26,6 +26,13 @@ public static class RepositoryGrantKey
     }
 
     /// <summary>
+    /// The one visibility rule of the per-repository metric series: <paramref name="visibleKeys"/> null = every
+    /// repository (the operator); otherwise <paramref name="remoteUrl"/>'s key must be in the set.
+    /// </summary>
+    public static bool IsVisible(IReadOnlySet<string>? visibleKeys, string? remoteUrl) =>
+        visibleKeys is null || visibleKeys.Contains(Of(remoteUrl));
+
+    /// <summary>
     /// The URL-policy decision for REVOKING a grant: <paramref name="policy"/>'s decision, except that a URL refused
     /// only because its host or owner is no longer allow-listed is still accepted when it passes the shape rules, so a
     /// grant made before an operator narrowed the allow-list can always be revoked.

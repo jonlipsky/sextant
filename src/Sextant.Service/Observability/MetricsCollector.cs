@@ -1,5 +1,6 @@
 using Microsoft.Data.Sqlite;
 using Sextant.Core;
+using Sextant.Service.Grants;
 using Sextant.Store;
 
 namespace Sextant.Service.Observability;
@@ -19,7 +20,9 @@ public sealed class MetricsCollector(
     ServiceMetrics metrics,
     bool hasWorkerCapacity,
     TimeProvider? timeProvider = null,
-    WriteLockTracker? writeLocks = null)
+    WriteLockTracker? writeLocks = null,
+    DefaultBranchFreshnessTracker? freshness = null,
+    DirectorySizeCache? sizeCache = null)
 {
     // Bound the latency window so a very long-lived service never scans an unbounded job history.
     private const int LatencyWindow = 1000;
@@ -29,17 +32,21 @@ public sealed class MetricsCollector(
     private static readonly long RecentWindowMs = (long)TimeSpan.FromHours(24).TotalMilliseconds;
     private readonly TimeProvider _time = timeProvider ?? TimeProvider.System;
 
-    public MetricsSnapshot Collect(AlertThresholds? thresholds = null)
+    /// <param name="visibleRepositoryKeys">
+    /// The <see cref="Sextant.Service.Grants.RepositoryGrantKey"/>s the per-repository series (freshness and cost) may name; null
+    /// = every repository (the operator's own access).
+    /// </param>
+    public MetricsSnapshot Collect(AlertThresholds? thresholds = null, IReadOnlySet<string>? visibleRepositoryKeys = null)
     {
         var collectedAt = _time.GetUtcNow();
         var windowEnd = collectedAt.ToUnixTimeMilliseconds();
         var windowStart = windowEnd - RecentWindowMs;
-        var jobs = CollectJobs();
+        var jobs = CollectJobs(windowEnd);
         var recentJobs = CollectRecentJobs(windowStart, windowEnd, thresholds?.SuccessRateMinSamples ??
             AlertThresholds.Default.SuccessRateMinSamples);
         var (indexing, queue) = CollectLatencies();
         var storage = CollectStorage();
-        var cost = CollectCost();
+        var cost = CollectCost(visibleRepositoryKeys);
 
         var snapshot = new MetricsSnapshot
         {
@@ -67,6 +74,7 @@ public sealed class MetricsCollector(
             QueryErrors = metrics.QueryErrors,
             Maintenance = metrics.Maintenance,
             Crash = CollectCrash(),
+            Freshness = freshness?.Evaluate(connection, visibleRepositoryKeys) ?? [],
             WriteLock = writeLocks?.Snapshot() ?? new WriteLockMetrics(),
             CostByRepository = cost
         };
@@ -161,7 +169,7 @@ public sealed class MetricsCollector(
         };
     }
 
-    private JobMetrics CollectJobs()
+    private JobMetrics CollectJobs(long nowMs)
     {
         var counts = new Dictionary<string, long>(StringComparer.Ordinal);
         using (var cmd = connection.CreateCommand())
@@ -175,8 +183,11 @@ public sealed class MetricsCollector(
             while (reader.Read())
                 counts[reader.GetString(0)] = reader.GetInt64(1);
         }
+        var (oldestQueued, longestRunning) = CollectJobAges(nowMs);
         return new JobMetrics
         {
+            OldestQueuedAgeSeconds = oldestQueued,
+            LongestRunningAgeSeconds = longestRunning,
             Queued = counts.GetValueOrDefault(SnapshotJobStatus.Queued),
             Running = counts.GetValueOrDefault(SnapshotJobStatus.Running),
             Complete = counts.GetValueOrDefault(SnapshotJobStatus.Complete),
@@ -186,6 +197,27 @@ public sealed class MetricsCollector(
             Cancelled = counts.GetValueOrDefault(SnapshotJobStatus.Cancelled),
             Coalesced = counts.GetValueOrDefault(SnapshotJobStatus.Coalesced)
         };
+    }
+
+    // Age of the longest-queued job and of the longest-running one (since started_at, else updated_at). A requeue keeps
+    // created_at, so queued age runs from updated_at, which every transition into queued stamps. A repeated ensure of a
+    // still-queued job also stamps it, so the age restarts then: it can under-report a job that is re-requested while
+    // it waits, never over-report a requeued one. Both read the status index, so they cost one seek per status however
+    // large the job history is.
+    private (double oldestQueued, double longestRunning) CollectJobAges(long nowMs)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT MIN(updated_at) FROM snapshot_jobs WHERE status = @queued AND " +
+            SnapshotJobStore.NotStartupSettledSql + ";" +
+            "SELECT MIN(COALESCE(started_at, updated_at)) FROM snapshot_jobs WHERE status = @running AND " +
+            SnapshotJobStore.NotStartupSettledSql + ";";
+        cmd.Parameters.AddWithValue("@queued", SnapshotJobStatus.Queued);
+        cmd.Parameters.AddWithValue("@running", SnapshotJobStatus.Running);
+        using var reader = cmd.ExecuteReader();
+        var oldestQueued = reader.Read() && !reader.IsDBNull(0) ? Math.Max(0, (nowMs - reader.GetInt64(0)) / 1000.0) : 0;
+        reader.NextResult();
+        var longestRunning = reader.Read() && !reader.IsDBNull(0) ? Math.Max(0, (nowMs - reader.GetInt64(0)) / 1000.0) : 0;
+        return (oldestQueued, longestRunning);
     }
 
     // Indexing latency = completed_at - started_at (worker run time); queue delay = started_at - created_at
@@ -227,19 +259,63 @@ public sealed class MetricsCollector(
         return (LatencyStats.FromSamples(indexingSamples), LatencyStats.FromSamples(queueSamples));
     }
 
-    private StorageMetrics CollectStorage() => new()
+    private StorageMetrics CollectStorage()
     {
-        CatalogBytes = CatalogSize(catalogDbPath),
-        ArtifactBytes = DirectorySize(paths.ArtifactRoot),
-        CacheBytes = DirectorySize(paths.CacheRoot),
-        CheckoutBytes = DirectorySize(paths.CheckoutRoot)
-    };
+        var (pages, free) = CatalogPages();
+        var artifacts = Volume(paths.ArtifactRoot);
+        var cache = Volume(paths.CacheRoot);
+        var checkouts = Volume(paths.CheckoutRoot);
+        return new StorageMetrics
+        {
+            CatalogBytes = CatalogSize(catalogDbPath),
+            CatalogPageCount = pages,
+            CatalogFreePages = free,
+            ArtifactBytes = artifacts ?? 0,
+            CacheBytes = cache ?? 0,
+            CheckoutBytes = checkouts ?? 0,
+            VolumesMeasured = artifacts is not null && cache is not null && checkouts is not null
+        };
+    }
 
-    private IReadOnlyList<AuditCostAttribution> CollectCost()
+    // Null while a volume has never been measured (the first walk is pending or failed).
+    private long? Volume(string root)
+    {
+        if (sizeCache is not null)
+            return sizeCache.TryGet(root, _time, out var bytes) ? bytes : null;
+        try
+        {
+            return DirectorySizeCache.Measure(root);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    // Both pragmas read the database header, so they cost nothing however large the catalog is (issue #354).
+    private (long pages, long free) CatalogPages()
     {
         try
         {
-            return new AuditLogStore(connection).CostByRepository();
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "PRAGMA page_count;";
+            var pages = Convert.ToInt64(cmd.ExecuteScalar(), System.Globalization.CultureInfo.InvariantCulture);
+            cmd.CommandText = "PRAGMA freelist_count;";
+            return (pages, Convert.ToInt64(cmd.ExecuteScalar(), System.Globalization.CultureInfo.InvariantCulture));
+        }
+        catch (SqliteException)
+        {
+            return (0, 0);
+        }
+    }
+
+    private IReadOnlyList<AuditCostAttribution> CollectCost(IReadOnlySet<string>? visibleRepositoryKeys)
+    {
+        try
+        {
+            return new AuditLogStore(connection).CostByRepository()
+                .Where(c => RepositoryGrantKey.IsVisible(visibleRepositoryKeys, c.RepositoryScope))
+                .ToList();
         }
         catch (SqliteException)
         {
@@ -257,7 +333,7 @@ public sealed class MetricsCollector(
         return total;
     }
 
-    private static long FileSize(string path)
+    internal static long FileSize(string path)
     {
         try
         {
@@ -267,19 +343,101 @@ public sealed class MetricsCollector(
         catch (IOException) { return 0; }
         catch (UnauthorizedAccessException) { return 0; }
     }
+}
 
-    private static long DirectorySize(string root)
+/// <summary>
+/// Remembers each volume's recursive size (issue #355). Walking a checkout or cache volume of hundreds of thousands of
+/// files is the one slow step of a metrics collection, so a walk never runs on the caller's thread: <see cref="Get"/>
+/// returns the last measured value at once (0 only until the first walk of that root finishes) and, when the value is
+/// older than <see cref="Ttl"/>, starts ONE background walk for that root; concurrent callers never start another
+/// while it runs.
+/// </summary>
+public sealed class DirectorySizeCache(Func<string, long>? measure = null)
+{
+    public static readonly TimeSpan Ttl = TimeSpan.FromMinutes(5);
+
+    private sealed class Entry
+    {
+        public long Bytes;
+        public bool Measured;
+        public DateTimeOffset? At;
+        public bool Walking;
+    }
+
+    private readonly Func<string, long> _measure = measure ?? Measure;
+    private readonly Lock _gate = new();
+    private readonly Dictionary<string, Entry> _entries = new(StringComparer.Ordinal);
+
+    public long Get(string root, TimeProvider time)
+    {
+        TryGet(root, time, out var bytes);
+        return bytes;
+    }
+
+    /// <summary>
+    /// As <see cref="Get"/>, but false (with 0) while no walk of <paramref name="root"/> has completed, so a caller can
+    /// tell "never measured" from an empty volume.
+    /// </summary>
+    public bool TryGet(string root, TimeProvider time, out long bytes)
+    {
+        var start = false;
+        bool measured;
+        lock (_gate)
+        {
+            if (!_entries.TryGetValue(root, out var entry))
+                _entries[root] = entry = new Entry();
+            bytes = entry.Bytes;
+            measured = entry.Measured;
+            if (!entry.Walking && (entry.At is not { } at || time.GetUtcNow() - at >= Ttl))
+                start = entry.Walking = true;
+        }
+        if (start)
+            _ = Task.Run(() => Walk(root, time));
+        return measured;
+    }
+
+    private void Walk(string root, TimeProvider time)
+    {
+        long bytes = 0;
+        var ok = false;
+        try
+        {
+            bytes = _measure(root);
+            ok = true;
+        }
+        catch (Exception)
+        {
+            // Keep the last value; the next collection past the TTL tries again.
+        }
+        lock (_gate)
+        {
+            var entry = _entries[root];
+            if (ok)
+            {
+                entry.Bytes = bytes;
+                entry.Measured = true;
+            }
+            entry.At = time.GetUtcNow();
+            entry.Walking = false;
+        }
+    }
+
+    internal static long Measure(string root)
     {
         if (!Directory.Exists(root))
             return 0;
+        // An unreadable directory or file throws: a partial total must never be stored as a measurement. Only a file
+        // that vanished mid-walk (normal churn) counts 0.
         long total = 0;
-        try
+        foreach (var file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
         {
-            foreach (var file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
-                total += FileSize(file);
+            try
+            {
+                total += new FileInfo(file).Length;
+            }
+            catch (FileNotFoundException) { }
+            catch (DirectoryNotFoundException) { }
         }
-        catch (IOException) { }
-        catch (UnauthorizedAccessException) { }
         return total;
     }
 }

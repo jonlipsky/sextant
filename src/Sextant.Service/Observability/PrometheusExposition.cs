@@ -85,6 +85,33 @@ public static class PrometheusExposition
         Gauge(sb, "sextant_query_errors", "Query-plane 5xx count.", s.QueryErrors);
 
         Gauge(sb, "sextant_alerts_active", "Active alerts.", s.Alerts.Count);
+        sb.Append("# HELP sextant_alert_active 1 while the alert is raised; absent once it clears.\n");
+        sb.Append("# TYPE sextant_alert_active gauge\n");
+        foreach (var alert in s.Alerts)
+            sb.Append("sextant_alert_active{id=\"").Append(Escape(alert.Id)).Append("\",severity=\"")
+              .Append(alert.Level.ToString().ToLowerInvariant()).Append("\"} 1\n");
+
+        Gauge(sb, "sextant_jobs_oldest_queued_age_seconds", "Seconds the oldest queued job has waited (0 when none).",
+            s.Jobs.OldestQueuedAgeSeconds);
+        Gauge(sb, "sextant_jobs_longest_running_age_seconds", "Seconds the longest-running job has been running (0 when none).",
+            s.Jobs.LongestRunningAgeSeconds);
+        Gauge(sb, "sextant_storage_catalog_pages", "Catalog page count (PRAGMA page_count).", s.Storage.CatalogPageCount);
+        Gauge(sb, "sextant_storage_catalog_free_pages", "Catalog free pages (PRAGMA freelist_count).", s.Storage.CatalogFreePages);
+        Gauge(sb, "sextant_storage_catalog_free_page_ratio", "Catalog free pages as a fraction of all pages.", s.Storage.CatalogFreePageRatio);
+
+        // Issue #355: freshness of each tracked default branch. Per-repository labels stay on this control surface.
+        if (s.Freshness.Count > 0)
+        {
+            sb.Append("# HELP sextant_default_branch_lag_seconds Seconds the indexed default-branch head has differed from the remote head (0 when equal).\n");
+            sb.Append("# TYPE sextant_default_branch_lag_seconds gauge\n");
+            foreach (var f in s.Freshness.Where(f => !f.Unknown))
+                sb.Append("sextant_default_branch_lag_seconds{repository=\"").Append(Escape(f.Repository)).Append("\"} ")
+                  .Append(f.LagSeconds.ToString("G", CultureInfo.InvariantCulture)).Append('\n');
+            sb.Append("# HELP sextant_default_branch_lag_unknown 1 when the remote head could not be read recently, so no lag is claimed.\n");
+            sb.Append("# TYPE sextant_default_branch_lag_unknown gauge\n");
+            foreach (var f in s.Freshness.Where(f => f.Unknown))
+                sb.Append("sextant_default_branch_lag_unknown{repository=\"").Append(Escape(f.Repository)).Append("\"} 1\n");
+        }
 
         // Issue #342: catalog write-lock holds and waits.
         Gauge(sb, "sextant_write_lock_longest_hold_ms", "Longest catalog write-lock hold since start, in milliseconds.",
@@ -195,6 +222,8 @@ public static class PrometheusExposition
                   .Append(cost.IndexMs.ToString(CultureInfo.InvariantCulture)).Append('\n');
         }
 
+        // The last line, so a reader can tell a complete body from a truncated one.
+        sb.Append("# EOF\n");
         return sb.ToString();
     }
 

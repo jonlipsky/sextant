@@ -179,6 +179,91 @@ during pushes make it larger. After startup, `sextant_jobs_queued` is only jobs 
 
 ---
 
+## Operations signals (issues #354, #355)
+
+Sextant pushes nothing. The `sextant` ProcessStack app reads `GET /control/metrics?format=prometheus` (an application
+caller, Prometheus text) every 15 minutes and raises the alert whose rule matches below, then sends the email. Every
+threshold is stated against that 15-minute poll. Metrics used: `sextant_alert_active{id,severity}` (1 only while raised;
+absent otherwise), `sextant_default_branch_lag_seconds{repository}`, `sextant_default_branch_lag_unknown{repository}`,
+`sextant_jobs_oldest_queued_age_seconds`, `sextant_jobs_longest_running_age_seconds`,
+`sextant_storage_catalog_pages` / `_free_pages` / `_free_page_ratio`. Repository labels exist only on the control plane,
+never on `/mcp`.
+
+### Runbook: service down / metrics absent
+
+**Raised when.** Two consecutive polls (30 minutes) get no `200` Prometheus text from `/control/metrics?format=prometheus`
+(connection refused, timeout or 5xx). Also raised on any increase of `sextant_service_unclean_shutdowns_total` between polls
+(a crash or kill; see "previous run ended without a clean shutdown").
+**Means.** The service is down or hung, or the app cannot reach it.
+**Confirm.** `GET /health` (and `/ready`); `docker logs` for the last lines; then `GET /control/metrics?format=prometheus` with
+the control token or an application assertion.
+**Do.** Restart the service if it is down. If `/health` answers but `/control/metrics` does not, check the write lock and the
+log for a stuck collection.
+
+### Runbook: index freshness lag
+
+**Raised when.** `sextant_default_branch_lag_seconds{repository}` is above 3600 (1 hour) on two consecutive polls. Raised
+separately when `sextant_default_branch_lag_unknown{repository}` is 1 on 4 consecutive polls (1 hour).
+**Means.** The metric is how long a default branch's indexed head has differed from its remote head (0 = equal; resolution is
+`SEXTANT_SERVICE_FRESHNESS_CHECK_MINUTES`, 5 by default, clone mode only). It keeps growing while the head is being indexed,
+and drops to 0 at the next collection after the indexed head matches the remote. A default branch whose pointer has no usable
+complete snapshot (failed, superseded, reclaimed) counts as lagging; so does an indexed head that is not the remote's (a
+fork-only commit). A repository whose current remote head holds no supported code is absent. `_lag_unknown` = 1 replaces the
+lag series when the remote head could not be read: a failed or timed-out read, a deleted default branch (no such ref), or no
+successful read for 3 intervals. It is never reported as 0.
+**Known limit.** The lag clock is in memory: after a service restart it starts again from 0, so the 3600 s rule can be delayed
+by up to an hour. An application caller sees these series only for repositories its tenant holds a grant for; the operator's
+own access sees all. Rows that share a label are reported once, with the larger lag.
+**Confirm.** `GET /control/resolve` for the repository (`commit_sha` vs the remote head); `GET /control/status` for the head's
+job; a missing push webhook shows as lag with no job at all.
+**Do.** No job: re-run `POST /control/ensure` for the head (the app's reconcile does this nightly). Queued/running: see queue
+backlog below. Failed: see job failures. Unknown: check the repository token/host reachability from the service, and that the
+default branch still exists.
+
+### Runbook: job failures
+
+**Raised when.** `sextant_alert_active{id="low_success_rate"}` = 1 (success rate below 0.90 warning, below 0.50 critical,
+once 5 jobs have ended).
+**Means.** Too many jobs end `failed`.
+**Confirm.** `GET /control/metrics` (`jobs.failed`, success rate); `GET /control/audit`; `GET /control/status/<job_id>` for
+`last_error` and the per-project diagnostics.
+**Do.** Transient (`sdk_pin_restore_failed`, clone/network): it is requeued, wait. Deterministic (`evaluation_budget_exceeded`,
+restore, unsupported): fix the repository or its `sextant.json`; "Runbook: unsupported workloads" above.
+
+### Runbook: queue backlog or stuck job
+
+**Raised when.** `sextant_jobs_oldest_queued_age_seconds` is above 1800 (backlog), or
+`sextant_jobs_longest_running_age_seconds` is above 2400 (stuck: the sandbox time budget defaults to 1800 s, so 2400 means a
+job outlived it; raise the rule if `SEXTANT_SERVICE_SANDBOX_TIME_BUDGET_SECONDS` is larger), or
+`sextant_alert_active{id="worker_exhaustion"}` = 1, each on two consecutive polls.
+**Means.** Work waits too long for a worker, or a job is not finishing.
+**Confirm.** `GET /control/metrics` (`jobs.queued`, `jobs.running`, `worker_capacity`); the service log for the running job.
+**Do.** Backlog: "Runbook: worker exhaustion". Stuck: "Runbook: stuck indexing"; a restart requeues `running` jobs (see "Startup
+settles orphaned queued jobs").
+
+### Runbook: low completeness
+
+**Raised when.** `sextant_alert_active{id="low_completeness_rate"}` = 1 (completeness below 0.90 warning, below 0.50
+critical, over the recent window once 5 jobs have ended).
+**Means.** Too many published snapshots are `partial`.
+**Confirm.** `GET /control/metrics` (`recent_jobs.completeness_rate`); `GET /control/resolve` for a partial repository and read
+`coverage.reasons` (unloaded projects, submodules not checked out, time budget).
+**Do.** Fix the named cause (a `solutions` list in `sextant.json`, a missing package feed credential, a budget too small); a
+partial snapshot is final for its identity, so push a new commit or re-ensure after the fix.
+
+### Runbook: catalog size or free-page growth
+
+**Raised when.** `sextant_storage_catalog_free_page_ratio` is above 0.30 while `sextant_storage_catalog_free_pages` is above
+100000, on 4 consecutive polls (1 hour), or `sextant_storage_catalog_bytes` (including WAL) grows on every poll for 24 hours.
+**Means.** Deleted data left free pages in the file. Incremental vacuum in the maintenance loop (issue #252) returns them in bounded
+steps, so a ratio that stays high while pages stay free means it is not keeping up.
+**Confirm.** Watch `_free_pages` over a few maintenance ticks (default hourly): falling = healthy. Check that retention runs
+(`POST /control/retention` dry-run) and the write lock is not held by long indexes.
+**Do.** Run retention. If free pages stay high, compact offline during a window with the manual fallback `sextant catalog
+compact` ("Runbook: offline catalog compaction" above).
+
+---
+
 ## Runbook: local retention (`sextant retention`)
 
 The standalone service runs its own retention/GC under the writer lease via `POST /control/retention`. A
@@ -266,7 +351,7 @@ Migrations are **additive/forward-only** from `011` onward; `LatestSchemaVersion
 highest migration file. A restored/older catalog is upgraded on next startup.
 
 **Rollback caveat (migration 032).** A pre-032 binary refuses a 032 catalog (`CheckReadiness`: newer schema), so
-rolling the service back after it has started on 032 needs the pre-upgrade backup (the g2d backup) restored, not
+rolling the service back after it has started on 032 needs the pre-upgrade backup restored, not
 just the old image. The crash counters (`writer_run_state`) live in the catalog and come back with a restored backup.
 
 **Rehearsal (do this before upgrading production).**
