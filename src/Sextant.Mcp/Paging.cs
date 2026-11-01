@@ -91,16 +91,18 @@ public static class Paging
 
     /// <summary>
     /// Counts <paramref name="items"/> by <paramref name="key"/>: the <see cref="SummaryTop"/> largest groups
-    /// (count descending, then key), then one <c>(N more)</c> entry holding the rest's total.
+    /// (count descending, then key), then one <c>(N more)</c> entry holding the rest's total. A group whose
+    /// every item satisfies <paramref name="demoted"/> (test code) ranks after the others, matching the row order.
     /// </summary>
-    public static Dictionary<string, int> CountBy<T>(IEnumerable<T> items, Func<T, string?> key)
+    public static Dictionary<string, int> CountBy<T>(
+        IEnumerable<T> items, Func<T, string?> key, Func<T, bool>? demoted = null)
     {
         var groups = items.GroupBy(i => key(i) ?? "(none)", StringComparer.Ordinal)
-            .Select(g => (Key: g.Key, Count: g.Count()))
-            .OrderByDescending(g => g.Count).ThenBy(g => g.Key, StringComparer.Ordinal)
+            .Select(g => (Key: g.Key, Count: g.Count(), Demoted: demoted != null && g.All(demoted)))
+            .OrderBy(g => g.Demoted).ThenByDescending(g => g.Count).ThenBy(g => g.Key, StringComparer.Ordinal)
             .ToList();
         var summary = new Dictionary<string, int>(StringComparer.Ordinal);
-        foreach (var (k, count) in groups.Take(SummaryTop))
+        foreach (var (k, count, _) in groups.Take(SummaryTop))
             summary[k] = count;
         if (groups.Count > SummaryTop)
             summary[$"({groups.Count - SummaryTop} more)"] = groups.Skip(SummaryTop).Sum(g => g.Count);

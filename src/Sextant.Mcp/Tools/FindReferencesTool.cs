@@ -97,15 +97,16 @@ public static class FindReferencesTool
                 ? $"No references to {SymbolResolver.Describe(namer, symbol)} were found{(filtered ? " with the given filters" : string.Empty)}."
                 : null);
 
-        // A stable order, so a cursor resumes exactly where the previous page ended.
-        refs = refs.OrderBy(r => r.FilePath, StringComparer.Ordinal).ThenBy(r => r.Line)
+        // Production before test projects, then a stable order, so a cursor resumes exactly where the previous page ended.
+        var testProjects = TestProjects.IdsIn(projectStore);
+        refs = refs.OrderBy(r => testProjects.Contains(r.InProjectId)).ThenBy(r => r.FilePath, StringComparer.Ordinal).ThenBy(r => r.Line)
             .ThenBy(r => r.InProjectId).ThenBy(r => r.Id).ToList();
 
         var canonicalIdCache = FindSymbolTool.BuildCanonicalIdCache(projectStore);
         object? Summary() => new
         {
             ByProject = Paging.CountBy(refs, r => FindSymbolTool.ResolveCanonicalId(r.InProjectId, canonicalIdCache)),
-            ByFile = Paging.CountBy(refs, r => r.FilePath)
+            ByFile = Paging.CountBy(refs, r => r.FilePath, r => testProjects.Contains(r.InProjectId))
         };
 
         // Only this page's rows are mapped, so snippets are read for at most `limit` references.
