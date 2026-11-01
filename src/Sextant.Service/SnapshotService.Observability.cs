@@ -49,7 +49,7 @@ public sealed partial class SnapshotService
             if (_reportCache.TryGetValue(scope, out var cached) && _timeProvider.GetUtcNow() - cached.At < ReportCacheTtl)
                 return Task.FromResult(cached.Report);
             if (!_reportInFlight.TryGetValue(scope, out task!))
-                _reportInFlight[scope] = task = Task.Run(() => ComputeStatusReportAsync(scope, visibleKeys, grantedUrls));
+                _reportInFlight[scope] = task = Task.Run(() => ComputeStatusReportAsync(scope, visibleKeys, grantedUrls), CancellationToken.None);
         }
         return task.WaitAsync(ct);
     }
