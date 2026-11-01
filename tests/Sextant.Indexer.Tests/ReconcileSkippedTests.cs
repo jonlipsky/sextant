@@ -32,6 +32,27 @@ public sealed class ReconcileSkippedTests
     }
 
     [TestMethod]
+    public void DegradedProject_KeepsTheFailureAnExclusionRuleReads_WhateverOrderTheFailuresArriveIn()
+    {
+        var a = Abs("Evidence", "A.csproj");
+        var solution = SolutionWith((a, withDocument: true));
+        const string tooling = "WindowsAppSDKSelfContained requires a supported Windows architecture.";
+        string Failure(string message) => $"Msbuild failed when processing the file '{a}' with message: {message}";
+
+        var result = SolutionLoader.ReconcileLoads([a], solution,
+        [
+            new SolutionLoader.LoadFailure(null, a, Failure("Version conflict detected for Some.Package (NU1605).")),
+            new SolutionLoader.LoadFailure(null, a, Failure(tooling))
+        ], [], null);
+
+        StringAssert.Contains(result.DegradedProjects.Single().Reason, tooling);
+
+        var noEvidence = SolutionLoader.ReconcileLoads([a], solution,
+            [new SolutionLoader.LoadFailure(null, a, Failure("Version conflict detected for Some.Package (NU1605)."))], [], null);
+        StringAssert.Contains(noEvidence.DegradedProjects.Single().Reason, "NU1605");
+    }
+
+    [TestMethod]
     public void PresentProject_IsNotDegraded_ByAFailureThatReplaysAWarningFromItsOwnAssetsFile()
     {
         var a = Abs("Replay-" + Guid.NewGuid().ToString("N"), "A.csproj");
@@ -415,6 +436,21 @@ public sealed class ReconcileSkippedTests
         Assert.AreEqual(0, skipped.Count,
             "a typed failure owned by A must not mark sibling B skipped merely by naming it in the message");
         Assert.AreEqual(a, result.DegradedProjects.Single().ProjectPath);
+    }
+
+    [TestMethod]
+    public void AVariantsOwnFailure_IsNotReplacedByAWholeLoadFailureThatReadsAsExclusionEvidence()
+    {
+        var a = Abs("A", "A.csproj");
+        var built = BuildSolution([(a, false)]);
+        const string own = "Msbuild failed when processing the file with message: a genuine failure";
+        var noHost = $"Project '{a}': There is no application host available for the specified RuntimeIdentifier 'android-arm64'.";
+
+        var result = SolutionLoader.ReconcileLoads([a], built.Solution,
+            [new SolutionLoader.LoadFailure(built.ProjectIds[0], null, own), new SolutionLoader.LoadFailure(null, null, noHost)],
+            [], null);
+
+        Assert.AreEqual(own, result.SkippedProjects.Single().Reason);
     }
 
     private const string TransitiveWarning = "PackageReference X will not be pruned.";

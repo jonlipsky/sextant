@@ -467,10 +467,15 @@ public static class SolutionLoader
                 var failure = candidates.FirstOrDefault(f => f.ProjectId == variant.Id)
                     ?? candidates.FirstOrDefault(f => f.ProjectId == null);
                 var reason = failure?.Message ?? thrown?.Reason;
-                // The first failure is not always the workload one: keep the workload failure when the variant has several.
-                if (candidates.Where(f => f.ProjectId == variant.Id || f.ProjectId == null)
-                        .FirstOrDefault(f => PlatformReferencePacks.IsWorkloadFailure(f.Message)) is { } workloadFailure)
-                    reason = workloadFailure.Message;
+                // The first failure is not always the one that explains the variant: keep the workload failure when the
+                // variant has several, else any other failure an exclusion rule reads (a missing import, desktop
+                // MSBuild, Windows tooling), so the order the failures arrive in never decides the classification.
+                var ofVariant = candidates.Where(f => f.ProjectId == variant.Id).ToList();
+                if (ofVariant.Count == 0)
+                    ofVariant = candidates.Where(f => f.ProjectId == null).ToList();
+                if ((ofVariant.FirstOrDefault(f => PlatformReferencePacks.IsWorkloadFailure(f.Message))
+                        ?? ofVariant.FirstOrDefault(f => ProjectExclusionClassifier.IsExclusionEvidence(f.Message))) is { } evidenceFailure)
+                    reason = evidenceFailure.Message;
                 if (reason == null)
                     continue;
                 var tfm = VariantFramework(variant, expected);

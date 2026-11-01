@@ -30,6 +30,12 @@ public sealed record RestorePassTiming
     public required string Result { get; init; }
 }
 
+/// <summary>A multi-target project restored for its buildable targets only, after its platform targets failed (issue #352).</summary>
+/// <param name="Project">The project file relative to the checkout (forward slashes).</param>
+/// <param name="Restored">The <c>;</c>-joined targets it was restored for.</param>
+/// <param name="LeftOut">The declared targets the repair left out (platform targets this worker cannot build).</param>
+public sealed record PlatformRepair(string Project, string Restored, IReadOnlyList<string> LeftOut);
+
 /// <summary>One project's restore failure, as reduced by <see cref="RestoreOutputParser"/>.</summary>
 public sealed record PackageRestoreProjectIssue
 {
@@ -123,6 +129,12 @@ public sealed record PackageRestoreOutcome
 
     /// <summary>Multi-target projects restored for their buildable targets after the platform targets failed, with those targets (issue #352).</summary>
     public IReadOnlyList<string> PlatformRetriedProjects { get; init; } = [];
+
+    /// <summary>
+    /// The same repairs as <see cref="PlatformRetriedProjects"/>, structured: the checkout-relative project, the targets
+    /// it was restored for and the platform targets left out, so coverage can keep those versions excluded (issue #352).
+    /// </summary>
+    public IReadOnlyList<PlatformRepair> PlatformRepairs { get; init; } = [];
 
     /// <summary>Checkout-relative paths of every project a repair restored with an unlocked lock file or reduced targets (issue #352): restored, but not cleanly.</summary>
     public IReadOnlyList<string> RepairedProjects { get; init; } = [];
