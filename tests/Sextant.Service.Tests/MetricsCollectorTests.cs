@@ -151,6 +151,121 @@ public class MetricsCollectorTests
         Assert.IsFalse(PrometheusExposition.Render(snapshot).Contains("sextant_job_phase_", StringComparison.Ordinal));
     }
 
+    [TestMethod]
+    public void CatalogPages_ReportFreePagesLeftByDeletedData()
+    {
+        var before = Collect(DateTimeOffset.UtcNow).Storage;
+        Assert.IsTrue(before.CatalogPageCount > 0);
+
+        Exec("CREATE TABLE junk(b BLOB);");
+        for (var i = 0; i < 200; i++)
+            Exec("INSERT INTO junk VALUES (zeroblob(4096));");
+        var grown = Collect(DateTimeOffset.UtcNow).Storage;
+        Exec("DROP TABLE junk;");
+        var after = Collect(DateTimeOffset.UtcNow).Storage;
+
+        Assert.IsTrue(grown.CatalogPageCount >= before.CatalogPageCount + 200);
+        Assert.IsTrue(after.CatalogFreePages >= before.CatalogFreePages + 200, $"free pages {after.CatalogFreePages}");
+        Assert.AreEqual((double)after.CatalogFreePages / after.CatalogPageCount, after.CatalogFreePageRatio, 1e-9);
+        var text = PrometheusExposition.Render(Collect(DateTimeOffset.UtcNow));
+        StringAssert.Contains(text, $"sextant_storage_catalog_free_pages {after.CatalogFreePages}");
+        StringAssert.Contains(text, "sextant_storage_catalog_pages ");
+        StringAssert.Contains(text, "sextant_storage_catalog_free_page_ratio ");
+    }
+
+    [TestMethod]
+    public void JobAges_OldestQueuedAndLongestRunning_FollowTheClock()
+    {
+        var now = new DateTimeOffset(2026, 1, 2, 12, 0, 0, TimeSpan.Zero);
+        var ms = now.ToUnixTimeMilliseconds();
+        AddJob(Queued, ms - 90_000, null);
+        AddJob(Queued, ms - 30_000, null);
+        AddJob(Running, ms - 600_000, ms - 120_000);
+        AddJob(Running, ms - 60_000, ms - 10_000);
+        AddJob(Complete, ms - 9_999_000, ms - 9_000_000);
+
+        var jobs = Collect(now).Jobs;
+        Assert.AreEqual(90, jobs.OldestQueuedAgeSeconds, 0.001);
+        Assert.AreEqual(120, jobs.LongestRunningAgeSeconds, 0.001);
+
+        var later = Collect(now.AddMinutes(1)).Jobs;
+        Assert.AreEqual(150, later.OldestQueuedAgeSeconds, 0.001);
+        Assert.AreEqual(180, later.LongestRunningAgeSeconds, 0.001);
+        var text = PrometheusExposition.Render(Collect(now));
+        StringAssert.Contains(text, "sextant_jobs_oldest_queued_age_seconds 90");
+        StringAssert.Contains(text, "sextant_jobs_longest_running_age_seconds 120");
+    }
+
+    [TestMethod]
+    public void QueuedAge_RunsFromWhenTheJobLastBecameQueued_NotFromItsFirstCreation()
+    {
+        var now = new DateTimeOffset(2026, 1, 12, 12, 0, 0, TimeSpan.Zero);
+        var ms = now.ToUnixTimeMilliseconds();
+        AddJob(Queued, ms - 10 * 86_400_000L, null, updatedAt: ms - 90_000);
+
+        Assert.AreEqual(90, Collect(now).Jobs.OldestQueuedAgeSeconds, 0.001);
+    }
+
+    [TestMethod]
+    public void CompleteBodyEndsWithTheEofMarker()
+    {
+        var text = PrometheusExposition.Render(Collect(DateTimeOffset.UtcNow));
+        Assert.IsTrue(text.EndsWith("\n# EOF\n", StringComparison.Ordinal));
+        Assert.AreEqual(1, text.Split('\n').Count(l => l == "# EOF"));
+    }
+
+    [TestMethod]
+    public void JobAges_AreZero_WhenNothingIsQueuedOrRunning()
+    {
+        AddJob(Complete, 1, 2);
+        var jobs = Collect(DateTimeOffset.UtcNow).Jobs;
+        Assert.AreEqual(0, jobs.OldestQueuedAgeSeconds);
+        Assert.AreEqual(0, jobs.LongestRunningAgeSeconds);
+    }
+
+    [TestMethod]
+    public void AlertGauge_IsPresentWhileRaised_AndAbsentAfterItClears()
+    {
+        var now = new DateTimeOffset(2026, 1, 2, 12, 0, 0, TimeSpan.Zero);
+        var start = now.AddHours(-24).ToUnixTimeMilliseconds();
+        for (var i = 0; i < 5; i++)
+            Add(Complete, start - 1 - i);
+        for (var i = 0; i < 5; i++)
+            Add(Partial, now.AddMinutes(-i - 1).ToUnixTimeMilliseconds());
+
+        var raised = PrometheusExposition.Render(Collect(now));
+        StringAssert.Contains(raised, "sextant_alert_active{id=\"low_completeness_rate\",severity=\"critical\"} 1");
+
+        for (var i = 0; i < 400; i++)
+            Add(Complete, now.AddSeconds(-i - 1).ToUnixTimeMilliseconds());
+        var cleared = PrometheusExposition.Render(Collect(now));
+        Assert.IsFalse(cleared.Contains("sextant_alert_active{id=\"low_completeness_rate\"", StringComparison.Ordinal));
+    }
+
+    private void Exec(string sql)
+    {
+        using var cmd = _db.GetConnection().CreateCommand();
+        cmd.CommandText = sql;
+        cmd.ExecuteNonQuery();
+    }
+
+    private void AddJob(string status, long createdAt, long? startedAt, long? updatedAt = null)
+    {
+        using var cmd = _db.GetConnection().CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO snapshot_jobs(
+                identity_hash, repository_url, commit_sha, status, created_at, updated_at, started_at)
+            VALUES (@identity, 'https://github.com/test/repo', @commit, @status, @created, @updated, @started);
+            """;
+        cmd.Parameters.AddWithValue("@identity", $"metrics-age-{++_nextId}");
+        cmd.Parameters.AddWithValue("@commit", $"commit-{_nextId}");
+        cmd.Parameters.AddWithValue("@status", status);
+        cmd.Parameters.AddWithValue("@created", createdAt);
+        cmd.Parameters.AddWithValue("@updated", updatedAt ?? createdAt);
+        cmd.Parameters.AddWithValue("@started", (object?)startedAt ?? DBNull.Value);
+        cmd.ExecuteNonQuery();
+    }
+
     private MetricsSnapshot Collect(DateTimeOffset now, AlertThresholds? thresholds = null)
     {
         var paths = new ServicePaths(ServiceVolumes.Rooted(Path.Combine(_root, "volumes")));

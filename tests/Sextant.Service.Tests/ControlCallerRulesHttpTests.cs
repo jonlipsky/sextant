@@ -259,6 +259,32 @@ public class ControlCallerRulesHttpTests
         }
     }
 
+    [TestMethod]
+    public async Task Metrics_ServeTheOperationsSignals_ToAnApplicationCaller_InPrometheusText()
+    {
+        await using var host = await Harness.StartAsync();
+        var assertion = AppAssertion(host);
+
+        // The second read is the one a 15-minute poll repeats: the directory sizes are cached, so it never walks.
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        string body = "";
+        for (var i = 0; i < 2; i++)
+        {
+            using var response = await host.ControlAsync(HttpMethod.Get, "/control/metrics?format=prometheus", ControlToken, assertion);
+            Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+            Assert.AreEqual("text/plain", response.Content.Headers.ContentType?.MediaType);
+            body = await response.Content.ReadAsStringAsync();
+        }
+        Assert.IsTrue(clock.Elapsed < TimeSpan.FromSeconds(10), $"two collections took {clock.Elapsed}");
+
+        foreach (var name in new[]
+        {
+            "sextant_alert_active", "sextant_jobs_oldest_queued_age_seconds", "sextant_jobs_longest_running_age_seconds",
+            "sextant_storage_catalog_pages", "sextant_storage_catalog_free_pages", "sextant_storage_catalog_free_page_ratio"
+        })
+            StringAssert.Contains(body, $"# TYPE {name} gauge");
+    }
+
     // ==== routes that decide user callers themselves ===============================================
 
     [TestMethod]

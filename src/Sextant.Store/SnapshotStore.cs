@@ -106,6 +106,12 @@ public sealed record IdleBranchCandidate(
     long BranchId, string RepositoryRemoteUrl, string Name, long SnapshotId, long UpdatedAt, string HeadCommit);
 
 /// <summary>
+/// A consumer repository's default branch and the commit its complete snapshot indexed (issue #355); the commit is null
+/// when the pointer has no usable complete snapshot (unset, failed, superseded or reclaimed).
+/// </summary>
+public sealed record DefaultBranchHead(long RepositoryId, string RepositoryRemoteUrl, string Branch, string? CommitSha);
+
+/// <summary>
 /// Reads and writes the Phase-9 immutable-snapshot tables (<c>repositories</c>, <c>commits</c>,
 /// <c>logical_projects</c>, <c>snapshots</c>, <c>branches</c>, <c>snapshot_projects</c>). The store is
 /// a thin adapter over parameterized SQL; it runs on the caller's connection so its publish statements
@@ -1061,6 +1067,34 @@ public sealed class SnapshotStore(SqliteConnection connection)
             result.Add(new IdleBranchCandidate(
                 reader.GetInt64(0), reader.GetString(1), reader.GetString(2),
                 reader.GetInt64(3), reader.GetInt64(4), reader.GetString(5)));
+        return result;
+    }
+
+    /// <summary>
+    /// Every consumer repository's default branch (issue #355), with the commit its pointer's complete snapshot
+    /// indexed, or a null commit when the pointer has no usable complete snapshot, so such a branch is still observed.
+    /// A complete snapshot that records no commit (client contributions) is not listed: there is nothing to compare.
+    /// Read-only.
+    /// </summary>
+    public IReadOnlyList<DefaultBranchHead> ListDefaultBranchHeads()
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT r.id, r.remote_url, b.name, CASE WHEN s.status = @complete THEN c.commit_sha END
+            FROM branches b
+            JOIN repositories r ON r.id = b.repository_id
+            LEFT JOIN snapshots s ON s.id = b.snapshot_id
+            LEFT JOIN commits c ON c.id = s.commit_id
+            WHERE b.is_default = 1 AND r.is_provider = 0
+              AND NOT (s.status = @complete AND c.commit_sha IS NULL)
+            ORDER BY r.id, b.id;
+            """;
+        cmd.Parameters.AddWithValue("@complete", SnapshotStatus.Complete);
+        using var reader = cmd.ExecuteReader();
+        var result = new List<DefaultBranchHead>();
+        while (reader.Read())
+            result.Add(new DefaultBranchHead(
+                reader.GetInt64(0), reader.GetString(1), reader.GetString(2), reader.IsDBNull(3) ? null : reader.GetString(3)));
         return result;
     }
 

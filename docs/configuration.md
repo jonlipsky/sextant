@@ -176,6 +176,7 @@ snapshots become reclaimable (issue #299). Both run from its maintenance loop:
 | Env var | Default | Purpose |
 |---|---|---|
 | `SEXTANT_SERVICE_MAINTENANCE_INTERVAL_MINUTES` | `60` | Maintenance loop tick interval (clamped to 7 days); `0` turns the loop (and both rules below) off. |
+| `SEXTANT_SERVICE_FRESHNESS_CHECK_MINUTES` | `5` | How often the remote head of each tracked default branch is read for `sextant_default_branch_lag_seconds` (clone mode); `0` = off (clamped to 1440). |
 | `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_DAYS` | `7` | Retire a non-default branch pointer that has not moved for more than this many days (clamped to 3650); `0` disables. The default branch is never retired, and the branch's next push re-creates it. |
 | `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_MAX_PER_PASS` | `20` | Most idle branches retired per tick (clamped to `1000`). |
 | `SEXTANT_SERVICE_BRANCH_UPSTREAM_CHECK_MINUTES` | `60` | Minimum minutes between upstream branch listings of one repository; a non-default pointer absent on two consecutive listings (at most 3 intervals apart) is retired; up to 3 repositories are listed in parallel with a 30 s timeout each. `0` disables (clamped to `10080`). |

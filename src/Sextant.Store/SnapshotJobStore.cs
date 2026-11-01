@@ -340,6 +340,31 @@ public sealed class SnapshotJobStore(SqliteConnection connection)
     /// </summary>
     public const string NoSupportedCodeDefaultBranchPrefix = "no_supported_code_default: ";
 
+    /// <summary>
+    /// The repository URLs (as the jobs recorded them) with an <c>unsupported</c> job for exactly this commit that ended
+    /// for no supported code (issue #355): that head was evaluated and holds nothing to index.
+    /// </summary>
+    public IReadOnlyList<string> RepositoriesWithNoSupportedCodeAt(string commitSha)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT repository_url FROM snapshot_jobs
+            WHERE commit_sha = @commit AND status = @unsupported
+              AND (substr(last_error, 1, @len1) = @prefix1 OR substr(last_error, 1, @len2) = @prefix2);
+            """;
+        cmd.Parameters.AddWithValue("@commit", commitSha);
+        cmd.Parameters.AddWithValue("@unsupported", SnapshotJobStatus.Unsupported);
+        cmd.Parameters.AddWithValue("@len1", NoSupportedCodePrefix.Length);
+        cmd.Parameters.AddWithValue("@prefix1", NoSupportedCodePrefix);
+        cmd.Parameters.AddWithValue("@len2", NoSupportedCodeDefaultBranchPrefix.Length);
+        cmd.Parameters.AddWithValue("@prefix2", NoSupportedCodeDefaultBranchPrefix);
+        var urls = new List<string>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            urls.Add(reader.GetString(0));
+        return urls;
+    }
+
     /// <summary>SQL predicate (on <c>snapshot_jobs</c>) true for a row that was NOT settled at startup.</summary>
     public const string NotStartupSettledSql =
         "(last_error IS NULL OR substr(last_error, 1, 13) <> 'not produced:')";
