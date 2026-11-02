@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using Sextant.Core;
 
 namespace Sextant.Service;
 
@@ -190,6 +191,7 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
                 switch (CheckoutCommitState(target, request.CommitSha))
                 {
                     case CommitState.Mismatch:
+                    case CommitState.Unreadable:
                         allowReplace = true;
                         break;
                     case CommitState.Match when NeedsSubmoduleUpgrade(target):
@@ -258,12 +260,12 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
     /// </summary>
     private bool IsReusable(string checkoutDir, string? commitSha) => CheckoutCommitState(checkoutDir, commitSha) switch
     {
-        CommitState.Mismatch => false,
+        CommitState.Mismatch or CommitState.Unreadable => false,
         CommitState.Match => !NeedsSubmoduleUpgrade(checkoutDir),
         _ => true
     };
 
-    private enum CommitState { Match, Mismatch, Unverifiable }
+    private enum CommitState { Match, Mismatch, Unverifiable, Unreadable }
 
     /// <summary>
     /// Compares the checked-out <c>HEAD</c> of <paramref name="checkoutDir"/> to the requested
@@ -276,8 +278,24 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
         var commit = commitSha?.Trim() ?? string.Empty;
         if (!IsHexObjectId(commit))
             return CommitState.Unverifiable;
-        if (!Run(checkoutDir, out var head, out _, "rev-parse", "HEAD"))
+        var read = RunGit(checkoutDir, "rev-parse", "HEAD");
+        if (!read.Ok && read.Kind == GitFailureKind.NonZeroExit)
+            read = RunGit(checkoutDir, "rev-parse", "HEAD");
+        var head = read.Stdout;
+        if (!read.Ok)
+        {
+            // A checkout this service provisioned (it carries our marker) whose HEAD git refuses to read, twice, is
+            // damaged: serving it would index whatever commit it holds without its submodules (#387), and refusing it
+            // forever would fail the repository for good, so it is replaced like a commit mismatch. A tree without
+            // the marker is externally provisioned and keeps the trust semantics, as does git that cannot start.
+            if (read.Kind == GitFailureKind.NonZeroExit && ReadMarker(checkoutDir) is not null)
+            {
+                _log?.Invoke($"Checkout '{Path.GetFileName(checkoutDir)}' is replaced — its git HEAD could not be read " +
+                             $"(git rev-parse HEAD: {GitFailureText.Describe(read.ExitCode, Redact(read.Stderr))}).");
+                return CommitState.Unreadable;
+            }
             return CommitState.Unverifiable;
+        }
         head = head.Trim();
         if (head.Length == 0)
             return CommitState.Unverifiable;
@@ -746,7 +764,7 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
     internal enum GitStage { Init, RemoteAdd, Fetch, Checkout, RevParse, Configure }
 
     /// <summary>The outcome of a git invocation: success/kind plus the drained stdout/stderr.</summary>
-    private readonly record struct GitResult(bool Ok, GitFailureKind Kind, string Stdout, string Stderr);
+    private readonly record struct GitResult(bool Ok, GitFailureKind Kind, string Stdout, string Stderr, int ExitCode = 0);
 
     /// <summary>
     /// The per-invocation git environment: the transport allowlist (<c>GIT_ALLOW_PROTOCOL</c>) and the
@@ -942,7 +960,7 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
             var stderr = SafeResult(stderrTask);
             return process.ExitCode == 0
                 ? new GitResult(true, GitFailureKind.None, stdout, stderr)
-                : new GitResult(false, GitFailureKind.NonZeroExit, stdout, stderr);
+                : new GitResult(false, GitFailureKind.NonZeroExit, stdout, stderr, process.ExitCode);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
