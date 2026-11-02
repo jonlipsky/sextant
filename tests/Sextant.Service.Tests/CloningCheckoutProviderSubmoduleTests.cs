@@ -34,6 +34,82 @@ public class CloningCheckoutProviderSubmoduleTests
     }
 
     [TestMethod]
+    public void TryResolve_ManagedCheckoutWhoseGitHeadCannotBeRead_IsReplacedAtTheRequestedCommit()
+    {
+        var (_, libUrl, libPinned, _) = NewLibRepo("lib");
+        var (_, appUrl, appCommit) = NewRepoWithSubmodules("app", ("lib", "libs/lib", libUrl, libPinned));
+        var paths = NewPaths();
+        var provider = NewProvider(paths);
+        Assert.IsTrue(provider.TryResolve(ServiceTestFixtures.Request(appUrl, appCommit), out var resolution));
+        var dir = resolution.CheckoutDir;
+
+        // A real git failure on the service's own checkout: HEAD is unreadable, every time.
+        File.WriteAllText(Path.Combine(dir, ".git", "HEAD"), "garbage\n");
+        File.WriteAllText(Path.Combine(dir, "stale.txt"), "from the damaged tree");
+
+        Assert.IsTrue(provider.TryResolve(ServiceTestFixtures.Request(appUrl, appCommit), out var again));
+
+        Assert.AreEqual(Path.GetFullPath(dir), Path.GetFullPath(again.CheckoutDir));
+        Assert.AreEqual(appCommit, GitHead(dir));
+        Assert.IsFalse(File.Exists(Path.Combine(dir, "stale.txt")), "the damaged tree was swapped out");
+        Assert.IsTrue(File.Exists(Path.Combine(dir, "libs", "lib", "Lib.cs")), "its submodule is populated again");
+        var logged = _log.FirstOrDefault(l => l.Contains("git rev-parse HEAD: exit code 128", StringComparison.Ordinal));
+        Assert.IsNotNull(logged, string.Join(Environment.NewLine, _log));
+        StringAssert.Contains(logged, "not a git repository");
+    }
+
+    [TestMethod]
+    public void TryResolve_UnreadableHead_NeverLeaksACredentialedUrlGitEchoes()
+    {
+        var (_, libUrl, libPinned, _) = NewLibRepo("lib");
+        var (_, appUrl, appCommit) = NewRepoWithSubmodules("app", ("lib", "libs/lib", libUrl, libPinned));
+        var paths = NewPaths();
+        var provider = NewProvider(paths, token: Sentinel);
+        Assert.IsTrue(provider.TryResolve(ServiceTestFixtures.Request(appUrl, appCommit), out var resolution));
+        // git echoes a bad config value in its error (and does not mask this credentialed form). Prove the premise.
+        File.WriteAllText(Path.Combine(resolution.CheckoutDir, ".git", "config"),
+            "[core]\n\trepositoryformatversion = user:" + Sentinel + "@example.com/x\n");
+        var stderr = GitStderr(resolution.CheckoutDir, "rev-parse", "HEAD");
+        StringAssert.Contains(stderr, Sentinel);
+
+        Assert.IsTrue(provider.TryResolve(ServiceTestFixtures.Request(appUrl, appCommit), out _));
+
+        Assert.IsTrue(_log.Any(l => l.Contains("git rev-parse HEAD: exit code", StringComparison.Ordinal)),
+            "the unreadable HEAD was logged");
+        Assert.IsFalse(_log.Any(l => l.Contains(Sentinel, StringComparison.Ordinal)), string.Join(Environment.NewLine, _log));
+    }
+
+    [TestMethod]
+    public void TryResolve_UnmarkedGitTreeWhoseHeadCannotBeRead_KeepsTheTrustWhatIsOnDiskSemantics()
+    {
+        var paths = NewPaths();
+        var request = ServiceTestFixtures.Request("https://github.com/org/external", new string('a', 40));
+        var dir = Path.Combine(paths.CheckoutRoot, ServicePaths.RepoDirectoryName(request.RepositoryRemoteUrl));
+        Directory.CreateDirectory(dir);
+        GitOut(dir, "init", "--quiet", "-b", "main");
+        File.WriteAllText(Path.Combine(dir, "App.slnx"), "<Solution />\n");
+        File.WriteAllText(Path.Combine(dir, ".git", "HEAD"), "garbage\n");
+
+        Assert.IsTrue(NewProvider(paths).TryResolve(request, out var resolution));
+
+        Assert.AreEqual(Path.GetFullPath(dir), Path.GetFullPath(resolution.CheckoutDir));
+        Assert.IsTrue(File.Exists(Path.Combine(dir, "App.slnx")), "an externally provisioned tree is never replaced");
+    }
+
+    [TestMethod]
+    public void TryResolve_NonGitTreeWithASolution_KeepsTheTrustWhatIsOnDiskSemantics()
+    {
+        var paths = NewPaths();
+        var request = ServiceTestFixtures.Request("https://github.com/org/external", new string('a', 40));
+        var dir = Path.Combine(paths.CheckoutRoot, ServicePaths.RepoDirectoryName(request.RepositoryRemoteUrl));
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "App.slnx"), "<Solution />\n");
+
+        Assert.IsTrue(NewProvider(paths).TryResolve(request, out var resolution));
+        Assert.AreEqual(Path.GetFullPath(dir), Path.GetFullPath(resolution.CheckoutDir));
+    }
+
+    [TestMethod]
     public async Task TryResolve_PopulatesAbsoluteRelativeAndNestedSubmodules_AtPinnedCommits()
     {
         var (_, libUrl, libPinned, libTip) = NewLibRepo("lib");
@@ -662,6 +738,19 @@ public class CloningCheckoutProviderSubmoduleTests
         p.WaitForExit();
         Assert.AreEqual(0, p.ExitCode, $"git {string.Join(' ', args)} failed in {dir}: {stderr}");
         return stdout.GetAwaiter().GetResult();
+    }
+
+    private static string GitStderr(string dir, params string[] args)
+    {
+        var psi = new ProcessStartInfo("git") { WorkingDirectory = dir, RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
+        foreach (var a in args)
+            psi.ArgumentList.Add(a);
+        using var p = Process.Start(psi)!;
+        var stdout = p.StandardOutput.ReadToEndAsync();
+        var stderr = p.StandardError.ReadToEnd();
+        p.WaitForExit();
+        stdout.GetAwaiter().GetResult();
+        return stderr;
     }
 
     /// <summary>Sets process environment variables for one test and restores the previous values.</summary>

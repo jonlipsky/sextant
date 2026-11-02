@@ -44,7 +44,15 @@ public sealed class IndexOrchestrator
     /// which runs git). Tests substitute a fixed list so the Phase-12 provider path runs over an in-memory
     /// workspace without a real submodule checkout.
     /// </summary>
-    internal Func<string, Task<List<SubmoduleInfo>>> SubmoduleDiscoverer { get; init; } = SubmoduleDiscovery.DiscoverAsync;
+    internal Func<string, Task<List<SubmoduleInfo>>> SubmoduleDiscoverer
+    {
+        get => root => _discoverSubmodules(root, null);
+        init => _discoverSubmodules = (root, _) => value(root);
+    }
+
+    // The default reports git failures; a substituted discoverer has none to report.
+    private Func<string, Action<GitCallFailure>?, Task<List<SubmoduleInfo>>> _discoverSubmodules =
+        SubmoduleDiscovery.DiscoverAsync;
 
     /// <summary>
     /// Where the run keeps the bytes of every source file it hashes (issue #244), so each published snapshot serves
@@ -221,7 +229,9 @@ public sealed class IndexOrchestrator
         var repoRoot = ResolveRepoRoot(solution, snapshotContext);
         if (repoRoot != null)
         {
-            submodules = await SubmoduleDiscoverer(repoRoot);
+            submodules = string.IsNullOrEmpty(snapshotContext?.CheckoutDir)
+                ? await SubmoduleDiscoverer(repoRoot)
+                : await CheckoutSubmoduleDiscovery.DiscoverVerifiedAsync(_discoverSubmodules, repoRoot, cancellationToken);
             if (submodules.Count > 0)
                 _log?.Invoke($"Discovered {submodules.Count} submodule(s)");
         }

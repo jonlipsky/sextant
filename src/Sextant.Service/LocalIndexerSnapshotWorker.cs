@@ -480,6 +480,13 @@ public sealed class LocalIndexerSnapshotWorker(
             // thrown from inside the evaluation (issue #113).
             throw;
         }
+        catch (SubmoduleDiscoveryException ex)
+        {
+            // Discovery failed on a checkout that has the submodules (a git failure, not a property of the commit):
+            // requeue instead of publishing a verdict that counts the submodules' projects as the repository's own (#387).
+            log?.Invoke($"Submodule discovery failed — {ex.Message}");
+            throw new TransientProvisioningException(ex.Message, ex, "submodule_discovery_failed");
+        }
         catch (OperationCanceledException) when (pinState.Overlay is { RestoreError: { } restoreError } failedOverlay)
         {
             // Even a cancelled job must report a checkout it could not put back, typed (it is still requeued).

@@ -13,7 +13,13 @@ public static partial class SubmoduleDiscovery
     /// Discovers all git submodules in a repository by running git submodule status --recursive.
     /// Returns submodule info with path, pinned commit SHA, and remote URL.
     /// </summary>
-    public static async Task<List<SubmoduleInfo>> DiscoverAsync(string repoRoot)
+    public static Task<List<SubmoduleInfo>> DiscoverAsync(string repoRoot) => DiscoverAsync(repoRoot, null);
+
+    /// <summary>
+    /// <see cref="DiscoverAsync(string)"/>, additionally reporting each git call that failed to
+    /// <paramref name="onFailure"/> (the result is unchanged: a failed call still reads as "nothing found").
+    /// </summary>
+    internal static async Task<List<SubmoduleInfo>> DiscoverAsync(string repoRoot, Action<GitCallFailure>? onFailure)
     {
         var results = new List<SubmoduleInfo>();
 
@@ -24,7 +30,7 @@ public static partial class SubmoduleDiscovery
         if (!File.Exists(Path.Combine(repoRoot, ".gitmodules")))
             return results;
 
-        var statusOutput = await RunGitAsync(repoRoot, "submodule status --recursive");
+        var statusOutput = await RunGitAsync(repoRoot, "submodule status --recursive", onFailure, null);
         if (string.IsNullOrWhiteSpace(statusOutput))
             return results;
 
@@ -47,7 +53,7 @@ public static partial class SubmoduleDiscovery
                 continue;
 
             // Get the submodule's own remote URL
-            var remoteUrl = await GetSubmoduleRemoteUrl(fullPath);
+            var remoteUrl = await RunGitAsync(fullPath, "remote get-url origin", onFailure, submodulePath.Replace('\\', '/').Trim('/'));
             if (string.IsNullOrWhiteSpace(remoteUrl))
                 continue;
 
@@ -162,15 +168,13 @@ public static partial class SubmoduleDiscovery
         return null;
     }
 
-    private static async Task<string> GetSubmoduleRemoteUrl(string submodulePath)
-    {
-        return await RunGitAsync(submodulePath, "remote get-url origin");
-    }
-
-    private static async Task<string> RunGitAsync(string workingDirectory, string arguments)
+    private static async Task<string> RunGitAsync(string workingDirectory, string arguments, Action<GitCallFailure>? onFailure, string? submodulePath)
     {
         if (!Directory.Exists(workingDirectory))
+        {
+            onFailure?.Invoke(new GitCallFailure(arguments, null, "working directory does not exist", submodulePath));
             return string.Empty;
+        }
 
         var psi = new ProcessStartInfo
         {
@@ -187,16 +191,37 @@ public static partial class SubmoduleDiscovery
         {
             using var process = Process.Start(psi);
             if (process == null)
+            {
+                onFailure?.Invoke(new GitCallFailure(arguments, null, "git did not run", submodulePath));
                 return string.Empty;
+            }
 
+            var stderrTask = process.StandardError.ReadToEndAsync();
             var output = await process.StandardOutput.ReadToEndAsync();
             await process.WaitForExitAsync();
+            var stderr = await stderrTask;
 
-            return process.ExitCode == 0 ? output.Trim() : string.Empty;
+            if (process.ExitCode == 0)
+                return output.Trim();
+            // A submodule without an origin remote is a property of the repository, not a git failure.
+            if (submodulePath is not null && stderr.Contains("No such remote", StringComparison.Ordinal))
+                return string.Empty;
+            onFailure?.Invoke(new GitCallFailure(arguments, process.ExitCode, GitFailureText.Describe(process.ExitCode, stderr), submodulePath));
+            return string.Empty;
         }
-        catch
+        catch (Exception ex)
         {
+            onFailure?.Invoke(new GitCallFailure(arguments, null, $"git did not run ({ex.GetType().Name})", submodulePath));
             return string.Empty;
         }
     }
+}
+
+/// <summary>
+/// A git call of submodule discovery that failed: its arguments, exit code (null when git never ran) and the
+/// credential-free detail. <see cref="SubmodulePath"/> is the submodule the call was about, null for the top-level call.
+/// </summary>
+internal sealed record GitCallFailure(string Command, int? ExitCode, string Detail, string? SubmodulePath = null)
+{
+    public override string ToString() => $"git {Command}: {Detail}";
 }
