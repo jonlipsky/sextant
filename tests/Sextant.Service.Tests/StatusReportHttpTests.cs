@@ -464,4 +464,56 @@ public class StatusReportHttpTests
             StringAssert.Contains(text, "report_timeout");
         }
     }
+
+    [TestMethod]
+    public void BudgetCancelledAtAnyPoint_IsATimeout_NeverAnotherSqliteError()
+    {
+        var path = ServiceTestFixtures.NewDbPath();
+        try
+        {
+            using var db = new IndexDatabase(path);
+            db.RunMigrations();
+            var widgetsSnapshot = ServiceTestFixtures.PublishComplete(db, ServiceTestFixtures.Request(repo: Widgets, commit: "commit-w1"), symbolCount: 1);
+            var store = new SnapshotStore(db.GetConnection());
+            var at = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            store.SetBranchPointer(store.EnsureBranch(store.GetRepositoryId(Widgets)!.Value, "main", true, at), widgetsSnapshot, at);
+            Seed(db);
+            var random = new Random(394);
+            var failures = new List<string>();
+            for (var i = 0; i < Iterations; i++)
+            {
+                using var budget = new CancellationTokenSource();
+                using var scope = ReadInterrupt.Begin(budget.Token);
+                var delay = random.Next(0, 400);
+                var canceller = Task.Run(() =>
+                {
+                    var until = System.Diagnostics.Stopwatch.GetTimestamp() + delay * System.Diagnostics.Stopwatch.Frequency / 1_000_000;
+                    while (System.Diagnostics.Stopwatch.GetTimestamp() < until) { }
+                    budget.Cancel();
+                });
+                try
+                {
+                    StatusReportBuilder.Build(db.OpenReadConnection, new DefaultBranchFreshnessTracker(TimeProvider.System, TimeSpan.FromHours(1)),
+                        new ReportCountCache(), TimeProvider.System, path, null, [], 100, 100, true, budget.Token);
+                }
+                catch (TimeoutException)
+                {
+                }
+                catch (Exception ex)
+                {
+                    failures.Add($"{i} (delay {delay}us): {ex.GetType().Name}: {ex.Message}");
+                }
+                canceller.Wait();
+            }
+            Assert.AreEqual(0, failures.Count, $"{failures.Count}/{Iterations}: {failures.FirstOrDefault()}");
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            foreach (var f in Directory.GetFiles(Path.GetDirectoryName(path)!, Path.GetFileName(path) + "*"))
+                File.Delete(f);
+        }
+    }
+
+    private const int Iterations = 1500;
 }

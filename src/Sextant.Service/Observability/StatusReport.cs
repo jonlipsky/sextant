@@ -202,11 +202,17 @@ public static class StatusReportBuilder
             return BuildCore(openRead, freshness, cache, time, catalogDbPath, visibleKeys, grantedUrls, maxRepositories,
                 noCodeJobLimit, includeStorage, budget);
         }
-        catch (SqliteException ex) when (ex.SqliteErrorCode == ReadInterrupt.InterruptedErrorCode)
+        catch (SqliteException ex) when (StoppedByBudget(ex, budget))
         {
             throw new TimeoutException("The status report did not finish within its time budget.", ex);
         }
     }
+
+    // The interrupt only fires once the budget is cancelled, and an interrupt that lands while SQLite is preparing a
+    // statement (reloading the schema) can surface as a plain SQLITE_ERROR such as "expected 0 columns for '' but got 7"
+    // instead of SQLITE_INTERRUPT. So any SQLite error after the stop is the stop; before it, an error is a real one.
+    private static bool StoppedByBudget(SqliteException ex, CancellationToken budget) =>
+        ex.SqliteErrorCode == ReadInterrupt.InterruptedErrorCode || budget.IsCancellationRequested;
 
     private sealed record Entry(string Label, string Url, CatalogRow? Source, ReportRepository Row);
 
@@ -410,7 +416,7 @@ public static class StatusReportBuilder
                 cache.Set(source.Identity!, kind, value);
                 return value;
             }
-            catch (SqliteException ex) when (ex.SqliteErrorCode == ReadInterrupt.InterruptedErrorCode)
+            catch (SqliteException ex) when (StoppedByBudget(ex, budget))
             {
                 countsComplete[0] = false;
                 return null;
