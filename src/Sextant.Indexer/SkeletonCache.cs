@@ -81,7 +81,7 @@ internal sealed class SkeletonCache
     private Skeleton? Emit(string name, Compilation compilation)
     {
         using var stream = new MemoryStream();
-        var result = compilation.Emit(stream, options: new Microsoft.CodeAnalysis.Emit.EmitOptions(metadataOnly: true, includePrivateMembers: true));
+        var result = compilation.Emit(stream, options: new Microsoft.CodeAnalysis.Emit.EmitOptions(metadataOnly: true, includePrivateMembers: true), cancellationToken: _lifetime);
         if (!result.Success)
             return Failed();
         Interlocked.Add(ref _bytes, stream.Length);
