@@ -511,12 +511,24 @@ public sealed class PackageRestoreRunner(
                     partialSkippedNames.Add(Path.GetFileName(solution));
                     foreach (var project in uncovered)
                         lastAttemptDir[project] = solutionDir;
+                    var partialOutcome = ran;
+                    if (ran == RunResult.Failed)
+                    {
+                        var partialRepair = await RepairAsync(
+                                checkoutDir, partialParser, globals, deadline - stopwatch.Elapsed, cancellationToken, scratchDir, environment)
+                            .ConfigureAwait(false);
+                        repairs.Add(partialRepair);
+                        if (partialRepair.Any && partialParser.Projects().Count == 0
+                            && partialParser.GeneralCodes().Count == 0 && partialParser.ProjectsDropped == 0)
+                            partialOutcome = RunResult.Succeeded;
+                    }
                     parser.MergeFrom(partialParser);
-                    switch (ran)
+                    switch (partialOutcome)
                     {
                         case RunResult.Succeeded:
                             succeeded++;
-                            foreach (var project in uncovered)
+                            var partialRepairedHere = RepairedFullPaths(checkoutDir, repairs);
+                            foreach (var project in uncovered.Where(p => !partialRepairedHere.Contains(p)))
                             {
                                 if (!restoredBy.TryGetValue(project, out var dirs))
                                     restoredBy[project] = dirs = new HashSet<string>(CheckoutInventory.PathComparer);
@@ -530,7 +542,9 @@ public sealed class PackageRestoreRunner(
                             timedOut = true;
                             break;
                         case RunResult.Failed:
-                            foreach (var project in DeterministicallyAttempted(uncovered, partialParser, startedUtc, solutionDir, restoredBy))
+                            var partialRepairedFailed = RepairedFullPaths(checkoutDir, repairs);
+                            foreach (var project in DeterministicallyAttempted(uncovered, partialParser, startedUtc, solutionDir, restoredBy)
+                                .Where(p => !partialRepairedFailed.Contains(p)))
                             {
                                 if (!failedBy.TryGetValue(project, out var dirs))
                                     failedBy[project] = dirs = new HashSet<string>(CheckoutInventory.PathComparer);

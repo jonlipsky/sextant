@@ -93,6 +93,68 @@ public class PackageRestoreRepairTests
         finally { Directory.Delete(root, true); }
     }
 
+    private static string WriteNamedSolution(string root, string name, params string[] projects)
+    {
+        var solution = Path.Combine(root, name);
+        File.WriteAllText(solution,
+            "<Solution>" + string.Concat(projects.Select(p => $"<Project Path=\"{Path.GetRelativePath(root, p).Replace('\\', '/')}\" />")) + "</Solution>");
+        return solution;
+    }
+
+    // Small.slnx restores the good projects; Big.slnx adds one project, so Big restores only that uncovered one (partial pass).
+    private static async Task<(PackageRestoreOutcome Outcome, List<string> Logs)> RunSubsetThenSupersetAsync(string root, string extraProject)
+    {
+        var logs = new List<string>();
+        var goods = Enumerable.Range(1, 4)
+            .Select(i => AddProject(root, $"Good{i}", $"<PropertyGroup><TargetFramework>{Tfm}</TargetFramework></PropertyGroup>")).ToArray();
+        // A reference to a project outside every selected solution forces the per-solution fallback.
+        AddProject(root, "Outside", $"<PropertyGroup><TargetFramework>{Tfm}</TargetFramework></PropertyGroup>");
+        File.WriteAllText(goods[0],
+            $"<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>{Tfm}</TargetFramework></PropertyGroup>" +
+            "<ItemGroup><ProjectReference Include=\"../Outside/Outside.csproj\" /></ItemGroup></Project>");
+        var small = WriteNamedSolution(root, "Small.slnx", goods);
+        var big = WriteNamedSolution(root, "Big.slnx", [.. goods, extraProject]);
+        var outcome = await new PackageRestoreRunner(timeout: TimeSpan.FromMinutes(3), log: logs.Add, staticGraphRestore: false)
+            .RunAsync(root, [small, big], limit: null, CancellationToken.None, Path.Combine(root, "scratch"));
+        return (outcome, logs);
+    }
+
+    [TestMethod]
+    public async Task AStaleLockFile_OnThePartialPass_IsRepairedAndReported()
+    {
+        var root = NewRoot();
+        try
+        {
+            var stale = AddProject(root, "Stale", LockedProps(), StaleLock);
+            var (outcome, logs) = await RunSubsetThenSupersetAsync(root, stale);
+
+            Assert.AreEqual(1, outcome.SolutionsPartiallySkipped, string.Join("|", logs));
+            CollectionAssert.AreEqual(new[] { "Stale/Stale.csproj" }, outcome.LockFileRetriedProjects.ToArray(), string.Join("|", logs));
+            Assert.AreEqual(0, outcome.Projects.Count, string.Join(", ", outcome.Projects.SelectMany(p => p.Codes)));
+            Assert.IsTrue(File.Exists(Path.Combine(root, "Stale", "obj", "project.assets.json")));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [TestMethod]
+    public async Task ANonRepairableFailure_OnThePartialPass_StillCountsAsFailed()
+    {
+        var root = NewRoot();
+        try
+        {
+            var missing = AddProject(root, "Missing",
+                $"<PropertyGroup><TargetFramework>{Tfm}</TargetFramework></PropertyGroup>" +
+                "<ItemGroup><PackageReference Include=\"No.Such.Package\" Version=\"1.0.0\" /></ItemGroup>");
+            var (outcome, logs) = await RunSubsetThenSupersetAsync(root, missing);
+
+            Assert.AreEqual(1, outcome.SolutionsPartiallySkipped, string.Join("|", logs));
+            Assert.AreEqual(0, outcome.LockFileRetriedProjects.Count);
+            Assert.IsFalse(outcome.Clean);
+            CollectionAssert.Contains(outcome.Projects.Single().Codes.ToArray(), "NU1101");
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
     [TestMethod]
     public async Task OnlyNU1004_TriggersTheUnlockedRetry()
     {
