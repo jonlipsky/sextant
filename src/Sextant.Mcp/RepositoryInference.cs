@@ -104,7 +104,9 @@ public static class RepositoryInference
         {
             return null;
         }
-        catch (SqliteException e) when (e.SqliteErrorCode == ReadInterrupt.InterruptedErrorCode && linked.IsCancellationRequested)
+        // Once the token driving the interrupt is cancelled, any SQLite error is that stop: an interrupt landing while
+        // SQLite prepares a statement can surface as a plain SQLITE_ERROR instead of SQLITE_INTERRUPT (#394, #395).
+        catch (SqliteException) when (linked.IsCancellationRequested)
         {
             cancellationToken.ThrowIfCancellationRequested();
             return null;

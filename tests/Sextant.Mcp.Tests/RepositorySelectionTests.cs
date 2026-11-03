@@ -473,6 +473,58 @@ public class RepositorySelectionTests
     }
 
     [TestMethod]
+    public void RunWithin_CancelledAtAnyPoint_IsOnlyTheBudgetOrCancellationOutcome()
+    {
+        var random = new Random(395);
+        var failures = new List<string>();
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        var runs = 0;
+        var cancelled = 0;
+        while (watch.Elapsed < TimeSpan.FromSeconds(2))
+        {
+            runs++;
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); // a fresh connection prepares against a cold schema
+            var delayTicks = random.Next(0, 1500) * (System.Diagnostics.Stopwatch.Frequency / 1_000_000);
+            using var caller = new CancellationTokenSource();
+            var canceller = Task.Run(() =>
+            {
+                var until = System.Diagnostics.Stopwatch.GetTimestamp() + delayTicks;
+                while (System.Diagnostics.Stopwatch.GetTimestamp() < until) { }
+                caller.Cancel();
+            });
+            try
+            {
+                RepositoryInference.RunWithin<object>(TimeSpan.FromSeconds(30), caller.Token, _ =>
+                {
+                    using var conn = _db.OpenReadConnection();
+                    var seen = 0L;
+                    for (var q = 0; q < 60; q++)
+                    {
+                        using var cmd = conn.CreateCommand();
+                        cmd.CommandText =
+                            $"SELECT s.id, s.project_id, s.display_name, s.kind, p.id, p.canonical_id, p.target_framework FROM symbols s JOIN projects p ON p.id = s.project_id WHERE s.id > {q - 1};";
+                        using var rows = cmd.ExecuteReader();
+                        while (rows.Read())
+                            seen += rows.GetInt64(0) + rows.GetInt64(1);
+                    }
+                    return new object();
+                });
+            }
+            catch (OperationCanceledException)
+            {
+                cancelled++;
+            }
+            catch (Exception ex)
+            {
+                failures.Add($"{runs}: {ex.GetType().Name}: {ex.Message}");
+            }
+            canceller.Wait();
+        }
+
+        Assert.AreEqual(0, failures.Count, $"{failures.Count}/{runs} ({cancelled} cancelled): {failures.FirstOrDefault()}");
+    }
+
+    [TestMethod]
     public void Holders_AreTheRepositoriesAtTheBestRank_InInputOrder()
     {
         CollectionAssert.AreEqual(new[] { "b", "c" }, RepositoryInference.Holders(
