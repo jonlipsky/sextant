@@ -120,7 +120,7 @@ public class UserEnsureBoundsHttpTests
 
         Assert.AreEqual(0L, host.JobRows());
         var rows = host.Service.RecentAudit(action: AuditAction.Ensure);
-        Assert.AreEqual(bodies.Length * 2, rows.Count);
+        Assert.AreEqual(Math.Min(bodies.Length * 2, DeniedAuditLimiter.MaxRowsPerWindow), rows.Count, "refusals past the per-window budget are counted, not written (#198)");
         Assert.IsTrue(rows.All(r => r.Detail == GrantReason.NotGranted + Suffix), "every refusal is audited as not_granted");
     }
 
