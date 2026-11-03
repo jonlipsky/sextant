@@ -69,6 +69,42 @@ public sealed class ParallelDeterminismTests
         }
     }
 
+    // Issue #388: compiling each phase in short-lived windows of projects (each on its own detached solution) bounds
+    // retained compilation state; the persisted symbols, occurrences and their order must not change.
+    [TestMethod]
+    [DataRow(1)]
+    [DataRow(2)]
+    public async Task CompilationWindows_PersistTheSameIndexAsOneSolution(int window)
+    {
+        var root = NewTempDir("windows");
+        var wholeDir = NewTempDir("windows-whole");
+        var windowedDir = NewTempDir("windows-windowed");
+        try
+        {
+            var slnx = CorpusGenerator.GenerateCorrectnessCorpus(root);
+            CorpusRestore.Restore(slnx);
+
+            var whole = await IndexAndDumpAsync(
+                slnx, Path.Combine(wholeDir, "index.db"),
+                new ExtractionParallelismOptions { MaxParallelism = 4, QueueCapacity = 4, CompilationWindow = 0 });
+            var windowed = await IndexAndDumpAsync(
+                slnx, Path.Combine(windowedDir, "index.db"),
+                new ExtractionParallelismOptions { MaxParallelism = 4, QueueCapacity = 4, CompilationWindow = window, CompilationWindowMinProjects = 0 });
+
+            Assert.IsTrue(whole.Ordered.Length > 0, "the corpus produced an empty ordered dump");
+            if (!string.Equals(whole.Canonical, windowed.Canonical, StringComparison.Ordinal))
+                Assert.Fail("windowed compilation diverged (canonical):\n" + FirstDifference(whole.Canonical, windowed.Canonical));
+            if (!string.Equals(whole.Ordered, windowed.Ordered, StringComparison.Ordinal))
+                Assert.Fail("windowed compilation diverged (row order):\n" + FirstDifference(whole.Ordered, windowed.Ordered));
+        }
+        finally
+        {
+            TryDelete(root);
+            TryDelete(wholeDir);
+            TryDelete(windowedDir);
+        }
+    }
+
     [TestMethod]
     public async Task Cancellation_DuringOccurrencePhase_AbandonsGenerationWithoutDeadlock()
     {

@@ -722,9 +722,21 @@ public sealed class IndexOrchestrator
                 : null;
         bool ExtractsSymbols(Project project) =>
             project.FilePath != null && projectRoslynToId.ContainsKey(project.Id) && processSet.Contains(project.Id);
+        var windowsApply = _parallelism.CompilationWindow > 0 && solution.ProjectIds.Count > _parallelism.CompilationWindowMinProjects;
+        var skeletons = _parallelism.CompilationSkeletons && windowsApply ? new SkeletonCache(solution, cancellationToken) : null;
+        if (windowsApply && !_useDocumentExtractor)
+            _log?.Invoke("  The legacy extractor reads every project from one solution: compilation windows bound the symbol phase only.");
+        var symbolWindows = new CompilationWindows(
+            solution, solution.Projects.Where(ExtractsSymbols).Select(p => p.Id).ToList(), _parallelism.CompilationWindow, skeletons, _parallelism.CompilationWindowMinProjects);
         await using var prefetch = new CompilationPrefetcher(
             solution.Projects.Where(ExtractsSymbols).ToList(), _parallelism.MaxParallelism, cancellationToken,
-            recordTimings: metrics != null, hints: compileCostHints, keyOf: HintKeyOf);
+            compile: async (listed, token) =>
+            {
+                _ = await symbolWindows.CompileAsync(listed.Id, token).ConfigureAwait(false);
+            },
+            // A cost-hinted compile of a later project would build a later window while this one is in use.
+            recordTimings: metrics != null, hints: symbolWindows.Enabled ? null : compileCostHints, keyOf: HintKeyOf,
+            beforePermit: position => symbolWindows.WhenReached(position));
         if (compileCostHints is { Count: > 0 })
         {
             if (metrics != null)
@@ -736,10 +748,14 @@ public sealed class IndexOrchestrator
                     : "."));
         }
 
-        foreach (var project in solution.Projects)
+        // One project's symbol pass is its own method so that nothing it holds (the window's project, its compilation,
+        // the symbols) stays reachable from this method's state once the project is done; the next window's release
+        // can then actually free the previous one (issue #388).
+        async Task ExtractSymbolsOfProjectAsync(Project listedProject)
         {
-            if (!ExtractsSymbols(project))
-                continue;
+            var project = (await symbolWindows.OfAsync(listedProject.Id, cancellationToken)).Project ?? listedProject;
+            symbolWindows.ReleaseBefore(symbolWindows.WindowOf(project.Id));
+            symbolWindows.Reached(symbolWindows.WindowOf(project.Id));
             var projectId = projectRoslynToId[project.Id];
             prefetch.Reached();
             var reachedAtMs = metrics != null ? prefetch.NowMs : 0;
@@ -763,7 +779,7 @@ public sealed class IndexOrchestrator
                     symbolStore.DeleteByProject(projectId);
                     fileStore.DeleteByProject(projectId);
                     session.Release();
-                    continue;
+                    return;
                 }
                 symbolProjectsAdmitted++;
             }
@@ -786,7 +802,7 @@ public sealed class IndexOrchestrator
             Compilation? timedCompilation = null;
             long walkStartedMs = 0, walkEndedMs = 0;
             if (metrics != null) walkStartedMs = prefetch.NowMs;
-            timedCompilation = await project.GetCompilationAsync(cancellationToken);
+            timedCompilation = await symbolWindows.CompileAsync(project.Id, cancellationToken);
             if (metrics != null) walkEndedMs = prefetch.NowMs;
             var compileMs = projectWatch.ElapsedMilliseconds;
 
@@ -863,7 +879,15 @@ public sealed class IndexOrchestrator
                 Rows = symbols.Count
             });
             _log?.Invoke($"    {symbols.Count} symbols extracted");
+        
         }
+
+        foreach (var listedProject in solution.Projects)
+        {
+            if (ExtractsSymbols(listedProject))
+                await ExtractSymbolsOfProjectAsync(listedProject);
+        }
+        symbolWindows.ReleaseAll();
         prefetch.Stop();
 
         // Phase 12: a REUSED submodule provider project version was not re-extracted this run (its
@@ -906,14 +930,17 @@ public sealed class IndexOrchestrator
             // when the project is produced and dropped with its documents, so it only ever retains assembly
             // symbols referenced by that project — all already rooted by that project's compilation —
             // rather than accumulating every processed project's assemblies.
-            Func<IAssemblySymbol, long?> NewTargetProjectResolver()
+            Func<IAssemblySymbol, long?> NewTargetProjectResolver(
+                Solution owningSolution, IReadOnlyDictionary<IAssemblySymbol, ProjectId>? images)
             {
                 var assemblyProjectCache = new ConcurrentDictionary<IAssemblySymbol, long?>(SymbolEqualityComparer.Default);
                 return assembly => assemblyProjectCache.GetOrAdd(assembly, a =>
-                    solution.GetProject(a, cancellationToken) is { } targetProject
-                    && projectRoslynToId.TryGetValue(targetProject.Id, out var targetPid)
-                        ? targetPid
-                        : null);
+                {
+                    var targetId = owningSolution.GetProject(a, cancellationToken)?.Id;
+                    if (targetId == null && images != null && images.TryGetValue(a, out var imageOwner))
+                        targetId = imageOwner;
+                    return targetId != null && projectRoslynToId.TryGetValue(targetId, out var targetPid) ? targetPid : null;
+                });
             }
 
             // Pure, CPU-bound per-document extraction run in parallel. Builds the document's semantic
@@ -932,7 +959,9 @@ public sealed class IndexOrchestrator
                 var model = doc.Compilation.GetSemanticModel(doc.Tree, SemanticModelOptions.DisableNullableAnalysis);
 #pragma warning restore RSEXPERIMENTAL001
                 var root = doc.Tree.GetRoot(ct);
-                var set = new DocumentContributionSet();
+                var set = skeletons == null
+                    ? new DocumentContributionSet()
+                    : new DocumentContributionSet { IsStoredDeclaration = (pid, key) => catalog.TryResolveExact(key, pid, out _) };
                 DocumentSemanticExtractor.ExtractDocument(
                     root, model, doc.Tree.FilePath, set, doc.ResolveTargetProject,
                     includeDataflow: persistDataflow);
@@ -942,6 +971,12 @@ public sealed class IndexOrchestrator
             // Project descriptors in deterministic solution order. Each materializes its compilation and
             // non-generated documents just-in-time; the pipeline holds up to ProjectsInFlight of them at once
             // (issue #270), so peak memory stays bounded (criteria 2 & 6).
+            var occurrenceWindows = new CompilationWindows(
+                solution,
+                solution.Projects
+                    .Where(p => processSet.Contains(p.Id) && !budgetNotIndexed.Contains(p.Id) && projectRoslynToId.ContainsKey(p.Id))
+                    .Select(p => p.Id).ToList(),
+                _parallelism.CompilationWindow, skeletons, _parallelism.CompilationWindowMinProjects);
             var projectDescriptors =
                 new List<Func<CancellationToken, Task<ProjectExtraction<OccurrenceDoc>>>>();
             foreach (var project in solution.Projects)
@@ -958,9 +993,15 @@ public sealed class IndexOrchestrator
                     // stops the phase where it actually passes.
                     if (PastExtractionDeadline(owner))
                         return new ProjectExtraction<OccurrenceDoc>(owner, captured.Name, new List<OccurrenceDoc>());
-                    var compilation = await captured.GetCompilationAsync(ct);
+                    var window = await occurrenceWindows.OfAsync(captured.Id, ct);
+                    occurrenceWindows.ReleaseBefore(occurrenceWindows.WindowOf(captured.Id) - 1);
+                    var compilation = window.Project != null
+                        ? await occurrenceWindows.CompileAsync(captured.Id, ct)
+                        : await captured.GetCompilationAsync(ct);
                     var docs = new List<OccurrenceDoc>();
-                    var resolveTargetProject = NewTargetProjectResolver();
+                    var resolveTargetProject = NewTargetProjectResolver(
+                        window.Solution,
+                        compilation != null ? CompilationWindows.SkeletonAssemblies(window, compilation) : null);
                     if (compilation != null)
                     {
                         foreach (var syntaxTree in compilation.SyntaxTrees)
@@ -1136,6 +1177,8 @@ public sealed class IndexOrchestrator
 
             await ParallelExtractionPipeline.RunAsync(
                 projectDescriptors, ExtractOne, PersistProject, _parallelism, cancellationToken);
+            occurrenceWindows.ReleaseAll();
+            skeletons = null;
         }
 
         // Phase 3: Extract relationships (legacy declaration-driven path; skipped when the
@@ -1326,8 +1369,9 @@ public sealed class IndexOrchestrator
                 ProjectIndex = projectIndex,
                 ProjectCount = totalProjects
             });
-            var compilation = await project.GetCompilationAsync(cancellationToken);
-            if (compilation == null) continue;
+            // Comments need syntax only: reading the documents' trees never builds (and so never retains) a
+            // compilation, which is what the windowed phases above exist to bound (issue #388).
+            if (!project.SupportsCompilation) continue;
 
             if (project.FilePath == null || !projectRoslynToId.TryGetValue(project.Id, out var commentProjectId))
                 continue;
@@ -1339,10 +1383,14 @@ public sealed class IndexOrchestrator
             session.Begin();
             commentStore.DeleteByProject(commentProjectId);
 
-            foreach (var syntaxTree in compilation.SyntaxTrees)
+            foreach (var document in project.Documents)
             {
                 ThrowIfCancelled();
-                if (SymbolExtractor.IsGeneratedFile(syntaxTree.FilePath))
+                if (SymbolExtractor.IsGeneratedFile(document.FilePath ?? string.Empty))
+                    continue;
+
+                var syntaxTree = await document.GetSyntaxTreeAsync(cancellationToken);
+                if (syntaxTree == null)
                     continue;
 
                 var comments = CommentExtractor.ExtractComments(syntaxTree);

@@ -174,7 +174,7 @@ internal sealed class CompilationPrefetcher : IAsyncDisposable
                         continue;
                 }
                 if (_beforePermit != null)
-                    await _beforePermit(position).ConfigureAwait(false);
+                    await _beforePermit(position).WaitAsync(cancellationToken).ConfigureAwait(false);
                 await _ahead.WaitAsync(cancellationToken).ConfigureAwait(false);
                 lock (_gate)
                 {
