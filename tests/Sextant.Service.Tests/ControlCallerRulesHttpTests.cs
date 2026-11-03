@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text.Json;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Sextant.Service.Host;
 using Sextant.Store;
@@ -312,9 +313,16 @@ public class ControlCallerRulesHttpTests
     public async Task ControlRouteInventory_OnlySelfGatedRoutesAdmitUserCallers()
     {
         await using var host = await Harness.StartAsync();
-        var control = host.RouteEndpoints()
-            .Where(e => e.RoutePattern.RawText?.StartsWith("/control/", StringComparison.Ordinal) == true)
-            .ToList();
+        // The control token gate is the middleware's `path.StartsWithSegments("/control")`; classify every mapped route
+        // the same way (case-insensitive, whole segment), not by a "/control/" text prefix.
+        var all = host.RouteEndpoints();
+        var control = all.Where(e => IsControlRoute(e.RoutePattern.RawText)).ToList();
+        Assert.IsTrue(control.Count > 0);
+
+        // Every other route is /health, /ready or on the query plane (/mcp, /query/*: the query token or a delegate
+        // token, never the control token). A new route outside these is either unauthenticated or needs its own gate.
+        var others = all.Except(control).Select(e => e.RoutePattern.RawText ?? "").Where(t => !IsKnownNonControlRoute(t)).ToArray();
+        Assert.AreEqual(0, others.Length, "unexpected routes outside the control, query and health planes: " + string.Join(", ", others));
 
         var admitted = control.Where(ControlCallerRules.AdmitsUserCallers).Select(Describe).Order(StringComparer.Ordinal).ToArray();
         CollectionAssert.AreEqual(new[]
@@ -377,6 +385,14 @@ public class ControlCallerRulesHttpTests
 
     private static string AppAssertion(Harness host) =>
         host.Sign(CallerAssertionSigner.ApplicationClaims(DateTimeOffset.UtcNow));
+
+    private static bool IsControlRoute(string? pattern) =>
+        pattern is not null && new PathString(pattern.Split('{', 2)[0].TrimEnd('/')).StartsWithSegments("/control");
+
+    private static bool IsKnownNonControlRoute(string pattern) =>
+        pattern is "/health" or "/ready"
+        || new PathString(pattern.Split('{', 2)[0].TrimEnd('/')).StartsWithSegments("/mcp")
+        || new PathString(pattern.Split('{', 2)[0].TrimEnd('/')).StartsWithSegments("/query");
 
     private static string Describe(RouteEndpoint endpoint) =>
         $"{string.Join(",", endpoint.Metadata.GetMetadata<HttpMethodMetadata>()?.HttpMethods ?? [])} {endpoint.RoutePattern.RawText}";

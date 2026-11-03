@@ -57,6 +57,7 @@ public sealed partial class SnapshotService : IDisposable
     private readonly RemoteDefaultBranchLookup? _remoteDefaults;
     private readonly IRemoteBranchLister? _remoteBranches;
     private readonly TimeProvider _timeProvider;
+    private readonly DeniedAuditLimiter _deniedLimiter;
     private readonly ServiceMetrics _metrics = new();
 
     // Issue #148: the service-owned lifetime every ensure operation + worker run is bound to (cancelled only
@@ -135,6 +136,7 @@ public sealed partial class SnapshotService : IDisposable
         _remoteBranches = remoteBranches;
         _headResolver = remoteDefaults as IRemoteBranchHeadResolver;
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _deniedLimiter = new DeniedAuditLimiter(_timeProvider);
         _freshness = new DefaultBranchFreshnessTracker(
             _timeProvider, 3 * _options.FreshnessCheckInterval + TimeSpan.FromMinutes(1));
         _writeGate = new WriteGate(_timeProvider);
@@ -515,6 +517,8 @@ public sealed partial class SnapshotService : IDisposable
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             ThrowIfStopping();
+            if (!_deniedLimiter.TryAdmit(principal.Actor, $"{action};{reason}", out var suppressed))
+                return;
             write = Task.Run(
                 () => WithWriteAsync(
                     () =>
@@ -522,7 +526,7 @@ public sealed partial class SnapshotService : IDisposable
                         new AuditLogStore(_conn).Append(
                             action, AuditOutcome.Denied,
                             actor: principal.Actor,
-                            detail: principal.Detail(reason));
+                            detail: DeniedAuditLimiter.WithSuppressed(principal.Detail(reason), suppressed));
                         return Task.FromResult(true);
                     },
                     CancellationToken.None),

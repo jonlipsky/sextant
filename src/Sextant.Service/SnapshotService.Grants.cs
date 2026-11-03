@@ -81,7 +81,9 @@ public sealed partial class SnapshotService
     /// <summary>
     /// Records the <c>grant</c>/<c>denied</c> audit row for a grant write the host refused (its caller, body,
     /// repository URL or branch). <paramref name="operation"/> and <paramref name="reason"/> are codes; the repository
-    /// scope is set only for a repository the URL policy accepted (a refused URL is never stored).
+    /// scope is set only for a repository the URL policy accepted (a refused URL is never stored). A flood of the same
+    /// refusal from one caller is bounded by <see cref="DeniedAuditLimiter"/> (issue #198): past its per-window budget
+    /// the refusal is only counted, not written.
     /// </summary>
     public Task RecordGrantDeniedAsync(
         string operation, string reason, string? repositoryKey = null, AuditCaller auditor = default,
@@ -89,10 +91,13 @@ public sealed partial class SnapshotService
     {
         ArgumentException.ThrowIfNullOrEmpty(operation);
         ArgumentException.ThrowIfNullOrEmpty(reason);
+        if (!_deniedLimiter.TryAdmit(auditor.Actor, $"{AuditAction.Grant};{operation};{reason}", out var suppressed))
+            return Task.CompletedTask;
         return RunGrantWriteAsync(conn =>
         {
             new AuditLogStore(conn).Append(AuditAction.Grant, AuditOutcome.Denied, actor: auditor.Actor,
-                repositoryScope: repositoryKey, detail: auditor.Detail($"{operation};{reason}"));
+                repositoryScope: repositoryKey,
+                detail: DeniedAuditLimiter.WithSuppressed(auditor.Detail($"{operation};{reason}"), suppressed));
             return true;
         }, cancellationToken);
     }
@@ -110,16 +115,20 @@ public sealed partial class SnapshotService
     /// repository (SX-6d, <see cref="EnsureSnapshotRequest.UserCallerBranchProblem"/>), with the same contract as
     /// <see cref="RecordEnsureNotGrantedAsync"/>: scoped to the repository key, written on the grant connection (so it
     /// never waits behind a production), and <see cref="GrantStoreUnavailableException"/> when it cannot be recorded.
+    /// A flood of the same refusal from one caller is bounded by <see cref="DeniedAuditLimiter"/> (issue #198): past its
+    /// per-window budget the refusal is only counted (and the call succeeds without a row).
     /// </summary>
     public Task RecordUserEnsureDeniedAsync(
         string repositoryKey, string reason, AuditCaller auditor = default, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(repositoryKey);
         ArgumentException.ThrowIfNullOrEmpty(reason);
+        if (!_deniedLimiter.TryAdmit(auditor.Actor, $"{AuditAction.Ensure};{reason}", out var suppressed))
+            return Task.CompletedTask;
         return RunGrantWriteAsync(conn =>
         {
             new AuditLogStore(conn).Append(AuditAction.Ensure, AuditOutcome.Denied, actor: auditor.Actor,
-                repositoryScope: repositoryKey, detail: auditor.Detail(reason));
+                repositoryScope: repositoryKey, detail: DeniedAuditLimiter.WithSuppressed(auditor.Detail(reason), suppressed));
             return true;
         }, cancellationToken);
     }
