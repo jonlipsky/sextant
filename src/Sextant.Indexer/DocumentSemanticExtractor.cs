@@ -98,6 +98,15 @@ public sealed class DocumentContributionSet
     public IReadOnlyList<RelationshipContribution> Relationships => _relationships;
 
     /// <summary>
+    /// Says whether a project's own symbol pass stored a declaration key (issue #388). A solution project referenced
+    /// as a metadata image (<see cref="CompilationWindows"/>) is read without the compiler's source-only facts: its
+    /// implicit members (a default constructor, record or delegate members, accessors) are not
+    /// <see cref="ISymbol.IsImplicitlyDeclared"/> there, so such a symbol anchors an occurrence only when its key was
+    /// stored, which is exactly what the source path keeps. Null outside a windowed run. Read-only, so safe on workers.
+    /// </summary>
+    public Func<long, string, bool>? IsStoredDeclaration { get; init; }
+
+    /// <summary>
     /// Identifier names examined (every simple name except the <c>var</c> keyword): the denominator of
     /// the binding-health counters.
     /// </summary>
@@ -309,7 +318,7 @@ public static class DocumentSemanticExtractor
             // FindReferences reports candidate locations.
             if (IsBindingFailure(name, model, info.CandidateReason))
                 sink.UnboundNames++;
-            foreach (var candidate in StoredCandidates(info.CandidateSymbols))
+            foreach (var candidate in StoredCandidates(info.CandidateSymbols, resolveTargetProject, sink))
                 EmitReferenceTo(candidate, isCandidate: true, name, model, filePath, sink, resolveTargetProject);
             return;
         }
@@ -317,7 +326,7 @@ public static class DocumentSemanticExtractor
         // Keep type usages independently of the overload-specific constructor occurrences emitted
         // from creation/initializer syntax, so type-impact queries retain their existing targets.
         var target = Canonicalize(ConstructedTypeOrSelf(symbol));
-        if (!IsStoredTarget(target))
+        if (!IsStoredTarget(target, resolveTargetProject, sink))
             return;
 
         EmitReferenceTo(target, isCandidate: false, name, model, filePath, sink, resolveTargetProject);
@@ -410,7 +419,9 @@ public static class DocumentSemanticExtractor
     /// (a constructor becomes its type), de-duplicated, ordered by declaration key so the result does not
     /// depend on the compiler's candidate order, and capped at <see cref="MaxCandidates"/>.
     /// </summary>
-    private static List<ISymbol> StoredCandidates(ImmutableArray<ISymbol> candidates)
+    private static List<ISymbol> StoredCandidates(
+        ImmutableArray<ISymbol> candidates, Func<IAssemblySymbol, long?>? resolveTargetProject,
+        DocumentContributionSet sink)
     {
         if (candidates.IsDefaultOrEmpty)
             return [];
@@ -420,7 +431,7 @@ public static class DocumentSemanticExtractor
         foreach (var candidate in candidates)
         {
             var target = Canonicalize(ConstructedTypeOrSelf(candidate));
-            if (IsStoredTarget(target) && seen.Add(target))
+            if (IsStoredTarget(target, resolveTargetProject, sink) && seen.Add(target))
                 keyed.Add((SemanticSymbolKeyFactory.DeclarationKey(target), target));
         }
         return keyed
@@ -458,7 +469,7 @@ public static class DocumentSemanticExtractor
         var canonicalCallee = Canonicalize(callee);
         // Only source methods have a stored declaration to anchor the edge; metadata callees (e.g.
         // Console.WriteLine) would fail catalog resolution anyway, so drop them here.
-        if (!IsStoredTarget(canonicalCallee))
+        if (!IsStoredTarget(canonicalCallee, resolveTargetProject, sink))
             return;
 
         var callerKey = EnclosingMemberKey(invocation, model);
@@ -503,7 +514,7 @@ public static class DocumentSemanticExtractor
         if (operation is IInvalidOperation)
             sink.UnboundInvocations++;
 
-        var candidates = StoredCandidates(model.GetSymbolInfo(invocation).CandidateSymbols);
+        var candidates = StoredCandidates(model.GetSymbolInfo(invocation).CandidateSymbols, resolveTargetProject, sink);
         if (!candidates.Any(c => c is IMethodSymbol))
             return;
 
@@ -574,7 +585,7 @@ public static class DocumentSemanticExtractor
             if (target.MethodKind != MethodKind.Constructor)
                 return;
             var canonical = Canonicalize(target);
-            if (!IsStoredTarget(canonical))
+            if (!IsStoredTarget(canonical, resolveTargetProject, sink))
                 return;
 
             var key = SemanticSymbolKeyFactory.DeclarationKey(canonical);
@@ -601,7 +612,7 @@ public static class DocumentSemanticExtractor
             return;
 
         createdType = createdType.OriginalDefinition;
-        if (!IsStoredTarget(createdType))
+        if (!IsStoredTarget(createdType, resolveTargetProject, sink))
             return;
 
         var enclosingKey = EnclosingMemberKey(creationNode, model);
@@ -630,7 +641,7 @@ public static class DocumentSemanticExtractor
             return;
 
         createdType = createdType.OriginalDefinition;
-        if (!IsStoredTarget(createdType))
+        if (!IsStoredTarget(createdType, resolveTargetProject, sink))
             return;
 
         var line = creation.NewKeyword.GetLocation().GetLineSpan().StartLinePosition.Line + 1;
@@ -761,13 +772,34 @@ public static class DocumentSemanticExtractor
     }
 
     /// <summary>
+    /// True for a symbol read from the metadata image that stands in for a solution project (issue #388): it is that
+    /// project's declaration, which the project's own symbol pass stored, so it anchors an occurrence like a source one.
+    /// A real binary reference resolves to no project.
+    /// </summary>
+    private static bool IsSolutionProjectImage(
+        ISymbol symbol, Func<IAssemblySymbol, long?>? resolveTargetProject, DocumentContributionSet sink)
+    {
+        if (resolveTargetProject == null || sink.IsStoredDeclaration == null
+            || symbol.ContainingAssembly is not { } assembly
+            || !symbol.Locations.Any(l => l.IsInMetadata)
+            || resolveTargetProject(assembly) is not { } projectId)
+            return false;
+
+        // Implicit declarations are indistinguishable from explicit ones in an image; only a stored key is a
+        // declaration the source path would have kept. A member without a documentation ID gets a metadata key
+        // that matches nothing and is dropped: only a type parameter has none and none can be named from another project.
+        return sink.IsStoredDeclaration(projectId, SemanticSymbolKeyFactory.DeclarationKey(symbol));
+    }
+
+    /// <summary>
     /// True when a symbol is one we store and can therefore anchor an occurrence on: a source-declared,
     /// mappable (type or type member) symbol that is not an excluded artifact. Locals, parameters,
     /// namespaces, and metadata-only symbols are excluded (they resolve to no stored row).
     /// </summary>
-    private static bool IsStoredTarget(ISymbol symbol)
+    private static bool IsStoredTarget(
+        ISymbol symbol, Func<IAssemblySymbol, long?>? resolveTargetProject, DocumentContributionSet sink)
         => !symbol.IsImplicitlyDeclared
-           && symbol.Locations.Any(l => l.IsInSource)
+           && (symbol.Locations.Any(l => l.IsInSource) || IsSolutionProjectImage(symbol, resolveTargetProject, sink))
            && SymbolExtractor.MapSymbolKind(symbol) != null
            && !SemanticSymbolKeyFactory.IsExcludedArtifact(symbol);
 

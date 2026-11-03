@@ -34,6 +34,31 @@ public sealed record ExtractionParallelismOptions
     /// </summary>
     public int ProjectsInFlight { get; init; } = 1;
 
+    /// <summary>
+    /// How many projects share one solution's compilations before the next group compiles on a fresh one (issue #388,
+    /// <see cref="CompilationWindows"/>); 0 keeps every compilation on the one solution. A repository with no more
+    /// projects than this, or than <see cref="CompilationWindowMinProjects"/>, is not windowed.
+    /// </summary>
+    public int CompilationWindow { get; init; } = DefaultCompilationWindow;
+
+    /// <summary>
+    /// A phase windows its compilations only when it visits more projects than this: a window costs an image per
+    /// project referenced from outside it, which a small repository never needs (its whole solution fits).
+    /// </summary>
+    public int CompilationWindowMinProjects { get; init; } = DefaultCompilationWindowMinProjects;
+
+    /// <summary>
+    /// A window references the projects outside it as in-memory metadata-only images instead of compiling them again
+    /// (<see cref="SkeletonCache"/>). Only meaningful with a <see cref="CompilationWindow"/>.
+    /// </summary>
+    public bool CompilationSkeletons { get; init; } = true;
+
+    /// <summary>The default <see cref="CompilationWindow"/>.</summary>
+    public const int DefaultCompilationWindow = 8;
+
+    /// <summary>The default <see cref="CompilationWindowMinProjects"/>.</summary>
+    public const int DefaultCompilationWindowMinProjects = 100;
+
     /// <summary>The projects-in-flight an auto-resolved configuration uses (at most the parallelism).</summary>
     public const int DefaultProjectsInFlight = 4;
 
