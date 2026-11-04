@@ -62,27 +62,32 @@ public static class AlertEvaluator
                 });
         }
 
-        // Low success: partial snapshots still count as successfully published.
-        if (snapshot.Jobs.Terminal >= t.SuccessRateMinSamples)
+        // Low success: evaluated over the 24 h rolling window so it clears once an incident is fixed.
+        // Partial snapshots still count as successfully published.
+        var recentJobs = snapshot.RecentJobs;
+        if (recentJobs.SampleCount >= Math.Max(1, t.SuccessRateMinSamples))
         {
-            var success = snapshot.Jobs.SuccessRate;
+            var success = recentJobs.SuccessRate!.Value;
+            var window = $"across {recentJobs.SampleCount} jobs completed from " +
+                         $"{recentJobs.WindowStartUnixMs} to {recentJobs.WindowEndUnixMs} Unix ms.";
             if (success < t.SuccessRateCrit)
                 alerts.Add(new Alert
                 {
                     Id = "low_success_rate",
                     Level = AlertLevel.Critical,
-                    Message = $"Job success rate {success:P0} is below critical threshold {t.SuccessRateCrit:P0}."
+                    Message = $"Recent job success rate {success:P0} is below critical threshold " +
+                              $"{t.SuccessRateCrit:P0} {window}"
                 });
             else if (success < t.SuccessRateWarn)
                 alerts.Add(new Alert
                 {
                     Id = "low_success_rate",
                     Level = AlertLevel.Warning,
-                    Message = $"Job success rate {success:P0} is below warning threshold {t.SuccessRateWarn:P0}."
+                    Message = $"Recent job success rate {success:P0} is below warning threshold " +
+                              $"{t.SuccessRateWarn:P0} {window}"
                 });
         }
 
-        var recentJobs = snapshot.RecentJobs;
         if (recentJobs.SampleCount >= Math.Max(1, t.SuccessRateMinSamples))
         {
             var completeness = recentJobs.CompletenessRate!.Value;
