@@ -7,11 +7,12 @@ namespace Sextant.Service;
 public interface IRemoteBranchLister
 {
     /// <summary>
-    /// The complete set of branch names (<c>refs/heads/*</c>, without the prefix) the remote has, or <c>null</c> when
-    /// the listing is not complete or trustworthy (unreachable, unauthorized, timeout, non-zero exit, unparseable
-    /// output, a refused URL). Never a partial set. The service treats a throw like <c>null</c>.
+    /// The complete map of branch names (<c>refs/heads/*</c>, without the prefix) to the head commit the remote has
+    /// (lower-case object id), from ONE call (issue #400), or <c>null</c> when the listing is not complete or
+    /// trustworthy (unreachable, unauthorized, timeout, non-zero exit, unparseable output, a refused URL). Never a
+    /// partial map. The service treats a throw like <c>null</c>.
     /// </summary>
-    IReadOnlySet<string>? ListBranches(string repositoryRemoteUrl);
+    IReadOnlyDictionary<string, string>? ListBranches(string repositoryRemoteUrl);
 }
 
 /// <summary>Parsing of <c>git ls-remote --heads</c> output for <see cref="IRemoteBranchLister"/>.</summary>
@@ -20,14 +21,14 @@ public static class RemoteBranchHeads
     private const string BranchRefPrefix = "refs/heads/";
 
     /// <summary>
-    /// The branch names of <c>ls-remote --heads</c> output (<c>&lt;object id&gt;&#9;refs/heads/&lt;name&gt;</c> per
-    /// line; the name may contain slashes). Refs outside <c>refs/heads/</c> are ignored. Returns <c>null</c> for output
+    /// The branch names and head commits of <c>ls-remote --heads</c> output (<c>&lt;object id&gt;&#9;refs/heads/&lt;name&gt;</c> per
+    /// line; the name may contain slashes; the commit is lower-cased). Refs outside <c>refs/heads/</c> are ignored. Returns <c>null</c> for output
     /// that is not ls-remote output (a line without an object id and a tab, an implausible branch name), so a damaged
-    /// listing is never read as a shorter one. Empty output is an empty set.
+    /// listing is never read as a shorter one. Empty output is an empty map.
     /// </summary>
-    public static IReadOnlySet<string>? Parse(string lsRemoteOutput)
+    public static IReadOnlyDictionary<string, string>? Parse(string lsRemoteOutput)
     {
-        var names = new HashSet<string>(StringComparer.Ordinal);
+        var names = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var raw in lsRemoteOutput.Split('\n'))
         {
             var line = raw.TrimEnd('\r');
@@ -42,7 +43,7 @@ public static class RemoteBranchHeads
             var name = reference[BranchRefPrefix.Length..];
             if (!IsPlausibleBranchName(name))
                 return null;
-            names.Add(name);
+            names[name] = line[..tab].ToLowerInvariant();
         }
         return names;
     }

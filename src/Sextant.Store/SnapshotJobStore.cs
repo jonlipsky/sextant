@@ -549,8 +549,10 @@ public sealed class SnapshotJobStore(SqliteConnection connection)
 
     /// <summary>
     /// The branches with work still pending against them (issue #299), as (normalized repository URL, branch name): a
-    /// queued or running job that names the branch, or an unconsumed branch-advance handover (issue #273). The idle-branch
-    /// rule never retires one of them. Read-only; repository URLs are normalized with <see cref="RemoteUrlIdentity"/>.
+    /// queued or running job that names the branch. The idle-branch rule never retires one of them. A branch-advance
+    /// handover (issue #273) is pending work only while its successor's job is queued or running, and that job names the
+    /// branch, so it is already covered here: a handover row alone, left by a head that never moved, is not (issue #401).
+    /// Read-only; repository URLs are normalized with <see cref="RemoteUrlIdentity"/>.
     /// </summary>
     public HashSet<(string RepositoryKey, string Branch)> BranchesWithPendingWork()
     {
@@ -567,16 +569,87 @@ public sealed class SnapshotJobStore(SqliteConnection connection)
             while (reader.Read())
                 result.Add((RemoteUrlIdentity.Normalize(reader.GetString(0)), reader.GetString(1)));
         }
-        using (var handovers = connection.CreateCommand())
+        return result;
+    }
+
+    /// <summary>
+    /// The newest job <c>created_at</c> (any status) per (normalized repository URL, branch) for jobs that name a branch:
+    /// the branch's last push activity, which a stuck pointer's <c>updated_at</c> does not show. One read-only query;
+    /// job rows may spell the URL differently, so the key is <see cref="RemoteUrlIdentity.Normalize"/>d here.
+    /// </summary>
+    public Dictionary<(string RepositoryKey, string Branch), long> LatestJobCreatedAtByBranch()
+    {
+        var result = new Dictionary<(string, string), long>();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT repository_url, branch_name, MAX(created_at) FROM snapshot_jobs
+            WHERE branch_name IS NOT NULL
+            GROUP BY repository_url, branch_name;
+            """;
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
         {
-            handovers.CommandText = """
-                SELECT repository_key, branch_name FROM branch_advance_handovers;
-                """;
-            using var reader = handovers.ExecuteReader();
-            while (reader.Read())
-                result.Add((reader.GetString(0), reader.GetString(1)));
+            var key = (RemoteUrlIdentity.Normalize(reader.GetString(0)), reader.GetString(1));
+            var createdAt = reader.GetInt64(2);
+            if (!result.TryGetValue(key, out var existing) || createdAt > existing)
+                result[key] = createdAt;
         }
         return result;
+    }
+
+    /// <summary>
+    /// Deletes the branch-advance handovers (issue #273) whose branch has no pointer row, except those of a branch in
+    /// <paramref name="protectedBranches"/> (normalized repository URL, branch name; one with work pending or admitted:
+    /// a successor retried for a branch not created yet still resolves its handover). Issue #401. Returns how many rows
+    /// went. Runs on the caller's connection and transaction; a catalog below migration 029 has none.
+    /// </summary>
+    public int PruneOrphanHandovers(IReadOnlySet<(string RepositoryKey, string Branch)> protectedBranches) =>
+        DeleteOrphanHandovers(protectedBranches, delete: true);
+
+    /// <summary>The number of rows <see cref="PruneOrphanHandovers"/> would delete. Read-only.</summary>
+    public int CountOrphanHandovers(IReadOnlySet<(string RepositoryKey, string Branch)> protectedBranches) =>
+        DeleteOrphanHandovers(protectedBranches, delete: false);
+
+    private int DeleteOrphanHandovers(IReadOnlySet<(string RepositoryKey, string Branch)> protectedBranches, bool delete)
+    {
+        using (var probe = connection.CreateCommand())
+        {
+            probe.CommandText = "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'branch_advance_handovers');";
+            if (probe.ExecuteScalar() is not long exists || exists == 0)
+                return 0;
+        }
+        var live = new HashSet<(string, string)>();
+        using (var branches = connection.CreateCommand())
+        {
+            branches.CommandText = "SELECT r.remote_url, b.name FROM branches b JOIN repositories r ON r.id = b.repository_id;";
+            using var reader = branches.ExecuteReader();
+            while (reader.Read())
+                live.Add((RemoteUrlIdentity.Normalize(reader.GetString(0)), reader.GetString(1)));
+        }
+        var orphans = new List<(string Repository, string Branch)>();
+        using (var handovers = connection.CreateCommand())
+        {
+            handovers.CommandText = "SELECT DISTINCT repository_key, branch_name FROM branch_advance_handovers;";
+            using var reader = handovers.ExecuteReader();
+            while (reader.Read())
+            {
+                var key = (reader.GetString(0), reader.GetString(1));
+                if (!live.Contains(key) && !protectedBranches.Contains(key))
+                    orphans.Add(key);
+            }
+        }
+        var count = 0;
+        foreach (var (repository, branch) in orphans)
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = delete
+                ? "DELETE FROM branch_advance_handovers WHERE repository_key = @repo AND branch_name = @branch;"
+                : "SELECT COUNT(*) FROM branch_advance_handovers WHERE repository_key = @repo AND branch_name = @branch;";
+            cmd.Parameters.AddWithValue("@repo", repository);
+            cmd.Parameters.AddWithValue("@branch", branch);
+            count += delete ? cmd.ExecuteNonQuery() : (int)(long)cmd.ExecuteScalar()!;
+        }
+        return count;
     }
 
     /// <summary>A job's recorded timings JSON (issue #267), or null when none was recorded.</summary>

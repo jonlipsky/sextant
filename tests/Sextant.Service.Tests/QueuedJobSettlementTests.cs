@@ -250,6 +250,10 @@ public class QueuedJobSettlementTests
                 store.SetBranchPointer(store.EnsureBranch(repoId, branch, isDefault, movedAt), snapshot, movedAt);
             }
             Job(db, "id-stale", Repo + ".git", "commit-stale", "feature");
+            // A recent job of any status counts as push activity (issue #400); this row stands for an old, long-dead push.
+            using var backdate = db.GetConnection().CreateCommand();
+            backdate.CommandText = $"UPDATE snapshot_jobs SET created_at = {movedAt} WHERE identity_hash = 'id-stale';";
+            backdate.ExecuteNonQuery();
         });
         using (var probe = new IndexDatabase(_dbPath))
             Assert.IsTrue(new SnapshotJobStore(probe.GetConnection()).BranchesWithPendingWork()

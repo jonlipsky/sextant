@@ -104,13 +104,17 @@ public sealed class ServiceMetrics
     }
 
     /// <summary>Records one maintenance tick's upstream-branch reconcile pass (issue #338).</summary>
-    public void RecordUpstreamBranchPass(int repositoriesChecked, int listingFailures, long atUnixMs, double durationMs)
+    public void RecordUpstreamBranchPass(
+        int repositoriesChecked, int listingFailures, long atUnixMs, double durationMs, int healsStarted = 0,
+        int healsSkippedTerminal = 0)
     {
         lock (_maintenanceLock)
             _maintenance = _maintenance with
             {
                 UpstreamRepositoriesCheckedTotal = _maintenance.UpstreamRepositoriesCheckedTotal + repositoriesChecked,
                 UpstreamListingFailuresTotal = _maintenance.UpstreamListingFailuresTotal + listingFailures,
+                UpstreamBranchHealsStartedTotal = _maintenance.UpstreamBranchHealsStartedTotal + healsStarted,
+                UpstreamBranchHealsSkippedTerminalTotal = _maintenance.UpstreamBranchHealsSkippedTerminalTotal + healsSkippedTerminal,
                 LastUpstreamPassAtUnixMs = atUnixMs,
                 LastUpstreamPassDurationMs = durationMs
             };
@@ -123,6 +127,15 @@ public sealed class ServiceMetrics
             _maintenance = retired
                 ? _maintenance with { UpstreamBranchesRetiredTotal = _maintenance.UpstreamBranchesRetiredTotal + 1 }
                 : _maintenance with { UpstreamBranchRetiresSkippedTotal = _maintenance.UpstreamBranchRetiresSkippedTotal + 1 };
+    }
+
+    /// <summary>Records one finished upstream-branch heal advance (issue #400): the pointer moved, or the ensure ended without moving it.</summary>
+    public void RecordUpstreamBranchHealApplied(bool advanced)
+    {
+        lock (_maintenanceLock)
+            _maintenance = advanced
+                ? _maintenance with { UpstreamBranchHealsAppliedTotal = _maintenance.UpstreamBranchHealsAppliedTotal + 1 }
+                : _maintenance with { UpstreamBranchHealsNotAppliedTotal = _maintenance.UpstreamBranchHealsNotAppliedTotal + 1 };
     }
 
     /// <summary>Records one maintenance tick's repository reclaim pass (issue #291).</summary>

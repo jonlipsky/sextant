@@ -133,6 +133,18 @@ public sealed record MaintenanceMetrics
 
     /// <summary>Upstream listings that failed or were not trustworthy (timeout, error, unparseable, empty), since start.</summary>
     public long UpstreamListingFailuresTotal { get; init; }
+
+    /// <summary>Service-owned advances started for branch pointers behind the remote head (issue #400), since start.</summary>
+    public long UpstreamBranchHealsStartedTotal { get; init; }
+
+    /// <summary>Heal advances that moved the pointer, since start.</summary>
+    public long UpstreamBranchHealsAppliedTotal { get; init; }
+
+    /// <summary>Confirmed stale pointers not healed because the heal identity's job is already terminal failed/unsupported, since start.</summary>
+    public long UpstreamBranchHealsSkippedTerminalTotal { get; init; }
+
+    /// <summary>Heal advances that finished without moving the pointer (CAS declined, failed, requeued), since start.</summary>
+    public long UpstreamBranchHealsNotAppliedTotal { get; init; }
     public long LastUpstreamPassAtUnixMs { get; init; }
     public double LastUpstreamPassDurationMs { get; init; }
 

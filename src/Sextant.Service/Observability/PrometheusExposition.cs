@@ -144,6 +144,14 @@ public static class PrometheusExposition
             s.Maintenance.UpstreamBranchesRetiredTotal);
         Gauge(sb, "sextant_upstream_branch_retires_skipped_total", "Upstream-branch retirements that applied but retired nothing since start.",
             s.Maintenance.UpstreamBranchRetiresSkippedTotal);
+        Gauge(sb, "sextant_upstream_branch_heals_started_total", "Advances started for branch pointers behind the remote head since start.",
+            s.Maintenance.UpstreamBranchHealsStartedTotal);
+        Gauge(sb, "sextant_upstream_branch_heals_applied_total", "Upstream-branch heal advances that moved the pointer since start.",
+            s.Maintenance.UpstreamBranchHealsAppliedTotal);
+        Gauge(sb, "sextant_upstream_branch_heals_not_applied_total", "Upstream-branch heal advances that finished without moving the pointer since start.",
+            s.Maintenance.UpstreamBranchHealsNotAppliedTotal);
+        Gauge(sb, "sextant_upstream_branch_heals_skipped_terminal_total", "Upstream-branch heals not started because the heal identity's job is terminal failed or unsupported since start.",
+            s.Maintenance.UpstreamBranchHealsSkippedTerminalTotal);
         Gauge(sb, "sextant_upstream_listing_failures_total", "Upstream branch listings that failed or were not trustworthy since start.",
             s.Maintenance.UpstreamListingFailuresTotal);
         Gauge(sb, "sextant_upstream_pass_duration_ms", "Duration of the latest upstream-branch pass in milliseconds.",

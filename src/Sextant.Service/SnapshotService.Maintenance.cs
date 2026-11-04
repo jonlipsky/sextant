@@ -16,6 +16,9 @@ public sealed record IdleBranchRetireReport
     /// <summary>Idle branches left alone because a job or a handover is pending against them.</summary>
     public int Busy { get; init; }
 
+    /// <summary>Idle-pointer branches left alone because a job (any status) for them was created within the idle window: pushed but with a stuck pointer (issue #400).</summary>
+    public int RecentActivity { get; init; }
+
     /// <summary>Retirements submitted this pass (at most the per-pass cap).</summary>
     public int Attempted { get; init; }
 
@@ -86,6 +89,9 @@ public sealed record MaintenanceTickReport
 
     /// <summary>The tick's inactive-repository reclaim pass (issue #291).</summary>
     public RepositoryReclaimReport? RepositoryReclaim { get; init; }
+
+    /// <summary>Branch-advance handover rows of branches with no pointer that this tick deleted (issue #401).</summary>
+    public int OrphanHandoversPruned { get; init; }
 
     /// <summary>The tick's upstream-branch reconcile pass (issue #338).</summary>
     public UpstreamBranchReport? UpstreamBranches { get; init; }
@@ -293,19 +299,28 @@ public sealed partial class SnapshotService
             _metrics.RecordIdleBranchRetirePass(idle.Retired, _timeProvider.GetUtcNow().ToUnixTimeMilliseconds(), idle.DurationMs);
             if (idle.Enabled)
                 Log($"maintenance: idle-branch pass retired {idle.Retired} branch pointer(s) " +
-                    $"(idle {idle.Idle}, busy {idle.Busy}, attempted {idle.Attempted}, skipped {idle.Skipped}, " +
+                    $"(idle {idle.Idle}, busy {idle.Busy}, recent activity {idle.RecentActivity}, attempted {idle.Attempted}, skipped {idle.Skipped}, " +
                     $"retired heads pruned {idle.RetiredHeadsPruned}) " +
                     $"in {idle.DurationMs:F0} ms.");
+
+            var handoversPruned = await PruneOrphanHandoversBoundedAsync(cancellationToken).ConfigureAwait(false);
+            if (handoversPruned > 0)
+                Log($"maintenance: pruned {handoversPruned} orphan branch-advance handover(s).");
 
             var upstream = await ReconcileUpstreamBranchesAsync(tickStartedAt, cancellationToken).ConfigureAwait(false);
             if (upstream.Enabled)
             {
                 _metrics.RecordUpstreamBranchPass(
-                    upstream.Checked, upstream.ListingFailures, _timeProvider.GetUtcNow().ToUnixTimeMilliseconds(), upstream.DurationMs);
+                    upstream.Checked, upstream.ListingFailures, _timeProvider.GetUtcNow().ToUnixTimeMilliseconds(), upstream.DurationMs,
+                    upstream.HealsStarted, upstream.HealSkippedTerminal);
                 Log($"maintenance: upstream-branch pass retired {upstream.Retired} branch pointer(s) " +
                     $"(repositories due {upstream.Due}, checked {upstream.Checked}, listing failures {upstream.ListingFailures}, " +
                     $"busy {upstream.Busy}, awaiting confirmation {upstream.AwaitingConfirmation}, " +
-                    $"attempted {upstream.Attempted}, skipped {upstream.Skipped}) in {upstream.DurationMs:F0} ms.");
+                    $"attempted {upstream.Attempted}, skipped {upstream.Skipped}); " +
+                    $"healed {upstream.HealsStarted} stale pointer(s) (stale {upstream.Stale}, busy {upstream.HealBusy}, " +
+                    $"awaiting confirmation {upstream.HealAwaitingConfirmation}, deferred {upstream.HealsDeferred}, " +
+                    $"skipped terminal {upstream.HealSkippedTerminal}) " +
+                    $"in {upstream.DurationMs:F0} ms.");
             }
             var reclaim = await ReclaimInactiveRepositoriesAsync(cancellationToken).ConfigureAwait(false);
             if (reclaim.Enabled && (!reclaim.Busy || reclaim.Reclaimed + reclaim.Failed > 0))
@@ -318,7 +333,7 @@ public sealed partial class SnapshotService
             }
 
             var report = await RunScheduledRetentionIfDueAsync(idle, cancellationToken).ConfigureAwait(false);
-            return report with { RepositoryReclaim = reclaim, UpstreamBranches = upstream };
+            return report with { RepositoryReclaim = reclaim, UpstreamBranches = upstream, OrphanHandoversPruned = handoversPruned };
         }
         finally
         {
@@ -354,10 +369,13 @@ public sealed partial class SnapshotService
         var cutoff = _timeProvider.GetUtcNow().AddDays(-idleDays).ToUnixTimeMilliseconds();
         IReadOnlyList<IdleBranchCandidate> idle;
         HashSet<(string RepositoryKey, string Branch)> pending;
+        Dictionary<(string RepositoryKey, string Branch), long> lastJobAt;
         using (var reader = OpenReadConnection())
         {
             idle = new SnapshotStore(reader).ListIdleNonDefaultBranches(cutoff);
-            pending = new SnapshotJobStore(reader).BranchesWithPendingWork();
+            var jobStore = new SnapshotJobStore(reader);
+            pending = jobStore.BranchesWithPendingWork();
+            lastJobAt = jobStore.LatestJobCreatedAtByBranch();
         }
         // An admitted branch-advance ensure that has not finished is pending work too (issue #273's registry), and so is
         // an idle retirement an earlier tick queued that has not applied yet (issue #333: never queue a duplicate).
@@ -371,12 +389,16 @@ public sealed partial class SnapshotService
 
         var eligible = new List<IdleBranchCandidate>();
         var busy = 0;
+        var recentActivity = 0;
         foreach (var candidate in idle)
         {
             var repositoryKey = RemoteUrlIdentity.Normalize(candidate.RepositoryRemoteUrl);
             if (pending.Contains((repositoryKey, candidate.Name)) || advancing.Contains(repositoryKey + "\n" + candidate.Name)
                 || retiring.Contains(IdleRetireKey(candidate.RepositoryRemoteUrl, candidate.Name)))
                 busy++;
+            // A stuck pointer (issue #400) is not idleness: the branch is idle only with no recent push activity either.
+            else if (lastJobAt.TryGetValue((repositoryKey, candidate.Name), out var jobAt) && jobAt >= cutoff)
+                recentActivity++;
             else
                 eligible.Add(candidate);
         }
@@ -415,6 +437,7 @@ public sealed partial class SnapshotService
             Enabled = true,
             Idle = idle.Count,
             Busy = busy,
+            RecentActivity = recentActivity,
             Attempted = retirements.Count,
             Retired = retired,
             Skipped = retirements.Count - retired - deferred,
@@ -650,6 +673,44 @@ public sealed partial class SnapshotService
             DeferStep("retired_head_prune", "pruning retired heads");
             return 0;
         }
+    }
+
+    // Issue #401: deletes the branch-advance handovers of branches that have no pointer (retired, deleted upstream, never
+    // created), keeping those of a branch with a queued/running job or an admitted advance: a successor retried for a
+    // branch not created yet still resolves its handover. Takes the writer only when there is something to prune.
+    private async Task<int> PruneOrphanHandoversBoundedAsync(CancellationToken cancellationToken)
+    {
+        using var step = BeginStep(cancellationToken);
+        try
+        {
+            using (var reader = OpenReadConnection())
+            {
+                if (new SnapshotJobStore(reader).CountOrphanHandovers(ProtectedHandoverBranches(new SnapshotJobStore(reader))) == 0)
+                    return 0;
+            }
+            return await WithWriteAsync(
+                () => Task.FromResult(new SnapshotJobStore(_conn).PruneOrphanHandovers(ProtectedHandoverBranches(new SnapshotJobStore(_conn)))),
+                step.Token, priority: true).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (step.TimedOut)
+        {
+            DeferStep("orphan_handover_prune", "pruning orphan handovers");
+            return 0;
+        }
+    }
+
+    private HashSet<(string RepositoryKey, string Branch)> ProtectedHandoverBranches(SnapshotJobStore jobs)
+    {
+        var protectedBranches = jobs.BranchesWithPendingWork();
+        lock (_inFlightLock)
+        {
+            foreach (var key in _latestAdvance.Keys)
+            {
+                var split = key.IndexOf('\n');
+                protectedBranches.Add((key[..split], key[(split + 1)..]));
+            }
+        }
+        return protectedBranches;
     }
 
     private async Task<int> PruneRetiredHeadsAsync(CancellationToken cancellationToken)
