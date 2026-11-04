@@ -9,7 +9,7 @@ public sealed record UpstreamBranchReport
     /// <summary>False when the step is off (<see cref="MaintenancePolicy.BranchUpstreamCheckMinutes"/> is 0) or no remote lister is wired (locate mode).</summary>
     public required bool Enabled { get; init; }
 
-    /// <summary>Repositories with a non-default branch pointer that were due for a check, before the per-tick cap.</summary>
+    /// <summary>Repositories with a branch pointer to compare (non-default ones; every one when healing is on) that were due for a check, before the per-tick cap.</summary>
     public int Due { get; init; }
 
     /// <summary>Repositories whose remote was listed this pass (successfully or not).</summary>
@@ -39,6 +39,24 @@ public sealed record UpstreamBranchReport
     /// <summary>Submitted retirements still waiting for the writer when the step's bound passed; they apply when their turn comes.</summary>
     public int Deferred { get; init; }
 
+    /// <summary>Pointers whose snapshot commit differs from the remote head, seen on this pass's listing (issue #400).</summary>
+    public int Stale { get; init; }
+
+    /// <summary>Stale pointers left alone because a job, handover, advance or retirement is pending against them.</summary>
+    public int HealBusy { get; init; }
+
+    /// <summary>Stale pointers seen for the first time (or against a different remote head): healed only if the next listing agrees.</summary>
+    public int HealAwaitingConfirmation { get; init; }
+
+    /// <summary>Confirmed stale pointers not started because <see cref="MaintenancePolicy.BranchUpstreamHealMaxPerTick"/> was reached; they heal on a later pass.</summary>
+    public int HealsDeferred { get; init; }
+
+    /// <summary>Service-owned advances to the remote head started this pass.</summary>
+    public int HealsStarted { get; init; }
+
+    /// <summary>Confirmed stale pointers not healed because the job of the heal's identity is already terminal <c>failed</c> or <c>unsupported</c> (a heal would only repeat it).</summary>
+    public int HealSkippedTerminal { get; init; }
+
     public double DurationMs { get; init; }
 }
 
@@ -52,6 +70,9 @@ public sealed partial class SnapshotService
     private readonly Dictionary<string, long> _upstreamCheckedAt = new(StringComparer.Ordinal);
     // Value: when the listing that first found the pointer absent started.
     private readonly Dictionary<(string Repository, string Branch, long SnapshotId), long> _upstreamAbsentOnce = [];
+    // Issue #400: pointers found behind the remote head. Value: the remote head seen and when the latest listing that
+    // saw it started; a confirmation needs the same pointer and the same head on the next listing.
+    private readonly Dictionary<(string Repository, string Branch, long SnapshotId), (string Head, long SeenAt)> _upstreamStale = [];
 
     // Repositories whose listing is still running (a previous tick abandoned the wait); guarded by its own lock because
     // the listing tasks clear their entry from the thread pool. Everything else above stays on the tick's flow.
@@ -69,10 +90,11 @@ public sealed partial class SnapshotService
     /// </summary>
     private static long DueSlack(long intervalMs) => Math.Min(intervalMs / 10, UpstreamDueSlackMaxMs);
 
-    private readonly record struct UpstreamListing(string RepositoryKey, bool Listed, IReadOnlySet<string>? Heads, long StartedAt);
+    private readonly record struct UpstreamListing(string RepositoryKey, bool Listed, IReadOnlyDictionary<string, string>? Heads, long StartedAt);
 
     /// <summary>
-    /// Retires non-default branch pointers whose branch no longer exists on the remote (issue #338). Per tick it lists
+    /// Retires non-default branch pointers whose branch no longer exists on the remote (issue #338) and heals pointers
+    /// that are behind the remote head (issue #400). Per tick it lists
     /// (<c>ls-remote --heads</c>, OUTSIDE the writer gate) at most
     /// <see cref="MaintenancePolicy.BranchUpstreamCheckMaxRepositoriesPerTick"/> repositories that have such pointers and
     /// were last checked at least <see cref="MaintenancePolicy.BranchUpstreamCheckMinutes"/> ago, least recently checked
@@ -83,6 +105,18 @@ public sealed partial class SnapshotService
     /// time stay due. Each retirement goes through the audited retire path (actor <c>upstream_policy</c>, snapshot + updated_at
     /// compare-and-swap, never a default branch, never a branch with pending work) and records no retired head, since the
     /// branch is gone from git too.
+    /// <para>
+    /// Healing (issue #400; off when <see cref="MaintenancePolicy.BranchUpstreamHealMaxPerTick"/> is 0, in which case only
+    /// non-default pointers are read): a pointer, default or not, whose snapshot commit differs from the head the same
+    /// <c>ls-remote</c> returned, with no queued/running job, admitted advance or queued retirement against it, and
+    /// the same difference (same pointer, same remote head) on two consecutive listings, gets a service-owned ensure of
+    /// the remote head under actor <c>upstream_policy</c>, a <c>branch_update: advance</c> CAS on the pointer's current
+    /// commit (<c>expected_head_commit</c>), so coalescing, the audit row and the handover rules are the push path's.
+    /// No ancestry check: like a force-push, a remote head that is an ancestor of the pointer moves the pointer back to
+    /// it, because the remote's head is what the branch is. At most
+    /// <see cref="MaintenancePolicy.BranchUpstreamHealMaxPerTick"/> are started per tick; a default branch is healed but
+    /// never retired.
+    /// </para>
     /// </summary>
     internal async Task<UpstreamBranchReport> ReconcileUpstreamBranchesAsync(DateTimeOffset tickStartedAt, CancellationToken cancellationToken = default)
     {
@@ -95,11 +129,13 @@ public sealed partial class SnapshotService
         var interval = (long)TimeSpan.FromMinutes(
             Math.Min(policy.BranchUpstreamCheckMinutes, MaintenancePolicy.MaxBranchUpstreamCheckMinutes)).TotalMilliseconds;
 
+        var healMax = policy.BranchUpstreamHealMaxPerTick;
         IReadOnlyList<IdleBranchCandidate> pointers;
         HashSet<(string RepositoryKey, string Branch)> pending;
         using (var reader = OpenReadConnection())
         {
-            pointers = new SnapshotStore(reader).ListIdleNonDefaultBranches(long.MaxValue);
+            var store = new SnapshotStore(reader);
+            pointers = healMax > 0 ? store.ListBranchPointers() : store.ListIdleNonDefaultBranches(long.MaxValue);
             pending = new SnapshotJobStore(reader).BranchesWithPendingWork();
         }
         HashSet<string> advancing;
@@ -113,10 +149,11 @@ public sealed partial class SnapshotService
         var byRepository = pointers
             .GroupBy(p => RemoteUrlIdentity.Normalize(p.RepositoryRemoteUrl), StringComparer.Ordinal)
             .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
-        // Forget repositories that no longer have a non-default pointer.
+        // Forget repositories that no longer have a pointer to compare.
         foreach (var gone in _upstreamCheckedAt.Keys.Where(k => !byRepository.ContainsKey(k)).ToList())
             _upstreamCheckedAt.Remove(gone);
         ForgetAbsent(k => !byRepository.ContainsKey(k.Repository));
+        ForgetStale(k => !byRepository.ContainsKey(k.Repository));
 
         var due = byRepository
             .Where(r => !_upstreamCheckedAt.TryGetValue(r.Key, out var last) || tickStart - last >= interval - DueSlack(interval))
@@ -130,6 +167,12 @@ public sealed partial class SnapshotService
         var awaiting = 0;
         var unverifiable = 0;
         var retirements = new List<Task<RetireBranchResult>>();
+        var stale = 0;
+        var healBusy = 0;
+        var healAwaiting = 0;
+        var healsDeferred = 0;
+        var healsStarted = 0;
+        var healsSkippedTerminal = 0;
 
         var batch = due.Where(r => { lock (_upstreamListing) return !_upstreamListing.Contains(r.Key); })
             .Take(policy.BranchUpstreamCheckMaxRepositoriesPerTick).ToList();
@@ -152,13 +195,16 @@ public sealed partial class SnapshotService
             {
                 failures++;
                 ForgetAbsent(k => k.Repository == repositoryKey);
+                ForgetStale(k => k.Repository == repositoryKey);
                 continue;
             }
 
             var current = branches.Select(b => (repositoryKey, b.Name, b.SnapshotId)).ToHashSet();
             // A pointer that moved or went away drops out of the confirmation set.
-            foreach (var stale in _upstreamAbsentOnce.Keys.Where(k => k.Repository == repositoryKey && !current.Contains(k)).ToList())
-                _upstreamAbsentOnce.Remove(stale);
+            foreach (var gone in _upstreamAbsentOnce.Keys.Where(k => k.Repository == repositoryKey && !current.Contains(k)).ToList())
+                _upstreamAbsentOnce.Remove(gone);
+            foreach (var moved in _upstreamStale.Keys.Where(k => k.Repository == repositoryKey && !current.Contains(k)).ToList())
+                _upstreamStale.Remove(moved);
 
             foreach (var candidate in branches)
             {
@@ -169,11 +215,53 @@ public sealed partial class SnapshotService
                     _upstreamAbsentOnce.Remove(key);
                     continue;
                 }
-                if (heads.Contains(candidate.Name))
+                if (heads.TryGetValue(candidate.Name, out var remoteHead))
                 {
                     _upstreamAbsentOnce.Remove(key);
+                    if (healMax <= 0 || string.Equals(remoteHead, candidate.HeadCommit, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _upstreamStale.Remove(key);
+                        continue;
+                    }
+                    stale++;
+                    if (pending.Contains((repositoryKey, candidate.Name)) || advancing.Contains(repositoryKey + "\n" + candidate.Name)
+                        || retiring.Contains(IdleRetireKey(candidate.RepositoryRemoteUrl, candidate.Name)))
+                    {
+                        healBusy++;
+                        _upstreamStale.Remove(key);
+                        continue;
+                    }
+                    if (!_upstreamStale.TryGetValue(key, out var seen) || seen.Head != remoteHead
+                        || listing.StartedAt - seen.SeenAt > UpstreamConfirmationWindowIntervals * interval)
+                    {
+                        _upstreamStale[key] = (remoteHead, listing.StartedAt);
+                        healAwaiting++;
+                        continue;
+                    }
+                    if (healsStarted >= healMax)
+                    {
+                        _upstreamStale[key] = (remoteHead, listing.StartedAt);
+                        healsDeferred++;
+                        continue;
+                    }
+                    _upstreamStale.Remove(key);
+                    switch (StartHeal(candidate, remoteHead))
+                    {
+                        case HealStart.Started:
+                            healsStarted++;
+                            break;
+                        case HealStart.Busy:
+                            healBusy++;
+                            break;
+                        case HealStart.Terminal:
+                            healsSkippedTerminal++;
+                            break;
+                    }
                     continue;
                 }
+                _upstreamStale.Remove(key);
+                if (candidate.IsDefault)
+                    continue;
                 if (pending.Contains((repositoryKey, candidate.Name)) || advancing.Contains(repositoryKey + "\n" + candidate.Name)
                     || retiring.Contains(IdleRetireKey(candidate.RepositoryRemoteUrl, candidate.Name)))
                 {
@@ -230,8 +318,78 @@ public sealed partial class SnapshotService
             Retired = retired,
             Skipped = retirements.Count - retired - deferred,
             Deferred = deferred,
+            Stale = stale,
+            HealBusy = healBusy,
+            HealAwaitingConfirmation = healAwaiting,
+            HealsDeferred = healsDeferred,
+            HealsStarted = healsStarted,
+            HealSkippedTerminal = healsSkippedTerminal,
             DurationMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds
         };
+    }
+
+    private enum HealStart { Started, Busy, Terminal, NotStarted }
+
+    // Issue #400: the heal is an ordinary service-owned branch-advance ensure of the remote head (the shape a push
+    // sends: CAS on the pointer's current commit), so admission, coalescing, the write turn, the CAS/reuse rules and
+    // the ensure audit row are exactly the push path's, attributed to upstream_policy. It is not awaited: the index may
+    // take minutes, and the pending-work check keeps the next pass off the branch meanwhile.
+    //
+    // The decision to heal was made from state read before the listing phase, which can take tens of seconds, so it is
+    // re-made here at the moment of admission. _inFlightLock is a reentrant Lock, and StartEnsureOperation takes it again
+    // to admit the ensure (and its write turn, which only queues), so the checks below and the registration are ONE
+    // critical section: a push is either admitted before it (seen as an in-flight advance, or already applied and seen
+    // in the re-read pointer) or after it (its ticket supersedes/expects this heal's commit as usual). The pointer and
+    // job reads are short WAL reads on an independent connection, taken inside the lock for that reason.
+    private HealStart StartHeal(IdleBranchCandidate candidate, string remoteHead)
+    {
+        var request = new EnsureSnapshotRequest
+        {
+            RepositoryRemoteUrl = candidate.RepositoryRemoteUrl,
+            CommitSha = remoteHead,
+            BranchName = candidate.Name,
+            ExpectedHeadCommit = candidate.HeadCommit,
+            IsDefaultBranch = candidate.IsDefault
+        };
+        var repositoryKey = RemoteUrlIdentity.Normalize(candidate.RepositoryRemoteUrl);
+        try
+        {
+            Task<EnsureSnapshotResult> completion;
+            lock (_inFlightLock)
+            {
+                ObjectDisposedException.ThrowIf(_disposed, this);
+                if (_latestAdvance.ContainsKey(repositoryKey + "\n" + candidate.Name)
+                    || _pendingIdleRetires.Contains(IdleRetireKey(candidate.RepositoryRemoteUrl, candidate.Name)))
+                    return HealStart.Busy;
+
+                SnapshotJobRow? healJob;
+                using (var reader = OpenReadConnection())
+                {
+                    var pointer = new SnapshotStore(reader).ListBranchPointers().FirstOrDefault(p => p.BranchId == candidate.BranchId);
+                    if (pointer is null || pointer.SnapshotId != candidate.SnapshotId
+                        || !string.Equals(pointer.HeadCommit, candidate.HeadCommit, StringComparison.OrdinalIgnoreCase))
+                        return HealStart.Busy;
+                    var jobs = new SnapshotJobStore(reader);
+                    if (jobs.BranchesWithPendingWork().Contains((repositoryKey, candidate.Name)))
+                        return HealStart.Busy;
+                    healJob = jobs.GetJobByIdentity(IdentityHashFor(request));
+                }
+                // A heal of a commit whose build already failed for good would only repeat the failure (and write an
+                // ensure audit row every pass), so it waits for a human or a new remote head.
+                if (healJob is not null && healJob.Status is SnapshotJobStatus.Failed or SnapshotJobStatus.Unsupported)
+                    return HealStart.Terminal;
+
+                (_, completion, _) = StartEnsureOperation(request, UpstreamPolicyCaller);
+            }
+            _ = completion.ContinueWith(
+                t => _metrics.RecordUpstreamBranchHealApplied(t.IsCompletedSuccessfully && t.Result.BranchAdvanced == true),
+                CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            return HealStart.Started;
+        }
+        catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException or ArgumentException)
+        {
+            return HealStart.NotStarted;
+        }
     }
 
     // Lists the repositories of one batch, at most UpstreamListingParallelism at a time, inside one phase bound of half of
@@ -316,8 +474,14 @@ public sealed partial class SnapshotService
             _upstreamAbsentOnce.Remove(key);
     }
 
+    private void ForgetStale(Func<(string Repository, string Branch, long SnapshotId), bool> predicate)
+    {
+        foreach (var key in _upstreamStale.Keys.Where(predicate).ToList())
+            _upstreamStale.Remove(key);
+    }
+
     // A throwing lister is a failed listing, never a failed tick.
-    private static IReadOnlySet<string>? SafeListBranches(IRemoteBranchLister lister, string url)
+    private static IReadOnlyDictionary<string, string>? SafeListBranches(IRemoteBranchLister lister, string url)
     {
         try
         {

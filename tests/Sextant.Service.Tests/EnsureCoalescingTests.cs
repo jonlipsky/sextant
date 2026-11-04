@@ -219,7 +219,9 @@ public class EnsureCoalescingTests
         Assert.IsTrue((await Push("commit-A", expected: "", branch: "feature")).BranchAdvanced);
         using (var idle = _db.GetConnection().CreateCommand())
         {
-            idle.CommandText = "UPDATE branches SET updated_at = 0 WHERE name = 'feature';";
+            // The branch's own job row (from the push above) counts as recent activity (issue #400): backdate it too.
+            idle.CommandText = "UPDATE branches SET updated_at = 0 WHERE name = 'feature';" +
+                "UPDATE snapshot_jobs SET created_at = 0 WHERE branch_name = 'feature';";
             await idle.ExecuteNonQueryAsync();
         }
         Assert.AreEqual(1, (await _service.RetireIdleBranchesAsync()).Retired);

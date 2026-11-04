@@ -63,6 +63,44 @@ public class IdleBranchMaintenanceTests
     }
 
     [TestMethod]
+    public async Task StuckPointer_WithARecentJobOnTheBranch_IsKept_EvenWithADifferentUrlSpelling()
+    {
+        foreach (var status in new[] { "cancelled", "coalesced", "complete" })
+        {
+            await using var h = Harness.Create(maintenance: NoLoop());
+            h.Seed("main", isDefault: true, "commit-main", idleFor: TimeSpan.FromDays(1));
+            h.Seed("stuck", isDefault: false, "commit-s", idleFor: TimeSpan.FromDays(15));
+            h.Start();
+            new SnapshotJobStore(h.Db.GetConnection()).EnsureJob("identity-stuck", Repo + ".git", "commit-s2", "stuck");
+            h.SetJob("identity-stuck", status, h.Clock.GetUtcNow() - TimeSpan.FromDays(1));
+
+            var report = await h.Service.RetireIdleBranchesAsync();
+
+            Assert.AreEqual(1, report.Idle, status);
+            Assert.AreEqual(1, report.RecentActivity, status);
+            Assert.AreEqual(0, report.Retired, status);
+            Assert.IsTrue(h.BranchExists("stuck"), status);
+        }
+    }
+
+    [TestMethod]
+    public async Task StuckPointer_WithOnlyAnOldJob_IsRetired()
+    {
+        await using var h = Harness.Create(maintenance: NoLoop());
+        h.Seed("main", isDefault: true, "commit-main", idleFor: TimeSpan.FromDays(1));
+        h.Seed("stuck", isDefault: false, "commit-s", idleFor: TimeSpan.FromDays(15));
+        h.Start();
+        new SnapshotJobStore(h.Db.GetConnection()).EnsureJob("identity-old", Repo + ".git", "commit-s2", "stuck");
+        h.SetJob("identity-old", "complete", h.Clock.GetUtcNow() - TimeSpan.FromDays(10));
+
+        var report = await h.Service.RetireIdleBranchesAsync();
+
+        Assert.AreEqual(0, report.RecentActivity);
+        Assert.AreEqual(1, report.Retired);
+        Assert.IsFalse(h.BranchExists("stuck"));
+    }
+
+    [TestMethod]
     public async Task ZeroDays_DisablesTheRule()
     {
         await using var h = Harness.Create(maintenance: NoLoop() with { BranchIdleRetireDays = 0 });
@@ -90,6 +128,7 @@ public class IdleBranchMaintenanceTests
         var jobs = new SnapshotJobStore(h.Db.GetConnection());
         jobs.EnsureJob("identity-queued", Repo + ".git", "commit-q2", "queued");
         jobs.RecordHandover(RemoteUrlIdentity.Normalize(Repo), "handed-over", "commit-x", "commit-h", "commit-y");
+        jobs.EnsureJob("identity-successor", Repo + ".git", "commit-y", "handed-over");
 
         var report = await h.Service.RetireIdleBranchesAsync();
 
@@ -97,7 +136,7 @@ public class IdleBranchMaintenanceTests
         Assert.AreEqual(2, report.Busy);
         Assert.AreEqual(1, report.Retired);
         Assert.IsTrue(h.BranchExists("queued"), "a queued job names the branch (matched across URL spellings)");
-        Assert.IsTrue(h.BranchExists("handed-over"), "a pending handover is unfinished work on the branch");
+        Assert.IsTrue(h.BranchExists("handed-over"), "a handover whose successor job is queued is unfinished work on the branch");
         Assert.IsFalse(h.BranchExists("idle"));
     }
 
@@ -702,6 +741,10 @@ public class IdleBranchMaintenanceTests
             Clock.Advance(_options.Maintenance.Interval);
             Assert.IsTrue(await Service.WaitForMaintenanceTickAsync(Settle), "the maintenance loop ticked");
         }
+
+        public void SetJob(string identity, string status, DateTimeOffset createdAt) => Execute(
+            $"UPDATE snapshot_jobs SET status = '{status}', created_at = {createdAt.ToUnixTimeMilliseconds()} " +
+            $"WHERE identity_hash = '{identity}';");
 
         public BranchRow? Branch(string name)
         {

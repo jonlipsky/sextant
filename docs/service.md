@@ -107,6 +107,7 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_MAX_PER_PASS` | The most idle branch pointers one tick retires (least recently moved first; the rest wait for the next tick). Clamped to `1000`; a non-numeric or non-positive value uses the default | `20` |
 | `SEXTANT_SERVICE_BRANCH_UPSTREAM_CHECK_MINUTES` | Minimum minutes between upstream (`git ls-remote --heads`) checks of one repository; a non-default branch pointer absent upstream on two consecutive listings is retired (issue #338). `0` disables. Clamped to `10080`; a non-numeric or negative value uses the default | `60` |
 | `SEXTANT_SERVICE_BRANCH_UPSTREAM_CHECK_MAX_REPOSITORIES_PER_TICK` | The most repositories one tick lists (least recently checked first). Clamped to `1000`; a non-numeric or non-positive value uses the default | `10` |
+| `SEXTANT_SERVICE_BRANCH_UPSTREAM_HEAL_MAX_PER_TICK` | The most stale branch pointers (behind the remote head, confirmed on two listings) one tick starts an advance for. `0` turns the heal off; clamped to `1000`; a non-numeric value uses the default | `10` |
 | `SEXTANT_SERVICE_REPOSITORY_RECLAIM_DAYS` | Reclaim the checkout, git object store and NuGet package folder of a repository with no branch pointer, no pending work and no activity for more than this many days (issue #291). `0` disables the rule. Clamped to `3650`; a non-numeric or negative value uses the default | `14` |
 | `SEXTANT_SERVICE_REPOSITORY_RECLAIM_MAX_PER_PASS` | The most inactive repositories one tick reclaims (least active first). Clamped to `1000`; a non-numeric or non-positive value uses the default | `5` |
 | `SEXTANT_SERVICE_RETENTION_SCHEDULE` | Run the bounded retention pass once a day from the maintenance loop (issue #299). A malformed boolean **fails startup** | `true` |
@@ -2339,7 +2340,12 @@ their snapshots forever. A service-owned loop cleans them up.
   (`branches.updated_at`) for more than `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_DAYS` (default 7, `0` = off) is
   retired, least recently moved first, at most `SEXTANT_SERVICE_BRANCH_IDLE_RETIRE_MAX_PER_PASS` (default 20) per
   tick. Candidates are read on an independent reader. A branch with a `queued`/`running` job that names it, an
-  unconsumed branch-advance handover (#273), or an admitted branch-advance ensure is left alone. Each
+  unconsumed branch-advance handover (#273), or an admitted branch-advance ensure is left alone. A branch is idle
+  only if it also had no push activity: one whose newest `snapshot_jobs` row (any status, repository matched by
+  normalized URL so a `.git` spelling still counts) was created within the idle window is kept and counted as
+  `recent activity` in the tick log, since a pointer stuck behind live pushes (#400) is for the upstream heal
+  pass to move, not for retirement. Activity counts job rows, so a push of an already-indexed commit (which
+  reuses its job row and creates no new one) does not count as activity. Each
   retirement then goes through the same path as `POST /control/branches/retire`: a queued writer turn in
   submission order (#158), and one `BEGIN IMMEDIATE` transaction with its `retire` audit row. The audit actor is
   `idle_policy` and the detail carries `;source=idle_policy`. When the retirement applies, it re-checks
@@ -2386,7 +2392,9 @@ their snapshots forever. A service-owned loop cleans them up.
   repository, branch and snapshot id holding the first listing's start time; a branch that reappears, whose pointer
   moves or whose confirmation is older than the window starts over). A stored branch name that starts with `refs/`
   or contains characters git ref names cannot have is NEVER retired (counted `unverifiable`). Branches with a
-  `queued`/`running` job, a handover or an admitted branch-advance ensure are skipped. The retirement goes through
+  `queued`/`running` job or an admitted branch-advance ensure are skipped (a branch-advance handover row alone
+  no longer counts: it makes a branch busy only through a `queued`/`running` job of its successor commit, issue
+  #401, and retiring a branch consumes its handovers). The retirement goes through
   the same guarded path as the idle rule (`IdleRetireGuard`: snapshot id and `updated_at` as read, so a moved
   pointer is `pointer_moved`, a busy one `branch_busy`, the default branch is refused), plus an upstream-only
   check: if any job row for that repository and branch, or the branch row itself, was created or updated at or
@@ -2399,6 +2407,30 @@ their snapshots forever. A service-owned loop cleans them up.
   `sextant_upstream_branches_retired_total`, `sextant_upstream_branch_retires_skipped_total`,
   `sextant_upstream_listing_failures_total`, `sextant_upstream_pass_duration_ms` (also in
   `MetricsSnapshot.Maintenance`), and one `maintenance: upstream-branch pass …` log line per tick.
+- **Stale-pointer heal (same pass, issue #400).** The same `ls-remote` call returns each branch's head SHA. While
+  `SEXTANT_SERVICE_BRANCH_UPSTREAM_HEAL_MAX_PER_TICK` is above 0 (default 10, `0` = heal off, clamped to `1000`),
+  the pass also reads the DEFAULT branch pointers and compares each pointer's snapshot commit with the remote
+  head. A pointer that differs, has no `queued`/`running` job, admitted advance or queued retirement, and differs
+  the same way (same pointer, same remote head) on two consecutive listings no more than 3 intervals apart gets a
+  service-owned ensure of the remote head: `branch_update: advance` with `expected_head_commit` = the pointer's
+  current commit, actor `upstream_policy`. That is the push path, so coalescing, the CAS, reuse of an already
+  built snapshot (a push whose advance declined its CAS) and the ensure audit row apply unchanged; the heal is not
+  awaited. At most the cap start per tick, the rest heal on later passes. There is no ancestry check: like a
+  force-push, a remote head that is an ancestor of the pointer moves the pointer to it, because the remote's head
+  is what the branch is. The decision is re-made at the moment of admission, atomically with it (under the
+  admission lock): a branch with an admitted advance or ensure, a queued retirement, a queued/running job, or a
+  pointer that moved since the pass read it is skipped and counted `heal busy`, so a push admitted during the
+  (possibly long) listing is never overtaken by a heal. A heal whose identity already has a terminal `failed` or
+  `unsupported` job is not started (counted `skipped terminal`,
+  `sextant_upstream_branch_heals_skipped_terminal_total`): it would repeat the failure and write an ensure audit
+  row every pass; a new remote head is a new identity and heals normally. The request identity folds the submitted URL spelling, so a heal can re-index a commit
+  once when the app's push used another spelling. A default branch is healed but never retired, and one absent
+  from a listing is left alone. Metrics: `sextant_upstream_branch_heals_started_total`,
+  `sextant_upstream_branch_heals_applied_total`, `sextant_upstream_branch_heals_not_applied_total`; the pass log
+  line reports stale/busy/awaiting/deferred/started counts.
+- **Orphan handover prune (every tick, issue #401).** Branch-advance handover rows whose branch has no pointer row,
+  and no `queued`/`running` job or admitted advance, are deleted (`orphan_handover_prune` deferral if the writer
+  is not available in time).
 - **Inactive-repository reclaim (every tick, issue #291).** A repository is inactive when it has no branch pointer
   row, no `queued`/`running` job and no unconsumed branch-advance handover, and its most recent activity is more
   than `SEXTANT_SERVICE_REPOSITORY_RECLAIM_DAYS` (default 14, `0` = off) old. Activity is the latest of: the

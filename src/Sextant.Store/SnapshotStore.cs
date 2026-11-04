@@ -103,7 +103,7 @@ public sealed record BranchRow
 /// retirement applies under; <see cref="HeadCommit"/> is the commit it points at.
 /// </summary>
 public sealed record IdleBranchCandidate(
-    long BranchId, string RepositoryRemoteUrl, string Name, long SnapshotId, long UpdatedAt, string HeadCommit);
+    long BranchId, string RepositoryRemoteUrl, string Name, long SnapshotId, long UpdatedAt, string HeadCommit, bool IsDefault = false);
 
 /// <summary>
 /// A consumer repository's default branch and the commit its complete snapshot indexed (issue #355); the commit is null
@@ -1067,6 +1067,30 @@ public sealed class SnapshotStore(SqliteConnection connection)
             result.Add(new IdleBranchCandidate(
                 reader.GetInt64(0), reader.GetString(1), reader.GetString(2),
                 reader.GetInt64(3), reader.GetInt64(4), reader.GetString(5)));
+        return result;
+    }
+
+    /// <summary>
+    /// Every branch pointer (default and non-default) at a snapshot with a recorded commit, least recently moved first
+    /// (issue #400): what the upstream pass compares with the remote's heads. Read-only.
+    /// </summary>
+    public IReadOnlyList<IdleBranchCandidate> ListBranchPointers()
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT b.id, r.remote_url, b.name, b.snapshot_id, b.updated_at, c.commit_sha, b.is_default
+            FROM branches b
+            JOIN repositories r ON r.id = b.repository_id
+            JOIN snapshots s ON s.id = b.snapshot_id
+            JOIN commits c ON c.id = s.commit_id
+            ORDER BY b.updated_at, b.id;
+            """;
+        using var reader = cmd.ExecuteReader();
+        var result = new List<IdleBranchCandidate>();
+        while (reader.Read())
+            result.Add(new IdleBranchCandidate(
+                reader.GetInt64(0), reader.GetString(1), reader.GetString(2),
+                reader.GetInt64(3), reader.GetInt64(4), reader.GetString(5), reader.GetInt64(6) != 0));
         return result;
     }
 

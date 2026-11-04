@@ -91,9 +91,9 @@ public sealed partial class CloningCheckoutProvider : IRemoteDefaultBranchResolv
     /// <summary>Upper bound on the <c>ls-remote --heads</c> call of the upstream-branch reconcile (issue #338); it runs in the maintenance loop, off the writer.</summary>
     private static readonly TimeSpan RemoteBranchListingTimeout = TimeSpan.FromSeconds(30);
 
-    // Issue #338: the complete list of the remote's branches, over the same hardened, token-scoped environment as the
+    // Issue #338: the complete list of the remote's branches and their heads (one call), over the same hardened, token-scoped environment as the
     // default-branch lookup. Anything short of a clean, parsed listing is null (never a partial set).
-    public IReadOnlySet<string>? ListBranches(string repositoryRemoteUrl)
+    public IReadOnlyDictionary<string, string>? ListBranches(string repositoryRemoteUrl)
     {
         if (string.IsNullOrWhiteSpace(repositoryRemoteUrl) || UrlHasUserInfo(repositoryRemoteUrl))
             return null;

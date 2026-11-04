@@ -20,12 +20,16 @@ public sealed record MaintenancePolicy
     internal const int DefaultTickDeadlineSeconds = 900;
     internal const int DefaultBranchUpstreamCheckMinutes = 60;
     internal const int DefaultBranchUpstreamCheckMaxRepositoriesPerTick = 10;
+    internal const int DefaultBranchUpstreamHealMaxPerTick = 10;
 
     /// <summary>The longest upstream-check interval, in minutes (7 days); a longer value is clamped to it.</summary>
     public const int MaxBranchUpstreamCheckMinutes = 7 * 24 * 60;
 
     /// <summary>The largest per-tick upstream-check repository cap the environment can set.</summary>
     public const int MaxBranchUpstreamCheckMaxRepositoriesPerTick = 1000;
+
+    /// <summary>The largest per-tick upstream-heal cap the environment can set.</summary>
+    public const int MaxBranchUpstreamHealMaxPerTick = 1000;
 
     /// <summary>The longest retention hold of the writer, in seconds (1 hour); a longer value is clamped to it.</summary>
     public const int MaxRetentionBurstSeconds = 3600;
@@ -147,6 +151,14 @@ public sealed record MaintenancePolicy
     /// </summary>
     public int BranchUpstreamCheckMaxRepositoriesPerTick { get; init; } = DefaultBranchUpstreamCheckMaxRepositoriesPerTick;
 
+    /// <summary>
+    /// The most stale branch pointers (default or not) one tick starts an advance for (issue #400): a pointer whose
+    /// snapshot commit differs from the remote's head on two consecutive listings. <c>0</c> disables healing (the
+    /// upstream pass then reads only non-default pointers, as before).
+    /// <c>SEXTANT_SERVICE_BRANCH_UPSTREAM_HEAL_MAX_PER_TICK</c> (default 10; clamped to <see cref="MaxBranchUpstreamHealMaxPerTick"/>).
+    /// </summary>
+    public int BranchUpstreamHealMaxPerTick { get; init; } = DefaultBranchUpstreamHealMaxPerTick;
+
     /// <summary>A one-line description of the effective policy for the startup log.</summary>
     public string Describe()
     {
@@ -159,7 +171,8 @@ public sealed record MaintenancePolicy
             ? $"reclaims disk of repositories inactive >= {RepositoryReclaimDays} day(s), at most {RepositoryReclaimMaxPerPass} per tick"
             : "repository reclaim disabled";
         var upstream = BranchUpstreamCheckMinutes > 0
-            ? $"checks upstream branches of each repository every {BranchUpstreamCheckMinutes} min, at most {BranchUpstreamCheckMaxRepositoriesPerTick} repositories per tick"
+            ? $"checks upstream branches of each repository every {BranchUpstreamCheckMinutes} min, at most {BranchUpstreamCheckMaxRepositoriesPerTick} repositories per tick, " +
+              (BranchUpstreamHealMaxPerTick > 0 ? $"heals at most {BranchUpstreamHealMaxPerTick} stale pointers per tick" : "stale-pointer heal disabled")
             : "upstream-branch check disabled";
         var retention = ScheduledRetention
             ? $"scheduled retention daily from {RetentionHourUtc:D2}:00 UTC"

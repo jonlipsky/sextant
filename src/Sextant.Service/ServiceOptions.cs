@@ -613,7 +613,8 @@ public sealed record ServiceOptions
                 Env("RETENTION_SCHEDULE_HOUR_UTC"), Env("RETENTION_PASS_SECONDS"),
                 Env("REPOSITORY_RECLAIM_DAYS"), Env("REPOSITORY_RECLAIM_MAX_PER_PASS"),
                 Env("RETENTION_BURST_SECONDS"), Env("RETENTION_CONTINUE_MINUTES"), Env("MAINTENANCE_TICK_DEADLINE_SECONDS"),
-                Env("BRANCH_UPSTREAM_CHECK_MINUTES"), Env("BRANCH_UPSTREAM_CHECK_MAX_REPOSITORIES_PER_TICK")),
+                Env("BRANCH_UPSTREAM_CHECK_MINUTES"), Env("BRANCH_UPSTREAM_CHECK_MAX_REPOSITORIES_PER_TICK"),
+                Env("BRANCH_UPSTREAM_HEAL_MAX_PER_TICK")),
             // Fold the node's own profile hash into request identities by default, so an ensure request that
             // omits ConfigHash resolves to the SAME identity_hash the local worker's orchestrator publishes
             // under (IndexProfileDescriptor.ConfigurationHash) — without it the idempotency lookup misses.
@@ -779,7 +780,8 @@ public sealed record ServiceOptions
         string? intervalMinutes, string? idleDays, string? maxPerPass, bool? scheduledRetention, string? retentionHourUtc,
         string? retentionPassSeconds = null, string? repositoryReclaimDays = null, string? repositoryReclaimMaxPerPass = null,
         string? retentionBurstSeconds = null, string? retentionContinueMinutes = null, string? tickDeadlineSeconds = null,
-        string? upstreamCheckMinutes = null, string? upstreamCheckMaxRepositories = null) => new()
+        string? upstreamCheckMinutes = null, string? upstreamCheckMaxRepositories = null,
+        string? upstreamHealMax = null) => new()
         {
             Interval = TimeSpan.FromMinutes(int.TryParse(intervalMinutes, out var minutes) && minutes >= 0
                 ? Math.Min(minutes, MaintenancePolicy.MaxIntervalMinutes) : MaintenancePolicy.DefaultIntervalMinutes),
@@ -806,7 +808,10 @@ public sealed record ServiceOptions
                 ? Math.Min(upstreamMinutes, MaintenancePolicy.MaxBranchUpstreamCheckMinutes) : MaintenancePolicy.DefaultBranchUpstreamCheckMinutes,
             BranchUpstreamCheckMaxRepositoriesPerTick = int.TryParse(upstreamCheckMaxRepositories, out var upstreamCap) && upstreamCap > 0
                 ? Math.Min(upstreamCap, MaintenancePolicy.MaxBranchUpstreamCheckMaxRepositoriesPerTick)
-                : MaintenancePolicy.DefaultBranchUpstreamCheckMaxRepositoriesPerTick
+                : MaintenancePolicy.DefaultBranchUpstreamCheckMaxRepositoriesPerTick,
+            BranchUpstreamHealMaxPerTick = int.TryParse(upstreamHealMax, out var healCap) && healCap >= 0
+                ? Math.Min(healCap, MaintenancePolicy.MaxBranchUpstreamHealMaxPerTick)
+                : MaintenancePolicy.DefaultBranchUpstreamHealMaxPerTick
         };
 
     internal static RetentionPolicy WithUnitMaxForTesting(RetentionPolicy policy) =>
