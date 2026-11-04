@@ -2753,10 +2753,11 @@ rows.
   (idempotent-ensure attach rate + federation page-cache hit rate), and query latency (p50/p95/max). Add
   `?format=prometheus` for text exposition a scraper/dashboard can ingest directly. Alerts are evaluated
   over the snapshot (`queue_delay_high`, `low_success_rate`, `low_completeness_rate`, `worker_exhaustion`,
-  `storage_pressure`). The existing `jobs` block retains cumulative counts/rates and `low_success_rate`
-  keeps its cumulative behavior. A separate `recent_jobs` block reports terminal jobs by `completed_at`
+  `storage_pressure`). The existing `jobs` block retains cumulative counts/rates and the cumulative `sextant_job_success_rate`
+  gauge is informational only; `low_success_rate` uses the 24 h rolling-window rate below. A separate `recent_jobs` block reports terminal jobs by `completed_at`
   over a rolling 24-hour window (`window_start_unix_ms` inclusive, `window_end_unix_ms` exclusive),
-  including bounds, sample count and recent rates. Its rates are null with no samples. `low_completeness_rate`
+  including bounds, sample count and recent rates. Its rates are null with no samples. `low_success_rate` (recent complete + partial / recent terminal),
+  `low_completeness_rate`
   and pilot `snapshot_completeness` use recent complete jobs / recent terminal jobs: partial jobs still
   count as successful publication but not as complete. The existing `AlertThresholds` programmatic
   configuration sets `CompletenessRateWarn` (default 0.90), `CompletenessRateCrit` (0.50), and the shared

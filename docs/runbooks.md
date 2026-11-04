@@ -29,11 +29,12 @@ Alerts evaluated over the metrics snapshot: `queue_delay_high`, `low_success_rat
 `low_completeness_rate` evaluates complete / terminal jobs completed in the rolling 24 hours; it warns
 below 90% and is critical below 50%, after at least five recent terminal jobs. The metrics snapshot reports
 the window as `[window_start_unix_ms, window_end_unix_ms)` and reports the sample count. Equality at 90%
-is healthy; equality at 50% is warning, not critical. Partial publication remains a success for the
-cumulative `low_success_rate`, but lowers recent completeness. These defaults
+is healthy; equality at 50% is warning, not critical. Partial publication remains a success for
+`low_success_rate` (a 24 h rolling-window rate over the same recent terminal jobs, same thresholds and minimum
+sample gate, so it clears once a fixed incident ages out), but lowers recent completeness. These defaults
 are configurable through `AlertThresholds.CompletenessRateWarn`, `CompletenessRateCrit`, and the shared
 `SuccessRateMinSamples` programmatic settings (no environment-variable overrides). The cumulative
-`jobs` counts/rates are retained for compatibility; neither alerting nor pilot readiness substitutes its
+`jobs` counts/rates (including `sextant_job_success_rate`) are informational and retained for compatibility; neither alerting nor pilot readiness substitutes its
 empty-history `1.0` rate for the recent window. Inspect
 `/control/status/{jobId}` and `/control/resolve` for `coverage.reasons`, then check the repository's
 `solutions` configuration and project-load/submodule diagnostics. With too few recent terminal jobs the rate
@@ -222,10 +223,10 @@ default branch still exists.
 
 ### Runbook: job failures
 
-**Raised when.** `sextant_alert_active{id="low_success_rate"}` = 1 (success rate below 0.90 warning, below 0.50 critical,
-once 5 jobs have ended).
+**Raised when.** `sextant_alert_active{id="low_success_rate"}` = 1 (24 h rolling-window success rate below 0.90 warning, below 0.50 critical,
+once at least 5 jobs have ended in the window; it clears when failures age out of the window).
 **Means.** Too many jobs end `failed`.
-**Confirm.** `GET /control/metrics` (`jobs.failed`, success rate); `GET /control/audit`; `GET /control/status/<job_id>` for
+**Confirm.** `GET /control/metrics` (`recent_jobs.failed`, `recent_jobs.success_rate`); `GET /control/audit`; `GET /control/status/<job_id>` for
 `last_error` and the per-project diagnostics.
 **Do.** Transient (`sdk_pin_restore_failed`, clone/network): it is requeued, wait. Deterministic (`evaluation_budget_exceeded`,
 restore, unsupported): fix the repository or its `sextant.json`; "Runbook: unsupported workloads" above.

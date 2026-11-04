@@ -38,6 +38,36 @@ public class AlertEvaluatorTests
     }
 
     [TestMethod]
+    public void SuccessRate_LifetimeBadButRecentGood_DoesNotAlert()
+    {
+        var snapshot = Snapshot(new JobMetrics { Complete = 10, Failed = 90 }) with { RecentJobs = Recent(complete: 10) };
+        Assert.IsFalse(AlertEvaluator.Evaluate(snapshot).Any(a => a.Id == "low_success_rate"));
+    }
+
+    [TestMethod]
+    [DataRow(9, 1, -1)]
+    [DataRow(8, 2, (int)AlertLevel.Warning)]
+    [DataRow(5, 5, (int)AlertLevel.Warning)]
+    [DataRow(4, 6, (int)AlertLevel.Critical)]
+    [DataRow(0, 5, (int)AlertLevel.Critical)]
+    public void SuccessRate_UsesRecentWindow(int complete, int failed, int expectedLevel)
+    {
+        var snapshot = Snapshot(new JobMetrics { Complete = 100 }) with { RecentJobs = Recent(complete: complete, failed: failed) };
+        var alert = AlertEvaluator.Evaluate(snapshot).SingleOrDefault(a => a.Id == "low_success_rate");
+
+        Assert.AreEqual(expectedLevel, alert is null ? -1 : (int)alert.Level);
+        if (alert is not null)
+            StringAssert.Contains(alert.Message, "Recent job success rate");
+    }
+
+    [TestMethod]
+    public void SuccessRate_RecentSamplesBelowMinimum_DoesNotAlert()
+    {
+        var snapshot = Snapshot(new JobMetrics { Failed = 100 }) with { RecentJobs = Recent(failed: 4) };
+        Assert.IsFalse(AlertEvaluator.Evaluate(snapshot).Any(a => a.Id == "low_success_rate"));
+    }
+
+    [TestMethod]
     public void Completeness_WaitsForSharedMinimumSamples()
     {
         var snapshot = Snapshot(new JobMetrics { Partial = 5 });
