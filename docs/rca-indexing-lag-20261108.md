@@ -1,0 +1,64 @@
+# RCA: default-branch indexing lag (2026-11-08, issue #403)
+
+Symptom: a push to `elevenworks/ProcessStack` `main` was indexed 9-14 hours late; MCP calls timed out; the writer
+lease logged `database is locked`.
+
+## Evidence (read-only: catalog `snapshot_jobs`, `docker logs sextant-service`, GitHub push events)
+
+1. **The queue is never idle and jobs run back to back.** Each job's `created_at == started_at ==` the previous job's
+   `completed_at` (job 4145 was created 20:07:41, right after 4144 completed 20:01:00). Complete jobs: median ~749 s,
+   p90 ~988 s, so ~5 productions/hour. Demand in 24 h: ~26 ProcessStack `main`, ~31 TextEditor `main` and ~36
+   feature-branch productions. Demand exceeds capacity, so a backlog is permanent.
+2. **The app is not the delay.** `POST /control/ensure?wait=False` reaches the service in real time (216 in 12 h; commits
+   at 19:45:32/19:45:37/19:46:09 produced ensures at 19:45:37-19:46:02). The push orchestration is not serial and does
+   not wait for jobs.
+3. **Lag measured:** push 25ba30ae to 00797461 at 06:41Z had its job created 16:19Z (9.6 h); push 56023850 to 27930d63
+   at 11-07 18:04Z had its coalesced job 4077 created 08:38Z (14.5 h).
+4. **Why no job existed for ~30 newer commits:** an ensure takes its writer turn at admission, but its `snapshot_jobs`
+   row is written only when the turn is granted. Queued ensures live in memory only (and are lost on restart: 1026
+   jobs were cancelled "service run ended before its turn (restart)").
+
+## Cause 1 (primary): one FIFO write gate, no priority for the default branch
+
+Every ensure registration and production is a `WriteGate` turn (`TakeWriteTurnLocked`, #158). The gate had only a
+normal lane plus a maintenance priority lane. A default-branch push waited behind every feature-branch build admitted
+earlier. #273 coalescing only collapses *queued linked* advances, and the survivor still keeps its own, late FIFO
+position; reconcile ensures (no CAS) never coalesce. With a 12-16 minute job time this serialised hours of work.
+
+**Fix:** a third, *expedited* lane (`WriteGate`). An ensure with `default_branch: true` (only the application may send
+it; a user ensure that does is refused) and not `branch_update: none` takes it, so it runs right after the current
+holder (after maintenance). Fairness: after `WriteGate.DefaultExpeditedStreakLimit` (4) consecutive expedited turns while
+a normal (feature-branch) turn waits, one normal turn runs, so feature branches are delayed, never starved. Same-lane
+order stays FIFO, so push, retire and re-create ordering per branch is unchanged. Superseded default-branch pushes still
+coalesce (#273), so only the newest head is built.
+
+## Cause 2: long write-lock holds starved lease renewal and readers
+
+114 `Write lock held for 5-11.7 s by 'index-write-session'` warnings in 12 h; 100 of them directly follow a
+`comments extracted` line. The comment phase opened a write batch per project and parsed every document inside it.
+The #344 hold cap (`MaxBatchHold` 2 s) is only evaluated when a row is written, so a project whose documents have no
+comments never committed. The lock stayed open for the whole parse. `busy_timeout` is 5 s, so the lease heartbeat
+(`writer lease renewal failed ... database is locked`) lost the race.
+
+**Fix:** `IndexWriteSession.ReleaseIfHeldTooLong()`; the comment loop calls it before parsing each document and
+`Begin()`s again before each insert. Holds are now bounded by `MaxBatchHold` (2 s default) plus one document parse.
+
+## Contributing factors (not changed here)
+
+- Retention/idle passes waited behind productions for 583-903 s and one idle pass took 722 s (the priority lane only
+  orders them; it does not bound a production already running). `RETENTION_PASS_SECONDS` bounds them.
+- Restore of `TextEditor.slnx` fails as a whole and retries 142 projects one by one (2-4 min per job).
+- 7 of ~1190 MCP `tools/call` took over 3 s (12-27 s) while a production ran at ~100% CPU and 4.8 of 7 GiB. Readers use a
+  separate WAL connection, so they are not blocked by the writer; the cause is CPU/memory pressure from the running
+  job. Lowering `MAX_PARALLELISM` (or a larger container) is the lever; no code change made.
+- Restart still loses queued ensures; the #400 upstream heal and the app's reconcile re-enqueue within ~2 h.
+
+## Deploy note
+
+1. **Service only** (`jonlipsky/sextant`, g2d deploy). No migration, no new config. Optional tuning already existing:
+   `SEXTANT_SERVICE_INDEX_BATCH_MAX_HOLD_MS` (default 2000), `SEXTANT_SERVICE_INDEX_YIELD_TO_WAITERS_MS` (500).
+2. **App** (`elevenworks/processstack-sextant`): no change and no publish. It already sends `default_branch: true` for
+   pushes and reconcile of the default branch, which selects the new lane.
+3. Deploy at low traffic: the restart loses in-memory queued ensures (heal ~2 h).
+4. Verify after deploy: `Write lock held` warnings drop below ~3 s, and the job for a default-branch push is created
+   directly after the running job (`snapshot_jobs.created_at` close to the push time plus the current job's remainder).

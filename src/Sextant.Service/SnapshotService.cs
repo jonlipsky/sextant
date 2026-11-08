@@ -605,7 +605,11 @@ public sealed partial class SnapshotService : IDisposable
             ThrowIfStopping();
             // Issue #158: the ensure takes its turn on the writer now, in submission order. A user ensure that must
             // first look up the remote's default branch (issue #199) takes its turn once that lookup has finished.
-            var turn = request.RestrictsImplicitDefault ? null : TakeWriteTurnLocked();
+            // Issue #403: an ensure that claims the default branch (only the application may; a user ensure with
+            // default_branch is refused) takes the expedited lane, so it never waits behind feature-branch work.
+            var turn = request.RestrictsImplicitDefault
+                ? null
+                : TakeWriteTurnLocked(out _, expedited: request.IsDefaultBranch == true && !request.SuppressesBranchUpdate);
             if (turn is not null)
                 ticket = AdmitAdvanceLocked(request, hash);
             completion = Task.Run(() => RunEnsureAsync(request, hash, principal, accepted, turn, ticket), CancellationToken.None);
@@ -728,10 +732,10 @@ public sealed partial class SnapshotService : IDisposable
     // writer stalls for good (ReleaseTurn covers a turn abandoned before it was granted).
     private Task TakeWriteTurnLocked() => TakeWriteTurnLocked(out _);
 
-    private Task TakeWriteTurnLocked(out long admission, bool priority = false)
+    private Task TakeWriteTurnLocked(out long admission, bool priority = false, bool expedited = false)
     {
         admission = Interlocked.Increment(ref _writeAdmissions);
-        return _writeGate.WaitAsync(CancellationToken.None, priority);
+        return _writeGate.WaitAsync(CancellationToken.None, priority, expedited);
     }
 
     private Task TakeWriteTurn()

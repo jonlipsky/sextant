@@ -132,6 +132,29 @@ public class WriteLockYieldTests
     }
 
     [TestMethod]
+    public void Session_ReleaseIfHeldTooLong_ReleasesAnIdleBatchPastTheCap_WithoutRowsBeingWritten()
+    {
+        var clock = new TickClock();
+        _db.WriteLockTracker = new WriteLockTracker(timeProvider: clock);
+        using var session = _db.BeginWriteSession(new IndexWriteOptions { MaxBatchHold = TimeSpan.FromSeconds(2) });
+        session.Begin();
+
+        clock.Advance(TimeSpan.FromSeconds(1.9));
+        session.ReleaseIfHeldTooLong();
+        Assert.IsTrue(session.IsOpen, "under the cap");
+
+        clock.Advance(TimeSpan.FromSeconds(0.2));
+        session.ReleaseIfHeldTooLong();
+        Assert.IsFalse(session.IsOpen, "past the cap the lock is released although no row was written");
+        Assert.AreEqual(1, session.CommittedBatches);
+
+        session.ReleaseIfHeldTooLong();
+        session.Begin();
+        Assert.IsTrue(session.IsOpen, "the next write begins again");
+        session.Complete();
+    }
+
+    [TestMethod]
     public void Session_WithMaxBatchHoldZero_NeverCommitsOnTime()
     {
         var clock = new TickClock();
