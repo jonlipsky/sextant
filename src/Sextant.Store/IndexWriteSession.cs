@@ -142,6 +142,18 @@ public sealed class IndexWriteSession : IDisposable
         CommittedBatches++;
     }
 
+    /// <summary>
+    /// Commits the open batch when it has held the write lock past <see cref="IndexWriteOptions.MaxBatchHold"/>,
+    /// without beginning another. For loops that do slow non-write work (parsing, extraction) between rows: the hold cap
+    /// in <see cref="RowsWritten"/> is only checked when a row is written, so a stretch of documents that write nothing
+    /// would otherwise keep the lock for the whole stretch. The next write must <see cref="Begin"/> again.
+    /// </summary>
+    public void ReleaseIfHeldTooLong()
+    {
+        if (_open && HeldTooLong())
+            Release();
+    }
+
     /// <summary>Commits the final batch (the publish). Does not begin a new transaction.</summary>
     public void Complete() => Release();
 

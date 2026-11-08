@@ -1389,6 +1389,8 @@ public sealed class IndexOrchestrator
                 if (SymbolExtractor.IsGeneratedFile(document.FilePath ?? string.Empty))
                     continue;
 
+                // Parsing writes nothing, so a stretch of comment-free documents must not keep the write lock open.
+                session.ReleaseIfHeldTooLong();
                 var syntaxTree = await document.GetSyntaxTreeAsync(cancellationToken);
                 if (syntaxTree == null)
                     continue;
@@ -1397,6 +1399,7 @@ public sealed class IndexOrchestrator
                 foreach (var comment in comments)
                 {
                     var enclosingSymbolId = ResolveEnclosingSymbol(comment.Line, comment.FilePath, commentProjectId, symbolStore);
+                    session.Begin();
                     commentStore.Insert(commentInsert, commentProjectId, comment.FilePath, comment.Line, comment.Tag,
                                        comment.Text, enclosingSymbolId, now);
                     session.RowsWritten();
