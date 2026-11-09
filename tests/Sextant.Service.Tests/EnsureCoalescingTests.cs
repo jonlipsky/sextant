@@ -340,6 +340,116 @@ public class EnsureCoalescingTests
         Assert.AreEqual(1, _service.RecentAudit().Count(e => e.Outcome == AuditOutcome.Coalesced));
     }
 
+    [TestMethod]
+    public async Task AnExpeditedPush_IsBuilt_NotHandedOverToANormalLaneSuccessor()
+    {
+        // The 2026-11-08 incident: the default-branch push took the expedited lane, its successor (no default_branch
+        // flag) the normal one, so handing over left the head waiting behind feature-branch builds for hours.
+        await SeedMainAt("commit-A");
+
+        var hold = Hold();
+        var b = _service.EnsureSnapshotAsync(Request("commit-B", "main") with { ExpectedHeadCommit = "commit-A", IsDefaultBranch = true });
+        var c = Push("commit-C", expected: "commit-B");
+        _release.Set();
+        await Task.WhenAll(hold, b, c);
+
+        Assert.AreEqual(SnapshotJobStatus.Complete, (await b).Status, "B's successor is slower, so B is built");
+        Assert.IsTrue((await b).BranchAdvanced);
+        CollectionAssert.AreEqual(new[] { "commit-A", "commit-hold", "commit-B", "commit-C" }, Built());
+        Assert.AreEqual("commit-C", HeadCommit("main"));
+        AssertEveryCoalescedJobHasABuiltSuccessor();
+    }
+
+    [TestMethod]
+    public async Task AnExpeditedPush_IsStillCoalesced_IntoAnExpeditedSuccessor()
+    {
+        await SeedMainAt("commit-A");
+
+        var hold = Hold();
+        var b = _service.EnsureSnapshotAsync(Request("commit-B", "main") with { ExpectedHeadCommit = "commit-A", IsDefaultBranch = true });
+        var c = _service.EnsureSnapshotAsync(Request("commit-C", "main") with { ExpectedHeadCommit = "commit-B", IsDefaultBranch = true });
+        _release.Set();
+        await Task.WhenAll(hold, b, c);
+
+        Assert.AreEqual(SnapshotJobStatus.Coalesced, (await b).Status);
+        CollectionAssert.AreEqual(new[] { "commit-A", "commit-hold", "commit-C" }, Built());
+        Assert.AreEqual("commit-C", HeadCommit("main"));
+        AssertEveryCoalescedJobHasABuiltSuccessor();
+    }
+
+    [TestMethod]
+    public async Task EnsuresQueuedAtShutdown_AreNotCoalesced_AndANewEnsureAfterRestartBuilds()
+    {
+        await SeedMainAt("commit-A");
+
+        var hold = Hold();
+        var b = Push("commit-B", expected: "commit-A");
+        var c = Push("commit-C", expected: "commit-B");
+        _service.StopProduction();
+        _release.Set();
+        await SettleAll(hold, b, c);
+
+        foreach (var commit in new[] { "commit-B", "commit-C" })
+        {
+            var job = Jobs().Single(j => j.Commit == commit);
+            Assert.AreEqual(SnapshotJobStatus.Queued, job.Status,
+                $"{commit} was queued at shutdown: it must stay queued, not coalesce into a successor that is cancelled");
+        }
+
+        _service.Dispose();
+        _service = SnapshotService.Start(ServiceTestFixtures.NewOptions(_dbPath), _worker, _db);
+        Assert.IsTrue(Jobs().Where(j => j.Commit is "commit-B" or "commit-C").All(j => j.Status == SnapshotJobStatus.Cancelled),
+            "startup cancels what the stopped run never produced");
+
+        var rebuilt = await Push("commit-B", expected: "commit-A");
+
+        Assert.AreEqual(SnapshotJobStatus.Complete, rebuilt.Status);
+        Assert.IsTrue(rebuilt.BranchAdvanced);
+        Assert.AreEqual("commit-B", HeadCommit("main"));
+        Assert.IsTrue(Built().Contains("commit-B"));
+    }
+
+    // Invariant: a coalesced job's successor commit always has a job that produced a snapshot (or is queued/running).
+    private void AssertEveryCoalescedJobHasABuiltSuccessor()
+    {
+        var all = Jobs();
+        foreach (var job in all.Where(j => j.Status == SnapshotJobStatus.Coalesced))
+        {
+            var match = System.Text.RegularExpressions.Regex.Match(job.LastError ?? "", @"by commit (\S+) of branch");
+            Assert.IsTrue(match.Success, $"coalesced job {job.Commit} names its successor");
+            Assert.IsTrue(
+                all.Any(j => j.Commit == match.Groups[1].Value
+                             && j.Status is SnapshotJobStatus.Complete or SnapshotJobStatus.Partial
+                                 or SnapshotJobStatus.Queued or SnapshotJobStatus.Running),
+                $"coalesced job {job.Commit} has no surviving successor job for {match.Groups[1].Value}");
+        }
+    }
+
+    private List<(string Commit, string Status, string? LastError)> Jobs()
+    {
+        using var cmd = _db.GetConnection().CreateCommand();
+        cmd.CommandText = "SELECT commit_sha, status, last_error FROM snapshot_jobs";
+        using var reader = cmd.ExecuteReader();
+        var rows = new List<(string, string, string?)>();
+        while (reader.Read())
+            rows.Add((reader.GetString(0), reader.GetString(1), reader.IsDBNull(2) ? null : reader.GetString(2)));
+        return rows;
+    }
+
+    private static async Task SettleAll(params Task[] tasks)
+    {
+        foreach (var task in tasks)
+        {
+            try
+            {
+                await task;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+    }
+
     // Publishes the request's snapshot and applies the compare-and-swap branch advance, as the orchestrator does. While
     // _release is reset the worker blocks, holding the single writer so later ensures queue behind it.
     private SnapshotWorkResult Produce(FakeSnapshotWorker self, EnsureSnapshotRequest request)
