@@ -195,12 +195,16 @@ public static class StatusReportBuilder
     public static StatusReport Build(
         Func<SqliteConnection> openRead, DefaultBranchFreshnessTracker freshness, ReportCountCache cache, TimeProvider time,
         string catalogDbPath, IReadOnlySet<string>? visibleKeys, IReadOnlyList<string> grantedUrls,
-        int maxRepositories, int noCodeJobLimit, bool includeStorage, CancellationToken budget)
+        int maxRepositories, int noCodeJobLimit, bool includeStorage, CancellationToken budget, Action? beforeCounts)
     {
+        // A budget already over (or the service stopping) before the first read is a timeout too: an interrupt armed on a
+        // connection with no statement running can be a no-op, so the reads would otherwise run unbounded.
+        if (budget.IsCancellationRequested)
+            throw new TimeoutException("The status report did not finish within its time budget.");
         try
         {
             return BuildCore(openRead, freshness, cache, time, catalogDbPath, visibleKeys, grantedUrls, maxRepositories,
-                noCodeJobLimit, includeStorage, budget);
+                noCodeJobLimit, includeStorage, budget, beforeCounts);
         }
         catch (SqliteException ex) when (StoppedByBudget(ex, budget))
         {
@@ -219,7 +223,7 @@ public static class StatusReportBuilder
     private static StatusReport BuildCore(
         Func<SqliteConnection> openRead, DefaultBranchFreshnessTracker freshness, ReportCountCache cache, TimeProvider time,
         string catalogDbPath, IReadOnlySet<string>? visibleKeys, IReadOnlyList<string> grantedUrls,
-        int maxRepositories, int noCodeJobLimit, bool includeStorage, CancellationToken budget)
+        int maxRepositories, int noCodeJobLimit, bool includeStorage, CancellationToken budget, Action? beforeCounts)
     {
         var now = time.GetUtcNow();
         List<Entry> entries;
@@ -286,6 +290,7 @@ public static class StatusReportBuilder
 
         // Counts last: they are the only part that can be slow, and they stop at the budget. Least recently attempted
         // first, so a snapshot whose count never finishes in budget cannot starve the ones after it.
+        beforeCounts?.Invoke();
         var counted = entries.Where(e => e.Source is not null)
             .OrderBy(e => cache.LastAttempt(e.Source!.Identity!)).ThenBy(e => e.Label, StringComparer.Ordinal).ToList();
         var measured = new Dictionary<string, ReportRepository>(StringComparer.Ordinal);

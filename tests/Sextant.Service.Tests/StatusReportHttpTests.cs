@@ -276,7 +276,7 @@ public class StatusReportHttpTests
             Assert.IsTrue(grant.IsSuccessStatusCode);
         var running = 0;
         var maxRunning = 0;
-        host.Service.ReportComputeHook = () =>
+        host.Service.ReportComputeHook = _ =>
         {
             var now = Interlocked.Increment(ref running);
             InterlockedMax(ref maxRunning, now);
@@ -302,7 +302,7 @@ public class StatusReportHttpTests
         await using var host = await StartAsync();
         var gate = new ManualResetEventSlim();
         var started = new ManualResetEventSlim();
-        host.Service.ReportComputeHook = () =>
+        host.Service.ReportComputeHook = _ =>
         {
             started.Set();
             gate.Wait(TimeSpan.FromSeconds(30));
@@ -363,7 +363,7 @@ public class StatusReportHttpTests
                 };
                 return conn;
             }
-            var report = StatusReportBuilder.Build(Open, tracker, cache, TimeProvider.System, path, null, [], 500, 100, true, budget.Token);
+            var report = StatusReportBuilder.Build(Open, tracker, cache, TimeProvider.System, path, null, [], 500, 100, true, budget.Token, null);
             opens = opened;
             maxLive = peak;
             return report;
@@ -446,23 +446,32 @@ public class StatusReportHttpTests
         Assert.AreEqual(3, doc.RootElement.GetProperty("totals").GetProperty("repositories").GetInt32());
     }
 
+    // #410 — the budget is ended at a chosen point rather than by a 1-tick timer racing the work.
     [TestMethod]
     public async Task ExhaustedBudget_LeavesCountsOut_ButStillAnswers()
     {
-        await using var host = await StartAsync(o => o with { ReportBudget = TimeSpan.FromTicks(1) });
+        await using var host = await StartAsync();
+        host.Service.ReportBeforeCountsHook = budget => budget.Cancel();
+
         using var response = await host.ControlAsync(HttpMethod.Get, "/control/report", ControlToken, null);
         var text = await response.Content.ReadAsStringAsync();
-        // Either the cheap reads were interrupted (503) or only the counts were skipped; never a partial body.
-        if (response.StatusCode == HttpStatusCode.OK)
-        {
-            using var doc = JsonDocument.Parse(text);
-            Assert.IsFalse(doc.RootElement.GetProperty("counts_complete").GetBoolean());
-        }
-        else
-        {
-            Assert.AreEqual(HttpStatusCode.ServiceUnavailable, response.StatusCode, text);
-            StringAssert.Contains(text, "report_timeout");
-        }
+
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode, text);
+        using var doc = JsonDocument.Parse(text);
+        Assert.IsFalse(doc.RootElement.GetProperty("counts_complete").GetBoolean());
+    }
+
+    [TestMethod]
+    public async Task BudgetEndedBeforeTheCheapReads_IsAReportTimeout()
+    {
+        await using var host = await StartAsync();
+        host.Service.ReportComputeHook = budget => budget.Cancel();
+
+        using var response = await host.ControlAsync(HttpMethod.Get, "/control/report", ControlToken, null);
+        var text = await response.Content.ReadAsStringAsync();
+
+        Assert.AreEqual(HttpStatusCode.ServiceUnavailable, response.StatusCode, text);
+        StringAssert.Contains(text, "report_timeout");
     }
 
     [TestMethod]
@@ -494,7 +503,7 @@ public class StatusReportHttpTests
                 try
                 {
                     StatusReportBuilder.Build(db.OpenReadConnection, new DefaultBranchFreshnessTracker(TimeProvider.System, TimeSpan.FromHours(1)),
-                        new ReportCountCache(), TimeProvider.System, path, null, [], 100, 100, true, budget.Token);
+                        new ReportCountCache(), TimeProvider.System, path, null, [], 100, 100, true, budget.Token, null);
                 }
                 catch (TimeoutException)
                 {

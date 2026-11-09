@@ -27,7 +27,11 @@ public sealed partial class SnapshotService
 
     internal int ReportComputations => Volatile.Read(ref _reportComputations);
 
-    internal Action? ReportComputeHook { get; set; }
+    /// <summary>Test seam: runs as a report computation starts, with the report's budget.</summary>
+    internal Action<CancellationTokenSource>? ReportComputeHook { get; set; }
+
+    /// <summary>Test seam (#410): runs after the report's cheap reads, before its counts, with the report's budget.</summary>
+    internal Action<CancellationTokenSource>? ReportBeforeCountsHook { get; set; }
 
     /// <summary>
     /// The operator status report. Read-only on its own connections (never the write gate). At most one report computes
@@ -77,12 +81,13 @@ public sealed partial class SnapshotService
                 var report = await Task.Run(() =>
                 {
                     Interlocked.Increment(ref _reportComputations);
-                    ReportComputeHook?.Invoke();
+                    ReportComputeHook?.Invoke(budget);
                     using var scopeGuard = ReadInterrupt.Begin(token);
                     return StatusReportBuilder.Build(
                         OpenReadConnection, _freshness, _reportCounts, _timeProvider, _options.CatalogDbPath, visibleKeys,
                         grantedUrls, _options.ReportMaxRepositories, _options.ReportMaxNoCodeJobs,
-                        includeStorage: visibleKeys is null, token);
+                        includeStorage: visibleKeys is null, token,
+                        ReportBeforeCountsHook is { } beforeCounts ? () => beforeCounts(budget) : null);
                 }, CancellationToken.None).ConfigureAwait(false);
                 lock (_reportLock)
                 {
