@@ -62,3 +62,31 @@ comments never committed. The lock stayed open for the whole parse. `busy_timeou
 3. Deploy at low traffic: the restart loses in-memory queued ensures (heal ~2 h).
 4. Verify after deploy: `Write lock held` warnings drop below ~3 s, and the job for a default-branch push is created
    directly after the running job (`snapshot_jobs.created_at` close to the push time plus the current job's remainder).
+
+## Follow-up: an ensure ended `coalesced` with no snapshot (ProcessStack `main` 9bbadf74b)
+
+**Symptom.** Job 4248 (9bbadf74b, created 23:37:35.765) was settled `coalesced` at .768, "superseded by commit
+279bdede8", with a NULL snapshot. `branch_advance_handovers` holds 9bbadf74b -> 279bdede8, but there is no job, audit or
+log line for 279bdede8: the successor never registered. `list_repositories` kept `main` at a72875a1. Jobs 4249/4250
+(other default branches) then took turns, and feature-branch job 4253 ran at 23:44. Ids 4251/4252 were reserved, never
+committed. (The successor's absence is inferred from this evidence, not directly observed.)
+
+**Cause.** `#273` coalescing only asked "has a newer linked push been admitted?" (`ticket.SupersededBy`). It never
+asked whether that successor would actually get a turn soon, or at all:
+1. After #404, a default-branch ensure takes the expedited lane and a successor without `default_branch` the normal
+   lane, so the predecessor stood down for a successor queued behind long feature-branch builds.
+2. During the shutdown drain, queued ensures got their turn, coalesced (the coalesce runs before `ThrowIfStopping`),
+   and their successors then threw and were cancelled by startup settle (the 22:53 jobs 4219 -> 4227, 4231).
+3. A successor that failed/was cancelled before the predecessor's turn was equally trusted.
+
+**Fix** (`SnapshotService`). `AdvanceTicket` now records `Expedited`, `Ended` and `Produced`. At its turn an ensure
+coalesces only if `WillBuildBranchHead`: the service is not stopping, the successor has not ended without producing
+(failed/unsupported/cancelled/thrown), and the successor is not in a slower lane than the predecessor. Otherwise the
+ensure is built. Restart: cancelled-at-restart jobs were already never successors in `FindQueuedJobs` (only
+complete/partial/failed/unsupported count); with no coalescing during shutdown no handover points at a cancelled job.
+Request details are not persisted, so queued ensures are not re-admitted; a lost push is healed by the #400 upstream
+heal and the app's reconcile.
+
+**Tests** (`EnsureCoalescingTests`): expedited push is built, not handed to a normal-lane successor; expedited
+successor still coalesces; ensures queued at shutdown stay queued (not coalesced), are cancelled at restart, and a new
+ensure for the same commit builds; invariant helper asserts every `coalesced` job has a queued/running/built successor.

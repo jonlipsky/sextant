@@ -611,7 +611,7 @@ public sealed partial class SnapshotService : IDisposable
                 ? null
                 : TakeWriteTurnLocked(out _, expedited: request.IsDefaultBranch == true && !request.SuppressesBranchUpdate);
             if (turn is not null)
-                ticket = AdmitAdvanceLocked(request, hash);
+                ticket = AdmitAdvanceLocked(request, hash, expedited: request.IsDefaultBranch == true && !request.SuppressesBranchUpdate);
             completion = Task.Run(() => RunEnsureAsync(request, hash, principal, accepted, turn, ticket), CancellationToken.None);
             _operations.Add(completion);
             _pendingEnsures[hash] = _pendingEnsures.GetValueOrDefault(hash) + 1;
@@ -623,6 +623,11 @@ public sealed partial class SnapshotService : IDisposable
                 {
                     _operations.Remove(t);
                     EndPendingEnsureLocked(hash);
+                    if (ticket is not null)
+                    {
+                        ticket.Ended = true;
+                        ticket.Produced = t.IsCompletedSuccessfully && !IsUnbuiltOutcome(t.Result.Status);
+                    }
                     if (ticket is not null
                         && _latestAdvance.TryGetValue(ticket.BranchKey, out var latest) && ReferenceEquals(latest, ticket))
                         _latestAdvance.Remove(ticket.BranchKey);
@@ -639,13 +644,13 @@ public sealed partial class SnapshotService : IDisposable
     // only known at its turn (it may attach an already-built identity and advance the branch instead), and only then
     // does it record the handover. Any other ensure (no branch, branch_update none, a head-sequence guard, a rebuild)
     // is never superseded and supersedes nothing. The caller holds _inFlightLock.
-    private AdvanceTicket? AdmitAdvanceLocked(EnsureSnapshotRequest request, string hash)
+    private AdvanceTicket? AdmitAdvanceLocked(EnsureSnapshotRequest request, string hash, bool expedited)
     {
         if (!IsBranchAdvance(request))
             return null;
 
         var key = RemoteUrlIdentity.Normalize(request.RepositoryRemoteUrl) + "\n" + request.BranchName;
-        var ticket = new AdvanceTicket { BranchKey = key, Hash = hash, CommitSha = request.CommitSha };
+        var ticket = new AdvanceTicket { BranchKey = key, Hash = hash, CommitSha = request.CommitSha, Expedited = expedited };
         // Only a linked successor supersedes: one that expects exactly the waiting commit as the branch head (the push
         // of Z after Y sends before=Y). Any other expectation (an out-of-order or unrelated push) leaves both to run in
         // order, so the branch ends exactly where serial processing would leave it.
@@ -655,6 +660,24 @@ public sealed partial class SnapshotService : IDisposable
             previous.SupersededBy = ticket;
         _latestAdvance[key] = ticket;
         return ticket;
+    }
+
+    // An ensure that ended without a snapshot serving its branch head (it threw, was cancelled, or its job failed).
+    private static bool IsUnbuiltOutcome(string status) =>
+        status is SnapshotJobStatus.Failed or SnapshotJobStatus.Unsupported or SnapshotJobStatus.Cancelled;
+
+    // A queued ensure may stand down for its successor only while the successor will surely build the branch head: the
+    // service is not stopping (a successor queued at shutdown is cancelled at restart, never built), the successor has
+    // not already ended without a snapshot, and its turn is not behind the superseded ensure's (an expedited
+    // default-branch ensure must not hand over to a normal-lane ensure that waits behind feature-branch builds, which
+    // left a branch head unindexed for hours). Otherwise the ensure is built. The caller holds _inFlightLock.
+    private bool WillBuildBranchHead(AdvanceTicket superseded, AdvanceTicket successor)
+    {
+        if (_lifetime.IsCancellationRequested)
+            return false;
+        if (successor.Ended && !successor.Produced)
+            return false;
+        return successor.Expedited || !superseded.Expedited;
     }
 
     // Issue #273: an ensure that advances its named branch under an expected_head_commit compare-and-swap, the shape a
@@ -954,8 +977,9 @@ public sealed partial class SnapshotService : IDisposable
                 lock (_inFlightLock)
                 {
                     ticket.Started = true;
-                    if (_pendingEnsures.GetValueOrDefault(hash) == 1)
-                        supersededBy = ticket.SupersededBy;
+                    if (_pendingEnsures.GetValueOrDefault(hash) == 1 && ticket.SupersededBy is { } successor
+                        && WillBuildBranchHead(ticket, successor))
+                        supersededBy = successor;
                 }
             }
             request = ResolveHandedOverExpectation(request);
@@ -3556,4 +3580,13 @@ internal sealed class AdvanceTicket
 
     /// <summary>The newer ensure of the same branch that superseded this one before its turn, if any.</summary>
     public AdvanceTicket? SupersededBy { get; set; }
+
+    /// <summary>Whether its turn was taken in the expedited (default-branch) lane.</summary>
+    public bool Expedited { get; init; }
+
+    /// <summary>Set when its ensure operation has finished, whatever the outcome.</summary>
+    public bool Ended { get; set; }
+
+    /// <summary>Whether the finished ensure left a job that is, or produced, a snapshot (not a failure or a throw).</summary>
+    public bool Produced { get; set; }
 }
