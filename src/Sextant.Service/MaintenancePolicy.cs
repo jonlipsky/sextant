@@ -18,6 +18,8 @@ public sealed record MaintenancePolicy
     internal const int DefaultRetentionBurstSeconds = 120;
     internal const int DefaultRetentionContinueMinutes = 5;
     internal const int DefaultTickDeadlineSeconds = 900;
+    internal const int DefaultBranchIdlePassSeconds = 120;
+    internal const int MaxBranchIdlePassSeconds = 3600;
     internal const int DefaultBranchUpstreamCheckMinutes = 60;
     internal const int DefaultBranchUpstreamCheckMaxRepositoriesPerTick = 10;
     internal const int DefaultBranchUpstreamHealMaxPerTick = 10;
@@ -114,6 +116,14 @@ public sealed record MaintenancePolicy
     /// (default 600; clamped to <see cref="MaxRetentionPassSeconds"/>).
     /// </summary>
     public int RetentionPassSeconds { get; init; } = DefaultRetentionPassSeconds;
+
+    /// <summary>
+    /// How long one idle-branch retirement pass waits for its retirements (issue #407), like
+    /// <see cref="RetentionPassSeconds"/> bounds retention. Retirements not applied by then stay queued and apply when
+    /// their turn comes; the next tick does not queue them twice. <c>SEXTANT_SERVICE_BRANCH_IDLE_PASS_SECONDS</c>
+    /// (default 120; clamped to <see cref="MaxBranchIdlePassSeconds"/>).
+    /// </summary>
+    public int BranchIdlePassSeconds { get; init; } = DefaultBranchIdlePassSeconds;
 
     /// <summary>
     /// How long the scheduled retention pass may keep the writer in ONE priority turn (issue #333): it runs its batches

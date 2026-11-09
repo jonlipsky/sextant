@@ -249,6 +249,7 @@ public sealed partial class SnapshotService : IDisposable
                 service._jobIds.Load();
                 service.LogTenantGrantLease();
                 service.ReconcileOnStartup();
+                service.ReplayQueuedEnsures();
                 service.StartMaintenanceLoop();
                 service.StartObservabilityLoops();
                 return service;
@@ -403,7 +404,7 @@ public sealed partial class SnapshotService : IDisposable
     public async Task<EnsureSnapshotResult> EnsureSnapshotAsync(
         EnsureSnapshotRequest request, CancellationToken cancellationToken = default, AuditCaller principal = default)
     {
-        var (_, completion, _) = StartEnsureOperation(request, principal);
+        var (_, completion, _, _) = StartEnsureOperation(request, principal);
         return await WaitForCallerAsync(completion, cancellationToken).ConfigureAwait(false);
     }
 
@@ -428,7 +429,11 @@ public sealed partial class SnapshotService : IDisposable
     public async Task<EnsureSnapshotResult> BeginEnsureSnapshotAsync(
         EnsureSnapshotRequest request, AuditCaller principal = default, CancellationToken cancellationToken = default)
     {
-        var (accepted, _, hash) = StartEnsureOperation(request, principal);
+        var (accepted, _, hash, persisted) = StartEnsureOperation(request, principal);
+        // Issue #406: the 202 is only given once the admitted ensure is durable (a short catalog write that does not
+        // take the write gate; it can wait out an open publish transaction, bounded by the grant busy timeout).
+        if (!persisted.IsCompleted)
+            await persisted.WaitAsync(cancellationToken).ConfigureAwait(false);
         if (!accepted.IsCompleted)
         {
             await ((Task)accepted).WaitAsync(_options.ControlWriteWait, cancellationToken)
@@ -586,8 +591,8 @@ public sealed partial class SnapshotService : IDisposable
     // exception when no caller is left waiting (the caller disconnected). Admission is atomic with Dispose's
     // drain snapshot (both under _inFlightLock): an operation either starts before shutdown closes admission
     // and is drained, or is refused, so none can run on against a released lease or a closed catalog.
-    private (Task<EnsureSnapshotResult> Accepted, Task<EnsureSnapshotResult> Completion, string Hash) StartEnsureOperation(
-        EnsureSnapshotRequest request, AuditCaller principal)
+    private (Task<EnsureSnapshotResult> Accepted, Task<EnsureSnapshotResult> Completion, string Hash, Task Persisted) StartEnsureOperation(
+        EnsureSnapshotRequest request, AuditCaller principal, long? replaySeq = null)
     {
         // SVC-6/7: a malformed branch guard is refused before any job exists. The host validates first and
         // answers 400; this protects direct callers.
@@ -596,9 +601,12 @@ public sealed partial class SnapshotService : IDisposable
 
         // The remote-default lookup (issue #199) is not part of the identity, so the hash is known before that lookup runs.
         var hash = IdentityHashFor(request);
+        var persist = replaySeq is null && !IsNoOpAttach(request, hash);
         var accepted = new TaskCompletionSource<EnsureSnapshotResult>(TaskCreationOptions.RunContinuationsAsynchronously);
         Task<EnsureSnapshotResult> completion;
+        Task persisted = Task.CompletedTask;
         AdvanceTicket? ticket = null;
+        long seq;
         lock (_inFlightLock)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -612,7 +620,26 @@ public sealed partial class SnapshotService : IDisposable
                 : TakeWriteTurnLocked(out _, expedited: request.IsDefaultBranch == true && !request.SuppressesBranchUpdate);
             if (turn is not null)
                 ticket = AdmitAdvanceLocked(request, hash, expedited: request.IsDefaultBranch == true && !request.SuppressesBranchUpdate);
-            completion = Task.Run(() => RunEnsureAsync(request, hash, principal, accepted, turn, ticket), CancellationToken.None);
+            // Issue #406: the admission sequence orders a restart's replay; a replayed ensure keeps its persisted row.
+            // The row is written on the grant connection (never the write gate) as part of admission: the wait=false
+            // answer is held until it is durable, and the ensure's completion always follows it.
+            seq = replaySeq ?? ++_ensureSeq;
+            _ensureSeq = Math.Max(_ensureSeq, seq);
+            var admittedSeq = seq;
+            if (persist)
+                persisted = Task.Run(() => PersistQueuedEnsure(admittedSeq, request, hash, principal), CancellationToken.None);
+            var rowWritten = persisted;
+            completion = Task.Run(async () =>
+            {
+                try
+                {
+                    return await RunEnsureAsync(request, hash, principal, accepted, turn, ticket).ConfigureAwait(false);
+                }
+                finally
+                {
+                    await rowWritten.ConfigureAwait(false);
+                }
+            }, CancellationToken.None);
             _operations.Add(completion);
             _pendingEnsures[hash] = _pendingEnsures.GetValueOrDefault(hash) + 1;
         }
@@ -632,10 +659,11 @@ public sealed partial class SnapshotService : IDisposable
                         && _latestAdvance.TryGetValue(ticket.BranchKey, out var latest) && ReferenceEquals(latest, ticket))
                         _latestAdvance.Remove(ticket.BranchKey);
                 }
+                ForgetQueuedEnsure(seq, t);
                 SettleAccepted(accepted, t);
             },
             CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-        return (accepted.Task, completion, hash);
+        return (accepted.Task, completion, hash, persisted);
     }
 
     // Issue #273: registers a branch-advance ensure guarded by expected_head_commit (what a repository push sends) as

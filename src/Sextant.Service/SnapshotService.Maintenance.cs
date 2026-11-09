@@ -416,7 +416,9 @@ public sealed partial class SnapshotService
         // retirements, which apply when their priority turn comes).
         int deferred;
         RetireBranchResult[] results;
-        using (var step = BeginStep(cancellationToken))
+        // Bounded by the pass budget as well as the tick (issue #407): what is not applied by then stays queued.
+        var passBudget = TimeSpan.FromSeconds(Math.Clamp(policy.BranchIdlePassSeconds, 1, MaintenancePolicy.MaxBranchIdlePassSeconds));
+        using (var step = new StepBound(StepRemaining() < passBudget ? StepRemaining() : passBudget, _timeProvider, cancellationToken))
         {
             try
             {

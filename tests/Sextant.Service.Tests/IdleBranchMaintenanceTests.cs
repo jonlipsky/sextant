@@ -625,6 +625,18 @@ public class IdleBranchMaintenanceTests
     }
 
     [TestMethod]
+    public void ParseMaintenance_IdlePassSeconds_DefaultsClampsAndIgnoresInvalidValues()
+    {
+        Assert.AreEqual(MaintenancePolicy.DefaultBranchIdlePassSeconds, ServiceOptions.ParseMaintenance(null, null, null, null, null).BranchIdlePassSeconds);
+        Assert.AreEqual(30, ServiceOptions.ParseMaintenance(null, null, null, null, null, idlePassSeconds: "30").BranchIdlePassSeconds);
+        Assert.AreEqual(MaintenancePolicy.MaxBranchIdlePassSeconds,
+            ServiceOptions.ParseMaintenance(null, null, null, null, null, idlePassSeconds: "999999").BranchIdlePassSeconds);
+        foreach (var bad in new[] { "0", "-5", "x", "" })
+            Assert.AreEqual(MaintenancePolicy.DefaultBranchIdlePassSeconds,
+                ServiceOptions.ParseMaintenance(null, null, null, null, null, idlePassSeconds: bad).BranchIdlePassSeconds, bad);
+    }
+
+    [TestMethod]
     public void ParseMaintenance_ZeroDisables_AndInvalidValuesKeepTheDefaults()
     {
         var off = ServiceOptions.ParseMaintenance("0", "0", "5", false, "22");

@@ -52,6 +52,42 @@ comments never committed. The lock stayed open for the whole parse. `busy_timeou
   separate WAL connection, so they are not blocked by the writer; the cause is CPU/memory pressure from the running
   job. Lowering `MAX_PARALLELISM` (or a larger container) is the lever; no code change made.
 - Restart still loses queued ensures; the #400 upstream heal and the app's reconcile re-enqueue within ~2 h.
+  (Fixed by #406, below.)
+
+## Follow-ups (#406, #407, #408)
+
+- **#406 queued ensures survive a restart.** Migration `033_queued_ensures` (identity-neutral service table). Each
+  admitted ensure is written to `queued_ensures` (admission sequence, request JSON, `RestrictsImplicitDefault`,
+  tenant, hashed actor, and for a user caller the tenant id and subject, never a token) on a side connection, off
+  the write gate, before a `wait=false` 202 is returned; a no-op attach of an already-built identity writes no row.
+  It is deleted when the ensure ends, and kept when shutdown, a lost lease or a requeue ended it. At startup, after
+  the orphan settle, `ReplayQueuedEnsures` seeds the admission sequence from `MAX(seq)` over every row, then
+  re-admits the rows in order through `StartEnsureOperation`, so lane, #273/#405 coalescing and the attach of an
+  already-built identity apply as for a live admission. Each row is handled on its own: it is dropped (logged, and
+  audited as `replay_*`) when malformed, older than `SEXTANT_SERVICE_QUEUED_ENSURE_MAX_AGE_HOURS` (default 168),
+  refused by `RepositoryUrlPolicy` as now configured, or a user row whose grant is gone; a failing row never stops
+  startup.
+- **#407 maintenance and a production (scope reduced).** Maintenance passes still wait for a running production. A
+  mid-production yield (`WriteGate.YieldToPriority` between write batches) was built and removed: letting retention
+  run between a production's batches breaks invariants (the source-blob sweep can delete a blob before
+  `CaptureAnalyzedHash` reads it; reused complete providers are unprotected until Phase 6 records their dependency
+  edges; a production can be starved by repeated priority turns; and the #403 lane fairness is skewed). The waits it
+  targeted are a minor contributor. A safe version needs an in-flight blob-key set honoured by the sweep, provider
+  dependency edges recorded at reuse time, and a minimum of production progress between yields. What remains is the
+  idle-branch pass bounded by `SEXTANT_SERVICE_BRANCH_IDLE_PASS_SECONDS` (default 120, max 3600); unapplied
+  retirements stay queued for the next tick.
+- **#408 restore fallback.** A failed whole-solution restore retries the projects as one traversal and bisects
+  breadth first (so the cap cannot starve right-hand siblings) in halves when no project is named, at most 48
+  invocations, checked before every call. The failing projects are remembered per repository and
+  solution, independent of the commit (`restore-known-bad.json`, saved in a `finally` so a cancelled job keeps what it
+  learned); the next job restores the rest in one call and tries
+  the known-bad group separately, healing any that now restore. The root cause of the `TextEditor.slnx` whole-restore
+  failure was not determined; the fallback no longer depends on it.
+- **MCP latency under CPU pressure (configuration, no code).** The service runs the defaults: `max_parallelism` 0 =
+  `min(cores, 8)`, `extraction_projects_in_flight` 0 = `min(parallelism, 4)`, and the container the RCA observed had
+  7 GiB (4.8 GiB used by a production). The symbol pass can use about twice `max_parallelism` threads. Recommendation:
+  set `SEXTANT_MAX_PARALLELISM` to about half the container's cores (e.g. 3-4) or grow the container, and re-measure
+  the `tools/call` tail.
 
 ## Deploy note
 
