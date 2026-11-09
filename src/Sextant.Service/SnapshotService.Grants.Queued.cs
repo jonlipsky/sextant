@@ -166,7 +166,7 @@ public sealed partial class SnapshotService
                 if (!decision.Ok)
                 {
                     Log($"Dropped queued ensure #{row.Seq}: the repository URL policy now refuses it ({decision.Reason}).");
-                    Observe(RecordEnsureDeniedAsync($"replay_{decision.Reason}", actor));
+                    Observe(RecordEnsureDeniedAsync($"replay_{decision.Reason}", actor, _lifetime.Token));
                     Drop(row);
                     continue;
                 }
@@ -179,7 +179,7 @@ public sealed partial class SnapshotService
                     if (!visible.Contains(key))
                     {
                         Log($"Dropped queued ensure #{row.Seq}: its user caller no longer has a grant on the repository.");
-                        Observe(RecordUserEnsureDeniedAsync(key, $"replay_{GrantReason.NotGranted}", actor));
+                        Observe(RecordUserEnsureDeniedAsync(key, $"replay_{GrantReason.NotGranted}", actor, _lifetime.Token));
                         Drop(row);
                         continue;
                     }
