@@ -124,6 +124,15 @@ public sealed record PackageRestoreOutcome
     /// <summary>Projects the per-project retries restored one by one.</summary>
     public int ProjectsRetried { get; init; }
 
+    /// <summary>Solutions restored in groups around the projects an earlier job found unrestorable (issue #408).</summary>
+    public int KnownBadSolutions { get; init; }
+
+    /// <summary>Remembered unrestorable projects those solutions tried again in their own group.</summary>
+    public int KnownBadProjects { get; init; }
+
+    /// <summary>Remembered projects that restored this time and were forgotten.</summary>
+    public int KnownBadHealed { get; init; }
+
     /// <summary>Projects whose stale-lock-file (NU1004) failure a second restore without the locked mode resolved (issue #352).</summary>
     public IReadOnlyList<string> LockFileRetriedProjects { get; init; } = [];
 

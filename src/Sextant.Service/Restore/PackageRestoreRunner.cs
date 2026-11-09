@@ -221,8 +221,19 @@ public sealed class PackageRestoreRunner(
             }
         }
 
-        var outcome = await RunCoreAsync(checkoutDir, solutions, globals, deadline, stopwatch, cancellationToken, scratchDir, replayed, memo)
-            .ConfigureAwait(false);
+        var knownBad = reuse is null ? null : KnownBadProjects.Load(reuse.StateDirectory);
+        PackageRestoreOutcome outcome;
+        try
+        {
+            outcome = await RunCoreAsync(checkoutDir, solutions, globals, deadline, stopwatch, cancellationToken, scratchDir, replayed, memo, knownBad)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            // A cancelled or failed job still keeps what it learned about failing projects.
+            if (reuse is not null && knownBad is { Dirty: true })
+                knownBad.Save(reuse.StateDirectory, log);
+        }
         if (reuseOutcome is null)
         {
             LogRestoreErrors(outcome);
@@ -298,7 +309,7 @@ public sealed class PackageRestoreRunner(
     private async Task<PackageRestoreOutcome> RunCoreAsync(
         string checkoutDir, IReadOnlyList<string> solutions, IReadOnlyList<KeyValuePair<string, string>> globals,
         TimeSpan deadline, Stopwatch stopwatch, CancellationToken cancellationToken, string? scratchDir,
-        IReadOnlySet<string>? replayed = null, RestoreMemo? memo = null)
+        IReadOnlySet<string>? replayed = null, RestoreMemo? memo = null, KnownBadProjects? knownBad = null)
     {
         var credentialsDir = PrepareCredentials(scratchDir, out var environment);
         var credentialsUnavailable = _sourceCredentials.Count > 0 && credentialsDir is null;
@@ -329,7 +340,7 @@ public sealed class PackageRestoreRunner(
 
             var fallback = await RunPerSolutionAsync(
                     checkoutDir, solutions, globals, Remaining(deadline, stopwatch), cancellationToken, environment, scratchDir,
-                    replayed, memo)
+                    replayed, memo, knownBad)
                 .ConfigureAwait(false);
             return fallback with
             {
@@ -401,9 +412,10 @@ public sealed class PackageRestoreRunner(
         string checkoutDir, IReadOnlyList<string> solutions, IReadOnlyList<KeyValuePair<string, string>> globals,
         TimeSpan deadline, CancellationToken cancellationToken,
         IReadOnlyDictionary<string, string> environment, string? scratchDir,
-        IReadOnlySet<string>? replayed = null, RestoreMemo? memo = null)
+        IReadOnlySet<string>? replayed = null, RestoreMemo? memo = null, KnownBadProjects? knownBad = null)
     {
         var parser = new RestoreOutputParser(checkoutDir);
+        int knownBadSolutions = 0, knownBadProjectCount = 0, knownBadHealed = 0;
         var stopwatch = Stopwatch.StartNew();
         int attempted = 0, succeeded = 0, notStarted = 0, retried = 0, retriedProjects = 0, failedAttributed = 0;
         int staticPasses = 0, staticFallbacks = 0, staticMemoSkips = 0, coveredByReplay = 0;
@@ -582,12 +594,37 @@ public sealed class PackageRestoreRunner(
             var rememberedFailure = staticGraphRestore && memo is not null && memo.Knows(memoName);
             if (rememberedFailure)
                 staticMemoSkips++;
-            var useStaticGraph = staticGraphRestore && !rememberedFailure && !FellBackSolutions.ContainsKey(memoKey);
             var passStarted = DateTime.UtcNow;
             var passWatch = Stopwatch.StartNew();
-            var result = await RunOneAsync(solution, globals, remaining, attempt, cancellationToken, environment, useStaticGraph)
-                .ConfigureAwait(false);
-            passes.Add(Pass("solution", Path.GetFileName(solution), declared, useStaticGraph, passStarted, passWatch.ElapsedMilliseconds, result));
+            // Issue #408: a solution whose whole restore failed in an earlier job restores everything but its known-bad
+            // projects in one call, then tries those in another; the whole-solution restore and the retry are skipped.
+            RunResult? knownBadResult = null;
+            if (knownBad is not null && declared.Count > 0 && !HasSolutionLevelImports(solutionDir, checkoutDir)
+                && !declared.Any(sensitive.ContainsKey)
+                && SolutionSensitivity.FindNotDefaultMapped(solution).Count == 0 && SafeForMsBuildProperty(Path.GetFullPath(solution))
+                && declared.All(project => SafeForMsBuildProperty(project)) && knownBad.For(memoName).Count > 0)
+            {
+                var known = await RestoreKnownBadAsync(
+                        checkoutDir, solution, memoName, declared, knownBad, globals, remaining, attempt, cancellationToken, scratchDir,
+                        environment, passes)
+                    .ConfigureAwait(false);
+                if (known is { } knownRun)
+                {
+                    knownBadResult = knownRun.Result;
+                    knownBadSolutions++;
+                    knownBadProjectCount += knownRun.Bad;
+                    knownBadHealed += knownRun.Healed;
+                    passStarted = DateTime.UtcNow;
+                    passWatch.Restart();
+                }
+            }
+            var usedKnownBad = knownBadResult is not null;
+            var useStaticGraph = staticGraphRestore && !rememberedFailure && !FellBackSolutions.ContainsKey(memoKey) && !usedKnownBad;
+            var result = knownBadResult
+                ?? await RunOneAsync(solution, globals, remaining, attempt, cancellationToken, environment, useStaticGraph)
+                    .ConfigureAwait(false);
+            if (!usedKnownBad)
+                passes.Add(Pass("solution", Path.GetFileName(solution), declared, useStaticGraph, passStarted, passWatch.ElapsedMilliseconds, result));
             if (useStaticGraph)
             {
                 staticPasses++;
@@ -624,7 +661,7 @@ public sealed class PackageRestoreRunner(
             var retrySucceeded = false;
             var ranRetry = false;
             var outcomeParser = attempt;
-            if (result == RunResult.Failed && AnyProjectWithoutAssets(solution))
+            if (result == RunResult.Failed && !usedKnownBad && AnyProjectWithoutAssets(solution))
             {
                 // Issue #296: a graph-level error leaves projects of the solution without assets. Restore its
                 // projects one by one so only the ones that really cannot restore stay unrestored. A failure that
@@ -633,8 +670,10 @@ public sealed class PackageRestoreRunner(
                 var retryStarted = DateTime.UtcNow;
                 var retryWatch = Stopwatch.StartNew();
                 var retry = await RetryPerProjectAsync(
-                        solution, globals, deadline - stopwatch.Elapsed, retryParser, cancellationToken, scratchDir, environment)
+                        checkoutDir, solution, globals, deadline - stopwatch.Elapsed, retryParser, cancellationToken, scratchDir, environment)
                     .ConfigureAwait(false);
+                if (retry is { Complete: true } && knownBad is not null)
+                    knownBad.Set(memoName, retry.Value.Bad);
                 RepairOutcome? repair = null;
                 if (retry is { Result: RunResult.Failed })
                 {
@@ -715,6 +754,9 @@ public sealed class PackageRestoreRunner(
             SolutionsFailedAttributed = failedAttributed,
             SolutionsRetriedPerProject = retried,
             ProjectsRetried = retriedProjects,
+            KnownBadSolutions = knownBadSolutions,
+            KnownBadProjects = knownBadProjectCount,
+            KnownBadHealed = knownBadHealed,
             LockFileRetriedProjects = [.. repairs.SelectMany(r => r.LockFile)],
             DowngradeRetriedProjects = [.. repairs.SelectMany(r => r.Downgrade)],
             PlatformRetriedProjects = [.. repairs.SelectMany(r => r.Platform)],
@@ -742,6 +784,9 @@ public sealed class PackageRestoreRunner(
         log?.Invoke(
             $"package restore: {succeeded}/{attempted} solution(s) restored cleanly in {outcome.Elapsed.TotalSeconds:0.#}s" +
             (retried > 0 ? $"; {retried} solution(s) retried per project ({retriedProjects} project(s))" : string.Empty) +
+            (knownBadSolutions > 0
+                ? $"; {knownBadSolutions} solution(s) restored in groups around {knownBadProjectCount} known-bad project(s) ({knownBadHealed} recovered)"
+                : string.Empty) +
             (staticPasses > 0 ? $"; static-graph evaluation on {staticPasses} pass(es), {staticFallbacks} fell back" : string.Empty) +
             (staticMemoSkips > 0 ? $"; static-graph evaluation skipped for {staticMemoSkips} solution(s) it failed for under the same inputs" : string.Empty) +
             (coveredByReplay > 0 ? $"; {coveredByReplay} solution(s) covered by replayed projects" : string.Empty) +
@@ -936,9 +981,13 @@ public sealed class PackageRestoreRunner(
 
     // Issue #296: the per-project retry of one solution whose restore failed. Null means no retry was possible (the
     // time is spent, a project path is unsafe in an MSBuild property, the solution lists no project, or the traversal
-    // could not be staged), so the caller keeps the failed attempt's findings.
-    private async Task<(RunResult Result, int Projects)?> RetryPerProjectAsync(
-        string solution, IReadOnlyList<KeyValuePair<string, string>> globals, TimeSpan deadline,
+    // could not be staged), so the caller keeps the failed attempt's findings. Issue #408: the retry restores the whole
+    // project set in one traversal first (which isolates a project that fails with a named error) and narrows a failure
+    // that names no project by halving the group, so the invocations are about k * log2(n) for k bad projects, not n.
+    // Bad lists the checkout-relative projects that failed on their own; Complete is false when time, the invocation
+    // budget or a failure to start cut the search short, so Bad may then be incomplete.
+    private async Task<(RunResult Result, int Projects, IReadOnlyList<string> Bad, bool Complete)?> RetryPerProjectAsync(
+        string checkoutDir, string solution, IReadOnlyList<KeyValuePair<string, string>> globals, TimeSpan deadline,
         RestoreOutputParser parser, CancellationToken cancellationToken, string? scratchDir,
         IReadOnlyDictionary<string, string> environment)
     {
@@ -962,10 +1011,190 @@ public sealed class PackageRestoreRunner(
         log?.Invoke(
             $"package restore of '{Path.GetFileName(solution)}' failed as a whole; retrying its {projects.Count} project(s) one by one.");
         var workingDirectory = Path.GetDirectoryName(solutionPath) ?? Environment.CurrentDirectory;
-        var result = await RunTraversalAsync(
-                workingDirectory, projects, globals, recursive: true, deadline, parser, cancellationToken, scratchDir, environment)
+        var search = new BisectState(Stopwatch.StartNew(), deadline);
+        var first = await BisectAsync(
+                checkoutDir, workingDirectory, projects, globals, parser, cancellationToken, scratchDir, environment, search, isRoot: true)
             .ConfigureAwait(false);
-        return result is { } ran ? (ran, projects.Count) : null;
+        if (first is not { } result)
+            return null;
+        if (search.Invocations > 1)
+            log?.Invoke(
+                $"package restore of '{Path.GetFileName(solution)}' narrowed to {search.Bad.Count} failing project(s) in {search.Invocations} restore call(s).");
+        return (result, projects.Count, [.. search.Bad.Order(StringComparer.Ordinal)], search.Complete);
+    }
+
+    // The most restore processes one retry may start: enough to find a handful of bad projects among thousands by
+    // halving, never one per project.
+    internal const int MaxRetryInvocations = 48;
+
+    private sealed class BisectState(Stopwatch watch, TimeSpan deadline)
+    {
+        public Stopwatch Watch { get; } = watch;
+        public TimeSpan Deadline { get; } = deadline;
+        public int Invocations { get; set; }
+        public bool Complete { get; set; } = true;
+        public HashSet<string> Bad { get; } = new(StringComparer.Ordinal);
+    }
+
+    private static RunResult Worst(RunResult a, RunResult b)
+    {
+        static int Rank(RunResult r) => r switch { RunResult.TimedOut => 3, RunResult.Failed => 2, RunResult.NotStarted => 1, _ => 0 };
+        return Rank(a) >= Rank(b) ? a : b;
+    }
+
+    // Breadth first: every group of a level gets a call before any group of the next one, so the call cap can never be
+    // spent on the left subtree while a right sibling goes unrestored. A group is split only while every group already
+    // waiting still has a call left (Invocations + waiting + 2 <= cap), so an enqueued group always gets its call.
+    private async Task<RunResult?> BisectAsync(
+        string checkoutDir, string workingDirectory, IReadOnlyList<UnionProject> group, IReadOnlyList<KeyValuePair<string, string>> globals,
+        RestoreOutputParser parser, CancellationToken cancellationToken, string? scratchDir,
+        IReadOnlyDictionary<string, string> environment, BisectState search, bool isRoot)
+    {
+        var queue = new Queue<IReadOnlyList<UnionProject>>();
+        queue.Enqueue(group);
+        var worst = RunResult.Succeeded;
+        var root = isRoot;
+        while (queue.TryDequeue(out var current))
+        {
+            var remaining = search.Deadline - search.Watch.Elapsed;
+            if (remaining <= TimeSpan.Zero)
+            {
+                search.Complete = false;
+                worst = Worst(worst, RunResult.TimedOut);
+                continue;
+            }
+            // The cap is enforced before EVERY invocation, not only before a split.
+            if (search.Invocations >= MaxRetryInvocations)
+            {
+                search.Complete = false;
+                worst = Worst(worst, RunResult.NotStarted);
+                continue;
+            }
+
+            search.Invocations++;
+            var attempt = new RestoreOutputParser(checkoutDir);
+            var ran = await RunTraversalAsync(
+                    workingDirectory, current, globals, recursive: true, remaining, attempt, cancellationToken, scratchDir, environment)
+                .ConfigureAwait(false);
+            if (ran is not { } result)
+            {
+                search.Complete = false;
+                if (root)
+                    return null;
+                worst = Worst(worst, RunResult.NotStarted);
+                continue;
+            }
+            root = false;
+
+            // A failure that names no project cannot be attributed, and splitting cannot help when a source is down.
+            var unattributed = result == RunResult.Failed && attempt.Projects().Count == 0 && attempt.ProjectsDropped == 0
+                && !attempt.SourceUnreachableGeneral;
+            if (unattributed && current.Count > 1 && search.Invocations + queue.Count + 2 <= MaxRetryInvocations)
+            {
+                var middle = current.Count / 2;
+                queue.Enqueue([.. current.Take(middle)]);
+                queue.Enqueue([.. current.Skip(middle)]);
+                continue;
+            }
+
+            parser.MergeFrom(attempt);
+            if (result == RunResult.Failed)
+            {
+                var named = attempt.Projects().Select(issue => issue.Project).ToList();
+                if (named.Count > 0)
+                    search.Bad.UnionWith(named);
+                else
+                {
+                    // Down to one project, or out of budget: the failure is the group's.
+                    if (current.Count > 1)
+                        search.Complete = false;
+                    search.Bad.UnionWith(current.Select(project => attempt.ProjectKey(project.ProjectPath)));
+                }
+            }
+            else if (result != RunResult.Succeeded)
+                search.Complete = false;
+            worst = Worst(worst, result);
+        }
+        return worst;
+    }
+
+    // Issue #408: restores every project of a solution but its remembered-bad ones in one traversal, then the
+    // remembered ones in another, so a project that was fixed restores and is forgotten and a failing one is reported as
+    // always. Null means it does not apply (nothing remembered is declared, a traversal could not be staged, or the good
+    // group failed without naming a project, which makes the memory stale): nothing was merged into attempt.
+    private async Task<(RunResult Result, int Bad, int Healed)?> RestoreKnownBadAsync(
+        string checkoutDir, string solution, string memoName, IReadOnlyList<string> declared, KnownBadProjects store,
+        IReadOnlyList<KeyValuePair<string, string>> globals, TimeSpan deadline, RestoreOutputParser attempt,
+        CancellationToken cancellationToken, string? scratchDir, IReadOnlyDictionary<string, string> environment,
+        List<RestorePassTiming> passes)
+    {
+        var solutionPath = Path.GetFullPath(solution);
+        var workingDirectory = Path.GetDirectoryName(solutionPath) ?? Environment.CurrentDirectory;
+        var probe = new RestoreOutputParser(checkoutDir);
+        var remembered = store.For(memoName);
+        var bad = declared.Where(project => remembered.Contains(probe.ProjectKey(project))).ToList();
+        if (bad.Count == 0)
+        {
+            store.Set(memoName, []);
+            return null;
+        }
+        var good = declared.Except(bad, CheckoutInventory.PathComparer).ToList();
+        var watch = Stopwatch.StartNew();
+        var remainingAfter = () => deadline - watch.Elapsed;
+        var goodParser = new RestoreOutputParser(checkoutDir);
+        var result = RunResult.Succeeded;
+        if (good.Count > 0)
+        {
+            var started = DateTime.UtcNow;
+            var goodWatch = Stopwatch.StartNew();
+            var ran = await RunTraversalAsync(
+                    workingDirectory, [.. good.Select(project => new UnionProject(project, solutionPath))], globals, recursive: true,
+                    remainingAfter(), goodParser, cancellationToken, scratchDir, environment)
+                .ConfigureAwait(false);
+            if (ran is not { } goodResult)
+                return null;
+            passes.Add(Pass("known_bad_rest", Path.GetFileName(solution), good, false, started, goodWatch.ElapsedMilliseconds, goodResult));
+            if (goodResult == RunResult.Failed && goodParser.Projects().Count == 0 && goodParser.ProjectsDropped == 0
+                && !goodParser.SourceUnreachableGeneral)
+            {
+                // The rest does not restore even without the remembered projects: the memory explains nothing.
+                store.Set(memoName, []);
+                return null;
+            }
+            result = goodResult;
+        }
+
+        var badParser = new RestoreOutputParser(checkoutDir);
+        var healed = 0;
+        if (result != RunResult.TimedOut && remainingAfter() > TimeSpan.Zero)
+        {
+            var started = DateTime.UtcNow;
+            var badWatch = Stopwatch.StartNew();
+            var ran = await RunTraversalAsync(
+                    workingDirectory, [.. bad.Select(project => new UnionProject(project, solutionPath))], globals, recursive: true,
+                    remainingAfter(), badParser, cancellationToken, scratchDir, environment)
+                .ConfigureAwait(false);
+            if (ran is { } badResult)
+            {
+                passes.Add(Pass("known_bad", Path.GetFileName(solution), bad, false, started, badWatch.ElapsedMilliseconds, badResult));
+                result = Worst(result, badResult);
+                if (badResult is RunResult.Succeeded or RunResult.Failed)
+                {
+                    var stillBad = bad.Where(project => !badParser.WasRestored(project)).Select(probe.ProjectKey)
+                        .Concat(goodParser.Projects().Select(issue => issue.Project)).ToList();
+                    healed = bad.Count - bad.Count(project => !badParser.WasRestored(project));
+                    store.Set(memoName, stillBad);
+                }
+            }
+            else
+                result = Worst(result, RunResult.NotStarted);
+        }
+        else
+            result = Worst(result, RunResult.TimedOut);
+
+        attempt.MergeFrom(goodParser);
+        attempt.MergeFrom(badParser);
+        return (result, bad.Count, healed);
     }
 
     // Stages the generated MSBuild traversal in scratch, runs it and removes it. Null when it could not be staged.

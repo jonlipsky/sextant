@@ -379,7 +379,7 @@ public sealed partial class SnapshotService
                 if (healJob is not null && healJob.Status is SnapshotJobStatus.Failed or SnapshotJobStatus.Unsupported)
                     return HealStart.Terminal;
 
-                (_, completion, _) = StartEnsureOperation(request, UpstreamPolicyCaller);
+                (_, completion, _, _) = StartEnsureOperation(request, UpstreamPolicyCaller);
             }
             _ = completion.ContinueWith(
                 t => _metrics.RecordUpstreamBranchHealApplied(t.IsCompletedSuccessfully && t.Result.BranchAdvanced == true),

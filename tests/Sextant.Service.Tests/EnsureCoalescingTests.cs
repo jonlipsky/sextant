@@ -120,13 +120,11 @@ public class EnsureCoalescingTests
         Assert.AreEqual(SnapshotJobStatus.Queued, (await c).Status, "precondition: C was requeued");
         Assert.AreEqual("commit-A", HeadCommit("main"));
 
-        // The client re-sends C exactly as pushed (expecting B), and to a fresh instance: the handover is durable.
+        // The requeued C is persisted and re-admitted by the fresh instance, which resolves the durable handover itself.
         _service.Dispose();
         _service = SnapshotService.Start(ServiceTestFixtures.NewOptions(_dbPath), _worker, _db);
-        var retried = await Push("commit-C", expected: "commit-B");
+        await WaitUntil(() => HeadCommit("main") == "commit-C");
 
-        Assert.AreEqual(SnapshotJobStatus.Complete, retried.Status);
-        Assert.IsTrue(retried.BranchAdvanced);
         Assert.AreEqual("commit-C", HeadCommit("main"));
     }
 
@@ -378,7 +376,7 @@ public class EnsureCoalescingTests
     }
 
     [TestMethod]
-    public async Task EnsuresQueuedAtShutdown_AreNotCoalesced_AndANewEnsureAfterRestartBuilds()
+    public async Task EnsuresQueuedAtShutdown_AreResumedAfterRestart_ASupersededOneCoalesces_AndNothingBuildsTwice()
     {
         await SeedMainAt("commit-A");
 
@@ -390,23 +388,119 @@ public class EnsureCoalescingTests
         await SettleAll(hold, b, c);
 
         foreach (var commit in new[] { "commit-B", "commit-C" })
-        {
-            var job = Jobs().Single(j => j.Commit == commit);
-            Assert.AreEqual(SnapshotJobStatus.Queued, job.Status,
+            Assert.AreEqual(SnapshotJobStatus.Queued, Jobs().Single(j => j.Commit == commit).Status,
                 $"{commit} was queued at shutdown: it must stay queued, not coalesce into a successor that is cancelled");
-        }
+        Assert.IsGreaterThanOrEqualTo(2, QueuedEnsureCount(), "the admitted ensures are durable");
 
         _service.Dispose();
         _service = SnapshotService.Start(ServiceTestFixtures.NewOptions(_dbPath), _worker, _db);
-        Assert.IsTrue(Jobs().Where(j => j.Commit is "commit-B" or "commit-C").All(j => j.Status == SnapshotJobStatus.Cancelled),
-            "startup cancels what the stopped run never produced");
+        await WaitUntil(() => HeadCommit("main") == "commit-C");
+        await WaitUntil(() => QueuedEnsureCount() == 0);
 
-        var rebuilt = await Push("commit-B", expected: "commit-A");
+        Assert.AreEqual(SnapshotJobStatus.Coalesced, Jobs().Single(j => j.Commit == "commit-B").Status,
+            "B is superseded by C after the restart exactly as before it");
+        Assert.AreEqual(0, Built().Count(x => x == "commit-B"), "the superseded commit is never built");
+        Assert.AreEqual(1, Built().Count(x => x == "commit-C"));
+        AssertEveryCoalescedJobHasABuiltSuccessor();
 
-        Assert.AreEqual(SnapshotJobStatus.Complete, rebuilt.Status);
-        Assert.IsTrue(rebuilt.BranchAdvanced);
-        Assert.AreEqual("commit-B", HeadCommit("main"));
-        Assert.IsTrue(Built().Contains("commit-B"));
+        var before = Built().Length;
+        _service.Dispose();
+        _service = SnapshotService.Start(ServiceTestFixtures.NewOptions(_dbPath), _worker, _db);
+        await Task.Delay(300);
+        Assert.AreEqual(before, Built().Length, "a settled ensure is not replayed again");
+    }
+
+    [TestMethod]
+    public async Task QueuedEnsures_RunOncePerIdentity_InAdmissionOrder_AfterRestart()
+    {
+        var hold = Hold();
+        var admitted = Enumerable.Range(1, 5)
+            .Select(i => _service.EnsureSnapshotAsync(Request($"commit-q{i}", $"feature-{i}") with { ExpectedHeadCommit = "" }))
+            .ToArray();
+        _service.StopProduction();
+        _release.Set();
+        await SettleAll([hold, .. admitted]);
+        Assert.IsFalse(Built().Any(x => x.StartsWith("commit-q", StringComparison.Ordinal)), "precondition: none ran before the stop");
+
+        _service.Dispose();
+        _service = SnapshotService.Start(ServiceTestFixtures.NewOptions(_dbPath), _worker, _db);
+        await WaitUntil(() => Built().Count(x => x.StartsWith("commit-q", StringComparison.Ordinal)) == 5);
+        await WaitUntil(() => QueuedEnsureCount() == 0);
+
+        CollectionAssert.AreEqual(
+            new[] { "commit-q1", "commit-q2", "commit-q3", "commit-q4", "commit-q5" },
+            Built().Where(x => x.StartsWith("commit-q", StringComparison.Ordinal)).ToArray(),
+            "each ran once, in the order it was admitted");
+    }
+
+    [TestMethod]
+    public async Task Replay_DropsMalformedAgedAndPolicyRefusedRows_KeepsStartingAndSeedsTheSequenceAboveEveryRow()
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var tooOld = now - (long)TimeSpan.FromDays(30).TotalMilliseconds;
+        InsertQueued(1, "{ not json", now);
+        InsertQueued(2, RequestJson(Request("commit-old", "feature-old") with { ExpectedHeadCommit = "" }), tooOld);
+        InsertQueued(3, RequestJson(Request("commit-evil", "feature-evil") with { ExpectedHeadCommit = "", RepositoryRemoteUrl = "https://evil.example/a/b" }), now);
+        InsertQueued(4, RequestJson(Request("commit-ok", "feature-ok") with { ExpectedHeadCommit = "" }), now);
+        InsertQueued(99, "{ not json either", now);
+
+        _service.Dispose();
+        _service = SnapshotService.Start(ServiceTestFixtures.NewOptions(_dbPath), _worker, _db);
+        await WaitUntil(() => Built().Contains("commit-ok"));
+        await WaitUntil(() => QueuedEnsureCount() == 0);
+
+        CollectionAssert.DoesNotContain(Built(), "commit-old");
+        CollectionAssert.DoesNotContain(Built(), "commit-evil");
+
+        // The unusable row 99 is gone, but its sequence must never be handed out again to a live admission.
+        var hold = Hold();
+        var live = _service.EnsureSnapshotAsync(Request("commit-live", "feature-live") with { ExpectedHeadCommit = "" });
+        _service.StopProduction();
+        _release.Set();
+        await SettleAll(hold, live);
+        using var cmd = _db.GetConnection().CreateCommand();
+        cmd.CommandText = "SELECT MIN(seq) FROM queued_ensures";
+        Assert.IsGreaterThan(99L, Convert.ToInt64(cmd.ExecuteScalar()), "a live admission never reuses a replayed or dropped sequence");
+    }
+
+    [TestMethod]
+    public async Task Replay_DropsAUserRowWhoseGrantIsGone()
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        InsertQueued(1, RequestJson(Request("commit-user", "feature-user") with { ExpectedHeadCommit = "" }), now, tenant: "t1", subject: "u1");
+
+        _service.Dispose();
+        _service = SnapshotService.Start(ServiceTestFixtures.NewOptions(_dbPath), _worker, _db);
+        await WaitUntil(() => QueuedEnsureCount() == 0);
+        await Task.Delay(200);
+
+        CollectionAssert.DoesNotContain(Built(), "commit-user", "no grant for the user: the ensure is not replayed");
+    }
+
+    private static string RequestJson(EnsureSnapshotRequest request) =>
+        System.Text.Json.JsonSerializer.Serialize(request, ServiceJson.Options);
+
+    private void InsertQueued(long seq, string json, long admittedAt, string? tenant = null, string? subject = null)
+    {
+        using var cmd = _db.GetConnection().CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO queued_ensures (seq, identity_hash, request_json, restricts_implicit_default, hashed_actor, caller_tenant, caller_subject, admitted_at)
+            VALUES (@seq, @hash, @json, 0, 'actor', @tenant, @subject, @at);
+            """;
+        cmd.Parameters.AddWithValue("@seq", seq);
+        cmd.Parameters.AddWithValue("@hash", "hash-" + seq);
+        cmd.Parameters.AddWithValue("@json", json);
+        cmd.Parameters.AddWithValue("@tenant", (object?)tenant ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@subject", (object?)subject ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@at", admittedAt);
+        cmd.ExecuteNonQuery();
+    }
+
+    private int QueuedEnsureCount()
+    {
+        using var cmd = _db.GetConnection().CreateCommand();
+        cmd.CommandText = "SELECT COUNT(*) FROM queued_ensures";
+        return Convert.ToInt32(cmd.ExecuteScalar());
     }
 
     // Invariant: a coalesced job's successor commit always has a job that produced a snapshot (or is queued/running).

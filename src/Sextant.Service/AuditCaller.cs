@@ -9,7 +9,8 @@ namespace Sextant.Service;
 /// </summary>
 /// <param name="Principal">The principal the audit row's actor hashes, or null for none.</param>
 /// <param name="DetailSuffix">Appended to the audit detail (empty when there is no verified caller).</param>
-public readonly record struct AuditCaller(string? Principal, string? DetailSuffix)
+public readonly record struct AuditCaller(string? Principal, string? DetailSuffix, string? HashedActor = null,
+    string? UserTenant = null, string? UserSubject = null)
 {
     private const int MaxValueLength = 64;
 
@@ -28,11 +29,13 @@ public readonly record struct AuditCaller(string? Principal, string? DetailSuffi
         var suffix =
             $";idp={Safe(caller.Idp)};kid={Safe(caller.KeyId)};via={Safe(caller.Via)}" +
             $";cid={Safe(caller.Connection)};dep={Safe(caller.Deployment)};jti={Safe(caller.Jti)}";
-        return new AuditCaller(caller.AuditPrincipal, suffix);
+        return caller.Actor == CallerActor.User
+            ? new AuditCaller(caller.AuditPrincipal, suffix, UserTenant: caller.TenantId, UserSubject: caller.UserId)
+            : new AuditCaller(caller.AuditPrincipal, suffix);
     }
 
     /// <summary>The hashed actor for the audit row.</summary>
-    internal string? Actor => Sextant.Store.AuditLogStore.HashActor(Principal);
+    internal string? Actor => HashedActor ?? Sextant.Store.AuditLogStore.HashActor(Principal);
 
     /// <summary><paramref name="detail"/> with this caller's suffix appended.</summary>
     internal string Detail(string detail) => detail + DetailSuffix;

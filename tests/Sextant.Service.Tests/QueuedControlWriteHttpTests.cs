@@ -328,10 +328,11 @@ public class QueuedControlWriteHttpTests
         var status = restarted.GetStatus(jobId);
         Assert.IsNotNull(status, "the id handed out while queued is the durable job's id");
         Assert.AreEqual(request.ToIdentity().Hash, status.Job.IdentityHash);
-        Assert.AreEqual(SnapshotJobStatus.Cancelled, status.Job.Status,
-            "registered, not produced, and its run ended: startup settles it and the next ensure produces it (#327)");
+        // Issue #406: the admitted ensure is durable, so the restarted service produces it under the same job id.
+        host.ReleaseWriter();
+        await WaitUntilAsync(() => Task.FromResult(restarted.GetStatus(jobId)!.Job.Status == SnapshotJobStatus.Complete));
         Assert.IsNull(restarted.ResolveBranch(Repo, "feature"), "the queued retire applied during the drain");
-        Assert.AreEqual(1, host.Worker.Calls);
+        Assert.IsGreaterThanOrEqualTo(2, host.Worker.Calls);
     }
 
     private static EnsureSnapshotRequest Ensure(string commit, string? branch = null, string? expected = null) => new()
