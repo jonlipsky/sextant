@@ -76,7 +76,8 @@ public static class ServiceHostRunner
             {
                 // Issue #272: fetch each new commit incrementally into a per-repository object store.
                 UseObjectStore = options.GitObjectStore,
-                AncestryCacheMaxBytes = options.AncestryCacheMaxBytes
+                AncestryCacheMaxBytes = options.AncestryCacheMaxBytes,
+                AncestryBuildTimeout = options.AncestryBuildTimeout
             };
         // Criterion 2: the service worker evaluates UNTRUSTED checkouts, so wrap its MSBuild evaluation in
         // the enforced sandbox (time/memory/secret/filesystem isolation) — applied to private and public

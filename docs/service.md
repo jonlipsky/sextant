@@ -137,6 +137,7 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_PACKAGE_CACHE_MAX_MB` | Bound, in MiB, on all per-repository NuGet package folders together (see [Package and git caches between jobs](#package-and-git-caches-between-jobs-issue-272)). Over it, whole folders are evicted least recently used first. `0` disables the cache: each job restores into a cold folder in its scratch again. Anything but a non-negative whole number **fails startup** | `10240` |
 | `SEXTANT_SERVICE_GIT_OBJECT_STORE` | In `clone` mode, fetch each new commit through a per-repository bare object store on the cache volume, so only objects the store lacks cross the network (see [Package and git caches between jobs](#package-and-git-caches-between-jobs-issue-272)). `false` fetches every commit from the remote afresh. An unparseable value **fails startup** | `true` |
 | `SEXTANT_SERVICE_ANCESTRY_CACHE_MAX_MB` | Maximum size of one repository's persistent commit-ancestry graph in clone mode. An over-limit graph is rotated; that check returns `ancestry_unknown` and the next check rebuilds it. Must be a positive whole number of MiB; invalid values **fail startup** | `1024` |
+| `SEXTANT_SERVICE_ANCESTRY_BUILD_TIMEOUT_SECONDS` | Independent deadline for background ancestry graph work, in seconds (1–3600). Invalid values **fail startup** | `900` |
 | `SEXTANT_SERVICE_EXPEDITED_STREAK_LIMIT` | Maximum consecutive default-branch writer turns while a feature-branch turn waits, then one feature turn is granted. Range 1–1000; invalid values **fail startup** | `8` |
 | `SEXTANT_SERVICE_BUILD_GENERATOR_PROJECTS` | Build a source generator that a project references as a PROJECT (`OutputItemType="Analyzer"`) from the loaded workspace and run it in the service process, so the code it generates binds (issue #352; see [Operator-visible limits](#operator-visible-limits) and the trust note in `docs/runbooks.md`). `false` builds nothing and leaves such a generator unresolved. An unparseable value **fails startup** | `true` |
 | `SEXTANT_SERVICE_PACKAGE_SOURCE_CREDENTIALS` | **Secret.** Credentials for private package source hosts, `host[:port]=username:password` entries separated by `;` (the password may contain `:` but not `;`). The restore hands each one to NuGet only for an `https` request to exactly that host and port (443 when no port is given), through the service's own credential provider plugin; a repository's `nuget.config` cannot redirect it (see [Private package feeds](#private-package-feeds-issue-231)). Not part of the snapshot identity. A malformed value **fails startup** | unset |
@@ -541,10 +542,11 @@ It retains one ref, `refs/sextant/ancestry-head`, advances that ref as remote he
 `git gc --auto` maintenance after fetches. Unreachable history from force-pushed commits is pruned as the graph is
 maintained. `SEXTANT_SERVICE_ANCESTRY_CACHE_MAX_MB` (default 1024 MiB) bounds each graph; if it grows beyond the cap,
 the cache is rotated and that ancestry check safely returns `ancestry_unknown` rather than rebuilding during the
-same check. A subsequent check rebuilds the graph from the remote. When a fetched head diverges from the cached
-head, the current ancestry answer is computed first, then the graph is rebuilt from the new head; this drops
-force-pushed objects retained by partial-clone packs. The rebuild is bounded and uses the same scrubbed
-credentials as ordinary ancestry fetches.
+same check. A subsequent check rebuilds the graph from the remote. Ancestry work runs off the writer with an
+independent `SEXTANT_SERVICE_ANCESTRY_BUILD_TIMEOUT_SECONDS` deadline (default 900); a repair returns
+`ancestry_unknown` while it runs, and a later check uses the completed result. Builds and rewrites publish only a
+finished graph. A fast-forward updates the ref; an older historical target keeps the newer ref. A divergent head
+rebuilds the graph. The rebuild uses the same scrubbed credentials as ordinary ancestry fetches.
 
 **NuGet package folders, one per repository** (`nuget-packages/<repository>/`, the same
 `<name>-<url hash>` directory name as the repository's checkout). The sandbox points the evaluation's

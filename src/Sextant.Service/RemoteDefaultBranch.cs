@@ -93,7 +93,13 @@ public interface ICommitAncestryChecker
 {
     /// <summary>True for an ancestor (including equality), false for unrelated commits, null when history is unknown.</summary>
     bool? IsAncestor(string repositoryRemoteUrl, string ancestor, string descendant, CancellationToken cancellationToken = default);
+
+    /// <summary>Checks ancestry and explains an unknown result without exposing credentials.</summary>
+    AncestryResult CheckAncestry(string repositoryRemoteUrl, string ancestor, string descendant, CancellationToken cancellationToken = default) =>
+        new(IsAncestor(repositoryRemoteUrl, ancestor, descendant, cancellationToken), "ancestry unavailable");
 }
+
+public readonly record struct AncestryResult(bool? IsAncestor, string? Detail = null);
 
 /// <summary>Parsing of <c>git ls-remote &lt;url&gt; refs/heads/&lt;branch&gt;</c> for <see cref="IRemoteBranchHeadResolver"/>.</summary>
 public static class RemoteBranchHead
