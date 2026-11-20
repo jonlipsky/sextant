@@ -164,6 +164,20 @@ during pushes make it larger. After startup, `sextant_jobs_queued` is only jobs 
 **Action.** None. If `sextant_jobs_queued` stays above 0 for long with `worker_in_flight` idle, see
 "stuck indexing" above.
 
+**Durable admissions (#406).** `queued_ensures` is separate from `snapshot_jobs`: it records admitted requests,
+not distinct builds. After the orphan-job settlement above, startup automatically re-admits these requests in
+admission order. Identical pending requests from the same actor share one turn even across traffic on other branches;
+a different request on that branch or an intervening non-ensure control write prevents sharing, preserving
+retire/re-create ordering. Linked pushes still coalesce into their newest successor. Shutdown and transient requeues
+keep their durable admission; a settled owner deletes it while holding the writer, before another index can contend
+with cleanup. A cleanup failure is logged, not silently ignored.
+
+Startup reports re-admitted, dropped and duplicate-shared counts. `queued_ensure_duplicate` names the retained
+admission; `queued_ensure_settled` reports the number removed and its durable job outcome. These are not counts of
+lost builds: duplicate callers share the outcome, and a coalesced job names its successor. Existing age/policy/grant
+replay exclusions remain logged. There is no automatic discard merely because a branch was merged or deleted:
+historical/pinned snapshot work may still be intentional. Do not purge this table to clear an alert.
+
 ---
 
 ## Runbook: worker exhaustion
@@ -245,6 +259,58 @@ If the CAS fails, re-read both heads before retrying. Do not edit the database o
 migration 034 merges legacy URL aliases and retains their snapshots. It advances the snapshot schema, so an ordinary
 ensure may build a new identity on next use; the verified-head repair can still use the retained complete snapshot.
 Back up the catalog before applying the migration.
+
+**Recovery after the disconnected-handover fix (no further migration).**
+
+1. Deploy the fixed binary on the schema-34 catalog. Leave snapshots, handovers and durable admissions intact.
+   Startup replays admitted work and reports duplicate-sharing/drop counts; it does not require hand SQL.
+2. In clone mode, enable `SEXTANT_SERVICE_MAINTENANCE_INTERVAL_MINUTES`,
+   `SEXTANT_SERVICE_BRANCH_UPSTREAM_CHECK_MINUTES` and
+   `SEXTANT_SERVICE_BRANCH_UPSTREAM_HEAL_MAX_PER_TICK` (all must be positive). The normal defaults are `60`,
+   `60` and `10`. For a recovery window, temporarily setting both intervals to `1` makes the two confirming
+   listings occur on successive minute ticks; restore the normal intervals afterwards. Restarting resets
+   confirmation state. Only a running job on the affected repository/branch, or its pending repair/retirement,
+   makes a heal busy. Other repositories' running jobs and queued advances do not block eligibility.
+3. After two successful listings agree on the same head and unchanged pointer, an already-published full default
+   snapshot is repaired on the maintenance-priority writer lane, ahead of queued indexing. It must still wait
+   for the current writer to yield. A changed pointer fails the repair's CAS instead of overwriting newer work.
+   Watch for `default_pointer_repaired` and the `reconcile` audit row `default_pointer_repaired;snapshot=...`.
+   Maintenance repair and a newly built or reused default-head ensure each re-read the remote branch on their
+   writer turn, just before the repair CAS. This is one network read under the writer (at most 30 seconds),
+   outside the SQLite transaction. If the head differs or is unknown, the repair logs one `remote_head_moved`
+   refusal with `observed_head` and `fresh_head` (null if unknown), leaving normal advances to queued ensures.
+   Git and the local CAS cannot be atomic: a push after the fresh read returns but before the CAS commits can
+   still leave the pointer behind. No ancestry guess, publication-time ordering or `forced` flag bypasses a
+   guard; sequence/rebuild guards and `branch_update: none` retain their existing semantics.
+4. For an explicit operator/application ensure, first read both heads. Use the existing owner-only curl config
+   containing the control authorization header (do not put a token in the command, repository or report).
+   For today's ProcessStack case, reuse the job's URL spelling to avoid an unnecessary identity change:
+
+   ```bash
+   curl --config /run/secrets/sextant-control.curl --get \
+     --data-urlencode 'repository=https://github.com/elevenworks/ProcessStack.git' \
+     --data-urlencode 'branch=main' "$BASE/control/resolve"
+   gh api repos/elevenworks/ProcessStack/git/ref/heads/main --jq .object.sha
+   ```
+
+   Substitute the **full** current remote SHA and the **full** indexed `commit_sha` just returned, not the
+   abbreviated incident SHAs or a webhook's old `before`, into this request:
+
+   ```bash
+   curl --config /run/secrets/sextant-control.curl \
+     --json '{"repository_remote_url":"https://github.com/elevenworks/ProcessStack.git","commit_sha":"<full remote SHA>","branch_name":"main","default_branch":true,"expected_head_commit":"<full indexed SHA>"}' \
+     "$BASE/control/ensure?wait=false"
+   ```
+
+   A `202` means admitted, not repaired: poll `/control/status/{job_id}` and re-read `/control/resolve`.
+   This ensure uses the expedited default lane; the automatic published-head repair uses maintenance priority.
+   If `branch_advanced` is false and the pointer is not already current, inspect the single structured
+   `branch_advance_refused` log line and its audit row, then refresh both observations before retrying.
+5. Confirm `/control/resolve` matches the current remote head for every affected default branch, and watch
+   freshness lag return to zero at the next successful collection. Check queue depth/oldest age separately:
+   real unique work still drains through the single production writer. `queue_delay_high` is a p95 over up to
+   1000 recent started jobs, so it can remain raised while old delayed samples age out; the number of
+   `queued_ensures` rows alone neither proves nor clears that alert.
 
 ### Runbook: job failures
 

@@ -42,7 +42,7 @@ public sealed record UpstreamBranchReport
     /// <summary>Pointers whose snapshot commit differs from the remote head, seen on this pass's listing (issue #400).</summary>
     public int Stale { get; init; }
 
-    /// <summary>Stale pointers left alone because a job, handover, advance or retirement is pending against them.</summary>
+    /// <summary>Stale pointers left alone because this repository/branch has a running job or pending repair/retirement.</summary>
     public int HealBusy { get; init; }
 
     /// <summary>Stale pointers seen for the first time (or against a different remote head): healed only if the next listing agrees.</summary>
@@ -108,7 +108,7 @@ public sealed partial class SnapshotService
     /// <para>
     /// Healing (issue #400; off when <see cref="MaintenancePolicy.BranchUpstreamHealMaxPerTick"/> is 0, in which case only
     /// non-default pointers are read): a pointer, default or not, whose snapshot commit differs from the head the same
-    /// <c>ls-remote</c> returned, with no queued/running job, admitted advance or queued retirement against it, and
+    /// <c>ls-remote</c> returned, with no running job or queued retirement against this repository/branch, and
     /// the same difference (same pointer, same remote head) on two consecutive listings, gets a service-owned ensure of
     /// the remote head under actor <c>upstream_policy</c>, a <c>branch_update: advance</c> CAS on the pointer's current
     /// commit (<c>expected_head_commit</c>), so coalescing, the audit row and the handover rules are the push path's.
@@ -132,11 +132,13 @@ public sealed partial class SnapshotService
         var healMax = policy.BranchUpstreamHealMaxPerTick;
         IReadOnlyList<IdleBranchCandidate> pointers;
         HashSet<(string RepositoryKey, string Branch)> pending;
+        HashSet<(string RepositoryKey, string Branch)> running;
         using (var reader = OpenReadConnection())
         {
             var store = new SnapshotStore(reader);
             pointers = healMax > 0 ? store.ListBranchPointers() : store.ListIdleNonDefaultBranches(long.MaxValue);
             pending = new SnapshotJobStore(reader).BranchesWithPendingWork();
+            running = new SnapshotJobStore(reader).BranchesWithPendingWork(includeQueued: false);
         }
         HashSet<string> advancing;
         HashSet<string> retiring;
@@ -225,7 +227,7 @@ public sealed partial class SnapshotService
                         continue;
                     }
                     stale++;
-                    if (pending.Contains((repositoryKey, candidate.Name)) || advancing.Contains(repositoryKey + "\n" + candidate.Name)
+                    if (running.Contains((repositoryKey, candidate.Name))
                         || retiring.Contains(IdleRetireKey(candidate.RepositoryRemoteUrl, candidate.Name)))
                     {
                         healBusy++;
@@ -348,11 +350,8 @@ public sealed partial class SnapshotService
     // take minutes, and the pending-work check keeps the next pass off the branch meanwhile.
     //
     // The decision to heal was made from state read before the listing phase, which can take tens of seconds, so it is
-    // re-made here at the moment of admission. _inFlightLock is a reentrant Lock, and StartEnsureOperation takes it again
-    // to admit the ensure (and its write turn, which only queues), so the checks below and the registration are ONE
-    // critical section: a push is either admitted before it (seen as an in-flight advance, or already applied and seen
-    // in the re-read pointer) or after it (its ticket supersedes/expects this heal's commit as usual). The pointer and
-    // job reads are short WAL reads on an independent connection, taken inside the lock for that reason.
+    // re-made here at admission under _inFlightLock. Queued work cannot block a repair indefinitely: only a running
+    // job on this branch is busy. The pointer is re-read here and CAS-checked again on the repair's writer turn.
     private HealStart StartHeal(IdleBranchCandidate candidate, string remoteHead)
     {
         var request = new EnsureSnapshotRequest
@@ -371,8 +370,7 @@ public sealed partial class SnapshotService
             {
                 ObjectDisposedException.ThrowIf(_disposed, this);
                 ThrowIfStopping();
-                if (_latestAdvance.ContainsKey(repositoryKey + "\n" + candidate.Name)
-                    || _pendingDefaultRepairs.Contains((repositoryKey, candidate.Name))
+                if (_pendingDefaultRepairs.Contains((repositoryKey, candidate.Name))
                     || _pendingIdleRetires.Contains(IdleRetireKey(candidate.RepositoryRemoteUrl, candidate.Name)))
                     return HealStart.Busy;
 
@@ -385,7 +383,7 @@ public sealed partial class SnapshotService
                         || !string.Equals(pointer.HeadCommit, candidate.HeadCommit, StringComparison.OrdinalIgnoreCase))
                         return HealStart.Busy;
                     var jobs = new SnapshotJobStore(reader);
-                    if (jobs.BranchesWithPendingWork().Contains((repositoryKey, candidate.Name)))
+                    if (jobs.BranchesWithPendingWork(includeQueued: false).Contains((repositoryKey, candidate.Name)))
                         return HealStart.Busy;
                     var store = new SnapshotStore(reader);
                     if (candidate.IsDefault && store.GetRepositoryId(candidate.RepositoryRemoteUrl) is long repoId
@@ -415,10 +413,10 @@ public sealed partial class SnapshotService
         }
     }
 
-    // Called at admission under _inFlightLock. Use the same writer ordering as a normal expedited default ensure.
+    // A short, already-published repair uses maintenance priority, ahead of the queued indexing backlog.
     private void StartPublishedDefaultRepair(IdleBranchCandidate candidate, string remoteHead, string repositoryKey)
     {
-        var turn = TakeWriteTurnLocked(out _, expedited: true);
+        var turn = TakeWriteTurnLocked(out _, priority: true);
         _pendingDefaultRepairs.Add((repositoryKey, candidate.Name));
         var operation = Task.Run(async () =>
         {
@@ -428,10 +426,20 @@ public sealed partial class SnapshotService
                 EnsureLeaseHeld();
                 if (_lifetime.IsCancellationRequested)
                     return false;
-                lock (_inFlightLock)
+                var freshHead = await ReadFreshRepairHeadAsync(candidate.RepositoryRemoteUrl, candidate.Name)
+                    .ConfigureAwait(false);
+                if (!string.Equals(freshHead, remoteHead, StringComparison.OrdinalIgnoreCase))
                 {
-                    if (_latestAdvance.ContainsKey(repositoryKey + "\n" + candidate.Name))
-                        return false;
+                    Log(System.Text.Json.JsonSerializer.Serialize(new
+                    {
+                        @event = AuditAction.BranchAdvanceRefused,
+                        repository = repositoryKey,
+                        branch = candidate.Name,
+                        observed_head = remoteHead,
+                        fresh_head = freshHead,
+                        reason = RemoteHeadMoved
+                    }));
+                    return false;
                 }
                 return RepairPublishedDefaultLocked(candidate, remoteHead);
             }
@@ -454,7 +462,8 @@ public sealed partial class SnapshotService
         }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
 
-    private bool RepairPublishedDefaultLocked(IdleBranchCandidate observed, string verifiedHead)
+    private bool RepairPublishedDefaultLocked(
+        IdleBranchCandidate observed, string verifiedHead, long? target = null, bool logRefusal = true)
     {
         var snapshots = new SnapshotStore(_conn);
         BeginRaw("repair-default-pointer");
@@ -468,7 +477,7 @@ public sealed partial class SnapshotService
                 && branch.SnapshotId == observed.SnapshotId && branch.UpdatedAt == observed.UpdatedAt)
             {
                 reason = "snapshot_unavailable";
-                if (snapshots.FindPublishedBranchHead(branch.RepositoryId, verifiedHead) is long publishedId)
+                if ((target ?? snapshots.FindPublishedBranchHead(branch.RepositoryId, verifiedHead)) is long publishedId)
                 {
                     if (snapshots.GetById(publishedId)?.Status == SnapshotStatus.Superseded)
                         snapshots.MarkStatus(publishedId, SnapshotStatus.Complete);
@@ -480,6 +489,16 @@ public sealed partial class SnapshotService
             new AuditLogStore(_conn).Append(AuditAction.Reconcile, advanced ? AuditOutcome.Complete : AuditOutcome.Failed,
                 actor: UpstreamPolicyCaller.Actor, repositoryScope: observed.RepositoryRemoteUrl, detail: reason);
             ExecRaw("COMMIT;");
+            if (advanced || logRefusal)
+                Log(System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    @event = advanced ? "default_pointer_repaired" : AuditAction.BranchAdvanceRefused,
+                    repository = RemoteUrlIdentity.Normalize(observed.RepositoryRemoteUrl),
+                    branch = observed.Name,
+                    expected_head = observed.HeadCommit,
+                    verified_head = verifiedHead,
+                    reason
+                }));
             return advanced;
         }
         catch
@@ -487,6 +506,60 @@ public sealed partial class SnapshotService
             ExecRaw("ROLLBACK;");
             throw;
         }
+    }
+
+    private const string RemoteHeadMoved = "remote_head_moved";
+    private sealed record DefaultRepairRefusal(string ObservedHead, string? FreshHead);
+
+    // Both paths start a dedicated read on their writer turn, after any listing, intake check or publication.
+    // The network wait is bounded and outside the SQLite transaction.
+    private async Task<string?> ReadFreshRepairHeadAsync(string repository, string branch, string? tenant = null)
+    {
+        if (_remoteDefaults is not { HasBranchHeadResolver: true } lookup)
+            return null;
+        using var bound = new CancellationTokenSource(RemoteHeadTimeout);
+        using var wait = CancellationTokenSource.CreateLinkedTokenSource(bound.Token, _lifetime.Token);
+        try
+        {
+            var head = await lookup.ResolveBranchHeadAsync(repository, branch, tenant, wait.Token, forRepair: true)
+                .WaitAsync(wait.Token).ConfigureAwait(false);
+            wait.Token.ThrowIfCancellationRequested();
+            EnsureLeaseHeld();
+            return head;
+        }
+        catch (Exception ex) when (ex is RemoteLookupBusyException || (ex is OperationCanceledException && bound.IsCancellationRequested))
+        {
+            return null;
+        }
+    }
+
+    // The writer is held across publication, verification and repair. Only a fresh remote observation, never a
+    // webhook's before/forced fields or a handover chain, may override a disconnected default-branch CAS.
+    private async Task<(EnsureSnapshotResult Result, DefaultRepairRefusal? Refusal)> RepairVerifiedDefaultHeadAsync(
+        EnsureSnapshotRequest request, EnsureSnapshotResult result)
+    {
+        if (result.BranchAdvanced != false || result.SnapshotId is not long target || request.SuppressesBranchUpdate
+            || request.BranchHeadSequence is not null || request.RebuildGeneration is not null
+            || result.Status is not (SnapshotJobStatus.Complete or SnapshotJobStatus.Partial)
+            || _remoteDefaults is not { HasBranchHeadResolver: true })
+            return (result, null);
+        var snapshots = new SnapshotStore(_conn);
+        var candidate = snapshots.ListBranchPointers().FirstOrDefault(p =>
+            p.IsDefault && p.Name == (request.BranchName ?? "main")
+            && RemoteUrlIdentity.Normalize(p.RepositoryRemoteUrl) == RemoteUrlIdentity.Normalize(request.RepositoryRemoteUrl));
+        if (candidate is null || candidate.SnapshotId == target
+            || snapshots.GetById(target) is not { Status: SnapshotStatus.Complete, PublishedAt: not null,
+                IsOverlay: false, IsProvider: false, WorkingTreeDelta: null } published
+            || !string.Equals(snapshots.GetCommitSha(published.CommitId), request.CommitSha, StringComparison.OrdinalIgnoreCase))
+            return (result, null);
+
+        var freshHead = await ReadFreshRepairHeadAsync(request.RepositoryRemoteUrl, candidate.Name, request.LookupTenant)
+            .ConfigureAwait(false);
+        if (!string.Equals(freshHead, request.CommitSha, StringComparison.OrdinalIgnoreCase))
+            return (result, new DefaultRepairRefusal(request.CommitSha, freshHead));
+        if (RepairPublishedDefaultLocked(candidate, request.CommitSha, target, logRefusal: false))
+            result = result with { BranchAdvanced = true };
+        return (result, null);
     }
 
     // Lists the repositories of one batch, at most UpstreamListingParallelism at a time, inside one phase bound of half of

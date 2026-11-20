@@ -553,18 +553,20 @@ public sealed class SnapshotJobStore(SqliteConnection connection)
     /// handover (issue #273) is pending work only while its successor's job is queued or running, and that job names the
     /// branch, so it is already covered here: a handover row alone, left by a head that never moved, is not (issue #401).
     /// Read-only; repository URLs are normalized with <see cref="RemoteUrlIdentity"/>.
+    /// Set <paramref name="includeQueued"/> false for healing: queued work must not indefinitely block pointer repair.
     /// </summary>
-    public HashSet<(string RepositoryKey, string Branch)> BranchesWithPendingWork()
+    public HashSet<(string RepositoryKey, string Branch)> BranchesWithPendingWork(bool includeQueued = true)
     {
         var result = new HashSet<(string, string)>();
         using (var jobs = connection.CreateCommand())
         {
             jobs.CommandText = """
                 SELECT repository_url, branch_name FROM snapshot_jobs
-                WHERE branch_name IS NOT NULL AND status IN (@queued, @running);
+                WHERE branch_name IS NOT NULL AND (status = @running OR (@include_queued = 1 AND status = @queued));
                 """;
             jobs.Parameters.AddWithValue("@queued", SnapshotJobStatus.Queued);
             jobs.Parameters.AddWithValue("@running", SnapshotJobStatus.Running);
+            jobs.Parameters.AddWithValue("@include_queued", includeQueued ? 1 : 0);
             using var reader = jobs.ExecuteReader();
             while (reader.Read())
                 result.Add((RemoteUrlIdentity.Normalize(reader.GetString(0)), reader.GetString(1)));

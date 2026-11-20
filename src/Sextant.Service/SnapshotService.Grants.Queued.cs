@@ -15,6 +15,30 @@ namespace Sextant.Service;
 public sealed partial class SnapshotService
 {
     private long _ensureSeq;
+    // Per branch, share an identical pending request even across other branches' traffic. A different request on
+    // this branch or any non-ensure control write is a barrier: retries must never jump across a retire/re-create.
+    private readonly Dictionary<string, PendingEnsureAdmission> _ensureAdmissions = new(StringComparer.Ordinal);
+    private long _ensureAdmissionBarrier;
+    private long _duplicateEnsureAdmissions;
+
+    private static string EnsureAdmissionKey(EnsureSnapshotRequest request) =>
+        Sextant.Core.RemoteUrlIdentity.Normalize(request.RepositoryRemoteUrl) + "\n" + (request.BranchName ?? "main");
+
+    private sealed record PendingEnsureAdmission(
+        EnsureSnapshotRequest Request, AuditCaller Principal, long Seq, long WriteAdmission,
+        Task<EnsureSnapshotResult> Accepted, Task<EnsureSnapshotResult> Completion, Task Persisted);
+
+    private void DeleteSettledQueuedEnsureLocked(long seq, EnsureSnapshotResult result)
+    {
+        if (_lifetime.IsCancellationRequested || LeaseLost || !SnapshotJobStatus.IsSettled(result.Status))
+            return;
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM queued_ensures WHERE seq = @seq;";
+        cmd.Parameters.AddWithValue("@seq", seq);
+        var removed = cmd.ExecuteNonQuery();
+        if (removed > 0)
+            Log($"queued_ensure_settled seq={seq} status={result.Status} removed={removed}");
+    }
 
     private void PersistQueuedEnsure(long seq, EnsureSnapshotRequest request, string hash, AuditCaller principal)
     {
@@ -66,8 +90,8 @@ public sealed partial class SnapshotService
         }
     }
 
-    // Removes the row of an ensure that ended for good. Shutdown, a lost lease and a requeued (still queued) result
-    // keep it for the next instance.
+    // Fallback cleanup for faults and duplicate replay rows. Successful owners delete under the writer gate.
+    // Shutdown, a lost lease and a transient requeue keep the row for the next instance.
     private void ForgetQueuedEnsure(long seq, Task<EnsureSnapshotResult> outcome)
     {
         if (_lifetime.IsCancellationRequested || LeaseLost || outcome.IsCanceled
@@ -88,10 +112,9 @@ public sealed partial class SnapshotService
                 return cmd.ExecuteNonQuery();
             }, CancellationToken.None).ConfigureAwait(false);
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            // Left behind, the row only makes the next start re-admit an ensure that already settled, which attaches
-            // its terminal job at no cost (or drops it once it is older than QueuedEnsureMaxAge).
+            Log($"queued_ensure_cleanup_failed seq={seq} error={ex.GetType().Name}; retained for replay");
         }
     }
 
@@ -141,6 +164,7 @@ public sealed partial class SnapshotService
         var oldest = _timeProvider.GetUtcNow() - _options.QueuedEnsureMaxAge;
         var replayed = 0;
         var dropped = 0;
+        var duplicatesBefore = _duplicateEnsureAdmissions;
         foreach (var row in rows)
         {
             try
@@ -185,7 +209,8 @@ public sealed partial class SnapshotService
                     }
                 }
 
-                var (_, completion, _, _) = StartEnsureOperation(request, new AuditCaller(null, row.Suffix, row.Actor), row.Seq);
+                var (_, completion, _, _) = StartEnsureOperation(request,
+                    new AuditCaller(null, row.Suffix, row.Actor, row.CallerTenant, row.CallerSubject), row.Seq);
                 Observe(completion);
                 replayed++;
             }
@@ -202,7 +227,8 @@ public sealed partial class SnapshotService
         }
 
         if (rows.Count > 0)
-            Log($"Re-admitted {replayed} queued ensure(s) persisted by the previous run ({dropped} dropped).");
+            Log($"Re-admitted {replayed} queued ensure(s) persisted by the previous run " +
+                $"({dropped} dropped; {_duplicateEnsureAdmissions - duplicatesBefore} duplicate admission(s) shared).");
         return replayed;
 
         void Drop(QueuedRow row)
