@@ -9,6 +9,8 @@ namespace Sextant.Cli.Handlers;
 /// <summary>Parsed <c>sextant contribute</c> options.</summary>
 internal sealed record ContributeOptions
 {
+    public override string ToString() => $"ContributeOptions {{ SolutionPath = {SolutionPath}, Token = ***, other settings = [redacted] }}";
+
     public required string SolutionPath { get; init; }
     public string? ServiceUrl { get; init; }
     public string? OutFile { get; init; }
@@ -137,7 +139,7 @@ internal static class ContributeHandler
         var remoteUrl = ResolveRepositoryUrl(gitRoot!);
         var config = SextantConfiguration.Load();
         var capability = WorkerCapability.LocalDefault;
-        var token = options.Token ?? Environment.GetEnvironmentVariable("SEXTANT_CONTRIB_TOKEN");
+        var token = options.Token ?? SecretEnvironmentVariable.Read("SEXTANT_CONTRIB_TOKEN");
 
         var provenance = new ContributionProvenance
         {

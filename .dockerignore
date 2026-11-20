@@ -1,0 +1,15 @@
+.git
+.github
+.claude
+.tmp
+.sextant
+**/bin
+**/obj
+**/TestResults
+**/artifacts
+docs
+specs
+tests
+deploy/README.md
+CLAUDE.md
+Sextant.slnx

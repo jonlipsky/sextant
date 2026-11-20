@@ -18,6 +18,8 @@ namespace Sextant.Service;
 /// </summary>
 public sealed record ServiceOptions
 {
+    public override string ToString() => "ServiceOptions { credentials = *** }";
+
     /// <summary>The durable catalog + semantic store (the Phase-9 snapshot catalog lives here).</summary>
     public required string CatalogDbPath { get; init; }
 
@@ -580,15 +582,15 @@ public sealed record ServiceOptions
                 artifactRoot: Env("ARTIFACT_ROOT"),
                 cacheRoot: Env("CACHE_ROOT"),
                 scratchRoot: Env("SCRATCH_ROOT")),
-            ControlToken = Env("CONTROL_TOKEN"),
+            ControlToken = SecretEnv("CONTROL_TOKEN"),
             InsecureOpenControlPlane = EnvBool("INSECURE_OPEN_CONTROL_PLANE") ?? false,
-            QueryToken = Env("QUERY_TOKEN"),
-            ContributeToken = Env("CONTRIBUTE_TOKEN"),
-            ReadPolicy = ReadAuthorizationPolicy.Parse(Env("READ_POLICY")),
+            QueryToken = SecretEnv("QUERY_TOKEN"),
+            ContributeToken = SecretEnv("CONTRIBUTE_TOKEN"),
+            ReadPolicy = ReadAuthorizationPolicy.Parse(SecretEnv("READ_POLICY")),
             RequireRepositorySelection = EnvBool("REQUIRE_REPOSITORY_SELECTION") ?? false,
-            DelegateTokens = ParseDelegateTokens(Env("DELEGATE_TOKENS")),
+            DelegateTokens = ParseDelegateTokens(SecretEnv("DELEGATE_TOKENS")),
             CallerAssertion = ParseCallerAssertion(
-                Env("CALLER_KEYS"), Env("CALLER_AUDIENCE"), Env("CALLER_ISSUERS"), Env("CALLER_HEADER"),
+                SecretEnv("CALLER_KEYS"), Env("CALLER_AUDIENCE"), Env("CALLER_ISSUERS"), Env("CALLER_HEADER"),
                 Env("CALLER_IDPS"), Env("CALLER_APPS")),
             MaxGrantsPerPrincipal = EnvInt("MAX_GRANTS_PER_PRINCIPAL") is int perPrincipal and > 0
                 ? perPrincipal : DefaultMaxGrantsPerPrincipal,
@@ -600,7 +602,7 @@ public sealed record ServiceOptions
             ControlPort = EnvInt("CONTROL_PORT") ?? 3011,
             QueryPort = EnvInt("QUERY_PORT"),
             CheckoutMode = ParseCheckoutMode(Env("CHECKOUT_MODE")),
-            CheckoutToken = Env("CHECKOUT_TOKEN"),
+            CheckoutToken = SecretEnv("CHECKOUT_TOKEN"),
             SubmoduleHosts = ParseSubmoduleHosts(Env("SUBMODULE_HOSTS")),
             RepositoryUrlPolicy = ParseRepositoryUrlPolicy(Env("REPOSITORY_HOSTS"), Env("REPOSITORY_OWNERS")),
             // Bound retryable-provisioning re-attempts. Out-of-range/invalid values fall back to the default
@@ -661,7 +663,7 @@ public sealed record ServiceOptions
                 ? Math.Min(maxNodes, PackageRestoreRunner.MaxMaxNodes) : PackageRestoreRunner.DefaultMaxNodes,
             PackageRestoreTimeout = EnvInt("PACKAGE_RESTORE_TIMEOUT_SECONDS") is int restoreSeconds and > 0
                 ? TimeSpan.FromSeconds(restoreSeconds) : PackageRestoreRunner.DefaultTimeout,
-            PackageSourceCredentials = ParsePackageSourceCredentials(Env("PACKAGE_SOURCE_CREDENTIALS")),
+            PackageSourceCredentials = ParsePackageSourceCredentials(SecretEnv("PACKAGE_SOURCE_CREDENTIALS")),
             PackageCacheMaxBytes = ParsePackageCacheMaxBytes(Env("PACKAGE_CACHE_MAX_MB")),
             GitObjectStore = EnvBool("GIT_OBJECT_STORE") ?? true,
             QueuedEnsureMaxAge = TimeSpan.FromHours(EnvInt("QUEUED_ENSURE_MAX_AGE_HOURS") is int ageHours && ageHours > 0
@@ -838,6 +840,8 @@ public sealed record ServiceOptions
 
     private static string? Env(string name) =>
         Environment.GetEnvironmentVariable(EnvPrefix + name) is { Length: > 0 } v ? v : null;
+
+    private static string? SecretEnv(string name) => SecretEnvironmentVariable.Read(EnvPrefix + name);
 
     private static int? EnvInt(string name) =>
         int.TryParse(Env(name), out var v) ? v : null;

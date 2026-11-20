@@ -8,6 +8,8 @@ namespace Sextant.Service.Contributions;
 /// <summary>Options controlling how a captured artifact is uploaded to the index service.</summary>
 public sealed record ContributionUploadOptions
 {
+    public override string ToString() => $"ContributionUploadOptions {{ ServiceUrl = {ServiceUrl}, Token = ***, Finalize = {Finalize} }}";
+
     /// <summary>The service base URL (e.g. <c>https://index.example.com</c>).</summary>
     public required Uri ServiceUrl { get; init; }
 

@@ -9,6 +9,8 @@ namespace Sextant.Service.CallerIdentity;
 /// </summary>
 public sealed partial record CallerAssertionOptions
 {
+    public override string ToString() => $"CallerAssertionOptions {{ Enabled = {Enabled}, Keys = ***, other settings = [redacted] }}";
+
     /// <summary>The default assertion header name.</summary>
     public const string DefaultHeader = "X-ProcessStack-Caller";
 

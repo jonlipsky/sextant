@@ -96,6 +96,21 @@ Environment variables take precedence over `sextant.json`:
 | `SEXTANT_RETENTION_API_KEEP_COMMITS` | API-surface snapshot commits to retain (Phase 8) | `10` |
 | `SEXTANT_RETENTION_PRUNE_SOURCE_BLOBS` | Prune superseded source blobs (Phase 8) | `true` (set `false`/`0`/`no`/`off` to keep) |
 
+### Secrets from files
+
+Credential-valued environment settings also accept a `_FILE` form containing a path to a UTF-8 file. Sextant reads
+the file at startup (or when the corresponding CLI configuration is loaded) and removes trailing newline characters.
+Set only one form; setting both the environment value and its `_FILE` counterpart is an error. For example,
+`SEXTANT_SERVICE_CONTROL_TOKEN_FILE=/run/secrets/control-token` supplies the control token without putting its value
+in the environment. The direct environment form remains supported but emits a one-time deprecation warning naming
+the variable only; secret values are never written to logs or error messages.
+
+This applies to `SEXTANT_SERVICE_CHECKOUT_TOKEN`, `SEXTANT_SERVICE_CONTROL_TOKEN`,
+`SEXTANT_SERVICE_QUERY_TOKEN`, `SEXTANT_SERVICE_CONTRIBUTE_TOKEN`, `SEXTANT_SERVICE_DELEGATE_TOKENS`,
+`SEXTANT_SERVICE_CALLER_KEYS`, `SEXTANT_SERVICE_READ_POLICY`, and
+`SEXTANT_SERVICE_PACKAGE_SOURCE_CREDENTIALS`, as well as `SEXTANT_PEER_QUERY_TOKEN` and
+`SEXTANT_CONTRIB_TOKEN`.
+
 ### Runtime Output
 
 Sextant stores its database and logs in the `.sextant/` directory at the repo root. This directory is automatically added to `.gitignore` by `sextant install`.
