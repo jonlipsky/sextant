@@ -743,6 +743,66 @@ public class UpstreamBranchReconcileTests
     }
 
     [TestMethod]
+    public async Task DefaultBranch_DeclinedHandoverAndForcePush_ReconcilesNewestVerifiedSnapshotAcrossUrlSpellings()
+    {
+        const string alternate = "HTTPS://GITHUB.COM/Acme/Upstream.git/";
+        await using var h = Harness.Create(p => p with { BranchUpstreamHealMaxPerTick = 10 });
+        h.Seed(Repo, "main", true, Sha('1'));
+        var old = h.Seed(Repo, "main", true, Sha('2'));
+        h.Start();
+        var key = RemoteUrlIdentity.Normalize(Repo);
+        new SnapshotJobStore(h.Db.GetConnection()).RecordHandover(key, "main", Sha('3'), Sha('1'), Sha('4'));
+
+        var declined = await h.Service.EnsureSnapshotAsync(new()
+        {
+            RepositoryRemoteUrl = alternate, BranchName = "main", IsDefaultBranch = true,
+            CommitSha = Sha('4'), ExpectedHeadCommit = Sha('3'), Forced = true
+        });
+        Assert.AreEqual(SnapshotJobStatus.Complete, declined.Status);
+        Assert.AreEqual(false, declined.BranchAdvanced, "the handover expects 1, but the pointer still serves 2");
+        Assert.AreEqual(Sha('2'), PointerCommit(h, Repo, "main"));
+        Assert.IsTrue(h.Service.RecentAudit(action: AuditAction.Ensure).Any(a =>
+            a.Detail?.Contains("branch_advance_refused=expected_head_mismatch", StringComparison.Ordinal) == true));
+
+        using (var sql = h.Db.GetConnection().CreateCommand())
+        {
+            sql.CommandText = "UPDATE snapshots SET published_at = CASE WHEN id = @old THEN 1000 ELSE 601000 END;";
+            sql.Parameters.AddWithValue("@old", old);
+            sql.ExecuteNonQuery();
+        }
+        Assert.AreEqual(600d, h.Service.CollectMetrics().DefaultBranchPointerLag.Single().LagSeconds);
+
+        // The upstream branch moves back to commit 1, rather than to the newer published but unverified commit 4.
+        // Its snapshot was built under a different URL spelling and is not the heal request's raw identity.
+        var reset = ServiceTestFixtures.PublishComplete(h.Db, new()
+        {
+            RepositoryRemoteUrl = alternate, CommitSha = Sha('1')
+        }, recordCommit: true);
+        h.Lister.SetHeads(Repo, new Dictionary<string, string> { ["main"] = Sha('1') });
+        Assert.AreEqual(0, (await Pass(h)).HealsStarted);
+        h.Clock.Advance(TimeSpan.FromMinutes(61));
+        Assert.AreEqual(1, (await Pass(h)).HealsStarted);
+        await WaitUntilAsync(() => PointerCommit(h, Repo, "main") == Sha('1'));
+        using var reader = h.OpenReader();
+        var snapshots = new SnapshotStore(reader);
+        Assert.AreEqual(reset, snapshots.GetBranch(h.RepositoryId(Repo), "main")!.SnapshotId);
+        Assert.AreEqual(1, h.Worker.Calls, "the repair did not rebuild the verified head");
+        Assert.AreEqual(0, h.CountHandovers(), "the move consumed the old handover");
+        Assert.AreEqual(0d, h.Service.CollectMetrics().DefaultBranchPointerLag.Single().LagSeconds);
+
+        var newer = ServiceTestFixtures.PublishComplete(h.Db, new()
+        {
+            RepositoryRemoteUrl = Repo, CommitSha = Sha('1'), RebuildGeneration = "same-head-rebuild"
+        }, recordCommit: true);
+        h.Clock.Advance(TimeSpan.FromMinutes(61));
+        Assert.AreEqual(0, (await Pass(h)).HealsStarted);
+        h.Clock.Advance(TimeSpan.FromMinutes(61));
+        Assert.AreEqual(1, (await Pass(h)).HealsStarted);
+        await WaitUntilAsync(() => snapshots.GetBranch(h.RepositoryId(Repo), "main")!.SnapshotId == newer);
+        Assert.AreEqual(1, h.Worker.Calls, "the newer publication of the same upstream head was also reused");
+    }
+
+    [TestMethod]
     public async Task HealCap_LimitsAdvancesPerPass_AndTheRestFollow()
     {
         await using var h = Harness.Create(p => p with { BranchUpstreamHealMaxPerTick = 2 });

@@ -39,8 +39,7 @@ public class SymbolDeclarationMigrationTests
     public void Migration026_AdvancesTheSnapshotSchema()
     {
         Assert.IsFalse(IndexDatabase.IdentityNeutralMigrations.Contains(26), "026 changes what the indexer stores");
-        Assert.AreEqual(26, IndexDatabase.SnapshotSchemaVersion);
-        Assert.AreEqual(33, IndexDatabase.LatestSchemaVersion);
+        Assert.IsGreaterThanOrEqualTo(26, IndexDatabase.SnapshotSchemaVersion);
     }
 
     [TestMethod]
@@ -55,7 +54,8 @@ public class SymbolDeclarationMigrationTests
             var runs = new IndexRunStore(conn);
             Assert.AreEqual(1, runs.MarkComplete(runs.BeginRun("full", 1), 2, 1));
             // Back to the schema a pre-026 build left: no column, version 25.
-            Exec(conn, "DROP TABLE queued_ensures; DROP TABLE writer_run_state; DROP TABLE retired_branch_heads; DROP TABLE branch_advance_handovers; DROP TABLE snapshot_job_timings; DROP INDEX ix_snapshot_jobs_completed_at; " +
+            Exec(conn, "DROP INDEX ix_repositories_key; DROP INDEX ix_snapshot_jobs_snapshot_branch; ALTER TABLE repositories DROP COLUMN repository_key; " +
+                "DROP TABLE queued_ensures; DROP TABLE writer_run_state; DROP TABLE retired_branch_heads; DROP TABLE branch_advance_handovers; DROP TABLE snapshot_job_timings; DROP INDEX ix_snapshot_jobs_completed_at; " +
                 "ALTER TABLE symbols DROP COLUMN declaration; " +
                 "DELETE FROM schema_version WHERE version >= 26;");
             Assert.AreEqual(25, db.CurrentSchemaVersion);
@@ -64,7 +64,7 @@ public class SymbolDeclarationMigrationTests
         using (var db = new IndexDatabase(_dbPath))
         {
             db.RunMigrations();
-            Assert.AreEqual(33, db.CurrentSchemaVersion);
+            Assert.AreEqual(IndexDatabase.LatestSchemaVersion, db.CurrentSchemaVersion);
             Assert.IsNotNull(new IndexRunStore(db.GetConnection()).GetLastCompleteRun(), "026 keeps index_runs");
 
             var symbol = new SymbolStore(db.GetConnection()).GetById(symbolId);

@@ -21,7 +21,6 @@ public class SnapshotJobTimingsTests
     {
         Assert.Contains(28, IndexDatabase.IdentityNeutralMigrations);
         Assert.Contains("snapshot_job_timings", IndexDatabase.ServiceJobTables);
-        Assert.AreEqual(26, IndexDatabase.SnapshotSchemaVersion, "adding job telemetry re-indexes nothing");
 
         using var db = new IndexDatabase(_dbPath);
         db.RunMigrations();

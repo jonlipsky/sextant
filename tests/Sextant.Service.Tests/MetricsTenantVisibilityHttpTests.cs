@@ -32,6 +32,14 @@ public class MetricsTenantVisibilityHttpTests
     }
 
     [TestMethod]
+    public async Task PointerLag_NeverNamesAnotherTenantsRepository()
+    {
+        await using var host = await StartAsync();
+        await AssertBothFormatsAsync(host, family: "sextant_default_branch_pointer_lag_seconds",
+            jsonProperty: "default_branch_pointer_lag", jsonKey: "repository");
+    }
+
+    [TestMethod]
     public async Task CostFamilies_NeverNameAnotherTenantsRepository()
     {
         await using var host = await StartAsync();

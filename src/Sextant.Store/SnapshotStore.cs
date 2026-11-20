@@ -124,12 +124,7 @@ public sealed class SnapshotStore(SqliteConnection connection)
 
     public long EnsureRepository(string remoteUrl, long now)
     {
-        // Key repository identity on the NORMALIZED remote url (issue #92) so trivially-equivalent
-        // spellings (trailing .git / trailing slash / case) collapse to ONE row, matching the checkout
-        // directory's notion of "same repo" (ServicePaths.ShortUrlHash). The dedup runs on the normalized
-        // key but the RAW spelling is STORED unchanged, so readback consumers (contribution-manifest
-        // reconstruction, cross-repo display) and the raw-url-based snapshot identity keep the original
-        // spelling. The single writer + BEGIN IMMEDIATE serializes this get-or-create.
+        // The submitted URL is provenance, not identity (contribution manifests also read it back).
         if (GetRepositoryId(remoteUrl) is long existing)
         {
             MarkConsumerRepository(existing);
@@ -137,10 +132,11 @@ public sealed class SnapshotStore(SqliteConnection connection)
         }
         using var cmd = connection.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO repositories (remote_url, created_at) VALUES (@url, @now)
+            INSERT INTO repositories (remote_url, repository_key, created_at) VALUES (@url, @key, @now)
             RETURNING id;
             """;
         cmd.Parameters.AddWithValue("@url", remoteUrl);
+        cmd.Parameters.AddWithValue("@key", RemoteUrlIdentity.Normalize(remoteUrl));
         cmd.Parameters.AddWithValue("@now", now);
         return (long)cmd.ExecuteScalar()!;
     }
@@ -171,20 +167,15 @@ public sealed class SnapshotStore(SqliteConnection connection)
     /// </summary>
     public long EnsureProviderRepository(string remoteUrl, long now)
     {
-        // Normalize provider identity too (issue #92): a submodule provider discovered from two parents'
-        // .gitmodules under different spellings (e.g. trailing .git vs not, or a different case) must
-        // resolve to ONE provider row so its symbols are shared, not indexed twice. Dedup on the
-        // normalized key; store the RAW spelling. If the remote already exists (as consumer or provider)
-        // leave its is_provider flag as-is — a repo genuinely indexed in its own right stays a consumer;
-        // only a brand-new provider-only remote is inserted with is_provider = 1.
         if (GetRepositoryId(remoteUrl) is long existing)
             return existing;
         using var cmd = connection.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO repositories (remote_url, created_at, is_provider) VALUES (@url, @now, 1)
+            INSERT INTO repositories (remote_url, repository_key, created_at, is_provider) VALUES (@url, @key, @now, 1)
             RETURNING id;
             """;
         cmd.Parameters.AddWithValue("@url", remoteUrl);
+        cmd.Parameters.AddWithValue("@key", RemoteUrlIdentity.Normalize(remoteUrl));
         cmd.Parameters.AddWithValue("@now", now);
         return (long)cmd.ExecuteScalar()!;
     }
@@ -495,6 +486,31 @@ public sealed class SnapshotStore(SqliteConnection connection)
         cmd.Parameters.AddWithValue("@sha", commitSha);
         var result = cmd.ExecuteScalar();
         return result is null or DBNull ? null : Convert.ToInt64(result);
+    }
+
+    /// <summary>Newest usable full snapshot for a verified upstream head, regardless of its ensure identity.</summary>
+    public long? FindPublishedBranchHead(long repositoryId, string commitSha)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT s.id, s.status
+            FROM commits c
+            JOIN snapshots s ON s.repository_id = c.repository_id AND s.commit_id = c.id
+            WHERE c.repository_id = @repo AND c.commit_sha = @sha COLLATE NOCASE
+              AND s.status IN ('complete', 'superseded') AND s.published_at IS NOT NULL
+              AND s.is_overlay = 0 AND s.is_provider = 0 AND s.working_tree_delta IS NULL
+            ORDER BY s.published_at DESC, s.id DESC;
+            """;
+        cmd.Parameters.AddWithValue("@repo", repositoryId);
+        cmd.Parameters.AddWithValue("@sha", commitSha);
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            var id = reader.GetInt64(0);
+            if (reader.GetString(1) == SnapshotStatus.Complete || IsReselectable(id))
+                return id;
+        }
+        return null;
     }
 
     /// <summary>
@@ -914,39 +930,13 @@ public sealed class SnapshotStore(SqliteConnection connection)
     /// <summary>The repository id for a remote url, or null when it has never been indexed (read-only lookup).</summary>
     public long? GetRepositoryId(string remoteUrl)
     {
-        // Fast, EXACT path first (issue #92): an exact raw match hits the UNIQUE(remote_url) index and
-        // returns the row that literally stores this spelling. This is the common case AND it keeps a
-        // database indexed BEFORE this fix fully readable: a legacy catalog can hold several raw-spelling
-        // rows that normalize equal (UNIQUE is on the RAW remote_url, migration 013), and each spelling
-        // must keep resolving to ITS OWN row so snapshots/branches/dependencies and contribution-validation
-        // binds attached to that row stay reachable (never silently hidden behind a different row's id).
-        using (var exact = connection.CreateCommand())
-        {
-            exact.CommandText = "SELECT id FROM repositories WHERE remote_url = @url LIMIT 1;";
-            exact.Parameters.AddWithValue("@url", remoteUrl ?? string.Empty);
-            if (exact.ExecuteScalar() is long fast)
-                return fast;
-        }
-        // Fallback: a spelling with NO exact row (a trailing .git / slash / case variant, issue #92)
-        // resolves to the one canonical row via the normalized identity key. This is the write-time dedup
-        // chokepoint — a new spelling of an already-known repo converges here instead of inserting a
-        // duplicate. Among equivalent-normalizing rows the pick is DETERMINISTIC (ORDER BY id: lowest
-        // wins), so the same input always resolves to the same repository id (that id feeds every
-        // cross-repo query). Normalization stays in C# (never reimplemented in SQL) so the identity rule
-        // can never drift from RemoteUrlIdentity / ServicePaths. The repositories table is one row per
-        // repo, so this scan is bounded and cheap.
         var key = RemoteUrlIdentity.Normalize(remoteUrl);
-        if (key.Length == 0)
-            return null;
-        using var scan = connection.CreateCommand();
-        scan.CommandText = "SELECT id, remote_url FROM repositories ORDER BY id;";
-        using var reader = scan.ExecuteReader();
-        while (reader.Read())
-        {
-            if (RemoteUrlIdentity.Normalize(reader.GetString(1)) == key)
-                return reader.GetInt64(0);
-        }
-        return null;
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = key.Length == 0
+            ? "SELECT id FROM repositories WHERE remote_url = @url;"
+            : "SELECT id FROM repositories WHERE repository_key = @key AND repository_key <> '';";
+        cmd.Parameters.AddWithValue(key.Length == 0 ? "@url" : "@key", key.Length == 0 ? remoteUrl : key);
+        return cmd.ExecuteScalar() is long id ? id : null;
     }
 
     /// <summary>The branch id for a (repository, name) pair, or null when absent (read-only lookup).</summary>
