@@ -6,6 +6,8 @@ namespace Sextant.Core;
 
 public sealed class SextantConfiguration
 {
+    public override string ToString() => nameof(SextantConfiguration);
+
     public string DbPath { get; set; } = ".sextant/profiles/default/sextant.db";
     public string Profile { get; set; } = "default";
     public int MaxCallHierarchyDepth { get; set; } = 5;
@@ -467,7 +469,7 @@ public sealed class SextantConfiguration
         if (int.TryParse(remoteFetchTimeout, out var remoteTimeout))
             config.RemoteFetchTimeoutSeconds = remoteTimeout;
 
-        var peerQueryToken = Environment.GetEnvironmentVariable("SEXTANT_PEER_QUERY_TOKEN");
+        var peerQueryToken = SecretEnvironmentVariable.Read("SEXTANT_PEER_QUERY_TOKEN");
         if (!string.IsNullOrWhiteSpace(peerQueryToken))
             config.PeerQueryToken = peerQueryToken;
 

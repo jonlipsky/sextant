@@ -361,6 +361,139 @@ public class ServiceOptionsEnvTests
     }
 
     [TestMethod]
+    public void CredentialSettings_BindFromFiles_AndTrimTrailingNewlines()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"sextant-secrets-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        var key = CallerAssertionSigner.NewKey();
+        var values = new Dictionary<string, string?>
+        {
+            ["SEXTANT_SERVICE_CONTROL_TOKEN"] = null,
+            ["SEXTANT_SERVICE_CONTROL_TOKEN_FILE"] = WriteSecret("control-token", "control-secret\r\n"),
+            ["SEXTANT_SERVICE_QUERY_TOKEN"] = null,
+            ["SEXTANT_SERVICE_QUERY_TOKEN_FILE"] = WriteSecret("query-token", "query-secret\n"),
+            ["SEXTANT_SERVICE_CONTRIBUTE_TOKEN"] = null,
+            ["SEXTANT_SERVICE_CONTRIBUTE_TOKEN_FILE"] = WriteSecret("contribute-token", "contribute-secret\n"),
+            [CheckoutToken] = null,
+            [CheckoutToken + "_FILE"] = WriteSecret("checkout-token", "checkout-secret\r\n"),
+            ["SEXTANT_SERVICE_DELEGATE_TOKENS"] = null,
+            ["SEXTANT_SERVICE_DELEGATE_TOKENS_FILE"] = WriteSecret("delegate-tokens", "delegate-secret\n"),
+            ["SEXTANT_SERVICE_CALLER_KEYS"] = null,
+            ["SEXTANT_SERVICE_CALLER_KEYS_FILE"] = WriteSecret("caller-keys",
+                CallerAssertionSigner.KeySpec("key-a", key, "tenant-a") + "\n"),
+            ["SEXTANT_SERVICE_CALLER_AUDIENCE"] = "sextant",
+            ["SEXTANT_SERVICE_READ_POLICY"] = null,
+            ["SEXTANT_SERVICE_READ_POLICY_FILE"] =
+                WriteSecret("read-policy", "read-secret=https://github.com/acme/widgets\r\n"),
+            ["SEXTANT_SERVICE_PACKAGE_SOURCE_CREDENTIALS"] = null,
+            ["SEXTANT_SERVICE_PACKAGE_SOURCE_CREDENTIALS_FILE"] =
+                WriteSecret("package-credentials", "nuget.example.com=user:password\n")
+        };
+
+        try
+        {
+            var options = WithEnvironment(values, () => ServiceOptions.FromEnvironment(Config()));
+            Assert.AreEqual("control-secret", options.ControlToken);
+            Assert.AreEqual("query-secret", options.QueryToken);
+            Assert.AreEqual("contribute-secret", options.ContributeToken);
+            Assert.AreEqual("checkout-secret", options.CheckoutToken);
+            CollectionAssert.AreEqual(new[] { "delegate-secret" }, options.DelegateTokens.ToArray());
+            Assert.AreEqual(1, options.CallerAssertion.Keys.Count);
+            Assert.IsTrue(options.ReadPolicy.IsKnownPrincipal("read-secret"));
+            Assert.AreEqual("password", options.PackageSourceCredentials.Single().Password);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+
+        string WriteSecret(string name, string contents)
+        {
+            var path = Path.Combine(root, name);
+            File.WriteAllText(path, contents);
+            return path;
+        }
+    }
+
+    [TestMethod]
+    public void SecretFileMissing_FailsWithoutEchoingThePath()
+    {
+        const string fileVariable = "SEXTANT_SERVICE_CHECKOUT_TOKEN_FILE";
+        const string missingPath = "/missing/secret-file-should-not-be-echoed";
+        var ex = WithEnvironment(new Dictionary<string, string?>
+        {
+            [CheckoutToken] = null,
+            [fileVariable] = missingPath
+        }, () => Assert.ThrowsExactly<InvalidOperationException>(
+            () => ServiceOptions.FromEnvironment(Config())));
+
+        StringAssert.Contains(ex.Message, fileVariable);
+        Assert.IsFalse(ex.Message.Contains(missingPath, StringComparison.Ordinal));
+    }
+
+    [TestMethod]
+    public void SecretEnvironmentAndFile_BothSet_FailsWithoutEchoingEitherValue()
+    {
+        const string secret = "secret-value-must-not-be-echoed";
+        const string fileVariable = "SEXTANT_SERVICE_CHECKOUT_TOKEN_FILE";
+        var ex = WithEnvironment(new Dictionary<string, string?>
+        {
+            [CheckoutToken] = secret,
+            [fileVariable] = "/tmp/secret-path"
+        }, () => Assert.ThrowsExactly<InvalidOperationException>(
+            () => ServiceOptions.FromEnvironment(Config())));
+
+        StringAssert.Contains(ex.Message, CheckoutToken);
+        StringAssert.Contains(ex.Message, fileVariable);
+        Assert.IsFalse(ex.Message.Contains(secret, StringComparison.Ordinal));
+        Assert.IsFalse(ex.Message.Contains("/tmp/secret-path", StringComparison.Ordinal));
+    }
+
+    [TestMethod]
+    public void LegacySecretWarning_IsOneTimeAndDoesNotLogTheValue()
+    {
+        var name = $"SEXTANT_TEST_SECRET_LOG_CANARY_{Guid.NewGuid():N}";
+        const string secret = "must-never-appear-in-logs";
+        var oldError = Console.Error;
+        using var output = new StringWriter();
+        try
+        {
+            Console.SetError(output);
+            WithEnvironment(new Dictionary<string, string?> { [name] = secret, [name + "_FILE"] = null }, () =>
+            {
+                Assert.AreEqual(secret, SecretEnvironmentVariable.Read(name));
+                Assert.AreEqual(secret, SecretEnvironmentVariable.Read(name));
+                return true;
+            });
+        }
+        finally
+        {
+            Console.SetError(oldError);
+        }
+
+        var warning = output.ToString();
+        StringAssert.Contains(warning, name);
+        Assert.AreEqual(1, warning.Split("WARNING:", StringSplitOptions.None).Length - 1);
+        Assert.IsFalse(warning.Contains(secret, StringComparison.Ordinal));
+    }
+
+    private static T WithEnvironment<T>(Dictionary<string, string?> values, Func<T> body)
+    {
+        var prior = values.Keys.ToDictionary(name => name, Environment.GetEnvironmentVariable);
+        try
+        {
+            foreach (var (name, value) in values)
+                Environment.SetEnvironmentVariable(name, value);
+            return body();
+        }
+        finally
+        {
+            foreach (var (name, value) in prior)
+                Environment.SetEnvironmentVariable(name, value);
+        }
+    }
+
+    [TestMethod]
     public void MaxProvisioningAttempts_DefaultsToFive_WhenUnset()
     {
         Environment.SetEnvironmentVariable(MaxProvisioningAttempts, null);

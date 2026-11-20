@@ -11,6 +11,8 @@ namespace Sextant.Core;
 /// </summary>
 public sealed record ReadPrincipal
 {
+    public override string ToString() => "ReadPrincipal { Token = ***, Repositories = [redacted] }";
+
     public required string Token { get; init; }
 
     /// <summary>Allowed repository remote URLs; the single entry <c>"*"</c> grants all repositories.</summary>
@@ -34,6 +36,8 @@ public sealed record ReadPrincipal
 /// </summary>
 public sealed record ReadAuthorizationPolicy
 {
+    public override string ToString() => $"ReadAuthorizationPolicy {{ Enabled = {Enabled}, Principals = [redacted] }}";
+
     /// <summary>False for the default open posture (no policy) — the authorizer allows everything.</summary>
     public bool Enabled { get; init; }
 

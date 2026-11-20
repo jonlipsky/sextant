@@ -23,6 +23,15 @@ public class ContributionCliPlanTests
     };
 
     [TestMethod]
+    public void ContributeOptions_ToStringRedactsToken()
+    {
+        const string secret = "contribution-cli-token-marker";
+        var text = (Options() with { Token = secret }).ToString();
+
+        Assert.IsFalse(text.Contains(secret, StringComparison.Ordinal));
+    }
+
+    [TestMethod]
     public void No_git_root_is_an_error()
     {
         var decision = ContributionCliPlan.Decide(hasGitRoot: false, isDirty: false, Options(service: "https://svc"));
