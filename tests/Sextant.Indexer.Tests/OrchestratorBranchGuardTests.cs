@@ -49,11 +49,14 @@ public class OrchestratorBranchGuardTests
     }
 
     [TestMethod]
-    public async Task Cas_StaleBefore_PublishesButAttachesOnly()
+    [DataRow(Repo)]
+    [DataRow("HTTPS://GITHUB.COM:443/Acme/WIDGETS.git/")]
+    public async Task Cas_StaleBefore_PublishesButAttachesOnly(string url)
     {
         await Index("commit-A");
-        await Index("commit-B", expected: "commit-X");
+        await Index("commit-B", expected: "commit-X", url: url);
 
+        Assert.AreEqual(RepoId(), Store().GetRepositoryId(url));
         Assert.AreEqual("commit-A", HeadCommit("main"), "a stale before never moves the head");
         Assert.AreEqual(SnapshotStatus.Complete, StatusOf("commit-A"));
         Assert.AreEqual(SnapshotStatus.Complete, StatusOf("commit-B"), "the snapshot is still published");
@@ -162,11 +165,11 @@ public class OrchestratorBranchGuardTests
         Assert.AreEqual(SnapshotStatus.Superseded, StatusOf("commit-B"));
     }
 
-    private async Task Index(string commit, string branch = "main", string? expected = null, bool suppress = false)
+    private async Task Index(string commit, string branch = "main", string? expected = null, bool suppress = false, string url = Repo)
     {
         var ctx = new SnapshotContext
         {
-            RepositoryRemoteUrl = Repo,
+            RepositoryRemoteUrl = url,
             CommitSha = commit,
             BranchName = branch,
             ExpectedHeadCommit = expected,

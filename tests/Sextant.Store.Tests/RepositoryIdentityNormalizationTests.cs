@@ -49,10 +49,12 @@ public class RepositoryIdentityNormalizationTests
         var id2 = store.EnsureRepository(NoGit, now: 2);
         var id3 = store.EnsureRepository(Lowercase, now: 3);
         var id4 = store.EnsureRepository(TrailingSlash, now: 4);
+        var id5 = store.EnsureRepository("HTTPS://GITHUB.COM:443/ElevenWorks/MIXANDMATCH.GIT/", now: 5);
 
         Assert.AreEqual(id1, id2, ".git is identity-neutral");
         Assert.AreEqual(id1, id3, "case is identity-neutral");
         Assert.AreEqual(id1, id4, "a trailing slash is identity-neutral");
+        Assert.AreEqual(id1, id5, "scheme and host case and the default HTTPS port are identity-neutral");
         Assert.AreEqual(1, CountRepositories(), "all equivalent spellings map to ONE repository row");
         Assert.AreEqual(WithGit, StoredRemoteUrl(id1), "the row preserves the FIRST raw spelling; dedup is by normalized key");
     }
@@ -137,26 +139,56 @@ public class RepositoryIdentityNormalizationTests
     }
 
     [TestMethod]
-    public void GetRepositoryId_LegacyDuplicateRows_ExactSpellingStaysReachable_EquivalentResolvesDeterministically()
+    public void Upgrade_MergesLegacyRowsWithoutLosingSnapshots_AndKeepsTheNewestMainPointer()
     {
-        // A database indexed BEFORE this fix can already hold several raw-spelling rows that normalize
-        // equal (UNIQUE is on the raw remote_url, so the #92 spellings coexisted). Two invariants must hold
-        // on such a legacy catalog:
-        //   (1) each EXACT stored spelling keeps resolving to ITS OWN row, so snapshots/branches/deps and
-        //       contribution-validation binds attached to a higher-id duplicate are never hidden; and
-        //   (2) an EQUIVALENT spelling that is NOT stored verbatim resolves DETERMINISTICALLY to the
-        //       lowest-id equivalent row (the write-time dedup chokepoint), so new writes converge.
-        var lowId = InsertRawRepository(WithGit, now: 1);   // stored ".../MixAndMatch.git"
-        var midId = InsertRawRepository(NoGit, now: 2);     // stored ".../MixAndMatch" (normalizes equal)
-        Assert.IsTrue(lowId < midId, "sanity: rows inserted in ascending id order");
-
+        const string unrelated = "https://github.com/acme/other";
         var store = new SnapshotStore(_conn);
-        // (1) exact spellings keep reaching their own rows — no legacy data hidden behind another id.
-        Assert.AreEqual(lowId, store.GetRepositoryId(WithGit), "the exact stored spelling resolves to its own row");
-        Assert.AreEqual(midId, store.GetRepositoryId(NoGit), "the other exact stored spelling resolves to its own row");
-        // (2) an equivalent spelling with no verbatim row resolves to the lowest-id equivalent, deterministically.
-        Assert.AreEqual(lowId, store.GetRepositoryId(Lowercase), "a lowercase (unstored) spelling resolves to the lowest-id equivalent row");
-        Assert.AreEqual(lowId, store.GetRepositoryId(TrailingSlash), "a trailing-slash (unstored) spelling resolves to the lowest-id equivalent row");
+        var root = store.EnsureRepository(NoGit, 1);
+        var duplicate = store.EnsureRepository(unrelated, 2);
+        var oldCommit = store.EnsureCommit(root, "head", null, 1);
+        var newCommit = store.EnsureCommit(duplicate, "head", "tree", 2);
+        var (oldSnapshot, _, _) = store.BeginPending(Identity(NoGit, "head", "tree"), root, oldCommit, null, 1);
+        var newIdentity = Identity(WithGit, "head", "tree");
+        var (newSnapshot, _, _) = store.BeginPending(newIdentity, duplicate, newCommit, null, 2);
+        store.MarkComplete(oldSnapshot, 1);
+        store.MarkComplete(newSnapshot, 2);
+        store.SetBranchPointer(store.EnsureBranch(root, "main", true, 1), oldSnapshot, 1);
+        store.SetBranchPointer(store.EnsureBranch(duplicate, "main", true, 2), newSnapshot, 2);
+        store.SetBranchPointer(store.EnsureBranch(duplicate, "feature", false, 2), newSnapshot, 2);
+        store.RecordRetiredHead(duplicate, "idle", "retired", 2, SnapshotStore.RetiredHeadCauseIdle);
+        using (var seed = _conn.CreateCommand())
+        {
+            seed.CommandText = """
+                DROP INDEX ix_repositories_key;
+                DROP INDEX ix_snapshot_jobs_snapshot_branch;
+                ALTER TABLE repositories DROP COLUMN repository_key;
+                DELETE FROM schema_version WHERE version = 34;
+                UPDATE repositories SET remote_url = @url WHERE id = @id;
+                INSERT INTO pull_request_snapshots (repository_id, pr_number, snapshot_id, updated_at)
+                VALUES (@id, 1, @snapshot, 2);
+                """;
+            seed.Parameters.AddWithValue("@url", WithGit);
+            seed.Parameters.AddWithValue("@id", duplicate);
+            seed.Parameters.AddWithValue("@snapshot", newSnapshot);
+            seed.ExecuteNonQuery();
+        }
+
+        _db.RunMigrations();
+
+        Assert.AreEqual(1, CountRepositories());
+        foreach (var spelling in new[] { NoGit, WithGit, Lowercase, TrailingSlash })
+            Assert.AreEqual(root, store.GetRepositoryId(spelling));
+        Assert.AreEqual(newSnapshot, store.GetBranch(root, "main")!.SnapshotId);
+        Assert.AreEqual(newSnapshot, store.GetBranch(root, "feature")!.SnapshotId);
+        Assert.AreEqual(root, store.GetById(oldSnapshot)!.RepositoryId);
+        Assert.AreEqual(root, store.GetByIdentityHash(newIdentity.Hash)!.RepositoryId);
+        Assert.AreEqual(oldCommit, store.GetById(newSnapshot)!.CommitId);
+        Assert.AreEqual("retired", store.GetRetiredHead(root, "idle"));
+        using var check = _conn.CreateCommand();
+        check.CommandText = "SELECT repository_id FROM pull_request_snapshots WHERE pr_number = 1;";
+        Assert.AreEqual(root, check.ExecuteScalar());
+        check.CommandText = "PRAGMA foreign_key_check;";
+        Assert.IsNull(check.ExecuteScalar());
     }
 
     private static SnapshotIdentity Identity(string repo, string commit, string tree) => new()
@@ -193,14 +225,4 @@ public class RepositoryIdentityNormalizationTests
         return (long)cmd.ExecuteScalar()!;
     }
 
-    // Inserts a repository row with the RAW spelling directly, bypassing SnapshotStore's dedup, to
-    // reproduce a pre-fix database that holds several equivalent-spelling rows for one logical repo.
-    private long InsertRawRepository(string rawUrl, long now)
-    {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "INSERT INTO repositories (remote_url, created_at) VALUES (@url, @now) RETURNING id;";
-        cmd.Parameters.AddWithValue("@url", rawUrl);
-        cmd.Parameters.AddWithValue("@now", now);
-        return (long)cmd.ExecuteScalar()!;
-    }
 }

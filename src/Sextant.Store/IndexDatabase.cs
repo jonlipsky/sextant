@@ -1,5 +1,6 @@
 using System.Reflection;
 using Microsoft.Data.Sqlite;
+using Sextant.Core;
 
 namespace Sextant.Store;
 
@@ -210,8 +211,18 @@ public sealed class IndexDatabase : IDisposable
             {
                 using var cmd = conn.CreateCommand();
                 cmd.Transaction = transaction;
-                cmd.CommandText = sql;
-                cmd.ExecuteNonQuery();
+                if (version == 34)
+                    conn.CreateFunction<string, string>("sextant_repository_key", RemoteUrlIdentity.Normalize, isDeterministic: true);
+                try
+                {
+                    cmd.CommandText = sql;
+                    cmd.ExecuteNonQuery();
+                }
+                finally
+                {
+                    if (version == 34)
+                        conn.CreateFunction<string, string>("sextant_repository_key", null);
+                }
 
                 SetSchemaVersion(conn, transaction, version);
                 transaction.Commit();

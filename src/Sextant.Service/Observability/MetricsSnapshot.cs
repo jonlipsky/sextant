@@ -242,6 +242,8 @@ public sealed record DefaultBranchFreshness
     public bool? BehindRemote { get; init; }
 }
 
+public sealed record DefaultBranchPointerLag(string Repository, string Branch, double LagSeconds);
+
 /// <summary>
 /// Whether the service's previous runs ended without releasing the writer lease (issue #320): a crash or kill such as
 /// the kernel OOM killer. <see cref="UncleanShutdownsTotal"/> is durable and monotonic (alert on its increase);
@@ -300,6 +302,7 @@ public sealed record MetricsSnapshot
 
     /// <summary>Index freshness per tracked default branch (issue #355). Control plane only.</summary>
     public IReadOnlyList<DefaultBranchFreshness> Freshness { get; init; } = [];
+    public IReadOnlyList<DefaultBranchPointerLag> DefaultBranchPointerLag { get; init; } = [];
 
     public IReadOnlyList<Alert> Alerts { get; init; } = [];
     public IReadOnlyList<Sextant.Store.AuditCostAttribution> CostByRepository { get; init; } = [];

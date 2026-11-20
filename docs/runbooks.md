@@ -221,6 +221,31 @@ job; a missing push webhook shows as lag with no job at all.
 backlog below. Failed: see job failures. Unknown: check the repository token/host reachability from the service, and that the
 default branch still exists.
 
+### Runbook: default branch pointer behind a completed snapshot
+
+**Raise when.** Alert on `sextant_default_branch_pointer_lag_seconds > 60 * N` for two consecutive scrapes (start with
+`N = 15`). This control-plane gauge is labelled by repository and branch and survives service restarts. It measures the
+publication-time gap between the pointed-to snapshot and the newest retained, complete full snapshot from a successful job
+for that branch. It does not assert that the newer snapshot is the remote head. A pointer with no published target is
+not measured here; use the remote freshness signal above.
+
+**Confirm.** Compare `/control/resolve` (`commit_sha`) with the remote branch head, then check `/control/status` for
+the job and `/control/audit` for action `branch_advance_refused` with detail `branch_advance_refused=expected_head_mismatch`, `head_sequence_not_newer`, or
+`pointer_not_selected`. A force-push or a missed predecessor can leave every later push expecting a head the index
+never pointed to. An older publication can also be the correct target after a reset: do not advance solely to clear
+the gauge if the pointer already matches the remote.
+
+**Recover.** In clone mode the upstream maintenance pass repairs a verified default-branch head after two successful
+listings agree, reusing the newest usable full snapshot for that commit even if the build used another URL spelling.
+Check `SEXTANT_SERVICE_MAINTENANCE_INTERVAL_MINUTES`, `SEXTANT_SERVICE_BRANCH_UPSTREAM_CHECK_MINUTES`, and
+`SEXTANT_SERVICE_BRANCH_UPSTREAM_HEAL_MAX_PER_TICK` if it is not running. For immediate manual recovery, independently
+verify the current remote head, then submit an application `POST /control/ensure` for that commit and branch with
+`expected_head_commit` set to the currently indexed commit from `/control/resolve`, not the webhook's `before` value.
+If the CAS fails, re-read both heads before retrying. Do not edit the database or disable the guard. On upgrade,
+migration 034 merges legacy URL aliases and retains their snapshots. It advances the snapshot schema, so an ordinary
+ensure may build a new identity on next use; the verified-head repair can still use the retained complete snapshot.
+Back up the catalog before applying the migration.
+
 ### Runbook: job failures
 
 **Raised when.** `sextant_alert_active{id="low_success_rate"}` = 1 (24 h rolling-window success rate below 0.90 warning, below 0.50 critical,

@@ -75,11 +75,41 @@ public sealed class MetricsCollector(
             Maintenance = metrics.Maintenance,
             Crash = CollectCrash(),
             Freshness = freshness?.Evaluate(connection, visibleRepositoryKeys) ?? [],
+            DefaultBranchPointerLag = CollectDefaultBranchPointerLag(visibleRepositoryKeys),
             WriteLock = writeLocks?.Snapshot() ?? new WriteLockMetrics(),
             CostByRepository = cost
         };
 
         return snapshot with { Alerts = AlertEvaluator.Evaluate(snapshot, thresholds) };
+    }
+
+    private IReadOnlyList<DefaultBranchPointerLag> CollectDefaultBranchPointerLag(IReadOnlySet<string>? visibleRepositoryKeys)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT r.remote_url, b.name, MAX(0, COALESCE((
+                SELECT MAX(s.published_at)
+                FROM snapshots s
+                JOIN snapshot_jobs j ON j.snapshot_id = s.id AND COALESCE(j.branch_name, 'main') = b.name
+                WHERE s.repository_id = r.id AND j.status IN ('complete', 'partial')
+                  AND s.status = 'complete' AND s.commit_id IS NOT NULL AND s.is_overlay = 0
+                  AND s.is_provider = 0 AND s.working_tree_delta IS NULL
+            ) - current.published_at, 0)) / 1000.0
+            FROM branches b
+            JOIN repositories r ON r.id = b.repository_id
+            JOIN snapshots current ON current.id = b.snapshot_id
+            WHERE b.is_default = 1 AND r.is_provider = 0 AND current.published_at IS NOT NULL
+            ORDER BY r.repository_key, b.name;
+            """;
+        using var reader = cmd.ExecuteReader();
+        var result = new List<DefaultBranchPointerLag>();
+        while (reader.Read())
+        {
+            var url = reader.GetString(0);
+            if (visibleRepositoryKeys is null || visibleRepositoryKeys.Contains(RepositoryGrantKey.Of(url)))
+                result.Add(new(DefaultBranchFreshnessTracker.LabelOf(url), reader.GetString(1), reader.GetDouble(2)));
+        }
+        return result;
     }
 
     // The crash counters are a bonus signal: a missing table (a pre-032 catalog being read) or a database error must

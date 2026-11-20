@@ -218,7 +218,8 @@ public sealed partial class SnapshotService
                 if (heads.TryGetValue(candidate.Name, out var remoteHead))
                 {
                     _upstreamAbsentOnce.Remove(key);
-                    if (healMax <= 0 || string.Equals(remoteHead, candidate.HeadCommit, StringComparison.OrdinalIgnoreCase))
+                    if (healMax <= 0 || (string.Equals(remoteHead, candidate.HeadCommit, StringComparison.OrdinalIgnoreCase)
+                        && (!candidate.IsDefault || !HasPublishedDefaultReplacement(candidate, remoteHead))))
                     {
                         _upstreamStale.Remove(key);
                         continue;
@@ -330,6 +331,17 @@ public sealed partial class SnapshotService
 
     private enum HealStart { Started, Busy, Terminal, NotStarted }
 
+    private readonly HashSet<(string Repository, string Branch)> _pendingDefaultRepairs = [];
+
+    private bool HasPublishedDefaultReplacement(IdleBranchCandidate candidate, string remoteHead) =>
+        ReadCatalog(conn =>
+        {
+            var snapshots = new SnapshotStore(conn);
+            return snapshots.GetById(candidate.SnapshotId) is { } current
+                && snapshots.FindPublishedBranchHead(current.RepositoryId, remoteHead) is long newer
+                && (newer != current.Id || current.Status != SnapshotStatus.Complete);
+        });
+
     // Issue #400: the heal is an ordinary service-owned branch-advance ensure of the remote head (the shape a push
     // sends: CAS on the pointer's current commit), so admission, coalescing, the write turn, the CAS/reuse rules and
     // the ensure audit row are exactly the push path's, attributed to upstream_policy. It is not awaited: the index may
@@ -358,7 +370,9 @@ public sealed partial class SnapshotService
             lock (_inFlightLock)
             {
                 ObjectDisposedException.ThrowIf(_disposed, this);
+                ThrowIfStopping();
                 if (_latestAdvance.ContainsKey(repositoryKey + "\n" + candidate.Name)
+                    || _pendingDefaultRepairs.Contains((repositoryKey, candidate.Name))
                     || _pendingIdleRetires.Contains(IdleRetireKey(candidate.RepositoryRemoteUrl, candidate.Name)))
                     return HealStart.Busy;
 
@@ -366,12 +380,21 @@ public sealed partial class SnapshotService
                 using (var reader = OpenReadConnection())
                 {
                     var pointer = new SnapshotStore(reader).ListBranchPointers().FirstOrDefault(p => p.BranchId == candidate.BranchId);
-                    if (pointer is null || pointer.SnapshotId != candidate.SnapshotId
+                    if (pointer is null || pointer.SnapshotId != candidate.SnapshotId || pointer.UpdatedAt != candidate.UpdatedAt
+                        || pointer.IsDefault != candidate.IsDefault
                         || !string.Equals(pointer.HeadCommit, candidate.HeadCommit, StringComparison.OrdinalIgnoreCase))
                         return HealStart.Busy;
                     var jobs = new SnapshotJobStore(reader);
                     if (jobs.BranchesWithPendingWork().Contains((repositoryKey, candidate.Name)))
                         return HealStart.Busy;
+                    var store = new SnapshotStore(reader);
+                    if (candidate.IsDefault && store.GetRepositoryId(candidate.RepositoryRemoteUrl) is long repoId
+                        && store.FindPublishedBranchHead(repoId, remoteHead) is long publishedId
+                        && (publishedId != candidate.SnapshotId || store.GetById(publishedId)?.Status != SnapshotStatus.Complete))
+                    {
+                        StartPublishedDefaultRepair(candidate, remoteHead, repositoryKey);
+                        return HealStart.Started;
+                    }
                     healJob = jobs.GetJobByIdentity(IdentityHashFor(request));
                 }
                 // A heal of a commit whose build already failed for good would only repeat the failure (and write an
@@ -389,6 +412,80 @@ public sealed partial class SnapshotService
         catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException or ArgumentException)
         {
             return HealStart.NotStarted;
+        }
+    }
+
+    // Called at admission under _inFlightLock. Use the same writer ordering as a normal expedited default ensure.
+    private void StartPublishedDefaultRepair(IdleBranchCandidate candidate, string remoteHead, string repositoryKey)
+    {
+        var turn = TakeWriteTurnLocked(out _, expedited: true);
+        _pendingDefaultRepairs.Add((repositoryKey, candidate.Name));
+        var operation = Task.Run(async () =>
+        {
+            await turn.ConfigureAwait(false);
+            try
+            {
+                EnsureLeaseHeld();
+                if (_lifetime.IsCancellationRequested)
+                    return false;
+                lock (_inFlightLock)
+                {
+                    if (_latestAdvance.ContainsKey(repositoryKey + "\n" + candidate.Name))
+                        return false;
+                }
+                return RepairPublishedDefaultLocked(candidate, remoteHead);
+            }
+            finally
+            {
+                _writeGate.Release();
+            }
+        }, CancellationToken.None);
+        _operations.Add(operation);
+        _ = operation.ContinueWith(t =>
+        {
+            lock (_inFlightLock)
+            {
+                _operations.Remove(t);
+                _pendingDefaultRepairs.Remove((repositoryKey, candidate.Name));
+            }
+            if (t.Exception is { } error)
+                Console.Error.WriteLine($"Default branch repair failed: {error.GetBaseException().Message}");
+            _metrics.RecordUpstreamBranchHealApplied(t.IsCompletedSuccessfully && t.Result);
+        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+    }
+
+    private bool RepairPublishedDefaultLocked(IdleBranchCandidate observed, string verifiedHead)
+    {
+        var snapshots = new SnapshotStore(_conn);
+        BeginRaw("repair-default-pointer");
+        try
+        {
+            var repo = snapshots.GetRepositoryId(observed.RepositoryRemoteUrl);
+            var branch = repo is long id ? snapshots.GetBranch(id, observed.Name) : null;
+            var reason = "pointer_changed";
+            var advanced = false;
+            if (branch is { IsDefault: true } && branch.Id == observed.BranchId
+                && branch.SnapshotId == observed.SnapshotId && branch.UpdatedAt == observed.UpdatedAt)
+            {
+                reason = "snapshot_unavailable";
+                if (snapshots.FindPublishedBranchHead(branch.RepositoryId, verifiedHead) is long publishedId)
+                {
+                    if (snapshots.GetById(publishedId)?.Status == SnapshotStatus.Superseded)
+                        snapshots.MarkStatus(publishedId, SnapshotStatus.Complete);
+                    advanced = snapshots.AdvanceBranchPointerIfHeadMatches(branch.Id, publishedId, observed.HeadCommit,
+                        _timeProvider.GetUtcNow().ToUnixTimeMilliseconds());
+                    reason = advanced ? $"default_pointer_repaired;snapshot={publishedId}" : "expected_head_mismatch";
+                }
+            }
+            new AuditLogStore(_conn).Append(AuditAction.Reconcile, advanced ? AuditOutcome.Complete : AuditOutcome.Failed,
+                actor: UpstreamPolicyCaller.Actor, repositoryScope: observed.RepositoryRemoteUrl, detail: reason);
+            ExecRaw("COMMIT;");
+            return advanced;
+        }
+        catch
+        {
+            ExecRaw("ROLLBACK;");
+            throw;
         }
     }
 

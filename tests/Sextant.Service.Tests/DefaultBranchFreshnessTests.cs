@@ -84,7 +84,9 @@ public class DefaultBranchFreshnessTests
 
         Assert.IsNull(h.Find(Repo));
         Assert.IsNotNull(h.Find(Other));
-        Assert.IsFalse(h.Prometheus().Contains("repository=\"" + Repo + "\"", StringComparison.Ordinal));
+        Assert.IsFalse(h.Prometheus().Split('\n').Any(line =>
+            line.StartsWith("sextant_default_branch_lag_", StringComparison.Ordinal)
+            && line.Contains("repository=\"" + Repo + "\"", StringComparison.Ordinal)));
     }
 
     [TestMethod]

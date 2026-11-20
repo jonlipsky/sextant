@@ -18,7 +18,6 @@ public class ApiSurfaceGitCommitIndexTests
     public void Migration031_IsIdentityNeutral()
     {
         Assert.Contains(31, IndexDatabase.IdentityNeutralMigrations);
-        Assert.AreEqual(26, IndexDatabase.SnapshotSchemaVersion);
         Assert.IsGreaterThanOrEqualTo(31, IndexDatabase.LatestSchemaVersion);
     }
 

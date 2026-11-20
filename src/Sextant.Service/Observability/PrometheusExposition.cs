@@ -113,6 +113,16 @@ public static class PrometheusExposition
                 sb.Append("sextant_default_branch_lag_unknown{repository=\"").Append(Escape(f.Repository)).Append("\"} 1\n");
         }
 
+        if (s.DefaultBranchPointerLag.Count > 0)
+        {
+            sb.Append("# HELP sextant_default_branch_pointer_lag_seconds Publication-time gap from the default pointer to the newest completed snapshot for that branch.\n");
+            sb.Append("# TYPE sextant_default_branch_pointer_lag_seconds gauge\n");
+            foreach (var lag in s.DefaultBranchPointerLag)
+                sb.Append("sextant_default_branch_pointer_lag_seconds{repository=\"").Append(Escape(lag.Repository))
+                    .Append("\",branch=\"").Append(Escape(lag.Branch)).Append("\"} ")
+                    .Append(lag.LagSeconds.ToString("G", CultureInfo.InvariantCulture)).Append('\n');
+        }
+
         // Issue #342: catalog write-lock holds and waits.
         Gauge(sb, "sextant_write_lock_longest_hold_ms", "Longest catalog write-lock hold since start, in milliseconds.",
             s.WriteLock.LongestHoldMs);

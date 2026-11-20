@@ -69,6 +69,21 @@ public static class RemoteUrlIdentity
         if (url.EndsWith(".git", StringComparison.OrdinalIgnoreCase))
             url = url[..^4];
 
+        var schemeEnd = url.IndexOf("://", StringComparison.Ordinal);
+        if (schemeEnd > 0 && Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.Host.Length > 0)
+        {
+            var authorityEnd = url.IndexOfAny(['/', '?', '#'], schemeEnd + 3);
+            if (authorityEnd < 0)
+                authorityEnd = url.Length;
+            var userEnd = url.LastIndexOf('@', authorityEnd - 1, authorityEnd - schemeEnd - 3);
+            var user = userEnd < 0 ? "" : url[(schemeEnd + 3)..(userEnd + 1)];
+            var path = url[authorityEnd..];
+            var hostAndPort = uri.Host.ToLowerInvariant()
+                + (uri.IsDefaultPort || uri.Port < 0 ? "" : $":{uri.Port}");
+            return $"{uri.Scheme}://{user}{hostAndPort}"
+                + (CaseInsensitivePathHosts.Contains(uri.Host) ? path.ToLowerInvariant() : path);
+        }
+
         var host = ExtractHost(url);
         if (host is null)
             return url; // Host indeterminable: conservatively fold nothing beyond trim/.git/slash.

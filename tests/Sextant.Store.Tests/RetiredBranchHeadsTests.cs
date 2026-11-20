@@ -34,7 +34,6 @@ public sealed class RetiredBranchHeadsTests : IDisposable
     {
         Assert.Contains(30, IndexDatabase.IdentityNeutralMigrations);
         Assert.Contains("retired_branch_heads", IndexDatabase.ServiceJobTables);
-        Assert.AreEqual(26, IndexDatabase.SnapshotSchemaVersion, "recording retired heads re-indexes nothing");
         Assert.AreEqual(IndexDatabase.LatestSchemaVersion, _db.CurrentSchemaVersion);
     }
 
