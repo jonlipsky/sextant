@@ -606,18 +606,36 @@ public sealed partial class SnapshotService : IDisposable
         Task<EnsureSnapshotResult> completion;
         Task persisted = Task.CompletedTask;
         AdvanceTicket? ticket = null;
+        var admissionKey = EnsureAdmissionKey(request);
         long seq;
         lock (_inFlightLock)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             ThrowIfStopping();
+            var barrier = Interlocked.Read(ref _ensureAdmissionBarrier);
+            if (_ensureAdmissions.TryGetValue(admissionKey, out var duplicate) && duplicate.Request == request
+                && duplicate.Principal.Actor == principal.Actor
+                && duplicate.Principal.UserTenant == principal.UserTenant && duplicate.Principal.UserSubject == principal.UserSubject
+                && duplicate.WriteAdmission == barrier && !duplicate.Completion.IsCompleted)
+            {
+                _duplicateEnsureAdmissions++;
+                if (replaySeq is long replay)
+                    _ = duplicate.Completion.ContinueWith(t => ForgetQueuedEnsure(replay, t),
+                        CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                Log($"queued_ensure_duplicate seq={replaySeq?.ToString() ?? "live"} retained_seq={duplicate.Seq}");
+                var duplicateAccepted = _inFlight.TryGetValue(hash, out var producing)
+                    ? Task.FromResult(PendingResult(producing.JobId, hash))
+                    : AsAttached(duplicate.Accepted);
+                return (duplicateAccepted, AsAttached(duplicate.Completion), hash, duplicate.Persisted);
+            }
             // Issue #158: the ensure takes its turn on the writer now, in submission order. A user ensure that must
             // first look up the remote's default branch (issue #199) takes its turn once that lookup has finished.
             // Issue #403: an ensure that claims the default branch (only the application may; a user ensure with
             // default_branch is refused) takes the expedited lane, so it never waits behind feature-branch work.
             var turn = request.RestrictsImplicitDefault
                 ? null
-                : TakeWriteTurnLocked(out _, expedited: request.IsDefaultBranch == true && !request.SuppressesBranchUpdate);
+                : TakeWriteTurnLocked(out _, expedited: request.IsDefaultBranch == true && !request.SuppressesBranchUpdate,
+                    ensureAdmission: true);
             if (turn is not null)
                 ticket = AdmitAdvanceLocked(request, hash, expedited: request.IsDefaultBranch == true && !request.SuppressesBranchUpdate);
             // Issue #406: the admission sequence orders a restart's replay; a replayed ensure keeps its persisted row.
@@ -631,17 +649,12 @@ public sealed partial class SnapshotService : IDisposable
             var rowWritten = persisted;
             completion = Task.Run(async () =>
             {
-                try
-                {
-                    return await RunEnsureAsync(request, hash, principal, accepted, turn, ticket).ConfigureAwait(false);
-                }
-                finally
-                {
-                    await rowWritten.ConfigureAwait(false);
-                }
+                await rowWritten.ConfigureAwait(false);
+                return await RunEnsureAsync(request, hash, principal, accepted, turn, ticket, admittedSeq).ConfigureAwait(false);
             }, CancellationToken.None);
             _operations.Add(completion);
             _pendingEnsures[hash] = _pendingEnsures.GetValueOrDefault(hash) + 1;
+            _ensureAdmissions[admissionKey] = new(request, principal, seq, barrier, accepted.Task, completion, persisted);
         }
         completion.ContinueWith(
             t =>
@@ -649,6 +662,8 @@ public sealed partial class SnapshotService : IDisposable
                 lock (_inFlightLock)
                 {
                     _operations.Remove(t);
+                    if (_ensureAdmissions.TryGetValue(admissionKey, out var admission) && admission.Completion == t)
+                        _ensureAdmissions.Remove(admissionKey);
                     EndPendingEnsureLocked(hash);
                     if (ticket is not null)
                     {
@@ -659,12 +674,16 @@ public sealed partial class SnapshotService : IDisposable
                         && _latestAdvance.TryGetValue(ticket.BranchKey, out var latest) && ReferenceEquals(latest, ticket))
                         _latestAdvance.Remove(ticket.BranchKey);
                 }
-                ForgetQueuedEnsure(seq, t);
+                if (!t.IsCompletedSuccessfully)
+                    ForgetQueuedEnsure(seq, t);
                 SettleAccepted(accepted, t);
             },
             CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
         return (accepted.Task, completion, hash, persisted);
     }
+
+    private static async Task<EnsureSnapshotResult> AsAttached(Task<EnsureSnapshotResult> result) =>
+        (await result.ConfigureAwait(false)) with { Attached = true };
 
     // Issue #273: registers a branch-advance ensure guarded by expected_head_commit (what a repository push sends) as
     // its branch's latest, superseding the previous one when that one is still waiting for its turn and this one expects
@@ -783,8 +802,10 @@ public sealed partial class SnapshotService : IDisposable
     // writer stalls for good (ReleaseTurn covers a turn abandoned before it was granted).
     private Task TakeWriteTurnLocked() => TakeWriteTurnLocked(out _);
 
-    private Task TakeWriteTurnLocked(out long admission, bool priority = false, bool expedited = false)
+    private Task TakeWriteTurnLocked(out long admission, bool priority = false, bool expedited = false, bool ensureAdmission = false)
     {
+        if (!ensureAdmission)
+            Interlocked.Increment(ref _ensureAdmissionBarrier);
         admission = Interlocked.Increment(ref _writeAdmissions);
         return _writeGate.WaitAsync(CancellationToken.None, priority, expedited);
     }
@@ -853,13 +874,13 @@ public sealed partial class SnapshotService : IDisposable
 
     private async Task<EnsureSnapshotResult> RunEnsureAsync(
         EnsureSnapshotRequest request, string hash, AuditCaller principal,
-        TaskCompletionSource<EnsureSnapshotResult> accepted, Task? turn, AdvanceTicket? ticket)
+        TaskCompletionSource<EnsureSnapshotResult> accepted, Task? turn, AdvanceTicket? ticket, long seq)
     {
         using var activity = ServiceTelemetry.Source.StartActivity("ensure_snapshot");
         activity?.SetTag("sextant.repository", request.RepositoryRemoteUrl);
         activity?.SetTag("sextant.commit", request.CommitSha);
 
-        var result = await EnsureSnapshotCoreAsync(request, hash, principal, accepted, turn, ticket).ConfigureAwait(false);
+        var result = await EnsureSnapshotCoreAsync(request, hash, principal, accepted, turn, ticket, seq).ConfigureAwait(false);
 
         _metrics.RecordEnsure(result.Attached);
         activity?.SetTag("sextant.status", result.Status);
@@ -969,7 +990,7 @@ public sealed partial class SnapshotService : IDisposable
     // a shared, service-owned production per identity, which runs on the turn of the ensure that started it.
     private async Task<EnsureSnapshotResult> EnsureSnapshotCoreAsync(
         EnsureSnapshotRequest request, string hash, AuditCaller principal,
-        TaskCompletionSource<EnsureSnapshotResult> accepted, Task? turn, AdvanceTicket? ticket = null)
+        TaskCompletionSource<EnsureSnapshotResult> accepted, Task? turn, AdvanceTicket? ticket, long seq)
     {
         var granted = false;
         var handedOff = false;
@@ -1035,20 +1056,30 @@ public sealed partial class SnapshotService : IDisposable
             // is attached — branch pointer advanced — in that SAME gate hold: releasing the gate between the check
             // and the advance would let a concurrent ensure supersede the snapshot in between, leaving the branch
             // head on a Superseded snapshot (issue #85).
-            var (job, existed, attached) = TryAttachTerminal(request, hash, principal);
+            var (job, existed, attached) = TryAttachTerminal(request, hash);
             if (attached is not null)
+            {
+                var (repaired, refusal) = await RepairVerifiedDefaultHeadAsync(request, attached).ConfigureAwait(false);
+                attached = repaired;
+                RecordEnsureAuditLocked(request, attached, principal, refusal);
+                DeleteSettledQueuedEnsureLocked(seq, attached);
                 return attached;
+            }
             accepted.TrySetResult(PendingResult(job, existed));
 
             // Issue #273: a newer commit of this branch was admitted while this one waited, so it builds the branch's
             // snapshot; this commit is not produced. (An identity already terminal was attached above at no cost.)
             if (supersededBy is not null && inFlight is null)
-                return CoalesceLocked(request, job, existed, supersededBy, principal);
+            {
+                var coalesced = CoalesceLocked(request, job, existed, supersededBy, principal);
+                DeleteSettledQueuedEnsureLocked(seq, coalesced);
+                return coalesced;
+            }
 
             // Shutdown began: the job stays durably queued for the next instance to produce.
             ThrowIfStopping();
 
-            var production = StartProduction(request, hash, job.Id, existed, principal);
+            var production = StartProduction(request, hash, job.Id, existed, principal, seq);
             handedOff = true;
             return await production.ConfigureAwait(false);
         }
@@ -1091,7 +1122,7 @@ public sealed partial class SnapshotService : IDisposable
     // when its terminal result is still usable, advances/attaches this request's branch pointer and records the
     // request's audit row in the SAME gate hold. Returns the attach result, or null when production is needed.
     private (SnapshotJobRow Job, bool Existed, EnsureSnapshotResult? Attached) TryAttachTerminal(
-        EnsureSnapshotRequest request, string hash, AuditCaller principal)
+        EnsureSnapshotRequest request, string hash)
     {
         var jobs = new SnapshotJobStore(_conn);
         var (row, wasExisting) = RegisterJobLocked(jobs, hash, request.RepositoryRemoteUrl, request.CommitSha, request.BranchName);
@@ -1101,7 +1132,6 @@ public sealed partial class SnapshotService : IDisposable
             return (row, wasExisting, null);
         var advanced = AdvanceOrAttachBranchPointer(request, row.SnapshotId);
         var attached = Attach(row, wasExisting, CoverageFor(row.SnapshotId)) with { BranchAdvanced = advanced };
-        RecordEnsureAuditLocked(request, attached, principal);
         return (row, wasExisting, attached);
     }
 
@@ -1128,7 +1158,7 @@ public sealed partial class SnapshotService : IDisposable
     // sequence) and principal. Every production runs while holding the gate and deregisters before releasing it, so
     // none can be in flight while the caller holds the gate.
     private Task<EnsureSnapshotResult> StartProduction(
-        EnsureSnapshotRequest request, string hash, long jobId, bool existed, AuditCaller principal)
+        EnsureSnapshotRequest request, string hash, long jobId, bool existed, AuditCaller principal, long seq)
     {
         lock (_inFlightLock)
         {
@@ -1139,7 +1169,7 @@ public sealed partial class SnapshotService : IDisposable
             // Registered under the lock BEFORE the production can deregister itself (it takes the same lock).
             var entry = new InFlightProduction(jobId);
             entry.Production = Task.Run(
-                () => RunProductionAsync(request, hash, jobId, existed, principal, entry), CancellationToken.None);
+                () => RunProductionAsync(request, hash, jobId, existed, principal, entry, seq), CancellationToken.None);
             _inFlight[hash] = entry;
             // After the production Task completed (not from inside its frame, which still roots the job's state).
             ScheduleJobMemoryReclaim(entry.Production, jobId);
@@ -1172,13 +1202,15 @@ public sealed partial class SnapshotService : IDisposable
     // deregisters itself BEFORE releasing the gate — so any request that can observe the new durable state (which
     // needs the gate) never attaches to this already-finished production.
     private async Task<EnsureSnapshotResult> RunProductionAsync(
-        EnsureSnapshotRequest request, string hash, long jobId, bool existed, AuditCaller principal, InFlightProduction entry)
+        EnsureSnapshotRequest request, string hash, long jobId, bool existed, AuditCaller principal, InFlightProduction entry, long seq)
     {
         try
         {
             EnsureLeaseHeld();
-            var result = await ProduceLockedAsync(request, hash, jobId, existed).ConfigureAwait(false);
-            RecordEnsureAuditLocked(request, result, principal);
+            var produced = await ProduceLockedAsync(request, hash, jobId, existed).ConfigureAwait(false);
+            var (result, refusal) = await RepairVerifiedDefaultHeadAsync(request, produced).ConfigureAwait(false);
+            RecordEnsureAuditLocked(request, result, principal, refusal);
+            DeleteSettledQueuedEnsureLocked(seq, result);
             return result;
         }
         finally
@@ -2644,6 +2676,7 @@ public sealed partial class SnapshotService : IDisposable
             {
                 // Counted like any write's turn, so a retirement is never coalesced across it (issue #158).
                 Interlocked.Increment(ref service._writeAdmissions);
+                Interlocked.Increment(ref service._ensureAdmissionBarrier);
                 var asked = System.Diagnostics.Stopwatch.GetTimestamp();
                 try
                 {
@@ -3345,7 +3378,8 @@ public sealed partial class SnapshotService : IDisposable
     // is recorded only for a job that actually RAN (an attach reuses prior work and has no new cost). The
     // caller holds the write gate — the row is written in the same hold that settled the result, so it is
     // durable before any caller observes the result, even one that already disconnected (issue #148).
-    private void RecordEnsureAuditLocked(EnsureSnapshotRequest request, EnsureSnapshotResult result, AuditCaller principal)
+    private void RecordEnsureAuditLocked(EnsureSnapshotRequest request, EnsureSnapshotResult result, AuditCaller principal,
+        DefaultRepairRefusal? repairRefusal = null)
     {
         var jobs = new SnapshotJobStore(_conn);
         var job = jobs.GetJob(result.JobId);
@@ -3363,9 +3397,23 @@ public sealed partial class SnapshotService : IDisposable
             costIndexMs: costMs);
         var refusal = BranchAdvanceRefusal(request, result);
         if (refusal is not null)
+        {
             audit.Append(AuditAction.BranchAdvanceRefused, AuditOutcome.Denied,
                 actor: principal.Actor, repositoryScope: request.RepositoryRemoteUrl,
                 detail: principal.Detail($"job_{result.JobId};branch_advance_refused={refusal}"));
+            Log(System.Text.Json.JsonSerializer.Serialize(new
+            {
+                @event = AuditAction.BranchAdvanceRefused,
+                job_id = result.JobId,
+                repository = RemoteUrlIdentity.Normalize(request.RepositoryRemoteUrl),
+                branch = request.BranchName ?? "main",
+                snapshot_id = result.SnapshotId,
+                expected_head = request.ExpectedHeadCommit,
+                observed_head = repairRefusal?.ObservedHead,
+                fresh_head = repairRefusal?.FreshHead,
+                reason = repairRefusal is null ? refusal : RemoteHeadMoved
+            }));
+        }
     }
 
     private string? BranchAdvanceRefusal(EnsureSnapshotRequest request, EnsureSnapshotResult result)
@@ -3467,6 +3515,7 @@ public sealed partial class SnapshotService : IDisposable
         // Synchronous callers only (startup reconcile, the sync retention/backup/PR-root APIs): request threads
         // use WithWriteAsync with their own token (issue #148), so this explicitly opts out of cancellation.
         Interlocked.Increment(ref _writeAdmissions);
+        Interlocked.Increment(ref _ensureAdmissionBarrier);
         _writeGate.Wait(CancellationToken.None);
         try
         {
@@ -3483,6 +3532,7 @@ public sealed partial class SnapshotService : IDisposable
     {
         // Counted like a control write's turn, so a retirement is never coalesced across another write (issue #158).
         Interlocked.Increment(ref _writeAdmissions);
+        Interlocked.Increment(ref _ensureAdmissionBarrier);
         // A maintenance write (issue #333) takes the priority lane and records how long it waited, so starvation shows.
         var asked = System.Diagnostics.Stopwatch.GetTimestamp();
         await _writeGate.WaitAsync(cancellationToken, priority).ConfigureAwait(false);

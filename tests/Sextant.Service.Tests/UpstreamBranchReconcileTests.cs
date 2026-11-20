@@ -848,20 +848,106 @@ public class UpstreamBranchReconcileTests
     }
 
     [TestMethod]
-    public async Task BranchWithAQueuedJob_IsNotHealed()
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task OnlyARunningJobOnTheSameBranch_BlocksHealing(bool running)
     {
         await using var h = Harness.Create(p => p with { BranchUpstreamHealMaxPerTick = 10 });
         h.Seed(Repo, "feature", false, Sha('2'));
         h.Lister.SetHeads(Repo, new Dictionary<string, string> { ["feature"] = Sha('3') });
         h.Start();
-        new SnapshotJobStore(h.Db.GetConnection()).EnsureJob("identity-q", Repo + ".git", Sha('3'), "feature");
+        var jobs = new SnapshotJobStore(h.Db.GetConnection());
+        var (job, _) = jobs.EnsureJob("identity-q", Repo + ".git", Sha('3'), "feature");
+        if (running)
+            jobs.MarkRunning(job.Id, h.Service.OwnerToken);
 
         await Pass(h);
         h.Clock.Advance(TimeSpan.FromMinutes(61));
         var second = await Pass(h);
 
-        Assert.AreEqual(1, second.HealBusy);
-        Assert.AreEqual(0, second.HealsStarted);
+        Assert.AreEqual(running ? 1 : 0, second.HealBusy);
+        Assert.AreEqual(running ? 0 : 1, second.HealsStarted);
+        if (!running)
+            await WaitUntilAsync(() => PointerCommit(h, Repo, "feature") == Sha('3'));
+    }
+
+    [TestMethod]
+    [DoNotParallelize]
+    [DataRow("3")]
+    [DataRow("4")]
+    [DataRow("")]
+    public async Task PublishedDefaultRepair_RechecksHeadBeforeQueuedAdvance(string freshHeadDigit)
+    {
+        var freshHead = freshHeadDigit.Length == 0 ? null : Sha(freshHeadDigit[0]);
+        var unchanged = freshHead == Sha('3');
+        await using var h = Harness.Create(p => p with { BranchUpstreamHealMaxPerTick = 10 }, gatedWorker: true);
+        h.Seed(Repo, "main", true, Sha('1'));
+        h.Seed(OtherRepo, "main", true, Sha('5'));
+        var target = ServiceTestFixtures.PublishComplete(h.Db, new EnsureSnapshotRequest
+        {
+            RepositoryRemoteUrl = Repo + ".git", CommitSha = Sha('3'), BranchName = "main"
+        }, recordCommit: true);
+        h.Lister.SetHeads(Repo, new Dictionary<string, string> { ["main"] = Sha('3') });
+        h.Lister.SetHeads(OtherRepo, new Dictionary<string, string> { ["main"] = Sha('5') });
+        string? observedBeforeQueuedBuild = null;
+        h.Work = (worker, request) =>
+        {
+            if (request.RepositoryRemoteUrl == Repo)
+                observedBeforeQueuedBuild = PointerCommit(h, Repo, "main");
+            return Harness.PublishAndAdvance(worker, request);
+        };
+        h.Start();
+        var hold = h.Service.EnsureSnapshotAsync(new EnsureSnapshotRequest
+        {
+            RepositoryRemoteUrl = OtherRepo, CommitSha = Sha('6'), BranchName = "main", ExpectedHeadCommit = Sha('5')
+        });
+        await WaitUntilAsync(() => h.Worker.Calls == 1);
+        var queued = h.Service.EnsureSnapshotAsync(new EnsureSnapshotRequest
+        {
+            RepositoryRemoteUrl = Repo, CommitSha = unchanged ? Sha('2') : Sha('4'), BranchName = "main",
+            ExpectedHeadCommit = unchanged ? Sha('0') : Sha('1'), IsDefaultBranch = true
+        });
+
+        Assert.AreEqual(1, (await Pass(h)).HealAwaitingConfirmation);
+        h.Clock.Advance(TimeSpan.FromMinutes(61));
+        var second = await Pass(h);
+        Assert.AreEqual(1, second.HealsStarted);
+        Assert.AreEqual(0, second.HealBusy, "queued advances and another repository's running job are not this branch running");
+        if (freshHead is null)
+            h.Lister.Fail(Repo);
+        else
+            h.Lister.SetHeads(Repo, new Dictionary<string, string> { ["main"] = freshHead });
+        using var output = new StringWriter();
+        var previousError = Console.Error;
+        try
+        {
+            Console.SetError(output);
+            h.Worker.Gate.TrySetResult();
+            await Task.WhenAll(hold, queued);
+        }
+        finally
+        {
+            Console.SetError(previousError);
+        }
+
+        Assert.AreEqual(unchanged ? Sha('3') : Sha('1'), observedBeforeQueuedBuild);
+        Assert.AreEqual(unchanged ? Sha('3') : Sha('4'), PointerCommit(h, Repo, "main"));
+        Assert.AreEqual(!unchanged, (await queued).BranchAdvanced);
+        var refusals = output.ToString().Split('\n').Where(l => l.StartsWith('{')
+            && !l.Contains("\"job_id\":", StringComparison.Ordinal)
+            && l.Contains("\"reason\":\"remote_head_moved\"", StringComparison.Ordinal)).ToArray();
+        Assert.AreEqual(unchanged ? 0 : 1, refusals.Length);
+        if (unchanged)
+        {
+            using var reader = h.OpenReader();
+            Assert.AreEqual(target, new SnapshotStore(reader).GetBranch(h.RepositoryId(Repo), "main")!.SnapshotId);
+        }
+        else
+        {
+            using var json = System.Text.Json.JsonDocument.Parse(refusals.Single());
+            Assert.AreEqual(Sha('3'), json.RootElement.GetProperty("observed_head").GetString());
+            Assert.AreEqual(freshHead, json.RootElement.GetProperty("fresh_head").GetString());
+        }
     }
 
     [TestMethod]
@@ -876,10 +962,14 @@ public class UpstreamBranchReconcileTests
         // Push Z (expecting the listed head Y) arrives while the second listing is running: the state the pass read
         // before listing cannot show it.
         Task<EnsureSnapshotResult>? push = null;
-        h.Lister.OnList = () => push ??= h.Service.EnsureSnapshotAsync(new EnsureSnapshotRequest
+        h.Lister.OnList = () =>
         {
-            RepositoryRemoteUrl = Repo, CommitSha = Sha('4'), BranchName = "feature", ExpectedHeadCommit = Sha('3')
-        });
+            push ??= h.Service.EnsureSnapshotAsync(new EnsureSnapshotRequest
+            {
+                RepositoryRemoteUrl = Repo, CommitSha = Sha('4'), BranchName = "feature", ExpectedHeadCommit = Sha('3')
+            });
+            Assert.IsTrue(SpinWait.SpinUntil(() => h.Worker.Calls == 1, TimeSpan.FromSeconds(5)));
+        };
         h.Clock.Advance(TimeSpan.FromMinutes(61));
         var second = await Pass(h);
 
@@ -1068,7 +1158,7 @@ public class UpstreamBranchReconcileTests
         }
     }
 
-    private sealed class FakeLister : IRemoteBranchLister
+    private sealed class FakeLister : IRemoteBranchLister, IRemoteDefaultBranchResolver, IRemoteBranchHeadResolver
     {
         private readonly Dictionary<string, Func<IReadOnlyDictionary<string, string>?>> _answers = new(StringComparer.Ordinal);
         private int _running;
@@ -1088,6 +1178,11 @@ public class UpstreamBranchReconcileTests
         public void SetHeads(string url, IReadOnlyDictionary<string, string> heads) => _answers[url] = () => heads;
         public void Fail(string url) => _answers[url] = () => null;
         public void Throw(string url) => _answers[url] = () => throw new InvalidOperationException("boom");
+
+        public string? ResolveDefaultBranch(string repositoryRemoteUrl) => "main";
+
+        public string? ResolveBranchHead(string repositoryRemoteUrl, string branch, CancellationToken cancellationToken) =>
+            _answers.TryGetValue(repositoryRemoteUrl, out var answer) ? answer()?.GetValueOrDefault(branch) : null;
 
         public IReadOnlyDictionary<string, string>? ListBranches(string repositoryRemoteUrl)
         {
@@ -1132,7 +1227,10 @@ public class UpstreamBranchReconcileTests
             h.Db.RunMigrations();
             h.Clock = new ManualClock(ClockStart);
             var policy = new MaintenancePolicy { Interval = TimeSpan.Zero, BranchIdleRetireDays = 0, BranchUpstreamHealMaxPerTick = 0 };
-            h._options = ServiceTestFixtures.NewOptions(h._dbPath) with { Maintenance = configure?.Invoke(policy) ?? policy };
+            h._options = ServiceTestFixtures.NewOptions(h._dbPath) with
+            {
+                Maintenance = configure?.Invoke(policy) ?? policy, FreshnessCheckInterval = TimeSpan.Zero
+            };
             return h;
         }
 
@@ -1149,7 +1247,7 @@ public class UpstreamBranchReconcileTests
         }
 
         // Publishes the requested commit and moves the branch pointer with the request's CAS, like the orchestrator.
-        private static SnapshotWorkResult PublishAndAdvance(FakeSnapshotWorker self, EnsureSnapshotRequest r)
+        public static SnapshotWorkResult PublishAndAdvance(FakeSnapshotWorker self, EnsureSnapshotRequest r)
         {
             var id = ServiceTestFixtures.PublishComplete(self.Database, r, recordCommit: true);
             var snapshots = new SnapshotStore(self.Database.GetConnection());
@@ -1162,7 +1260,8 @@ public class UpstreamBranchReconcileTests
         public void Start(bool withLister = true)
         {
             Worker = new FakeSnapshotWorker(Db, Work) { UseGate = _gatedWorker };
-            Service = SnapshotService.Start(_options, Worker, Db, timeProvider: Clock, remoteBranches: withLister ? Lister : null);
+            Service = SnapshotService.Start(_options, Worker, Db, timeProvider: Clock,
+                remoteDefaults: withLister ? Lister : null, remoteBranches: withLister ? Lister : null);
         }
 
         public long RepositoryId(string url)

@@ -86,6 +86,105 @@ public class EnsureCoalescingTests
     }
 
     [TestMethod]
+    [DoNotParallelize]
+    [DataRow(false, "6452c686")]
+    [DataRow(true, "6452c686")]
+    [DataRow(false, "other-head")]
+    [DataRow(true, "other-head")]
+    [DataRow(true, null)]
+    public async Task DisconnectedHandovers_DefaultHeadIsRepairedOnlyWhenVerified(bool alreadyBuilt, string? freshHead)
+    {
+        await SeedMainAt("1657c332f");
+        var jobs = new SnapshotJobStore(_db.GetConnection());
+        var key = RemoteUrlIdentity.Normalize(Repo);
+        jobs.RecordHandover(key, "main", "378be5c6", "fcd78b31", "08584047");
+        jobs.RecordHandover(key, "main", "08584047", "8d36a70a", "6e4f4888");
+        jobs.RecordHandover(key, "main", "6e4f4888", "8d36a70a", "6452c686");
+        var request = Request("6452c686", "main") with
+        {
+            RepositoryRemoteUrl = Repo + ".git",
+            ExpectedHeadCommit = "6e4f4888"
+        };
+        if (alreadyBuilt)
+            await _service.EnsureSnapshotAsync(request with { BranchUpdate = "none" });
+        _service.Dispose();
+        using var releaseLookup = new ManualResetEventSlim();
+        var observed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resolver = new HeadResolver(request.CommitSha, observed, releaseLookup);
+        var options = ServiceTestFixtures.NewOptions(_dbPath) with { FreshnessCheckInterval = TimeSpan.Zero };
+        _service = SnapshotService.Start(options, _worker, _db, remoteDefaults: resolver);
+
+        using var output = new StringWriter();
+        var previousError = Console.Error;
+        var callsBeforeHold = _worker.Calls;
+        var hold = Hold();
+        var intake = _service.UserAdvanceProblemAsync(request);
+        EnsureSnapshotResult result;
+        try
+        {
+            Console.SetError(output);
+            await observed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await WaitUntil(() => _worker.Calls > callsBeforeHold);
+            var repair = _service.EnsureSnapshotAsync(request);
+            resolver.Head = freshHead;
+            _release.Set();
+            // Intake still has the old head in flight when the repair gets its own writer turn.
+            result = await repair.WaitAsync(TimeSpan.FromSeconds(10));
+            await hold;
+        }
+        finally
+        {
+            releaseLookup.Set();
+            _release.Set();
+            Console.SetError(previousError);
+        }
+
+        var remoteMatches = freshHead == request.CommitSha;
+        Assert.IsNull(await intake, "the older intake lookup observed the requested commit");
+        Assert.AreEqual(SnapshotJobStatus.Complete, result.Status);
+        Assert.AreEqual(remoteMatches, result.BranchAdvanced);
+        Assert.AreEqual(remoteMatches ? request.CommitSha : "1657c332f", HeadCommit("main"));
+        Assert.AreEqual(remoteMatches ? 0 : 1,
+            _service.RecentAudit(action: AuditAction.BranchAdvanceRefused)
+                .Count(a => a.Detail?.StartsWith($"job_{result.JobId};", StringComparison.Ordinal) == true));
+        var refusalLines = output.ToString().Split('\n').Where(l => l.StartsWith('{')
+            && l.Contains($"\"job_id\":{result.JobId},", StringComparison.Ordinal)
+            && l.Contains("\"event\":\"branch_advance_refused\"", StringComparison.Ordinal)).ToArray();
+        Assert.AreEqual(remoteMatches ? 0 : 1, refusalLines.Length, "one structured refusal, never an audit-only silence");
+        if (!remoteMatches)
+        {
+            using var json = System.Text.Json.JsonDocument.Parse(refusalLines.Single());
+            Assert.AreEqual("remote_head_moved", json.RootElement.GetProperty("reason").GetString());
+            Assert.AreEqual("8d36a70a", json.RootElement.GetProperty("expected_head").GetString());
+            Assert.AreEqual(request.CommitSha, json.RootElement.GetProperty("observed_head").GetString());
+            Assert.AreEqual(freshHead, json.RootElement.GetProperty("fresh_head").GetString());
+        }
+        if (remoteMatches)
+            Assert.IsNull(jobs.GetHandover(key, "main", "6e4f4888", "6452c686"),
+                "a verified head move consumes stale handovers");
+    }
+
+    private sealed class HeadResolver(string initialHead, TaskCompletionSource observed, ManualResetEventSlim release)
+        : IRemoteDefaultBranchResolver, IRemoteBranchHeadResolver
+    {
+        private int _calls;
+        public string? Head { get; set; } = initialHead;
+
+        public string? ResolveDefaultBranch(string repositoryRemoteUrl) => "main";
+
+        public string? ResolveBranchHead(string repositoryRemoteUrl, string branchName, CancellationToken cancellationToken)
+        {
+            var head = Head;
+            if (Interlocked.Increment(ref _calls) == 1)
+            {
+                observed.TrySetResult();
+                return release.Wait(TimeSpan.FromSeconds(20), cancellationToken) ? head : null;
+            }
+            return head;
+        }
+    }
+
+    [TestMethod]
     public async Task ASupersededPushWhoseCommitIsAlreadyBuilt_AttachesAndAdvances_AndTheNextPushStillAdvances()
     {
         // A fast-forward merge of a commit already built (here on another branch): its push attaches at no cost and moves
@@ -431,6 +530,67 @@ public class EnsureCoalescingTests
             new[] { "commit-q1", "commit-q2", "commit-q3", "commit-q4", "commit-q5" },
             Built().Where(x => x.StartsWith("commit-q", StringComparison.Ordinal)).ToArray(),
             "each ran once, in the order it was admitted");
+    }
+
+    [TestMethod]
+    public async Task DuplicateQueuedPushes_ShareAdmission_AndDoNotPreventCoalescing()
+    {
+        await SeedMainAt("commit-A");
+        var hold = Hold();
+        await WaitUntil(() => Built().Length == 1 && _worker.Calls == 2);
+        var first = Push("commit-B", "commit-A");
+        var other = _service.EnsureSnapshotAsync(Request("commit-other", "feature"));
+        var duplicates = Enumerable.Range(0, 20).Select(_ => Push("commit-B", "commit-A")).ToArray();
+        await WaitUntil(() => QueuedEnsureCount() >= 3);
+        Assert.AreEqual(3, QueuedEnsureCount(), "holder, B, and another branch; interleaved traffic does not duplicate B");
+        var c = Push("commit-C", "commit-B");
+        _release.Set();
+        await Task.WhenAll([hold, c, first, other, .. duplicates]);
+
+        Assert.IsTrue(duplicates.All(t => t.Result.Status == SnapshotJobStatus.Coalesced));
+        Assert.AreEqual("commit-C", HeadCommit("main"));
+        CollectionAssert.DoesNotContain(Built(), "commit-B");
+        await WaitUntil(() => QueuedEnsureCount() == 0);
+    }
+
+    [TestMethod]
+    public async Task DuplicateEnsure_AfterARetire_TakesItsOwnTurn()
+    {
+        await SeedMainAt("commit-M");
+        await Push("commit-A", "", "feature");
+        var hold = Hold();
+        await WaitUntil(() => _worker.Calls == 3);
+        var first = Push("commit-B", "commit-A", "feature");
+        var retire = _service.RetireBranchAsync(new RetireBranchRequest { Repository = Repo, Branch = "feature" });
+        var repeated = Push("commit-B", "commit-A", "feature");
+        _release.Set();
+        await Task.WhenAll(hold, first, retire, repeated);
+
+        Assert.IsTrue(first.Result.BranchAdvanced);
+        Assert.IsTrue(retire.Result.Retired);
+        Assert.IsFalse(repeated.Result.BranchAdvanced, "the post-retire ensure cannot share the pre-retire decision");
+        Assert.IsNull(HeadCommit("feature"));
+    }
+
+    [TestMethod]
+    public async Task Replay_DuplicateAdmissions_ShareOneTurn_AndSettleEveryDurableRow()
+    {
+        await SeedMainAt("commit-A");
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        InsertQueued(1, RequestJson(Request("commit-hold", "other")), now);
+        for (var seq = 2; seq <= 21; seq++)
+            InsertQueued(seq, RequestJson(Request("commit-B", "main") with { ExpectedHeadCommit = "commit-A" }), now);
+        InsertQueued(22, RequestJson(Request("commit-C", "main") with { ExpectedHeadCommit = "commit-B" }), now);
+        _service.Dispose();
+        _release.Reset();
+        _service = SnapshotService.Start(ServiceTestFixtures.NewOptions(_dbPath), _worker, _db);
+        await WaitUntil(() => _worker.Calls == 2);
+        _release.Set();
+
+        await WaitUntil(() => HeadCommit("main") == "commit-C");
+        await WaitUntil(() => QueuedEnsureCount() == 0);
+        CollectionAssert.DoesNotContain(Built(), "commit-B", "duplicate replay rows must not disable coalescing");
+        Assert.AreEqual(1, Built().Count(c => c == "commit-C"));
     }
 
     [TestMethod]

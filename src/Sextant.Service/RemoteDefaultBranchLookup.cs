@@ -72,12 +72,14 @@ internal sealed class RemoteDefaultBranchLookup(
     /// The commit <c>refs/heads/&lt;branch&gt;</c> names on the remote (issue #203), or <c>null</c> when it is unknown,
     /// no head resolver is configured; throws <see cref="RemoteLookupBusyException"/> when no lookup slot is free.
     /// Concurrent lookups share one call but a finished answer is never reused, because a head moves with every push.
+    /// A repair under the single writer uses a separate key so it cannot join a pre-writer intake lookup.
     /// </summary>
     public Task<string?> ResolveBranchHeadAsync(
-        string repositoryRemoteUrl, string branch, string? tenant = null, CancellationToken cancellationToken = default) =>
+        string repositoryRemoteUrl, string branch, string? tenant = null, CancellationToken cancellationToken = default,
+        bool forRepair = false) =>
         heads is null
             ? Task.FromResult<string?>(null)
-            : Start($"{RepositoryGrantKey.Of(repositoryRemoteUrl)}\n{branch}", tenant, TimeSpan.Zero,
+            : Start($"{(forRepair ? "\u0001repair\n" : "")}{RepositoryGrantKey.Of(repositoryRemoteUrl)}\n{branch}", tenant, TimeSpan.Zero,
                 ct => heads.ResolveBranchHead(repositoryRemoteUrl, branch, ct), cancellationToken, throwWhenBusy: true);
 
     private Task<string?> Start(

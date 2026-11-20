@@ -58,7 +58,8 @@ public static class RemoteDefaultBranch
 
 /// <summary>
 /// Looks up the commit a branch of a repository points at on the REMOTE itself (issue #203). The service consults it
-/// only to check the target of a user caller's branch advance. Implemented by the clone-mode checkout provider;
+/// to check user advances and to recover a published default head from a disconnected pointer CAS.
+/// Implemented by the clone-mode checkout provider;
 /// without an implementation (locate mode) the check is skipped.
 /// </summary>
 public interface IRemoteBranchHeadResolver
