@@ -1415,7 +1415,10 @@ public sealed partial class SnapshotService : IDisposable
             }
             catch (Exception ex) when (ex is SqliteException or NotSupportedException or InvalidOperationException)
             {
-                await Console.Error.WriteLineAsync($"Job {jobId}: its phase timings could not be recorded: {ex.Message}").ConfigureAwait(false);
+                // This production still owns the writer turn until it returns.
+                await Console.Error.WriteLineAsync(
+                    $"Job {jobId}: its phase timings could not be recorded: {ex.Message}".AsMemory(),
+                    CancellationToken.None).ConfigureAwait(false);
             }
         }
         bool? workerAdvanced = validated.SnapshotId is long producedId
@@ -2775,12 +2778,16 @@ public sealed partial class SnapshotService : IDisposable
         }
         catch (OperationCanceledException) when (!_lifetime.IsCancellationRequested)
         {
-            await Console.Error.WriteLineAsync("maintenance: retention pass audit waited too long for the writer; it is skipped.").ConfigureAwait(false);
+            await Console.Error.WriteLineAsync(
+                "maintenance: retention pass audit waited too long for the writer; it is skipped.".AsMemory(),
+                _lifetime.Token).ConfigureAwait(false);
             return true;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            await Console.Error.WriteLineAsync($"maintenance: retention pass audit failed: {ex.GetType().Name}.").ConfigureAwait(false);
+            await Console.Error.WriteLineAsync(
+                $"maintenance: retention pass audit failed: {ex.GetType().Name}.".AsMemory(),
+                _lifetime.Token).ConfigureAwait(false);
             return true;
         }
     }
@@ -2945,10 +2952,11 @@ public sealed partial class SnapshotService : IDisposable
                 {
                     _oversizedToday[oversizedId] = _timeProvider.GetUtcNow().UtcDateTime.Date;
                     await Console.Error.WriteLineAsync(
-                        $"Retention rolled back the deletion unit of snapshot {oversizedId}: it ran past {_options.Retention.Normalized().UnitMaxSeconds}s. It is skipped for the rest of the UTC day.").ConfigureAwait(false);
+                        $"Retention rolled back the deletion unit of snapshot {oversizedId}: it ran past {_options.Retention.Normalized().UnitMaxSeconds}s. It is skipped for the rest of the UTC day."
+                            .AsMemory(), cancellationToken).ConfigureAwait(false);
                 }
                 foreach (var line in batch.TailSkipped)
-                    await Console.Error.WriteLineAsync(line).ConfigureAwait(false);
+                    await Console.Error.WriteLineAsync(line.AsMemory(), cancellationToken).ConfigureAwait(false);
                 if (batch.StopReason != null) return report with { LeftWork = plan.DescribeLeft() };
                 // The writer-held budget is spent: stop here (a wall-clock pass is cut by its token instead).
                 if (report.MoreRemaining && timer.Priority && timer.BudgetElapsed() >= limit)
@@ -3075,15 +3083,21 @@ public sealed partial class SnapshotService : IDisposable
                 this, () => Task.FromResult(IncrementalVacuum.CheckpointTruncate(_conn, _writeLocks)),
                 ms => timer.VacuumMs += ms, wait.Token).ConfigureAwait(false);
             if (!complete)
-                await Console.Error.WriteLineAsync("maintenance: WAL checkpoint after vacuum was busy; it is retried next pass.").ConfigureAwait(false);
+                await Console.Error.WriteLineAsync(
+                    "maintenance: WAL checkpoint after vacuum was busy; it is retried next pass.".AsMemory(),
+                    lifetimeToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (!lifetimeToken.IsCancellationRequested)
         {
-            await Console.Error.WriteLineAsync("maintenance: WAL checkpoint after vacuum waited too long for the writer; it is retried next pass.").ConfigureAwait(false);
+            await Console.Error.WriteLineAsync(
+                "maintenance: WAL checkpoint after vacuum waited too long for the writer; it is retried next pass.".AsMemory(),
+                lifetimeToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            await Console.Error.WriteLineAsync($"maintenance: WAL checkpoint after vacuum failed: {ex.GetType().Name}.").ConfigureAwait(false);
+            await Console.Error.WriteLineAsync(
+                $"maintenance: WAL checkpoint after vacuum failed: {ex.GetType().Name}.".AsMemory(),
+                lifetimeToken).ConfigureAwait(false);
         }
     }
 
