@@ -88,6 +88,13 @@ public interface IRemoteCommitBranchChecker
     bool IsCommitOnBranch(string repositoryRemoteUrl, string commit, CancellationToken cancellationToken = default);
 }
 
+/// <summary>Checks git ancestry using complete commit history, fetching missing objects without changing the checkout.</summary>
+public interface ICommitAncestryChecker
+{
+    /// <summary>True for an ancestor (including equality), false for unrelated commits, null when history is unknown.</summary>
+    bool? IsAncestor(string repositoryRemoteUrl, string ancestor, string descendant, CancellationToken cancellationToken = default);
+}
+
 /// <summary>Parsing of <c>git ls-remote &lt;url&gt; refs/heads/&lt;branch&gt;</c> for <see cref="IRemoteBranchHeadResolver"/>.</summary>
 public static class RemoteBranchHead
 {

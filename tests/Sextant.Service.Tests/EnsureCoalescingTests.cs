@@ -154,7 +154,7 @@ public class EnsureCoalescingTests
         if (!remoteMatches)
         {
             using var json = System.Text.Json.JsonDocument.Parse(refusalLines.Single());
-            Assert.AreEqual("remote_head_moved", json.RootElement.GetProperty("reason").GetString());
+            Assert.AreEqual("ancestry_unknown", json.RootElement.GetProperty("reason").GetString());
             Assert.AreEqual("8d36a70a", json.RootElement.GetProperty("expected_head").GetString());
             Assert.AreEqual(request.CommitSha, json.RootElement.GetProperty("observed_head").GetString());
             Assert.AreEqual(freshHead, json.RootElement.GetProperty("fresh_head").GetString());
@@ -165,12 +165,16 @@ public class EnsureCoalescingTests
     }
 
     private sealed class HeadResolver(string initialHead, TaskCompletionSource observed, ManualResetEventSlim release)
-        : IRemoteDefaultBranchResolver, IRemoteBranchHeadResolver
+        : IRemoteDefaultBranchResolver, IRemoteBranchHeadResolver, ICommitAncestryChecker
     {
         private int _calls;
+        private readonly string _repairHead = initialHead;
         public string? Head { get; set; } = initialHead;
 
         public string? ResolveDefaultBranch(string repositoryRemoteUrl) => "main";
+
+        public bool? IsAncestor(string repositoryRemoteUrl, string ancestor, string descendant, CancellationToken cancellationToken) =>
+            ancestor == "1657c332f" && descendant == _repairHead ? true : null;
 
         public string? ResolveBranchHead(string repositoryRemoteUrl, string branchName, CancellationToken cancellationToken)
         {
@@ -182,6 +186,82 @@ public class EnsureCoalescingTests
             }
             return head;
         }
+    }
+
+    [TestMethod]
+    [DoNotParallelize]
+    [DataRow(false, "busy", true, null)]
+    [DataRow(true, "busy", true, null)]
+    [DataRow(false, "exact", true, null)]
+    [DataRow(true, "backwards", false, "not_descendant")]
+    [DataRow(false, "force-push", false, "not_on_remote_history")]
+    [DataRow(true, "unknown", false, "ancestry_unknown")]
+    [DataRow(false, "throws", false, "ancestry_unknown")]
+    public async Task DefaultRepair_RequiresForwardAncestryOnFreshRemoteHistory(
+        bool alreadyBuilt, string scenario, bool advances, string? reason)
+    {
+        await SeedMainAt("pointer");
+        var request = Request("snapshot", "main") with { ExpectedHeadCommit = "disconnected", Forced = true };
+        if (alreadyBuilt)
+            await _service.EnsureSnapshotAsync(request with { BranchUpdate = "none" });
+        _service.Dispose();
+        var checks = new List<(string, string)>();
+        var history = new RepairHistory
+        {
+            Head = scenario == "exact" ? "snapshot" : "remote-two-commits-later",
+            Check = (a, d) =>
+            {
+                checks.Add((a, d));
+                return scenario switch
+                {
+                    "backwards" => a != "pointer",
+                    "force-push" => d != "remote-two-commits-later",
+                    "unknown" => null,
+                    "throws" => throw new InvalidOperationException("history unavailable"),
+                    _ => true
+                };
+            }
+        };
+        _service = SnapshotService.Start(ServiceTestFixtures.NewOptions(_dbPath), _worker, _db, remoteDefaults: history);
+        using var output = new StringWriter();
+        var previous = Console.Error;
+        EnsureSnapshotResult result;
+        try
+        {
+            Console.SetError(output);
+            result = await _service.EnsureSnapshotAsync(request);
+        }
+        finally
+        {
+            Console.SetError(previous);
+        }
+        Assert.AreEqual(advances, result.BranchAdvanced);
+        Assert.AreEqual(advances ? "snapshot" : "pointer", HeadCommit("main"));
+        if (advances)
+        {
+            Assert.IsTrue(checks.Contains(("pointer", "snapshot")));
+            Assert.AreEqual(scenario == "exact" ? 1 : 2, checks.Count, "exact head skips only the remote ancestry query");
+            if (scenario != "exact")
+                Assert.IsTrue(checks.Contains(("snapshot", "remote-two-commits-later")));
+        }
+        else
+        {
+            var lines = output.ToString().Split('\n').Where(l => l.StartsWith('{')
+                && l.Contains("\"event\":\"branch_advance_refused\"", StringComparison.Ordinal)).ToArray();
+            Assert.HasCount(1, lines);
+            using var json = System.Text.Json.JsonDocument.Parse(lines[0]);
+            Assert.AreEqual(reason, json.RootElement.GetProperty("reason").GetString());
+        }
+    }
+
+    private sealed class RepairHistory : IRemoteDefaultBranchResolver, IRemoteBranchHeadResolver, ICommitAncestryChecker
+    {
+        public string Head { get; init; } = "";
+        public required Func<string, string, bool?> Check { get; init; }
+        public string? ResolveDefaultBranch(string repositoryRemoteUrl) => "main";
+        public string? ResolveBranchHead(string repositoryRemoteUrl, string branch, CancellationToken cancellationToken) => Head;
+        public bool? IsAncestor(string repositoryRemoteUrl, string ancestor, string descendant, CancellationToken cancellationToken) =>
+            Check(ancestor, descendant);
     }
 
     [TestMethod]
@@ -438,7 +518,7 @@ public class EnsureCoalescingTests
     }
 
     [TestMethod]
-    public async Task AnExpeditedPush_IsBuilt_NotHandedOverToANormalLaneSuccessor()
+    public async Task AKnownDefaultSuccessorWithoutTheFlag_IsExpedited_AndCoalescesItsPredecessor()
     {
         // The 2026-11-08 incident: the default-branch push took the expedited lane, its successor (no default_branch
         // flag) the normal one, so handing over left the head waiting behind feature-branch builds for hours.
@@ -450,9 +530,8 @@ public class EnsureCoalescingTests
         _release.Set();
         await Task.WhenAll(hold, b, c);
 
-        Assert.AreEqual(SnapshotJobStatus.Complete, (await b).Status, "B's successor is slower, so B is built");
-        Assert.IsTrue((await b).BranchAdvanced);
-        CollectionAssert.AreEqual(new[] { "commit-A", "commit-hold", "commit-B", "commit-C" }, Built());
+        Assert.AreEqual(SnapshotJobStatus.Coalesced, (await b).Status, "the catalog default keeps both pushes in the same lane");
+        CollectionAssert.AreEqual(new[] { "commit-A", "commit-hold", "commit-C" }, Built());
         Assert.AreEqual("commit-C", HeadCommit("main"));
         AssertEveryCoalescedJobHasABuiltSuccessor();
     }

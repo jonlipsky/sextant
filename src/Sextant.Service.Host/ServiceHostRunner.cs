@@ -40,21 +40,22 @@ public static class ServiceHostRunner
         }
         catch (InvalidOperationException ex)
         {
-            await Console.Error.WriteLineAsync($"Failed to start Sextant index service: {ex.Message}");
+            await Console.Error.WriteLineAsync(
+                $"Failed to start Sextant index service: {ex.Message}".AsMemory(), cancellationToken);
             return 1;
         }
         if (options.ControlPlaneIsOpen)
-            await Console.Error.WriteLineAsync(ServiceOptions.OpenControlPlaneWarning);
+            await Console.Error.WriteLineAsync(ServiceOptions.OpenControlPlaneWarning.AsMemory(), cancellationToken);
         if (options.RepositoryUrlPolicy.AllowsAnyHost)
             await Console.Error.WriteLineAsync(
-                "WARNING: SEXTANT_SERVICE_REPOSITORY_HOSTS contains '*': /control/ensure accepts a repository on ANY " +
-                "public DNS host that passes the URL shape rules, including a name that resolves to an internal " +
-                "address. Prefer an explicit host allow-list.");
+                ("WARNING: SEXTANT_SERVICE_REPOSITORY_HOSTS contains '*': /control/ensure accepts a repository on ANY " +
+                 "public DNS host that passes the URL shape rules, including a name that resolves to an internal " +
+                 "address. Prefer an explicit host allow-list.").AsMemory(), cancellationToken);
         if (options.DelegateTokens.Count > 0 && string.IsNullOrEmpty(options.QueryToken) && !options.ReadPolicy.Enabled)
             await Console.Error.WriteLineAsync(
-                "WARNING: SEXTANT_SERVICE_DELEGATE_TOKENS is set but the query plane is OPEN (no " +
-                "SEXTANT_SERVICE_QUERY_TOKEN and no SEXTANT_SERVICE_READ_POLICY): a request without a bearer still " +
-                "reads every repository. Set a query token or a read policy.");
+                ("WARNING: SEXTANT_SERVICE_DELEGATE_TOKENS is set but the query plane is OPEN (no " +
+                 "SEXTANT_SERVICE_QUERY_TOKEN and no SEXTANT_SERVICE_READ_POLICY): a request without a bearer still " +
+                 "reads every repository. Set a query token or a read policy.").AsMemory(), cancellationToken);
 
         var paths = new ServicePaths(options.Volumes);
         var database = new IndexDatabase(options.CatalogDbPath, options.ApplyTo(IndexWriteOptions.FromConfiguration(config)));
@@ -74,7 +75,8 @@ public static class ServiceHostRunner
                 submoduleHosts: options.SubmoduleHosts)
             {
                 // Issue #272: fetch each new commit incrementally into a per-repository object store.
-                UseObjectStore = options.GitObjectStore
+                UseObjectStore = options.GitObjectStore,
+                AncestryCacheMaxBytes = options.AncestryCacheMaxBytes
             };
         // Criterion 2: the service worker evaluates UNTRUSTED checkouts, so wrap its MSBuild evaluation in
         // the enforced sandbox (time/memory/secret/filesystem isolation) — applied to private and public
@@ -102,7 +104,9 @@ public static class ServiceHostRunner
             options.PackageSourceCredentials.Count > 0 ? CredentialPluginPath() : null,
             options.RestoreStaticGraph, options.RestoreMaxNodes);
         if (packageRestore.CredentialHosts.Count > 0)
-            await Console.Error.WriteLineAsync($"package restore: credentials configured for {string.Join(", ", packageRestore.CredentialHosts)}.").ConfigureAwait(false);
+            await Console.Error.WriteLineAsync(
+                $"package restore: credentials configured for {string.Join(", ", packageRestore.CredentialHosts)}.".AsMemory(),
+                cancellationToken).ConfigureAwait(false);
         // Issue #244: the worker keeps every indexed file's bytes on the artifact volume, where the query surface
         // (SnapshotService.SourceTexts, the same root) reads each snapshot's own source text back.
         // Issue #272: each repository restores into its own package folder on the cache volume, kept between its
@@ -140,11 +144,15 @@ public static class ServiceHostRunner
         }
         catch (Exception ex)
         {
-            await Console.Error.WriteLineAsync($"Failed to start Sextant index service: {ex.Message}").ConfigureAwait(false);
+            // The database must be disposed even if startup is cancelled.
+            await Console.Error.WriteLineAsync(
+                $"Failed to start Sextant index service: {ex.Message}".AsMemory(),
+                CancellationToken.None).ConfigureAwait(false);
             database.Dispose();
             return 1;
         }
-        await Console.Error.WriteLineAsync(options.Maintenance.Describe());
+        // Keep shutdown cleanup reachable after the service has acquired its lease.
+        await Console.Error.WriteLineAsync(options.Maintenance.Describe().AsMemory(), CancellationToken.None);
 
         try
         {
@@ -182,9 +190,11 @@ public static class ServiceHostRunner
             if (service.ProductionDrained)
                 database.Dispose();
             else
+                // This lease-abandonment diagnostic must survive shutdown cancellation.
                 await Console.Error.WriteLineAsync(
-                    $"An in-flight snapshot production did not stop within {options.ShutdownDrainTimeout}; the " +
-                    "writer lease was abandoned (it expires by its TTL) instead of released.");
+                    ($"An in-flight snapshot production did not stop within {options.ShutdownDrainTimeout}; the " +
+                     "writer lease was abandoned (it expires by its TTL) instead of released.").AsMemory(),
+                    CancellationToken.None);
         }
     }
 

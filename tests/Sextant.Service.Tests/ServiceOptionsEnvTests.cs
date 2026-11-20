@@ -131,6 +131,44 @@ public class ServiceOptionsEnvTests
     }
 
     [TestMethod]
+    public void AncestryCacheAndExpeditedBurstSettings_HaveDefaultsAndRejectInvalidBounds()
+    {
+        const string cache = "SEXTANT_SERVICE_ANCESTRY_CACHE_MAX_MB";
+        const string burst = "SEXTANT_SERVICE_EXPEDITED_STREAK_LIMIT";
+        try
+        {
+            Environment.SetEnvironmentVariable(cache, null);
+            Environment.SetEnvironmentVariable(burst, null);
+            var options = ServiceOptions.FromEnvironment(Config());
+            Assert.AreEqual(1024L * 1024 * 1024, options.AncestryCacheMaxBytes);
+            Assert.AreEqual(8, options.ExpeditedStreakLimit);
+
+            Environment.SetEnvironmentVariable(cache, "256");
+            Environment.SetEnvironmentVariable(burst, "3");
+            options = ServiceOptions.FromEnvironment(Config());
+            Assert.AreEqual(256L * 1024 * 1024, options.AncestryCacheMaxBytes);
+            Assert.AreEqual(3, options.ExpeditedStreakLimit);
+
+            foreach (var bad in new[] { "0", "-1", "1.5", "999999999999999999999" })
+            {
+                Environment.SetEnvironmentVariable(cache, bad);
+                Assert.ThrowsExactly<InvalidOperationException>(() => ServiceOptions.FromEnvironment(Config()), bad);
+            }
+            Environment.SetEnvironmentVariable(cache, "1024");
+            foreach (var bad in new[] { "0", "-1", "1001", "abc" })
+            {
+                Environment.SetEnvironmentVariable(burst, bad);
+                Assert.ThrowsExactly<InvalidOperationException>(() => ServiceOptions.FromEnvironment(Config()), bad);
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(cache, null);
+            Environment.SetEnvironmentVariable(burst, null);
+        }
+    }
+
+    [TestMethod]
     public void BuildGeneratorProjects_IsOnByDefault_AndFailsClosedOnATypo()
     {
         const string name = "SEXTANT_SERVICE_BUILD_GENERATOR_PROJECTS";
