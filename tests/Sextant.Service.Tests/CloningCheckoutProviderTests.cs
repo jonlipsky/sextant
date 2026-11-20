@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using Sextant.Store;
 
 namespace Sextant.Service.Tests;
 
@@ -465,7 +466,8 @@ public class CloningCheckoutProviderTests
         foreach (var lookup in new Func<CancellationToken, object?>[]
                  {
                      ct => provider.IsCommitOnBranch(remoteUrl, commit, ct),
-                     ct => provider.ResolveBranchHead(remoteUrl, "main", ct)
+                     ct => provider.ResolveBranchHead(remoteUrl, "main", ct),
+                     ct => provider.IsAncestor(remoteUrl, commit, commit, ct)
                  })
         {
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
@@ -479,6 +481,134 @@ public class CloningCheckoutProviderTests
     }
 
     // ---- helpers ---------------------------------------------------------------------------------
+
+    [TestMethod]
+    public async Task DefaultRepair_AdvancesToBuiltAncestorOfBusyMain_ButNotAnOffHistoryBuild()
+    {
+        var (url, pointer) = NewRemoteRepo(out var repo);
+        var built = CommitFile(repo, "Built.cs");
+        var later = CommitFile(repo, "Remote1.cs");
+        CommitFile(repo, "Remote2.cs");
+        var paths = NewPaths();
+        var provider = NewCloneProvider(paths);
+        var dbPath = ServiceTestFixtures.NewDbPath();
+        var db = new IndexDatabase(dbPath);
+        try
+        {
+            db.RunMigrations();
+            var snapshots = new SnapshotStore(db.GetConnection());
+            var initial = ServiceTestFixtures.PublishComplete(db, new()
+            {
+                RepositoryRemoteUrl = url, CommitSha = pointer
+            }, recordCommit: true);
+            var repoId = snapshots.GetRepositoryId(url)!.Value;
+            var branch = snapshots.EnsureBranch(repoId, "main", true, 1);
+            snapshots.SetBranchPointer(branch, initial, 1);
+            var worker = new FakeSnapshotWorker(db, (self, request) =>
+                SnapshotWorkResult.Complete(ServiceTestFixtures.PublishComplete(self.Database, request, recordCommit: true)));
+            using var service = SnapshotService.Start(ServiceTestFixtures.NewOptions(dbPath), worker, db, remoteDefaults: provider);
+
+            var result = await service.EnsureSnapshotAsync(new()
+            {
+                RepositoryRemoteUrl = url, CommitSha = built, BranchName = "main", ExpectedHeadCommit = "disconnected"
+            });
+            Assert.AreEqual(true, result.BranchAdvanced, "remote main is already two commits beyond this build");
+            Assert.AreEqual(result.SnapshotId, snapshots.GetBranch(repoId, "main")!.SnapshotId);
+
+            Git(repo, "checkout", "--quiet", "-b", "reset", pointer);
+            var forced = CommitFile(repo, "Forced.cs");
+            Git(repo, "branch", "-f", "main", forced);
+            var offHistory = await service.EnsureSnapshotAsync(new()
+            {
+                RepositoryRemoteUrl = url, CommitSha = later, BranchName = "main", ExpectedHeadCommit = "disconnected"
+            });
+            Assert.AreEqual(false, offHistory.BranchAdvanced, "the newer build was removed by the force-push");
+            Assert.AreEqual(result.SnapshotId, snapshots.GetBranch(repoId, "main")!.SnapshotId);
+        }
+        finally
+        {
+            SqliteTestDatabase.Delete(dbPath, db);
+        }
+    }
+
+    [TestMethod]
+    public void Ancestry_FetchesMissingHistory_AndDistinguishesFalseFromUnknown()
+    {
+        var (url, first) = NewRemoteRepo(out var repo);
+        var built = CommitFile(repo, "Built.cs");
+        CommitFile(repo, "Remote1.cs");
+        var remote = CommitFile(repo, "Remote2.cs");
+        var paths = NewPaths();
+        var provider = new CloningCheckoutProvider(new PersistentVolumeCheckoutProvider(paths), paths, log: Console.Error.WriteLine);
+        Assert.AreEqual(true, provider.IsAncestor(url, first, built));
+        Assert.AreEqual(true, provider.IsAncestor(url, built, remote), "the remote tip was not in the cached graph");
+        Assert.AreEqual(false, provider.IsAncestor(url, built, first), "never roll back");
+
+        Git(repo, "checkout", "--quiet", "-b", "reset", first);
+        var forced = CommitFile(repo, "Forced.cs");
+        Assert.AreEqual(false, provider.IsAncestor(url, built, forced), "snapshot is off the force-pushed history");
+        Assert.IsNull(provider.IsAncestor(url, first, new string('0', 40)), "a failed fetch is unknown, not unrelated");
+        Assert.AreEqual(true, provider.IsAncestor(url, first.ToUpperInvariant(), remote.ToUpperInvariant()));
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+        Assert.IsNull(provider.IsAncestor(url, first, remote, cancelled.Token));
+        Assert.IsFalse(Directory.EnumerateFiles(paths.GitObjectStoreRoot, "FETCH_HEAD", SearchOption.AllDirectories).Any());
+    }
+
+    [TestMethod]
+    public void Ancestry_RepeatedFetchesKeepOneHeadRef_AndRunBoundedMaintenance()
+    {
+        var (url, first) = NewRemoteRepo(out var repo);
+        var built = CommitFile(repo, "Built.cs");
+        var latest = CommitFile(repo, "Latest.cs");
+        var paths = NewPaths();
+        var logs = new List<string>();
+        var provider = new CloningCheckoutProvider(
+            new PersistentVolumeCheckoutProvider(paths), paths, log: logs.Add);
+
+        Assert.AreEqual(true, provider.IsAncestor(url, first, built));
+        Assert.AreEqual(true, provider.IsAncestor(url, first, latest));
+        Git(repo, "checkout", "--quiet", "-b", "reset", first);
+        var forced = CommitFile(repo, "Forced.cs");
+        Git(repo, "branch", "-f", "main", forced);
+        Assert.IsFalse(TryGit(repo, "merge-base", "--is-ancestor", latest, forced).ok,
+            "fixture must be a force-push that diverges from the cached head");
+        Assert.AreEqual(true, provider.IsAncestor(url, first, forced));
+
+        var graph = Path.Combine(paths.GitObjectStoreRoot, ServicePaths.RepoDirectoryName(url), "ancestry.git");
+        var (refsOk, refsOutput) = TryGit(graph, "--git-dir", graph, "for-each-ref", "--format=%(refname)");
+        Assert.IsTrue(refsOk);
+        var refs = refsOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        CollectionAssert.AreEqual(new[] { CloningCheckoutProvider.AncestryHeadRef }, refs);
+        var (headOk, headOutput) = TryGit(graph, "--git-dir", graph, "rev-parse", CloningCheckoutProvider.AncestryHeadRef);
+        Assert.IsTrue(headOk);
+        Assert.AreEqual(forced, headOutput.Trim());
+        Assert.AreEqual(4, logs.Count(line => line == "Ancestry history store maintenance completed."));
+        Assert.IsFalse(TryGit(graph, "--git-dir", graph, "cat-file", "-e", built + "^{commit}").ok,
+            "force-pushed-away commits must be pruned from the maintained graph");
+    }
+
+    [TestMethod]
+    public void Ancestry_OverLimitCacheIsRotatedAndTheNextCheckRebuildsIt()
+    {
+        var (url, first) = NewRemoteRepo(out var repo);
+        var built = CommitFile(repo, "Built.cs");
+        var paths = NewPaths();
+        var graph = Path.Combine(paths.GitObjectStoreRoot, ServicePaths.RepoDirectoryName(url), "ancestry.git");
+        var normal = NewCloneProvider(paths);
+        Assert.AreEqual(true, normal.IsAncestor(url, first, built));
+        Assert.IsTrue(Directory.Exists(graph));
+
+        var limited = new CloningCheckoutProvider(new PersistentVolumeCheckoutProvider(paths), paths)
+        {
+            AncestryCacheMaxBytes = 1
+        };
+        Assert.IsNull(limited.IsAncestor(url, first, built), "the over-limit check rotates rather than rebuilding inline");
+        Assert.IsFalse(Directory.Exists(graph));
+
+        Assert.AreEqual(true, normal.IsAncestor(url, first, built));
+        Assert.IsTrue(Directory.Exists(graph), "the next check rebuilds the graph");
+    }
 
     private static string CommitFile(string repoDir, string file)
     {

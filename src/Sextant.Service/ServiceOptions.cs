@@ -517,11 +517,24 @@ public sealed record ServiceOptions
     public long PackageCacheMaxBytes { get; init; } = PackageCache.DefaultMaxBytes;
 
     /// <summary>
+    /// Maximum size of one repository's persistent ancestry graph
+    /// (<c>SEXTANT_SERVICE_ANCESTRY_CACHE_MAX_MB</c>, default 1024 MiB). An oversized graph is rotated and that
+    /// ancestry check returns unknown; the next check rebuilds it. Must be a positive whole number of MiB.
+    /// </summary>
+    public long AncestryCacheMaxBytes { get; init; } = CloningCheckoutProvider.DefaultAncestryCacheMaxBytes;
+
+    /// <summary>
     /// In <c>clone</c> mode, fetch each new commit into a per-repository bare object store on the cache volume and
     /// copy the checkout from it, so only objects the store lacks cross the network (issue #272,
     /// <c>SEXTANT_SERVICE_GIT_OBJECT_STORE</c>, default true). False fetches every commit from the remote afresh.
     /// </summary>
     public bool GitObjectStore { get; init; } = true;
+
+    /// <summary>
+    /// Maximum consecutive expedited default-branch writer turns while normal work waits
+    /// (<c>SEXTANT_SERVICE_EXPEDITED_STREAK_LIMIT</c>, default 8; range 1–1000).
+    /// </summary>
+    public int ExpeditedStreakLimit { get; init; } = WriteGate.DefaultExpeditedStreakLimit;
 
     /// <summary>
     /// Build a source generator that a project references as a PROJECT, from the workspace, and run it in the service process
@@ -666,6 +679,8 @@ public sealed record ServiceOptions
             PackageSourceCredentials = ParsePackageSourceCredentials(SecretEnv("PACKAGE_SOURCE_CREDENTIALS")),
             PackageCacheMaxBytes = ParsePackageCacheMaxBytes(Env("PACKAGE_CACHE_MAX_MB")),
             GitObjectStore = EnvBool("GIT_OBJECT_STORE") ?? true,
+            AncestryCacheMaxBytes = ParseAncestryCacheMaxBytes(Env("ANCESTRY_CACHE_MAX_MB")),
+            ExpeditedStreakLimit = ParseExpeditedStreakLimit(Env("EXPEDITED_STREAK_LIMIT")),
             QueuedEnsureMaxAge = TimeSpan.FromHours(EnvInt("QUEUED_ENSURE_MAX_AGE_HOURS") is int ageHours && ageHours > 0
                 ? Math.Min(ageHours, 8760) : DefaultQueuedEnsureMaxAgeHours),
             BuildGeneratorProjects = EnvBool("BUILD_GENERATOR_PROJECTS") ?? true,
@@ -700,6 +715,31 @@ public sealed record ServiceOptions
                 $"Environment variable {EnvPrefix}PACKAGE_CACHE_MAX_MB has an invalid value '{value}'. Use a whole number " +
                 "of MiB (0 disables the package cache). Refusing to start with an unbounded or ambiguous cache size.");
         return mib * 1024 * 1024;
+    }
+
+    internal static long ParseAncestryCacheMaxBytes(string? value)
+    {
+        if (value is null)
+            return CloningCheckoutProvider.DefaultAncestryCacheMaxBytes;
+        if (!long.TryParse(value.Trim(), System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out var mib)
+            || mib <= 0 || mib > long.MaxValue / (1024 * 1024))
+            throw new InvalidOperationException(
+                $"Environment variable {EnvPrefix}ANCESTRY_CACHE_MAX_MB has an invalid value '{value}'. " +
+                "Use a positive whole number of MiB. Refusing to start with an unbounded ancestry cache.");
+        return mib * 1024 * 1024;
+    }
+
+    internal static int ParseExpeditedStreakLimit(string? value)
+    {
+        if (value is null)
+            return WriteGate.DefaultExpeditedStreakLimit;
+        if (!int.TryParse(value.Trim(), System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out var limit) || limit is < 1 or > 1000)
+            throw new InvalidOperationException(
+                $"Environment variable {EnvPrefix}EXPEDITED_STREAK_LIMIT has an invalid value '{value}'. " +
+                "Use a whole number from 1 through 1000.");
+        return limit;
     }
 
     /// <summary>

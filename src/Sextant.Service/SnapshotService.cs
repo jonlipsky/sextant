@@ -139,7 +139,7 @@ public sealed partial class SnapshotService : IDisposable
         _deniedLimiter = new DeniedAuditLimiter(_timeProvider);
         _freshness = new DefaultBranchFreshnessTracker(
             _timeProvider, 3 * _options.FreshnessCheckInterval + TimeSpan.FromMinutes(1));
-        _writeGate = new WriteGate(_timeProvider);
+        _writeGate = new WriteGate(_timeProvider, expeditedStreakLimit: options.ExpeditedStreakLimit);
         _jobIds = new JobIdReservations(
             JobIdReservations.FloorPathFor(options.CatalogDbPath),
             () => ReadCatalog(conn => new SnapshotJobStore(conn).MaxJobId()));
@@ -632,12 +632,13 @@ public sealed partial class SnapshotService : IDisposable
             // first look up the remote's default branch (issue #199) takes its turn once that lookup has finished.
             // Issue #403: an ensure that claims the default branch (only the application may; a user ensure with
             // default_branch is refused) takes the expedited lane, so it never waits behind feature-branch work.
+            var expedited = IsDefaultBranchWork(request);
             var turn = request.RestrictsImplicitDefault
                 ? null
-                : TakeWriteTurnLocked(out _, expedited: request.IsDefaultBranch == true && !request.SuppressesBranchUpdate,
+                : TakeWriteTurnLocked(out _, expedited: expedited,
                     ensureAdmission: true);
             if (turn is not null)
-                ticket = AdmitAdvanceLocked(request, hash, expedited: request.IsDefaultBranch == true && !request.SuppressesBranchUpdate);
+                ticket = AdmitAdvanceLocked(request, hash, expedited: expedited);
             // Issue #406: the admission sequence orders a restart's replay; a replayed ensure keeps its persisted row.
             // The row is written on the grant connection (never the write gate) as part of admission: the wait=false
             // answer is held until it is durable, and the ensure's completion always follows it.
@@ -815,6 +816,17 @@ public sealed partial class SnapshotService : IDisposable
         lock (_inFlightLock)
             return TakeWriteTurnLocked();
     }
+
+    private bool IsDefaultBranchWork(EnsureSnapshotRequest request) =>
+        !request.SuppressesBranchUpdate && (request.IsDefaultBranch == true || ReadCatalog(conn =>
+        {
+            var snapshots = new SnapshotStore(conn);
+            return snapshots.GetRepositoryId(request.RepositoryRemoteUrl) is long repository
+                && snapshots.GetBranch(repository, request.BranchName ?? "main") is { IsDefault: true };
+        }));
+
+    private static bool IsAutomaticDefaultRepair(EnsureSnapshotRequest request, AuditCaller principal) =>
+        principal.Actor == UpstreamPolicyCaller.Actor && request.IsDefaultBranch == true;
 
     // Releases a turn whether or not it has been granted yet.
     private void ReleaseTurn(Task turn, bool granted)
@@ -999,7 +1011,11 @@ public sealed partial class SnapshotService : IDisposable
             if (turn is null)
             {
                 request = await WithVerifiedRemoteDefaultAsync(request).ConfigureAwait(false);
-                turn = TakeWriteTurn();
+                lock (_inFlightLock)
+                {
+                    var expedited = IsDefaultBranchWork(request);
+                    turn = TakeWriteTurnLocked(out _, expedited: expedited, ensureAdmission: true);
+                }
             }
 
             // The identity is already producing: report its job at once, so a re-ensure — e.g. the retry of a
@@ -1056,7 +1072,7 @@ public sealed partial class SnapshotService : IDisposable
             // is attached — branch pointer advanced — in that SAME gate hold: releasing the gate between the check
             // and the advance would let a concurrent ensure supersede the snapshot in between, leaving the branch
             // head on a Superseded snapshot (issue #85).
-            var (job, existed, attached) = TryAttachTerminal(request, hash);
+            var (job, existed, attached) = TryAttachTerminal(request, hash, IsAutomaticDefaultRepair(request, principal));
             if (attached is not null)
             {
                 var (repaired, refusal) = await RepairVerifiedDefaultHeadAsync(request, attached).ConfigureAwait(false);
@@ -1122,7 +1138,7 @@ public sealed partial class SnapshotService : IDisposable
     // when its terminal result is still usable, advances/attaches this request's branch pointer and records the
     // request's audit row in the SAME gate hold. Returns the attach result, or null when production is needed.
     private (SnapshotJobRow Job, bool Existed, EnsureSnapshotResult? Attached) TryAttachTerminal(
-        EnsureSnapshotRequest request, string hash)
+        EnsureSnapshotRequest request, string hash, bool repairOnly)
     {
         var jobs = new SnapshotJobStore(_conn);
         var (row, wasExisting) = RegisterJobLocked(jobs, hash, request.RepositoryRemoteUrl, request.CommitSha, request.BranchName);
@@ -1130,7 +1146,7 @@ public sealed partial class SnapshotService : IDisposable
         _jobIds.Release(hash);
         if (!SnapshotJobStatus.IsTerminal(row.Status) || !TerminalResultUsable(row, hash, new SnapshotStore(_conn), jobs))
             return (row, wasExisting, null);
-        var advanced = AdvanceOrAttachBranchPointer(request, row.SnapshotId);
+        var advanced = repairOnly ? false : AdvanceOrAttachBranchPointer(request, row.SnapshotId);
         var attached = Attach(row, wasExisting, CoverageFor(row.SnapshotId)) with { BranchAdvanced = advanced };
         return (row, wasExisting, attached);
     }
@@ -1207,7 +1223,10 @@ public sealed partial class SnapshotService : IDisposable
         try
         {
             EnsureLeaseHeld();
-            var produced = await ProduceLockedAsync(request, hash, jobId, existed).ConfigureAwait(false);
+            var workRequest = IsAutomaticDefaultRepair(request, principal)
+                ? request with { BranchUpdate = "none" }
+                : request;
+            var produced = await ProduceLockedAsync(workRequest, hash, jobId, existed).ConfigureAwait(false);
             var (result, refusal) = await RepairVerifiedDefaultHeadAsync(request, produced).ConfigureAwait(false);
             RecordEnsureAuditLocked(request, result, principal, refusal);
             DeleteSettledQueuedEnsureLocked(seq, result);
@@ -3411,7 +3430,7 @@ public sealed partial class SnapshotService : IDisposable
                 expected_head = request.ExpectedHeadCommit,
                 observed_head = repairRefusal?.ObservedHead,
                 fresh_head = repairRefusal?.FreshHead,
-                reason = repairRefusal is null ? refusal : RemoteHeadMoved
+                reason = repairRefusal?.Reason ?? refusal
             }));
         }
     }

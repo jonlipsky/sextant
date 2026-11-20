@@ -162,7 +162,7 @@ public sealed partial class CloningCheckoutProvider
         [Path.Combine("objects", "info", "alternates"), Path.Combine("objects", "info", "http-alternates"), "commondir", "gitdir"];
 
     /// <summary>Creates <paramref name="store"/> as a bare repository when it does not hold one. False when it cannot.</summary>
-    private bool TryPrepareStore(string store)
+    private bool TryPrepareStore(string store, CancellationToken cancellationToken = default)
     {
         try
         {
@@ -171,7 +171,7 @@ public sealed partial class CloningCheckoutProvider
             if (Directory.Exists(store))
                 DiscardStore(store);
             Directory.CreateDirectory(store);
-            var init = RunGit(store, StoreEnvironment(LocalGitEnvironment), "init", "--bare", "--quiet");
+            var init = RunGit(store, StoreEnvironment(LocalGitEnvironment), GitTimeout, cancellationToken, "init", "--bare", "--quiet");
             if (init.Ok)
                 return ResetStoreMetadata(store);
             _log?.Invoke($"Object store could not be created ({ShortReason(init)}); fetching directly.");

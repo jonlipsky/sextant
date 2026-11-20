@@ -136,6 +136,8 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_PACKAGE_RESTORE_TIMEOUT_SECONDS` | Bound on one job's whole project-union restore step, clamped to 3600. Under the sandbox the step also stops at a fifth of the sandbox time budget, whichever is shorter. On expiry the restore process tree is killed and the load goes ahead with whatever was restored | `300` |
 | `SEXTANT_SERVICE_PACKAGE_CACHE_MAX_MB` | Bound, in MiB, on all per-repository NuGet package folders together (see [Package and git caches between jobs](#package-and-git-caches-between-jobs-issue-272)). Over it, whole folders are evicted least recently used first. `0` disables the cache: each job restores into a cold folder in its scratch again. Anything but a non-negative whole number **fails startup** | `10240` |
 | `SEXTANT_SERVICE_GIT_OBJECT_STORE` | In `clone` mode, fetch each new commit through a per-repository bare object store on the cache volume, so only objects the store lacks cross the network (see [Package and git caches between jobs](#package-and-git-caches-between-jobs-issue-272)). `false` fetches every commit from the remote afresh. An unparseable value **fails startup** | `true` |
+| `SEXTANT_SERVICE_ANCESTRY_CACHE_MAX_MB` | Maximum size of one repository's persistent commit-ancestry graph in clone mode. An over-limit graph is rotated; that check returns `ancestry_unknown` and the next check rebuilds it. Must be a positive whole number of MiB; invalid values **fail startup** | `1024` |
+| `SEXTANT_SERVICE_EXPEDITED_STREAK_LIMIT` | Maximum consecutive default-branch writer turns while a feature-branch turn waits, then one feature turn is granted. Range 1–1000; invalid values **fail startup** | `8` |
 | `SEXTANT_SERVICE_BUILD_GENERATOR_PROJECTS` | Build a source generator that a project references as a PROJECT (`OutputItemType="Analyzer"`) from the loaded workspace and run it in the service process, so the code it generates binds (issue #352; see [Operator-visible limits](#operator-visible-limits) and the trust note in `docs/runbooks.md`). `false` builds nothing and leaves such a generator unresolved. An unparseable value **fails startup** | `true` |
 | `SEXTANT_SERVICE_PACKAGE_SOURCE_CREDENTIALS` | **Secret.** Credentials for private package source hosts, `host[:port]=username:password` entries separated by `;` (the password may contain `:` but not `;`). The restore hands each one to NuGet only for an `https` request to exactly that host and port (443 when no port is given), through the service's own credential provider plugin; a repository's `nuget.config` cannot redirect it (see [Private package feeds](#private-package-feeds-issue-231)). Not part of the snapshot identity. A malformed value **fails startup** | unset |
 
@@ -533,6 +535,16 @@ next job of each repository its head start. Neither is backed up, and neither ch
 The maintenance loop also reclaims a repository's package folder, object store and persistent checkout once the
 repository has been inactive for `SEXTANT_SERVICE_REPOSITORY_RECLAIM_DAYS` (see the maintenance section); its next
 ensure starts cold.
+
+The separate per-repository `ancestry.git` graph caches commit-only history used to verify default-pointer repairs.
+It retains one ref, `refs/sextant/ancestry-head`, advances that ref as remote heads are fetched, and runs bounded
+`git gc --auto` maintenance after fetches. Unreachable history from force-pushed commits is pruned as the graph is
+maintained. `SEXTANT_SERVICE_ANCESTRY_CACHE_MAX_MB` (default 1024 MiB) bounds each graph; if it grows beyond the cap,
+the cache is rotated and that ancestry check safely returns `ancestry_unknown` rather than rebuilding during the
+same check. A subsequent check rebuilds the graph from the remote. When a fetched head diverges from the cached
+head, the current ancestry answer is computed first, then the graph is rebuilt from the new head; this drops
+force-pushed objects retained by partial-clone packs. The rebuild is bounded and uses the same scrubbed
+credentials as ordinary ancestry fetches.
 
 **NuGet package folders, one per repository** (`nuget-packages/<repository>/`, the same
 `<name>-<url hash>` directory name as the repository's checkout). The sandbox points the evaluation's
@@ -2412,15 +2424,25 @@ their snapshots forever. A service-owned loop cleans them up.
 - **Stale-pointer heal (same pass, issue #400).** The same `ls-remote` call returns each branch's head SHA. While
   `SEXTANT_SERVICE_BRANCH_UPSTREAM_HEAL_MAX_PER_TICK` is above 0 (default 10, `0` = heal off, clamped to `1000`),
   the pass also reads the DEFAULT branch pointers and compares each pointer's snapshot commit with the remote
-  head. A pointer that differs, has no `queued`/`running` job, admitted advance or queued retirement, and differs
-  the same way (same pointer, same remote head) on two consecutive listings no more than 3 intervals apart gets a
+  head. A pointer that differs, has no running job or queued retirement on that repository/branch, and differs
+  on two consecutive listings no more than 3 intervals apart gets a
   service-owned ensure of the remote head: `branch_update: advance` with `expected_head_commit` = the pointer's
   current commit, actor `upstream_policy`. That is the push path, so coalescing, the CAS, reuse of an already
   built snapshot (a push whose advance declined its CAS) and the ensure audit row apply unchanged; the heal is not
-  awaited. At most the cap start per tick, the rest heal on later passes. There is no ancestry check: like a
-  force-push, a remote head that is an ancestor of the pointer moves the pointer to it, because the remote's head
-  is what the branch is. The decision is re-made at the moment of admission, atomically with it (under the
-  admission lock): a branch with an admitted advance or ensure, a queued retirement, a queued/running job, or a
+  awaited. At most the cap start per tick, the rest heal on later passes. **Default-branch repairs are forward-only:**
+  the pointer must be a strict ancestor of the selected published, complete, non-overlay snapshot, which must be
+  on the freshly read remote head's history. Maintenance chooses the newest qualifying commit, not simply the
+  last publication, and a moving default head does not reset confirmation of the unchanged stale pointer.
+  Published repairs use maintenance priority. A default heal that must build first suppresses the worker's
+  ordinary pointer advance and applies the same ancestry check after publication. Exact snapshot/head equality
+  skips only the remote-history check, never the forward check. Missing/failed history is `ancestry_unknown`;
+  a snapshot off the remote history is `not_on_remote_history`; no forward move is `not_descendant`.
+  The remote read (30 seconds) and ancestry checks (a shared two minutes, fetching missing history into a separate
+  credential-safe per-repository graph) run under the writer, outside the CAS transaction. A remote change after
+  the read cannot be atomic with SQLite. Non-default heals retain their existing CAS/force-push semantics.
+  If no retained candidate qualifies, a proven forward head without a complete snapshot gets a default-priority
+  ensure; older/off-history retained snapshots cannot indefinitely prevent missing default-head work.
+  The decision is re-made at admission (under the admission lock): a queued retirement, a running job, or a
   pointer that moved since the pass read it is skipped and counted `heal busy`, so a push admitted during the
   (possibly long) listing is never overtaken by a heal. A heal whose identity already has a terminal `failed` or
   `unsupported` job is not started (counted `skipped terminal`,
@@ -2430,6 +2452,10 @@ their snapshots forever. A service-owned loop cleans them up.
   from a listing is left alone. Metrics: `sextant_upstream_branch_heals_started_total`,
   `sextant_upstream_branch_heals_applied_total`, `sextant_upstream_branch_heals_not_applied_total`; the pass log
   line reports stale/busy/awaiting/deferred/started counts.
+
+  Default-branch ensure advances are FIFO ahead of non-default work, including durable replay and requests that
+  omit `default_branch` when the catalog knows the default. Coalescing remains enabled and no feature work is
+  dropped. `branch_update: none` stays in the normal FIFO lane.
 - **Orphan handover prune (every tick, issue #401).** Branch-advance handover rows whose branch has no pointer row,
   and no `queued`/`running` job or admitted advance, are deleted (`orphan_handover_prune` deferral if the writer
   is not available in time).
@@ -2479,12 +2505,13 @@ their snapshots forever. A service-owned loop cleans them up.
   so a waiting production can be delayed by up to about 3 min.
   `SEXTANT_SERVICE_RETENTION_SCHEDULE=false` turns it off. Like a manual pass, it never runs `VACUUM` (#252).
   Compaction stays an offline operator action.
-- **Writer gate: priority lane for maintenance (#333).** The single-writer gate has two lanes. Productions,
-  registrations and request-thread writes keep FIFO order among themselves. Maintenance writes (the idle-branch
-  retire, the retired-head prune, repository reclaim's catalog writes and audit, and the scheduled retention
-  turns) take the **next turn after the current holder**, ahead of every queued production. Starvation the
-  other way is bounded: a retire or reclaim turn is short, and once the priority lane has held the gate for 30 s
-  while a production waits, the next turn goes to that production.
+- **Writer gate: priority and expedited lanes (#333, #403).** The single-writer gate has maintenance-priority,
+  default-branch expedited and normal lanes. Productions, registrations and request-thread writes keep FIFO order
+  within their lane. Maintenance writes (the idle-branch retire, the retired-head prune, repository reclaim's
+  catalog writes and audit, and the scheduled retention turns) take the **next turn after the current holder**,
+  ahead of indexing. Default-branch ensures run ahead of feature-branch work, but after
+  `SEXTANT_SERVICE_EXPEDITED_STREAK_LIMIT` consecutive default turns while normal work waits (default 8), one
+  normal turn runs; maintenance priority and its existing 30-second burst bound are unchanged.
   **Scheduled retention holds a burst (#333 round 2).** A turn per batch (2 s) gave retention ~0.5% of the writer,
   because the priority lane was empty whenever the gate was released and the next production (5-10 min) won. The
   scheduled pass now runs its batches (snapshot units, tail, vacuum steps) in a loop inside ONE priority hold, each

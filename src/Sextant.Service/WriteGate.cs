@@ -3,20 +3,21 @@ namespace Sextant.Service;
 /// <summary>
 /// The service's single-writer turn gate (issue #333). Waiting turns are granted one at a time, first-in first-out within
 /// a lane, and a release hands the gate DIRECTLY to the next waiter (the gate never becomes free in between, so a
-/// newcomer cannot barge in). There are two lanes: the normal lane (productions, control writes) and a PRIORITY lane for
-/// the service's own maintenance writes. On release the priority lane goes first, so a maintenance write takes the next
-/// turn after the current holder instead of queueing behind every production admitted earlier. Priority is bounded so
-/// productions still progress: when a priority turn ends while a normal waiter is queued, that turn's WHOLE hold counts
-/// toward <see cref="PriorityBurstBudget"/>; once the counted holds since the last normal turn reach it, the next turn
-/// goes to the normal lane. A priority turn that ends with no normal waiter counts nothing.
+/// newcomer cannot barge in). Maintenance writes use a PRIORITY lane and take precedence over indexing. Priority is
+/// bounded so productions still progress: when a priority turn ends while a lower-lane waiter is queued, that turn's
+/// WHOLE hold counts toward <see cref="PriorityBurstBudget"/>; once the counted holds since the last normal turn reach
+/// it, the next turn goes to a lower lane. A priority turn that ends with no lower-lane waiter counts nothing.
 /// Between them sits an EXPEDITED lane (issue #403) for ensures that claim their repository's default branch: it goes
-/// before the normal lane (feature branches), but after every <see cref="ExpeditedStreakLimit"/> consecutive expedited
-/// turns granted while a normal waiter is queued, one normal turn runs, so feature branches are delayed, never starved.
+/// before the normal lane (feature branches). Both lanes are FIFO; after a bounded burst of expedited turns while
+/// normal work waits, one normal turn runs.
 /// </summary>
 internal sealed class WriteGate
 {
     /// <summary>How long consecutive priority turns may hold the gate while a normal waiter is queued.</summary>
     public static readonly TimeSpan DefaultPriorityBurstBudget = TimeSpan.FromSeconds(30);
+
+    /// <summary>Consecutive default-branch turns allowed while a feature-branch turn waits.</summary>
+    public const int DefaultExpeditedStreakLimit = 8;
 
     private readonly Lock _lock = new();
     private readonly LinkedList<Waiter> _normal = new();
@@ -25,6 +26,7 @@ internal sealed class WriteGate
     private readonly TimeProvider _time;
     private bool _held;
     private bool _holderIsPriority;
+    private bool _holderIsExpedited;
     private DateTimeOffset _holderSince;
     private TimeSpan _priorityBurst;
     private int _expeditedStreak;
@@ -37,13 +39,6 @@ internal sealed class WriteGate
     }
 
     public TimeSpan PriorityBurstBudget { get; }
-
-    /// <summary>
-    /// How many consecutive expedited turns (default-branch ensures) may be granted while a normal turn (a
-    /// feature-branch ensure) waits before the next turn goes to the normal lane (issue #403).
-    /// </summary>
-    public const int DefaultExpeditedStreakLimit = 4;
-
     public int ExpeditedStreakLimit { get; }
 
     /// <summary>Turns waiting in the expedited lane.</summary>
@@ -133,11 +128,17 @@ internal sealed class WriteGate
             if (_holderIsPriority && _normal.Count + _expedited.Count > 0)
                 _priorityBurst += _time.GetUtcNow() - _holderSince;
 
+            if (_normal.Count == 0)
+                _expeditedStreak = 0;
+            else if (_holderIsExpedited)
+                _expeditedStreak++;
+
             next = PickNext();
             if (next is null)
             {
                 _held = false;
                 _holderIsPriority = false;
+                _holderIsExpedited = false;
                 _priorityBurst = TimeSpan.Zero;
                 _expeditedStreak = 0;
             }
@@ -167,16 +168,15 @@ internal sealed class WriteGate
         return lower;
     }
 
-    // Caller holds _lock. Expedited before normal, unless the expedited lane has had its streak while a normal waiter queues.
     private Waiter? PickLower()
     {
-        var normal = _normal.First?.Value;
         var expedited = _expedited.First?.Value;
-        if (expedited is null)
-            return normal;
-        if (normal is null || _expeditedStreak < ExpeditedStreakLimit)
+        var normal = _normal.First?.Value;
+        if (normal is null)
             return expedited;
-        return normal;
+        if (expedited is null || _expeditedStreak >= ExpeditedStreakLimit)
+            return normal;
+        return expedited;
     }
 
     // Caller holds _lock.
@@ -184,14 +184,13 @@ internal sealed class WriteGate
     {
         _held = true;
         _holderIsPriority = priority;
+        _holderIsExpedited = !priority && expedited;
         _holderSince = _time.GetUtcNow();
         if (priority)
             return;
         _priorityBurst = TimeSpan.Zero;
         if (!expedited)
             _expeditedStreak = 0;
-        else if (_normal.Count > 0)
-            _expeditedStreak++;
     }
 
     private void Cancel(Waiter waiter)

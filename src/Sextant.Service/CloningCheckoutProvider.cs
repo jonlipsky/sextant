@@ -852,13 +852,13 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
     /// An older git would silently IGNORE the hardening and the auth header, so clone mode must not proceed on
     /// it. A timeout or a spawn failure is transient (not cached); a completed probe's answer is cached.
     /// </summary>
-    private bool EnvironmentConfigSupported(string workingDir)
+    private bool EnvironmentConfigSupported(string workingDir, CancellationToken cancellationToken = default)
     {
         if (_envConfigSupported is { } known)
             return known;
         var probe = new GitEnvironment("https", [.. HardeningConfig, new("sextant.envconfigprobe", "ok")]);
-        var result = RunGit(workingDir, probe, "config", "--get", "sextant.envconfigprobe");
-        if (result.Kind is GitFailureKind.Timeout or GitFailureKind.SpawnFailure)
+        var result = RunGit(workingDir, probe, GitTimeout, cancellationToken, "config", "--get", "sextant.envconfigprobe");
+        if (result.Kind is GitFailureKind.Timeout or GitFailureKind.SpawnFailure or GitFailureKind.Cancelled)
             throw Transient("config probe", "(local)", result);
         var supported = result.Ok && string.Equals(result.Stdout.Trim(), "ok", StringComparison.Ordinal);
         _envConfigSupported = supported;

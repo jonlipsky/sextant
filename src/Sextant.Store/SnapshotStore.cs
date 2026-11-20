@@ -553,6 +553,25 @@ public sealed class SnapshotStore(SqliteConnection connection)
         return null;
     }
 
+    /// <summary>Published full candidates; ancestry, not publication time, determines the newest usable commit.</summary>
+    public IReadOnlyList<(long Id, string Commit)> ListPublishedAdvanceCandidates(long repositoryId)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT s.id, c.commit_sha
+            FROM snapshots s JOIN commits c ON c.id = s.commit_id
+            WHERE s.repository_id = @repo AND s.status = 'complete' AND s.published_at IS NOT NULL
+              AND s.is_overlay = 0 AND s.is_provider = 0 AND s.working_tree_delta IS NULL
+            ORDER BY s.published_at DESC, s.id DESC;
+            """;
+        cmd.Parameters.AddWithValue("@repo", repositoryId);
+        using var reader = cmd.ExecuteReader();
+        var result = new List<(long, string)>();
+        while (reader.Read())
+            result.Add((reader.GetInt64(0), reader.GetString(1)));
+        return result;
+    }
+
     /// <summary>
     /// The git commit SHA for a <c>commits.id</c> (a snapshot's <see cref="SnapshotRow.CommitId"/>), or
     /// null when the id is null or unknown. Used by the Phase-11 federated read planner to stamp the base

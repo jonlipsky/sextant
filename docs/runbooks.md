@@ -249,8 +249,11 @@ the job and `/control/audit` for action `branch_advance_refused` with detail `br
 never pointed to. An older publication can also be the correct target after a reset: do not advance solely to clear
 the gauge if the pointer already matches the remote.
 
-**Recover.** In clone mode the upstream maintenance pass repairs a verified default-branch head after two successful
-listings agree, reusing the newest usable full snapshot for that commit even if the build used another URL spelling.
+**Recover.** In clone mode the upstream maintenance pass repairs a default pointer after two successful listings
+confirm it is stale and unchanged, even if the remote moved between listings. It reuses the newest published,
+complete full snapshot on the remote's history, even if built under another URL spelling or behind the current tip.
+Both repair paths require `pointer.commit` to be a **strict ancestor** of the snapshot commit, and the snapshot
+commit to be an ancestor of (or equal to) the freshly read remote head. No automatic repair rolls back a pointer.
 Check `SEXTANT_SERVICE_MAINTENANCE_INTERVAL_MINUTES`, `SEXTANT_SERVICE_BRANCH_UPSTREAM_CHECK_MINUTES`, and
 `SEXTANT_SERVICE_BRANCH_UPSTREAM_HEAL_MAX_PER_TICK` if it is not running. For immediate manual recovery, independently
 verify the current remote head, then submit an application `POST /control/ensure` for that commit and branch with
@@ -271,17 +274,28 @@ Back up the catalog before applying the migration.
    listings occur on successive minute ticks; restore the normal intervals afterwards. Restarting resets
    confirmation state. Only a running job on the affected repository/branch, or its pending repair/retirement,
    makes a heal busy. Other repositories' running jobs and queued advances do not block eligibility.
-3. After two successful listings agree on the same head and unchanged pointer, an already-published full default
+3. After two successful listings confirm the unchanged pointer is stale, an already-published full default
    snapshot is repaired on the maintenance-priority writer lane, ahead of queued indexing. It must still wait
    for the current writer to yield. A changed pointer fails the repair's CAS instead of overwriting newer work.
    Watch for `default_pointer_repaired` and the `reconcile` audit row `default_pointer_repaired;snapshot=...`.
    Maintenance repair and a newly built or reused default-head ensure each re-read the remote branch on their
-   writer turn, just before the repair CAS. This is one network read under the writer (at most 30 seconds),
-   outside the SQLite transaction. If the head differs or is unknown, the repair logs one `remote_head_moved`
-   refusal with `observed_head` and `fresh_head` (null if unknown), leaving normal advances to queued ensures.
+   writer turn, just before ancestry verification and the repair CAS. A moving tip is expected: a build several
+   commits behind it can still advance the pointer. The fresh read takes at most 30 seconds; git ancestry checks
+   share a further two-minute deadline under the writer, outside the SQLite transaction. Clone mode caches a
+   separate, full commit graph in the repository's `ancestry.git` object store and fetches missing commits/history
+   with the existing credential-safe git environment. It never deepens or modifies the indexing checkout.
+   The ancestry graph keeps one head ref and runs bounded `git gc --auto` after fetches; set
+   `SEXTANT_SERVICE_ANCESTRY_CACHE_MAX_MB` (default 1024) to tune its per-repository cap. An over-cap graph is
+   rotated and that check reports `ancestry_unknown`; the next check rebuilds it.
+   Exact snapshot/head equality skips only the second ancestry check, never the forward-only check.
+   If retained candidates are all older or off-history, a proven forward remote head without a complete snapshot
+   gets a default-priority ensure instead; its worker cannot advance the pointer before the post-build ancestry check.
+   Watch `branch_advance_refused`: `not_descendant` means no strict forward move, `not_on_remote_history` means
+   a force-push or an off-history snapshot, and `ancestry_unknown` means missing history, a failed/expired fetch,
+   an unknown remote head, or no ancestry checker. Unknown is never permission to advance.
    Git and the local CAS cannot be atomic: a push after the fresh read returns but before the CAS commits can
-   still leave the pointer behind. No ancestry guess, publication-time ordering or `forced` flag bypasses a
-   guard; sequence/rebuild guards and `branch_update: none` retain their existing semantics.
+   still leave the pointer behind or change the remote history. Publication time and `forced` never substitute
+   for ancestry; sequence/rebuild guards and `branch_update: none` retain their existing semantics.
 4. For an explicit operator/application ensure, first read both heads. Use the existing owner-only curl config
    containing the control authorization header (do not put a token in the command, repository or report).
    For today's ProcessStack case, reuse the job's URL spelling to avoid an unnecessary identity change:
@@ -303,11 +317,17 @@ Back up the catalog before applying the migration.
    ```
 
    A `202` means admitted, not repaired: poll `/control/status/{job_id}` and re-read `/control/resolve`.
-   This ensure uses the expedited default lane; the automatic published-head repair uses maintenance priority.
+   Default-branch advances use the expedited FIFO lane even without `default_branch: true` when the catalog
+   already knows the default branch. They run before feature-branch work, up to
+   `SEXTANT_SERVICE_EXPEDITED_STREAK_LIMIT` consecutive turns while a feature waits (default 8), after which one
+   feature turn runs; feature work stays queued, not dropped. Maintenance priority remains unchanged.
+   Coalescing remains enabled. Historical `branch_update: none` work stays in the normal lane.
+   The automatic published-snapshot repair uses maintenance priority.
    If `branch_advanced` is false and the pointer is not already current, inspect the single structured
    `branch_advance_refused` log line and its audit row, then refresh both observations before retrying.
-5. Confirm `/control/resolve` matches the current remote head for every affected default branch, and watch
-   freshness lag return to zero at the next successful collection. Check queue depth/oldest age separately:
+5. Confirm `/control/resolve` advances onto the verified remote history. On a continuously moving branch it may
+   legitimately trail the tip; watch it make forward progress as builds complete rather than demand exact equality.
+   On a quiet branch, freshness lag should return to zero. Check queue depth/oldest age separately:
    real unique work still drains through the single production writer. `queue_delay_high` is a p95 over up to
    1000 recent started jobs, so it can remain raised while old delayed samples age out; the number of
    `queued_ensures` rows alone neither proves nor clears that alert.

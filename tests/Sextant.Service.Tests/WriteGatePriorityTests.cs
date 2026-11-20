@@ -52,6 +52,26 @@ public class WriteGatePriorityTests
     }
 
     [TestMethod]
+    public async Task Gate_AWaitingNormalTurnRunsAfterTheExpeditedBurst_EvenWithDefaultWorkQueued()
+    {
+        var gate = new WriteGate(expeditedStreakLimit: 8);
+        await gate.WaitAsync();
+        var order = new List<string>();
+        var normal = Take(gate, "feature", order, priority: false);
+        var expedited = Enumerable.Range(1, 12)
+            .Select(i => Take(gate, $"default-{i}", order, priority: false, expedited: true)).ToArray();
+
+        gate.Release();
+        await Task.WhenAll(expedited.Append(normal)).WaitAsync(Settle);
+
+        CollectionAssert.AreEqual(
+            Enumerable.Range(1, 8).Select(i => $"default-{i}")
+                .Append("feature")
+                .Concat(Enumerable.Range(9, 4).Select(i => $"default-{i}")).ToArray(),
+            order);
+    }
+
+    [TestMethod]
     public async Task Gate_AFreeGateIsTakenAtOnce_AndNeverGrantedTwice()
     {
         var gate = new WriteGate();
@@ -566,8 +586,9 @@ public class WriteGatePriorityTests
 
     private static MaintenancePolicy NoLoop() => new() { Interval = TimeSpan.Zero };
 
-    private static Task Take(WriteGate gate, string name, List<string> order, bool priority, bool autoRelease = true) =>
-        gate.WaitAsync(priority: priority).ContinueWith(_ =>
+    private static Task Take(
+        WriteGate gate, string name, List<string> order, bool priority, bool autoRelease = true, bool expedited = false) =>
+        gate.WaitAsync(priority: priority, expedited: expedited).ContinueWith(_ =>
         {
             lock (order)
                 order.Add(name);

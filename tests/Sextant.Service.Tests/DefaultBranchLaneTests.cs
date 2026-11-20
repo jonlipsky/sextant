@@ -6,7 +6,7 @@ namespace Sextant.Service.Tests;
 /// <summary>
 /// Issue #403: the write gate was one FIFO queue shared by every production, so a push to a default branch waited behind
 /// every feature-branch build admitted before it (hours when feature branches queue up). An ensure that claims the default
-/// branch now takes an expedited lane, bounded so feature branches still progress.
+/// branch now takes an expedited FIFO lane, including requests that omit the default-branch flag.
 /// </summary>
 [TestClass]
 public class DefaultBranchLaneTests
@@ -55,9 +55,9 @@ public class DefaultBranchLaneTests
     }
 
     [TestMethod]
-    public async Task Gate_ANormalTurnRunsAfterTheStreakLimit_SoFeatureBranchesAreNotStarved()
+    public async Task Gate_AllDefaultTurnsRunBeforeFeatureTurns_InFifoOrder()
     {
-        var gate = new WriteGate(expeditedStreakLimit: 2);
+        var gate = new WriteGate();
         await gate.WaitAsync();
         var order = new List<string>();
         var turns = new List<Task> { Take(gate, "n1", order, expedited: false), Take(gate, "n2", order, expedited: false) };
@@ -67,8 +67,7 @@ public class DefaultBranchLaneTests
         gate.Release();
         await Task.WhenAll(turns).WaitAsync(Settle);
 
-        CollectionAssert.AreEqual(new[] { "e1", "e2", "n1", "e3", "e4", "n2", "e5" }, order,
-            "two expedited turns, then one normal turn while normal turns wait");
+        CollectionAssert.AreEqual(new[] { "e1", "e2", "e3", "e4", "e5", "n1", "n2" }, order);
     }
 
     [TestMethod]
@@ -102,6 +101,55 @@ public class DefaultBranchLaneTests
         await Task.WhenAll(hold, f1, f2, main).WaitAsync(Settle);
 
         CollectionAssert.AreEqual(new[] { "hold", "main-1", "feature-1", "feature-2" }, _produced.ToArray());
+    }
+
+    [TestMethod]
+    public async Task AKnownDefaultWithoutTheFlag_RunsNextAheadOfFiftyFeatures()
+    {
+        await _service.EnsureSnapshotAsync(Request("seed", "trunk") with { IsDefaultBranch = true });
+        var snapshots = new SnapshotStore(_db.GetConnection());
+        var repo = snapshots.GetRepositoryId(Repo)!.Value;
+        var branch = snapshots.EnsureBranch(repo, "trunk", true, 1);
+        snapshots.SetBranchPointer(branch, snapshots.ResolveCompleteSnapshotByCommit(repo, "seed")!.Value, 1);
+        _release.Reset();
+        var hold = _service.EnsureSnapshotAsync(Request("hold", "other"));
+        var features = Enumerable.Range(0, 50)
+            .Select(i => _service.EnsureSnapshotAsync(Request($"feature-{i}", $"branch-{i}"))).ToArray();
+        var main = _service.EnsureSnapshotAsync(Request("main-1", "trunk"));
+        var main2 = _service.EnsureSnapshotAsync(Request("main-2", "trunk"));
+        _release.Set();
+
+        await Task.WhenAll(features.Append(hold).Append(main).Append(main2)).WaitAsync(Settle);
+
+        CollectionAssert.AreEqual(new[] { "seed", "hold", "main-1", "main-2" }
+            .Concat(Enumerable.Range(0, 50).Select(i => $"feature-{i}")).ToArray(), _produced.ToArray());
+    }
+
+    [TestMethod]
+    public async Task AContinuousDefaultStreamLetsAWaitingFeatureStartWithinTheConfiguredBurst()
+    {
+        await _service.EnsureSnapshotAsync(Request("seed", "trunk") with { IsDefaultBranch = true });
+        var snapshots = new SnapshotStore(_db.GetConnection());
+        var repo = snapshots.GetRepositoryId(Repo)!.Value;
+        var branch = snapshots.EnsureBranch(repo, "trunk", true, 1);
+        snapshots.SetBranchPointer(branch, snapshots.ResolveCompleteSnapshotByCommit(repo, "seed")!.Value, 1);
+        _release.Reset();
+        var hold = _service.EnsureSnapshotAsync(Request("hold", "other"));
+        var feature = _service.EnsureSnapshotAsync(Request("feature", "feature"));
+        var defaults = Enumerable.Range(0, 12)
+            .Select(i => _service.EnsureSnapshotAsync(Request($"main-{i}", "trunk"))).ToArray();
+        _release.Set();
+
+        await Task.WhenAll(defaults.Append(feature).Append(hold)).WaitAsync(Settle);
+
+        CollectionAssert.AreEqual(
+            new[] { "seed", "hold" }
+                .Concat(Enumerable.Range(0, WriteGate.DefaultExpeditedStreakLimit).Select(i => $"main-{i}"))
+                .Append("feature")
+                .Concat(Enumerable.Range(WriteGate.DefaultExpeditedStreakLimit, defaults.Length - WriteGate.DefaultExpeditedStreakLimit)
+                    .Select(i => $"main-{i}"))
+                .ToArray(),
+            _produced.ToArray());
     }
 
     [TestMethod]
