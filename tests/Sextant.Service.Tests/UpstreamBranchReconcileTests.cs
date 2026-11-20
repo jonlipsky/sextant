@@ -761,8 +761,10 @@ public class UpstreamBranchReconcileTests
         Assert.AreEqual(SnapshotJobStatus.Complete, declined.Status);
         Assert.AreEqual(false, declined.BranchAdvanced, "the handover expects 1, but the pointer still serves 2");
         Assert.AreEqual(Sha('2'), PointerCommit(h, Repo, "main"));
-        Assert.IsTrue(h.Service.RecentAudit(action: AuditAction.Ensure).Any(a =>
+        Assert.IsTrue(h.Service.RecentAudit(action: AuditAction.BranchAdvanceRefused).Any(a =>
             a.Detail?.Contains("branch_advance_refused=expected_head_mismatch", StringComparison.Ordinal) == true));
+        Assert.IsTrue(h.Service.RecentAudit(action: AuditAction.Ensure).Any(a =>
+            a.Detail == $"job_{declined.JobId};forced"));
 
         using (var sql = h.Db.GetConnection().CreateCommand())
         {

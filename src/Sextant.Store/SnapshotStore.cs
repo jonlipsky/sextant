@@ -120,6 +120,33 @@ public sealed record DefaultBranchHead(long RepositoryId, string RepositoryRemot
 /// </summary>
 public sealed class SnapshotStore(SqliteConnection connection)
 {
+    private long _repositorySchemaCookie = -1;
+    private bool _hasRepositoryKey;
+    private bool _hasProviderFlag;
+
+    private void RefreshRepositorySchema()
+    {
+        using var version = connection.CreateCommand();
+        version.CommandText = "PRAGMA schema_version;";
+        var cookie = (long)version.ExecuteScalar()!;
+        if (cookie == _repositorySchemaCookie)
+            return;
+
+        using var columns = connection.CreateCommand();
+        columns.CommandText = "PRAGMA table_info(repositories);";
+        using var reader = columns.ExecuteReader();
+        var hasKey = false;
+        var hasProvider = false;
+        while (reader.Read())
+        {
+            hasKey |= reader.GetString(1) == "repository_key";
+            hasProvider |= reader.GetString(1) == "is_provider";
+        }
+        _hasRepositoryKey = hasKey;
+        _hasProviderFlag = hasProvider;
+        _repositorySchemaCookie = cookie;
+    }
+
     // ---- get-or-create identity rows -----------------------------------------------------------
 
     public long EnsureRepository(string remoteUrl, long now)
@@ -131,12 +158,17 @@ public sealed class SnapshotStore(SqliteConnection connection)
             return existing;
         }
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = """
+        RefreshRepositorySchema();
+        cmd.CommandText = _hasRepositoryKey ? """
             INSERT INTO repositories (remote_url, repository_key, created_at) VALUES (@url, @key, @now)
+            RETURNING id;
+            """ : """
+            INSERT INTO repositories (remote_url, created_at) VALUES (@url, @now)
             RETURNING id;
             """;
         cmd.Parameters.AddWithValue("@url", remoteUrl);
-        cmd.Parameters.AddWithValue("@key", RemoteUrlIdentity.Normalize(remoteUrl));
+        if (_hasRepositoryKey)
+            cmd.Parameters.AddWithValue("@key", RemoteUrlIdentity.Normalize(remoteUrl));
         cmd.Parameters.AddWithValue("@now", now);
         return (long)cmd.ExecuteScalar()!;
     }
@@ -152,6 +184,9 @@ public sealed class SnapshotStore(SqliteConnection connection)
     /// </summary>
     public void MarkConsumerRepository(long repositoryId)
     {
+        RefreshRepositorySchema();
+        if (!_hasProviderFlag)
+            return;
         using var cmd = connection.CreateCommand();
         cmd.CommandText = "UPDATE repositories SET is_provider = 0 WHERE id = @id AND is_provider <> 0;";
         cmd.Parameters.AddWithValue("@id", repositoryId);
@@ -170,12 +205,17 @@ public sealed class SnapshotStore(SqliteConnection connection)
         if (GetRepositoryId(remoteUrl) is long existing)
             return existing;
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = """
+        RefreshRepositorySchema();
+        cmd.CommandText = _hasRepositoryKey ? """
             INSERT INTO repositories (remote_url, repository_key, created_at, is_provider) VALUES (@url, @key, @now, 1)
+            RETURNING id;
+            """ : """
+            INSERT INTO repositories (remote_url, created_at, is_provider) VALUES (@url, @now, 1)
             RETURNING id;
             """;
         cmd.Parameters.AddWithValue("@url", remoteUrl);
-        cmd.Parameters.AddWithValue("@key", RemoteUrlIdentity.Normalize(remoteUrl));
+        if (_hasRepositoryKey)
+            cmd.Parameters.AddWithValue("@key", RemoteUrlIdentity.Normalize(remoteUrl));
         cmd.Parameters.AddWithValue("@now", now);
         return (long)cmd.ExecuteScalar()!;
     }
@@ -931,6 +971,24 @@ public sealed class SnapshotStore(SqliteConnection connection)
     public long? GetRepositoryId(string remoteUrl)
     {
         var key = RemoteUrlIdentity.Normalize(remoteUrl);
+        RefreshRepositorySchema();
+        if (!_hasRepositoryKey)
+        {
+            using var exact = connection.CreateCommand();
+            exact.CommandText = "SELECT id FROM repositories WHERE remote_url = @url;";
+            exact.Parameters.AddWithValue("@url", remoteUrl);
+            if (exact.ExecuteScalar() is long exactId)
+                return exactId;
+            if (key.Length == 0)
+                return null;
+            using var scan = connection.CreateCommand();
+            scan.CommandText = "SELECT id, remote_url FROM repositories ORDER BY id;";
+            using var reader = scan.ExecuteReader();
+            while (reader.Read())
+                if (RemoteUrlIdentity.Normalize(reader.GetString(1)) == key)
+                    return reader.GetInt64(0);
+            return null;
+        }
         using var cmd = connection.CreateCommand();
         cmd.CommandText = key.Length == 0
             ? "SELECT id FROM repositories WHERE remote_url = @url;"

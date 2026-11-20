@@ -230,7 +230,7 @@ for that branch. It does not assert that the newer snapshot is the remote head. 
 not measured here; use the remote freshness signal above.
 
 **Confirm.** Compare `/control/resolve` (`commit_sha`) with the remote branch head, then check `/control/status` for
-the job and `/control/audit` for `branch_advance_refused=expected_head_mismatch`, `head_sequence_not_newer`, or
+the job and `/control/audit` for action `branch_advance_refused` with detail `branch_advance_refused=expected_head_mismatch`, `head_sequence_not_newer`, or
 `pointer_not_selected`. A force-push or a missed predecessor can leave every later push expecting a head the index
 never pointed to. An older publication can also be the correct target after a reset: do not advance solely to clear
 the gauge if the pointer already matches the remote.

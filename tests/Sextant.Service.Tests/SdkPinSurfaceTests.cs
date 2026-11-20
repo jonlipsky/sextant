@@ -337,6 +337,8 @@ public sealed class SdkPinSurfaceTests
 
             var audit = new AuditLogStore(db.GetConnection()).Recent(action: AuditAction.Ensure).Single();
             Assert.AreEqual($"job_{result.JobId};sdk_pin_overridden", audit.Detail);
+            var refusal = new AuditLogStore(db.GetConnection()).Recent(action: AuditAction.BranchAdvanceRefused).Single();
+            Assert.AreEqual($"job_{result.JobId};branch_advance_refused=pointer_not_selected", refusal.Detail);
         }
         finally
         {

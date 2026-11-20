@@ -3352,32 +3352,37 @@ public sealed partial class SnapshotService : IDisposable
         long? costMs = !result.Attached && job is { StartedAt: long s, CompletedAt: long c } && c >= s
             ? c - s
             : null;
-        var refusal = BranchAdvanceRefusal(request, result);
-        new AuditLogStore(_conn).Append(
+        var audit = new AuditLogStore(_conn);
+        audit.Append(
             AuditAction.Ensure,
             MapOutcome(result.Status),
             actor: principal.Actor,
             repositoryScope: request.RepositoryRemoteUrl,
-            detail: principal.Detail($"job_{result.JobId}{SdkPinAuditSuffix(jobs.GetDiagnostics(result.JobId))}{ForcedAuditSuffix(request)}{refusal}"
+            detail: principal.Detail($"job_{result.JobId}{SdkPinAuditSuffix(jobs.GetDiagnostics(result.JobId))}{ForcedAuditSuffix(request)}"
                 + (request.RebuildGeneration is { } generation ? $";rebuild={generation};identity={result.IdentityHash}" : "")),
             costIndexMs: costMs);
+        var refusal = BranchAdvanceRefusal(request, result);
+        if (refusal is not null)
+            audit.Append(AuditAction.BranchAdvanceRefused, AuditOutcome.Denied,
+                actor: principal.Actor, repositoryScope: request.RepositoryRemoteUrl,
+                detail: principal.Detail($"job_{result.JobId};branch_advance_refused={refusal}"));
     }
 
-    private string BranchAdvanceRefusal(EnsureSnapshotRequest request, EnsureSnapshotResult result)
+    private string? BranchAdvanceRefusal(EnsureSnapshotRequest request, EnsureSnapshotResult result)
     {
         if (result.BranchAdvanced != false || result.SnapshotId is not long target || request.SuppressesBranchUpdate)
-            return "";
+            return null;
         var snapshots = new SnapshotStore(_conn);
         var name = request.BranchName ?? "main";
         var repo = snapshots.GetRepositoryId(request.RepositoryRemoteUrl);
         var branch = repo is long id ? snapshots.GetBranch(id, name) : null;
         if (branch?.SnapshotId == target)
-            return "";
+            return null;
         if (request.ExpectedHeadCommit is { } expected && !snapshots.BranchHeadMatches(branch?.Id, expected, repo, name))
-            return ";branch_advance_refused=expected_head_mismatch";
+            return "expected_head_mismatch";
         if (request.BranchHeadSequence is long sequence && branch?.HeadSequence >= sequence)
-            return ";branch_advance_refused=head_sequence_not_newer";
-        return ";branch_advance_refused=pointer_not_selected";
+            return "head_sequence_not_newer";
+        return "pointer_not_selected";
     }
 
     // SVC-6: `forced` is informational only (it never bypasses the head CAS); the audit trail records it.

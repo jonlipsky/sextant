@@ -8,6 +8,9 @@ namespace Sextant.Store;
 public static class AuditAction
 {
     public const string Ensure = "ensure";
+
+    /// <summary>A completed ensure whose guarded branch advance was not selected.</summary>
+    public const string BranchAdvanceRefused = "branch_advance_refused";
     public const string Contribute = "contribute";
     public const string Retention = "retention";
 
@@ -46,7 +49,8 @@ public static class AuditOutcome
     /// detail = the reason code; the refused URL is never stored) or whose branch guards are malformed
     /// (SVC-6/7), and a branch retirement refused by that policy, for a missing branch name, as the
     /// repository's default branch, or on a head mismatch (SVC-6, <c>retire</c>/<c>denied</c>), a repository
-    /// grant write refused for its caller, body, repository URL, branch or limit (SVC-4, <c>grant</c>/<c>denied</c>,
+    /// a declined branch advance (<c>branch_advance_refused</c>/<c>denied</c>), a grant write refused for its
+    /// caller, body, repository URL, branch or limit (SVC-4, <c>grant</c>/<c>denied</c>,
     /// detail = <c>{operation};{reason}</c>), and an ensure a user caller is not granted (SVC-4,
     /// <c>ensure</c>/<c>denied</c>, detail <c>not_granted</c>). It is
     /// deliberately NOT emitted from the

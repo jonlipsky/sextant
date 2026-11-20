@@ -110,6 +110,43 @@ public class OccurrenceIndexPlanTests
         }
     }
 
+    [TestMethod]
+    [DataRow(13)]
+    [DataRow(14)]
+    [DataRow(15)]
+    [DataRow(22)]
+    [DataRow(33)]
+    public void RepositoryOperations_WorkBeforeAndAfterUpgrade(int version)
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"sextant_repo_v{version}_{Guid.NewGuid():N}.db");
+        var db = new IndexDatabase(path);
+        try
+        {
+            var conn = db.GetConnection();
+            ApplyMigrationsThrough(conn, version);
+            var store = new SnapshotStore(conn);
+            const string url = "https://github.com/acme/example.git";
+            const string alias = "https://github.com/acme/example";
+            var id = store.EnsureRepository(url, 1);
+            Assert.AreEqual(id, store.GetRepositoryId(alias));
+            Assert.AreEqual(id, store.EnsureRepository(alias, 2));
+            if (version >= 15)
+            {
+                var provider = store.EnsureProviderRepository("https://github.com/acme/provider.git", 1);
+                Assert.AreEqual(provider, store.EnsureRepository("https://github.com/acme/provider", 2));
+            }
+
+            db.RunMigrations();
+            Assert.AreEqual(id, store.GetRepositoryId(alias), "the same store observes the upgraded schema");
+            Assert.AreEqual(id, store.EnsureRepository(url, 3));
+            Assert.AreEqual(id, store.EnsureProviderRepository(alias, 4));
+        }
+        finally
+        {
+            SqliteTestDatabase.Delete(path, db);
+        }
+    }
+
     // ==== the swept queries: real store SQL, explained ============================================
 
     [TestMethod]
