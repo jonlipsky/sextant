@@ -3444,7 +3444,8 @@ public sealed partial class SnapshotService : IDisposable
                 expected_head = request.ExpectedHeadCommit,
                 observed_head = repairRefusal?.ObservedHead,
                 fresh_head = repairRefusal?.FreshHead,
-                reason = repairRefusal?.Reason ?? refusal
+                reason = repairRefusal?.Reason ?? refusal,
+                detail = repairRefusal?.Reason == AncestryUnknown ? repairRefusal.Detail : null
             }));
         }
     }

@@ -1000,6 +1000,8 @@ public class UpstreamBranchReconcileTests
         Assert.AreEqual(advances ? target : Sha('2'), PointerCommit(h, Repo, "main"));
         if (!advances)
             StringAssert.Contains(output.ToString(), $"\"reason\":\"{(scenario == "backwards" ? "not_descendant" : "ancestry_unknown")}\"");
+        if (scenario == "unknown")
+            StringAssert.Contains(output.ToString(), "\"detail\":\"ancestry unavailable\"");
     }
 
     [TestMethod]

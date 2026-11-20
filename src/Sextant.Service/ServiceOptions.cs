@@ -523,6 +523,9 @@ public sealed record ServiceOptions
     /// </summary>
     public long AncestryCacheMaxBytes { get; init; } = CloningCheckoutProvider.DefaultAncestryCacheMaxBytes;
 
+    /// <summary>Independent timeout for background ancestry graph builds.</summary>
+    public TimeSpan AncestryBuildTimeout { get; init; } = TimeSpan.FromMinutes(15);
+
     /// <summary>
     /// In <c>clone</c> mode, fetch each new commit into a per-repository bare object store on the cache volume and
     /// copy the checkout from it, so only objects the store lacks cross the network (issue #272,
@@ -680,6 +683,7 @@ public sealed record ServiceOptions
             PackageCacheMaxBytes = ParsePackageCacheMaxBytes(Env("PACKAGE_CACHE_MAX_MB")),
             GitObjectStore = EnvBool("GIT_OBJECT_STORE") ?? true,
             AncestryCacheMaxBytes = ParseAncestryCacheMaxBytes(Env("ANCESTRY_CACHE_MAX_MB")),
+            AncestryBuildTimeout = ParsePositiveSeconds("ANCESTRY_BUILD_TIMEOUT_SECONDS", Env("ANCESTRY_BUILD_TIMEOUT_SECONDS"), 900),
             ExpeditedStreakLimit = ParseExpeditedStreakLimit(Env("EXPEDITED_STREAK_LIMIT")),
             QueuedEnsureMaxAge = TimeSpan.FromHours(EnvInt("QUEUED_ENSURE_MAX_AGE_HOURS") is int ageHours && ageHours > 0
                 ? Math.Min(ageHours, 8760) : DefaultQueuedEnsureMaxAgeHours),

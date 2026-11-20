@@ -281,7 +281,9 @@ Back up the catalog before applying the migration.
    Maintenance repair and a newly built or reused default-head ensure each re-read the remote branch on their
    writer turn, just before ancestry verification and the repair CAS. A moving tip is expected: a build several
    commits behind it can still advance the pointer. The fresh read takes at most 30 seconds; git ancestry checks
-   share a further two-minute deadline under the writer, outside the SQLite transaction. Clone mode caches a
+   share a further two-minute deadline under the writer, outside the SQLite transaction. Graph work itself runs
+   off the writer, bounded by `SEXTANT_SERVICE_ANCESTRY_BUILD_TIMEOUT_SECONDS` (default 900 seconds); a repair
+   reports `ancestry_unknown` while it runs and a later check reuses the result. Clone mode caches a
    separate, full commit graph in the repository's `ancestry.git` object store and fetches missing commits/history
    with the existing credential-safe git environment. It never deepens or modifies the indexing checkout.
    The ancestry graph keeps one head ref and runs bounded `git gc --auto` after fetches; set
@@ -292,7 +294,8 @@ Back up the catalog before applying the migration.
    gets a default-priority ensure instead; its worker cannot advance the pointer before the post-build ancestry check.
    Watch `branch_advance_refused`: `not_descendant` means no strict forward move, `not_on_remote_history` means
    a force-push or an off-history snapshot, and `ancestry_unknown` means missing history, a failed/expired fetch,
-   an unknown remote head, or no ancestry checker. Unknown is never permission to advance.
+   an unknown remote head, or no ancestry checker. Its `detail` identifies the cause without credentials.
+   Unknown is never permission to advance.
    Git and the local CAS cannot be atomic: a push after the fresh read returns but before the CAS commits can
    still leave the pointer behind or change the remote history. Publication time and `forced` never substitute
    for ancestry; sequence/rebuild guards and `branch_update: none` retain their existing semantics.

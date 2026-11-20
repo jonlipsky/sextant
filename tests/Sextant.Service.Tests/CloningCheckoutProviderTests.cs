@@ -466,8 +466,7 @@ public class CloningCheckoutProviderTests
         foreach (var lookup in new Func<CancellationToken, object?>[]
                  {
                      ct => provider.IsCommitOnBranch(remoteUrl, commit, ct),
-                     ct => provider.ResolveBranchHead(remoteUrl, "main", ct),
-                     ct => provider.IsAncestor(remoteUrl, commit, commit, ct)
+                     ct => provider.ResolveBranchHead(remoteUrl, "main", ct)
                  })
         {
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
@@ -488,7 +487,7 @@ public class CloningCheckoutProviderTests
         var (url, pointer) = NewRemoteRepo(out var repo);
         var built = CommitFile(repo, "Built.cs");
         var later = CommitFile(repo, "Remote1.cs");
-        CommitFile(repo, "Remote2.cs");
+        var remote = CommitFile(repo, "Remote2.cs");
         var paths = NewPaths();
         var provider = NewCloneProvider(paths);
         var dbPath = ServiceTestFixtures.NewDbPath();
@@ -508,6 +507,8 @@ public class CloningCheckoutProviderTests
                 SnapshotWorkResult.Complete(ServiceTestFixtures.PublishComplete(self.Database, request, recordCommit: true)));
             using var service = SnapshotService.Start(ServiceTestFixtures.NewOptions(dbPath), worker, db, remoteDefaults: provider);
 
+            Assert.AreEqual(true, AwaitAncestry(provider, url, built, remote).IsAncestor);
+            Assert.AreEqual(true, AwaitAncestry(provider, url, pointer, built).IsAncestor);
             var result = await service.EnsureSnapshotAsync(new()
             {
                 RepositoryRemoteUrl = url, CommitSha = built, BranchName = "main", ExpectedHeadCommit = "disconnected"
@@ -518,6 +519,7 @@ public class CloningCheckoutProviderTests
             Git(repo, "checkout", "--quiet", "-b", "reset", pointer);
             var forced = CommitFile(repo, "Forced.cs");
             Git(repo, "branch", "-f", "main", forced);
+            Assert.AreEqual(false, AwaitAncestry(provider, url, later, forced).IsAncestor);
             var offHistory = await service.EnsureSnapshotAsync(new()
             {
                 RepositoryRemoteUrl = url, CommitSha = later, BranchName = "main", ExpectedHeadCommit = "disconnected"
@@ -540,15 +542,17 @@ public class CloningCheckoutProviderTests
         var remote = CommitFile(repo, "Remote2.cs");
         var paths = NewPaths();
         var provider = new CloningCheckoutProvider(new PersistentVolumeCheckoutProvider(paths), paths, log: Console.Error.WriteLine);
-        Assert.AreEqual(true, provider.IsAncestor(url, first, built));
-        Assert.AreEqual(true, provider.IsAncestor(url, built, remote), "the remote tip was not in the cached graph");
-        Assert.AreEqual(false, provider.IsAncestor(url, built, first), "never roll back");
+        Assert.AreEqual(true, AwaitAncestry(provider, url, first, built).IsAncestor);
+        Assert.AreEqual(true, AwaitAncestry(provider, url, built, remote).IsAncestor, "the remote tip was not in the cached graph");
+        Assert.AreEqual(false, AwaitAncestry(provider, url, built, first).IsAncestor, "never roll back");
 
         Git(repo, "checkout", "--quiet", "-b", "reset", first);
         var forced = CommitFile(repo, "Forced.cs");
-        Assert.AreEqual(false, provider.IsAncestor(url, built, forced), "snapshot is off the force-pushed history");
-        Assert.IsNull(provider.IsAncestor(url, first, new string('0', 40)), "a failed fetch is unknown, not unrelated");
-        Assert.AreEqual(true, provider.IsAncestor(url, first.ToUpperInvariant(), remote.ToUpperInvariant()));
+        Assert.AreEqual(false, AwaitAncestry(provider, url, built, forced).IsAncestor, "snapshot is off the force-pushed history");
+        var failed = AwaitAncestry(provider, url, first, new string('0', 40));
+        Assert.IsNull(failed.IsAncestor, "a failed fetch is unknown, not unrelated");
+        StringAssert.Contains(failed.Detail!, "fetch failed: exit ");
+        Assert.AreEqual(true, AwaitAncestry(provider, url, first.ToUpperInvariant(), remote.ToUpperInvariant()).IsAncestor);
         using var cancelled = new CancellationTokenSource();
         cancelled.Cancel();
         Assert.IsNull(provider.IsAncestor(url, first, remote, cancelled.Token));
@@ -566,16 +570,22 @@ public class CloningCheckoutProviderTests
         var provider = new CloningCheckoutProvider(
             new PersistentVolumeCheckoutProvider(paths), paths, log: logs.Add);
 
-        Assert.AreEqual(true, provider.IsAncestor(url, first, built));
-        Assert.AreEqual(true, provider.IsAncestor(url, first, latest));
+        Assert.AreEqual(true, AwaitAncestry(provider, url, first, built).IsAncestor);
+        Assert.AreEqual(true, AwaitAncestry(provider, url, first, latest).IsAncestor);
+        Assert.IsFalse(logs.Any(line => line.Contains("diverged", StringComparison.Ordinal)),
+            "a fast-forward after maintenance must not rebuild");
+        var graph = Path.Combine(paths.GitObjectStoreRoot, ServicePaths.RepoDirectoryName(url), "ancestry.git");
+        Assert.AreEqual(latest, TryGit(graph, "--git-dir", graph, "rev-parse", CloningCheckoutProvider.AncestryHeadRef).stdout.Trim());
+        Assert.AreEqual(true, AwaitAncestry(provider, url, built, built).IsAncestor);
+        Assert.AreEqual(latest, TryGit(graph, "--git-dir", graph, "rev-parse", CloningCheckoutProvider.AncestryHeadRef).stdout.Trim(),
+            "an older target must not rewind the cached head");
         Git(repo, "checkout", "--quiet", "-b", "reset", first);
         var forced = CommitFile(repo, "Forced.cs");
         Git(repo, "branch", "-f", "main", forced);
         Assert.IsFalse(TryGit(repo, "merge-base", "--is-ancestor", latest, forced).ok,
             "fixture must be a force-push that diverges from the cached head");
-        Assert.AreEqual(true, provider.IsAncestor(url, first, forced));
+        Assert.AreEqual(true, AwaitAncestry(provider, url, first, forced).IsAncestor);
 
-        var graph = Path.Combine(paths.GitObjectStoreRoot, ServicePaths.RepoDirectoryName(url), "ancestry.git");
         var (refsOk, refsOutput) = TryGit(graph, "--git-dir", graph, "for-each-ref", "--format=%(refname)");
         Assert.IsTrue(refsOk);
         var refs = refsOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries);
@@ -583,9 +593,142 @@ public class CloningCheckoutProviderTests
         var (headOk, headOutput) = TryGit(graph, "--git-dir", graph, "rev-parse", CloningCheckoutProvider.AncestryHeadRef);
         Assert.IsTrue(headOk);
         Assert.AreEqual(forced, headOutput.Trim());
-        Assert.AreEqual(4, logs.Count(line => line == "Ancestry history store maintenance completed."));
-        Assert.IsFalse(TryGit(graph, "--git-dir", graph, "cat-file", "-e", built + "^{commit}").ok,
-            "force-pushed-away commits must be pruned from the maintained graph");
+        Assert.AreEqual(1, logs.Count(line => line.Contains("diverged", StringComparison.Ordinal)));
+        Assert.AreEqual(3, logs.Count(line => line == "Ancestry history store maintenance completed."));
+    }
+
+    [TestMethod]
+    [DoNotParallelize]
+    public async Task Ancestry_SlowInitialBuildDoesNotHoldWriter_AndLaterRepairSucceeds()
+    {
+        if (OperatingSystem.IsWindows())
+            Assert.Inconclusive("uses a shell script as the git executable");
+        var (url, pointer) = NewRemoteRepo(out var repo);
+        var built = CommitFile(repo, "Built.cs");
+        var paths = NewPaths();
+        var scriptDir = Path.Combine(Path.GetTempPath(), "sextant-ancestry-git-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(scriptDir);
+        _tempDirs.Add(scriptDir);
+        var started = Path.Combine(scriptDir, "started");
+        var release = Path.Combine(scriptDir, "release");
+        var git = Path.Combine(scriptDir, "git");
+        await File.WriteAllTextAsync(git, $"#!/bin/sh\nfor a in \"$@\"; do if [ \"$a\" = fetch ]; then touch '{started}'; while [ ! -f '{release}' ]; do sleep 0.1; done; break; fi; done\nexec git \"$@\"\n");
+        if (!OperatingSystem.IsWindows())
+            File.SetUnixFileMode(git, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        var provider = new CloningCheckoutProvider(new PersistentVolumeCheckoutProvider(paths), paths, gitExecutable: git)
+        {
+            AncestryBuildTimeout = TimeSpan.FromSeconds(30)
+        };
+        var dbPath = ServiceTestFixtures.NewDbPath();
+        var db = new IndexDatabase(dbPath);
+        using var output = new StringWriter();
+        var previousError = Console.Error;
+        try
+        {
+            db.RunMigrations();
+            var snapshots = new SnapshotStore(db.GetConnection());
+            var initial = ServiceTestFixtures.PublishComplete(db, new() { RepositoryRemoteUrl = url, CommitSha = pointer }, recordCommit: true);
+            var repoId = snapshots.GetRepositoryId(url)!.Value;
+            var branch = snapshots.EnsureBranch(repoId, "main", true, 1);
+            snapshots.SetBranchPointer(branch, initial, 1);
+            var worker = new FakeSnapshotWorker(db, (self, request) =>
+                SnapshotWorkResult.Complete(ServiceTestFixtures.PublishComplete(self.Database, request, recordCommit: true)));
+            using var service = SnapshotService.Start(ServiceTestFixtures.NewOptions(dbPath), worker, db, remoteDefaults: provider);
+            Console.SetError(TextWriter.Synchronized(output));
+            var request = new EnsureSnapshotRequest
+            {
+                RepositoryRemoteUrl = url,
+                CommitSha = built,
+                BranchName = "main",
+                ExpectedHeadCommit = "disconnected"
+            };
+            var first = await service.EnsureSnapshotAsync(request).WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.AreEqual(false, first.BranchAdvanced);
+            Assert.IsTrue(SpinWait.SpinUntil(() => File.Exists(started), TimeSpan.FromSeconds(10)));
+            var graph = Path.Combine(paths.GitObjectStoreRoot, ServicePaths.RepoDirectoryName(url), "ancestry.git");
+            Assert.IsFalse(Directory.Exists(graph), "a partial graph must never be published");
+            StringAssert.Contains(output.ToString(), "\"detail\":\"rebuild in progress\"");
+
+            var other = await service.EnsureSnapshotAsync(new()
+            {
+                RepositoryRemoteUrl = url,
+                CommitSha = pointer,
+                BranchName = "side",
+                ExpectedHeadCommit = ""
+            }).WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.AreEqual(SnapshotJobStatus.Complete, other.Status, "another writer turn must finish while fetch is blocked");
+            await File.WriteAllTextAsync(release, "");
+            Assert.AreEqual(true, AwaitAncestry(provider, url, pointer, built).IsAncestor);
+            var retried = await service.EnsureSnapshotAsync(request).WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.AreEqual(true, retried.BranchAdvanced);
+            Assert.IsTrue(Directory.Exists(graph));
+        }
+        finally
+        {
+            await File.WriteAllTextAsync(release, "");
+            Console.SetError(previousError);
+            SqliteTestDatabase.Delete(dbPath, db);
+        }
+    }
+
+    [TestMethod]
+    public void Ancestry_FetchFailureReportsScrubbedStderr()
+    {
+        if (OperatingSystem.IsWindows())
+            Assert.Inconclusive("uses a shell script as the git executable");
+        var (url, commit) = NewRemoteRepo();
+        var paths = NewPaths();
+        var scriptDir = Path.Combine(Path.GetTempPath(), "sextant-ancestry-fail-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(scriptDir);
+        _tempDirs.Add(scriptDir);
+        var git = Path.Combine(scriptDir, "git");
+        const string token = "sensitive-checkout-token";
+        File.WriteAllText(git, $"#!/bin/sh\nfor a in \"$@\"; do if [ \"$a\" = fetch ]; then echo 'fatal: {token} refused' >&2; exit 42; fi; done\nexec git \"$@\"\n");
+        if (!OperatingSystem.IsWindows())
+            File.SetUnixFileMode(git, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        var provider = new CloningCheckoutProvider(new PersistentVolumeCheckoutProvider(paths), paths, token: token, gitExecutable: git);
+        var result = AwaitAncestry(provider, url, commit, commit);
+        Assert.IsNull(result.IsAncestor);
+        StringAssert.Contains(result.Detail!, "fetch failed: exit 42: *** refused");
+        Assert.IsFalse(result.Detail.Contains(token, StringComparison.Ordinal));
+    }
+
+    [TestMethod]
+    public void Ancestry_ShallowGraphReturnsUnknown()
+    {
+        var (url, first) = NewRemoteRepo(out var repo);
+        var built = CommitFile(repo, "Built.cs");
+        var paths = NewPaths();
+        var provider = NewCloneProvider(paths);
+        Assert.AreEqual(true, AwaitAncestry(provider, url, first, built).IsAncestor);
+        var graph = Path.Combine(paths.GitObjectStoreRoot, ServicePaths.RepoDirectoryName(url), "ancestry.git");
+        File.WriteAllText(Path.Combine(graph, "shallow"), built + "\n");
+        var result = AwaitAncestry(provider, url, built, built);
+        Assert.IsNull(result.IsAncestor);
+        Assert.AreEqual("shallow history", result.Detail);
+    }
+
+    [TestMethod]
+    public void Ancestry_BuildTimeoutReportsTimeout()
+    {
+        if (OperatingSystem.IsWindows())
+            Assert.Inconclusive("uses a shell script as the git executable");
+        var (url, commit) = NewRemoteRepo();
+        var paths = NewPaths();
+        var scriptDir = Path.Combine(Path.GetTempPath(), "sextant-ancestry-timeout-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(scriptDir);
+        _tempDirs.Add(scriptDir);
+        var git = Path.Combine(scriptDir, "git");
+        File.WriteAllText(git, "#!/bin/sh\nfor a in \"$@\"; do if [ \"$a\" = fetch ]; then exec sleep 20; fi; done\nexec git \"$@\"\n");
+        if (!OperatingSystem.IsWindows())
+            File.SetUnixFileMode(git, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        var provider = new CloningCheckoutProvider(new PersistentVolumeCheckoutProvider(paths), paths, gitExecutable: git)
+        {
+            AncestryBuildTimeout = TimeSpan.FromSeconds(1)
+        };
+        var result = AwaitAncestry(provider, url, commit, commit);
+        Assert.IsNull(result.IsAncestor);
+        Assert.AreEqual("timeout", result.Detail);
     }
 
     [TestMethod]
@@ -596,18 +739,34 @@ public class CloningCheckoutProviderTests
         var paths = NewPaths();
         var graph = Path.Combine(paths.GitObjectStoreRoot, ServicePaths.RepoDirectoryName(url), "ancestry.git");
         var normal = NewCloneProvider(paths);
-        Assert.AreEqual(true, normal.IsAncestor(url, first, built));
+        Assert.AreEqual(true, AwaitAncestry(normal, url, first, built).IsAncestor);
         Assert.IsTrue(Directory.Exists(graph));
 
         var limited = new CloningCheckoutProvider(new PersistentVolumeCheckoutProvider(paths), paths)
         {
             AncestryCacheMaxBytes = 1
         };
-        Assert.IsNull(limited.IsAncestor(url, first, built), "the over-limit check rotates rather than rebuilding inline");
+        Assert.IsNull(AwaitAncestry(limited, url, first, built).IsAncestor, "the over-limit check rotates rather than rebuilding inline");
         Assert.IsFalse(Directory.Exists(graph));
 
-        Assert.AreEqual(true, normal.IsAncestor(url, first, built));
+        normal = NewCloneProvider(paths);
+        Assert.AreEqual(true, AwaitAncestry(normal, url, first, built).IsAncestor);
         Assert.IsTrue(Directory.Exists(graph), "the next check rebuilds the graph");
+    }
+
+    private static AncestryResult AwaitAncestry(CloningCheckoutProvider provider, string url, string ancestor, string descendant)
+    {
+        var watch = Stopwatch.StartNew();
+        AncestryResult result;
+        do
+        {
+            result = provider.CheckAncestry(url, ancestor, descendant);
+            if (result.Detail != "rebuild in progress")
+                return result;
+            Thread.Sleep(20);
+        } while (watch.Elapsed < TimeSpan.FromSeconds(30));
+        Assert.Fail("ancestry work did not finish");
+        return result;
     }
 
     private static string CommitFile(string repoDir, string file)
