@@ -2,7 +2,7 @@
 
 **Status:** Approved · **Date:** 2026-11-21 · **Owner:** Jon Lipsky
 
-Decisions 1–7 answered by the owner on 2026-11-21.
+Decisions 1–7 answered by the owner on 2026-11-21. Epic #418.
 
 ## Why this exists
 
