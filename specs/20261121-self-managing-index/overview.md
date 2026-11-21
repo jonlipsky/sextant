@@ -77,7 +77,7 @@ Sextant manages an **active set** and nothing else:
 | 2 | Phase 2 — active set and per-branch retention | K snapshots per active branch; inactive or deleted branches, closed PRs and idle repositories expire; reactivation rebuilds | Delete a branch, and its data is gone in the next pass; query an expired repository, and it rebuilds and answers | [phase-2-active-set.md](phase-2-active-set.md) |
 | 3 | Phase 3 — cheap reclamation | Each project version lives in its own file; dropping one deletes the file | Drop of a TextEditor-sized snapshot takes seconds, and the file shrinks after the pass | [phase-3-cheap-reclamation.md](phase-3-cheap-reclamation.md) |
 | 4 | Phase 4 — storage proportional to change | Unchanged project versions are shared between snapshots (#274) | A one-file TextEditor commit adds ≤ 5% of a full snapshot's bytes | [phase-4-share-unchanged-projects.md](phase-4-share-unchanged-projects.md) |
-| 5 | Phase 5 — storage SLOs and the recovery drill | Alerts on bytes a day, retention throughput and backlog; a scheduled recovery drill | A monitor issue opens when growth exceeds budget; the drill rebuilds a scratch catalog sequentially, and every target comes back | [phase-5-slos-and-drill.md](phase-5-slos-and-drill.md) |
+| 5 | Phase 5 — storage alerts | Alerts on bytes a day, retention throughput, backlog age, free disk and prolonged budget enforcement | Replaying the November history makes each alert fire | [phase-5-storage-alerts.md](phase-5-storage-alerts.md) |
 
 ## Acceptance criteria
 
@@ -89,12 +89,12 @@ Sextant manages an **active set** and nothing else:
 6. From an empty catalog, the service returns to a fully current active set using only its normal triggers: sequentially, gated on host resources, with no operator action and no time limit. Every watched repository comes back, including ones Sextant registered itself.
 7. Reclaiming a snapshot costs seconds, not hours, and space is returned to the OS.
 8. A one-file commit costs storage proportional to the projects it changes.
-9. Growth, retention throughput and backlog have alerts, and the recovery drill runs on a schedule.
+9. Growth, retention throughput, backlog and free disk have alerts.
 
 ## Testing seams
 
 - **Service integration tests through the control and query HTTP API.** Real boundary: a real SQLite catalog and real indexing of small fixture repositories. Proves 2, 3, 4, 5 and 7.
-- **Recovery drill against a scratch catalog** on the service host. Real boundary: real repositories, the real triggers, and an empty DB. Proves 6. This is also Phase 5's scheduled job.
+- **Empty-catalog recovery integration test** (Phase 0). Real boundary: the real service with an empty DB and fixture repositories, including `self`-registered ones. Proves 6, on every change.
 - **Storage measurement harness** (the Phase 1 harness from the indexing-performance spec). Real boundary: real indexing of TextEditor-sized fixtures. Proves 1 and 8.
 - **Production read-only checks** after each phase's deploy: `index_runs.final_db_bytes`, retention audit and queue metrics. Prove 1 and 9.
 - **Deliberately not tested:** multi-writer races, which are excluded by the single-writer design.
