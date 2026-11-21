@@ -1,12 +1,12 @@
 # Phase 2 — active set and per-branch retention
 
 ## Goal
-The service keeps exactly the active set: the newest head plus K earlier snapshots per active branch, and open-PR heads. Everything else expires, and expired targets rebuild when they're used again.
+The service keeps exactly the active set: the newest head plus one earlier snapshot (K = 1) earlier snapshots per active branch, and open-PR heads. Everything else expires, and expired targets rebuild when they're used again.
 
 ## Scope
-- **Activity tracking:** last push, ensure or query per (repository, branch) and per repository. Default branches of watched repositories are always active. Window per decision 2.
+- **Activity tracking:** last push, ensure or query per (repository, branch) and per repository. Default branches of watched repositories are always active. Window: 7 days (decision 2).
 - **Retention policy:**
-  - per branch: newest head plus K, open-PR heads, pinned snapshots;
+  - per branch: newest head plus one earlier snapshot (K = 1), open-PR heads, pinned snapshots;
   - replaces the global "newest 3 runs" rule (`RetentionService.cs:1129-1160`, `RetentionPolicy.KeepCompleteGenerations`).
 - **Expiry:** deleted branches (delete events and reconcile), closed or merged PRs, and branches or repositories inactive past the window. Catalog rows, checkouts, git objects and package caches for them are reclaimed.
 - **Reactivation:**

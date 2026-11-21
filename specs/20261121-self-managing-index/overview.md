@@ -1,6 +1,8 @@
 # Self-managing index: active branches stay current, everything else cleans itself up
 
-**Status:** Draft · **Date:** 2026-11-21 · **Owner:** Jon Lipsky
+**Status:** Approved · **Date:** 2026-11-21 · **Owner:** Jon Lipsky
+
+Decisions 1–7 answered by the owner on 2026-11-21.
 
 ## Why this exists
 
@@ -48,7 +50,7 @@ Sextant manages an **active set** and nothing else:
 5. **Storage is proportional to change, and reclaiming it is cheap.**
    - Unchanged project versions are shared between snapshots (#274).
    - Data is laid out so a whole snapshot or project version can be dropped at once, not row by row.
-6. **The service proves it can recover.** From an empty or lost catalog it returns to a fully current active set on its own, within a stated time, using only its normal triggers (pushes, reconcile, healer, grants).
+6. **The service proves it can recover.** From an empty or lost catalog it returns to a fully current active set on its own, using only its normal triggers (pushes, reconcile, healer, grants). It rebuilds one repository at a time, as host resources allow, and never overloads its host.
 
 ## What already exists (build against, not greenfield)
 
@@ -70,12 +72,12 @@ Sextant manages an **active set** and nothing else:
 
 | # | Title | Outcome | Demo | File |
 |---|---|---|---|---|
-| 0 | Phase 0 — walking skeleton | Bursts collapse to the newest default-branch head, the backlog is visible, and recovery from an empty catalog is measured | 5 rapid pushes produce 1 index; `/control/status` shows queued depth and age; the recovery baseline is recorded | [phase-0-walking-skeleton.md](phase-0-walking-skeleton.md) |
+| 0 | Phase 0 — walking skeleton | Bursts collapse to the newest default-branch head, the backlog is visible, and the watched-repository list survives catalog loss | 5 rapid pushes produce 1 index; `/control/status` shows queued depth and age; after an empty-catalog restart every watched repository is re-queued | [phase-0-walking-skeleton.md](phase-0-walking-skeleton.md) |
 | 1 | Phase 1 — every protection has a live owner | Pending snapshots, staging generations, queued ensures and checkouts without a live owner are failed and reclaimed | Kill a running index mid-run; within one maintenance tick its pending snapshot is failed and its rows reclaimed | [phase-1-live-owners.md](phase-1-live-owners.md) |
 | 2 | Phase 2 — active set and per-branch retention | K snapshots per active branch; inactive or deleted branches, closed PRs and idle repositories expire; reactivation rebuilds | Delete a branch, and its data is gone in the next pass; query an expired repository, and it rebuilds and answers | [phase-2-active-set.md](phase-2-active-set.md) |
-| 3 | Phase 3 — cheap reclamation | A snapshot or project version is dropped as a unit; space returns to the OS | Drop of a TextEditor-sized snapshot takes seconds, and the file shrinks after the pass | [phase-3-cheap-reclamation.md](phase-3-cheap-reclamation.md) |
+| 3 | Phase 3 — cheap reclamation | Each project version lives in its own file; dropping one deletes the file | Drop of a TextEditor-sized snapshot takes seconds, and the file shrinks after the pass | [phase-3-cheap-reclamation.md](phase-3-cheap-reclamation.md) |
 | 4 | Phase 4 — storage proportional to change | Unchanged project versions are shared between snapshots (#274) | A one-file TextEditor commit adds ≤ 5% of a full snapshot's bytes | [phase-4-share-unchanged-projects.md](phase-4-share-unchanged-projects.md) |
-| 5 | Phase 5 — storage SLOs and the recovery drill | Alerts on bytes a day, retention throughput and backlog; a scheduled recovery drill | Monitor issue opens when growth exceeds budget; the drill rebuilds a scratch catalog to current within the SLO | [phase-5-slos-and-drill.md](phase-5-slos-and-drill.md) |
+| 5 | Phase 5 — storage SLOs and the recovery drill | Alerts on bytes a day, retention throughput and backlog; a scheduled recovery drill | A monitor issue opens when growth exceeds budget; the drill rebuilds a scratch catalog sequentially, and every target comes back | [phase-5-slos-and-drill.md](phase-5-slos-and-drill.md) |
 
 ## Acceptance criteria
 
@@ -84,7 +86,7 @@ Sextant manages an **active set** and nothing else:
 3. No object is protected without a live owner. An abandoned run's data is reclaimed within one maintenance tick.
 4. Deleted branches, closed PRs and branches or repositories inactive past the window are fully reclaimed (catalog rows, checkouts, caches) without operator action.
 5. A query or ensure for an expired target triggers a rebuild and is answered when done.
-6. From an empty catalog, the service returns to a fully current active set using only its normal triggers, within **the recovery SLO**, which Phase 0 sets from the measured baseline.
+6. From an empty catalog, the service returns to a fully current active set using only its normal triggers: sequentially, gated on host resources, with no operator action and no time limit. Every watched repository comes back, including ones Sextant registered itself.
 7. Reclaiming a snapshot costs seconds, not hours, and space is returned to the OS.
 8. A one-file commit costs storage proportional to the projects it changes.
 9. Growth, retention throughput and backlog have alerts, and the recovery drill runs on a schedule.
@@ -99,10 +101,10 @@ Sextant manages an **active set** and nothing else:
 
 ## Decisions
 
-1. **K (earlier snapshots kept per active branch).** **Proposed:** K = 1 (the newest head plus the previous one), plus heads of open PRs and any pinned snapshots. Alternative: K = 3, which costs more storage and buys more history for diffing.
-2. **Activity window.** **Proposed:** 14 days for branches and repositories, the same as today's checkout eviction. Default branches of watched repositories are always active. Alternative: 7 days, which is leaner but rebuilds more after a week off.
-3. **Live owner of a pending snapshot.** **Proposed:** its job holds a heartbeat lease; one missed lease plus a grace period (2 × heartbeat) makes it failed. Startup and every maintenance tick sweep. Alternative: sweep only at startup, which is simpler but leaves leaks until restart.
-4. **Answer for an expired target.** **Proposed:** `not-indexed` with `rebuilding: true` and an estimated time, and the ensure is queued. Alternative: block until rebuilt, which is bad for MCP latency.
-5. **Reclamation layout (Phase 3).** **Proposed:** design gate between (a) one attached SQLite file per project version and (b) `WITHOUT ROWID` tables clustered on `(project_version_id, …)`, picked by a measured prototype. Either way drop `ix_occ_project`, and justify or drop `ix_occ_file_version`.
-6. **Storage budget back-pressure.** **Proposed:** when catalog bytes exceed a configured budget, defer non-default-branch indexing and run retention bursts until under budget. Alternative: alert only.
-7. **Recovery SLO.** **Proposed:** set in Phase 0 from the measured baseline after the 2026-11-21 reset, with a target of every watched default branch current within 6 hours of an empty start.
+1. **History per branch.** **Approved:** keep the newest head plus one earlier snapshot (K = 1), plus the heads of open PRs and any pinned snapshots.
+2. **Activity window.** **Approved:** 7 days. A branch with no push, ensure or query for 7 days is inactive and expires. Default branches of watched repositories never expire.
+3. **Live owner of a pending snapshot.** **Approved:** each job holds a heartbeat lease. A missed lease plus a grace period of two heartbeats makes its snapshot `failed`. The sweep runs on **every maintenance pass**, not only at startup.
+4. **Answer for an expired target.** **Approved:** answer at once with `not-indexed`, `rebuilding: true` and an estimated time, and queue the rebuild in the background. Never block the caller.
+5. **Reclamation layout.** **Approved:** one SQLite file per project version, attached as needed. Removing a snapshot or project version deletes its file. There's no prototype comparison: Phase 3 builds this layout and measures only query latency, to confirm no regression.
+6. **Storage budget.** **Approved:** enforce a configured budget. While over it, defer non-default-branch indexing and run retention bursts until under; default branches keep indexing.
+7. **Recovery.** **Approved:** no time limit. Recovery is best effort and sequential, gated on the host's available resources (CPU, memory and disk, within the single-writer design), so a rebuild never overloads the server it runs on. The bar is that every watched target comes back with no operator action. **The list of watched repositories must survive losing the catalog.** The 2026-11-21 reset showed that repositories Sextant had registered itself (TextEditor, MixAndMatch, Confluo, Crdt and others) did not return, while the ones re-sent by a tenant grant did.

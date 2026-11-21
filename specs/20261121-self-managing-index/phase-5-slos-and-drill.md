@@ -11,7 +11,7 @@ Growth problems are caught by alerts, not by a full disk, and recovery from an e
   - disk free under 20%.
 - **Recovery drill:**
   - a scheduled job (weekly) starts a second service instance on a scratch catalog with read-only credentials and no publishing;
-  - it lets that instance rebuild the active set's default branches through normal triggers, and measures time to current against the SLO;
+  - it lets that instance rebuild every watched default branch through normal triggers, sequentially and resource-gated, and records how long it took (informational; there is no deadline);
   - it reports and tears down;
   - it never touches the production catalog.
 - **Runbook:** catalog reset procedure (stop, delete, start, watch), with today's procedure as the reference.
@@ -22,7 +22,7 @@ Growth problems are caught by alerts, not by a full disk, and recovery from an e
 
 ## Acceptance criteria
 1. Each alert fires on the Nov 19–21 history fixture.
-2. The drill meets the SLO, or opens an issue.
+2. The drill brings back every watched target without help, or opens an issue naming what didn't come back.
 
 ## Demo
 Replay the November history into the alert evaluator, and each alert fires. Run the drill once and attach its report.
