@@ -2,7 +2,7 @@
 
 **Status:** Approved · **Date:** 2026-11-21 · **Owner:** Jon Lipsky
 
-Decisions 1–7 answered by the owner on 2026-11-21. Epic #418.
+Decisions 1–7 answered by the owner on 2026-11-21, decision 8 on 2026-11-22. Epic #418.
 
 ## Why this exists
 
@@ -78,6 +78,7 @@ Sextant manages an **active set** and nothing else:
 | 3 | Phase 3 — cheap reclamation | Each project version lives in its own file; dropping one deletes the file | Drop of a TextEditor-sized snapshot takes seconds, and the file shrinks after the pass | [phase-3-cheap-reclamation.md](phase-3-cheap-reclamation.md) |
 | 4 | Phase 4 — storage proportional to change | Unchanged project versions are shared between snapshots (#274) | A one-file TextEditor commit adds ≤ 5% of a full snapshot's bytes | [phase-4-share-unchanged-projects.md](phase-4-share-unchanged-projects.md) |
 | 5 | Phase 5 — storage alerts | Alerts on bytes a day, retention throughput, backlog age, free disk and prolonged budget enforcement | Replaying the November history makes each alert fire | [phase-5-storage-alerts.md](phase-5-storage-alerts.md) |
+| 6 | Phase 6 — compact storage | Each project version and the working storage beside the catalog (package folders, checkouts, git objects) are stored compactly; package folders stay under their bound | The storage harness shows bytes per symbol and per occurrence at ≤ 50% of the 2026-11-22 measurement with identical answers; `/control/status` reports bytes per storage class | [phase-6-compact-storage.md](phase-6-compact-storage.md) |
 
 ## Acceptance criteria
 
@@ -90,6 +91,7 @@ Sextant manages an **active set** and nothing else:
 7. Reclaiming a snapshot costs seconds, not hours, and space is returned to the OS.
 8. A one-file commit costs storage proportional to the projects it changes.
 9. Growth, retention throughput, backlog and free disk have alerts.
+10. Stored rows are compact: bytes per symbol and per occurrence at most half of the 2026-11-22 measurement, with identical answers. Working storage beside the catalog stays within its bounds and is reported per storage class.
 
 ## Testing seams
 
@@ -108,3 +110,4 @@ Sextant manages an **active set** and nothing else:
 5. **Reclamation layout.** **Approved:** one SQLite file per project version, attached as needed. Removing a snapshot or project version deletes its file. There's no prototype comparison: Phase 3 builds this layout and measures only query latency, to confirm no regression.
 6. **Storage budget.** **Approved:** enforce a configured budget. While over it, defer non-default-branch indexing and run retention bursts until under; default branches keep indexing.
 7. **Recovery.** **Approved:** no time limit. Recovery is best effort and sequential, gated on the host's available resources (CPU, memory and disk, within the single-writer design), so a rebuild never overloads the server it runs on. The bar is that every watched target comes back with no operator action. **The list of watched repositories must survive losing the catalog.** The 2026-11-21 reset showed that repositories Sextant had registered itself (TextEditor, MixAndMatch, Confluo, Crdt and others) did not return, while the ones re-sent by a tenant grant did.
+8. **Sharing identical package files (Phase 6).** **Approved 2026-11-22:** share by content hash through copy-on-write reflinks where the filesystem supports them; otherwise (ext4, cloudserver1 today) keep separate copies under the fixed bound. No plain hard links.
