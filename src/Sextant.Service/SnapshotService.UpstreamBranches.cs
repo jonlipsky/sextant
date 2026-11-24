@@ -54,9 +54,6 @@ public sealed record UpstreamBranchReport
     /// <summary>Service-owned advances to the remote head started this pass.</summary>
     public int HealsStarted { get; init; }
 
-    /// <summary>Confirmed stale pointers not healed because the job of the heal's identity is already terminal <c>failed</c> or <c>unsupported</c> (a heal would only repeat it).</summary>
-    public int HealSkippedTerminal { get; init; }
-
     public double DurationMs { get; init; }
 }
 
@@ -109,11 +106,9 @@ public sealed partial class SnapshotService
     /// Healing (issue #400; off when <see cref="MaintenancePolicy.BranchUpstreamHealMaxPerTick"/> is 0, in which case only
     /// non-default pointers are read): a pointer, default or not, whose snapshot commit differs from the head the same
     /// <c>ls-remote</c> returned, with no running job or queued retirement against this repository/branch, and
-    /// the same difference (same pointer, same remote head) on two consecutive listings, gets a service-owned ensure of
-    /// the remote head under actor <c>upstream_policy</c>, a <c>branch_update: advance</c> CAS on the pointer's current
-    /// commit (<c>expected_head_commit</c>), so coalescing, the audit row and the handover rules are the push path's.
-    /// Default repairs require a strict forward move on freshly verified remote history; non-default ensures retain
-    /// their ordinary CAS semantics. A moving default head does not reset confirmation of an unchanged stale pointer. At most
+    /// the same difference (same pointer, same remote head) on two consecutive listings, admits a service-owned refresh
+    /// marker under actor <c>upstream_policy</c>. The marker follows a freshly verified remote head, including rewinds
+    /// and force-pushes, for both default and feature branches. At most
     /// <see cref="MaintenancePolicy.BranchUpstreamHealMaxPerTick"/> are started per tick; a default branch is healed but
     /// never retired.
     /// </para>
@@ -174,7 +169,6 @@ public sealed partial class SnapshotService
         var healAwaiting = 0;
         var healsDeferred = 0;
         var healsStarted = 0;
-        var healsSkippedTerminal = 0;
 
         var batch = due.Where(r => { lock (_upstreamListing) return !_upstreamListing.Contains(r.Key); })
             .Take(policy.BranchUpstreamCheckMaxRepositoriesPerTick).ToList();
@@ -255,9 +249,6 @@ public sealed partial class SnapshotService
                         case HealStart.Busy:
                             healBusy++;
                             break;
-                        case HealStart.Terminal:
-                            healsSkippedTerminal++;
-                            break;
                     }
                     continue;
                 }
@@ -325,23 +316,17 @@ public sealed partial class SnapshotService
             HealAwaitingConfirmation = healAwaiting,
             HealsDeferred = healsDeferred,
             HealsStarted = healsStarted,
-            HealSkippedTerminal = healsSkippedTerminal,
             DurationMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds
         };
     }
 
-    private enum HealStart { Started, Busy, Terminal, NotStarted }
+    private enum HealStart { Started, Busy, NotStarted }
 
     private readonly HashSet<(string Repository, string Branch)> _pendingDefaultRepairs = [];
 
-    // Issue #400: the heal is an ordinary service-owned branch-advance ensure of the remote head (the shape a push
-    // sends: CAS on the pointer's current commit), so admission, coalescing, the write turn, the CAS/reuse rules and
-    // the ensure audit row are exactly the push path's, attributed to upstream_policy. It is not awaited: the index may
-    // take minutes, and the pending-work check keeps the next pass off the branch meanwhile.
-    //
-    // The decision to heal was made from state read before the listing phase, which can take tens of seconds, so it is
-    // re-made here at admission under _inFlightLock. Queued work cannot block a repair indefinitely: only a running
-    // job on this branch is busy. The pointer is re-read here and CAS-checked again on the repair's writer turn.
+    // Issue #400: admit a durable refresh marker attributed to upstream_policy. Its turn independently verifies
+    // the remote head and default ownership before deciding the pointer. Recheck the listed pointer and running work
+    // at admission; indexing continues asynchronously.
     private HealStart StartHeal(IdleBranchCandidate candidate, string remoteHead)
     {
         var request = new EnsureSnapshotRequest
@@ -355,7 +340,6 @@ public sealed partial class SnapshotService
         var repositoryKey = RemoteUrlIdentity.Normalize(candidate.RepositoryRemoteUrl);
         try
         {
-            Task<EnsureSnapshotResult> completion;
             lock (_inFlightLock)
             {
                 ObjectDisposedException.ThrowIf(_disposed, this);
@@ -364,7 +348,6 @@ public sealed partial class SnapshotService
                     || _pendingIdleRetires.Contains(IdleRetireKey(candidate.RepositoryRemoteUrl, candidate.Name)))
                     return HealStart.Busy;
 
-                SnapshotJobRow? healJob;
                 using (var reader = OpenReadConnection())
                 {
                     var pointer = new SnapshotStore(reader).ListBranchPointers().FirstOrDefault(p => p.BranchId == candidate.BranchId);
@@ -375,28 +358,13 @@ public sealed partial class SnapshotService
                     var jobs = new SnapshotJobStore(reader);
                     if (jobs.BranchesWithPendingWork(includeQueued: false).Contains((repositoryKey, candidate.Name)))
                         return HealStart.Busy;
-                    var store = new SnapshotStore(reader);
-                    if (candidate.IsDefault && store.GetRepositoryId(candidate.RepositoryRemoteUrl) is long repoId
-                        && store.ListPublishedAdvanceCandidates(repoId).Any(s =>
-                            s.Id != candidate.SnapshotId
-                            && !string.Equals(s.Commit, candidate.HeadCommit, StringComparison.OrdinalIgnoreCase)))
-                    {
-                        StartPublishedDefaultRepair(candidate, remoteHead, repositoryKey);
-                        return HealStart.Started;
-                    }
-                    healJob = jobs.GetJobByIdentity(IdentityHashFor(request));
+                    _pendingDefaultRepairs.Add((repositoryKey, candidate.Name));
+                    var refresh = AdmitRefreshAsync(request with { Refresh = true }, UpstreamPolicyCaller,
+                        Guid.NewGuid().ToString("N"), CancellationToken.None);
+                    _ = CompleteDefaultHealAsync(refresh, repositoryKey, candidate.Name);
+                    return HealStart.Started;
                 }
-                // A heal of a commit whose build already failed for good would only repeat the failure (and write an
-                // ensure audit row every pass), so it waits for a human or a new remote head.
-                if (healJob is not null && healJob.Status is SnapshotJobStatus.Failed or SnapshotJobStatus.Unsupported)
-                    return HealStart.Terminal;
-
-                (_, completion, _, _) = StartEnsureOperation(request, UpstreamPolicyCaller);
             }
-            _ = completion.ContinueWith(
-                t => _metrics.RecordUpstreamBranchHealApplied(t.IsCompletedSuccessfully && t.Result.BranchAdvanced == true),
-                CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-            return HealStart.Started;
         }
         catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException or ArgumentException)
         {
@@ -404,122 +372,26 @@ public sealed partial class SnapshotService
         }
     }
 
-    // A short, already-published repair uses maintenance priority, ahead of the queued indexing backlog.
-    private void StartPublishedDefaultRepair(IdleBranchCandidate candidate, string remoteHead, string repositoryKey)
+    private async Task CompleteDefaultHealAsync(
+        Task<(EnsureSnapshotResult Admission, Task<EnsureSnapshotResult> Completion)> admission,
+        string repositoryKey, string branch)
     {
-        var turn = TakeWriteTurnLocked(out _, priority: true);
-        _pendingDefaultRepairs.Add((repositoryKey, candidate.Name));
-        Task<EnsureSnapshotResult>? build = null;
-        var operation = Task.Run(async () =>
+        try
         {
-            await turn.ConfigureAwait(false);
-            try
-            {
-                EnsureLeaseHeld();
-                if (_lifetime.IsCancellationRequested)
-                    return false;
-                var freshHead = await ReadFreshRepairHeadAsync(candidate.RepositoryRemoteUrl, candidate.Name)
-                    .ConfigureAwait(false);
-                using var bound = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
-                bound.CancelAfter(RepairAncestryTimeout);
-                var store = new SnapshotStore(_conn);
-                (long Id, string Commit)? newest = null;
-                var reason = AncestryUnknown;
-                string? detail = null;
-                if (store.GetRepositoryId(candidate.RepositoryRemoteUrl) is long repo)
-                {
-                    foreach (var snapshot in store.ListPublishedAdvanceCandidates(repo))
-                    {
-                        if (snapshot.Id == candidate.SnapshotId
-                            || string.Equals(snapshot.Commit, candidate.HeadCommit, StringComparison.OrdinalIgnoreCase))
-                            continue;
-                        var refused = await CheckRepairAncestryAsync(candidate, snapshot.Commit, freshHead, bound.Token)
-                            .ConfigureAwait(false);
-                        if (refused.Reason is not null)
-                        {
-                            if (reason != "not_on_remote_history")
-                            {
-                                reason = refused.Reason;
-                                detail = refused.Detail;
-                            }
-                            continue;
-                        }
-                        if (newest is null)
-                            newest = snapshot;
-                        else if (!string.Equals(newest.Value.Commit, snapshot.Commit, StringComparison.OrdinalIgnoreCase))
-                        {
-                            var newer = await IsRepairAncestorAsync(candidate.RepositoryRemoteUrl,
-                                newest.Value.Commit, snapshot.Commit, bound.Token).ConfigureAwait(false);
-                            if (newer.IsAncestor is null)
-                            {
-                                newest = null;
-                                reason = AncestryUnknown;
-                                detail = newer.Detail;
-                                break;
-                            }
-                            if (newer.IsAncestor == true)
-                                newest = snapshot;
-                        }
-                    }
-                }
-                if (newest is not { } target)
-                {
-                    Log(System.Text.Json.JsonSerializer.Serialize(new
-                    {
-                        @event = AuditAction.BranchAdvanceRefused,
-                        repository = repositoryKey,
-                        branch = candidate.Name,
-                        observed_head = remoteHead,
-                        fresh_head = freshHead,
-                        reason,
-                        detail = reason == AncestryUnknown ? detail : null
-                    }));
-                    // Retained older/off-history snapshots must not prevent the healer from requesting missing
-                    // default-head work. The production suppresses its ordinary CAS and re-verifies ancestry.
-                    if (reason != AncestryUnknown && freshHead is not null && candidate.HeadCommit is not null
-                        && !string.Equals(candidate.HeadCommit, freshHead, StringComparison.OrdinalIgnoreCase)
-                        && store.GetRepositoryId(candidate.RepositoryRemoteUrl) is long repository
-                        && !store.ListPublishedAdvanceCandidates(repository).Any(s =>
-                            string.Equals(s.Commit, freshHead, StringComparison.OrdinalIgnoreCase))
-                        && (await IsRepairAncestorAsync(candidate.RepositoryRemoteUrl,
-                            candidate.HeadCommit, freshHead, bound.Token).ConfigureAwait(false)).IsAncestor == true)
-                    {
-                        (_, build, _, _) = StartEnsureOperation(new EnsureSnapshotRequest
-                        {
-                            RepositoryRemoteUrl = candidate.RepositoryRemoteUrl,
-                            CommitSha = freshHead,
-                            BranchName = candidate.Name,
-                            IsDefaultBranch = true,
-                            ExpectedHeadCommit = candidate.HeadCommit
-                        }, UpstreamPolicyCaller);
-                    }
-                    return false;
-                }
-                EnsureLeaseHeld();
-                return RepairPublishedDefaultLocked(candidate, target.Commit, target.Id);
-            }
-            finally
-            {
-                _writeGate.Release();
-            }
-        }, CancellationToken.None);
-        _operations.Add(operation);
-        _ = operation.ContinueWith(t =>
+            var (_, completion) = await admission.ConfigureAwait(false);
+            var result = await completion.ConfigureAwait(false);
+            _metrics.RecordUpstreamBranchHealApplied(result.BranchAdvanced == true);
+        }
+        catch (Exception ex)
+        {
+            Log($"default_heal_refresh_failed error={ex.GetType().Name}");
+            _metrics.RecordUpstreamBranchHealApplied(false);
+        }
+        finally
         {
             lock (_inFlightLock)
-            {
-                _operations.Remove(t);
-                _pendingDefaultRepairs.Remove((repositoryKey, candidate.Name));
-            }
-            if (t.Exception is { } error)
-                Console.Error.WriteLine($"Default branch repair failed: {error.GetBaseException().Message}");
-            if (build is null)
-                _metrics.RecordUpstreamBranchHealApplied(t.IsCompletedSuccessfully && t.Result);
-            else
-                _ = build.ContinueWith(b =>
-                    _metrics.RecordUpstreamBranchHealApplied(b.IsCompletedSuccessfully && b.Result.BranchAdvanced == true),
-                    CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                _pendingDefaultRepairs.Remove((repositoryKey, branch));
+        }
     }
 
     private bool RepairPublishedDefaultLocked(
@@ -594,11 +466,13 @@ public sealed partial class SnapshotService
     }
 
     private async Task<(string? Reason, string? Detail)> CheckRepairAncestryAsync(
-        IdleBranchCandidate pointer, string target, string? freshHead, CancellationToken token)
+        IdleBranchCandidate pointer, string target, string? freshHead, CancellationToken token,
+        bool allowIdentityUpgrade = false)
     {
         if (freshHead is null || pointer.HeadCommit is null)
             return (AncestryUnknown, "remote or pointer head unavailable");
-        if (string.Equals(pointer.HeadCommit, target, StringComparison.OrdinalIgnoreCase))
+        var sameCommit = string.Equals(pointer.HeadCommit, target, StringComparison.OrdinalIgnoreCase);
+        if (sameCommit && !allowIdentityUpgrade)
             return ("not_descendant", null);
         // Equality avoids fetching the remote tip, but never bypasses the forward-only pointer check.
         if (!string.Equals(target, freshHead, StringComparison.OrdinalIgnoreCase))
@@ -607,6 +481,8 @@ public sealed partial class SnapshotService
             if (onRemote.IsAncestor != true)
                 return (onRemote.IsAncestor is false ? "not_on_remote_history" : AncestryUnknown, onRemote.Detail);
         }
+        if (sameCommit)
+            return (null, null);
         var forward = await IsRepairAncestorAsync(pointer.RepositoryRemoteUrl, pointer.HeadCommit, target, token).ConfigureAwait(false);
         if (forward.IsAncestor == true)
             return (null, null);
@@ -619,7 +495,7 @@ public sealed partial class SnapshotService
     {
         if (_remoteDefaults is not { HasBranchHeadResolver: true } lookup)
             return null;
-        using var bound = new CancellationTokenSource(RemoteHeadTimeout);
+        using var bound = new CancellationTokenSource(RemoteHeadTimeout, _timeProvider);
         using var wait = CancellationTokenSource.CreateLinkedTokenSource(bound.Token, _lifetime.Token);
         try
         {
@@ -640,7 +516,8 @@ public sealed partial class SnapshotService
     private async Task<(EnsureSnapshotResult Result, DefaultRepairRefusal? Refusal)> RepairVerifiedDefaultHeadAsync(
         EnsureSnapshotRequest request, EnsureSnapshotResult result)
     {
-        if (result.BranchAdvanced != false || result.SnapshotId is not long target || request.SuppressesBranchUpdate
+        if (result.BranchAdvanced != false || result.SnapshotId is not long target
+            || request.SuppressesBranchUpdate
             || request.BranchHeadSequence is not null || request.RebuildGeneration is not null
             || result.Status is not (SnapshotJobStatus.Complete or SnapshotJobStatus.Partial)
             || _remoteDefaults is not { HasBranchHeadResolver: true })
@@ -657,6 +534,8 @@ public sealed partial class SnapshotService
 
         var freshHead = await ReadFreshRepairHeadAsync(request.RepositoryRemoteUrl, candidate.Name, request.LookupTenant)
             .ConfigureAwait(false);
+        if (freshHead is not null && !string.Equals(request.CommitSha, freshHead, StringComparison.OrdinalIgnoreCase))
+            return (result, new DefaultRepairRefusal(request.CommitSha, freshHead, "not_verified_head", null));
         using var bound = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
         bound.CancelAfter(RepairAncestryTimeout);
         var refused = await CheckRepairAncestryAsync(candidate, request.CommitSha, freshHead, bound.Token).ConfigureAwait(false);

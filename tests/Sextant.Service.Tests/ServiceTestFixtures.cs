@@ -171,6 +171,8 @@ internal sealed class FakeSnapshotWorker(
     /// <summary>Set true to make the worker wait on <see cref="Gate"/> before producing.</summary>
     public bool UseGate { get; init; }
 
+    public Func<FakeSnapshotWorker, EnsureSnapshotRequest, CancellationToken, Task<SnapshotWorkResult>>? AsyncBehavior { get; init; }
+
     public async Task<SnapshotWorkResult> ProduceAsync(
         EnsureSnapshotRequest request, string identityHash, string scratchDir, CancellationToken cancellationToken)
     {
@@ -178,6 +180,8 @@ internal sealed class FakeSnapshotWorker(
         if (UseGate)
             await Gate.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
 
+        if (AsyncBehavior is not null)
+            return await AsyncBehavior(this, request, cancellationToken).ConfigureAwait(false);
         var produce = behavior ?? DefaultPublishComplete;
         return produce(this, request);
     }

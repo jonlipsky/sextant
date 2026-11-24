@@ -95,6 +95,11 @@ public static class PrometheusExposition
             s.Jobs.OldestQueuedAgeSeconds);
         Gauge(sb, "sextant_jobs_longest_running_age_seconds", "Seconds the longest-running job has been running (0 when none).",
             s.Jobs.LongestRunningAgeSeconds);
+        QueueEnsureGauge(sb, "sextant_queued_ensures_depth", "Queued ensure admissions awaiting a writer turn.",
+            s.Jobs.QueuedEnsures, lane => lane.Depth);
+        QueueEnsureGauge(sb, "sextant_queued_ensures_oldest_age_seconds",
+            "Seconds the oldest queued ensure admission has waited for a writer turn (0 when none).",
+            s.Jobs.QueuedEnsures, lane => lane.OldestAgeSeconds);
         Gauge(sb, "sextant_storage_catalog_pages", "Catalog page count (PRAGMA page_count).", s.Storage.CatalogPageCount);
         Gauge(sb, "sextant_storage_catalog_free_pages", "Catalog free pages (PRAGMA freelist_count).", s.Storage.CatalogFreePages);
         Gauge(sb, "sextant_storage_catalog_free_page_ratio", "Catalog free pages as a fraction of all pages.", s.Storage.CatalogFreePageRatio);
@@ -160,8 +165,6 @@ public static class PrometheusExposition
             s.Maintenance.UpstreamBranchHealsAppliedTotal);
         Gauge(sb, "sextant_upstream_branch_heals_not_applied_total", "Upstream-branch heal advances that finished without moving the pointer since start.",
             s.Maintenance.UpstreamBranchHealsNotAppliedTotal);
-        Gauge(sb, "sextant_upstream_branch_heals_skipped_terminal_total", "Upstream-branch heals not started because the heal identity's job is terminal failed or unsupported since start.",
-            s.Maintenance.UpstreamBranchHealsSkippedTerminalTotal);
         Gauge(sb, "sextant_upstream_listing_failures_total", "Upstream branch listings that failed or were not trustworthy since start.",
             s.Maintenance.UpstreamListingFailuresTotal);
         Gauge(sb, "sextant_upstream_pass_duration_ms", "Duration of the latest upstream-branch pass in milliseconds.",
@@ -250,6 +253,21 @@ public static class PrometheusExposition
         sb.Append("# HELP ").Append(name).Append(' ').Append(help).Append('\n');
         sb.Append("# TYPE ").Append(name).Append(" gauge\n");
         sb.Append(name).Append(' ').Append(value.ToString("G", CultureInfo.InvariantCulture)).Append('\n');
+    }
+
+    private static void QueueEnsureGauge(
+        StringBuilder sb, string name, string help, QueuedEnsureMetrics metrics, Func<QueuedEnsureLaneMetrics, double> value)
+    {
+        sb.Append("# HELP ").Append(name).Append(' ').Append(help).Append('\n');
+        sb.Append("# TYPE ").Append(name).Append(" gauge\n");
+        foreach (var (laneName, lane) in new[]
+                 {
+                     ("total", metrics.Total),
+                     ("expedited", metrics.Expedited),
+                     ("normal", metrics.Normal)
+                 })
+            sb.Append(name).Append("{lane=\"").Append(laneName).Append("\"} ")
+                .Append(value(lane).ToString(CultureInfo.InvariantCulture)).Append('\n');
     }
 
     private static void Counter(StringBuilder sb, string name, string help, double value)

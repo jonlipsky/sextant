@@ -32,6 +32,8 @@ public sealed class MetricsCollector(
     private static readonly long RecentWindowMs = (long)TimeSpan.FromHours(24).TotalMilliseconds;
     private readonly TimeProvider _time = timeProvider ?? TimeProvider.System;
 
+    internal Action? QueuedEnsureReadHook { get; set; }
+
     /// <param name="visibleRepositoryKeys">
     /// The <see cref="Sextant.Service.Grants.RepositoryGrantKey"/>s the per-repository series (freshness and cost) may name; null
     /// = every repository (the operator's own access).
@@ -82,6 +84,10 @@ public sealed class MetricsCollector(
 
         return snapshot with { Alerts = AlertEvaluator.Evaluate(snapshot, thresholds) };
     }
+
+    /// <summary>Collects only queued-ensure depth and age, without unrelated catalog, storage, or latency metrics.</summary>
+    public QueuedEnsureMetrics CollectQueuedEnsureMetrics() =>
+        CollectQueuedEnsures(_time.GetUtcNow().ToUnixTimeMilliseconds());
 
     private IReadOnlyList<DefaultBranchPointerLag> CollectDefaultBranchPointerLag(IReadOnlySet<string>? visibleRepositoryKeys)
     {
@@ -218,6 +224,7 @@ public sealed class MetricsCollector(
         {
             OldestQueuedAgeSeconds = oldestQueued,
             LongestRunningAgeSeconds = longestRunning,
+            QueuedEnsures = CollectQueuedEnsures(nowMs),
             Queued = counts.GetValueOrDefault(SnapshotJobStatus.Queued),
             Running = counts.GetValueOrDefault(SnapshotJobStatus.Running),
             Complete = counts.GetValueOrDefault(SnapshotJobStatus.Complete),
@@ -226,6 +233,80 @@ public sealed class MetricsCollector(
             Unsupported = counts.GetValueOrDefault(SnapshotJobStatus.Unsupported),
             Cancelled = counts.GetValueOrDefault(SnapshotJobStatus.Cancelled),
             Coalesced = counts.GetValueOrDefault(SnapshotJobStatus.Coalesced)
+        };
+    }
+
+    private QueuedEnsureMetrics CollectQueuedEnsures(long nowMs)
+    {
+        return metrics.WithQueuedEnsureSnapshot(live =>
+        {
+            var admissions = new Dictionary<long, (bool Expedited, long AdmittedAtUnixMs)>();
+            var durable = new List<(long Seq, string Hash, string RequestJson, long AdmittedAtUnixMs)>();
+            using (var cmd = connection.CreateCommand())
+            {
+                cmd.CommandText = """
+                    SELECT seq, identity_hash, request_json, admitted_at
+                    FROM queued_ensures
+                    ORDER BY seq;
+                    """;
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                    durable.Add((reader.GetInt64(0), reader.GetString(1), reader.GetString(2), reader.GetInt64(3)));
+            }
+
+            var snapshots = new SnapshotStore(connection);
+            foreach (var row in durable)
+            {
+                var request = System.Text.Json.JsonSerializer.Deserialize<EnsureSnapshotRequest>(
+                                  row.RequestJson, ServiceJson.Options)
+                              ?? throw new InvalidDataException($"Durable queued ensure {row.Seq} has a null request.");
+                var lane = IsExpeditedQueueLane(request, snapshots);
+                admissions[row.Seq] = (lane, row.AdmittedAtUnixMs);
+            }
+
+            QueuedEnsureReadHook?.Invoke();
+
+            foreach (var (seq, admission) in live)
+            {
+                if (admission.Started || admission.Duplicate)
+                    admissions.Remove(seq);
+                else
+                    admissions[seq] = (admission.Expedited, admission.AdmittedAtUnixMs);
+            }
+
+            var total = Summarize(admissions.Values, nowMs);
+            var expeditedOnly = Summarize(admissions.Values.Where(a => a.Expedited), nowMs);
+            var normalOnly = Summarize(admissions.Values.Where(a => !a.Expedited), nowMs);
+            return new QueuedEnsureMetrics
+            {
+                Total = total,
+                Expedited = expeditedOnly,
+                Normal = normalOnly
+            };
+        });
+    }
+
+    private static bool IsExpeditedQueueLane(EnsureSnapshotRequest request, SnapshotStore snapshots)
+    {
+        if (request.SuppressesBranchUpdate)
+            return false;
+        if (request.IsDefaultBranch == true)
+            return true;
+        var repositoryId = snapshots.GetRepositoryId(request.RepositoryRemoteUrl);
+        return repositoryId is long id
+            && snapshots.GetBranch(id, request.BranchName ?? "main") is { IsDefault: true };
+    }
+
+    private static QueuedEnsureLaneMetrics Summarize(
+        IEnumerable<(bool Expedited, long AdmittedAtUnixMs)> admissions, long nowMs)
+    {
+        var values = admissions.ToArray();
+        return new QueuedEnsureLaneMetrics
+        {
+            Depth = values.LongLength,
+            OldestAgeSeconds = values.Length == 0
+                ? 0
+                : Math.Max(0, (nowMs - values.Min(a => a.AdmittedAtUnixMs)) / 1000.0)
         };
     }
 

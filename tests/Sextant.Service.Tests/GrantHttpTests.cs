@@ -583,6 +583,19 @@ public class GrantHttpTests
         Assert.AreEqual(HttpStatusCode.OK, application.StatusCode);
         Assert.AreEqual(HttpStatusCode.OK, operatorCall.StatusCode);
         Assert.AreEqual(HttpStatusCode.OK, granted.StatusCode);
+        Assert.IsTrue((await JsonAsync(operatorCall, HttpStatusCode.OK)).TryGetProperty("queued_ensures", out _),
+            "only the assertion-less operator status includes node-wide queue metrics");
+        Assert.IsFalse((await JsonAsync(application, HttpStatusCode.OK)).TryGetProperty("queued_ensures", out _));
+        Assert.IsFalse((await JsonAsync(granted, HttpStatusCode.OK)).TryGetProperty("queued_ensures", out _));
+
+        using var operatorReport = await host.ControlAsync(HttpMethod.Get, "/control/report", ControlToken);
+        using var applicationReport = await host.ControlAsync(HttpMethod.Get, "/control/report", ControlToken, AppAssertion(host));
+        using var userReport = await host.ControlAsync(HttpMethod.Get, "/control/report", ControlToken, host.UserAssertion());
+        Assert.IsTrue((await JsonAsync(operatorReport, HttpStatusCode.OK)).TryGetProperty("queued_ensures", out _),
+            "the operator daily report includes node-wide queue metrics");
+        Assert.IsFalse((await JsonAsync(applicationReport, HttpStatusCode.OK)).TryGetProperty("queued_ensures", out _),
+            "tenant-scoped reports omit node-wide queue metrics");
+        Assert.AreEqual(HttpStatusCode.Forbidden, userReport.StatusCode);
     }
 
     // ==== list_repositories =========================================================================

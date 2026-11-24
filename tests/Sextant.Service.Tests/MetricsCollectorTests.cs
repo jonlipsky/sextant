@@ -224,6 +224,156 @@ public class MetricsCollectorTests
     }
 
     [TestMethod]
+    public void QueuedEnsureMetrics_CombineLiveAndDurableAdmissions_WithoutDoubleCounting()
+    {
+        var now = new DateTimeOffset(2026, 1, 2, 12, 0, 0, TimeSpan.Zero);
+        var nowMs = now.ToUnixTimeMilliseconds();
+        AddQueuedEnsure(11, nowMs - 120_000, expedited: true);
+        AddQueuedEnsure(12, nowMs - 30_000, expedited: false);
+        AddQueuedEnsure(14, nowMs - 180_000, expedited: false, identityHash: "queued-ensure-12");
+
+        var metrics = new ServiceMetrics();
+        metrics.RecordQueuedEnsureAdmission(11, "queued-ensure-11", expedited: true, admittedAtUnixMs: nowMs - 120_000);
+        metrics.RecordQueuedEnsureAdmission(13, "live-ensure-13", expedited: false, admittedAtUnixMs: nowMs - 90_000);
+
+        var snapshot = Collect(now, metrics: metrics);
+        var queued = snapshot.Jobs.QueuedEnsures;
+        Assert.AreEqual(4, queued.Total.Depth);
+        Assert.AreEqual(180, queued.Total.OldestAgeSeconds, 0.001);
+        Assert.AreEqual(1, queued.Expedited.Depth);
+        Assert.AreEqual(120, queued.Expedited.OldestAgeSeconds, 0.001);
+        Assert.AreEqual(3, queued.Normal.Depth);
+        Assert.AreEqual(180, queued.Normal.OldestAgeSeconds, 0.001);
+
+        var exposition = PrometheusExposition.Render(snapshot);
+        StringAssert.Contains(exposition, "sextant_queued_ensures_depth{lane=\"total\"} 4");
+        StringAssert.Contains(exposition, "sextant_queued_ensures_depth{lane=\"expedited\"} 1");
+        StringAssert.Contains(exposition, "sextant_queued_ensures_oldest_age_seconds{lane=\"normal\"} 180");
+
+        var later = Collect(now.AddMinutes(1), metrics: metrics).Jobs.QueuedEnsures;
+        Assert.AreEqual(240, later.Total.OldestAgeSeconds, 0.001);
+        Assert.AreEqual(240, later.Normal.OldestAgeSeconds, 0.001);
+    }
+
+    [TestMethod]
+    public void QueuedEnsureMetrics_StartedLiveAdmissionMasksItsStillDurableRow()
+    {
+        var now = new DateTimeOffset(2026, 1, 2, 12, 0, 0, TimeSpan.Zero);
+        var nowMs = now.ToUnixTimeMilliseconds();
+        AddQueuedEnsure(21, nowMs - 300_000, expedited: true);
+        var metrics = new ServiceMetrics();
+        metrics.RecordQueuedEnsureAdmission(21, "queued-ensure-21", expedited: true, admittedAtUnixMs: nowMs - 300_000);
+        metrics.RecordQueuedEnsureStarted(21);
+
+        var queued = Collect(now, metrics: metrics).Jobs.QueuedEnsures;
+        Assert.AreEqual(0, queued.Total.Depth);
+        Assert.AreEqual(0, queued.Total.OldestAgeSeconds);
+        Assert.AreEqual(0, queued.Expedited.Depth);
+    }
+
+    [TestMethod]
+    public void QueuedEnsureMetrics_DistinctTurnsWithTheSameIdentityCountSeparately()
+    {
+        var now = new DateTimeOffset(2026, 1, 2, 12, 0, 0, TimeSpan.Zero);
+        var admittedAt = now.ToUnixTimeMilliseconds() - 30_000;
+        const string hash = "duplicate-replay-identity";
+        AddQueuedEnsure(51, admittedAt, expedited: false, identityHash: hash);
+        AddQueuedEnsure(52, admittedAt + 1, expedited: false, identityHash: hash);
+
+        var metrics = new ServiceMetrics();
+        metrics.RecordQueuedEnsureAdmission(51, hash, expedited: false, admittedAtUnixMs: admittedAt);
+        metrics.RecordQueuedEnsureAdmission(52, hash, expedited: false, admittedAtUnixMs: admittedAt + 1);
+        Assert.AreEqual(2, Collect(now, metrics: metrics).Jobs.QueuedEnsures.Total.Depth);
+
+        metrics.RecordQueuedEnsureStarted(51);
+        Assert.AreEqual(1, Collect(now, metrics: metrics).Jobs.QueuedEnsures.Total.Depth);
+        metrics.RecordQueuedEnsureStarted(52);
+        Assert.AreEqual(0, Collect(now, metrics: metrics).Jobs.QueuedEnsures.Total.Depth);
+    }
+
+    [TestMethod]
+    public void QueuedEnsureMetrics_DuplicateReplayRowDoesNotCountAsAnotherTurn()
+    {
+        var now = new DateTimeOffset(2026, 1, 2, 12, 0, 0, TimeSpan.Zero);
+        var admittedAt = now.ToUnixTimeMilliseconds() - 30_000;
+        const string hash = "duplicate-replay-identity";
+        AddQueuedEnsure(51, admittedAt, expedited: false, identityHash: hash);
+        AddQueuedEnsure(52, admittedAt + 1, expedited: false, identityHash: hash);
+        var metrics = new ServiceMetrics();
+        metrics.RecordQueuedEnsureAdmission(51, hash, expedited: false, admittedAtUnixMs: admittedAt);
+        metrics.RecordQueuedEnsureDuplicate(52, hash, expedited: false, admittedAtUnixMs: admittedAt + 1);
+        Assert.AreEqual(1, Collect(now, metrics: metrics).Jobs.QueuedEnsures.Total.Depth);
+        metrics.RecordQueuedEnsureStarted(51);
+        Assert.AreEqual(0, Collect(now, metrics: metrics).Jobs.QueuedEnsures.Total.Depth);
+    }
+
+    [TestMethod]
+    public async Task QueuedEnsureMetrics_FinishingBetweenSourceReadsCannotLeaveAStaleDurableCount()
+    {
+        var now = new DateTimeOffset(2026, 1, 2, 12, 0, 0, TimeSpan.Zero);
+        var nowMs = now.ToUnixTimeMilliseconds();
+        AddQueuedEnsure(41, nowMs - 10_000, expedited: false);
+        var metrics = new ServiceMetrics();
+        metrics.RecordQueuedEnsureAdmission(41, "queued-ensure-41", expedited: false, admittedAtUnixMs: nowMs - 10_000);
+        var durableRead = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var continueRead = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var collector = new MetricsCollector(
+            _db.GetConnection(),
+            new ServicePaths(ServiceVolumes.Rooted(Path.Combine(_root, "volumes"))),
+            _dbPath, metrics, hasWorkerCapacity: true, timeProvider: new ManualClock(now))
+        {
+            QueuedEnsureReadHook = () =>
+            {
+                durableRead.TrySetResult();
+                continueRead.Task.GetAwaiter().GetResult();
+            }
+        };
+
+        var collection = Task.Run(collector.CollectQueuedEnsureMetrics);
+        await durableRead.Task;
+        var finishAttempted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var finish = Task.Run(() =>
+        {
+            finishAttempted.TrySetResult();
+            metrics.WithQueuedEnsureLock(() =>
+            {
+                using var cmd = _db.GetConnection().CreateCommand();
+                cmd.CommandText = "DELETE FROM queued_ensures WHERE seq = 41;";
+                cmd.ExecuteNonQuery();
+                metrics.RecordQueuedEnsureFinished(41);
+                return 0;
+            });
+        });
+        await finishAttempted.Task;
+        continueRead.TrySetResult();
+
+        var beforeFinish = await collection;
+        await finish;
+        var afterFinish = Collect(now, metrics: metrics).Jobs.QueuedEnsures;
+        Assert.AreEqual(1, beforeFinish.Total.Depth, "the consistent snapshot linearizes before completion");
+        Assert.AreEqual(0, afterFinish.Total.Depth, "a completed admission is absent from the next snapshot");
+    }
+
+    [TestMethod]
+    public void QueuedEnsureMetrics_MissingDurableTableSurfacesTheSqliteError()
+    {
+        Exec("DROP TABLE queued_ensures;");
+
+        Assert.Throws<Microsoft.Data.Sqlite.SqliteException>(() =>
+            Collect(DateTimeOffset.UtcNow));
+    }
+
+    [TestMethod]
+    public void QueuedEnsureMetrics_MalformedDurableRequestSurfacesTheJsonError()
+    {
+        AddQueuedEnsure(31, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), expedited: false);
+        Exec("UPDATE queued_ensures SET request_json = '{' WHERE seq = 31;");
+
+        Assert.Throws<System.Text.Json.JsonException>(() =>
+            Collect(DateTimeOffset.UtcNow));
+    }
+
+    [TestMethod]
     public void AlertGauge_IsPresentWhileRaised_AndAbsentAfterItClears()
     {
         var now = new DateTimeOffset(2026, 1, 2, 12, 0, 0, TimeSpan.Zero);
@@ -266,12 +416,32 @@ public class MetricsCollectorTests
         cmd.ExecuteNonQuery();
     }
 
-    private MetricsSnapshot Collect(DateTimeOffset now, AlertThresholds? thresholds = null)
+    private MetricsSnapshot Collect(DateTimeOffset now, AlertThresholds? thresholds = null, ServiceMetrics? metrics = null)
     {
         var paths = new ServicePaths(ServiceVolumes.Rooted(Path.Combine(_root, "volumes")));
         return new MetricsCollector(
-            _db.GetConnection(), paths, _dbPath, new ServiceMetrics(), hasWorkerCapacity: true,
+            _db.GetConnection(), paths, _dbPath, metrics ?? new ServiceMetrics(), hasWorkerCapacity: true,
             timeProvider: new ManualClock(now)).Collect(thresholds);
+    }
+
+    private void AddQueuedEnsure(long seq, long admittedAt, bool expedited, string? identityHash = null)
+    {
+        var request = new EnsureSnapshotRequest
+        {
+            RepositoryRemoteUrl = $"https://github.com/metrics/repo-{seq}",
+            CommitSha = $"commit-{seq}",
+            IsDefaultBranch = expedited
+        };
+        using var cmd = _db.GetConnection().CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO queued_ensures(seq, identity_hash, request_json, admitted_at)
+            VALUES (@seq, @identity, @request, @admitted);
+            """;
+        cmd.Parameters.AddWithValue("@seq", seq);
+        cmd.Parameters.AddWithValue("@identity", identityHash ?? $"queued-ensure-{seq}");
+        cmd.Parameters.AddWithValue("@request", System.Text.Json.JsonSerializer.Serialize(request, ServiceJson.Options));
+        cmd.Parameters.AddWithValue("@admitted", admittedAt);
+        cmd.ExecuteNonQuery();
     }
 
     private void Add(string status, long? completedAt)

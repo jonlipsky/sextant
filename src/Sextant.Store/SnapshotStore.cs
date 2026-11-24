@@ -120,6 +120,27 @@ public sealed record DefaultBranchHead(long RepositoryId, string RepositoryRemot
 /// </summary>
 public sealed class SnapshotStore(SqliteConnection connection)
 {
+    public IReadOnlyList<string> ProjectRepositorySpellings(long repositoryId, string commitSha)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT DISTINCT p.git_remote_url
+            FROM snapshots s
+            JOIN commits c ON c.id = s.commit_id
+            JOIN snapshot_projects sp ON sp.snapshot_id = s.id
+            JOIN projects p ON p.id = sp.project_id
+            WHERE s.repository_id = @repository AND c.commit_sha = @commit
+            ORDER BY p.git_remote_url;
+            """;
+        command.Parameters.AddWithValue("@repository", repositoryId);
+        command.Parameters.AddWithValue("@commit", commitSha);
+        using var reader = command.ExecuteReader();
+        var result = new List<string>();
+        while (reader.Read())
+            result.Add(reader.GetString(0));
+        return result;
+    }
+
     private long _repositorySchemaCookie = -1;
     private bool _hasRepositoryKey;
     private bool _hasProviderFlag;
@@ -302,6 +323,20 @@ public sealed class SnapshotStore(SqliteConnection connection)
         // Issue #299: a branch that exists has no retired head; re-creating an idle-retired branch consumes it.
         ConsumeRetiredHead(repositoryId, name);
         return branchId;
+    }
+
+    /// <summary>Atomically makes the named branch the repository default, demoting any prior default branch.</summary>
+    public long SetDefaultBranch(long repositoryId, string name, long now)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            UPDATE branches SET is_default = 0
+            WHERE repository_id = @repo AND is_default = 1 AND name <> @name;
+            """;
+        command.Parameters.AddWithValue("@repo", repositoryId);
+        command.Parameters.AddWithValue("@name", name);
+        command.ExecuteNonQuery();
+        return EnsureBranch(repositoryId, name, isDefault: true, now);
     }
 
     // ---- snapshots -----------------------------------------------------------------------------

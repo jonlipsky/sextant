@@ -237,7 +237,8 @@ public class UpstreamBranchReconcileTests
         h.Seed(Repo, "idle", false, "c-i");
         h.Lister.Set(Repo, "main");
         h.Start();
-        var jobs = new SnapshotJobStore(h.Db.GetConnection());
+        using var conn = h.OpenReader();
+        var jobs = new SnapshotJobStore(conn);
         jobs.EnsureJob("identity-queued", Repo + ".git", "c-q2", "queued");
         jobs.RecordHandover(RemoteUrlIdentity.Normalize(Repo), "handed-over", "c-x", "c-h", "c-y");
         jobs.EnsureJob("identity-successor", Repo + ".git", "c-y", "handed-over");
@@ -672,6 +673,8 @@ public class UpstreamBranchReconcileTests
         var second = await Pass(h);
         Assert.AreEqual(1, second.HealsStarted);
         await WaitUntilAsync(() => PointerCommit(h, Repo, "feature") == Sha('3'));
+        await WaitUntilAsync(() => h.Service.RecentAudit(action: AuditAction.Ensure)
+            .Any(a => a.Actor == AuditLogStore.HashActor("upstream_policy")));
         var audit = h.Service.RecentAudit(action: AuditAction.Ensure);
         Assert.IsTrue(audit.Any(a => a.Actor == AuditLogStore.HashActor("upstream_policy")));
         Assert.AreEqual(Sha('1'), PointerCommit(h, Repo, "main"));
@@ -729,7 +732,14 @@ public class UpstreamBranchReconcileTests
 
         Assert.AreEqual(1, second.HealsStarted);
         Assert.AreEqual(1, second.Retired);
-        await WaitUntilAsync(() => PointerCommit(h, Repo, "main") == Sha('2'));
+        await WaitUntilAsync(() => PointerCommit(h, Repo, "main") == Sha('3'));
+        await WaitUntilAsync(() =>
+        {
+            using var conn = h.Db.OpenReadConnection();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM completed_refresh_admissions;";
+            return Convert.ToInt32(cmd.ExecuteScalar()) == 1;
+        });
         Assert.IsFalse(h.BranchExists(Repo, "gone"));
 
         // A default branch absent from a successful listing is never retired.
@@ -740,61 +750,6 @@ public class UpstreamBranchReconcileTests
             await Pass(h);
         }
         Assert.IsTrue(h.BranchExists(Repo, "main"));
-    }
-
-    [TestMethod]
-    public async Task DefaultBranch_DeclinedHandover_RefusesRollback_ThenRepairsForwardAcrossUrlSpellings()
-    {
-        const string alternate = "HTTPS://GITHUB.COM/Acme/Upstream.git/";
-        await using var h = Harness.Create(p => p with { BranchUpstreamHealMaxPerTick = 10 });
-        h.Seed(Repo, "main", true, Sha('1'));
-        var old = h.Seed(Repo, "main", true, Sha('2'));
-        h.Start();
-        var key = RemoteUrlIdentity.Normalize(Repo);
-        new SnapshotJobStore(h.Db.GetConnection()).RecordHandover(key, "main", Sha('3'), Sha('1'), Sha('4'));
-
-        var declined = await h.Service.EnsureSnapshotAsync(new()
-        {
-            RepositoryRemoteUrl = alternate, BranchName = "main", IsDefaultBranch = true,
-            CommitSha = Sha('4'), ExpectedHeadCommit = Sha('3'), Forced = true
-        });
-        Assert.AreEqual(SnapshotJobStatus.Complete, declined.Status);
-        Assert.AreEqual(false, declined.BranchAdvanced, "the handover expects 1, but the pointer still serves 2");
-        Assert.AreEqual(Sha('2'), PointerCommit(h, Repo, "main"));
-        Assert.IsTrue(h.Service.RecentAudit(action: AuditAction.BranchAdvanceRefused).Any(a =>
-            a.Detail?.Contains("branch_advance_refused=expected_head_mismatch", StringComparison.Ordinal) == true));
-        Assert.IsTrue(h.Service.RecentAudit(action: AuditAction.Ensure).Any(a =>
-            a.Detail == $"job_{declined.JobId};forced"));
-
-        using (var sql = h.Db.GetConnection().CreateCommand())
-        {
-            sql.CommandText = "UPDATE snapshots SET published_at = CASE WHEN id = @old THEN 1000 ELSE 601000 END;";
-            sql.Parameters.AddWithValue("@old", old);
-            sql.ExecuteNonQuery();
-        }
-        Assert.AreEqual(600d, h.Service.CollectMetrics().DefaultBranchPointerLag.Single().LagSeconds);
-
-        // The upstream branch moves back to commit 1, rather than to the newer published but unverified commit 4.
-        // Its snapshot was built under a different URL spelling and is not the heal request's raw identity.
-        ServiceTestFixtures.PublishComplete(h.Db, new()
-        {
-            RepositoryRemoteUrl = alternate, CommitSha = Sha('1')
-        }, recordCommit: true);
-        h.Lister.SetHeads(Repo, new Dictionary<string, string> { ["main"] = Sha('1') });
-        Assert.AreEqual(0, (await Pass(h)).HealsStarted);
-        h.Clock.Advance(TimeSpan.FromMinutes(61));
-        Assert.AreEqual(1, (await Pass(h)).HealsStarted);
-        await WaitUntilAsync(() => h.Service.Metrics.Maintenance.UpstreamBranchHealsAppliedTotal
-            + h.Service.Metrics.Maintenance.UpstreamBranchHealsNotAppliedTotal > 0);
-        Assert.AreEqual(Sha('2'), PointerCommit(h, Repo, "main"), "a remote reset never rolls the repair pointer back");
-        h.Lister.SetHeads(Repo, new Dictionary<string, string> { ["main"] = Sha('5') });
-        h.Clock.Advance(TimeSpan.FromMinutes(61));
-        Assert.AreEqual(0, (await Pass(h)).HealsStarted);
-        h.Clock.Advance(TimeSpan.FromMinutes(61));
-        Assert.AreEqual(1, (await Pass(h)).HealsStarted);
-        await WaitUntilAsync(() => PointerCommit(h, Repo, "main") == Sha('4'));
-        Assert.AreEqual(1, h.Worker.Calls, "the newest forward snapshot is reused even though the remote is ahead");
-        Assert.AreEqual(0, h.CountHandovers(), "the move consumed the old handover");
     }
 
     [TestMethod]
@@ -849,7 +804,8 @@ public class UpstreamBranchReconcileTests
         h.Seed(Repo, "feature", false, Sha('2'));
         h.Lister.SetHeads(Repo, new Dictionary<string, string> { ["feature"] = Sha('3') });
         h.Start();
-        var jobs = new SnapshotJobStore(h.Db.GetConnection());
+        using var conn = h.OpenReader();
+        var jobs = new SnapshotJobStore(conn);
         var (job, _) = jobs.EnsureJob("identity-q", Repo + ".git", Sha('3'), "feature");
         if (running)
             jobs.MarkRunning(job.Id, h.Service.OwnerToken);
@@ -862,86 +818,6 @@ public class UpstreamBranchReconcileTests
         Assert.AreEqual(running ? 0 : 1, second.HealsStarted);
         if (!running)
             await WaitUntilAsync(() => PointerCommit(h, Repo, "feature") == Sha('3'));
-    }
-
-    [TestMethod]
-    [DoNotParallelize]
-    [DataRow("3")]
-    [DataRow("4")]
-    [DataRow("")]
-    public async Task PublishedDefaultRepair_RechecksHeadBeforeQueuedAdvance(string freshHeadDigit)
-    {
-        var freshHead = freshHeadDigit.Length == 0 ? null : Sha(freshHeadDigit[0]);
-        var unchanged = freshHead == Sha('3');
-        var repairable = freshHead is not null;
-        await using var h = Harness.Create(p => p with { BranchUpstreamHealMaxPerTick = 10 }, gatedWorker: true);
-        h.Seed(Repo, "main", true, Sha('1'));
-        h.Seed(OtherRepo, "main", true, Sha('5'));
-        var target = ServiceTestFixtures.PublishComplete(h.Db, new EnsureSnapshotRequest
-        {
-            RepositoryRemoteUrl = Repo + ".git", CommitSha = Sha('3'), BranchName = "main"
-        }, recordCommit: true);
-        h.Lister.SetHeads(Repo, new Dictionary<string, string> { ["main"] = Sha('3') });
-        h.Lister.SetHeads(OtherRepo, new Dictionary<string, string> { ["main"] = Sha('5') });
-        string? observedBeforeQueuedBuild = null;
-        h.Work = (worker, request) =>
-        {
-            if (request.RepositoryRemoteUrl == Repo)
-                observedBeforeQueuedBuild = PointerCommit(h, Repo, "main");
-            return Harness.PublishAndAdvance(worker, request);
-        };
-        h.Start();
-        var hold = h.Service.EnsureSnapshotAsync(new EnsureSnapshotRequest
-        {
-            RepositoryRemoteUrl = OtherRepo, CommitSha = Sha('6'), BranchName = "main", ExpectedHeadCommit = Sha('5')
-        });
-        await WaitUntilAsync(() => h.Worker.Calls == 1);
-        var queued = h.Service.EnsureSnapshotAsync(new EnsureSnapshotRequest
-        {
-            RepositoryRemoteUrl = Repo, CommitSha = unchanged ? Sha('2') : Sha('4'), BranchName = "main",
-            ExpectedHeadCommit = unchanged ? Sha('0') : Sha('1'), IsDefaultBranch = true
-        });
-
-        Assert.AreEqual(1, (await Pass(h)).HealAwaitingConfirmation);
-        h.Clock.Advance(TimeSpan.FromMinutes(61));
-        var second = await Pass(h);
-        Assert.AreEqual(1, second.HealsStarted);
-        Assert.AreEqual(0, second.HealBusy, "queued advances and another repository's running job are not this branch running");
-        if (freshHead is null)
-            h.Lister.Fail(Repo);
-        else
-            h.Lister.SetHeads(Repo, new Dictionary<string, string> { ["main"] = freshHead });
-        using var output = new StringWriter();
-        var previousError = Console.Error;
-        try
-        {
-            Console.SetError(output);
-            h.Worker.Gate.TrySetResult();
-            await Task.WhenAll(hold, queued);
-        }
-        finally
-        {
-            Console.SetError(previousError);
-        }
-
-        Assert.AreEqual(repairable ? Sha('3') : Sha('1'), observedBeforeQueuedBuild);
-        Assert.AreEqual(unchanged ? Sha('3') : Sha('4'), PointerCommit(h, Repo, "main"));
-        Assert.AreEqual(!unchanged, (await queued).BranchAdvanced);
-        var refusals = output.ToString().Split('\n').Where(l => l.StartsWith('{')
-            && !l.Contains("\"job_id\":", StringComparison.Ordinal)
-            && l.Contains("\"reason\":\"ancestry_unknown\"", StringComparison.Ordinal)).ToArray();
-        Assert.AreEqual(repairable ? 0 : 1, refusals.Length);
-        if (unchanged)
-        {
-            using var reader = h.OpenReader();
-            Assert.AreEqual(target, new SnapshotStore(reader).GetBranch(h.RepositoryId(Repo), "main")!.SnapshotId);
-        }
-        else if (!repairable)
-        {
-            using var json = System.Text.Json.JsonDocument.Parse(refusals.Single());
-            Assert.AreEqual(Sha('3'), json.RootElement.GetProperty("observed_head").GetString());
-            Assert.AreEqual(freshHead, json.RootElement.GetProperty("fresh_head").GetString());
-        }
     }
 
     [TestMethod]
@@ -966,9 +842,9 @@ public class UpstreamBranchReconcileTests
     [TestMethod]
     [DoNotParallelize]
     [DataRow("forward", true)]
-    [DataRow("backwards", false)]
-    [DataRow("unknown", false)]
-    public async Task DefaultHealThatBuildsFirst_StillRequiresAncestryBeforeMoving(string scenario, bool advances)
+    [DataRow("backwards", true)]
+    [DataRow("unknown", true)]
+    public async Task DefaultHealThatBuildsFirst_FollowsVerifiedHead(string scenario, bool advances)
     {
         await using var h = Harness.Create(p => p with { BranchUpstreamHealMaxPerTick = 10 });
         h.Seed(Repo, "main", true, Sha('2'));
@@ -977,46 +853,37 @@ public class UpstreamBranchReconcileTests
         h.Lister.Ancestry = (a, d) => scenario == "unknown" ? null : string.CompareOrdinal(a, d) <= 0;
         h.Work = (worker, request) =>
         {
-            Assert.IsTrue(request.SuppressesBranchUpdate, "automatic default heals must not bypass ancestry in the worker");
+            Assert.IsTrue(request.SuppressesBranchUpdate, "automatic heals defer pointer selection until head verification");
             return Harness.PublishAndAdvance(worker, request);
         };
         h.Start();
         await Pass(h);
         h.Clock.Advance(TimeSpan.FromMinutes(61));
-        using var output = new StringWriter();
-        var previous = Console.Error;
-        try
+        Assert.AreEqual(1, (await Pass(h)).HealsStarted);
+        await WaitUntilAsync(() =>
         {
-            Console.SetError(TextWriter.Synchronized(output));
-            Assert.AreEqual(1, (await Pass(h)).HealsStarted);
-            await WaitUntilAsync(() => h.Service.Metrics.Maintenance.UpstreamBranchHealsAppliedTotal
-                + h.Service.Metrics.Maintenance.UpstreamBranchHealsNotAppliedTotal == 1);
-        }
-        finally
-        {
-            Console.SetError(previous);
-        }
+            if (advances)
+                return h.Service.Metrics.Maintenance.UpstreamBranchHealsAppliedTotal == 1;
+            using var conn = h.Db.OpenReadConnection();
+            return new PendingRefreshStore(conn).ListPending().Any(marker => marker.Attempts > 0);
+        });
         Assert.AreEqual(1, h.Worker.Calls);
         Assert.AreEqual(advances ? target : Sha('2'), PointerCommit(h, Repo, "main"));
-        if (!advances)
-            StringAssert.Contains(output.ToString(), $"\"reason\":\"{(scenario == "backwards" ? "not_descendant" : "ancestry_unknown")}\"");
-        if (scenario == "unknown")
-            StringAssert.Contains(output.ToString(), "\"detail\":\"ancestry unavailable\"");
     }
 
     [TestMethod]
     [DoNotParallelize]
-    [DataRow("busy", null)]
-    [DataRow("backwards", "not_descendant")]
-    [DataRow("force-push", "not_on_remote_history")]
-    [DataRow("unknown", "ancestry_unknown")]
-    [DataRow("comparison-unknown", "ancestry_unknown")]
-    [DataRow("throws", "ancestry_unknown")]
-    public async Task DefaultMaintenance_UsesNewestForwardSnapshot_EvenWhenEveryListingMoves(string scenario, string? refusal)
+    [DataRow("busy", true)]
+    [DataRow("backwards", true)]
+    [DataRow("force-push", true)]
+    [DataRow("unknown", true)]
+    [DataRow("comparison-unknown", true)]
+    [DataRow("throws", true)]
+    public async Task DefaultMaintenance_RefreshesCurrentHeadWhenListingsMove(string scenario, bool advances)
     {
         await using var h = Harness.Create(p => p with { BranchUpstreamHealMaxPerTick = 10 });
         h.Seed(Repo, "main", true, Sha('2'));
-        var newest = ServiceTestFixtures.PublishComplete(h.Db, new()
+        ServiceTestFixtures.PublishComplete(h.Db, new()
         {
             RepositoryRemoteUrl = Repo, CommitSha = Sha('4')
         }, recordCommit: true);
@@ -1039,34 +906,16 @@ public class UpstreamBranchReconcileTests
         Assert.AreEqual(1, (await Pass(h)).HealAwaitingConfirmation);
         h.Clock.Advance(TimeSpan.FromMinutes(61));
         h.Lister.SetHeads(Repo, new Dictionary<string, string> { ["main"] = Sha('6') });
-        using var output = new StringWriter();
-        var previous = Console.Error;
-        try
+        Assert.AreEqual(1, (await Pass(h)).HealsStarted, "default confirmations survive a busy remote head");
+        await WaitUntilAsync(() =>
         {
-            Console.SetError(TextWriter.Synchronized(output));
-            Assert.AreEqual(1, (await Pass(h)).HealsStarted, "default confirmations survive a busy remote head");
-            await WaitUntilAsync(() => h.Service.Metrics.Maintenance.UpstreamBranchHealsAppliedTotal
-                + h.Service.Metrics.Maintenance.UpstreamBranchHealsNotAppliedTotal == 1);
-        }
-        finally
-        {
-            Console.SetError(previous);
-        }
-        Assert.AreEqual(refusal is null ? Sha('4') : Sha('2'), PointerCommit(h, Repo, "main"));
-        Assert.AreEqual(0, h.Worker.Calls);
-        if (refusal is null)
-        {
-            using var reader = h.OpenReader();
-            Assert.AreEqual(newest, new SnapshotStore(reader).GetBranch(h.RepositoryId(Repo), "main")!.SnapshotId);
-        }
-        else
-        {
-            var lines = output.ToString().Split('\n').Where(l => l.StartsWith('{')
-                && l.Contains("\"event\":\"branch_advance_refused\"", StringComparison.Ordinal)).ToArray();
-            Assert.AreEqual(1, lines.Length);
-            using var json = System.Text.Json.JsonDocument.Parse(lines[0]);
-            Assert.AreEqual(refusal, json.RootElement.GetProperty("reason").GetString());
-        }
+            if (advances)
+                return h.Service.Metrics.Maintenance.UpstreamBranchHealsAppliedTotal == 1;
+            using var conn = h.Db.OpenReadConnection();
+            return new PendingRefreshStore(conn).ListPending().Any(marker => marker.Attempts > 0);
+        });
+        Assert.AreEqual(advances ? Sha('6') : Sha('2'), PointerCommit(h, Repo, "main"));
+        Assert.AreEqual(1, h.Worker.Calls);
     }
 
     [TestMethod]
@@ -1096,8 +945,9 @@ public class UpstreamBranchReconcileTests
         Assert.AreEqual(1, second.HealBusy, "the admitted push is seen at the moment of admission");
         Assert.IsNotNull(push);
         h.Worker.Gate.TrySetResult();
-        await push!;
-        Assert.AreEqual(Sha('2'), PointerCommit(h, Repo, "feature"), "the declined push left the pointer where it was; no heal moved it behind Z");
+        var result = await push!;
+        Assert.AreEqual(false, result.BranchAdvanced, "the push's stale CAS must not move the pointer");
+        await WaitUntilAsync(() => PointerCommit(h, Repo, "feature") == Sha('3'));
         Assert.IsFalse(h.Service.RecentAudit(action: AuditAction.Ensure).Any(a => a.Actor == AuditLogStore.HashActor("upstream_policy")));
     }
 
@@ -1121,29 +971,39 @@ public class UpstreamBranchReconcileTests
     }
 
     [TestMethod]
-    public async Task StalePointerWhoseRemoteHeadJobFailedForGood_IsNotHealed_AndWritesNoFurtherAudit()
+    public async Task StalePointerWhoseRemoteHeadJobFailed_RefreshRetriesWithoutAnotherHeal()
     {
         await using var h = Harness.Create(p => p with { BranchUpstreamHealMaxPerTick = 10 });
-        h.Work = (_, _) => SnapshotWorkResult.Failed("cannot build");
+        var attempts = 0;
+        h.Work = (worker, request) => Interlocked.Increment(ref attempts) == 1
+            ? SnapshotWorkResult.Failed("cannot build")
+            : Harness.PublishAndAdvance(worker, request);
         h.Seed(Repo, "feature", false, Sha('2'));
         h.Lister.SetHeads(Repo, new Dictionary<string, string> { ["feature"] = Sha('3') });
         h.Start();
-        int EnsureRows() => h.Service.RecentAudit(action: AuditAction.Ensure).Count(a => a.Actor == AuditLogStore.HashActor("upstream_policy"));
+        using var progress = new SemaphoreSlim(0);
+        h.Service.ProgressForTesting = () => progress.Release();
+        async Task WaitFor(Func<bool> condition)
+        {
+            while (!condition())
+                Assert.IsTrue(await progress.WaitAsync(TimeSpan.FromSeconds(10)), "refresh did not progress");
+        }
+        int MarkerAttempts()
+        {
+            using var conn = h.OpenReader();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT COALESCE(MAX(attempts), 0) FROM pending_refreshes;";
+            return Convert.ToInt32(cmd.ExecuteScalar());
+        }
 
         await Pass(h);
         h.Clock.Advance(TimeSpan.FromMinutes(61));
         Assert.AreEqual(1, (await Pass(h)).HealsStarted, "the first heal runs and fails");
-        await WaitUntilAsync(() => EnsureRows() == 1);
-
-        for (var i = 0; i < 3; i++)
-        {
-            h.Clock.Advance(TimeSpan.FromMinutes(61));
-            var report = await Pass(h);
-            Assert.AreEqual(0, report.HealsStarted);
-            Assert.AreEqual(i % 2 == 0 ? 0 : 1, report.HealSkippedTerminal, "skipped each time the confirmation completes");
-        }
-        Assert.AreEqual(1, EnsureRows(), "no further ensure audit rows");
+        await WaitFor(() => MarkerAttempts() == 1);
         Assert.AreEqual(Sha('2'), PointerCommit(h, Repo, "feature"));
+        h.Clock.Advance(TimeSpan.FromSeconds(30));
+        await WaitFor(() => PointerCommit(h, Repo, "feature") == Sha('3') && MarkerAttempts() == 0);
+        Assert.AreEqual(2, attempts, "the marker retries without another push or maintenance pass");
     }
 
     [TestMethod]
@@ -1190,7 +1050,8 @@ public class UpstreamBranchReconcileTests
         h.Lister.Set(Repo, "main");
         h.Start();
         var key = RemoteUrlIdentity.Normalize(Repo);
-        new SnapshotJobStore(h.Db.GetConnection()).RecordHandover(key, "stale", "c-x", Sha('2'), "c-y");
+        using var conn = h.OpenReader();
+        new SnapshotJobStore(conn).RecordHandover(key, "stale", "c-x", Sha('2'), "c-y");
 
         await Pass(h);
         h.Clock.Advance(TimeSpan.FromMinutes(61));
@@ -1208,7 +1069,8 @@ public class UpstreamBranchReconcileTests
         h.Seed(Repo, "main", true, Sha('1'));
         h.Start();
         var key = RemoteUrlIdentity.Normalize(Repo);
-        var jobs = new SnapshotJobStore(h.Db.GetConnection());
+        using var conn = h.OpenReader();
+        var jobs = new SnapshotJobStore(conn);
         jobs.RecordHandover(key, "main", "c-x", Sha('1'), "c-y");
         jobs.RecordHandover(key, "orphan", "c-x", "c-h", "c-y");
         jobs.RecordHandover(key, "queued-new", "c-x", "c-h", "c-y");
@@ -1279,6 +1141,15 @@ public class UpstreamBranchReconcileTests
 
     private sealed class FakeLister : IRemoteBranchLister, IRemoteDefaultBranchResolver, IRemoteBranchHeadResolver, ICommitAncestryChecker
     {
+        public RemoteBranchHeadObservation? ObserveBranchHead(
+            string repositoryRemoteUrl, string branch, CancellationToken cancellationToken = default) =>
+            ResolveBranchHead(repositoryRemoteUrl, branch, cancellationToken) is { } observed && !string.IsNullOrWhiteSpace(observed)
+                ? new RemoteBranchHeadObservation(observed)
+                : null;
+
+        public string? ResolveDefaultBranch(string repositoryRemoteUrl, CancellationToken cancellationToken) =>
+            ResolveDefaultBranch(repositoryRemoteUrl);
+
         private readonly Dictionary<string, Func<IReadOnlyDictionary<string, string>?>> _answers = new(StringComparer.Ordinal);
         private int _running;
         public List<string> Calls { get; } = [];
@@ -1306,6 +1177,10 @@ public class UpstreamBranchReconcileTests
 
         public string? ResolveBranchHead(string repositoryRemoteUrl, string branch, CancellationToken cancellationToken) =>
             _answers.TryGetValue(repositoryRemoteUrl, out var answer) ? answer()?.GetValueOrDefault(branch) : null;
+
+        public RemoteBranchStateObservation? ObserveBranchState(string repositoryRemoteUrl, string branch, CancellationToken cancellationToken = default) =>
+            ResolveBranchHead(repositoryRemoteUrl, branch, cancellationToken) is { } head
+                ? new RemoteBranchStateObservation("main", head) : null;
 
         public IReadOnlyDictionary<string, string>? ListBranches(string repositoryRemoteUrl)
         {
@@ -1359,10 +1234,11 @@ public class UpstreamBranchReconcileTests
 
         public long Seed(string url, string branch, bool isDefault, string commit)
         {
+            using var seedDb = new IndexDatabase(_dbPath);
             var snapshot = ServiceTestFixtures.PublishComplete(
-                Db, new EnsureSnapshotRequest { RepositoryRemoteUrl = url, CommitSha = commit }, recordCommit: true);
+                seedDb, new EnsureSnapshotRequest { RepositoryRemoteUrl = url, CommitSha = commit }, recordCommit: true);
             var movedAt = Clock.GetUtcNow().ToUnixTimeMilliseconds();
-            var store = new SnapshotStore(Db.GetConnection());
+            var store = new SnapshotStore(seedDb.GetConnection());
             var repoId = store.EnsureRepository(url, movedAt);
             var branchId = store.EnsureBranch(repoId, branch, isDefault, movedAt);
             store.SetBranchPointer(branchId, snapshot, movedAt);
@@ -1386,6 +1262,7 @@ public class UpstreamBranchReconcileTests
             Worker = new FakeSnapshotWorker(Db, Work) { UseGate = _gatedWorker };
             Service = SnapshotService.Start(_options, Worker, Db, timeProvider: Clock,
                 remoteDefaults: withLister ? Lister : null, remoteBranches: withLister ? Lister : null);
+            Service.EnableWriterTurnGuardForTesting();
         }
 
         public long RepositoryId(string url)
@@ -1440,7 +1317,9 @@ public class UpstreamBranchReconcileTests
         {
             Worker?.Gate.TrySetResult();
             Service?.Dispose();
+            var violations = Service?.WriterTraceViolationsForTesting ?? 0;
             SqliteTestDatabase.Delete(_dbPath, Db);
+            Assert.AreEqual(0, violations, "The shared writer must only be accessed on its owning turn.");
             return ValueTask.CompletedTask;
         }
     }

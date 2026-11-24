@@ -177,6 +177,26 @@ public sealed class SnapshotJobStore(SqliteConnection connection)
         return reader.Read() ? ReadJob(reader) : null;
     }
 
+    public IReadOnlyList<string> RepositorySpellings(string repositoryKey, string commitSha)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT DISTINCT repository_url FROM snapshot_jobs
+            WHERE commit_sha = @commit
+            ORDER BY repository_url;
+            """;
+        cmd.Parameters.AddWithValue("@commit", commitSha);
+        using var reader = cmd.ExecuteReader();
+        var result = new List<string>();
+        while (reader.Read())
+        {
+            var url = reader.GetString(0);
+            if (RemoteUrlIdentity.Normalize(url) == repositoryKey)
+                result.Add(url);
+        }
+        return result;
+    }
+
     /// <summary>
     /// Transitions a queued job to <c>running</c> under <paramref name="ownerToken"/> (the writer-lease
     /// token), stamping <c>started_at</c> and incrementing <c>attempts</c>. Guarded on the job not already

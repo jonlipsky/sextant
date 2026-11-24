@@ -1,4 +1,5 @@
 using Sextant.Core;
+using Sextant.Service.Observability;
 using Sextant.Store;
 using System.Text.Json.Serialization;
 
@@ -78,6 +79,14 @@ public sealed record EnsureSnapshotRequest
     public string? ExpectedHeadCommit { get; init; }
 
     /// <summary>
+    /// Optional admission intent for a push-triggered watched-branch refresh. When true, the service coalesces
+    /// waiting refreshes and resolves the current remote head at the writer turn; absent/false preserves explicit
+    /// ensure semantics even when the request carries an ordinary head CAS. Deliberately NOT folded into
+    /// <see cref="ToIdentity"/>. Serializes as <c>refresh</c>.
+    /// </summary>
+    public bool? Refresh { get; init; }
+
+    /// <summary>
     /// OPTIONAL and informational (SVC-6): the caller reports that the push was a force-push. It is recorded
     /// in the ensure audit row and does NOT bypass the <see cref="ExpectedHeadCommit"/> CAS, because the CAS
     /// on the push's <c>before</c> already orders the events. Deliberately NOT folded into
@@ -136,7 +145,7 @@ public sealed record EnsureSnapshotRequest
     /// A user may never claim the default branch (<c>default_branch: true</c>:
     /// <see cref="BranchGuardReason.DefaultBranchNotAllowed"/>) or send a head sequence (a large one would move the
     /// pointer and block every later sequenced advance: <see cref="BranchGuardReason.HeadSequenceNotAllowed"/>). Unless
-    /// the ensure is <c>branch_update: none</c>, it must carry the <see cref="ExpectedHeadCommit"/> CAS
+    /// the ensure is a refresh or <c>branch_update: none</c>, it must carry the <see cref="ExpectedHeadCommit"/> CAS
     /// (<see cref="BranchGuardReason.BranchGuardRequired"/>) and name its branch
     /// (<see cref="BranchGuardReason.BranchRequired"/>), because an ensure that names no branch claims the default by
     /// the legacy <see cref="ResolveIsDefaultBranch"/> heuristic. The checks read the request only, never the catalog,
@@ -150,6 +159,8 @@ public sealed record EnsureSnapshotRequest
             return BranchGuardReason.HeadSequenceNotAllowed;
         if (SuppressesBranchUpdate)
             return null;
+        if (Refresh == true)
+            return string.IsNullOrWhiteSpace(BranchName) ? BranchGuardReason.BranchRequired : null;
         if (ExpectedHeadCommit is null)
             return BranchGuardReason.BranchGuardRequired;
         if (string.IsNullOrWhiteSpace(BranchName))
@@ -194,6 +205,7 @@ public sealed record EnsureSnapshotRequest
     /// </summary>
     [JsonIgnore]
     internal string? VerifiedRemoteDefaultBranch { get; init; }
+
 
     /// <summary>
     /// Whether the issue #104 first-branch safety net may make <paramref name="branchName"/> its repository's
@@ -243,13 +255,14 @@ public sealed record EnsureSnapshotRequest
 /// <summary>The result of an ensure-snapshot request: the attached durable job plus its resolved status.</summary>
 public sealed record EnsureSnapshotResult
 {
-    public required long JobId { get; init; }
-    public required string IdentityHash { get; init; }
+    public long? JobId { get; init; }
+    public string? IdentityHash { get; init; }
     public required string Status { get; init; }
     public long? SnapshotId { get; init; }
+    public string? AdmissionId { get; init; }
 
     /// <summary>True when this request ATTACHED to an already-existing job rather than creating one (criterion 1).</summary>
-    public required bool Attached { get; init; }
+    public bool Attached { get; init; }
 
     /// <summary>
     /// Why the job is not complete (the job's recorded reason): the partial-coverage reasons for a
@@ -319,6 +332,9 @@ public static class BranchGuardReason
 
     /// <summary>A user caller's ensure carried neither <c>expected_head_commit</c> nor <c>branch_update: none</c> (SX-6d).</summary>
     public const string BranchGuardRequired = "branch_guard_required";
+
+    /// <summary>A refresh request could not verify its branch. The legacy reason code remains wire-compatible.</summary>
+    public const string RefreshDefaultUnconfirmed = "refresh_default_unconfirmed";
 }
 
 /// <summary>A request to retire (delete) a repository branch's pointer (SVC-6).</summary>
@@ -341,6 +357,12 @@ public sealed record RetireBranchResult
 {
     /// <summary>True when the branch row was deleted; false when it did not exist (idempotent) or was refused.</summary>
     public required bool Retired { get; init; }
+
+    /// <summary>The public branch-intent admission id, when this operation was durably admitted.</summary>
+    public string? AdmissionId { get; init; }
+
+    /// <summary>True when this response is an admission receipt and the intent has not settled yet.</summary>
+    public bool Pending { get; init; }
 
     /// <summary>
     /// The refusal reason (<see cref="BranchGuardReason.HeadMismatch"/> or
@@ -397,6 +419,13 @@ public sealed record JobStatusResult
 {
     public required SnapshotJobRow Job { get; init; }
     public IReadOnlyList<SnapshotJobDiagnostic> Diagnostics { get; init; } = [];
+
+    /// <summary>
+    /// Node-wide queued-ensure depth and age, included only on the control surface for non-user callers; a user must not
+    /// infer activity in other repositories from aggregate queue data.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public QueuedEnsureMetrics? QueuedEnsures { get; init; }
 
     /// <summary>The durable checkout coverage recorded for the job's snapshot (issue #119), or null.</summary>
     public SnapshotCoverage? Coverage { get; init; }

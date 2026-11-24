@@ -20,6 +20,9 @@ public sealed record JobMetrics
     /// <summary>Seconds the oldest queued job has waited (0 when none is queued; issue #355).</summary>
     public double OldestQueuedAgeSeconds { get; init; }
 
+    /// <summary>Admitted ensures that have not yet acquired their writer turn, including durable admissions awaiting replay.</summary>
+    public QueuedEnsureMetrics QueuedEnsures { get; init; } = new();
+
     /// <summary>Seconds the longest-running job has been running (0 when none is running; issue #355).</summary>
     public double LongestRunningAgeSeconds { get; init; }
 
@@ -31,6 +34,21 @@ public sealed record JobMetrics
 
     /// <summary>Fraction of terminal jobs that were fully complete (not partial/failed). 1.0 when none yet.</summary>
     public double CompletenessRate => Terminal == 0 ? 1.0 : (double)Complete / Terminal;
+}
+
+/// <summary>Current queued-ensure depth and oldest admission age, split by writer lane.</summary>
+public sealed record QueuedEnsureMetrics
+{
+    public QueuedEnsureLaneMetrics Total { get; init; } = new();
+    public QueuedEnsureLaneMetrics Expedited { get; init; } = new();
+    public QueuedEnsureLaneMetrics Normal { get; init; } = new();
+}
+
+/// <summary>Queue depth and age for one queued-ensure lane.</summary>
+public sealed record QueuedEnsureLaneMetrics
+{
+    public long Depth { get; init; }
+    public double OldestAgeSeconds { get; init; }
 }
 
 /// <summary>Terminal job outcomes completed inside an explicitly bounded rolling window.</summary>
@@ -139,9 +157,6 @@ public sealed record MaintenanceMetrics
 
     /// <summary>Heal advances that moved the pointer, since start.</summary>
     public long UpstreamBranchHealsAppliedTotal { get; init; }
-
-    /// <summary>Confirmed stale pointers not healed because the heal identity's job is already terminal failed/unsupported, since start.</summary>
-    public long UpstreamBranchHealsSkippedTerminalTotal { get; init; }
 
     /// <summary>Heal advances that finished without moving the pointer (CAS declined, failed, requeued), since start.</summary>
     public long UpstreamBranchHealsNotAppliedTotal { get; init; }

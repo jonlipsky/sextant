@@ -264,12 +264,14 @@ public sealed record ServiceOptions
 
     internal const int DefaultQueuedEnsureMaxAgeHours = 168;
     /// <summary>
-    /// How long a control write waits for the single writer before it answers without it (issue #158): a
-    /// <c>POST /control/ensure?wait=false</c> then returns <c>202</c> with a reserved <c>job_id</c>, and a
-    /// <c>POST /control/branches/retire</c> returns <c>202 {"status":"accepted"}</c>. Either write stays queued,
-    /// service-owned, and applies in submission order once the writer frees. Keep it well under the callers' HTTP
-    /// timeout. <c>SEXTANT_SERVICE_CONTROL_WRITE_WAIT_SECONDS</c> (default 5); a missing, non-positive or
-    /// unparseable value keeps the default, and a larger value is clamped to <see cref="MaxControlWriteWaitSeconds"/>.
+    /// How long a control write waits before it answers without the single writer (issue #158): a
+    /// <c>POST /control/ensure?wait=false</c> returns <c>202</c> with a reserved <c>job_id</c> after its queued
+    /// admission is durable, and a <c>POST /control/branches/retire</c> returns <c>202 {"status":"accepted"}</c>.
+    /// If SQLite cannot durably record an ensure admission within this bound, it returns <c>503</c> instead. Either
+    /// accepted write stays queued, service-owned, and applies in submission order once the writer frees. Keep it
+    /// well under the callers' HTTP timeout. <c>SEXTANT_SERVICE_CONTROL_WRITE_WAIT_SECONDS</c> (default 5); a missing,
+    /// non-positive or unparseable value keeps the default, and a larger value is clamped to
+    /// <see cref="MaxControlWriteWaitSeconds"/>.
     /// </summary>
     public TimeSpan ControlWriteWait { get; init; } = TimeSpan.FromSeconds(DefaultControlWriteWaitSeconds);
 

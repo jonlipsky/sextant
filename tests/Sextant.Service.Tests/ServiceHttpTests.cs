@@ -84,6 +84,22 @@ public class ServiceHttpTests
     }
 
     [TestMethod]
+    public async Task Control_RefreshAdmissionStatus_RequiresControlTokenAndReportsUnknownIds()
+    {
+        await using var host = await ServiceHttpHarness.StartAsync(withWorker: true, seedComplete: false);
+        Assert.AreEqual(HttpStatusCode.Unauthorized,
+            (await host.Client.GetAsync("/control/refresh-status/unknown-admission")).StatusCode);
+
+        using var request = new HttpRequestMessage(HttpMethod.Get, "/control/refresh-status/unknown-admission");
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", ControlToken);
+        var response = await host.Client.SendAsync(request);
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+        using var body = System.Text.Json.JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.AreEqual("unknown", body.RootElement.GetProperty("status").GetString());
+        Assert.AreEqual("unknown-admission", body.RootElement.GetProperty("admission_id").GetString());
+    }
+
+    [TestMethod]
     public async Task Control_Ensure_WithToken_ProducesAndPublishes()
     {
         await using var host = await ServiceHttpHarness.StartAsync(withWorker: true, seedComplete: false);

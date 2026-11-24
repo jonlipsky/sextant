@@ -1,4 +1,5 @@
 using System.Net;
+using System.Text.Json;
 using Sextant.Service.Grants;
 using Sextant.Store;
 using static Sextant.Service.Tests.CallerAssertionHttpTests;
@@ -57,8 +58,20 @@ public class UserAdvanceHeadCheckTests
         using var response = await host.ControlAsync(HttpMethod.Post, Ensure, ControlToken, host.UserAssertion(),
             EnsureOf(Widgets, "commit-w2", """{"branch_name":"main","expected_head_commit":"commit-w1"}"""));
 
-        await AssertRejectedAsync(response, HttpStatusCode.Conflict, BranchGuardReason.CommitNotRemoteHead);
+        await AssertRejectedAsync(response, HttpStatusCode.ServiceUnavailable, BranchGuardReason.LookupBusy);
         Assert.AreEqual(headBefore.Snapshot.Id, host.Service.ResolveBranchHead(Widgets, null)!.Snapshot.Id);
+        Assert.AreEqual(0L, host.JobRows());
+    }
+
+    [TestMethod]
+    public async Task UserCas_WhenTheBranchIsConfirmedAbsent_IsConflict()
+    {
+        var remote = new FakeRemote(head: "absent");
+        await using var host = await Harness.StartAsync(seed: Seed, remoteDefaults: remote);
+        await GrantAsync(host, Widgets);
+        using var response = await host.ControlAsync(HttpMethod.Post, Ensure, ControlToken, host.UserAssertion(),
+            EnsureOf(Widgets, "commit-w2", """{"branch_name":"main","expected_head_commit":"commit-w1"}"""));
+        await AssertRejectedAsync(response, HttpStatusCode.Conflict, BranchGuardReason.CommitNotRemoteHead);
         Assert.AreEqual(0L, host.JobRows());
     }
 
@@ -75,6 +88,38 @@ public class UserAdvanceHeadCheckTests
         Assert.IsTrue(result.GetProperty("branch_advanced").GetBoolean());
         Assert.AreEqual("commit-w2", host.Service.ResolveBranchHead(Widgets, "feature")!.CommitSha);
         Assert.AreEqual(("feature", Widgets), remote.LastHeadRequest);
+    }
+
+    [TestMethod]
+    [DataRow("main")]
+    [DataRow("feature")]
+    public async Task UserCallerRefreshIgnoresStaleHintAndSelectsVerifiedHead(string branch)
+    {
+        var remote = new FakeRemote(branch: "main", head: "commit-w2");
+        await using var host = await Harness.StartAsync(seed: Seed, remoteDefaults: remote);
+        await GrantAsync(host, Widgets);
+        using var response = await host.ControlAsync(HttpMethod.Post, Ensure, ControlToken, host.UserAssertion(),
+            EnsureOf(Widgets, "stale-hint", $$"""{"branch_name":"{{branch}}","refresh":true}"""));
+        var raw = await response.Content.ReadAsStringAsync();
+        Assert.AreEqual(HttpStatusCode.Accepted, response.StatusCode, raw);
+        var id = JsonDocument.Parse(raw).RootElement.GetProperty("admission_id").GetString()!;
+        var deadline = DateTime.UtcNow + Wait;
+        while (host.Service.GetRefreshAdmissionStatus(id)?.Status != "completed")
+        {
+            Assert.IsTrue(DateTime.UtcNow < deadline, "refresh did not complete");
+            await Task.Delay(10);
+        }
+        Assert.AreEqual("commit-w2", host.Service.ResolveBranchHead(Widgets, branch)!.CommitSha);
+        Assert.AreEqual(0, host.Worker.Calls, "the verified head was already published; the hint was not built");
+        using var visible = await host.ControlAsync(HttpMethod.Get, "/control/refresh-status/" + id,
+            ControlToken, host.UserAssertion());
+        Assert.AreEqual("completed", JsonDocument.Parse(await visible.Content.ReadAsStringAsync()).RootElement.GetProperty("status").GetString());
+        using var revoke = await host.ControlAsync(HttpMethod.Delete,
+            "/control/grants/self?repository=" + Uri.EscapeDataString(Widgets), ControlToken, host.UserAssertion());
+        Assert.AreEqual(HttpStatusCode.OK, revoke.StatusCode);
+        using var hidden = await host.ControlAsync(HttpMethod.Get, "/control/refresh-status/" + id,
+            ControlToken, host.UserAssertion());
+        Assert.AreEqual("unknown", JsonDocument.Parse(await hidden.Content.ReadAsStringAsync()).RootElement.GetProperty("status").GetString());
     }
 
     [TestMethod]
@@ -106,14 +151,15 @@ public class UserAdvanceHeadCheckTests
         using var response = await host.ControlAsync(HttpMethod.Post, Ensure, ControlToken, host.UserAssertion(),
             EnsureOf(Widgets, "forkcommit", """{"branch_update":"none"}"""));
 
-        await AssertRejectedAsync(response, HttpStatusCode.Conflict, BranchGuardReason.CommitNotOnBranch);
+        var reason = reachable == "throw" ? BranchGuardReason.LookupBusy : BranchGuardReason.CommitNotOnBranch;
+        await AssertRejectedAsync(response, reachable == "throw" ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.Conflict, reason);
         Assert.AreEqual(1, remote.ReachabilityCalls);
         Assert.AreEqual(0L, host.JobRows());
         Assert.AreEqual(0, host.Worker.Calls, "no evaluation of the unreachable commit");
         Assert.AreEqual(branchesBefore, host.BranchRows());
         var audit = host.Service.RecentAudit(action: AuditAction.Ensure).Single();
         Assert.AreEqual(AuditOutcome.Denied, audit.Outcome);
-        StringAssert.StartsWith(audit.Detail, BranchGuardReason.CommitNotOnBranch);
+        StringAssert.StartsWith(audit.Detail, reason);
         Assert.AreEqual(RepositoryGrantKey.Of(Widgets), audit.RepositoryScope);
     }
 
@@ -196,6 +242,47 @@ public class UserAdvanceHeadCheckTests
     }
 
     [TestMethod]
+    public async Task ReachabilityHasItsOwnDeadlineAndTimeoutIsUnavailable()
+    {
+        var clock = new Sextant.TestSupport.ManualClock();
+        var resolver = new FakeRemote(reachable: "true");
+        resolver.Gate.Reset();
+        var lookup = new RemoteDefaultBranchLookup(resolver, clock, resolver, resolver);
+        var reachable = lookup.IsCommitOnBranchAsync("https://github.com/acme/one", "abc");
+        await resolver.WaitUntilStartedAsync();
+        clock.Advance(TimeSpan.FromSeconds(65));
+        Assert.IsFalse(reachable.IsCompleted);
+        resolver.Gate.Set();
+        Assert.IsTrue(await reachable.WaitAsync(Wait));
+
+        resolver.Gate.Reset();
+        var timedOut = lookup.IsCommitOnBranchAsync("https://github.com/acme/two", "def");
+        while (resolver.ReachabilityCalls < 2)
+            await Task.Delay(10);
+        clock.Advance(TimeSpan.FromMinutes(2));
+        await Assert.ThrowsExactlyAsync<RemoteLookupBusyException>(() => timedOut.WaitAsync(Wait));
+        resolver.Gate.Set();
+    }
+
+    [TestMethod]
+    public async Task ReachabilityTimeoutReturnsRetryable503OverHttp()
+    {
+        var clock = new Sextant.TestSupport.ManualClock();
+        var remote = new FakeRemote(reachable: "true");
+        remote.Gate.Reset();
+        await using var host = await Harness.StartAsync(seed: Seed, remoteDefaults: remote, timeProvider: clock);
+        await GrantAsync(host, Widgets);
+        var pending = host.ControlAsync(HttpMethod.Post, Ensure, ControlToken, host.UserAssertion(),
+            EnsureOf(Widgets, "commit-w2", """{"branch_update":"none"}"""));
+        await remote.WaitUntilStartedAsync();
+        clock.Advance(TimeSpan.FromMinutes(2));
+        using var response = await pending.WaitAsync(Wait);
+        await AssertRejectedAsync(response, HttpStatusCode.ServiceUnavailable, BranchGuardReason.LookupBusy);
+        remote.Gate.Set();
+        Assert.AreEqual(0L, host.JobRows());
+    }
+
+    [TestMethod]
     public async Task ACancelledLookup_KillsTheRemoteCall_AndFreesItsSlot_OnlyWhenEveryWaiterLeft()
     {
         var resolver = new FakeRemote(head: "abc", reachable: "true");
@@ -214,7 +301,10 @@ public class UserAdvanceHeadCheckTests
         Assert.IsFalse(await a.WaitAsync(Wait));
         Assert.IsFalse(await b.WaitAsync(Wait));
 
-        var head = lookup.ResolveBranchHeadAsync("https://github.com/acme/widgets", "main", "t", first.Token);
+        using var headCaller = new CancellationTokenSource();
+        var head = lookup.ResolveBranchHeadAsync("https://github.com/acme/widgets", "main", "t", headCaller.Token);
+        await resolver.WaitUntilStartedAsync(calls: 2);
+        headCaller.Cancel();
         Assert.IsNull(await head.WaitAsync(Wait), "a cancelled head lookup answers null");
         Assert.IsTrue(resolver.HeadToken!.Value.IsCancellationRequested);
 
@@ -305,11 +395,23 @@ public class UserAdvanceHeadCheckTests
         await using var host = await Harness.StartAsync(seed: Seed, remoteDefaults: remote);
         var assertion = application ? host.Sign(CallerAssertionSigner.ApplicationClaims(DateTimeOffset.UtcNow)) : null;
 
-        var result = await EnsureOkAsync(host, assertion, Widgets, "commit-w2",
-            """{"branch_name":"feature","expected_head_commit":""}""");
+        // Issue #273, rule 1: the ensure's own following refresh reads the remote head after the ensure, to converge the
+        // branch, so the remote's call count is no longer zero by the end. What this checks is the intake: with every
+        // head read blocked, the ensure still completes (an intake check would block it) and advances the branch even
+        // though the remote reports an unrelated head.
+        remote.Gate.Reset();
+        try
+        {
+            var result = await EnsureOkAsync(host, assertion, Widgets, "commit-w2",
+                """{"branch_name":"feature","expected_head_commit":""}""");
 
-        Assert.IsTrue(result.GetProperty("branch_advanced").GetBoolean());
-        Assert.AreEqual(0, remote.HeadCalls);
+            Assert.IsTrue(result.GetProperty("branch_advanced").GetBoolean());
+            Assert.IsTrue(remote.HeadCalls <= 1, "at most the following refresh's read, never an intake check");
+        }
+        finally
+        {
+            remote.Gate.Set();
+        }
     }
 
     // ==== lookup: per-tenant slots, heads never remembered =========================================
@@ -414,12 +516,21 @@ public class UserAdvanceHeadCheckTests
 
     private sealed class DefaultsOnly : IRemoteDefaultBranchResolver
     {
+        public string? ResolveDefaultBranch(string repositoryRemoteUrl, CancellationToken cancellationToken) =>
+            ResolveDefaultBranch(repositoryRemoteUrl);
+
         public string? ResolveDefaultBranch(string repositoryRemoteUrl) => "main";
     }
 
     private sealed class FakeRemote(string? branch = null, string? head = null, string? reachable = null)
         : IRemoteDefaultBranchResolver, IRemoteBranchHeadResolver, IRemoteCommitBranchChecker
     {
+        public bool? ObserveCommitOnBranch(string repositoryRemoteUrl, string commit, CancellationToken cancellationToken = default) =>
+            IsCommitOnBranch(repositoryRemoteUrl, commit, cancellationToken);
+
+        public string? ResolveDefaultBranch(string repositoryRemoteUrl, CancellationToken cancellationToken) =>
+            ResolveDefaultBranch(repositoryRemoteUrl);
+
         private int _headCalls;
         private int _reachabilityCalls;
         private (string, string)? _last;
@@ -485,6 +596,16 @@ public class UserAdvanceHeadCheckTests
             WaitGate(cancellationToken);
             return head == "throw" ? throw new InvalidOperationException("boom") : head;
         }
+
+        public RemoteBranchHeadObservation? ObserveBranchHead(string repositoryRemoteUrl, string branchName, CancellationToken cancellationToken = default)
+        {
+            var observed = ResolveBranchHead(repositoryRemoteUrl, branchName, cancellationToken);
+            return observed == "absent" ? new RemoteBranchHeadObservation(null)
+                : observed is null ? null : new RemoteBranchHeadObservation(observed);
+        }
+
+        public RemoteBranchStateObservation? ObserveBranchState(string repositoryRemoteUrl, string branchName, CancellationToken cancellationToken = default) =>
+            branch is not null && head is not null && head != "throw" ? new(branch, head) : null;
     }
 
     private sealed class ManualClock : TimeProvider

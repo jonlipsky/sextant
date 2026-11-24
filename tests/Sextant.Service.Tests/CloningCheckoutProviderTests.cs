@@ -451,7 +451,7 @@ public class CloningCheckoutProviderTests
     [TestMethod]
     public void CancellingARemoteLookup_KillsTheGitProcess_InsteadOfWaitingForItsTimeout()
     {
-        if (!OperatingSystem.IsLinux())
+        if (OperatingSystem.IsWindows())
             Assert.Inconclusive("uses a shell script as the git executable");
         var (remoteUrl, commit) = NewRemoteRepo();
         var paths = NewPaths();
@@ -459,14 +459,17 @@ public class CloningCheckoutProviderTests
         Directory.CreateDirectory(scriptDir);
         _tempDirs.Add(scriptDir);
         var git = Path.Combine(scriptDir, "git");
-        File.WriteAllText(git, "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in fetch|ls-remote) exec sleep 120;; esac; done\nexec git \"$@\"\n");
+        var pidPath = Path.Combine(scriptDir, "pid");
+        File.WriteAllText(git, $"#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in fetch|ls-remote) echo $$ > '{pidPath}'; exec sleep 120;; esac; done\nexec git \"$@\"\n");
         File.SetUnixFileMode(git, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         var provider = new CloningCheckoutProvider(new PersistentVolumeCheckoutProvider(paths), paths, gitExecutable: git);
 
         foreach (var lookup in new Func<CancellationToken, object?>[]
                  {
                      ct => provider.IsCommitOnBranch(remoteUrl, commit, ct),
-                     ct => provider.ResolveBranchHead(remoteUrl, "main", ct)
+                     ct => provider.ResolveBranchHead(remoteUrl, "main", ct),
+                     ct => provider.ResolveDefaultBranch(remoteUrl, ct),
+                     ct => provider.ObserveBranchState(remoteUrl, "main", ct)
                  })
         {
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
@@ -475,14 +478,41 @@ public class CloningCheckoutProviderTests
 
             Assert.IsTrue(watch.Elapsed < TimeSpan.FromSeconds(20), $"the git call was killed on cancel, not run to its timeout ({watch.Elapsed})");
             Assert.IsTrue(answer is null or false, "a cancelled lookup answers nothing");
+            var pid = int.Parse(File.ReadAllText(pidPath));
+            Assert.ThrowsExactly<ArgumentException>(() => Process.GetProcessById(pid), "the child exited and was reaped");
         }
         Assert.IsFalse(Directory.EnumerateDirectories(paths.CheckoutRoot, ".tmp-clone-*").Any(), "no temp directory is left behind");
+    }
+
+    [TestMethod]
+    public async Task RemoteLookupDeadlineKillsAndReapsGit()
+    {
+        if (OperatingSystem.IsWindows())
+            Assert.Inconclusive("uses a shell script as the git executable");
+        var (remoteUrl, _) = NewRemoteRepo();
+        var paths = NewPaths();
+        var scriptDir = Path.Combine(Path.GetTempPath(), $"sextant_slowgit_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(scriptDir);
+        _tempDirs.Add(scriptDir);
+        var pidPath = Path.Combine(scriptDir, "pid");
+        var git = Path.Combine(scriptDir, "git");
+        File.WriteAllText(git, $"#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in ls-remote) echo $$ > '{pidPath}'; exec sleep 120;; esac; done\nexec git \"$@\"\n");
+        File.SetUnixFileMode(git, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        var provider = new CloningCheckoutProvider(new PersistentVolumeCheckoutProvider(paths), paths, gitExecutable: git);
+        var lookup = new RemoteDefaultBranchLookup(provider, heads: provider, resolverTimeout: TimeSpan.FromSeconds(2));
+        Assert.IsNull(await lookup.ResolveBranchHeadAsync(remoteUrl, "main").WaitAsync(TimeSpan.FromSeconds(15)));
+        var pid = int.Parse(File.ReadAllText(pidPath));
+        var until = DateTime.UtcNow.AddSeconds(10);
+        while (lookup.AbandonedCountForTesting() != 0 && DateTime.UtcNow < until)
+            await Task.Delay(10);
+        Assert.AreEqual(0, lookup.AbandonedCountForTesting());
+        Assert.ThrowsExactly<ArgumentException>(() => Process.GetProcessById(pid), "the timed-out child was reaped");
     }
 
     // ---- helpers ---------------------------------------------------------------------------------
 
     [TestMethod]
-    public async Task DefaultRepair_AdvancesToBuiltAncestorOfBusyMain_ButNotAnOffHistoryBuild()
+    public async Task DefaultRepairFollowsVerifiedRemoteHeadIncludingForcePush()
     {
         var (url, pointer) = NewRemoteRepo(out var repo);
         var built = CommitFile(repo, "Built.cs");
@@ -513,8 +543,9 @@ public class CloningCheckoutProviderTests
             {
                 RepositoryRemoteUrl = url, CommitSha = built, BranchName = "main", ExpectedHeadCommit = "disconnected"
             });
-            Assert.AreEqual(true, result.BranchAdvanced, "remote main is already two commits beyond this build");
-            Assert.AreEqual(result.SnapshotId, snapshots.GetBranch(repoId, "main")!.SnapshotId);
+            Assert.AreEqual(SnapshotJobStatus.Complete, result.Status);
+            Assert.AreEqual(false, result.BranchAdvanced, "the explicit repair must not select an older remote head");
+            await WaitForBranchCommit(db, url, "main", remote);
 
             Git(repo, "checkout", "--quiet", "-b", "reset", pointer);
             var forced = CommitFile(repo, "Forced.cs");
@@ -524,8 +555,9 @@ public class CloningCheckoutProviderTests
             {
                 RepositoryRemoteUrl = url, CommitSha = later, BranchName = "main", ExpectedHeadCommit = "disconnected"
             });
-            Assert.AreEqual(false, offHistory.BranchAdvanced, "the newer build was removed by the force-push");
-            Assert.AreEqual(result.SnapshotId, snapshots.GetBranch(repoId, "main")!.SnapshotId);
+            Assert.AreEqual(SnapshotJobStatus.Complete, offHistory.Status);
+            Assert.AreEqual(false, offHistory.BranchAdvanced, "the off-history explicit build cannot advance");
+            await WaitForBranchCommit(db, url, "main", forced);
         }
         finally
         {
@@ -659,8 +691,11 @@ public class CloningCheckoutProviderTests
             Assert.AreEqual(SnapshotJobStatus.Complete, other.Status, "another writer turn must finish while fetch is blocked");
             await File.WriteAllTextAsync(release, "");
             Assert.AreEqual(true, AwaitAncestry(provider, url, pointer, built).IsAncestor);
+            await WaitForBranchCommit(db, url, "main", built);
             var retried = await service.EnsureSnapshotAsync(request).WaitAsync(TimeSpan.FromSeconds(10));
-            Assert.AreEqual(true, retried.BranchAdvanced);
+            Assert.AreEqual(SnapshotJobStatus.Complete, retried.Status);
+            Assert.AreEqual(false, retried.BranchAdvanced, "the marker already selected the explicit build");
+            Assert.AreEqual(first.SnapshotId, retried.SnapshotId);
             Assert.IsTrue(Directory.Exists(graph));
         }
         finally
@@ -669,6 +704,24 @@ public class CloningCheckoutProviderTests
             Console.SetError(previousError);
             SqliteTestDatabase.Delete(dbPath, db);
         }
+    }
+
+    private static async Task WaitForBranchCommit(IndexDatabase db, string url, string branch, string expected)
+    {
+        var deadline = Stopwatch.StartNew();
+        while (deadline.Elapsed < TimeSpan.FromSeconds(15))
+        {
+            using var connection = db.OpenReadConnection();
+            var snapshots = new SnapshotStore(connection);
+            if (snapshots.GetRepositoryId(url) is long repository
+                && snapshots.GetBranchId(repository, branch) is long branchId
+                && snapshots.GetBranchSnapshotId(branchId) is long snapshotId
+                && snapshots.GetById(snapshotId) is { } snapshot
+                && snapshots.GetCommitSha(snapshot.CommitId) == expected)
+                return;
+            await Task.Delay(20);
+        }
+        Assert.Fail($"branch {branch} did not converge to {expected}");
     }
 
     [TestMethod]
