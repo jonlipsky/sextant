@@ -322,14 +322,15 @@ public sealed partial class SnapshotService
     // Runs one grant write as a service-owned operation (drained by Dispose, refused once shutdown began) on its own
     // catalog connection, in ONE BEGIN IMMEDIATE transaction that commits only while the writer lease is held. The
     // caller's token bounds only its wait.
-    private async Task<T> RunGrantWriteAsync<T>(Func<SqliteConnection, T> work, CancellationToken cancellationToken)
+    private async Task<T> RunGrantWriteAsync<T>(Func<SqliteConnection, T> work, CancellationToken cancellationToken,
+        bool synchronizeQueuedMetrics = false)
     {
         Task<T> write;
         lock (_inFlightLock)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             ThrowIfStopping();
-            write = Task.Run(() => GrantWrite(work), CancellationToken.None);
+            write = Task.Run(() => GrantWrite(work, synchronizeQueuedMetrics), CancellationToken.None);
             _operations.Add(write);
         }
         _ = write.ContinueWith(
@@ -343,11 +344,11 @@ public sealed partial class SnapshotService
         return await WaitForCallerAsync(write, cancellationToken).ConfigureAwait(false);
     }
 
-    private T GrantWrite<T>(Func<SqliteConnection, T> work)
+    private T GrantWrite<T>(Func<SqliteConnection, T> work, bool synchronizeQueuedMetrics = false)
     {
         try
         {
-            return GrantWriteCore(work);
+            return GrantWriteCore(work, synchronizeQueuedMetrics);
         }
         catch (SqliteException ex) when (ex.SqliteErrorCode is SqliteBusy or SqliteLocked)
         {
@@ -359,7 +360,7 @@ public sealed partial class SnapshotService
     private const int SqliteBusy = 5;
     private const int SqliteLocked = 6;
 
-    private T GrantWriteCore<T>(Func<SqliteConnection, T> work)
+    private T GrantWriteCore<T>(Func<SqliteConnection, T> work, bool synchronizeQueuedMetrics)
     {
         ThrowIfGrantLeaseLost();
         using var conn = OpenGrantWriteConnection();
@@ -377,12 +378,18 @@ public sealed partial class SnapshotService
         var committed = false;
         try
         {
-            var result = work(conn);
-            // The lease may have been lost while this write waited for SQLite's lock: never commit then.
-            ThrowIfGrantLeaseLost();
-            ExecOn(conn, "COMMIT;");
-            committed = true;
-            return result;
+            T Commit()
+            {
+                var result = work(conn);
+                // The lease may have been lost while this write waited for SQLite's lock: never commit then.
+                ThrowIfGrantLeaseLost();
+                ExecOn(conn, "COMMIT;");
+                committed = true;
+                return result;
+            }
+
+            // SQLite's writer lock must precede the metrics lock on every queued-ensure write.
+            return synchronizeQueuedMetrics ? _metrics.WithQueuedEnsureLock(Commit) : Commit();
         }
         finally
         {

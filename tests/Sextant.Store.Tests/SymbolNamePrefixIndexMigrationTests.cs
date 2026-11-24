@@ -38,7 +38,9 @@ public class SymbolNamePrefixIndexMigrationTests
             db.RunMigrations();
             var conn = db.GetConnection();
             Exec(conn, "DROP INDEX ix_repositories_key; DROP INDEX ix_snapshot_jobs_snapshot_branch; ALTER TABLE repositories DROP COLUMN repository_key; " +
-                "DROP TABLE queued_ensures; DROP TABLE writer_run_state; DROP TABLE retired_branch_heads; DROP TABLE branch_advance_handovers; DROP TABLE snapshot_job_timings; " +
+                "DROP TABLE branch_intents; " +
+                "DROP TABLE pending_refreshes; DROP TABLE queued_ensures; DROP TABLE writer_run_state; DROP TABLE retired_branch_heads; DROP TABLE branch_advance_handovers; DROP TABLE snapshot_job_timings; " +
+                "DROP TABLE completed_refresh_admissions; " +
                 "DROP INDEX ix_symbols_project_name_nocase; DROP INDEX ix_repositories_remote_url_nocase; " +
                 "DROP INDEX ix_snapshot_jobs_completed_at; ALTER TABLE symbols DROP COLUMN declaration; " +
                 "DELETE FROM schema_version WHERE version >= 25;");
@@ -67,6 +69,10 @@ public class SymbolNamePrefixIndexMigrationTests
         Assert.Contains(27, IndexDatabase.IdentityNeutralMigrations);
         Assert.Contains(28, IndexDatabase.IdentityNeutralMigrations);
         Assert.Contains(31, IndexDatabase.IdentityNeutralMigrations);
+        Assert.Contains(35, IndexDatabase.IdentityNeutralMigrations);
+        Assert.Contains("pending_refreshes", IndexDatabase.ServiceJobTables);
+        Assert.Contains("completed_refresh_admissions", IndexDatabase.ServiceJobTables);
+        Assert.Contains("branch_intents", IndexDatabase.ServiceJobTables);
         // Adding 025 left every snapshot identity (and so every published snapshot's reuse) as it was at 24.
     }
 
@@ -75,7 +81,8 @@ public class SymbolNamePrefixIndexMigrationTests
     {
         // An identity-neutral migration must not change a table, a row or anything the indexer writes: otherwise a
         // snapshot reused across it would differ from one built after it. Besides index DDL it may create a declared
-        // service job table (issues #267 and #273), which no snapshot reads.
+        // service job table (issues #267 and #273), which no snapshot reads. Migration 035 also clears the service-owned
+        // queued_ensures table: requests queued before the upgrade are not converted (#273 rules, "Not handled").
         var telemetry = string.Join("|", IndexDatabase.ServiceJobTables.Select(Regex.Escape));
         var migrations = Migrations().ToDictionary(m => m.Version, m => m.Sql);
         foreach (var version in IndexDatabase.IdentityNeutralMigrations)
@@ -85,8 +92,10 @@ public class SymbolNamePrefixIndexMigrationTests
                 .Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
             Assert.IsNotEmpty(statements, $"migration {version} has statements");
             foreach (var statement in statements)
-                Assert.IsTrue(Regex.IsMatch(statement, @"^(CREATE\s+(UNIQUE\s+)?INDEX|DROP\s+INDEX)\s", RegexOptions.IgnoreCase)
-                              || Regex.IsMatch(statement, $@"^CREATE\s+TABLE\s+({telemetry})\s*\(", RegexOptions.IgnoreCase),
+                Assert.IsTrue(
+                    Regex.IsMatch(statement, @"^(CREATE\s+(UNIQUE\s+)?INDEX|DROP\s+INDEX)\s", RegexOptions.IgnoreCase)
+                    || Regex.IsMatch(statement, $@"^CREATE\s+TABLE\s+({telemetry})\s*\(", RegexOptions.IgnoreCase)
+                    || (version == 35 && Regex.IsMatch(statement, @"^DELETE\s+FROM\s+queued_ensures$", RegexOptions.IgnoreCase)),
                     $"migration {version} only creates or drops indexes or creates a service job table, but has: {statement}");
         }
     }

@@ -18,23 +18,31 @@ namespace Sextant.Service;
 /// <item>A head or reachability call whose every waiter was cancelled is cancelled itself (its git process is
 /// killed), so an abandoned request never keeps a slot for the lookup's full timeout.</item>
 /// </list>
+/// A resolver that ignores cancellation is detached at the same deadline. It continues to count against the
+/// global outstanding-work limit until it actually returns.
 /// The remembered table is pruned so it never holds more than about <see cref="MaxRememberedRepositories"/> entries.
 /// Never faults: a resolver that throws answers <c>null</c>.
 /// </summary>
 internal sealed class RemoteDefaultBranchLookup(
     IRemoteDefaultBranchResolver resolver, TimeProvider? time = null, IRemoteBranchHeadResolver? heads = null,
-    IRemoteCommitBranchChecker? reachability = null)
+    IRemoteCommitBranchChecker? reachability = null, TimeSpan? resolverTimeout = null)
 {
     internal const int MaxConcurrentLookups = 4;
     internal const int MaxConcurrentLookupsTotal = 32;
     internal const int MaxRememberedRepositories = 1024;
     internal static readonly TimeSpan ResultLifetime = TimeSpan.FromMinutes(1);
+    internal static readonly TimeSpan DefaultResolverTimeout = TimeSpan.FromSeconds(30);
+    internal static readonly TimeSpan ReachabilityResolverTimeout = TimeSpan.FromMinutes(2);
 
     private readonly TimeProvider _time = time ?? TimeProvider.System;
+    private readonly TimeSpan _resolverTimeout = resolverTimeout ?? DefaultResolverTimeout;
     private readonly Lock _lock = new();
     private readonly Dictionary<string, Entry> _entries = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> _runningByTenant = new(StringComparer.Ordinal);
-    private int _running;
+    private int _outstanding;
+    private int _abandoned;
+    internal Action? BeforeWaiterCancelForTesting { get; set; }
+    internal Action? AfterCancellationDisposedForTesting { get; set; }
 
     /// <summary>Whether a branch-head resolver is configured (clone mode).</summary>
     internal bool HasBranchHeadResolver => heads is not null;
@@ -43,16 +51,28 @@ internal sealed class RemoteDefaultBranchLookup(
     internal bool HasCommitBranchChecker => reachability is not null;
 
     /// <summary>
-    /// Whether the commit is reachable from a branch of the remote (issue #209); <c>false</c> when it is not, cannot be
-    /// determined or no checker is configured; throws <see cref="RemoteLookupBusyException"/> when no lookup slot is free.
+    /// Whether the commit is reachable from a branch of the remote (issue #209); throws
+    /// <see cref="RemoteLookupBusyException"/> when the observation is unavailable.
     /// Shares in-flight calls, never remembers an answer.
     /// </summary>
     public async Task<bool> IsCommitOnBranchAsync(
-        string repositoryRemoteUrl, string commit, string? tenant = null, CancellationToken cancellationToken = default) =>
-        reachability is not null
-        && await Start($"\u0001reach\n{RepositoryGrantKey.Of(repositoryRemoteUrl)}\n{commit.ToLowerInvariant()}", tenant, TimeSpan.Zero,
-            ct => reachability.IsCommitOnBranch(repositoryRemoteUrl, commit, ct) ? "yes" : null, cancellationToken, throwWhenBusy: true)
-            .ConfigureAwait(false) is not null;
+        string repositoryRemoteUrl, string commit, string? tenant = null, CancellationToken cancellationToken = default)
+    {
+        if (reachability is null)
+            return false;
+        var answer = await Start($"\u0001reach\n{RepositoryGrantKey.Of(repositoryRemoteUrl)}\n{commit.ToLowerInvariant()}",
+            tenant, TimeSpan.Zero,
+            ct => reachability.ObserveCommitOnBranch(repositoryRemoteUrl, commit, ct) switch
+            {
+                true => "yes",
+                false => "no",
+                null => null
+            }, cancellationToken, throwWhenBusy: true, timeout: resolverTimeout ?? ReachabilityResolverTimeout)
+            .ConfigureAwait(false);
+        if (answer is null)
+            return cancellationToken.IsCancellationRequested ? false : throw new RemoteLookupBusyException();
+        return answer == "yes";
+    }
 
     /// <summary>How many repositories the table currently holds (for tests).</summary>
     internal int RememberedCount
@@ -64,9 +84,23 @@ internal sealed class RemoteDefaultBranchLookup(
         }
     }
 
+    internal int AbandonedCountForTesting()
+    {
+        lock (_lock)
+            return _abandoned;
+    }
+
     /// <summary>The remote's default branch, or <c>null</c> when it is unknown or no lookup slot is free.</summary>
-    public Task<string?> ResolveAsync(string repositoryRemoteUrl, string? tenant = null) =>
-        Start(RepositoryGrantKey.Of(repositoryRemoteUrl), tenant, ResultLifetime, _ => resolver.ResolveDefaultBranch(repositoryRemoteUrl));
+    public Task<string?> ResolveAsync(
+        string repositoryRemoteUrl, string? tenant = null, CancellationToken cancellationToken = default) =>
+        Start(RepositoryGrantKey.Of(repositoryRemoteUrl), tenant,
+            ResultLifetime, ct => resolver.ResolveDefaultBranch(repositoryRemoteUrl, ct), cancellationToken);
+
+    /// <summary>A fresh turn-time default lookup, independent of cached admission answers.</summary>
+    public Task<string?> ResolveFreshAsync(string repositoryRemoteUrl, CancellationToken cancellationToken) =>
+        Start("\u0001default-repair\n" + Guid.NewGuid().ToString("N") + "\n" + RepositoryGrantKey.Of(repositoryRemoteUrl),
+            null, TimeSpan.Zero,
+            ct => resolver.ResolveDefaultBranch(repositoryRemoteUrl, ct), cancellationToken);
 
     /// <summary>
     /// The commit <c>refs/heads/&lt;branch&gt;</c> names on the remote (issue #203), or <c>null</c> when it is unknown,
@@ -79,12 +113,41 @@ internal sealed class RemoteDefaultBranchLookup(
         bool forRepair = false) =>
         heads is null
             ? Task.FromResult<string?>(null)
-            : Start($"{(forRepair ? "\u0001repair\n" : "")}{RepositoryGrantKey.Of(repositoryRemoteUrl)}\n{branch}", tenant, TimeSpan.Zero,
+            : Start($"{(forRepair ? "\u0001repair\n" + Guid.NewGuid().ToString("N") + "\n" : "")}{RepositoryGrantKey.Of(repositoryRemoteUrl)}\n{branch}",
+                tenant, TimeSpan.Zero,
                 ct => heads.ResolveBranchHead(repositoryRemoteUrl, branch, ct), cancellationToken, throwWhenBusy: true);
+
+    // Empty string denotes a successful observation of an absent branch; null means unavailable.
+    public Task<string?> ObserveBranchHeadForIntakeAsync(
+        string repositoryRemoteUrl, string branch, string? tenant, CancellationToken cancellationToken) =>
+        heads is null
+            ? Task.FromResult<string?>(null)
+            : Start($"\u0001intake\n{RepositoryGrantKey.Of(repositoryRemoteUrl)}\n{branch}",
+                tenant, TimeSpan.Zero,
+                ct => heads.ObserveBranchHead(repositoryRemoteUrl, branch, ct) is { } observed
+                    ? observed.Head is null ? string.Empty
+                        : string.IsNullOrWhiteSpace(observed.Head) ? null : observed.Head
+                    : null, cancellationToken, throwWhenBusy: true);
+
+    public async Task<RemoteBranchStateObservation?> ObserveBranchStateAsync(
+        string repositoryRemoteUrl, string branch, CancellationToken cancellationToken)
+    {
+        if (heads is null)
+            return null;
+        var answer = await Start("\u0001state\n" + Guid.NewGuid().ToString("N"),
+            null, TimeSpan.Zero,
+            ct => heads.ObserveBranchState(repositoryRemoteUrl, branch, ct) is { } state
+                ? state.DefaultBranch + "\n" + state.Head : null, cancellationToken, throwWhenBusy: true)
+            .ConfigureAwait(false);
+        if (answer is null)
+            return null;
+        var separator = answer.IndexOf('\n');
+        return separator < 0 ? null : new RemoteBranchStateObservation(answer[..separator], answer[(separator + 1)..]);
+    }
 
     private Task<string?> Start(
         string key, string? tenant, TimeSpan lifetime, Func<CancellationToken, string?> lookup,
-        CancellationToken caller = default, bool throwWhenBusy = false)
+        CancellationToken caller = default, bool throwWhenBusy = false, TimeSpan? timeout = null)
     {
         tenant ??= string.Empty;
         Entry entry;
@@ -98,19 +161,20 @@ internal sealed class RemoteDefaultBranchLookup(
                     Watch(existing, caller);
                 return existing.Answer.Task;
             }
-            if (_running >= MaxConcurrentLookupsTotal || _runningByTenant.GetValueOrDefault(tenant) >= MaxConcurrentLookups)
+            if (_outstanding >= MaxConcurrentLookupsTotal
+                || _runningByTenant.GetValueOrDefault(tenant) >= MaxConcurrentLookups)
                 return throwWhenBusy ? Task.FromException<string?>(new RemoteLookupBusyException()) : Task.FromResult<string?>(null);
             Prune(now);
             entry = new Entry();
             _entries[key] = entry;
-            _running++;
+            _outstanding++;
             _runningByTenant[tenant] = _runningByTenant.GetValueOrDefault(tenant) + 1;
             if (lifetime == TimeSpan.Zero)
                 Watch(entry, caller);
         }
         // The shared lookup is cancelled through entry.Cancellation once every waiter has left (Watch), never by one
         // caller's token.
-        entry.Worker = Task.Run(() => Run(lookup, tenant, lifetime, entry), CancellationToken.None);
+        entry.Worker = RunAsync(lookup, tenant, lifetime, entry, timeout ?? _resolverTimeout);
         return entry.Answer.Task;
     }
 
@@ -132,36 +196,92 @@ internal sealed class RemoteDefaultBranchLookup(
                     entry.Abandoned = true;
             }
             if (cancel)
-                entry.Cancellation.Cancel();
+            {
+                BeforeWaiterCancelForTesting?.Invoke();
+                try
+                {
+                    entry.Cancellation.Cancel();
+                }
+                catch (ObjectDisposedException) { }
+            }
         });
         entry.Unregister = entry.Answer.Task.ContinueWith(_ => registration.Dispose(), TaskScheduler.Default);
     }
 
-    private void Run(Func<CancellationToken, string?> lookup, string tenant, TimeSpan lifetime, Entry entry)
+    private async Task RunAsync(Func<CancellationToken, string?> lookup, string tenant, TimeSpan lifetime, Entry entry, TimeSpan timeoutDuration)
     {
-        string? answer;
+        var worker = Task.Run(() => lookup(entry.Cancellation.Token), CancellationToken.None);
+        var timeout = Task.Delay(timeoutDuration, _time);
+        var cancelled = Task.Delay(Timeout.InfiniteTimeSpan, _time, entry.Cancellation.Token);
+        await Task.WhenAny(worker, timeout, cancelled).ConfigureAwait(false);
+        if (worker.IsCompleted)
+        {
+            string? answer;
+            try
+            {
+                answer = await worker.ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                // The resolvers answer null for a remote they cannot read; a throw means the same.
+                answer = null;
+            }
+            Complete(entry, tenant, lifetime,
+                entry.Cancellation.IsCancellationRequested ? null : answer, abandoned: false);
+            entry.Cancellation.Dispose();
+            AfterCancellationDisposedForTesting?.Invoke();
+            return;
+        }
+
+        var abandoned = !worker.IsCompleted;
         try
         {
-            answer = lookup(entry.Cancellation.Token);
+            await entry.Cancellation.CancelAsync().ConfigureAwait(false);
         }
-        catch (Exception)
+        catch (ObjectDisposedException) { }
+        Complete(entry, tenant, lifetime, null, abandoned);
+        if (abandoned)
         {
-            // The resolvers answer null for a remote they cannot read; a throw means the same.
-            answer = null;
+            _ = worker.ContinueWith(
+                _ => FinishAbandoned(entry),
+                CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            return;
         }
-        // Every waiter left: an abandoned lookup never reports a verdict, whatever the resolver returned.
-        if (entry.Cancellation.IsCancellationRequested)
-            answer = null;
+        entry.Cancellation.Dispose();
+    }
+
+    private void Complete(Entry entry, string tenant, TimeSpan lifetime, string? answer, bool abandoned)
+    {
         lock (_lock)
         {
             entry.ExpiresAt = _time.GetUtcNow() + lifetime;
-            _running--;
-            if (_runningByTenant[tenant] <= 1)
-                _runningByTenant.Remove(tenant);
+            entry.Abandoned = abandoned;
+            ReleaseRunningSlot(tenant);
+            if (abandoned)
+                _abandoned++;
             else
-                _runningByTenant[tenant]--;
+                _outstanding--;
         }
         entry.Answer.TrySetResult(answer);
+    }
+
+    private void FinishAbandoned(Entry entry)
+    {
+        lock (_lock)
+        {
+            _abandoned--;
+            _outstanding--;
+            RemoveWhere(candidate => ReferenceEquals(candidate, entry));
+        }
+        entry.Cancellation.Dispose();
+    }
+
+    private void ReleaseRunningSlot(string tenant)
+    {
+        if (_runningByTenant[tenant] <= 1)
+            _runningByTenant.Remove(tenant);
+        else
+            _runningByTenant[tenant]--;
     }
 
     // Drops expired answers; if the table is still full, drops every finished one. In-flight entries are kept (at
@@ -187,7 +307,7 @@ internal sealed class RemoteDefaultBranchLookup(
 
         public int Waiters { get; set; }
 
-        /// <summary>The task running the lookup; <see cref="Run"/> catches everything, so it never faults.</summary>
+        /// <summary>The task coordinating the resolver call and its deadline.</summary>
         public Task? Worker { get; set; }
 
         /// <summary>The continuation that disposes the last registered waiter's cancellation registration.</summary>

@@ -308,6 +308,19 @@ public class DefaultBranchFreshnessTests
 
     private sealed class FakeResolver : IRemoteDefaultBranchResolver, IRemoteBranchHeadResolver
     {
+        public RemoteBranchHeadObservation? ObserveBranchHead(
+            string repositoryRemoteUrl, string branch, CancellationToken cancellationToken = default) =>
+            ResolveBranchHead(repositoryRemoteUrl, branch, cancellationToken) is { } observed && !string.IsNullOrWhiteSpace(observed)
+                ? new RemoteBranchHeadObservation(observed)
+                : null;
+
+        // This double cannot observe the default and head atomically (the refresh retries and stays supersedable).
+        public RemoteBranchStateObservation? ObserveBranchState(
+            string repositoryRemoteUrl, string branch, CancellationToken cancellationToken = default) => null;
+
+        public string? ResolveDefaultBranch(string repositoryRemoteUrl, CancellationToken cancellationToken) =>
+            ResolveDefaultBranch(repositoryRemoteUrl);
+
         public Dictionary<string, string?> Heads { get; } = new(StringComparer.Ordinal);
         public volatile bool Throw;
         public volatile string? BlockUrl;

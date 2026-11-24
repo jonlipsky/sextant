@@ -707,7 +707,7 @@ public class CallerAssertionHttpTests
         public static async Task<Harness> StartAsync(
             bool callerIdentity = true, bool readPolicy = false, string[]? apps = null,
             Func<ServiceOptions, ServiceOptions>? configure = null, Action<IndexDatabase>? seed = null,
-            bool kestrel = false, IRemoteDefaultBranchResolver? remoteDefaults = null)
+            bool kestrel = false, IRemoteDefaultBranchResolver? remoteDefaults = null, TimeProvider? timeProvider = null)
         {
             var harness = new Harness();
             var dbPath = ServiceTestFixtures.NewDbPath();
@@ -749,7 +749,7 @@ public class CallerAssertionHttpTests
             var worker = new FakeSnapshotWorker(db);
             if (configure is not null)
                 options = configure(options);
-            var service = SnapshotService.Start(options, worker, db, remoteDefaults: remoteDefaults);
+            var service = SnapshotService.Start(options, worker, db, remoteDefaults: remoteDefaults, timeProvider: timeProvider);
 
             var builder = WebApplication.CreateBuilder();
             // A real Kestrel socket on an ephemeral loopback port, so its request-target normalization is exercised.

@@ -15,38 +15,44 @@ public sealed partial class CloningCheckoutProvider : IRemoteDefaultBranchResolv
     // object database only through refs/pull/* (a fork-network commit) is never transferred, and so never found.
     // Anything short of a clear "reachable" answer is false (fail closed).
     public bool IsCommitOnBranch(string repositoryRemoteUrl, string commit, CancellationToken cancellationToken = default)
+        => ObserveCommitOnBranch(repositoryRemoteUrl, commit, cancellationToken) == true;
+
+    public bool? ObserveCommitOnBranch(string repositoryRemoteUrl, string commit, CancellationToken cancellationToken = default)
     {
         var id = commit?.Trim() ?? string.Empty;
-        if (string.IsNullOrWhiteSpace(repositoryRemoteUrl) || UrlHasUserInfo(repositoryRemoteUrl)
-            || id.Length is not (40 or 64) || !id.All(Uri.IsHexDigit))
+        if (id.Length is not (40 or 64) || !id.All(Uri.IsHexDigit))
             return false;
+        if (string.IsNullOrWhiteSpace(repositoryRemoteUrl) || UrlHasUserInfo(repositoryRemoteUrl))
+            return null;
 
         var root = Path.GetFullPath(_paths.CheckoutRoot);
         var temp = Path.GetFullPath(Path.Combine(root, $"{TempClonePrefix}{Guid.NewGuid():N}"));
         if (!IsContainedIn(root, temp))
-            return false;
+            return null;
 
         var authority = SubmoduleUrlPolicy.HttpsAuthority(repositoryRemoteUrl);
         var environment = TopLevelEnvironment(_token is not null ? authority : null, repositoryRemoteUrl);
         try
         {
             Directory.CreateDirectory(temp);
-            if (!EnvironmentConfigSupported(temp) || !RunGit(temp, environment, "init", "--quiet").Ok)
-                return false;
+            if (!EnvironmentConfigSupported(temp, cancellationToken)
+                || !RunGit(temp, environment, CommitReachabilityTimeout, cancellationToken, "init", "--quiet").Ok)
+                return null;
             var fetch = RunGit(temp, environment, CommitReachabilityTimeout, cancellationToken,
                 "fetch", "--quiet", "--no-tags", "--filter=blob:none", "--end-of-options", repositoryRemoteUrl,
                 "+refs/heads/*:refs/remotes/origin/*");
             if (!fetch.Ok)
-                return false;
+                return null;
             var local = LocalGitEnvironment with { AllowedProtocols = AllowedGitProtocols };
-            if (!RunGit(temp, local, "rev-parse", "--verify", "--quiet", id + "^{commit}").Ok)
-                return false;
-            var containing = RunGit(temp, local, "for-each-ref", "--format=%(refname)", "--contains", id, "refs/remotes/origin/");
-            return containing.Ok && containing.Stdout.Split('\n').Any(l => l.TrimEnd('\r').StartsWith("refs/remotes/origin/", StringComparison.Ordinal));
+            var resolved = RunGit(temp, local, CommitReachabilityTimeout, cancellationToken, "rev-parse", "--verify", "--quiet", id + "^{commit}");
+            if (!resolved.Ok)
+                return resolved.Kind == GitFailureKind.NonZeroExit && resolved.ExitCode == 1 ? false : null;
+            var containing = RunGit(temp, local, CommitReachabilityTimeout, cancellationToken, "for-each-ref", "--format=%(refname)", "--contains", id, "refs/remotes/origin/");
+            return !containing.Ok ? null : containing.Stdout.Split('\n').Any(l => l.TrimEnd('\r').StartsWith("refs/remotes/origin/", StringComparison.Ordinal));
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or TransientProvisioningException)
         {
-            return false;
+            return null;
         }
         finally
         {
@@ -57,6 +63,9 @@ public sealed partial class CloningCheckoutProvider : IRemoteDefaultBranchResolv
     // Issue #203: the commit refs/heads/<branch> names on the remote, over the same hardened environment. Anything
     // short of one clean, exactly matching line is null (fail closed).
     public string? ResolveBranchHead(string repositoryRemoteUrl, string branch, CancellationToken cancellationToken = default)
+        => ObserveBranchHead(repositoryRemoteUrl, branch, cancellationToken)?.Head;
+
+    public RemoteBranchHeadObservation? ObserveBranchHead(string repositoryRemoteUrl, string branch, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(repositoryRemoteUrl) || UrlHasUserInfo(repositoryRemoteUrl)
             || !RemoteBranchHeads.IsVerifiableBranchName(branch))
@@ -72,11 +81,55 @@ public sealed partial class CloningCheckoutProvider : IRemoteDefaultBranchResolv
         try
         {
             Directory.CreateDirectory(temp);
-            if (!EnvironmentConfigSupported(temp) || !RunGit(temp, environment, "init", "--quiet").Ok)
+            if (!EnvironmentConfigSupported(temp, cancellationToken)
+                || !RunGit(temp, environment, RemoteDefaultBranchTimeout, cancellationToken, "init", "--quiet").Ok)
                 return null;
             var result = RunGit(temp, environment, RemoteDefaultBranchTimeout, cancellationToken,
                 "ls-remote", "--end-of-options", repositoryRemoteUrl, "refs/heads/" + branch);
-            return result.Ok ? RemoteBranchHead.Parse(result.Stdout, branch) : null;
+            if (!result.Ok)
+                return null;
+            if (string.IsNullOrWhiteSpace(result.Stdout))
+                return new RemoteBranchHeadObservation(null);
+            var head = RemoteBranchHead.Parse(result.Stdout, branch);
+            return head is null ? null : new RemoteBranchHeadObservation(head);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or TransientProvisioningException)
+        {
+            return null;
+        }
+        finally
+        {
+            TryDeleteDirectory(temp);
+        }
+    }
+
+    public RemoteBranchStateObservation? ObserveBranchState(string repositoryRemoteUrl, string branch, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(repositoryRemoteUrl) || UrlHasUserInfo(repositoryRemoteUrl)
+            || !RemoteBranchHeads.IsVerifiableBranchName(branch))
+            return null;
+
+        var root = Path.GetFullPath(_paths.CheckoutRoot);
+        var temp = Path.GetFullPath(Path.Combine(root, $"{TempClonePrefix}{Guid.NewGuid():N}"));
+        if (!IsContainedIn(root, temp))
+            return null;
+        var authority = SubmoduleUrlPolicy.HttpsAuthority(repositoryRemoteUrl);
+        var environment = TopLevelEnvironment(_token is not null ? authority : null, repositoryRemoteUrl);
+        try
+        {
+            Directory.CreateDirectory(temp);
+            if (!EnvironmentConfigSupported(temp, cancellationToken)
+                || !RunGit(temp, environment, RemoteDefaultBranchTimeout, cancellationToken, "init", "--quiet").Ok)
+                return null;
+            var result = RunGit(temp, environment, RemoteDefaultBranchTimeout, cancellationToken,
+                "ls-remote", "--symref", "--end-of-options", repositoryRemoteUrl, "HEAD", "refs/heads/" + branch);
+            if (!result.Ok)
+                return null;
+            var defaultBranch = RemoteDefaultBranch.ParseSymref(result.Stdout);
+            var refs = string.Join('\n', result.Stdout.Split('\n')
+                .Where(line => !line.StartsWith("ref: ", StringComparison.Ordinal)));
+            var head = RemoteBranchHead.Parse(refs, branch);
+            return defaultBranch is null || head is null ? null : new RemoteBranchStateObservation(defaultBranch, head);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or TransientProvisioningException)
         {
@@ -128,6 +181,9 @@ public sealed partial class CloningCheckoutProvider : IRemoteDefaultBranchResolv
     private static readonly TimeSpan RemoteDefaultBranchTimeout = TimeSpan.FromSeconds(30);
 
     public string? ResolveDefaultBranch(string repositoryRemoteUrl)
+        => ResolveDefaultBranch(repositoryRemoteUrl, CancellationToken.None);
+
+    public string? ResolveDefaultBranch(string repositoryRemoteUrl, CancellationToken cancellationToken)
     {
         // Credentials only ever arrive through SEXTANT_SERVICE_CHECKOUT_TOKEN, exactly as for a clone.
         if (string.IsNullOrWhiteSpace(repositoryRemoteUrl) || UrlHasUserInfo(repositoryRemoteUrl))
@@ -143,9 +199,10 @@ public sealed partial class CloningCheckoutProvider : IRemoteDefaultBranchResolv
         try
         {
             Directory.CreateDirectory(temp);
-            if (!EnvironmentConfigSupported(temp) || !RunGit(temp, environment, "init", "--quiet").Ok)
+            if (!EnvironmentConfigSupported(temp, cancellationToken)
+                || !RunGit(temp, environment, RemoteDefaultBranchTimeout, cancellationToken, "init", "--quiet").Ok)
                 return null;
-            var result = RunGit(temp, environment, RemoteDefaultBranchTimeout,
+            var result = RunGit(temp, environment, RemoteDefaultBranchTimeout, cancellationToken,
                 "ls-remote", "--symref", "--end-of-options", repositoryRemoteUrl, "HEAD");
             var branch = result.Ok ? RemoteDefaultBranch.ParseSymref(result.Stdout) : null;
             if (branch is null)

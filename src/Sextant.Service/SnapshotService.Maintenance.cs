@@ -312,14 +312,13 @@ public sealed partial class SnapshotService
             {
                 _metrics.RecordUpstreamBranchPass(
                     upstream.Checked, upstream.ListingFailures, _timeProvider.GetUtcNow().ToUnixTimeMilliseconds(), upstream.DurationMs,
-                    upstream.HealsStarted, upstream.HealSkippedTerminal);
+                    upstream.HealsStarted);
                 Log($"maintenance: upstream-branch pass retired {upstream.Retired} branch pointer(s) " +
                     $"(repositories due {upstream.Due}, checked {upstream.Checked}, listing failures {upstream.ListingFailures}, " +
                     $"busy {upstream.Busy}, awaiting confirmation {upstream.AwaitingConfirmation}, " +
                     $"attempted {upstream.Attempted}, skipped {upstream.Skipped}); " +
                     $"healed {upstream.HealsStarted} stale pointer(s) (stale {upstream.Stale}, busy {upstream.HealBusy}, " +
-                    $"awaiting confirmation {upstream.HealAwaitingConfirmation}, deferred {upstream.HealsDeferred}, " +
-                    $"skipped terminal {upstream.HealSkippedTerminal}) " +
+                    $"awaiting confirmation {upstream.HealAwaitingConfirmation}, deferred {upstream.HealsDeferred}) " +
                     $"in {upstream.DurationMs:F0} ms.");
             }
             var reclaim = await ReclaimInactiveRepositoriesAsync(cancellationToken).ConfigureAwait(false);
@@ -333,6 +332,26 @@ public sealed partial class SnapshotService
             }
 
             var report = await RunScheduledRetentionIfDueAsync(idle, cancellationToken).ConfigureAwait(false);
+            if (_writeGate.CurrentCount == 0)
+                DeferStep("refresh_status_prune", "writer busy");
+            else
+            {
+                using var step = BeginStep(cancellationToken);
+                try
+                {
+                    var completedRefreshAdmissionsPruned = await WithWriteAsync(
+                        () => Task.FromResult(new PendingRefreshStore(_conn).PruneCompleted(
+                            _timeProvider.GetUtcNow().AddDays(-7).ToUnixTimeMilliseconds())),
+                        step.Token).ConfigureAwait(false);
+                    if (completedRefreshAdmissionsPruned > 0)
+                        Log($"maintenance: pruned {completedRefreshAdmissionsPruned} completed refresh admission status row(s).");
+                }
+                catch (OperationCanceledException) when (step.TimedOut)
+                {
+                    DeferStep("refresh_status_prune", "completed admission statuses");
+                }
+            }
+            // Rule 7 (#273): maintenance never dispatches retries; they start only from their own due-time wake.
             return report with { RepositoryReclaim = reclaim, UpstreamBranches = upstream, OrphanHandoversPruned = handoversPruned };
         }
         finally
@@ -376,6 +395,10 @@ public sealed partial class SnapshotService
             var jobStore = new SnapshotJobStore(reader);
             pending = jobStore.BranchesWithPendingWork();
             lastJobAt = jobStore.LatestJobCreatedAtByBranch();
+            // Issue #273: any admitted, unsettled branch intent (a retrying push's refresh included) is pending work too.
+            foreach (var intent in new BranchIntentStore(reader).ListUnsettled())
+                if (new SnapshotStore(reader).GetRepositoryRemoteUrl(intent.RepositoryId) is { } url)
+                    pending.Add((RemoteUrlIdentity.Normalize(url), intent.Branch));
         }
         // An admitted branch-advance ensure that has not finished is pending work too (issue #273's registry), and so is
         // an idle retirement an earlier tick queued that has not applied yet (issue #333: never queue a duplicate).

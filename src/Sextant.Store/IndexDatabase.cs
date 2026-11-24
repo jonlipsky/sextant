@@ -11,6 +11,9 @@ public sealed class IndexDatabase : IDisposable
     private readonly IndexWriteOptions _writeOptions;
     private SqliteConnection? _connection;
     private Func<bool>? _writerLostProbe;
+    private Action? _writerAccessGuard;
+    private Action? _writerTraceViolation;
+    private bool _writerTraceInstalled;
 
     public IndexDatabase(string dbPath, IndexWriteOptions? writeOptions = null)
     {
@@ -25,7 +28,10 @@ public sealed class IndexDatabase : IDisposable
         {
             DataSource = dbPath,
             Mode = SqliteOpenMode.ReadWriteCreate,
-            Cache = SqliteCacheMode.Shared
+            Cache = SqliteCacheMode.Shared,
+            // A diagnostic trace can remain installed until this long-lived writer closes.
+            // Do not return its native handle to a pool after the managed callback is released.
+            Pooling = false
         }.ToString();
     }
 
@@ -97,14 +103,47 @@ public sealed class IndexDatabase : IDisposable
     /// </summary>
     public void SetWriterLostProbe(Func<bool>? writerLostProbe) => _writerLostProbe = writerLostProbe;
 
+    /// <summary>Installs an optional diagnostic guard for accesses to the shared writer connection.</summary>
+    public void SetWriterAccessGuard(Action? guard, Action? traceViolation = null)
+    {
+        _writerAccessGuard = guard;
+        _writerTraceViolation = traceViolation;
+        // SQLitePCL's trace wrapper cannot register a null callback. An installed callback
+        // becomes inert when the guard is cleared and remains until the connection closes.
+        // Reinstalling it would free the old callback before SQLite replaces it.
+        if (_connection is not null && traceViolation is not null && !_writerTraceInstalled)
+            ConfigureWriterTrace(_connection);
+    }
+
+    private void ConfigureWriterTrace(SqliteConnection connection)
+    {
+        SQLitePCL.strdelegate_trace trace = (_, _) =>
+        {
+            try
+            {
+                _writerAccessGuard?.Invoke();
+            }
+            catch
+            {
+                // Never throw through a native SQLite callback. The test checks the recorded violations.
+                _writerTraceViolation?.Invoke();
+            }
+        };
+        SQLitePCL.raw.sqlite3_trace(connection.Handle, trace, null!);
+        _writerTraceInstalled = true;
+    }
+
     public SqliteConnection GetConnection()
     {
+        _writerAccessGuard?.Invoke();
         if (_connection != null)
             return _connection;
 
         _connection = new SqliteConnection(_connectionString);
         _connection.Open();
         ConfigurePragmas(_connection);
+        if (_writerTraceViolation is not null)
+            ConfigureWriterTrace(_connection);
         return _connection;
     }
 
@@ -125,6 +164,7 @@ public sealed class IndexDatabase : IDisposable
             // The connection is already in a bad state; dropping the reference is what matters.
         }
         _connection = null;
+        _writerTraceInstalled = false;
     }
 
     public SqliteConnection CreateReadOnlyConnection()
@@ -211,7 +251,7 @@ public sealed class IndexDatabase : IDisposable
             {
                 using var cmd = conn.CreateCommand();
                 cmd.Transaction = transaction;
-                if (version == 34)
+                if (version is 34 or 41)
                     conn.CreateFunction<string, string>("sextant_repository_key", RemoteUrlIdentity.Normalize, isDeterministic: true);
                 try
                 {
@@ -220,7 +260,7 @@ public sealed class IndexDatabase : IDisposable
                 }
                 finally
                 {
-                    if (version == 34)
+                    if (version is 34 or 41)
                         conn.CreateFunction<string, string>("sextant_repository_key", null);
                 }
 
@@ -253,15 +293,15 @@ public sealed class IndexDatabase : IDisposable
     /// index-only migration that did), and those identities are left as they are.
     /// </summary>
     public static IReadOnlySet<int> IdentityNeutralMigrations { get; } =
-        new HashSet<int> { 25, 27, 28, 29, 30, 31, 32, 33 };
+        new HashSet<int> { 25, 27, 28, 29, 30, 31, 32, 33, 35 };
 
     /// <summary>
     /// Tables the service keeps about its jobs only: job telemetry (issue #267), branch-advance handovers (issue
-    /// #273) and idle-retired branch heads (issue #299). Never read or written by the indexer, and never part of a
-    /// snapshot. Creating one is identity-neutral.
+    /// #273), idle-retired branch heads (issue #299), completed refresh admission statuses, and identity retry deadlines. Never read or
+    /// written by the indexer, and never part of a snapshot. Creating one is identity-neutral.
     /// </summary>
     public static IReadOnlySet<string> ServiceJobTables { get; } =
-        new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "snapshot_job_timings", "branch_advance_handovers", "retired_branch_heads", "writer_run_state", "queued_ensures" };
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "snapshot_job_timings", "branch_advance_handovers", "retired_branch_heads", "writer_run_state", "queued_ensures", "pending_refreshes", "completed_refresh_admissions", "branch_intents" };
 
     /// <summary>
     /// The schema version folded into a snapshot's identity (<c>SnapshotIdentity.SchemaVersion</c>) and compared by
@@ -423,5 +463,6 @@ public sealed class IndexDatabase : IDisposable
     {
         _connection?.Dispose();
         _connection = null;
+        _writerTraceInstalled = false;
     }
 }

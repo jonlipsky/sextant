@@ -70,6 +70,10 @@ public sealed record StatusReport
     [JsonPropertyName("last_24h")]
     public required ReportLast24h Last24h { get; init; }
 
+    /// <summary>Operator-only node-wide queued-ensure depth and age, omitted from tenant-scoped daily reports.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public QueuedEnsureMetrics? QueuedEnsures { get; init; }
+
     /// <summary>Catalog size and free space; the operator only, left out for an application caller.</summary>
     public ReportStorage? Storage { get; init; }
 }

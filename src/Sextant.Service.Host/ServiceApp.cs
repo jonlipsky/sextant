@@ -403,9 +403,14 @@ public static class ServiceApp
                             statusCode: StatusCodes.Status409Conflict);
                     }
                 }
-                result = wait == false
+                result = request.Refresh == true || wait == false
                     ? await service.BeginEnsureSnapshotAsync(request, AuditActor(req), ct)
                     : await service.EnsureSnapshotAsync(request, ct, AuditActor(req));
+            }
+            catch (RefreshLookupUnavailableException)
+            {
+                return Results.Json(new { status = "unavailable", reason = "refresh_lookup_busy" },
+                    ServiceJson.Options, statusCode: StatusCodes.Status503ServiceUnavailable);
             }
             catch (Exception ex) when ((ex is OperationCanceledException && !ct.IsCancellationRequested) || ex is GrantStoreUnavailableException)
             {
@@ -414,7 +419,12 @@ public static class ServiceApp
                 // it may have been requeued, never registered, or already settled — the retried ensure reports
                 // (and re-attaches to) its real state.
                 return Results.Json(
-                    new { status = "unavailable", reason = "the index service stopped this ensure before it completed (e.g. it is shutting down); retry the ensure" },
+                    new
+                    {
+                        status = "unavailable",
+                        reason = "the index service stopped this ensure before it completed (e.g. it is shutting down); retry the ensure",
+                        admission_id = (ex as GrantStoreUnavailableException)?.AdmissionId
+                    },
                     ServiceJson.Options, statusCode: StatusCodes.Status503ServiceUnavailable);
             }
             // A non-terminal result is 202 Accepted so the orchestrator polls /status rather than treating it
@@ -422,8 +432,15 @@ public static class ServiceApp
             // re-attempt (a TRANSIENT provisioning failure bounded by the attempt cap; nothing re-runs it in the
             // background, so the next attempt is the orchestrator's next ensure for the same commit), or
             // `wait=false` returned while production is still queued/running. A coalesced result (issue #273) is
-            // settled — a newer commit of the branch builds instead — so it is a 200 as well.
-            var statusCode = SnapshotJobStatus.IsSettled(result.Status)
+            // settled — a newer commit of the branch builds instead — so it is a 200 as well. A refresh admission is
+            // different: `coalesced` there means the request was absorbed into a pending refresh that has not run yet, so
+            // both successful refresh admission statuses (queued and coalesced) are 202 and the caller polls the
+            // admission id.
+            var statusCode = result.Reason == BranchGuardReason.RefreshDefaultUnconfirmed
+                ? StatusCodes.Status409Conflict
+                : request.Refresh == true && result.Status is SnapshotJobStatus.Queued or SnapshotJobStatus.Coalesced
+                ? StatusCodes.Status202Accepted
+                : SnapshotJobStatus.IsSettled(result.Status)
                 ? StatusCodes.Status200OK
                 : StatusCodes.Status202Accepted;
             return Results.Json(result, ServiceJson.Options, statusCode: statusCode);
@@ -435,11 +452,29 @@ public static class ServiceApp
         control.MapGet("/status/{jobId:long}", (long jobId, HttpRequest req, SnapshotService service) =>
         {
             var status = service.GetStatus(jobId);
+            var caller = CallerRequest.Get(req.HttpContext)?.Principal;
             if (status is not null
-                && CallerRequest.Get(req.HttpContext)?.Principal is { Actor: CallerActor.User } user
+                && caller is { Actor: CallerActor.User } user
                 && !service.IsRepositoryVisible(user, status.Job.RepositoryUrl))
                 status = null;
-            return status is null ? Results.NotFound() : Results.Json(status, ServiceJson.Options);
+            if (status is null)
+                return Results.NotFound();
+            if (caller is null)
+                status = status with { QueuedEnsures = service.CollectQueuedEnsureMetrics() };
+            return Results.Json(status, ServiceJson.Options);
+        }).DecidesUserCallers();
+
+        control.MapGet("/refresh-status/{admissionId}", (string admissionId, HttpRequest req, SnapshotService service) =>
+        {
+            var status = service.GetRefreshAdmissionStatus(admissionId);
+            var caller = CallerRequest.Get(req.HttpContext)?.Principal;
+            if (status is not null
+                && caller is { Actor: CallerActor.User } user
+                && !service.IsRepositoryVisible(user, status.RepositoryUrl))
+                status = null;
+            return status is null
+                ? Results.Json(new { AdmissionId = admissionId, Status = "unknown" }, ServiceJson.Options)
+                : Results.Json(status, ServiceJson.Options);
         }).DecidesUserCallers();
 
         // SVC-4: a user caller resolves only a repository it can read. The grant is checked BEFORE the branch is
@@ -490,7 +525,7 @@ public static class ServiceApp
         // of a repository other users watch is a destructive cross-user action.
         control.MapPost("/branches/retire", async (RetireBranchRequest request, HttpRequest req, SnapshotService service, ServiceOptions options, CancellationToken ct) =>
         {
-            RetireBranchResult? result;
+            RetireBranchResult result;
             try
             {
                 var decision = options.RepositoryUrlPolicy.Evaluate(request.Repository);
@@ -513,11 +548,23 @@ public static class ServiceApp
                     new { status = "unavailable", reason = "the index service is shutting down and did not accept this retirement; retry it" },
                     ServiceJson.Options, statusCode: StatusCodes.Status503ServiceUnavailable);
             }
-            if (result is null)
-                return Results.Json(new { status = "accepted" }, ServiceJson.Options, statusCode: StatusCodes.Status202Accepted);
+            catch (RetireAdmissionUnavailableException ex)
+            {
+                return Results.Json(
+                    new
+                    {
+                        status = "unavailable",
+                        reason = "the retirement could not be durably admitted; retry it",
+                        admission_id = ex.AdmissionId
+                    },
+                    ServiceJson.Options, statusCode: StatusCodes.Status503ServiceUnavailable);
+            }
+            if (result is { Pending: true })
+                return Results.Json(new { status = "accepted", admission_id = result.AdmissionId },
+                    ServiceJson.Options, statusCode: StatusCodes.Status202Accepted);
             return result.Reason is null
-                ? Results.Json(new { retired = result.Retired }, ServiceJson.Options)
-                : Results.Json(new { status = "rejected", reason = result.Reason }, ServiceJson.Options,
+                ? Results.Json(new { retired = result.Retired, admission_id = result.AdmissionId }, ServiceJson.Options)
+                : Results.Json(new { status = "rejected", reason = result.Reason, admission_id = result.AdmissionId }, ServiceJson.Options,
                     statusCode: StatusCodes.Status409Conflict);
         }).AuditsRefusedUserCallsAs(AuditAction.Retire);
 
@@ -573,6 +620,9 @@ public static class ServiceApp
             try
             {
                 var report = await service.BuildStatusReportAsync(visible, granted, ct);
+                // The queue is node-wide, so only an operator report (no tenant caller) may include it.
+                if (caller is null)
+                    report = report with { QueuedEnsures = service.CollectQueuedEnsureMetrics() };
                 return Results.Json(report, ServiceJson.Options);
             }
             catch (TimeoutException)

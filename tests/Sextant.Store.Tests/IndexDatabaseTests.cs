@@ -33,6 +33,46 @@ public class IndexDatabaseTests
     }
 
     [TestMethod]
+    public void WriterAccessGuard_CanBeClearedWithOrWithoutTrace()
+    {
+        using var db = new IndexDatabase(_dbPath);
+        var conn = db.GetConnection();
+        db.SetWriterAccessGuard(null);
+
+        var violations = 0;
+        db.SetWriterAccessGuard(() => throw new InvalidOperationException(), () => violations++);
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT 1;";
+        cmd.ExecuteScalar();
+        Assert.AreEqual(1, violations);
+
+        db.SetWriterAccessGuard(null);
+        cmd.ExecuteScalar();
+        Assert.AreEqual(1, violations);
+        Assert.AreSame(conn, db.GetConnection());
+
+        db.SetWriterAccessGuard(() => throw new InvalidOperationException(), () => violations++);
+        cmd.ExecuteScalar();
+        Assert.AreEqual(2, violations);
+    }
+
+    [TestMethod]
+    public void TracedWriter_CanBeClosedAndReopened()
+    {
+        using (var db = new IndexDatabase(_dbPath))
+        {
+            db.GetConnection();
+            db.SetWriterAccessGuard(() => { }, () => { });
+            db.SetWriterAccessGuard(null);
+        }
+
+        using var reopened = new IndexDatabase(_dbPath);
+        using var cmd = reopened.GetConnection().CreateCommand();
+        cmd.CommandText = "SELECT 1;";
+        Assert.AreEqual(1L, cmd.ExecuteScalar());
+    }
+
+    [TestMethod]
     public void MigrationRunner_AppliesMigrationsInOrder()
     {
         using var db = new IndexDatabase(_dbPath);

@@ -4,9 +4,11 @@ using System.Net.Http.Headers;
 using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.TestHost;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 using Sextant.Service.Host;
 using Sextant.Store;
+using Sextant.TestSupport;
 
 namespace Sextant.Service.Tests;
 
@@ -35,17 +37,21 @@ public class QueuedControlWriteHttpTests
     [TestMethod]
     public async Task EnsureWaitFalse_NewIdentityWhileTheWriterIsBusy_Is202Queued_WithAnIntegerJobId_ThatStatusResolves()
     {
-        await using var host = await Harness.StartAsync();
+        var clock = new ManualClock();
+        await using var host = await Harness.StartAsync(clock);
         await host.HoldWriterAsync();
         var request = Ensure("commit-new");
         var hash = request.ToIdentity().Hash;
 
-        var sw = Stopwatch.StartNew();
-        var response = await host.EnsureAsync(request, wait: false).WaitAsync(Answered);
-        sw.Stop();
+        var controlWaitStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        host.Service.ControlWaitStartedForTesting = () => controlWaitStarted.TrySetResult();
+        var post = host.EnsureAsync(request, wait: false);
+        await controlWaitStarted.Task.WaitAsync(Answered);
+        Assert.IsFalse(post.IsCompleted, "the queued response waits through its configured bound");
+        clock.Advance(Bound);
+        var response = await post.WaitAsync(Answered);
 
         Assert.AreEqual(HttpStatusCode.Accepted, response.StatusCode);
-        Assert.IsTrue(sw.Elapsed >= Bound - TimeSpan.FromMilliseconds(50), $"answered after {sw.Elapsed}: the writer was busy");
         long jobId;
         using (var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync()))
         {
@@ -69,7 +75,13 @@ public class QueuedControlWriteHttpTests
         Assert.AreEqual(Repo, status.Value.GetProperty("job").GetProperty("repository_url").GetString());
 
         // A second ensure of the pending identity attaches to the same id.
-        var again = await host.EnsureAsync(request, wait: false).WaitAsync(Answered);
+        var duplicateWaitStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        host.Service.ControlWaitStartedForTesting = () => duplicateWaitStarted.TrySetResult();
+        var duplicatePost = host.EnsureAsync(request, wait: false);
+        await duplicateWaitStarted.Task.WaitAsync(Answered);
+        Assert.IsFalse(duplicatePost.IsCompleted);
+        clock.Advance(Bound);
+        var again = await duplicatePost.WaitAsync(Answered);
         Assert.AreEqual(HttpStatusCode.Accepted, again.StatusCode);
         using (var json = JsonDocument.Parse(await again.Content.ReadAsStringAsync()))
         {
@@ -85,6 +97,392 @@ public class QueuedControlWriteHttpTests
         Assert.AreEqual(hash, produced.GetProperty("identity_hash").GetString(), "the durable row took the reserved id");
         Assert.AreEqual(2, host.Worker.Calls, "the identity produced exactly once");
         Assert.AreNotEqual(host.BlockerJobId, jobId);
+    }
+
+    [TestMethod]
+    public async Task EnsureWaitFalse_DurableAdmissionBlockedByCatalogWriter_ReturnsUnavailableAtResponseBound()
+    {
+        // This deterministic reproduction holds SQLite's BEGIN IMMEDIATE lock while the service-owned queued_ensures
+        // write runs. The older writer-gate tests use a fake worker that does not hold a SQLite transaction, so this
+        // proves a distinct delay path, not the historical flake's cause.
+        var clock = new ManualClock();
+        await using var host = await Harness.StartAsync(clock, new Harness.ConfirmingRemote());
+        using var catalogLock = host.HoldCatalogWriteLock();
+        var request = Ensure("refresh-head", "feature");
+        var admitted = host.Service.WriteAdmissions;
+        var post = host.EnsureAsync(request, wait: false);
+
+        await WaitUntilAsync(() => Task.FromResult(
+            host.Service.WriteAdmissions > admitted && host.Service.WriteLockMetrics.WaitingWriters > 0));
+        Assert.IsFalse(post.IsCompleted, "durable admission is blocked on SQLite, not the service write gate");
+        clock.Advance(Bound);
+
+        var response = await post.WaitAsync(Answered);
+        Assert.AreEqual(HttpStatusCode.ServiceUnavailable, response.StatusCode,
+            "wait=false must not overrun its response bound while queued_ensures is not durable");
+        string? admissionId;
+        using (var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync()))
+        {
+            admissionId = json.RootElement.GetProperty("admission_id").GetString();
+            Assert.IsFalse(string.IsNullOrEmpty(admissionId));
+        }
+
+        catalogLock.Dispose();
+        host.ReleaseWriter();
+        var hash = request.ToIdentity().Hash;
+        await WaitUntilAsync(() =>
+            Task.FromResult(host.Service.GetStatusByIdentity(hash)?.Job.Status == SnapshotJobStatus.Complete));
+        var admission = await host.AdmissionStatusAsync(admissionId!);
+        Assert.AreEqual(admissionId, admission.GetProperty("admission_id").GetString());
+        Assert.AreEqual("ensure", admission.GetProperty("kind").GetString());
+        Assert.AreEqual(1, host.Worker.Calls, "the service-owned admitted ensure continues after this caller receives 503");
+    }
+
+    [TestMethod]
+    [DataRow(true, false)]
+    [DataRow(true, true)]
+    [DataRow(false, false)]
+    [DataRow(false, true)]
+    public async Task EnsureWaitFalse_NonConvergenceAdmissionCanOutlastResponseBound(bool locate, bool failWrite)
+    {
+        var clock = new ManualClock();
+        await using var host = await Harness.StartAsync(clock, locate ? null : new Harness.ConfirmingRemote());
+        if (failWrite)
+            host.Service.BeforeQueuedEnsureWriteForTesting =
+                () => throw new InvalidOperationException("injected admission write failure");
+        using var catalogLock = host.HoldCatalogWriteLock();
+        var request = Ensure("refresh-head", "feature") with
+        {
+            BranchUpdate = locate ? BranchUpdateMode.Advance : BranchUpdateMode.None
+        };
+        var post = host.EnsureAsync(request, wait: false);
+        await WaitUntilAsync(() => Task.FromResult(host.Service.WriteLockMetrics.WaitingWriters > 0));
+        clock.Advance(Bound);
+        Assert.IsFalse(post.IsCompleted, "best-effort admission is not subject to the response bound");
+
+        catalogLock.Dispose();
+        host.ReleaseWriter();
+        using var response = await post.WaitAsync(Answered);
+        Assert.AreNotEqual(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+        var hash = request.ToIdentity().Hash;
+        await WaitUntilAsync(() =>
+            Task.FromResult(host.Service.GetStatusByIdentity(hash)?.Job.Status == SnapshotJobStatus.Complete));
+        Assert.AreEqual(1, host.Worker.Calls);
+    }
+
+    [TestMethod]
+    public async Task EnsureWaitFalse_RemoteConvergenceAdmissionWriteFailure_ReturnsUnavailable()
+    {
+        var clock = new ManualClock();
+        await using var host = await Harness.StartAsync(clock, new Harness.ConfirmingRemote());
+        host.Service.BeforeQueuedEnsureWriteForTesting =
+            () => throw new InvalidOperationException("injected admission write failure");
+        var request = Ensure("commit-new", "feature");
+
+        using var response = await host.EnsureAsync(request, wait: false).WaitAsync(Answered);
+
+        Assert.AreEqual(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+        Assert.AreEqual(0, host.Worker.Calls, "a branch-moving ensure never runs without a durable convergence marker");
+        Assert.IsNull(host.Service.GetStatusByIdentity(request.ToIdentity().Hash));
+    }
+
+    // Issue #273 (B2): a CAS ensure that would move a branch onto an already-published snapshot is a durable admission,
+    // so it is bound by the response wait (503 while the catalog writer is blocked). Its service-owned operation still
+    // commits and runs afterwards, and the retry attaches: commit-C is never produced.
+    [TestMethod]
+    public async Task EnsureWaitFalse_BranchMovingTerminalAttach_IsDurablyAdmitted_503RetryAttachesWithoutWorker()
+    {
+        var clock = new ManualClock();
+        await using var host = await Harness.StartAsync(clock, new Harness.ConfirmingRemote(), recordWorkerCommit: true);
+        host.ReleaseWriter();
+        foreach (var (commit, branch) in new[] { ("commit-A", "main"), ("commit-B", "feature") })
+        {
+            using var seeded = await host.EnsureAsync(Ensure(commit, branch, expected: ""), wait: true).WaitAsync(Settle);
+            Assert.AreEqual(HttpStatusCode.OK, seeded.StatusCode, await seeded.Content.ReadAsStringAsync());
+        }
+        await WaitUntilAsync(() => Task.FromResult(host.OpenWorkCount == 0));
+        Assert.AreEqual("refresh-head", await host.ResolveCommitAsync("feature"));
+        var calls = host.Worker.Calls;
+
+        var move = Ensure("commit-C", "feature", expected: "refresh-head");
+        string? admissionId;
+        using (host.HoldCatalogWriteLock())
+        {
+            var post = host.EnsureAsync(move, wait: false);
+            await WaitUntilAsync(() => Task.FromResult(host.Service.WriteLockMetrics.WaitingWriters > 0));
+            clock.Advance(Bound);
+            using var unavailable = await post.WaitAsync(Answered);
+            Assert.AreEqual(HttpStatusCode.ServiceUnavailable, unavailable.StatusCode,
+                "a branch-moving attach is acknowledged only once its intent is durable");
+            using var unavailableBody = JsonDocument.Parse(await unavailable.Content.ReadAsStringAsync());
+            admissionId = unavailableBody.RootElement.GetProperty("admission_id").GetString();
+            Assert.IsFalse(string.IsNullOrEmpty(admissionId));
+        }
+
+        await WaitUntilAsync(async () =>
+            (await host.AdmissionStatusAsync(admissionId!)).TryGetProperty("kind", out _));
+        var admission = await host.AdmissionStatusAsync(admissionId!);
+        Assert.AreEqual(admissionId, admission.GetProperty("admission_id").GetString());
+        Assert.AreEqual("ensure", admission.GetProperty("kind").GetString());
+        await WaitUntilAsync(() => Task.FromResult(host.OpenWorkCount == 0));
+        Assert.IsTrue(host.SettledEnsureIntents("feature") >= 1, "the 503'd admission committed and ran in order");
+        using var retry = await host.EnsureAsync(move, wait: false).WaitAsync(Answered);
+        Assert.IsTrue(retry.StatusCode is HttpStatusCode.OK or HttpStatusCode.Accepted,
+            await retry.Content.ReadAsStringAsync());
+        using (var body = JsonDocument.Parse(await retry.Content.ReadAsStringAsync()))
+        {
+            Assert.IsTrue(body.RootElement.GetProperty("attached").GetBoolean());
+            if (body.RootElement.TryGetProperty("admission_id", out var responseAdmissionId))
+            {
+                var status = await host.AdmissionStatusAsync(responseAdmissionId.GetString()!);
+                Assert.AreEqual("ensure", status.GetProperty("kind").GetString());
+            }
+        }
+        await WaitUntilAsync(() => Task.FromResult(host.OpenWorkCount == 0));
+        Assert.AreEqual(calls, host.Worker.Calls, "commit-C was attached, never produced");
+        Assert.AreEqual("refresh-head", await host.ResolveCommitAsync("feature"), "convergence follows the move");
+    }
+
+    // Issue #273 (D2): E's caller got an ambiguous 503 while its admission was still being written; the admission then
+    // committed and a retirement of the branch was admitted. The identical retry must not share E across that
+    // retirement: it gets its own intent after the retirement and recreates the branch at E's snapshot.
+    [TestMethod]
+    public async Task Coalesce_RetryAfter503AndAdmittedRetire_IsAdmittedAfterTheRetirement()
+    {
+        var clock = new ManualClock();
+        await using var host = await Harness.StartAsync(clock, new Harness.ConfirmingRemote(),
+            publishedCommits: ["refresh-head"]);
+        using (var seeded = await host.EnsureAsync(Ensure("commit-A", "main", expected: ""), wait: true).WaitAsync(Settle))
+            Assert.AreEqual(HttpStatusCode.OK, seeded.StatusCode, await seeded.Content.ReadAsStringAsync());
+        await WaitUntilAsync(() => Task.FromResult(host.OpenWorkCount == 0));
+        // A historical production of another repository holds the writer (it moves no branch, so it has no refresh).
+        using (var hold = await host.EnsureAsync(new EnsureSnapshotRequest
+               {
+                   RepositoryRemoteUrl = BlockerRepo, CommitSha = "blocker-1", BranchUpdate = BranchUpdateMode.None
+               }, wait: false).WaitAsync(Answered))
+            Assert.AreEqual(HttpStatusCode.Accepted, hold.StatusCode);
+        await WaitUntilAsync(() => Task.FromResult(host.Worker.Calls == 1));
+        var request = Ensure("refresh-head", "feature");
+
+        string firstAdmission;
+        using (host.HoldCatalogWriteLock())
+        {
+            var post = host.EnsureAsync(request, wait: false);
+            await WaitUntilAsync(() => Task.FromResult(host.Service.WriteLockMetrics.WaitingWriters > 0));
+            clock.Advance(Bound);
+            using var unavailable = await post.WaitAsync(Answered);
+            Assert.AreEqual(HttpStatusCode.ServiceUnavailable, unavailable.StatusCode);
+            using var body = JsonDocument.Parse(await unavailable.Content.ReadAsStringAsync());
+            firstAdmission = body.RootElement.GetProperty("admission_id").GetString()!;
+        }
+        await WaitUntilAsync(async () =>
+            (await host.AdmissionStatusAsync(firstAdmission)).TryGetProperty("kind", out _));
+
+        var retire = host.Service.RetireBranchAsync(new RetireBranchRequest { Repository = Repo, Branch = "feature" });
+        await WaitUntilAsync(() => Task.FromResult(host.IntentCount("retire") == 1));
+
+        using var retry = await EnsureQueuedAsync(host, clock, request);
+        Assert.AreEqual(HttpStatusCode.Accepted, retry.StatusCode, await retry.Content.ReadAsStringAsync());
+        string retryAdmission;
+        using (var body = JsonDocument.Parse(await retry.Content.ReadAsStringAsync()))
+            retryAdmission = body.RootElement.GetProperty("admission_id").GetString()!;
+        Assert.AreNotEqual(firstAdmission, retryAdmission, "the retry is a new intent after the retirement");
+        Assert.AreEqual("ensure", (await host.AdmissionStatusAsync(retryAdmission)).GetProperty("kind").GetString());
+
+        host.ReleaseWriter();
+        Assert.IsTrue((await retire.WaitAsync(Settle)).Retired, "E created the branch before the retirement applied");
+        await WaitUntilAsync(() => Task.FromResult(host.OpenWorkCount == 0));
+        var audit = host.Service.RecentAudit(action: AuditAction.Retire, repositoryScope: Repo);
+        Assert.AreEqual("retired", audit.Single().Detail);
+        Assert.AreEqual("refresh-head", await host.ResolveCommitAsync("feature"), "the retry recreated the branch at E's snapshot");
+        Assert.AreEqual(1, host.Worker.Calls, "only the blocker ran: E and its retry attached the published snapshot");
+    }
+
+    // Issue #273 (D2): an identical wait=false ensure that shares E while E still waits for the writer answers its
+    // queued 202 with E's admission id (the one its admission transaction resolved), which status resolves.
+    [TestMethod]
+    public async Task Coalesce_SharedQueuedEnsure_ReturnsTheSharedAdmissionId()
+    {
+        var clock = new ManualClock();
+        await using var host = await Harness.StartAsync(clock, new Harness.ConfirmingRemote());
+        // An unrelated repository's historical production holds the writer.
+        using (var hold = await host.EnsureAsync(new EnsureSnapshotRequest
+               {
+                   RepositoryRemoteUrl = BlockerRepo, CommitSha = "blocker-1", BranchUpdate = BranchUpdateMode.None
+               }, wait: false).WaitAsync(Answered))
+            Assert.AreEqual(HttpStatusCode.Accepted, hold.StatusCode);
+        await WaitUntilAsync(() => Task.FromResult(host.Worker.Calls == 1));
+        var request = Ensure("commit-C", "feature");
+
+        string first;
+        using (var admitted = await EnsureQueuedAsync(host, clock, request))
+        {
+            Assert.AreEqual(HttpStatusCode.Accepted, admitted.StatusCode, await admitted.Content.ReadAsStringAsync());
+            using var body = JsonDocument.Parse(await admitted.Content.ReadAsStringAsync());
+            first = body.RootElement.GetProperty("admission_id").GetString()!;
+        }
+        string shared;
+        using (var again = await EnsureQueuedAsync(host, clock, request))
+        {
+            Assert.AreEqual(HttpStatusCode.Accepted, again.StatusCode, await again.Content.ReadAsStringAsync());
+            using var body = JsonDocument.Parse(await again.Content.ReadAsStringAsync());
+            shared = body.RootElement.GetProperty("admission_id").GetString()!;
+        }
+
+        Assert.AreEqual(first, shared, "the shared request answers with E's admitted id, not its unrecorded candidate");
+        var status = await host.AdmissionStatusAsync(shared);
+        Assert.AreEqual("ensure", status.GetProperty("kind").GetString());
+        Assert.AreEqual(1, host.IntentCount("ensure"), "the identical request shared E's intent");
+        host.ReleaseWriter();
+    }
+
+    [TestMethod]
+    [DataRow(false, false, false)]
+    [DataRow(false, false, true)]
+    public async Task ExplicitRetryAfter503WithRepositoryAliasAttachesOriginalTerminalResult(
+        bool locate, bool suppress, bool unsupported)
+    {
+        var clock = new ManualClock();
+        await using var host = await Harness.StartAsync(clock, locate ? null : new Harness.ConfirmingRemote(),
+            terminalStatus: unsupported ? SnapshotJobStatus.Unsupported : SnapshotJobStatus.Failed);
+        using var catalogLock = host.HoldCatalogWriteLock();
+        var request = Ensure("refresh-head", "feature") with
+        {
+            BranchUpdate = suppress ? BranchUpdateMode.None : BranchUpdateMode.Advance
+        };
+        var post = host.EnsureAsync(request, wait: false);
+        await WaitUntilAsync(() => Task.FromResult(host.Service.WriteLockMetrics.WaitingWriters > 0));
+        clock.Advance(Bound);
+        using var unavailable = await post.WaitAsync(Answered);
+        Assert.AreEqual(HttpStatusCode.ServiceUnavailable, unavailable.StatusCode);
+
+        catalogLock.Dispose();
+        host.ReleaseWriter();
+        var hash = request.ToIdentity().Hash;
+        var expected = unsupported ? SnapshotJobStatus.Unsupported : SnapshotJobStatus.Failed;
+        await WaitUntilAsync(() => Task.FromResult(host.Service.GetStatusByIdentity(hash)?.Job.Status == expected));
+        var aliasRequest = request with
+        {
+            RepositoryRemoteUrl = "HTTPS://GITHUB.COM/acme/widgets.git"
+        };
+        Assert.AreNotEqual(hash, aliasRequest.ToIdentity().Hash,
+            "the submitted spelling differs; admission must pin it to the catalog's first spelling");
+        using var retry = await host.EnsureAsync(aliasRequest, wait: false).WaitAsync(Answered);
+        Assert.IsTrue(retry.StatusCode is HttpStatusCode.OK or HttpStatusCode.Accepted,
+            await retry.Content.ReadAsStringAsync());
+        using var body = JsonDocument.Parse(await retry.Content.ReadAsStringAsync());
+        if (retry.StatusCode == HttpStatusCode.OK)
+            Assert.AreEqual(expected, body.RootElement.GetProperty("status").GetString());
+        else
+            Assert.IsTrue(body.RootElement.GetProperty("attached").GetBoolean());
+        await WaitUntilAsync(() => Task.FromResult(host.Service.GetStatusByIdentity(hash)?.Job.Status == expected));
+        Assert.AreEqual(1, host.Worker.Calls, "the retry attaches instead of launching another production");
+
+        // On another branch: the failed ensure's following refresh holds "feature" until its retry (rule 3: admission
+        // order within a branch), and branch order is not what this checks.
+        var incompatibleConfig = aliasRequest with { ConfigHash = "different-config", BranchName = "feature-2" };
+        var incompatibleIdentity = request with { ConfigHash = incompatibleConfig.ConfigHash, BranchName = "feature-2" };
+        using (var response = await host.EnsureAsync(incompatibleConfig, wait: false).WaitAsync(Answered))
+            Assert.IsTrue(response.StatusCode is HttpStatusCode.OK or HttpStatusCode.Accepted);
+        await WaitUntilAsync(() =>
+            Task.FromResult(host.Service.GetStatusByIdentity(incompatibleIdentity.ToIdentity().Hash)?.Job.Status == expected));
+        Assert.AreEqual(2, host.Worker.Calls, "an alias with a different config is a distinct identity");
+
+        var otherRepository = aliasRequest with { RepositoryRemoteUrl = "https://github.com/acme/other" };
+        using (var response = await host.EnsureAsync(otherRepository, wait: false).WaitAsync(Answered))
+            Assert.IsTrue(response.StatusCode is HttpStatusCode.OK or HttpStatusCode.Accepted);
+        await WaitUntilAsync(() =>
+            Task.FromResult(host.Service.GetStatusByIdentity(otherRepository.ToIdentity().Hash)?.Job.Status == expected));
+        Assert.AreEqual(3, host.Worker.Calls, "a different repository never attaches through the spelling map");
+    }
+
+    [TestMethod]
+    public async Task EnsureWaitFalse_NonConvergenceUnwritableJobIdFloor_WaitsForResult()
+    {
+        var clock = new ManualClock();
+        await using var host = await Harness.StartAsync(clock);
+        await host.HoldWriterAsync();
+        host.BlockJobIdFloor();
+        try
+        {
+            var controlWaitStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            host.Service.ControlWaitStartedForTesting = () => controlWaitStarted.TrySetResult();
+            var post = host.EnsureAsync(Ensure("commit-new"), wait: false);
+            await controlWaitStarted.Task.WaitAsync(Answered);
+            Assert.IsFalse(post.IsCompleted);
+            clock.Advance(Bound);
+
+            Assert.IsFalse(post.IsCompleted, "a missing safe id leaves the main-compatible request waiting");
+
+            host.ClearJobIdFloor();
+            host.ReleaseWriter();
+            using var response = await post.WaitAsync(Answered);
+            Assert.IsTrue(response.StatusCode is HttpStatusCode.OK or HttpStatusCode.Accepted);
+            var hash = Ensure("commit-new").ToIdentity().Hash;
+            await WaitUntilAsync(() =>
+                Task.FromResult(host.Service.GetStatusByIdentity(hash)?.Job.Status == SnapshotJobStatus.Complete));
+            Assert.AreEqual(2, host.Worker.Calls, "the service-owned operation can still finish after its 503 response");
+        }
+        finally
+        {
+            host.ClearJobIdFloor();
+            host.ReleaseWriter();
+        }
+    }
+
+    [TestMethod]
+    public async Task EnsureWaitFalse_RefreshAdmissionBlockedByCatalogWriter_ReturnsUnavailableAtResponseBound()
+    {
+        var clock = new ManualClock();
+        await using var host = await Harness.StartAsync(clock, new Harness.ConfirmingRemote());
+        using var catalogLock = host.HoldCatalogWriteLock();
+        var request = new EnsureSnapshotRequest
+        {
+            RepositoryRemoteUrl = Repo,
+            CommitSha = "refresh-head",
+            BranchName = "feature",
+            Refresh = true
+        };
+        var post = host.EnsureAsync(request, wait: false);
+
+        await WaitUntilAsync(() => Task.FromResult(host.Service.WriteLockMetrics.WaitingWriters > 0));
+        Assert.IsFalse(post.IsCompleted, "refresh confirmation passed; durable marker admission is blocked on SQLite");
+        clock.Advance(Bound);
+
+        var response = await post.WaitAsync(Answered);
+        Assert.AreEqual(HttpStatusCode.ServiceUnavailable, response.StatusCode,
+            "a refresh is not acknowledged until its marker is durable");
+
+        catalogLock.Dispose();
+        await WaitUntilAsync(() => Task.FromResult(host.PendingRefreshCount > 0));
+    }
+
+    [TestMethod]
+    public async Task RefreshRetryWithoutKey_AfterUnavailableAndClaim_CreatesAnotherAdmission()
+    {
+        var clock = new ManualClock();
+        await using var host = await Harness.StartAsync(clock, new Harness.ConfirmingRemote(), recordWorkerCommit: true);
+        using var catalogLock = host.HoldCatalogWriteLock();
+        var request = new EnsureSnapshotRequest
+        {
+            RepositoryRemoteUrl = Repo,
+            CommitSha = "refresh-head",
+            BranchName = "feature",
+            Refresh = true
+        };
+        var post = host.EnsureAsync(request, wait: false);
+        await WaitUntilAsync(() => Task.FromResult(host.Service.WriteLockMetrics.WaitingWriters > 0));
+        clock.Advance(Bound);
+        using var unavailable = await post.WaitAsync(Answered);
+        Assert.AreEqual(HttpStatusCode.ServiceUnavailable, unavailable.StatusCode);
+
+        catalogLock.Dispose();
+        await WaitUntilAsync(() => Task.FromResult(host.ClaimedRefreshCount == 1));
+        using var retry = await host.EnsureAsync(request, wait: false).WaitAsync(Answered);
+        Assert.AreEqual(HttpStatusCode.Accepted, retry.StatusCode);
+        Assert.AreEqual(2, host.PendingRefreshCount, "a retry without a key after claim is a new admission");
+        host.ReleaseWriter();
+        await WaitUntilAsync(() => Task.FromResult(host.CompletedRefreshCount == 2));
     }
 
     [TestMethod]
@@ -110,9 +508,10 @@ public class QueuedControlWriteHttpTests
     [TestMethod]
     public async Task EnsureWaitFalse_RegistrationThatNeverCommits_LeavesTheReservedIdUnknown_NotQueuedForever()
     {
-        await using var host = await Harness.StartAsync();
+        var clock = new ManualClock();
+        await using var host = await Harness.StartAsync(clock);
         await host.HoldWriterAsync();
-        var response = await host.EnsureAsync(Ensure("commit-new"), wait: false).WaitAsync(Answered);
+        var response = await EnsureQueuedAsync(host, clock, Ensure("commit-new"));
         Assert.AreEqual(HttpStatusCode.Accepted, response.StatusCode);
         long jobId;
         using (var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync()))
@@ -160,13 +559,18 @@ public class QueuedControlWriteHttpTests
     [TestMethod]
     public async Task Retire_WhileTheWriterIsBusy_Is202Accepted_AndAppliesOnceItFrees()
     {
-        await using var host = await Harness.StartAsync();
+        var clock = new ManualClock();
+        await using var host = await Harness.StartAsync(clock);
         await host.SeedAsync();
         await host.HoldWriterAsync();
 
-        var sw = Stopwatch.StartNew();
-        var response = await host.RetireAsync("feature", expected: "commit-B").WaitAsync(Answered);
-        sw.Stop();
+        var waitStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        host.Service.RetireWaitStartedForTesting = () => waitStarted.TrySetResult();
+        var post = host.RetireAsync("feature", expected: "commit-B");
+        await waitStarted.Task.WaitAsync(Answered);
+        Assert.IsFalse(post.IsCompleted, "the retire turn is queued behind the production");
+        clock.Advance(Bound);
+        var response = await post.WaitAsync(Answered);
 
         Assert.AreEqual(HttpStatusCode.Accepted, response.StatusCode);
         Assert.AreEqual("{\"status\":\"accepted\"}", await response.Content.ReadAsStringAsync());
@@ -181,6 +585,85 @@ public class QueuedControlWriteHttpTests
         Assert.AreEqual("retired", audit.Detail);
         Assert.AreEqual(Repo, audit.RepositoryScope);
         Assert.AreEqual(AuditLogStore.HashActor(ControlToken), audit.Actor);
+    }
+
+    [TestMethod]
+    public async Task RetireUnavailableResponseId_ResolvesWhenAdmissionWasCommitted()
+    {
+        var clock = new ManualClock();
+        await using var host = await Harness.StartAsync(clock, new Harness.ConfirmingRemote());
+        var committed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var releaseAdmission = new ManualResetEventSlim();
+        host.Service.AfterRetireAdmissionCommitForTesting = () =>
+        {
+            committed.TrySetResult();
+            releaseAdmission.Wait();
+        };
+        // The clock may only move once the handler's admission timer exists, or that timer would wait for a later advance.
+        var admissionWaitStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        host.Service.RetireWaitStartedForTesting = () => admissionWaitStarted.TrySetResult();
+        try
+        {
+            var post = host.RetireAsync("feature");
+            await committed.Task.WaitAsync(Answered);
+            await admissionWaitStarted.Task.WaitAsync(Answered);
+            clock.Advance(Bound);
+
+            using var response = await post.WaitAsync(Answered);
+            Assert.AreEqual(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+            using var body = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            var admissionId = body.RootElement.GetProperty("admission_id").GetString();
+            Assert.IsFalse(string.IsNullOrEmpty(admissionId));
+            var admission = await host.AdmissionStatusAsync(admissionId!);
+            Assert.AreEqual(admissionId, admission.GetProperty("admission_id").GetString());
+            Assert.AreEqual("retire", admission.GetProperty("kind").GetString());
+        }
+        finally
+        {
+            releaseAdmission.Set();
+            host.Service.AfterRetireAdmissionCommitForTesting = null;
+            host.Service.RetireWaitStartedForTesting = null;
+        }
+    }
+
+    [TestMethod]
+    public async Task RetireAdmissionResponseId_ResolvesAsRetireIntent()
+    {
+        await using var host = await Harness.StartAsync(remoteDefaults: new Harness.ConfirmingRemote());
+        using var response = await host.RetireAsync("feature").WaitAsync(Answered);
+
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+        using var body = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        var admissionId = body.RootElement.GetProperty("admission_id").GetString();
+        Assert.IsFalse(string.IsNullOrEmpty(admissionId));
+        var status = await host.AdmissionStatusAsync(admissionId!);
+        Assert.AreEqual(admissionId, status.GetProperty("admission_id").GetString());
+        Assert.AreEqual("retire", status.GetProperty("kind").GetString());
+    }
+
+    [TestMethod]
+    public async Task EnsureAdmissionResponseId_ResolvesAsEnsureIntent()
+    {
+        var clock = new ManualClock();
+        await using var host = await Harness.StartAsync(clock, new Harness.ConfirmingRemote());
+        await host.HoldWriterAsync();
+        var request = Ensure("commit-new", "feature", expected: "") with { IsDefaultBranch = false };
+        var waitStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        host.Service.ControlWaitStartedForTesting = () => waitStarted.TrySetResult();
+
+        var post = host.EnsureAsync(request, wait: false);
+        await waitStarted.Task.WaitAsync(Answered);
+        clock.Advance(Bound);
+        using var response = await post.WaitAsync(Answered);
+
+        Assert.AreEqual(HttpStatusCode.Accepted, response.StatusCode);
+        using var body = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        var admissionId = body.RootElement.GetProperty("admission_id").GetString();
+        Assert.IsFalse(string.IsNullOrEmpty(admissionId));
+        var pending = await host.AdmissionStatusAsync(admissionId!);
+        Assert.AreEqual(admissionId, pending.GetProperty("admission_id").GetString());
+        Assert.AreEqual("ensure", pending.GetProperty("kind").GetString());
+        host.ReleaseWriter();
     }
 
     [TestMethod]
@@ -207,14 +690,20 @@ public class QueuedControlWriteHttpTests
     {
         // When it was submitted, feature was at B and the CAS would have passed; by the time it applies, the push
         // queued before it has moved feature to C, so it must not retire the branch.
-        await using var host = await Harness.StartAsync();
+        var clock = new ManualClock();
+        await using var host = await Harness.StartAsync(clock);
         await host.SeedAsync();
         await host.HoldWriterAsync();
 
         Assert.AreEqual(HttpStatusCode.Accepted,
-            (await host.EnsureAsync(Ensure("commit-C", "feature", expected: "commit-B"), wait: false).WaitAsync(Answered)).StatusCode);
+            (await EnsureQueuedAsync(host, clock, Ensure("commit-C", "feature", expected: "commit-B"))).StatusCode);
+        var retireWait = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        host.Service.RetireWaitStartedForTesting = () => retireWait.TrySetResult();
+        var retire = host.RetireAsync("feature", expected: "commit-B");
+        await retireWait.Task.WaitAsync(Answered);
+        clock.Advance(Bound);
         Assert.AreEqual(HttpStatusCode.Accepted,
-            (await host.RetireAsync("feature", expected: "commit-B").WaitAsync(Answered)).StatusCode);
+            (await retire.WaitAsync(Answered)).StatusCode);
 
         host.ReleaseWriter();
         await WaitUntilAsync(() => Task.FromResult(host.Service.RecentAudit(action: AuditAction.Retire).Count == 1));
@@ -248,29 +737,35 @@ public class QueuedControlWriteHttpTests
         // A push (B -> C), the branch's deletion (before = C) and its re-creation (before = zeros) at D, all while a
         // production holds the writer. Only submission order ends with feature at D: every other order leaves it at
         // C (the retire's CAS fails against B) or absent (the re-create's CAS fails against a still-present branch).
-        await using var host = await Harness.StartAsync();
+        var clock = new ManualClock();
+        await using var host = await Harness.StartAsync(clock);
         await host.SeedAsync();
         await host.HoldWriterAsync();
 
         Assert.AreEqual(HttpStatusCode.Accepted,
-            (await host.EnsureAsync(Ensure("commit-C", "feature", expected: "commit-B"), wait: false).WaitAsync(Answered)).StatusCode);
+            (await EnsureQueuedAsync(host, clock, Ensure("commit-C", "feature", expected: "commit-B"))).StatusCode);
+        var retireWait = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        host.Service.RetireWaitStartedForTesting = () => retireWait.TrySetResult();
+        var retire = host.RetireAsync("feature", expected: "commit-C");
+        await retireWait.Task.WaitAsync(Answered);
+        clock.Advance(Bound);
+        Assert.AreEqual(HttpStatusCode.Accepted, (await retire.WaitAsync(Answered)).StatusCode);
         Assert.AreEqual(HttpStatusCode.Accepted,
-            (await host.RetireAsync("feature", expected: "commit-C").WaitAsync(Answered)).StatusCode);
-        Assert.AreEqual(HttpStatusCode.Accepted,
-            (await host.EnsureAsync(Ensure("commit-D", "feature", expected: ""), wait: false).WaitAsync(Answered)).StatusCode);
+            (await EnsureQueuedAsync(host, clock, Ensure("commit-D", "feature", expected: ""))).StatusCode);
 
         host.ReleaseWriter();
+        await host.QuiesceAsync();
         var recreate = Ensure("commit-D", "feature").ToIdentity().Hash;
-        await WaitUntilAsync(() => Task.FromResult(host.Service.GetStatusByIdentity(recreate)?.Job.Status == SnapshotJobStatus.Complete));
+        Assert.AreEqual(SnapshotJobStatus.Complete, host.Service.GetStatusByIdentity(recreate)?.Job.Status);
         Assert.AreEqual("commit-D", await host.ResolveCommitAsync("feature"));
-        var audit = host.Service.RecentAudit(action: AuditAction.Retire);
+        var audit = host.Service.RecentAudit(action: AuditAction.Retire, repositoryScope: Repo);
         Assert.AreEqual(1, audit.Count);
         Assert.AreEqual(AuditOutcome.Complete, audit[0].Outcome);
         Assert.AreEqual("retired", audit[0].Detail, "the retire applied between the push and the re-create");
     }
 
     [TestMethod]
-    public async Task IdenticalQueuedRetires_AreCoalesced_ADifferentOneIsNot()
+    public async Task EachQueuedRetireGetsItsOwnIntentAndAudit()
     {
         await using var host = await Harness.StartAsync();
         await host.SeedAsync();
@@ -282,11 +777,10 @@ public class QueuedControlWriteHttpTests
         Assert.AreEqual(HttpStatusCode.Accepted, (await host.RetireAsync("feature").WaitAsync(Answered)).StatusCode);
 
         host.ReleaseWriter();
-        await WaitUntilAsync(() => Task.FromResult(host.Service.RecentAudit(action: AuditAction.Retire, repositoryScope: Repo).Count >= 2));
+        await WaitUntilAsync(() => Task.FromResult(host.Service.RecentAudit(action: AuditAction.Retire, repositoryScope: Repo).Count >= 3));
         await host.QuiesceAsync();
         var audit = host.Service.RecentAudit(action: AuditAction.Retire, repositoryScope: Repo);
-        CollectionAssert.AreEqual(new[] { "absent", "retired" }, audit.Select(a => a.Detail).ToArray(),
-            "the identical retires share one application; the unguarded one applies on its own, after them");
+        CollectionAssert.AreEqual(new[] { "absent", "absent", "retired" }, audit.Select(a => a.Detail).ToArray());
     }
 
     [TestMethod]
@@ -354,6 +848,25 @@ public class QueuedControlWriteHttpTests
         }
     }
 
+    private static async Task<HttpResponseMessage> EnsureQueuedAsync(
+        Harness host, ManualClock clock, EnsureSnapshotRequest request)
+    {
+        var waitStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        host.Service.ControlWaitStartedForTesting = () => waitStarted.TrySetResult();
+        var post = host.EnsureAsync(request, wait: false);
+        try
+        {
+            await waitStarted.Task.WaitAsync(Answered);
+        }
+        catch (TimeoutException)
+        {
+            Assert.Fail($"ensure did not reach control wait; response_completed={post.IsCompleted}, " +
+                $"admissions={host.Service.WriteAdmissions}, sqlite_waiters={host.Service.WriteLockMetrics.WaitingWriters}");
+        }
+        clock.Advance(Bound);
+        return await post.WaitAsync(Answered);
+    }
+
     private sealed class Harness : IAsyncDisposable
     {
         public HttpClient Client { get; private init; } = null!;
@@ -365,17 +878,28 @@ public class QueuedControlWriteHttpTests
         private WebApplication App { get; init; } = null!;
         private string DbPath { get; init; } = "";
 
-        public static async Task<Harness> StartAsync()
+        public static async Task<Harness> StartAsync(
+            ManualClock? clock = null, IRemoteDefaultBranchResolver? remoteDefaults = null, bool recordWorkerCommit = false,
+            string? terminalStatus = null, string[]? publishedCommits = null)
         {
             var dbPath = ServiceTestFixtures.NewDbPath();
             var db = new IndexDatabase(dbPath);
             db.RunMigrations();
-            foreach (var commit in new[] { "commit-A", "commit-B", "commit-C", "commit-D" })
+            foreach (var commit in new[] { "commit-A", "commit-B", "commit-C", "commit-D" }.Concat(publishedCommits ?? []))
                 ServiceTestFixtures.PublishComplete(db, Ensure(commit), recordCommit: true);
 
             var options = ServiceTestFixtures.NewOptions(dbPath, controlToken: ControlToken) with { ControlWriteWait = Bound };
-            var worker = new FakeSnapshotWorker(db) { UseGate = true };
-            var service = SnapshotService.Start(options, worker, db);
+            Func<FakeSnapshotWorker, EnsureSnapshotRequest, SnapshotWorkResult>? produce = terminalStatus switch
+            {
+                SnapshotJobStatus.Failed => (_, _) => SnapshotWorkResult.Failed("test failure"),
+                SnapshotJobStatus.Unsupported => (_, _) => SnapshotWorkResult.Unsupported("test unsupported"),
+                _ when recordWorkerCommit => (self, request) => SnapshotWorkResult.Complete(
+                    ServiceTestFixtures.PublishComplete(self.Database, request, recordCommit: true)),
+                _ => null
+            };
+            var worker = new FakeSnapshotWorker(db, produce) { UseGate = true };
+            var service = SnapshotService.Start(options, worker, db, remoteDefaults: remoteDefaults, timeProvider: clock);
+            service.EnableWriterTurnGuardForTesting();
 
             var builder = WebApplication.CreateBuilder();
             builder.WebHost.UseTestServer();
@@ -414,6 +938,71 @@ public class QueuedControlWriteHttpTests
         }
 
         public void ReleaseWriter() => Worker.Gate.TrySetResult();
+
+        public SqliteConnection HoldCatalogWriteLock()
+        {
+            var connection = new SqliteConnection(new SqliteConnectionStringBuilder
+            {
+                DataSource = DbPath,
+                Pooling = false
+            }.ToString());
+            connection.Open();
+            using var command = connection.CreateCommand();
+            command.CommandText = "BEGIN IMMEDIATE;";
+            command.ExecuteNonQuery();
+            return connection;
+        }
+
+        public void BlockJobIdFloor() =>
+            Directory.CreateDirectory(JobIdReservations.FloorPathFor(DbPath));
+
+        public void ClearJobIdFloor()
+        {
+            var path = JobIdReservations.FloorPathFor(DbPath);
+            if (Directory.Exists(path))
+                Directory.Delete(path);
+        }
+
+        public int PendingRefreshCount
+        {
+            get
+            {
+                using var connection = Db.OpenReadConnection();
+                using var command = connection.CreateCommand();
+                command.CommandText = """
+                    SELECT (SELECT COUNT(*) FROM pending_refreshes)
+                         + (SELECT COUNT(*) FROM completed_refresh_admissions);
+                    """;
+                return Convert.ToInt32(command.ExecuteScalar());
+            }
+        }
+
+        // Unsettled branch intents plus pending markers and queued ensures: zero once every admission has run.
+        public int OpenWorkCount => RefreshCount("""
+            SELECT (SELECT COUNT(*) FROM pending_refreshes)
+                 + (SELECT COUNT(*) FROM queued_ensures)
+                 + (SELECT COUNT(*) FROM branch_intents WHERE state <> 'settled');
+            """);
+
+        public int SettledEnsureIntents(string branch) => RefreshCount(
+            $"SELECT COUNT(*) FROM branch_intents WHERE kind = 'ensure' AND state = 'settled' AND branch = '{branch}';");
+
+        public int IntentCount(string kind) => RefreshCount(
+            $"SELECT COUNT(*) FROM branch_intents WHERE kind = '{kind}';");
+
+        public int ClaimedRefreshCount => RefreshCount(
+            "SELECT COUNT(*) FROM pending_refreshes WHERE claimed_at IS NOT NULL;");
+
+        public int CompletedRefreshCount => RefreshCount(
+            "SELECT COUNT(*) FROM completed_refresh_admissions;");
+
+        private int RefreshCount(string sql)
+        {
+            using var connection = Db.OpenReadConnection();
+            using var command = connection.CreateCommand();
+            command.CommandText = sql;
+            return Convert.ToInt32(command.ExecuteScalar());
+        }
 
         /// <summary>Takes the single-writer lease from this service (another owner claims it) and waits until it notices.</summary>
         public async Task StealLeaseAsync()
@@ -461,6 +1050,14 @@ public class QueuedControlWriteHttpTests
             return json.RootElement.Clone();
         }
 
+        public async Task<JsonElement> AdmissionStatusAsync(string admissionId)
+        {
+            var response = await GetAsync($"/control/refresh-status/{admissionId}");
+            Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+            using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            return json.RootElement.Clone();
+        }
+
         public async Task<string?> ResolveCommitAsync(string branch)
         {
             var response = await GetAsync(
@@ -496,7 +1093,28 @@ public class QueuedControlWriteHttpTests
             await App.StopAsync();
             await App.DisposeAsync();
             Service.Dispose();
+            Assert.AreEqual(0, Service.WriterTraceViolationsForTesting,
+                "all writer-connection access must stay inside its admitted writer turn");
             SqliteTestDatabase.Delete(DbPath, Db);
+        }
+
+        public sealed class ConfirmingRemote : IRemoteDefaultBranchResolver, IRemoteBranchHeadResolver
+        {
+            public RemoteBranchHeadObservation? ObserveBranchHead(
+                string repositoryRemoteUrl, string branch, CancellationToken cancellationToken = default) =>
+                ResolveBranchHead(repositoryRemoteUrl, branch, cancellationToken) is { } observed && !string.IsNullOrWhiteSpace(observed)
+                    ? new RemoteBranchHeadObservation(observed)
+                    : null;
+
+            public string? ResolveDefaultBranch(string repositoryRemoteUrl, CancellationToken cancellationToken) =>
+                ResolveDefaultBranch(repositoryRemoteUrl);
+
+            public string? ResolveDefaultBranch(string repositoryRemoteUrl) => "main";
+
+            public string? ResolveBranchHead(
+                string repositoryRemoteUrl, string branch, CancellationToken cancellationToken = default) => "refresh-head";
+            public RemoteBranchStateObservation? ObserveBranchState(
+                string repositoryRemoteUrl, string branch, CancellationToken cancellationToken = default) => new("main", "refresh-head");
         }
     }
 }

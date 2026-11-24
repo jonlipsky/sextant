@@ -95,7 +95,7 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_CONTROL_PORT` | HTTP port | `3011` |
 | `SEXTANT_SERVICE_QUERY_PORT` | Optional dedicated query port (shares the control port when unset) | none (shared) |
 | `SEXTANT_SERVICE_LEASE_TTL_SECONDS` | Single-writer lease TTL | `30` |
-| `SEXTANT_SERVICE_CONTROL_WRITE_WAIT_SECONDS` | How long a `POST /control/ensure?wait=false` registration or a `POST /control/branches/retire` waits for the single writer before answering `202` with the write still queued (issue #158; see [Queued control writes](#queued-control-writes-issue-158)). Keep it well under the client's timeout. A value above `25` is clamped to `25`; a missing, non-numeric or non-positive value uses the default | `5` |
+| `SEXTANT_SERVICE_CONTROL_WRITE_WAIT_SECONDS` | How long a `POST /control/ensure?wait=false` or `POST /control/branches/retire` waits before answering without the single writer (issue #158; see [Queued control writes](#queued-control-writes-issue-158)). For ensure, this includes durable queued-admission recording: if SQLite stays locked, it answers `503` instead of an unrecorded `202`. Keep it well under the client's timeout. A value above `25` is clamped to `25`; a missing, non-numeric or non-positive value uses the default | `5` |
 | `SEXTANT_SERVICE_GRANT_WRITE_BUSY_TIMEOUT_SECONDS` | How long a grant write (`PUT`/`DELETE /control/grants/*`) waits for the catalog's SQLite write lock before answering `503 {"status":"unavailable"}` with `Retry-After: 5` (issue #342). Keep it well under the client's timeout. The wait is rounded up to whole seconds (the connection's command timeout). Whole seconds, `1`-`3600`; anything else fails startup | `10` |
 | `SEXTANT_SERVICE_VACUUM_TARGET_HOLD_MS` | Target write-lock hold of one incremental-vacuum step; the page count adapts toward it (#344). Milliseconds, `10`-`60000` | `1000` |
 | `SEXTANT_SERVICE_INDEX_BATCH_MAX_HOLD_MS` | Backstop for long write-only stretches: an index write-session batch commits at its next row once it has held the lock this long (besides the row threshold), then re-begins (#344). The batches themselves are released before every compile, extraction and channel wait, so this only bounds a single stretch of writes. Milliseconds, `0` disables, else `100`-`600000`. The service turns it on; the library default (local CLI/daemon) is off | `2000` |
@@ -1101,11 +1101,11 @@ The host deliberately **separates control endpoints from query endpoints**, and 
 | --- | --- | --- | --- |
 | `GET /health` | — | open | Service **AVAILABILITY**: the process is up and the catalog is reachable. |
 | `GET /ready` | — | open | Worker **CAPACITY**: `503` when this node has no worker (query-only), so an operator can tell "up" from "can index". |
-| `POST /control/ensure` | control | control token | Idempotent ensure-snapshot (criterion 1). Accepts an optional monotonic `branch_head_sequence` for forward-only branch-head advance (Phase 14, issue #84), **or** an `expected_head_commit` head CAS, plus `forced` and `branch_update` (see [Branch-pointer guards](#branch-pointer-guards-head-cas-branch_update-none-retire-svc-67)); the result carries `branch_advanced`. Blocks until terminal (`200`; `202` when transient-requeued, until the next start settles it as cancelled, see [Job lifecycle (#327)](#job-lifecycle-queued-means-admitted-in-this-run-issue-327)) unless `?wait=false`, which returns `202` at once with the job to poll (issue #148). When that registration is still waiting for the writer after `CONTROL_WRITE_WAIT_SECONDS` (another identity is producing), it returns `202 {"job_id":<integer>,"identity_hash":…,"status":"queued","attached":…}` with the id the job is (or will be) registered under, which `/control/status/{job_id}` resolves at once (issue #158, see [Queued control writes](#queued-control-writes-issue-158)). A caller disconnect/timeout **never** cancels production. A repository URL the [repository URL policy](#repository-url-policy-svc-5) refuses, both branch guards together (`conflicting_branch_guards`) or an unknown `branch_update` (`invalid_branch_update`) is `400 {"status":"rejected","reason":"<code>"}` before any job exists (audited `ensure`/`denied`). A user caller (`act=user` assertion) may ensure only a repository it can read: otherwise `403 {"status":"rejected","reason":"not_granted"}` (SVC-4), whatever the body asks. A user caller's ensure is then bounded (SX-6d, see [User callers on the control plane](#user-callers-on-the-control-plane-issue-193)): `default_branch: true`, any `branch_head_sequence`, or an advance with no `expected_head_commit` or no `branch_name` is `400` (`default_branch_not_allowed`, `branch_head_sequence_not_allowed`, `branch_guard_required`, `branch_required`). |
+| `POST /control/ensure` | control | control token | Idempotent ensure-snapshot (criterion 1). Accepts an optional monotonic `branch_head_sequence` for forward-only branch-head advance (Phase 14, issue #84), **or** an `expected_head_commit` head CAS, plus `forced` and `branch_update` (see [Branch-pointer guards](#branch-pointer-guards-head-cas-branch_update-none-retire-svc-67)); the result carries `branch_advanced`. A branch-moving ensure admitted to the branch-intent log returns its `admission_id`, which `/control/refresh-status/{admission_id}` resolves as `kind: ensure`; the 503 response also includes the candidate id when durable admission may still be completing. Blocks until terminal (`200`; `202` when transient-requeued, until the next start settles it as cancelled, see [Job lifecycle (#327)](#job-lifecycle-queued-means-admitted-in-this-run-issue-327)) unless `?wait=false`. When its queued admission is durable but the write is still waiting for the writer after `CONTROL_WRITE_WAIT_SECONDS`, it returns `202 {"job_id":<integer>,"identity_hash":…,"status":"queued","attached":…}` with the id the job is (or will be) registered under, which `/control/status/{job_id}` resolves at once (issue #158, see [Queued control writes](#queued-control-writes-issue-158)). If SQLite prevents durable admission for the full bound, it returns `503 {"status":"unavailable"}` instead; the service-owned ensure remains active and may still persist and finish after the response. A caller disconnect/timeout **never** cancels production. A repository URL the [repository URL policy](#repository-url-policy-svc-5) refuses, both branch guards together (`conflicting_branch_guards`) or an unknown `branch_update` (`invalid_branch_update`) is `400 {"status":"rejected","reason":"<code>"}` before any job exists (audited `ensure`/`denied`). A user caller (`act=user` assertion) may ensure only a repository it can read: otherwise `403 {"status":"rejected","reason":"not_granted"}` (SVC-4), whatever the body asks. A user caller's ensure is then bounded (SX-6d, see [User callers on the control plane](#user-callers-on-the-control-plane-issue-193)): `default_branch: true`, any `branch_head_sequence`, or a non-refresh advance with no `expected_head_commit` or any advance with no `branch_name` is `400` (`default_branch_not_allowed`, `branch_head_sequence_not_allowed`, `branch_guard_required`, `branch_required`). |
 | `POST /control/contribute` | control | control **or** contribute token | Ingest a client/CI semantic contribution (Phase 16); the least-privilege contribute token authorizes this endpoint only. |
 | `GET /control/status/{jobId}` | control | control token | Job status + per-project diagnostics (criterion 5) + checkout `coverage` (#119) + phase `timings` (#267, see [Job phase timings](#observability-criterion-5)). For a user caller, a job on a repository it cannot read is the same `404` as an unknown id (SVC-4). |
 | `GET /control/resolve` | control | control token | Resolve a repository branch (`?branch=`, else the default) to its current published snapshot (+ its `coverage`, #119), plus `commit_sha`, the resolved `branch` name, `is_default` and `head_sequence` (SVC-7; a null `commit_sha`/`head_sequence` is omitted), and `current_identity_hash` + `identity_current`: whether the snapshot is what an ensure of its commit would build on this node now (both omitted when there is no `commit_sha` or the head is a contribution; see [Identity currency](#branch-pointer-guards-head-cas-branch_update-none-retire-svc-67)). For a user caller, a repository it cannot read is the same bare `404` as an absent one (SVC-4). |
-| `POST /control/branches/retire` | control | control token | Delete a branch pointer (`{repository, branch, expected_head_commit?}`, SVC-6); its snapshots stay for retention. The service's idle-branch rule retires idle non-default branches through the same path (issue #299, see [Maintenance loop](#maintenance-loop-idle-branch-retirement--scheduled-retention-issue-299)). `200 {"retired":true}`, or `{"retired":false}` for a missing branch (idempotent). The default branch or a head-CAS mismatch is `409 {"status":"rejected","reason":"default_branch"\|"head_mismatch"}`; a refused URL or blank branch is `400`. When the retirement has not applied within `CONTROL_WRITE_WAIT_SECONDS` (a production holds the writer), the answer is `202 {"status":"accepted"}`: it applies once the writer frees, with both guards evaluated then (issue #158, see [Queued control writes](#queued-control-writes-issue-158)). `503 {"status":"unavailable"}` once shutdown began (nothing queued). Audited `retire`. A user caller is refused with `403 {"error":"caller_not_allowed"}` (issue #193, see [User callers on the control plane](#user-callers-on-the-control-plane-issue-193)). |
+| `POST /control/branches/retire` | control | control token | Delete a branch pointer (`{repository, branch, expected_head_commit?}`, SVC-6); its snapshots stay for retention. The service's idle-branch rule retires idle non-default branches through the same path (issue #299, see [Maintenance loop](#maintenance-loop-idle-branch-retirement--scheduled-retention-issue-299)). When branch-intent ordering is active, an admitted retirement returns `admission_id` on its `200` or `202` response; poll `/control/refresh-status/{admission_id}` for `kind: retire`. `200 {"retired":true}`, or `{"retired":false}` for a missing branch (idempotent). The default branch or a head-CAS mismatch is `409 {"status":"rejected","reason":"default_branch"\|"head_mismatch"}`; a refused URL or blank branch is `400`. When the retirement has not applied within `CONTROL_WRITE_WAIT_SECONDS` (a production holds the writer), the answer is `202 {"status":"accepted"}`: it applies once the writer frees, with both guards evaluated then (issue #158, see [Queued control writes](#queued-control-writes-issue-158)). A `503 {"status":"unavailable","admission_id":…}` includes the candidate id; if the admission was committed or finishes committing, it resolves via `/control/refresh-status/{admission_id}`, otherwise it is `unknown`. A refusal before admission has no id. Audited `retire`. A user caller is refused with `403 {"error":"caller_not_allowed"}` (issue #193, see [User callers on the control plane](#user-callers-on-the-control-plane-issue-193)). |
 | `POST /control/retention` | control | control token | Run the service-owned retention/GC pass (`?execute=true` to apply, `?seconds=N` for a longer budget up to `SEXTANT_SERVICE_RETENTION_PASS_SECONDS`; default 10 s, or 60 s for a dry run, which holds no writer). A user caller is refused (`403 caller_not_allowed`). |
 | `PUT`/`DELETE`/`GET /control/grants/self` | control | control token + `act=user` assertion | The caller's own repository grants (see [Repository grants](#repository-grants-and-visibility-svc-4)). |
 | `PUT`/`DELETE /control/grants/tenant` | control | control token + `act=application` assertion | The tenant-wide repository grants. |
@@ -1490,6 +1490,7 @@ checked in this order, reading nothing but the body:
 | `default_branch: true` | `default_branch_not_allowed` |
 | any `branch_head_sequence` | `branch_head_sequence_not_allowed` |
 | `branch_update: none` | allowed (moves no pointer) |
+| `refresh: true` with a named branch | allowed (uses only the verified remote head) |
 | no `expected_head_commit` | `branch_guard_required` |
 | a missing or blank `branch_name` | `branch_required` (an ensure that names no branch claims the default) |
 
@@ -1503,14 +1504,16 @@ ensure that may move a pointer (not `branch_update: none`) is refused with `409
 {"status":"rejected","reason":"commit_not_remote_head"}` unless its `commit_sha` is the commit `refs/heads/<branch>`
 names on the remote right now. The service asks the remote itself (`git ls-remote <url> refs/heads/<branch>`, same
 credential scoping and 30 s timeout as the #199 lookup; the request never supplies it), so a user CAS cannot move a
-branch to an older commit or a `refs/pull/*` head. It fails closed: an unreachable remote, a missing branch, an
-unparseable answer is the same `409`, audited `ensure`/`denied` with the repository scope. A full lookup
-slot (per tenant or global) is not a verdict on the commit: it is `503 {"status":"rejected","reason":"lookup_busy"}`
-with `Retry-After: 5`, also audited, and safe to retry. If the caller disconnects, the `git` call is killed so it
+branch to an older commit or a `refs/pull/*` head. A confirmed missing branch is also `409`; an unavailable or
+timed-out observation or a full lookup slot is retryable `503 {"status":"rejected","reason":"lookup_busy"}`
+with `Retry-After: 5`. Both outcomes are audited as `ensure`/`denied`. If the caller disconnects, the `git` call is killed so it
 does not hold its slot.
 Head answers are shared between concurrent callers but never remembered, because a push moves the head. In locate
 mode (no clone) there is nothing to ask and the check is skipped. Application and assertion-less callers are
 unchanged.
+
+A granted user may also request a refresh of a cataloged branch or a branch verified to exist remotely. Its commit
+and CAS hints do not select a head and are not compared to the remote; default promotion still needs confirmation.
 
 **A user's pinned commit must be on a branch (issue #209).** On GitHub a base repository also serves fork-network
 commits (`refs/pull/*` heads and objects shared across the fork network), and the worker evaluates what it fetches
@@ -1520,10 +1523,9 @@ none`. In clone mode a user ensure with `branch_update: none` is therefore refus
 `refs/heads/*` branch of the canonical repository. The service decides this itself, before any job row or
 evaluation: it fetches only `+refs/heads/*` (commits and trees, no blobs, no tags, no pull refs) into a throwaway
 repository with the #199 credential scoping and a 2 minute bound, then asks `git for-each-ref --contains`. A commit
-present in the remote only through a pull ref is never transferred, so it is not found. It fails closed: a blank
-commit, an abbreviated id, an unreachable remote or a git failure is the same `409`, audited
-`ensure`/`denied` with the repository scope; a full lookup slot is the retryable `503 lookup_busy` described above, never
-`commit_not_on_branch`. Concurrent checks of one commit share a call; answers are not
+present in the remote only through a pull ref is never transferred, so it is not found. A blank or abbreviated
+id is refused with `409`; an unavailable or timed-out check, like a full lookup slot, is retryable `503
+lookup_busy`, never `commit_not_on_branch`. Both outcomes are audited as `ensure`/`denied`. Concurrent checks of one commit share a call; answers are not
 remembered. A user CAS (`expected_head_commit`) is unaffected: its #203 check already requires the commit to be a
 branch head. **Contract change:** a user can no longer index a commit that is on no branch (an unmerged pull
 request head, a force-pushed-away commit); an application caller still can, and a user can index such a commit
@@ -1538,8 +1540,10 @@ as a clone and a 30 s timeout. The request never supplies it. The lookup happens
 default and only for an ensure that may move a pointer, never under `branch_update: none`. Lookups are bounded:
 - concurrent lookups of one repository share one call;
 - an answer is remembered for 60 s;
-- at most 4 run at once per tenant (the verified caller's tenant), and 32 in all, so one tenant's slow remotes
-  cannot hold the slots other tenants need (issue #203).
+- at most 4 run at once per tenant (the verified caller's tenant), and at most 32 calls are outstanding globally;
+- default and head lookups have a 30 s service-side deadline; reachability has two minutes. Git is killed and
+  reaped on cancellation. A custom resolver that ignores cancellation keeps its global slot until it returns.
+  Saturation returns an unavailable/busy result rather than treating an unobserved branch as absent.
 
 **Latency (issue #203).** Such an ensure, `?wait=false` included, is registered only after its lookup finishes
 (and a user advance only after the #203 head check above), so the call can block for up to about 30 s per lookup
@@ -1693,12 +1697,29 @@ A production holds the single writer for its whole run, which can take hours for
 control writes must not make their caller wait that long: registering a new identity's job
 (`POST /control/ensure?wait=false`) and retiring a branch (`POST /control/branches/retire`). Both are
 **service-owned** operations that take their turn on the writer when the service admits them. The caller waits
-at most `SEXTANT_SERVICE_CONTROL_WRITE_WAIT_SECONDS` (default `5`, at most `25`) for that turn; the write
-itself never gives up.
+at most `SEXTANT_SERVICE_CONTROL_WRITE_WAIT_SECONDS` (default `5`, at most `25`) for the bounded control-write
+decision; an admitted write itself never gives up.
 
-- **Ensure with `wait=false`.** When the job is registered within the bound, the response is unchanged: a
-  `202` `queued`/`running` result, or the `200` terminal result. Otherwise the response is `202` with
-  `{"job_id": <integer>, "identity_hash": "…", "status": "queued", "attached": <bool>}`.
+- **Ensure with `wait=false`.** For remote branch-moving ensures, the response bound includes the durable
+  `queued_ensures` write and convergence marker that record admission before acknowledgment. If that catalog write cannot acquire SQLite's writer lock within the bound,
+  the endpoint returns `503 {"status":"unavailable"}` rather than claiming a durable admission. This 503 does
+  **not** cancel or roll back the already service-owned in-memory operation: once the catalog lock frees, it may
+  persist, register and produce. Retry the same identity; the ensure is idempotent and attaches if it is still
+  in flight. Once admission is durable, the caller waits only for the remaining control-write budget. If the
+  ensure is still waiting for its writer turn, it returns `202` with
+  `{"job_id": <integer>, "identity_hash": "…", "status": "queued", "attached": <bool>}`. It may instead return
+  the usual `202` `running` result or a `200` terminal result if the operation advanced before the answer.
+  Locate-mode and `branch_update: none` ensures retain the best-effort admission behavior: their admission
+  write is awaited outside the response bound, but a failure is logged and the ensure proceeds. A terminal
+  no-op attach may skip that write. If the admission was not recorded, a crash can lose the queued work.
+  A `wait=false` request with `refresh: true` first confirms the remote branch head; that remote lookup is a
+  precondition outside this bound, with its own 30-second injected-clock deadline. A timeout returns 503 with
+  reason `refresh_lookup_busy` (also used for unavailable or saturated lookups). Retry it. Its durable refresh-marker admission is then subject to the same bound and
+  returns `503` if the catalog stays locked, without canceling the service-owned admission operation. For user
+  callers, branch-head verification and `branch_update: none` reachability checks also run before ensure
+  admission and may take up to their documented remote-lookup bounds; the control-write bound does not cover
+  that intake work. The #199 implicit remote-default lookup, when needed, is service-owned after admission; its
+  delay does not make the caller's wait unbounded, and the admitted ensure may continue after a queued response.
   - `job_id` is always a JSON integer. It is the identity's durable job id when its row already exists;
     otherwise it is an id **reserved** for the identity, and the row is inserted with exactly that id when the
     ensure's turn comes.
@@ -1721,15 +1742,63 @@ itself never gives up.
   - Its `retire` audit row (`retired`, `absent`, `default_branch` or `head_mismatch`) is written then. To learn
     the outcome, read the audit log, or `GET /control/resolve` the branch.
   - An identical retirement (same repository, branch, `expected_head_commit` and audit actor) submitted while
-    one is still queued, with no other write admitted in between, is **coalesced** into it: it shares that
-    retirement's result and its single audit row.
+    another one is queued is admitted as a separate branch intent and receives its own audit outcome.
 - **A caller's disconnect or timeout never drops a queued write.** The request token only bounds that
   caller's own wait.
-- **Submission order.** Ensures and retires take their writer turns in the order the service admits them,
-  and a production runs on the turn of the ensure that started it. So a push's ensure, the branch's retire
-  and its re-creation's ensure apply in that order even when all three are queued behind another
-  repository's production. Other control writes (contribution ingest, retention, backup, denied-audit
-  rows) queue on the same writer.
+- **Branch ordering (issue #273; contract: `specs/20261007-indexing-performance/phase-7-rules.md`).** Remote
+  branch-moving ensures, refreshes, explicit and maintenance retirements, and upstream deletions append a durable
+  `branch_intents` row before acknowledgment. Its global autoincrement `id` is the branch's admission order: each
+  branch's intents form a **strict FIFO queue**, and only its first unsettled intent can run; priority lanes select
+  among runnable branches, never reorder work within one branch, so a retire followed by a recreate stays in that
+  order. Nothing supersedes and nothing rotates. The only coalescing is between adjacent refreshes: a refresh request
+  admitted directly behind a pending, unclaimed refresh that is not waiting out a retry deadline is absorbed into it
+  (the request is answered with that refresh's `admission_id` and `coalesced`, and the refresh's `admitted_at`
+  advances to the absorbed push). Behind any other intent (a claimed or deferred refresh, an ensure, a retirement or
+  a deletion) it queues on its own, so a push is never absorbed across a retirement. Every branch-moving ensure's
+  own following refresh is admitted in its transaction, directly behind it.
+  **Retries and expiry (rule 7).** A failing intent keeps its place and retries on its own due time
+  (`next_attempt_at`, 30 seconds doubling to one hour); there is no periodic sweep. Every intent kind expires after
+  `QUEUED_ENSURE_MAX_AGE_HOURS` (default 168) with no effect: a queued ensure is dropped by its replay step, a
+  retire/delete head is settled `expired` (`branch_intent_expired`; one whose persisted payload cannot be read ends
+  `refused`, `branch_intent_refused`), and a refresh whose latest admission is older than the max age ends
+  `expired` (`refresh_expired`). Dropping a destructive request is safe: nothing is deleted. The status read reports
+  the outcome.
+  **Retirements (rule 5).** An upstream deletion yields (`upstream_activity`) to any intent admitted at or after the
+  listing that called the branch deleted, read from `branch_intents`; an idle retirement keeps its pointer and
+  pending-work guards. Every resolver method is required (the resolver interfaces have no default implementations).
+  An identical branch-moving ensure (same request and caller) shares a still-running earlier ensure E only when
+  the admission transaction that would otherwise admit it finds E's intent still the branch's newest: the only
+  intent allowed after E is E's own following refresh, whose id is recorded on E's intent
+  (`following_refresh_id`); a push refresh admitted behind E's own pending refresh is absorbed into it and does not
+  intervene. The decision is made once, in that admission transaction, and stored by its effect: a share admits no
+  intent, and an admitted ensure intent always takes its own turn. Replay never re-derives it, so retention may
+  prune settled intents on its plain seven-day schedule (in a FIFO nothing admitted after E can settle while E is
+  unsettled). Any later retire, delete or ensure means the request is admitted as its own ensure intent with its
+  own refresh and runs in order after them, attaching E's snapshot without another worker run. A shared request
+  reuses E's result and `admission_id`, including on its queued `202` while E still waits for the writer; the
+  decision waits for E's own admission transaction to finish. Only a `503` issued before that decision carries the
+  request's own candidate id, which is then never recorded and resolves as `unknown`. Other control writes, such
+  as retention or another branch's traffic, no longer prevent sharing. Ensures without an intent (locate mode,
+  `branch_update: none`, terminal failure attaches) keep the in-process rule: any other write admitted in between,
+  including a retirement that has not yet taken its turn, prevents sharing.
+  A terminal attach to an already-published snapshot is admitted like any other branch move, including when
+  the branch already selects it: its turn may update the sequence or default ownership. A terminal failure
+  with no snapshot can still attach without an intent and cannot change branch state. `branch_update: none`
+  and locate-mode requests without a remote-head resolver create no intent.
+  See [Watched-branch refreshes](#watched-branch-refreshes).
+  **Upgrade.** Migration `035` clears `queued_ensures`: requests queued before the upgrade are not converted (pushes
+  are redelivered and callers retry). Every row queued from then on has its intent.
+  **Restart (rule 6).** Durable intents resume in FIFO order. Startup resumes every queued row in `seq` order: one
+  decide-and-commit step reloads the row and re-applies the drop rules (age: `expired`; an unusable request, the
+  current URL policy or a revoked user grant: `refused`), deleting a dropped row and settling its intent in that
+  transaction, and otherwise starts the row's ensure, which waits for its branch head. A step that fails is logged
+  (`queued_row_retry`) and retried on its own backoff (1 s doubling to 60 s); an in-process guard per row keeps two
+  callers from starting it twice. A row admitted while convergence was off gets its intent (and following refresh)
+  at the end of its branch queue then. It never holds a writer turn; the started row takes its turn like any other.
+  Replay uses the service's current configuration:
+  a remote-head resolver enables convergence intents, while locate mode keeps its legacy behavior. No mode
+  discriminator is persisted.
+  Other control writes (contribution ingest, retention, backup, denied-audit rows) use the same writer.
 - **Graceful shutdown drains.** Once shutdown begins, a new ensure or retire is refused with
   `503 {"status":"unavailable"}` and nothing is queued. Writes queued before that **drain**: Dispose
   cancels and requeues the running production, then waits (up to `ShutdownDrainTimeout`, 30 s) for each
@@ -1737,51 +1806,138 @@ itself never gives up.
   registration inserts its job row under its reserved id. That job is not produced: it stays `queued` until the
   next start settles it as `cancelled` (see [Job lifecycle](#job-lifecycle-queued-means-admitted-in-this-run-issue-327)),
   and the next ensure of the identity produces it.
-- **A crash loses queued writes.** Queued registrations and retirements are held in memory only, so a
-  crash, or a drain that times out, **loses** them:
-  - A reserved `job_id` then answers `404` from the next instance. Re-ensure the identity to register it.
+- **Crash and replay.** Remote branch-moving ensures have a durable `queued_ensures` row and convergence marker
+  before 202. Other ensures have a row only when their best-effort write succeeded and was not skipped for a
+  terminal attach. Recorded ensures are replayed in admission order unless too old, malformed,
+  forbidden by current repository policy, or no longer granted to the user; each row's replay step (see above)
+  makes that decision in the same transaction that deletes it, so a grant restored before a retried drop admits the
+  row instead, and a drop that has not committed is never resurrected. Startup resumes queued ensures and pending
+  retire/delete intents; their order on a branch is the intent queue's. A replayed queued ensure is durable, so it never shares: it takes its own turn at its
+  place, which is always correct for an identical request (its earlier twin's effect is already applied and nothing
+  after it has run), even when that twin has since settled or been pruned. Refresh markers replay independently. Every intent still waits
+  for earlier intents of its branch. A 503 may precede admission, so it does not prove whether the operation
+  committed; a retry after it shares the earlier ensure only if nothing was admitted on the branch in between.
+  - A reserved `job_id` can answer `404` until replay registers the job; re-ensure the identity if needed.
   - A reserved id is never given to another identity. Before it hands out an id with no row yet, the service
     persists an id floor in `<catalog-db>.job-id-floor`, and ids start above it after a restart. If that
-    file cannot be written, the ensure keeps waiting for the writer rather than hand out an unrecorded id.
+    file cannot be written and no durable id is available, a remote branch-moving ensure returns `503`; a
+    best-effort ensure waits for its result instead. Neither hands out an unrecorded id.
     A malformed floor file **fails startup**.
-  - A lost retirement leaves its branch in place.
+  - Pending retirement and deletion intents retain their payload and replay at startup in branch order.
 
-  Treat a `202` as "accepted, not yet durable", and keep a reconcile as the backstop. The ProcessStack app's
+  Keep a reconcile as the backstop. The ProcessStack app's
   nightly reconcile re-ensures watched branches and retires branches the host no longer has.
 
-### Coalesced branch advances (issue #273)
+### Watched-branch refreshes
 
-Pushes to a busy branch can arrive faster than the index builds them. When an ensure is a branch advance
-guarded by `expected_head_commit` (what a repository push sends: `branch_name`, `expected_head_commit` = the
-push's `before`, no `branch_head_sequence`, `branch_update` not `none`, not a rebuild), and it is still waiting
-for its writer turn when a newer push of the **same repository and branch** arrives whose `expected_head_commit`
-is the waiting ensure's commit, the waiting ensure is **coalesced**:
+A watched branch is refreshed toward its verified remote head after a push or failure. A push to any watched
+branch can be a **refresh request**, not a chained set of push commits. The
+push caller identifies it explicitly in `POST /control/ensure` with `"refresh": true`; without that field,
+including for an ordinary `expected_head_commit` CAS, the request is an explicit ensure. Admission commits a
+durable `pending_refreshes` marker and a following `branch_intents` row before responding. Each request receives its own
+`202` response with `status: "queued"` (or `coalesced` when it was absorbed into the pending refresh directly ahead
+of it, whose `admission_id` it then carries), a string `admission_id`, and no `job_id` field. Refreshes run in their
+branch's FIFO order like every other intent (see Branch ordering): nothing supersedes them. Refresh requests create no job or reserve a job id until their turn. The
+request's commit, `before`/`expected_head_commit`, and `forced` values appear only in the admission audit record;
+they are not saved as marker data or used to select an indexed commit.
+Retry a 503: the service-owned admission may still commit after the response. A retry after that marker is claimed
+can create another marker. Each marker retries on its own backoff. On its first attempt a refresh does not produce
+again an identity that failed within the last retry interval (the ensure it follows just ran it): it attaches that
+result and retries later.
 
-- When its turn comes it does not run the worker. Its job settles as `coalesced`, with no snapshot and a
-  `last_error` naming the commit that superseded it. A blocking ensure returns `200` with that result; a
-  polled job reports `"status": "coalesced"`. The ensure is audited with outcome `coalesced`.
-- It records a durable **handover** (`branch_advance_handovers`, migration `029`): the coalesced commit never
-  moves the branch head, so an ensure of that branch expecting it as the head expects what the coalesced ensure
-  expected instead. Every branch-advance ensure resolves handovers when its turn comes, so a chain (B, then C,
-  then D) coalesces to D. The
-  branch therefore ends exactly where building every push in order would have left it, while only the newest
-  commit is built. Because the handover is durable, a successor that is requeued, re-sent, or re-submitted
-  after a restart still resolves it. Only the push that superseded the coalesced one resolves its handover,
-  and the handover is **consumed** the next time the branch head moves (or the branch is retired), so a later
-  reset of the branch can never revive it: a compare-and-swap stays exactly one link deep, as serially. An
-  unconsumed handover is dropped after 30 days.
-- Whether an ensure coalesces is decided at its turn, not at submission. A superseded ensure whose commit is
-  already built still attaches at no cost and advances the branch (it records no handover); one whose commit
-  another pending ensure (of another branch) also needs is produced; one that has started producing always
-  runs to completion.
-- Only a **linked** successor supersedes. A push of the same branch that expects some other commit (an
-  out-of-order or unrelated push), a push of another branch, an unguarded ensure, `branch_update: none`, a
-  `branch_head_sequence` ensure and a rebuild are never coalesced and never supersede anything.
-- `coalesced` is **settled but not terminal**. It is not an outcome: it counts toward neither the success
-  nor the completeness rate (`sextant_jobs_coalesced` counts these jobs). A later ensure of the same commit
-  produces it under the same job id.
-- Clients must treat `coalesced` as a settled status, not an unknown one. Deploy a service that coalesces only
-  after every client that polls jobs (the ProcessStack app) knows the status.
+For an uncataloged branch, the verified branch-head resolver must confirm that it exists before admitting a marker.
+If a successful observation confirms the branch is absent, the request is audited and returns
+`409 {"status":"rejected","reason":"refresh_default_unconfirmed"}` rather than indexing a caller-supplied hint.
+An unavailable observation returns retryable `503` with reason `refresh_lookup_busy`. The legacy 409 reason code
+is retained for wire compatibility.
+At its turn the refresh publishes the head GitHub reports; when the final observation reports this branch as the
+remote default, the catalog default follows it. Handling an upstream default-branch rename (keeping the old default
+until the new one is built, deferring the old branch's refresh) is out of scope for #273 and tracked as a follow-up.
+
+When the refresh turn starts, Sextant resolves the branch's current remote head with the verified remote-head
+resolver; only a known head is indexed or attached. An unknown, busy, or timed-out lookup indexes nothing and
+leaves the pointer untouched. The marker is retried with exponential backoff (30 seconds, doubling per failure
+up to one hour); a worker failure also returns the marker to retry. A refresh waiting out its retry deadline is not
+absorbable and is not woken by a new push: the push queues its own refresh behind it, which runs after that retry.
+Past the max age a refresh that never finished ends `expired`.
+After production, one fresh `git ls-remote --symref` advertisement observes both the default and branch head
+immediately before deciding the pointer, without another asynchronous lookup between observation and decision.
+Every branch, including the default, follows that verified head, even for a rewind or non-ancestor force-push.
+Freshness replaces the ancestry guard: an older observation cannot authorize a move, while a genuine remote rewind
+must converge. A null or unusable pointer is repaired to the verified published head as well. A later push
+after a marker is claimed creates a second marker and a separate turn.
+
+A selected rebuild of the verified head remains selected rather than reverting to its original identity.
+
+The branch-intent log orders refreshes with ensures, retirements, and deletions. A retrying refresh at the head
+blocks only its own branch until its retry time (or its expiry); other branches continue. Successful processing
+atomically records the outcome and removes the marker. Claims left by a dead service instance are scheduled
+again at startup. If a turn cannot claim its marker or fails before claiming it, it retries after a bounded
+in-memory backoff with its own armed wake; it does not spin on the writer.
+
+**Recovery of an unsettled turn (one rule for every intent kind).** A claim records the turn that owns it. A turn
+that ends without settling its intent (an exception, a transient write failure such as a busy catalog, caller
+cancellation or shutdown) returns the intent to `pending` with a recorded `next_attempt_at`, from that turn's own
+finally path: a refresh claim is returned with its marker's retry time (shutdown returns it immediately, without
+counting an attempt), and a failed retirement or deletion turn records its retry time on the intent, which
+stays the branch head. If even that write fails, the turn's claim token dies with it: a later turn of the same
+process treats a claim whose owning turn is no longer live as reclaimable, so the branch recovers without a restart.
+Nothing sweeps on a timer: one wake is armed for the earliest due time (an earlier due time replaces it), an intent
+that defers arms it, and startup arms it from the durable due times. A wake whose scan faults logs
+`branch_intent_wake_failed` and re-arms itself on a bounded backoff; the maintenance tick never starts a retry. Each wake starts every runnable branch head of every kind (refresh, explicit ensure,
+retirement and deletion) that has no live executor in this process, once its durable retry time and a bounded
+per-intent backoff (30 seconds doubling to one hour, on the service clock) have passed. A remote ensure that ended
+unsettled keeps its `queued_ensures` row and intent and is resumed the same way. Only a branch's head ever runs, so
+recovery never reorders a branch; startup still releases every claim and replays pending work.
+Retirement and deletion replay and their execution turns both honor the persisted retry deadline.
+
+Every branch intent (refresh, ensure, retire and delete) has a public string admission id. Poll `GET /control/refresh-status/{admission_id}` with the control token for any of them; the
+response carries `kind` (`refresh`, `ensure`, `retire` or `delete`) and its state. A non-refresh intent reports
+`queued`, `retrying` (with `attempts`, `next_attempt_at` and `last_error`), `claimed`, or its settled outcome: the
+ensure's job status, or a retirement or deletion outcome (`retired`, `absent`, `deleted`, `already_gone` or a guard
+reason). For a refresh it returns `queued`, `claimed`,
+`retrying` (with `attempts`, `next_attempt_at`, and `last_error`), `completed` (with `snapshot_id` and
+`commit_sha`), `expired` (past the max age, without effect), or `unknown`. Completed refresh outcomes are retained
+for seven days and pruned at startup, on refresh admission and by maintenance; retirement/deletion outcomes are read
+from the durable intent log, whose settled rows are pruned after seven days by a bounded, indexed oldest-first scan. A user caller
+can read an admission only when its repository is visible to that caller.
+
+An HTTP response that admits an intent also returns its `admission_id`: a branch-moving `/control/ensure` and
+`/control/branches/retire` return their admission ids, including on an `unavailable` response when the admission write
+is still in flight. Poll it after retrying, since an admission that did not commit resolves as `unknown`. In locate mode
+without a remote-head resolver, branch operations retain their legacy writer ordering and do not create branch-intent
+admissions. Upstream deletions are service-owned (the maintenance upstream-branch pass) rather than directly
+requested by an HTTP caller.
+
+Every branch-moving explicit ensure in remote/clone mode atomically admits an `ensure` intent and its following
+refresh intent with its `queued_ensures` admission, before acknowledging or running it, including rebuilds and
+an explicit ensure that attaches an already-published snapshot (for example one built by an earlier
+`branch_update: none` ensure), even if that snapshot is already selected. Such an attach waits behind earlier intents of its
+branch, is bound by the admission response wait (a `503` retry attaches the same identity without another worker
+run: it shares the original admission while that is still the branch's newest intent, and is otherwise admitted
+after the intervening intents. A retry that runs after the original finished reuses its retained snapshot even
+when a refresh has since superseded it, guarded or not: an intact superseded snapshot of the requested identity is
+re-selected without the worker), and is followed by convergence to the remote head. Only a terminal failure with no snapshot keeps
+best-effort semantics.
+This covers worker failure or unsupported results, CAS/sequence mismatch, superseded or coalesced intermediates,
+transient requeues, exceptions, caller cancellation, shutdown before or during a turn, and partial results.
+The admission fails closed if persistence fails; a crash cannot record an outcome without its marker.
+Explicit ensures retain their commit, guards and own turns, and their marker resolves the latest head. In the
+absence of a concurrent retirement, A -> B -> C converges to C (or newer) even if B fails, without another push or a handover.
+`branch_update: none` remains historical work and creates no marker. Locate mode without a remote-head resolver
+retains its legacy linked-successor semantics.
+Before removing a marker, the refresh re-reads the remote head; a newly advanced head is processed immediately
+without waiting for another push. A branch whose head GitHub no longer reports leaves the marker retrying until it
+expires; deleting a branch confirmed deleted upstream from a refresh is out of scope for #273 (follow-up issue).
+- **Per-branch order and retirement.** Explicit and maintenance retirements execute at their place in the log and
+  settle as `retired` or `absent`; a refresh admitted after a retirement runs afterward and may recreate the branch.
+  Pending intents are replayed after restart. Admission status reports the `completed`, `expired` and retirement
+  outcomes.
+- `queued` is a marker-admission status, not a job outcome. Poll the admission-status endpoint
+  for refresh progress; ordinary explicit ensures continue to use the job status API.
+- HTTP refresh always returns its committed admission (`queued`, or `coalesced` when absorbed) with HTTP 202
+  immediately, whether `wait` is omitted, true, or false. Poll the admission-status endpoint for completion;
+  refresh responses omit `job_id`.
 
 **Forward-only branch-head advance (Phase 14, issue #84).** An ensure request may carry an optional
 monotonic `branch_head_sequence`. Because the service ensures *every* delivered commit (including
@@ -1814,8 +1970,8 @@ republishes into the same id. Retention also reclaims ledger rows independently 
 
 Otherwise it is demoted to `failed` and the ensure falls through to the worker, which rebuilds the identity
 into the same snapshot id instead of resurrecting a data-less snapshot. A snapshot whose row retention has
-already GC'd is simply regenerated (issue #46). The null-sequence path does not re-select: it still hands a
-superseded identity to the worker.
+already GC'd is simply regenerated (issue #46). The null-sequence path does not re-select in locate/local
+mode: it still hands a superseded identity to the worker (remote branch-moving ensures re-select, see below).
 
 **Null-sequence reuse re-points only when history cannot regress (issue #162).** An ensure with no
 `branch_head_sequence` that reuses an already-published snapshot (a Phase-12 provider built by a monorepo
@@ -1897,16 +2053,15 @@ still points at it (the #128 guard), and it never writes `head_sequence`.
 A superseded snapshot is re-selected under **any** guard (sequence, CAS or `none`), not only under a
 sequence. When intact it is restored to `complete` without the worker, exactly as the orchestrator's
 `SelectExistingSnapshot` restores it. The branch is re-pointed at it **only when the guard passes**, so a
-reset or force-push whose CAS matches re-points the head and a stale one leaves it alone. An unguarded
-ensure still hands a superseded identity to the worker.
+reset or force-push whose CAS matches re-points the head and a stale one leaves it alone. In remote/clone mode
+(a remote-head resolver), every branch-moving ensure re-selects an intact superseded snapshot the same way,
+guarded or not, and applies its own branch decision; its following refresh then converges the branch to the
+verified head. An unguarded ensure in locate/local mode still hands a superseded identity to the worker.
 
-**Out-of-order pushes converge on retry.** Pushes `A→B` then `B→C` delivered in reverse order: `B→C`
-arrives first and its CAS fails (the head is still A), so it builds C and returns `branch_advanced: false`.
-`A→B` then advances the head to B. Re-sending `B→C` (a cheap reuse) advances it to C. A delayed duplicate of
-`A→B` is then declined, because the head is C. The client should retry a declined push once the pushes
-before it have landed, or let its reconcile catch up. A push for a branch the service has never seen that
-names a real `before` commit fails the CAS, so seed the branch first with an ensure that sends
-`expected_head_commit: ""`, or with a plain unguarded ensure.
+**Remote pushes converge to the verified head.** Explicit ensures retain their `expected_head_commit` CAS;
+each branch-moving remote ensure also admits a refresh marker. That marker follows the freshly verified
+remote head for default and feature branches, including rewinds and force-pushes, even if an explicit CAS
+fails. `refresh: true` requests this behavior directly without a per-push commit.
 
 **Retire.** `POST /control/branches/retire` with `{repository, branch, expected_head_commit?}` deletes the
 branch row for a branch deleted upstream. The snapshots stay in the catalog, and retention reclaims them once
@@ -1931,7 +2086,7 @@ the single writer in submission order (issue #158). When a running production ho
 retirement has not applied within `SEXTANT_SERVICE_CONTROL_WRITE_WAIT_SECONDS`, the response is
 `202 {"status":"accepted"}`. The steps above then run when the writer frees, against the branch as it is at
 that point, and their outcome is recorded only in the audit row. The caller's disconnect or timeout never drops
-the retirement. See [Queued control writes](#queued-control-writes-issue-158) for ordering, coalescing and
+the retirement. See [Queued control writes](#queued-control-writes-issue-158) for bounded waits and
 durability.
 
 Because a failed CAS never creates a branch, a stale push that arrives after its branch was retired cannot
@@ -1964,6 +2119,10 @@ reproduces the snapshot's `identity_hash` is returned (`identity_current: true`)
 under the request's spelling, which is exactly the `identity_hash` the caller's own ensure of `commit_sha` will
 produce. A head built by an ensure that sent a `config_hash` or `tree_sha` reads as not current, since the
 default ensure builds another snapshot.
+Before starting production, an ensure reuses an existing identity under any spelling still retained for that
+repository and commit (the request, the catalog row, historical job rows and mapped project rows), and only when
+the complete identity hash matches. Alias-reuse limit: an old snapshot whose original URL spelling is no longer
+retained in any job, catalog or project row is re-indexed once; this never produces a wrong result.
 
 Both fields are **omitted together, never `null`**, when currency is not reported, so a client treats an absent
 `identity_current` as current, which is also what an older service implies:
@@ -2025,9 +2184,7 @@ inflating `sextant_jobs_queued`.
 Startup therefore **settles** every such row, right after `ReconcileOrphanedJobs`, in transactions of at most 500
 rows, with the existing statuses only:
 
-- `coalesced` when a newer job (`complete`, `partial`, `failed` or `unsupported`) of the same repository (any URL
-  spelling) and branch already ran: that job produced the branch's snapshot. No handover is recorded: the newer
-  job already ran, and the row does not store the head commit a handover would carry. A newer `failed` or
+- `coalesced` when a newer job of the same branch already ran. A newer `failed` or
   `unsupported` job counts as "ran": both are re-produced on a later ensure anyway (a `failed` job unless its result
   is reusable, see the ensure lifecycle), so the coalesced row loses nothing.
 - `cancelled` otherwise, with `last_error` "not produced: its service run ended before its turn (restart); a
@@ -2427,37 +2584,26 @@ their snapshots forever. A service-owned loop cleans them up.
   `SEXTANT_SERVICE_BRANCH_UPSTREAM_HEAL_MAX_PER_TICK` is above 0 (default 10, `0` = heal off, clamped to `1000`),
   the pass also reads the DEFAULT branch pointers and compares each pointer's snapshot commit with the remote
   head. A pointer that differs, has no running job or queued retirement on that repository/branch, and differs
-  on two consecutive listings no more than 3 intervals apart gets a
-  service-owned ensure of the remote head: `branch_update: advance` with `expected_head_commit` = the pointer's
-  current commit, actor `upstream_policy`. That is the push path, so coalescing, the CAS, reuse of an already
-  built snapshot (a push whose advance declined its CAS) and the ensure audit row apply unchanged; the heal is not
-  awaited. At most the cap start per tick, the rest heal on later passes. **Default-branch repairs are forward-only:**
-  the pointer must be a strict ancestor of the selected published, complete, non-overlay snapshot, which must be
-  on the freshly read remote head's history. Maintenance chooses the newest qualifying commit, not simply the
-  last publication, and a moving default head does not reset confirmation of the unchanged stale pointer.
-  Published repairs use maintenance priority. A default heal that must build first suppresses the worker's
-  ordinary pointer advance and applies the same ancestry check after publication. Exact snapshot/head equality
-  skips only the remote-history check, never the forward check. Missing/failed history is `ancestry_unknown`;
-  a snapshot off the remote history is `not_on_remote_history`; no forward move is `not_descendant`.
-  The remote read (30 seconds) and ancestry checks (a shared two minutes, fetching missing history into a separate
-  credential-safe per-repository graph) run under the writer, outside the CAS transaction. A remote change after
-  the read cannot be atomic with SQLite. Non-default heals retain their existing CAS/force-push semantics.
-  If no retained candidate qualifies, a proven forward head without a complete snapshot gets a default-priority
-  ensure; older/off-history retained snapshots cannot indefinitely prevent missing default-head work.
+  on two consecutive listings no more than 3 intervals apart is healed by `upstream_policy`. Every heal admits
+  a durable refresh marker: the listing's head is only a hint, and the turn reads the head again.
+  It attaches or builds that head and rechecks it immediately before the pointer decision; both default and feature
+  heals follow the verified remote head, including force-pushes and rewinds.
+  A moving default head does not reset confirmation of the unchanged stale pointer.
+  The heal is not awaited. At most the cap start per tick, the rest heal on later passes.
   The decision is re-made at admission (under the admission lock): a queued retirement, a running job, or a
   pointer that moved since the pass read it is skipped and counted `heal busy`, so a push admitted during the
-  (possibly long) listing is never overtaken by a heal. A heal whose identity already has a terminal `failed` or
-  `unsupported` job is not started (counted `skipped terminal`,
-  `sextant_upstream_branch_heals_skipped_terminal_total`): it would repeat the failure and write an ensure audit
-  row every pass; a new remote head is a new identity and heals normally. The request identity folds the submitted URL spelling, so a heal can re-index a commit
+  (possibly long) listing is never overtaken by a heal. Default and feature heals both admit durable refresh markers;
+  failed identities retry under the refresh backoff policy. The request identity folds the submitted URL spelling, so a heal can re-index a commit
   once when the app's push used another spelling. A default branch is healed but never retired, and one absent
   from a listing is left alone. Metrics: `sextant_upstream_branch_heals_started_total`,
   `sextant_upstream_branch_heals_applied_total`, `sextant_upstream_branch_heals_not_applied_total`; the pass log
   line reports stale/busy/awaiting/deferred/started counts.
 
   Default-branch ensure advances are FIFO ahead of non-default work, including durable replay and requests that
-  omit `default_branch` when the catalog knows the default. Coalescing remains enabled and no feature work is
-  dropped. `branch_update: none` stays in the normal FIFO lane.
+  omit `default_branch` when the catalog knows the default. Explicit default-branch CAS ensures are plain CAS
+  ensures and do not use linked-successor handovers. Every remote branch-moving ensure admits its convergence
+  marker before acknowledgment, so failed intermediates trigger immediate refresh rather than waiting for the healer.
+  The healer remains a backstop for both defaults and features. `branch_update: none` stays in the normal FIFO lane.
 - **Orphan handover prune (every tick, issue #401).** Branch-advance handover rows whose branch has no pointer row,
   and no `queued`/`running` job or admitted advance, are deleted (`orphan_handover_prune` deferral if the writer
   is not available in time).
@@ -2829,6 +2975,9 @@ rows.
   The recent job metric reflects recorded outcomes completed in that window, not a fresh audit of
   historical coverage rows. The cumulative no-sample rate value of 1.0 remains for wire compatibility;
   it is not used as evidence of recent health.
+- `jobs.queued_ensures` reports depth and oldest age in seconds for the total, expedited and normal lanes,
+  including waiting admissions in memory and durable `queued_ensures` rows. Prometheus exposes
+  `sextant_queued_ensures_depth` and `sextant_queued_ensures_oldest_age_seconds` by lane.
 - **Job phase timings (issue #267).** Every job the worker produces records where its time went, in
   [`snapshot_job_timings`](../src/Sextant.Store/Migrations/028_snapshot_job_timings.sql) (migration 028, a
   job-telemetry table and so identity-neutral: adding it re-indexes nothing). `GET /control/status/{job}` returns
@@ -3110,7 +3259,7 @@ catalog, and a `FakeSnapshotWorker`. The suite maps to the acceptance criteria:
 
 | Criterion | Test coverage |
 | --- | --- |
-| 1 — idempotent ensure | `SnapshotServiceTests` (concurrent ensures attach to one job; worker runs once); `EnsureCallerDisconnectTests` / `EnsureCallerDisconnectHttpTests` (#148: caller disconnect never cancels production, re-ensure attaches to the in-flight run, `wait=false`, prompt status/resolve during a run, shutdown requeues); `QueuedControlWriteHttpTests` / `JobIdReservationsTests` (#158: `wait=false` and retire answer `202` within the bound while a production holds the writer, reserved job ids resolve and are never reused, apply-time retire guards, submission order, coalescing, shutdown drain) |
+| 1 — idempotent ensure | `SnapshotServiceTests` (concurrent ensures attach to one job; worker runs once); `EnsureCallerDisconnectTests` / `EnsureCallerDisconnectHttpTests` (#148: caller disconnect never cancels production, re-ensure attaches to the in-flight run, `wait=false`, prompt status/resolve during a run, shutdown requeues); `QueuedControlWriteHttpTests` / `JobIdReservationsTests` (#158: `wait=false` and retire answer `202` within the bound while a production holds the writer, reserved job ids resolve and are never reused, apply-time retire guards, submission order, durable retire admissions, shutdown drain) |
 | 2 — restart recovery | `SnapshotServiceTests` (catalog survives restart; orphaned `running` jobs reconciled) |
 | 3 — scratch cannot delete published | `ServicePathsTests` (scratch/persistent separation + `ReleaseScratch` refusal) |
 | 4 — query via HTTP MCP without ProcessStack | `ServiceHttpTests` (`/mcp` mapped + auth-gated; `/query` paging); `RepositorySelectionHttpTests` (the `X-Sextant-Repository` header without a read policy, the legacy no-header unscoped read, `repository_required`); `ToolArgumentSelectionHttpTests` + `ToolSelectionFiltersTests` (SVC-2: the reserved `repository`/`branch` arguments listed on repository-scoped tools and stripped on call, argument-over-header precedence, `selector_conflict`/`invalid_selector`, branch pinning, `branch` without a repository, the unknown-branch uniform not-found); `McpClientCompatibilityTests` (an SDK client selecting through the `repository` argument); `QueryToolInputResolutionHttpTests` (issues #149/#163: symbol arguments without `global::`, `Type.Member`, parameter lists and documentation IDs; exact type lookup and `kind`; ambiguity and not-found as tool errors with candidates; `get_type_members`; implicit selection naming its repository and `repository_required` listing the caller's repositories; HTML-escaped names and the unique trailing-name fallback with `meta.warning`); `RepositoryInferenceHttpTests` (repository inference: one holder inferred, several holders listed, none, and a repository the caller cannot read never probed, chosen or named); `AgentSizedOutputHttpTests` (#145: paging, truncation summary, cursor binding, lean `meta.snapshot`, repo-relative paths in and out, server `instructions`, the `tools/list` size pin); `RemoteToolSurfaceGuardTests` (S12: exactly the agent tools of `RemoteQueryTools`, and no remote text naming another tool); `SubmoduleCheckoutIntegrationTests.RemoteMcp_RepositoryRelativePaths_*` (#145 on a real worker index: repo-relative inputs over `/mcp`, a submodule file included) |

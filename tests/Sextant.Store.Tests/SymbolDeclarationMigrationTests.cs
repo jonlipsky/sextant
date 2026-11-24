@@ -55,7 +55,8 @@ public class SymbolDeclarationMigrationTests
             Assert.AreEqual(1, runs.MarkComplete(runs.BeginRun("full", 1), 2, 1));
             // Back to the schema a pre-026 build left: no column, version 25.
             Exec(conn, "DROP INDEX ix_repositories_key; DROP INDEX ix_snapshot_jobs_snapshot_branch; ALTER TABLE repositories DROP COLUMN repository_key; " +
-                "DROP TABLE queued_ensures; DROP TABLE writer_run_state; DROP TABLE retired_branch_heads; DROP TABLE branch_advance_handovers; DROP TABLE snapshot_job_timings; DROP INDEX ix_snapshot_jobs_completed_at; " +
+            "DROP TABLE branch_intents; " +
+            "DROP TABLE completed_refresh_admissions; DROP TABLE pending_refreshes; DROP TABLE queued_ensures; DROP TABLE writer_run_state; DROP TABLE retired_branch_heads; DROP TABLE branch_advance_handovers; DROP TABLE snapshot_job_timings; DROP INDEX ix_snapshot_jobs_completed_at; " +
                 "ALTER TABLE symbols DROP COLUMN declaration; " +
                 "DELETE FROM schema_version WHERE version >= 26;");
             Assert.AreEqual(25, db.CurrentSchemaVersion);

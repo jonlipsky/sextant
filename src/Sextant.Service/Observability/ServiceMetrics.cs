@@ -41,6 +41,58 @@ public sealed class ServiceMetrics
     private long _pageCacheHits;
     private long _pageCacheMisses;
     private long _queryErrors;
+    private readonly Lock _queuedEnsureLock = new();
+    private readonly Dictionary<long, QueuedEnsureAdmission> _queuedEnsures = [];
+
+    internal readonly record struct QueuedEnsureAdmission(
+        string IdentityHash, bool Expedited, long AdmittedAtUnixMs, bool Started, bool Duplicate);
+
+    /// <summary>Tracks a live admission while it waits for its writer turn.</summary>
+    public void RecordQueuedEnsureAdmission(long seq, string identityHash, bool expedited, long admittedAtUnixMs)
+    {
+        lock (_queuedEnsureLock)
+            _queuedEnsures[seq] = new(identityHash, expedited, admittedAtUnixMs, Started: false, Duplicate: false);
+    }
+
+    internal void RecordQueuedEnsureDuplicate(long seq, string identityHash, bool expedited, long admittedAtUnixMs)
+    {
+        lock (_queuedEnsureLock)
+            _queuedEnsures[seq] = new(identityHash, expedited, admittedAtUnixMs, Started: false, Duplicate: true);
+    }
+
+    /// <summary>Stops counting a live admission as queued once its writer turn is granted.</summary>
+    public void RecordQueuedEnsureStarted(long seq)
+    {
+        lock (_queuedEnsureLock)
+        {
+            if (_queuedEnsures.TryGetValue(seq, out var admission))
+            {
+                _queuedEnsures[seq] = admission with { Started = true };
+            }
+        }
+    }
+
+    /// <summary>Removes the live admission after its operation ends.</summary>
+    public void RecordQueuedEnsureFinished(long seq)
+    {
+        lock (_queuedEnsureLock)
+            _queuedEnsures.Remove(seq);
+    }
+
+    internal T WithQueuedEnsureSnapshot<T>(
+        Func<IReadOnlyDictionary<long, QueuedEnsureAdmission>, T> collect)
+    {
+        lock (_queuedEnsureLock)
+        {
+            return collect(new Dictionary<long, QueuedEnsureAdmission>(_queuedEnsures));
+        }
+    }
+
+    internal T WithQueuedEnsureLock<T>(Func<T> action)
+    {
+        lock (_queuedEnsureLock)
+            return action();
+    }
 
     /// <summary>Query-plane request latency (HTTP MCP + snapshot paging), recorded by the host middleware.</summary>
     public LatencyHistogram QueryLatency { get; } = new();
@@ -105,8 +157,7 @@ public sealed class ServiceMetrics
 
     /// <summary>Records one maintenance tick's upstream-branch reconcile pass (issue #338).</summary>
     public void RecordUpstreamBranchPass(
-        int repositoriesChecked, int listingFailures, long atUnixMs, double durationMs, int healsStarted = 0,
-        int healsSkippedTerminal = 0)
+        int repositoriesChecked, int listingFailures, long atUnixMs, double durationMs, int healsStarted = 0)
     {
         lock (_maintenanceLock)
             _maintenance = _maintenance with
@@ -114,7 +165,6 @@ public sealed class ServiceMetrics
                 UpstreamRepositoriesCheckedTotal = _maintenance.UpstreamRepositoriesCheckedTotal + repositoriesChecked,
                 UpstreamListingFailuresTotal = _maintenance.UpstreamListingFailuresTotal + listingFailures,
                 UpstreamBranchHealsStartedTotal = _maintenance.UpstreamBranchHealsStartedTotal + healsStarted,
-                UpstreamBranchHealsSkippedTerminalTotal = _maintenance.UpstreamBranchHealsSkippedTerminalTotal + healsSkippedTerminal,
                 LastUpstreamPassAtUnixMs = atUnixMs,
                 LastUpstreamPassDurationMs = durationMs
             };

@@ -161,8 +161,11 @@ public class RepositoryIdentityNormalizationTests
             seed.CommandText = """
                 DROP INDEX ix_repositories_key;
                 DROP INDEX ix_snapshot_jobs_snapshot_branch;
+                DROP TABLE branch_intents;
+                DROP TABLE completed_refresh_admissions;
+                DROP TABLE pending_refreshes;
                 ALTER TABLE repositories DROP COLUMN repository_key;
-                DELETE FROM schema_version WHERE version = 34;
+                DELETE FROM schema_version WHERE version >= 34;
                 UPDATE repositories SET remote_url = @url WHERE id = @id;
                 INSERT INTO pull_request_snapshots (repository_id, pr_number, snapshot_id, updated_at)
                 VALUES (@id, 1, @snapshot, 2);

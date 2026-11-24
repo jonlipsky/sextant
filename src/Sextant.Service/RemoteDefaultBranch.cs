@@ -14,6 +14,10 @@ public interface IRemoteDefaultBranchResolver
     /// service treats a throw like <c>null</c> (fail closed: the branch is created without the default).
     /// </summary>
     string? ResolveDefaultBranch(string repositoryRemoteUrl);
+
+    /// <summary>Looks up the default; cancelling <paramref name="cancellationToken"/> stops the remote call where the
+    /// resolver can.</summary>
+    string? ResolveDefaultBranch(string repositoryRemoteUrl, CancellationToken cancellationToken);
 }
 
 /// <summary>Parsing of <c>git ls-remote --symref &lt;url&gt; HEAD</c> for <see cref="IRemoteDefaultBranchResolver"/>.</summary>
@@ -70,7 +74,25 @@ public interface IRemoteBranchHeadResolver
     /// Cancelling <paramref name="cancellationToken"/> stops the remote call.
     /// </summary>
     string? ResolveBranchHead(string repositoryRemoteUrl, string branch, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Returns a verified head, or a verified absence (<c>Head = null</c>); a null observation means the remote could not
+    /// be observed.
+    /// </summary>
+    RemoteBranchHeadObservation? ObserveBranchHead(
+        string repositoryRemoteUrl, string branch, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Observes the default branch and the requested head in one remote advertisement, or <c>null</c> when the remote could
+    /// not be observed. A null answer is never final: the refresh that asked releases its intent with a bounded retry time,
+    /// and any later intent of the branch supersedes it, so the branch is never stranded behind it.
+    /// </summary>
+    RemoteBranchStateObservation? ObserveBranchState(
+        string repositoryRemoteUrl, string branch, CancellationToken cancellationToken = default);
 }
+
+public sealed record RemoteBranchHeadObservation(string? Head);
+public sealed record RemoteBranchStateObservation(string DefaultBranch, string Head);
 
 /// <summary>
 /// Decides whether a commit is reachable from a <c>refs/heads/*</c> branch of a repository as the REMOTE holds it
@@ -82,10 +104,13 @@ public interface IRemoteCommitBranchChecker
 {
     /// <summary>
     /// <c>true</c> only when <paramref name="commit"/> (a full object id) is reachable from a branch of the remote.
-    /// Unreachable, unauthorized, unparseable or a refused URL is <c>false</c>. A throw is treated like <c>false</c>.
+    /// Unreachable, unauthorized, unparseable or a refused URL is <c>false</c>.
     /// Cancelling <paramref name="cancellationToken"/> stops the remote call.
     /// </summary>
     bool IsCommitOnBranch(string repositoryRemoteUrl, string commit, CancellationToken cancellationToken = default);
+
+    /// <summary>Returns null when reachability could not be determined; a throw is also unavailable.</summary>
+    bool? ObserveCommitOnBranch(string repositoryRemoteUrl, string commit, CancellationToken cancellationToken = default);
 }
 
 /// <summary>Checks git ancestry using complete commit history, fetching missing objects without changing the checkout.</summary>

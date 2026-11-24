@@ -951,6 +951,7 @@ public sealed partial class CloningCheckoutProvider : ICheckoutProvider
             {
                 cts.Cancel();
                 KillTree(process);
+                process.WaitForExitAsync(CancellationToken.None).GetAwaiter().GetResult();
                 return new GitResult(false, GitFailureKind.Timeout, string.Empty, string.Empty);
             }
 

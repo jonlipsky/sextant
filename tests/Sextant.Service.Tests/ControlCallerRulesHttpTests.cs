@@ -331,6 +331,7 @@ public class ControlCallerRulesHttpTests
             "DELETE /control/grants/tenant",
             "GET /control/grants",
             "GET /control/grants/self",
+            "GET /control/refresh-status/{admissionId}",
             "GET /control/resolve",
             "GET /control/status/{jobId:long}",
             "POST /control/ensure",

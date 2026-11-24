@@ -9,43 +9,96 @@ namespace Sextant.Service;
 // reconcile. The row is written on a grant-style side connection (never under the write gate, so admission never
 // waits behind a production) and removed when the ensure ends. It is KEPT when shutdown, a lost lease or a transient
 // requeue ended the ensure, which is exactly the case a restart must resume. At startup the rows are replayed through
-// StartEnsureOperation in admission order, so the lane (expedited default-branch vs normal), the #273/#405 coalescing
-// (AdmitAdvanceLocked / WillBuildBranchHead) and the idempotent attach of an already-built identity all apply exactly
-// as for a live admission. Persistence is best effort: a failed write is logged and the ensure still runs.
+// StartEnsureOperation in admission order, so branch refresh deduplication and
+// the idempotent attach of an already-built identity all apply exactly
+// as for a live admission. Branch-moving remote ensures require durable convergence admission before running.
 public sealed partial class SnapshotService
 {
     private long _ensureSeq;
-    // Per branch, share an identical pending request even across other branches' traffic. A different request on
-    // this branch or any non-ensure control write is a barrier: retries must never jump across a retire/re-create.
+    // Per branch, the latest live ensure admission: an identical request may share it. A branch-moving remote ensure
+    // shares only when its admission transaction finds that ensure's intent still the branch's newest (issue #273, D2).
+    // An ensure without an intent (locate mode, branch_update: none, a terminal failure attach) keeps the in-process
+    // barrier instead: a different request on this branch or any non-ensure control write admitted in between.
     private readonly Dictionary<string, PendingEnsureAdmission> _ensureAdmissions = new(StringComparer.Ordinal);
     private long _ensureAdmissionBarrier;
     private long _duplicateEnsureAdmissions;
+    internal Action? BeforeQueuedEnsureWriteForTesting { get; set; }
 
     private static string EnsureAdmissionKey(EnsureSnapshotRequest request) =>
         Sextant.Core.RemoteUrlIdentity.Normalize(request.RepositoryRemoteUrl) + "\n" + (request.BranchName ?? "main");
 
     private sealed record PendingEnsureAdmission(
         EnsureSnapshotRequest Request, AuditCaller Principal, long Seq, long WriteAdmission,
-        Task<EnsureSnapshotResult> Accepted, Task<EnsureSnapshotResult> Completion, Task Persisted);
+        string? AdmissionId, Task<EnsureSnapshotResult> Accepted, Task<EnsureSnapshotResult> Completion,
+        Task<EnsureAdmissionOutcome> Admission);
 
     private void DeleteSettledQueuedEnsureLocked(long seq, EnsureSnapshotResult result)
     {
         if (_lifetime.IsCancellationRequested || LeaseLost || !SnapshotJobStatus.IsSettled(result.Status))
             return;
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "DELETE FROM queued_ensures WHERE seq = @seq;";
-        cmd.Parameters.AddWithValue("@seq", seq);
-        var removed = cmd.ExecuteNonQuery();
+        BeginRaw("settle-queued-ensure");
+        int removed;
+        try
+        {
+            removed = _metrics.WithQueuedEnsureLock(() =>
+            {
+                using var cmd = _conn.CreateCommand();
+                cmd.CommandText = "DELETE FROM queued_ensures WHERE seq = @seq;";
+                cmd.Parameters.AddWithValue("@seq", seq);
+                var count = cmd.ExecuteNonQuery();
+                new BranchIntentStore(_conn).SettleByQueuedEnsureId(
+                    seq, result.Status, _timeProvider.GetUtcNow().ToUnixTimeMilliseconds());
+                ExecRaw("COMMIT;");
+                return count;
+            });
+        }
+        catch
+        {
+            ExecRaw("ROLLBACK;");
+            throw;
+        }
         if (removed > 0)
+        {
+            WakeBranchIntentForQueuedEnsure(seq);
             Log($"queued_ensure_settled seq={seq} status={result.Status} removed={removed}");
+            SchedulePendingRefreshes();
+        }
     }
 
-    private void PersistQueuedEnsure(long seq, EnsureSnapshotRequest request, string hash, AuditCaller principal)
+    // The branch intent an ensure admission resolved to (issue #273, D2): its own queued sequence, or the sequence of the
+    // identical earlier ensure it shares, with that intent's public admission id.
+    private readonly record struct EnsureAdmissionOutcome(long Seq, string? AdmissionId)
+    {
+        public bool SharedWith(long seq) => Seq != seq;
+    }
+
+    // An identical earlier ensure this admission may share: its resolved admission and whether its operation is live.
+    private sealed record EnsureShareCandidate(Task<EnsureAdmissionOutcome> Admission, Func<bool> Live);
+
+    // Records the queued ensure and, for a branch-moving remote ensure, its intent and following refresh, in one catalog
+    // transaction. Issue #273 (D2): when an identical earlier ensure is still live, the same transaction first decides
+    // whether a LIVE request shares it: only while that ensure's intent is the branch's newest (only its own following
+    // refresh may follow it). Otherwise this ensure is admitted on its own and runs after every intervening intent.
+    // The decision is stored by its effect: a share admits no intent, and an admitted intent always takes its own turn.
+    private EnsureAdmissionOutcome PersistQueuedEnsure(
+        long seq, EnsureSnapshotRequest request, string hash, AuditCaller principal, long admittedAt,
+        bool bestEffort = false, string? admissionId = null,
+        long? shareWithSeq = null, Func<bool>? shareLive = null, Action? onAdmitted = null)
     {
         try
         {
-            GrantWrite(conn =>
+            var outcome = GrantWrite(conn =>
             {
+                var convergence = NeedsBranchConvergence(request);
+                // The share decision is made here, once, for a live request: a share admits nothing, so a replayed
+                // queued ensure (durable, so never a share) always takes its own turn and nothing re-derives it.
+                if (convergence && shareWithSeq is long target && target != seq && (shareLive?.Invoke() ?? true))
+                {
+                    var shareIntents = new BranchIntentStore(conn);
+                    if (shareIntents.GetByQueuedEnsureId(target) is { } shared
+                        && shareIntents.IsNewestEnsureBefore(shared.Id))
+                        return new EnsureAdmissionOutcome(target, shared.AdmissionId);
+                }
                 using var cmd = conn.CreateCommand();
                 cmd.CommandText = """
                     INSERT OR REPLACE INTO queued_ensures
@@ -62,60 +115,157 @@ public sealed partial class SnapshotService
                 cmd.Parameters.AddWithValue("@suffix", (object?)principal.DetailSuffix ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("@ctenant", (object?)principal.UserTenant ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("@csubject", (object?)principal.UserSubject ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("@at", _timeProvider.GetUtcNow().ToUnixTimeMilliseconds());
+                cmd.Parameters.AddWithValue("@at", admittedAt);
                 cmd.ExecuteNonQuery();
-                return 0;
-            });
+                BeforeQueuedEnsureWriteForTesting?.Invoke();
+                string? admitted = admissionId;
+                if (convergence)
+                {
+                    BeforeConvergenceAdmissionForTesting?.Invoke();
+                    var snapshots = new SnapshotStore(conn);
+                    var repository = snapshots.GetRepositoryId(request.RepositoryRemoteUrl)
+                        ?? snapshots.EnsureRepository(request.RepositoryRemoteUrl, admittedAt);
+                    var intents = new BranchIntentStore(conn);
+                    var ensureIntent = intents.GetByQueuedEnsureId(seq);
+                    ensureIntent ??= intents.Admit(repository, request.BranchName ?? "main", "ensure", seq, admissionId,
+                        JsonSerializer.Serialize(request, ServiceJson.Options), admittedAt);
+                    admitted = ensureIntent.AdmissionId;
+                    AdmitFollowingRefresh(conn, ensureIntent);
+                }
+                onAdmitted?.Invoke();
+                return new EnsureAdmissionOutcome(seq, admitted);
+            }, synchronizeQueuedMetrics: true);
+            if (outcome.SharedWith(seq))
+                return outcome;
+            if (NeedsBranchConvergence(request))
+                WakeBranchIntentForQueuedEnsure(seq);
+            ProgressForTesting?.Invoke();
+            return outcome;
         }
         catch (Exception ex)
         {
-            Log($"Could not persist the queued ensure {hash} (it still runs, but a restart would not resume it): {ex.Message}");
+            Log($"queued_ensure_admission_failed seq={seq} error={ex.GetType().Name}");
+            if (!bestEffort || LeaseLost || _lifetime.IsCancellationRequested)
+                throw;
+            onAdmitted?.Invoke();
+            return new EnsureAdmissionOutcome(seq, admissionId);
         }
     }
 
-    // An ensure whose identity already has a complete/partial job just attaches it (and moves the branch pointer, in
-    // milliseconds): a restart gains nothing from replaying it, so it costs no catalog write.
-    private bool IsNoOpAttach(EnsureSnapshotRequest request, string hash)
+    // Admits an ensure intent's own following refresh (and its marker) directly behind the ensure, in the transaction that
+    // admits the ensure (rule 1: the branch then converges to the newest head after the ensure's own commit). Its id is
+    // recorded on the ensure (following_refresh_id) for the identical-ensure share check. An ensure that already has one,
+    // or has settled, gets none.
+    private static void AdmitFollowingRefresh(Microsoft.Data.Sqlite.SqliteConnection conn, BranchIntent ensureIntent)
+    {
+        if (ensureIntent.FollowingRefreshId is not null || ensureIntent.State == "settled")
+            return;
+        var refresh = new BranchIntentStore(conn).AdmitFollowingRefresh(ensureIntent, Guid.NewGuid().ToString("N"));
+        new PendingRefreshStore(conn).Admit(refresh.RepositoryId, refresh.Branch, refresh.AdmissionId!, refresh.AdmittedAt);
+    }
+
+    private bool CanAttachWithoutAdmission(EnsureSnapshotRequest request, string hash)
     {
         if (request.RebuildGeneration is not null)
             return false;
         try
         {
-            var job = ReadCatalog(conn => new SnapshotJobStore(conn).GetJobByIdentity(hash));
-            return job?.Status is SnapshotJobStatus.Complete or SnapshotJobStatus.Partial;
+            return ReadCatalog(conn =>
+            {
+                var jobs = new SnapshotJobStore(conn);
+                var job = jobs.GetJobByIdentity(hash);
+                return job is not null && SnapshotJobStatus.IsTerminal(job.Status)
+                    && TerminalResultUsable(job, hash, new SnapshotStore(conn), jobs)
+                    && (!NeedsBranchConvergence(request) || job.SnapshotId is null);
+            });
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            Log($"queued_ensure_attach_lookup_failed error={ex.GetType().Name}");
             return false;
         }
     }
 
-    // Fallback cleanup for faults and duplicate replay rows. Successful owners delete under the writer gate.
-    // Shutdown, a lost lease and a transient requeue keep the row for the next instance.
-    private void ForgetQueuedEnsure(long seq, Task<EnsureSnapshotResult> outcome)
+    private static QueuedRow? ReadQueuedRow(Microsoft.Data.Sqlite.SqliteConnection conn, long seq)
     {
-        if (_lifetime.IsCancellationRequested || LeaseLost || outcome.IsCanceled
-            || (outcome.IsCompletedSuccessfully && outcome.Result.Status == SnapshotJobStatus.Queued))
-            return;
-        _ = DeleteQueuedEnsureAsync(seq);
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT seq, request_json, restricts_implicit_default, lookup_tenant, hashed_actor, detail_suffix,
+                   caller_tenant, caller_subject, admitted_at
+            FROM queued_ensures WHERE seq = @seq;
+            """;
+        cmd.Parameters.AddWithValue("@seq", seq);
+        using var reader = cmd.ExecuteReader();
+        return reader.Read()
+            ? new QueuedRow(reader.GetInt64(0), reader.GetString(1), reader.GetInt64(2) != 0,
+                reader.IsDBNull(3) ? null : reader.GetString(3),
+                reader.IsDBNull(4) ? null : reader.GetString(4),
+                reader.IsDBNull(5) ? null : reader.GetString(5),
+                reader.IsDBNull(6) ? null : reader.GetString(6),
+                reader.IsDBNull(7) ? null : reader.GetString(7),
+                reader.GetInt64(8))
+            : null;
     }
 
-    private async Task DeleteQueuedEnsureAsync(long seq)
+    // The sequence an identical earlier ensure resolved to, once its own admission transaction has finished (so this
+    // admission's transaction can see its intent). A candidate whose admission failed has no intent to share.
+    private static async Task<long?> ShareTargetAsync(EnsureShareCandidate? share)
+    {
+        if (share is null)
+            return null;
+        await ((Task)share.Admission).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+        return share.Admission.IsCompletedSuccessfully ? share.Admission.Result.Seq : null;
+    }
+
+    // Duplicate replay rows are cleaned up only after their shared operation settles. Faults retain durable work.
+    private void ForgetQueuedEnsure(long seq, Task<EnsureSnapshotResult> outcome, bool finishMetricAfterCleanup = false)
+    {
+        if (_lifetime.IsCancellationRequested || LeaseLost || !outcome.IsCompletedSuccessfully
+            || !SnapshotJobStatus.IsSettled(outcome.Result.Status))
+        {
+            if (finishMetricAfterCleanup)
+                _metrics.RecordQueuedEnsureFinished(seq);
+            return;
+        }
+        _ = DeleteQueuedEnsureAsync(seq, outcome.Result.Status, finishMetricAfterCleanup);
+    }
+
+    private async Task DeleteQueuedEnsureAsync(long seq, string status, bool finishMetricAfterCleanup = false)
     {
         try
         {
-            await RunGrantWriteAsync(conn =>
+            var removed = await RunGrantWriteAsync(conn =>
             {
                 using var cmd = conn.CreateCommand();
                 cmd.CommandText = "DELETE FROM queued_ensures WHERE seq = @seq;";
                 cmd.Parameters.AddWithValue("@seq", seq);
-                return cmd.ExecuteNonQuery();
-            }, CancellationToken.None).ConfigureAwait(false);
+                var removed = cmd.ExecuteNonQuery();
+                new BranchIntentStore(conn).SettleByQueuedEnsureId(
+                    seq, status, _timeProvider.GetUtcNow().ToUnixTimeMilliseconds());
+                if (finishMetricAfterCleanup)
+                    _metrics.RecordQueuedEnsureFinished(seq);
+                return removed;
+            }, CancellationToken.None, synchronizeQueuedMetrics: true).ConfigureAwait(false);
+            if (removed > 0)
+            {
+                WakeBranchIntentForQueuedEnsure(seq);
+                SchedulePendingRefreshes();
+            }
         }
+
         catch (Exception ex)
         {
             Log($"queued_ensure_cleanup_failed seq={seq} error={ex.GetType().Name}; retained for replay");
+            if (finishMetricAfterCleanup)
+                _metrics.RecordQueuedEnsureFinished(seq);
         }
+    }
+
+    private void WakeBranchIntentForQueuedEnsure(long seq)
+    {
+        var intent = ReadCatalog(conn => new BranchIntentStore(conn).GetByQueuedEnsureId(seq));
+        if (intent is not null)
+            WakeBranchIntent(intent.RepositoryId, intent.Branch);
     }
 
     private static void Observe(Task task) =>
@@ -127,114 +277,53 @@ public sealed partial class SnapshotService
         string? CallerTenant, string? CallerSubject, long AdmittedAt);
 
     /// <summary>
-    /// Startup only, after <see cref="ReconcileOnStartup"/> has settled the orphaned queued jobs: re-admits every
-    /// persisted ensure in its original admission order. Each row is evaluated on its own: one older than
-    /// <see cref="ServiceOptions.QueuedEnsureMaxAge"/>, malformed, refused by the CURRENT <see cref="RepositoryUrlPolicy"/>
-    /// or no longer granted to its user caller is dropped (logged; a policy or grant refusal is audited), and a row
-    /// that throws never stops the others or the startup. Returns how many were re-admitted.
+    /// Startup only, after <see cref="ReconcileOnStartup"/> has settled the orphaned queued jobs (rule 6): resumes every
+    /// persisted ensure in sequence order and every unsettled retire/delete intent. Their order on a branch is the branch
+    /// intent queue's (each waits for its branch head), so startup order decides nothing. A replayed ensure never shares
+    /// (only a live request can): it takes its own turn at its place. Each row is decided on its own (see
+    /// <see cref="ResumeQueuedRow"/>), and a row that fails never stops the others or the startup. Returns how many
+    /// queued rows were handed to replay.
     /// </summary>
-    internal int ReplayQueuedEnsures()
+    internal int ReplayDurableAdmissions()
     {
-        var (rows, maxSeq) = ReadCatalog(conn =>
+        var (rows, maxSeq, retirements) = ReadCatalog(conn =>
         {
-            var list = new List<QueuedRow>();
+            var seqs = new List<long>();
             using var cmd = conn.CreateCommand();
-            cmd.CommandText = """
-                SELECT seq, request_json, restricts_implicit_default, lookup_tenant, hashed_actor, detail_suffix,
-                       caller_tenant, caller_subject, admitted_at
-                FROM queued_ensures ORDER BY seq;
-                """;
-            using var reader = cmd.ExecuteReader();
-            while (reader.Read())
-                list.Add(new QueuedRow(reader.GetInt64(0), reader.GetString(1), reader.GetInt64(2) != 0,
-                    reader.IsDBNull(3) ? null : reader.GetString(3),
-                    reader.IsDBNull(4) ? null : reader.GetString(4),
-                    reader.IsDBNull(5) ? null : reader.GetString(5),
-                    reader.IsDBNull(6) ? null : reader.GetString(6),
-                    reader.IsDBNull(7) ? null : reader.GetString(7),
-                    reader.GetInt64(8)));
-            return (list, list.Count == 0 ? 0L : list.Max(r => r.Seq));
+            cmd.CommandText = "SELECT seq FROM queued_ensures ORDER BY seq;";
+            using (var reader = cmd.ExecuteReader())
+                while (reader.Read())
+                    seqs.Add(reader.GetInt64(0));
+            var retires = new BranchIntentStore(conn).ListUnsettled().Where(i => i.Kind is "retire" or "delete").ToList();
+            return (seqs, seqs.Count == 0 ? 0L : seqs.Max(), retires);
         });
 
-        // Seeded from EVERY row, usable or not, before any admission: a live ensure must never take the seq of a row
-        // that is still to be deleted (INSERT OR REPLACE would let that delete remove the live ensure's row).
+        // Seeded from every row before any admission: a live ensure must never take the seq of a row still to be deleted.
         lock (_inFlightLock)
             _ensureSeq = Math.Max(_ensureSeq, maxSeq);
 
-        var oldest = _timeProvider.GetUtcNow() - _options.QueuedEnsureMaxAge;
         var replayed = 0;
-        var dropped = 0;
         var duplicatesBefore = _duplicateEnsureAdmissions;
-        foreach (var row in rows)
+        foreach (var seq in rows)
         {
-            try
+            if (_lifetime.IsCancellationRequested || LeaseLost)
             {
-                if (DateTimeOffset.FromUnixTimeMilliseconds(row.AdmittedAt) < oldest)
-                {
-                    Log($"Dropped queued ensure #{row.Seq}: older than {_options.QueuedEnsureMaxAge}.");
-                    Drop(row);
-                    continue;
-                }
-
-                var request = JsonSerializer.Deserialize<EnsureSnapshotRequest>(row.Json, ServiceJson.Options);
-                if (request is null || request.BranchGuardProblem() is not null)
-                {
-                    Log($"Dropped queued ensure #{row.Seq}: its request is unusable.");
-                    Drop(row);
-                    continue;
-                }
-                request = request with { RestrictsImplicitDefault = row.Restricts, LookupTenant = row.Tenant };
-                var actor = new AuditCaller(null, (row.Suffix ?? "") + ";replay", row.Actor);
-
-                var decision = _options.RepositoryUrlPolicy.Evaluate(request.RepositoryRemoteUrl);
-                if (!decision.Ok)
-                {
-                    Log($"Dropped queued ensure #{row.Seq}: the repository URL policy now refuses it ({decision.Reason}).");
-                    Observe(RecordEnsureDeniedAsync($"replay_{decision.Reason}", actor, _lifetime.Token));
-                    Drop(row);
-                    continue;
-                }
-
-                if (row.CallerSubject is not null)
-                {
-                    var key = RepositoryGrantKey.Of(request.RepositoryRemoteUrl);
-                    var visible = ReadCatalog(conn => new RepositoryGrantStore(conn)
-                        .VisibleKeys(row.CallerTenant ?? "", row.CallerSubject, LeaseCutoff(), LeaseCeiling()));
-                    if (!visible.Contains(key))
-                    {
-                        Log($"Dropped queued ensure #{row.Seq}: its user caller no longer has a grant on the repository.");
-                        Observe(RecordUserEnsureDeniedAsync(key, $"replay_{GrantReason.NotGranted}", actor, _lifetime.Token));
-                        Drop(row);
-                        continue;
-                    }
-                }
-
-                var (_, completion, _, _) = StartEnsureOperation(request,
-                    new AuditCaller(null, row.Suffix, row.Actor, row.CallerTenant, row.CallerSubject), row.Seq);
-                Observe(completion);
-                replayed++;
-            }
-            catch (Exception ex) when (ex is ObjectDisposedException or OperationCanceledException)
-            {
-                Log($"Stopped replaying queued ensures at #{row.Seq} (shutting down); the rest stay for the next start.");
+                Log("Stopped replaying queued ensures (shutting down or writer unavailable); the rest stay for the next start.");
                 break;
             }
-            catch (Exception ex)
-            {
-                Log($"Dropped queued ensure #{row.Seq}: it could not be re-admitted ({ex.GetType().Name}: {ex.Message}).");
-                Drop(row);
-            }
+            ResumeQueuedRow(seq);
+            replayed++;
+        }
+        foreach (var retirement in retirements)
+        {
+            if (_lifetime.IsCancellationRequested || LeaseLost)
+                break;
+            ReplayRetirement(retirement);
         }
 
         if (rows.Count > 0)
-            Log($"Re-admitted {replayed} queued ensure(s) persisted by the previous run " +
-                $"({dropped} dropped; {_duplicateEnsureAdmissions - duplicatesBefore} duplicate admission(s) shared).");
+            Log($"Resumed {replayed} queued ensure(s) persisted by the previous run " +
+                $"({_duplicateEnsureAdmissions - duplicatesBefore} duplicate admission(s) shared).");
         return replayed;
-
-        void Drop(QueuedRow row)
-        {
-            dropped++;
-            Observe(DeleteQueuedEnsureAsync(row.Seq));
-        }
     }
 }

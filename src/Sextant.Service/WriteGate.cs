@@ -25,6 +25,11 @@ internal sealed class WriteGate
     private readonly LinkedList<Waiter> _expedited = new();
     private readonly TimeProvider _time;
     private bool _held;
+    // Completes when the current hold ends (a release, including one handed over to a waiter).
+    private TaskCompletionSource _holdReleased = NewHoldSignal();
+
+    private static TaskCompletionSource NewHoldSignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private Task? _holderTurn;
     private bool _holderIsPriority;
     private bool _holderIsExpedited;
     private DateTimeOffset _holderSince;
@@ -95,8 +100,10 @@ internal sealed class WriteGate
         {
             if (!_held)
             {
-                Take(priority, expedited);
-                return Task.CompletedTask;
+                var granted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                Take(priority, expedited, granted.Task);
+                granted.SetResult();
+                return granted.Task;
             }
             waiter = new Waiter(priority, expedited);
             waiter.Node = (priority ? _priority : expedited ? _expedited : _normal).AddLast(waiter);
@@ -120,10 +127,12 @@ internal sealed class WriteGate
     public void Release()
     {
         Waiter? next;
+        TaskCompletionSource released;
         lock (_lock)
         {
             if (!_held)
                 throw new SemaphoreFullException("The write gate was released more often than it was taken.");
+            released = _holdReleased;
 
             if (_holderIsPriority && _normal.Count + _expedited.Count > 0)
                 _priorityBurst += _time.GetUtcNow() - _holderSince;
@@ -146,13 +155,27 @@ internal sealed class WriteGate
             {
                 next.Node!.List!.Remove(next.Node);
                 next.Node = null;
-                Take(next.Priority, next.Expedited);
+                Take(next.Priority, next.Expedited, next.Turn.Task);
             }
         }
+        released.TrySetResult();
         if (next is not null)
         {
             next.Registration.Dispose();
             next.Turn.TrySetResult();
+        }
+    }
+
+    /// <summary>
+    /// A task that completes when the hold current at the call ends (already completed when the gate is free). Used
+    /// to look at the gate after the writer that produced a job has released it, not while it is still finishing.
+    /// </summary>
+    internal Task CurrentHoldReleased
+    {
+        get
+        {
+            lock (_lock)
+                return _held ? _holdReleased.Task : Task.CompletedTask;
         }
     }
 
@@ -180,9 +203,12 @@ internal sealed class WriteGate
     }
 
     // Caller holds _lock.
-    private void Take(bool priority, bool expedited = false)
+    private void Take(bool priority, bool expedited, Task turn)
     {
         _held = true;
+        if (_holdReleased.Task.IsCompleted)
+            _holdReleased = NewHoldSignal();
+        _holderTurn = turn;
         _holderIsPriority = priority;
         _holderIsExpedited = !priority && expedited;
         _holderSince = _time.GetUtcNow();
@@ -191,6 +217,12 @@ internal sealed class WriteGate
         _priorityBurst = TimeSpan.Zero;
         if (!expedited)
             _expeditedStreak = 0;
+    }
+
+    internal bool Owns(Task? turn)
+    {
+        lock (_lock)
+            return _held && turn is not null && ReferenceEquals(turn, _holderTurn);
     }
 
     private void Cancel(Waiter waiter)

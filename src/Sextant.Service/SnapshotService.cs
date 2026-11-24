@@ -4,6 +4,7 @@ using Sextant.Core;
 using Sextant.Core.Platform;
 using Sextant.Service.Backup;
 using Sextant.Service.Contributions;
+using Sextant.Service.Grants;
 using Sextant.Service.Observability;
 using Sextant.Service.Rollout;
 using Sextant.Service.Sandbox;
@@ -43,7 +44,18 @@ public sealed partial class SnapshotService : IDisposable
     private readonly IndexDatabase _db;
     /// <summary>The write-session options of the catalog database this service (and its worker) writes through.</summary>
     internal IndexWriteOptions WriteOptions => _db.WriteOptions;
-    private readonly SqliteConnection _conn;
+    private readonly SqliteConnection _writerConnection;
+    private SqliteConnection _conn
+    {
+        get
+        {
+            AssertWriterTurn();
+            return _writerConnection;
+        }
+    }
+    private readonly AsyncLocal<Task?> _writerTurn = new();
+    private bool _guardWriterAccess;
+    private int _writerTraceViolations;
     private readonly WriterLease _lease;
     private readonly WriteGate _writeGate;
     private readonly WriteLockTracker _writeLocks;
@@ -68,21 +80,22 @@ public sealed partial class SnapshotService : IDisposable
     // production.
     private readonly CancellationTokenSource _lifetime = new();
     private readonly Lock _inFlightLock = new();
+    private readonly Dictionary<(long RepositoryId, string Branch), TaskCompletionSource> _branchIntentWakeups = [];
+    private readonly Dictionary<string, string> _ensureRepositorySpellings = new(StringComparer.Ordinal);
+    // Replay must finish admitting the durable queue before its first turn inspects linked successors.
+    private readonly TaskCompletionSource _replayAdmissions = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly Dictionary<string, InFlightProduction> _inFlight = new(StringComparer.Ordinal);
     private readonly HashSet<Task> _operations = [];
     private volatile bool _leaseReleased;
     private volatile bool _disposed;
 
     // Issue #158: ensures and retires take their turn on the writer at admission, in submission order (see
-    // TakeWriteTurnLocked). _writeAdmissions counts every write admitted to the gate (Interlocked) and _pendingRetire,
-    // guarded by _inFlightLock, is the latest retire still waiting for its turn (the only one an identical retire may
-    // coalesce into, and only while no other write was admitted after it). Job ids are handed out before their rows
-    // exist through _jobIds. _pendingEnsures (guarded by _inFlightLock) counts the ensure operations of each identity
+    // TakeWriteTurnLocked). _writeAdmissions counts every write admitted to the gate (Interlocked). Job ids are
+    // handed out before their rows exist through _jobIds. _pendingEnsures (guarded by _inFlightLock) counts the ensure operations of each identity
     // that have not finished: an identity's id reservation lives while one of them may still register it, and is
     // dropped once none is left (EndPendingEnsureLocked), so a registration that failed or rolled back never leaves a
     // reserved id reading as queued forever.
     private long _writeAdmissions;
-    private PendingRetire? _pendingRetire;
 
     // Idle-branch retirements admitted and not yet applied (issue #333), guarded by _inFlightLock: the next maintenance
     // tick leaves these branches out, so a step that stopped waiting never grows the queue with duplicates.
@@ -104,11 +117,9 @@ public sealed partial class SnapshotService : IDisposable
             return _pendingIdleRetires.Contains(IdleRetireKey(repository, branch));
     }
 
-    // Issue #273: the latest admitted branch-advance ensure per (repository, branch), guarded by _inFlightLock. When a
-    // newer linked one is admitted while the previous one is still waiting for its turn, the previous one is superseded:
-    // it is settled as coalesced at its turn instead of producing, and records a durable handover of its
-    // compare-and-swap that the newer one resolves at its own turn (ResolveHandedOverExpectation).
+    // The latest admitted feature-branch advance ensure per (repository, branch).
     private readonly Dictionary<string, AdvanceTicket> _latestAdvance = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, int> _pendingDefaultEnsures = new(StringComparer.Ordinal);
     private readonly JobIdReservations _jobIds;
     private readonly Dictionary<string, int> _pendingEnsures = new(StringComparer.Ordinal);
 
@@ -125,14 +136,14 @@ public sealed partial class SnapshotService : IDisposable
         _paths = paths;
         SourceTexts = new SourceTextStore(paths.SourceTextRoot);
         _db = db;
-        _conn = db.GetConnection();
+        _writerConnection = db.GetConnection();
         _lease = lease;
         _ownsDatabase = ownsDatabase;
         _authorizer = authorizer;
         _gitContent = gitContent;
         _contributionPolicy = contributionPolicy;
         _remoteDefaults = remoteDefaults is null ? null : new RemoteDefaultBranchLookup(
-            remoteDefaults, null, remoteDefaults as IRemoteBranchHeadResolver, remoteDefaults as IRemoteCommitBranchChecker);
+            remoteDefaults, timeProvider ?? TimeProvider.System, remoteDefaults as IRemoteBranchHeadResolver, remoteDefaults as IRemoteCommitBranchChecker);
         _remoteBranches = remoteBranches;
         _headResolver = remoteDefaults as IRemoteBranchHeadResolver;
         _timeProvider = timeProvider ?? TimeProvider.System;
@@ -249,7 +260,15 @@ public sealed partial class SnapshotService : IDisposable
                 service._jobIds.Load();
                 service.LogTenantGrantLease();
                 service.ReconcileOnStartup();
-                service.ReplayQueuedEnsures();
+                try
+                {
+                    service.ReplayDurableAdmissions();
+                }
+                finally
+                {
+                    service._replayAdmissions.TrySetResult();
+                }
+                service.StartIntentScheduling();
                 service.StartMaintenanceLoop();
                 service.StartObservabilityLoops();
                 return service;
@@ -317,9 +336,12 @@ public sealed partial class SnapshotService : IDisposable
             var jobs = new SnapshotJobStore(_conn);
             var count = jobs.ReconcileOrphanedJobs(_lease.OwnerToken)
                       + jobs.ReconcilePhantomTerminalJobs();
+            var releasedRefreshes = new PendingRefreshStore(_conn).ReleaseDeadClaims(_refreshTurnId);
+            var releasedIntents = new BranchIntentStore(_conn).ReleaseClaims();
             // Durable audit trail of the recovery action (criterion 5). Service-wide (no repository scope).
             new AuditLogStore(_conn).Append(
-                AuditAction.Reconcile, AuditOutcome.Complete, detail: $"reconciled_{count}");
+                AuditAction.Reconcile, AuditOutcome.Complete,
+                detail: $"reconciled_{count};refresh_claims_released={releasedRefreshes};branch_intents_released={releasedIntents}");
             SettleOrphanedQueuedJobsLocked(jobs);
             return count;
         });
@@ -334,10 +356,9 @@ public sealed partial class SnapshotService : IDisposable
 
     // Issue #327: at startup no job has a live in-process turn, so every queued row is an orphan of an earlier run (its
     // turn was lost to a restart, a cancel or a retention requeue). Settle it with the existing statuses, in bounded
-    // transactions: coalesced when a newer job of its branch already ran (complete/partial/failed/unsupported; that job
-    // produced the branch's snapshot or is itself re-produced on a later ensure; the successor already used any head the
-    // coalesced commit expected, so no handover is recorded, and the row carries no expected_head_commit to record),
-    // cancelled otherwise. A later ensure of either identity produces it again. Timestamps are not touched.
+    // transactions: coalesced when a newer job of its branch already ran, cancelled otherwise. The durable ensure
+    // admission is replayed separately and applies the current branch-specific behavior (default refresh or feature
+    // handover). A later ensure of either identity produces it again. Timestamps are not touched.
     // MUST only run before admission opens (it takes the write gate and treats every queued row as orphaned).
     private const int StartupSettleBatchSize = 500;
 
@@ -404,7 +425,21 @@ public sealed partial class SnapshotService : IDisposable
     public async Task<EnsureSnapshotResult> EnsureSnapshotAsync(
         EnsureSnapshotRequest request, CancellationToken cancellationToken = default, AuditCaller principal = default)
     {
-        var (_, completion, _, _) = StartEnsureOperation(request, principal);
+        var refresh = await ResolveRefreshRequestAsync(request, cancellationToken).ConfigureAwait(false);
+        if (refresh.IsRefresh)
+        {
+            if (!refresh.IsDefaultConfirmed)
+            {
+                await RecordEnsureDeniedAsync(BranchGuardReason.RefreshDefaultUnconfirmed, principal, cancellationToken)
+                    .ConfigureAwait(false);
+                return RejectedRefreshResult();
+            }
+            var admissionId = Guid.NewGuid().ToString("N");
+            var (_, refreshCompletion) = await AdmitRefreshAsync(request, principal, admissionId, cancellationToken).ConfigureAwait(false);
+            return await WaitForCallerAsync(refreshCompletion, cancellationToken).ConfigureAwait(false);
+        }
+        var (_, completion, _, persisted, _, _) = StartEnsureOperation(request, principal);
+        await persisted.WaitAsync(cancellationToken).ConfigureAwait(false);
         return await WaitForCallerAsync(completion, cancellationToken).ConfigureAwait(false);
     }
 
@@ -420,31 +455,117 @@ public sealed partial class SnapshotService : IDisposable
     /// when the row exists, else an id RESERVED for it, which <see cref="GetStatus"/> reports as <c>queued</c> at
     /// once and which the row is inserted with when the ensure's turn on the writer comes. The ensure itself stays
     /// queued and service-owned, so it registers and produces even after this caller has gone; a second ensure of the
-    /// same identity gets the same id. Ensures and retires take the writer in submission order. The only case that
-    /// keeps waiting past the bound is a reservation whose id floor cannot be persisted (see
-    /// <see cref="JobIdReservations"/>): then no unrecorded id is handed out. <paramref name="cancellationToken"/>
-    /// only bounds this caller's wait.
+    /// same identity gets the same id. For remote branch-moving ensures, the response bound includes recording a
+    /// durable admission; a catalog lock past the bound produces <see cref="GrantStoreUnavailableException"/>.
+    /// Other ensures await their best-effort admission outside the bound; a failed write can leave queued work
+    /// without a replay record. The service-owned ensure remains active in either case.
+    /// <paramref name="cancellationToken"/> only bounds this caller's wait.
     /// </para>
     /// </summary>
     public async Task<EnsureSnapshotResult> BeginEnsureSnapshotAsync(
         EnsureSnapshotRequest request, AuditCaller principal = default, CancellationToken cancellationToken = default)
     {
-        var (accepted, _, hash, persisted) = StartEnsureOperation(request, principal);
+        var refresh = await ResolveRefreshRequestAsync(request, cancellationToken).ConfigureAwait(false);
+        if (refresh.IsRefresh)
+        {
+            if (!refresh.IsDefaultConfirmed)
+            {
+                await RecordEnsureDeniedAsync(BranchGuardReason.RefreshDefaultUnconfirmed, principal, cancellationToken)
+                    .ConfigureAwait(false);
+                return RejectedRefreshResult();
+            }
+            using var refreshResponseBound = new CancellationTokenSource(_options.ControlWriteWait, _timeProvider);
+            using var refreshWait = CancellationTokenSource.CreateLinkedTokenSource(
+                refreshResponseBound.Token, cancellationToken);
+            var refreshAdmissionId = Guid.NewGuid().ToString("N");
+            try
+            {
+                var (admission, _) = await AdmitRefreshAsync(request, principal, refreshAdmissionId, refreshWait.Token).ConfigureAwait(false);
+                return admission;
+            }
+            catch (OperationCanceledException) when (
+                refreshResponseBound.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                throw new GrantStoreUnavailableException(
+                    "The refresh admission could not be durably recorded within the control-write response bound; retry the request.")
+                { AdmissionId = refreshAdmissionId };
+            }
+        }
+        var (accepted, _, hash, persisted, _, admissionId) = StartEnsureOperation(request, principal);
+        if (!NeedsBranchConvergence(request))
+        {
+            if (!persisted.IsCompleted)
+                await persisted.WaitAsync(cancellationToken).ConfigureAwait(false);
+            if (!accepted.IsCompleted)
+            {
+                using var legacyBound = new CancellationTokenSource(_options.ControlWriteWait, _timeProvider);
+                using var legacyWait = CancellationTokenSource.CreateLinkedTokenSource(legacyBound.Token, cancellationToken);
+                ControlWaitStartedForTesting?.Invoke();
+                try
+                {
+                    await ((Task)accepted).WaitAsync(legacyWait.Token)
+                        .ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+                }
+                catch (OperationCanceledException) when (legacyBound.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+                {
+                }
+                if (!accepted.IsCompleted)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (QueuedResult(request, hash, null) is { } queued && !accepted.IsCompleted)
+                        return queued;
+                }
+            }
+            return await WaitForCallerAsync(accepted, cancellationToken).ConfigureAwait(false);
+        }
+
+        using var responseBound = new CancellationTokenSource(_options.ControlWriteWait, _timeProvider);
+        using var waitCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            responseBound.Token, cancellationToken);
         // Issue #406: the 202 is only given once the admitted ensure is durable (a short catalog write that does not
         // take the write gate; it can wait out an open publish transaction, bounded by the grant busy timeout).
-        if (!persisted.IsCompleted)
-            await persisted.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await persisted.WaitAsync(waitCancellation.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (responseBound.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            throw new GrantStoreUnavailableException(
+                "The queued ensure could not be durably admitted within the control-write response bound; retry the request.")
+            { AdmissionId = admissionId };
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            throw new GrantStoreUnavailableException(
+                "The queued ensure could not be durably admitted; retry the request.", ex)
+            { AdmissionId = admissionId };
+        }
+        // Issue #273 (D2): from here on the answer carries the admission the transaction resolved: this request's own
+        // intent, or the identical earlier ensure it shares. The candidate id is only for a 503 before that decision.
+        admissionId = persisted.Result.AdmissionId ?? admissionId;
         if (!accepted.IsCompleted)
         {
-            await ((Task)accepted).WaitAsync(_options.ControlWriteWait, cancellationToken)
-                .ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+            ControlWaitStartedForTesting?.Invoke();
+            try
+            {
+                await ((Task)accepted).WaitAsync(waitCancellation.Token)
+                    .ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+            }
+            catch (OperationCanceledException) when (responseBound.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                // The durable admission is already recorded; the reserved id can safely be returned as queued.
+            }
             if (!accepted.IsCompleted)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 // The writer is busy: answer with the identity's job id without it. A registration that settled
                 // meanwhile reports its own result (it carries the same id).
-                if (QueuedResult(request, hash) is { } queued && !accepted.IsCompleted)
+                if (QueuedResult(request, hash, admissionId) is { } queued && !accepted.IsCompleted)
                     return queued;
+                if (!accepted.IsCompleted && responseBound.IsCancellationRequested)
+                    throw new GrantStoreUnavailableException(
+                        "The queued ensure exceeded the control-write response bound before a safe job id could be reserved; retry the request.")
+                    { AdmissionId = admissionId };
             }
         }
         return await WaitForCallerAsync(accepted, cancellationToken).ConfigureAwait(false);
@@ -452,10 +573,10 @@ public sealed partial class SnapshotService : IDisposable
 
     // The wait=false answer for an ensure still waiting for the writer (issue #158): queued, with the job id the
     // ensure will register (or has registered) its identity under. Null when no id can be handed out safely.
-    private EnsureSnapshotResult? QueuedResult(EnsureSnapshotRequest request, string hash)
+    private EnsureSnapshotResult? QueuedResult(EnsureSnapshotRequest request, string hash, string? admissionId)
     {
         if (FindInFlight(hash) is { } inFlight)
-            return PendingResult(inFlight.JobId, hash);
+            return PendingResult(inFlight.JobId, hash, admissionId);
         var handed = _jobIds.ForCaller(
             hash, request.RepositoryRemoteUrl, request.CommitSha, request.BranchName,
             identity => ReadCatalog(conn => new SnapshotJobStore(conn).GetJobByIdentity(identity)?.Id));
@@ -470,7 +591,11 @@ public sealed partial class SnapshotService : IDisposable
             }
         }
         return handed is { } job
-            ? new EnsureSnapshotResult { JobId = job.Id, IdentityHash = hash, Status = SnapshotJobStatus.Queued, Attached = job.Existed }
+            ? new EnsureSnapshotResult
+            {
+                JobId = job.Id, IdentityHash = hash, Status = SnapshotJobStatus.Queued,
+                Attached = job.Existed, AdmissionId = admissionId
+            }
             : null;
     }
 
@@ -548,7 +673,7 @@ public sealed partial class SnapshotService : IDisposable
             CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
         try
         {
-            await write.WaitAsync(_options.DeniedAuditWait, cancellationToken).ConfigureAwait(false);
+            await write.WaitAsync(_options.DeniedAuditWait, _timeProvider, cancellationToken).ConfigureAwait(false);
         }
         catch (TimeoutException)
         {
@@ -585,29 +710,99 @@ public sealed partial class SnapshotService : IDisposable
         _options.DefaultConfigHash, _options.DefaultCapabilityFingerprint, _options.SdkPinIdentityComponent,
         _options.RestoreIdentityComponent).Hash;
 
+    private (EnsureSnapshotRequest Request, string RepositoryKey) PinEnsureRepositorySpelling(
+        EnsureSnapshotRequest request)
+    {
+        var repositoryKey = RemoteUrlIdentity.Normalize(request.RepositoryRemoteUrl);
+        var (catalogUrl, existingUrl) = ReadCatalog(conn => CatalogSpellings(conn, request, repositoryKey));
+
+        lock (_inFlightLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            ThrowIfStopping();
+            if (repositoryKey.Length == 0)
+                return (request, repositoryKey);
+
+            var spelling = existingUrl
+                ?? catalogUrl
+                ?? _ensureRepositorySpellings.GetValueOrDefault(repositoryKey)
+                ?? request.RepositoryRemoteUrl;
+            _ensureRepositorySpellings[repositoryKey] = spelling;
+            return (request with { RepositoryRemoteUrl = spelling }, repositoryKey);
+        }
+    }
+
+    // The repository spellings an ensure of `request` is pinned to: the catalog's spelling, and the spelling of an
+    // existing job or snapshot of the same identity (which wins). /control/resolve reads the same pair, so its
+    // current_identity_hash is the identity the resolving caller's ensure builds.
+    private (string? CatalogUrl, string? ExistingUrl) CatalogSpellings(
+        SqliteConnection conn, EnsureSnapshotRequest request, string repositoryKey)
+    {
+        var snapshots = new SnapshotStore(conn);
+        var repositoryId = snapshots.GetRepositoryId(request.RepositoryRemoteUrl);
+        var catalog = repositoryId is long id ? snapshots.GetRepositoryRemoteUrl(id) : null;
+        var jobs = new SnapshotJobStore(conn);
+        bool Exists(string spelling)
+        {
+            var hash = IdentityHashFor(request with { RepositoryRemoteUrl = spelling });
+            return jobs.GetJobByIdentity(hash) is not null
+                || snapshots.GetByIdentityHash(hash) is { } snapshot && snapshot.RepositoryId == repositoryId;
+        }
+        if (Exists(request.RepositoryRemoteUrl))
+            return (catalog, request.RepositoryRemoteUrl);
+        if (catalog is not null && Exists(catalog))
+            return (catalog, catalog);
+        foreach (var spelling in jobs.RepositorySpellings(repositoryKey, request.CommitSha))
+            if (Exists(spelling))
+                return (catalog, spelling);
+        if (repositoryId is long repository)
+            foreach (var spelling in snapshots.ProjectRepositorySpellings(repository, request.CommitSha))
+                if (RemoteUrlIdentity.Normalize(spelling) == repositoryKey && Exists(spelling))
+                    return (catalog, spelling);
+        return (catalog, (string?)null);
+    }
+
     // Starts one ensure as a service-owned background operation and returns (accepted, completion, identity hash): the
     // completion is the ensure's final result; accepted settles as soon as the job is registered (wait=false).
     // The operation is tracked so Dispose can drain it, and neither task can ever surface as an unobserved
     // exception when no caller is left waiting (the caller disconnected). Admission is atomic with Dispose's
     // drain snapshot (both under _inFlightLock): an operation either starts before shutdown closes admission
     // and is drained, or is refused, so none can run on against a released lease or a closed catalog.
-    private (Task<EnsureSnapshotResult> Accepted, Task<EnsureSnapshotResult> Completion, string Hash, Task Persisted) StartEnsureOperation(
-        EnsureSnapshotRequest request, AuditCaller principal, long? replaySeq = null)
+    private (Task<EnsureSnapshotResult> Accepted, Task<EnsureSnapshotResult> Completion, string Hash,
+        Task<EnsureAdmissionOutcome> Persisted, long Sequence, string? AdmissionId) StartEnsureOperation(
+        EnsureSnapshotRequest request, AuditCaller principal, long? replaySeq = null, long? replayAdmittedAt = null)
     {
         // SVC-6/7: a malformed branch guard is refused before any job exists. The host validates first and
         // answers 400; this protects direct callers.
         if (request.BranchGuardProblem() is { } problem)
             throw new ArgumentException($"The ensure request's branch guards are invalid ({problem}).", nameof(request));
-
         // The remote-default lookup (issue #199) is not part of the identity, so the hash is known before that lookup runs.
+        var pinned = PinEnsureRepositorySpelling(request);
+        request = pinned.Request;
+        var repositoryKey = pinned.RepositoryKey;
         var hash = IdentityHashFor(request);
-        var persist = replaySeq is null && !IsNoOpAttach(request, hash);
+        var convergence = NeedsBranchConvergence(request);
+        var unorderedAttach = replaySeq is null && CanAttachWithoutAdmission(request, hash);
+        var persist = replaySeq is null ? !unorderedAttach : convergence;
+        var candidateAdmissionId = convergence && !unorderedAttach && replaySeq is null
+            ? Guid.NewGuid().ToString("N")
+            : null;
         var accepted = new TaskCompletionSource<EnsureSnapshotResult>(TaskCreationOptions.RunContinuationsAsynchronously);
         Task<EnsureSnapshotResult> completion;
-        Task persisted = Task.CompletedTask;
+        Task<EnsureAdmissionOutcome> persisted;
         AdvanceTicket? ticket = null;
+        string? defaultEnsureKey = null;
         var admissionKey = EnsureAdmissionKey(request);
+        // Issue #273 (D2): a branch-moving remote ensure decides whether to share an identical earlier ensure in its own
+        // admission transaction, from branch_intents ids. Every other ensure (no intent) keeps the in-process barrier.
+        // Only a live request can share: a replayed or rescheduled queued ensure is durable, and anything durable takes its
+        // own turn, so that decision is never re-derived from neighbouring rows that retention may have pruned.
+        var durableShare = persist && convergence && replaySeq is null;
         long seq;
+        EnsureShareCandidate? shareCandidate = null;
+        Task<EnsureSnapshotResult>? shareCompletion = null;
+        Task<EnsureSnapshotResult>? shareAccepted = null;
+        Task<EnsureAdmissionOutcome> admission;
         lock (_inFlightLock)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -616,56 +811,158 @@ public sealed partial class SnapshotService : IDisposable
             if (_ensureAdmissions.TryGetValue(admissionKey, out var duplicate) && duplicate.Request == request
                 && duplicate.Principal.Actor == principal.Actor
                 && duplicate.Principal.UserTenant == principal.UserTenant && duplicate.Principal.UserSubject == principal.UserSubject
-                && duplicate.WriteAdmission == barrier && !duplicate.Completion.IsCompleted)
+                && !duplicate.Completion.IsCompleted)
             {
-                _duplicateEnsureAdmissions++;
-                if (replaySeq is long replay)
-                    _ = duplicate.Completion.ContinueWith(t => ForgetQueuedEnsure(replay, t),
-                        CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-                Log($"queued_ensure_duplicate seq={replaySeq?.ToString() ?? "live"} retained_seq={duplicate.Seq}");
-                var duplicateAccepted = _inFlight.TryGetValue(hash, out var producing)
-                    ? Task.FromResult(PendingResult(producing.JobId, hash))
-                    : AsAttached(duplicate.Accepted);
-                return (duplicateAccepted, AsAttached(duplicate.Completion), hash, duplicate.Persisted);
+                if (durableShare)
+                {
+                    var candidateCompletion = duplicate.Completion;
+                    shareCandidate = new EnsureShareCandidate(duplicate.Admission, () => !candidateCompletion.IsCompleted);
+                    shareCompletion = duplicate.Completion;
+                    shareAccepted = duplicate.Accepted;
+                }
+                // A durable (intent-backed) replayed ensure never shares; only ensures without an intent use the barrier.
+                else if (!(persist && convergence) && duplicate.WriteAdmission == barrier)
+                {
+                    _duplicateEnsureAdmissions++;
+                    if (replaySeq is long replay)
+                    {
+                        _metrics.RecordQueuedEnsureDuplicate(replay, hash, IsDefaultBranchWork(request),
+                            replayAdmittedAt ?? _timeProvider.GetUtcNow().ToUnixTimeMilliseconds());
+                        _liveQueuedEnsures.Add(replay);
+                        _ = duplicate.Completion.ContinueWith(t =>
+                            {
+                                lock (_inFlightLock)
+                                    _liveQueuedEnsures.Remove(replay);
+                                ForgetQueuedEnsure(replay, t, finishMetricAfterCleanup: true);
+                            },
+                            CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                    }
+                    Log($"queued_ensure_duplicate seq={replaySeq?.ToString() ?? "live"} retained_seq={duplicate.Seq}");
+                    var duplicateAccepted = _inFlight.TryGetValue(hash, out var producing)
+                        ? Task.FromResult(PendingResult(producing.JobId, hash, duplicate.AdmissionId))
+                        : AsAttached(duplicate.Accepted);
+                    return (duplicateAccepted, AsAttached(duplicate.Completion), hash, duplicate.Admission,
+                        duplicate.Seq, duplicate.AdmissionId);
+                }
             }
             // Issue #158: the ensure takes its turn on the writer now, in submission order. A user ensure that must
             // first look up the remote's default branch (issue #199) takes its turn once that lookup has finished.
             // Issue #403: an ensure that claims the default branch (only the application may; a user ensure with
             // default_branch is refused) takes the expedited lane, so it never waits behind feature-branch work.
             var expedited = IsDefaultBranchWork(request);
-            var turn = request.RestrictsImplicitDefault
+            var needsDefaultLookup = request.RestrictsImplicitDefault && !request.SuppressesBranchUpdate
+                && !RepositoryHasDefaultBranch(request.RepositoryRemoteUrl);
+            // Issue #273: a replayed intent-backed ensure reserves no turn at admission. Its order is its branch intent,
+            // and its admission may retry indefinitely, which must never hold a granted writer turn; it takes its turn
+            // once admitted (as the #199 lookup path does).
+            var turn = needsDefaultLookup || (replaySeq is not null && persist)
                 ? null
                 : TakeWriteTurnLocked(out _, expedited: expedited,
                     ensureAdmission: true);
             if (turn is not null)
                 ticket = AdmitAdvanceLocked(request, hash, expedited: expedited);
+            if (!request.SuppressesBranchUpdate)
+            {
+                defaultEnsureKey = RemoteUrlIdentity.Normalize(request.RepositoryRemoteUrl) + "\n" + (request.BranchName ?? "main");
+                _pendingDefaultEnsures[defaultEnsureKey] = _pendingDefaultEnsures.GetValueOrDefault(defaultEnsureKey) + 1;
+            }
             // Issue #406: the admission sequence orders a restart's replay; a replayed ensure keeps its persisted row.
             // The row is written on the grant connection (never the write gate) as part of admission: the wait=false
             // answer is held until it is durable, and the ensure's completion always follows it.
             seq = replaySeq ?? ++_ensureSeq;
             _ensureSeq = Math.Max(_ensureSeq, seq);
+            // Issue #273 (B1): the rescan never starts a second operation for a queued ensure that is live here.
+            _liveQueuedEnsures.Add(seq);
             var admittedSeq = seq;
-            if (persist)
-                persisted = Task.Run(() => PersistQueuedEnsure(admittedSeq, request, hash, principal), CancellationToken.None);
-            var rowWritten = persisted;
+            var admittedAt = replayAdmittedAt ?? _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
+            // A possible share is not counted as queued until its transaction admits it on its own.
+            if (shareCandidate is null)
+                _metrics.RecordQueuedEnsureAdmission(seq, hash, expedited, admittedAt);
+            else
+                _metrics.RecordQueuedEnsureDuplicate(seq, hash, expedited, admittedAt);
+            Action onAdmitted = shareCandidate is null
+                ? () => { }
+                : () => _metrics.RecordQueuedEnsureAdmission(admittedSeq, hash, expedited, admittedAt);
+            ProgressForTesting?.Invoke();
+            if (!persist)
+                admission = Task.FromResult(new EnsureAdmissionOutcome(seq, candidateAdmissionId));
+            else if (replaySeq is not null)
+                // A replayed queued ensure is started only by its owner, after its admission committed.
+                admission = Task.FromResult(new EnsureAdmissionOutcome(seq, null));
+            else
+                admission = Task.Run(async () =>
+                {
+                    var shareWithSeq = await ShareTargetAsync(shareCandidate).ConfigureAwait(false);
+                    return PersistQueuedEnsure(admittedSeq, request, hash, principal, admittedAt,
+                        bestEffort: !convergence, admissionId: candidateAdmissionId,
+                        shareWithSeq: shareWithSeq, shareLive: shareCandidate?.Live, onAdmitted: onAdmitted);
+                }, CancellationToken.None);
+            persisted = admission;
+            if (ticket is not null)
+            {
+                ticket.Persisted = persisted;
+            }
+            var rowWritten = admission;
             completion = Task.Run(async () =>
             {
-                await rowWritten.ConfigureAwait(false);
-                return await RunEnsureAsync(request, hash, principal, accepted, turn, ticket, admittedSeq).ConfigureAwait(false);
+                EnsureAdmissionOutcome admitted;
+                try
+                {
+                    admitted = await rowWritten.ConfigureAwait(false);
+                }
+                catch
+                {
+                    if (turn is not null)
+                        ReleaseTurn(turn, granted: false);
+                    throw;
+                }
+                if (admitted.SharedWith(admittedSeq))
+                {
+                    // The admission transaction found the identical ensure still the branch's newest intent: this
+                    // request shares its operation and result, with no intent, worker run or writer turn of its own.
+                    if (turn is not null)
+                        ReleaseTurn(turn, granted: false);
+                    Interlocked.Increment(ref _duplicateEnsureAdmissions);
+                    Log($"queued_ensure_duplicate seq=live retained_seq={admitted.Seq}");
+                    ForwardSharedAcceptance(accepted, hash, admitted.AdmissionId, shareAccepted!);
+                    return await AsAttached(shareCompletion!).ConfigureAwait(false);
+                }
+                try
+                {
+                    var result = await RunEnsureAsync(request, hash, principal, accepted, turn, ticket, admittedSeq).ConfigureAwait(false);
+                    if (!SnapshotJobStatus.IsSettled(result.Status) && !_lifetime.IsCancellationRequested && !LeaseLost)
+                        DeferQueuedEnsure(admittedSeq, $"ensure_{result.Status}");
+                    return result;
+                }
+                catch (Exception ex)
+                {
+                    if (!_lifetime.IsCancellationRequested && !LeaseLost)
+                        DeferQueuedEnsure(admittedSeq, $"turn_{ex.GetType().Name}");
+                    throw;
+                }
             }, CancellationToken.None);
             _operations.Add(completion);
             _pendingEnsures[hash] = _pendingEnsures.GetValueOrDefault(hash) + 1;
-            _ensureAdmissions[admissionKey] = new(request, principal, seq, barrier, accepted.Task, completion, persisted);
+            _ensureAdmissions[admissionKey] = new(
+                request, principal, seq, barrier, candidateAdmissionId, accepted.Task, completion, admission);
         }
         completion.ContinueWith(
             t =>
             {
                 lock (_inFlightLock)
                 {
+                    _metrics.RecordQueuedEnsureFinished(seq);
                     _operations.Remove(t);
-                    if (_ensureAdmissions.TryGetValue(admissionKey, out var admission) && admission.Completion == t)
+                    _liveQueuedEnsures.Remove(seq);
+                    if (_ensureAdmissions.TryGetValue(admissionKey, out var pending) && pending.Completion == t)
                         _ensureAdmissions.Remove(admissionKey);
+                    if (repositoryKey.Length > 0
+                        && _ensureRepositorySpellings.TryGetValue(repositoryKey, out var spelling)
+                        && string.Equals(spelling, request.RepositoryRemoteUrl, StringComparison.Ordinal))
+                        _ensureRepositorySpellings.Remove(repositoryKey);
                     EndPendingEnsureLocked(hash);
+                    if (defaultEnsureKey is not null)
+                        EndPendingDefaultEnsureLocked(defaultEnsureKey);
                     if (ticket is not null)
                     {
                         ticket.Ended = true;
@@ -678,78 +975,102 @@ public sealed partial class SnapshotService : IDisposable
                 if (!t.IsCompletedSuccessfully)
                     ForgetQueuedEnsure(seq, t);
                 SettleAccepted(accepted, t);
+                ProgressForTesting?.Invoke();
+                if (defaultEnsureKey is not null)
+                    SchedulePendingRefreshes();
             },
             CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-        return (accepted.Task, completion, hash, persisted);
+        return (accepted.Task, completion, hash, persisted, seq, candidateAdmissionId);
+    }
+
+    // A request that shares an identical ensure answers its wait=false acceptance from that ensure's: the running
+    // production's job at once, or the shared acceptance once it settles (its final result settles it otherwise).
+    private void ForwardSharedAcceptance(
+        TaskCompletionSource<EnsureSnapshotResult> accepted, string hash, string? admissionId,
+        Task<EnsureSnapshotResult> shared)
+    {
+        InFlightProduction? producing;
+        lock (_inFlightLock)
+            _inFlight.TryGetValue(hash, out producing);
+        if (producing is not null)
+        {
+            accepted.TrySetResult(PendingResult(producing.JobId, hash, admissionId));
+            return;
+        }
+        _ = shared.ContinueWith(t =>
+            {
+                if (t.IsCompletedSuccessfully)
+                    accepted.TrySetResult(t.Result with { Attached = true, AdmissionId = t.Result.AdmissionId ?? admissionId });
+            },
+            CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
 
     private static async Task<EnsureSnapshotResult> AsAttached(Task<EnsureSnapshotResult> result) =>
         (await result.ConfigureAwait(false)) with { Attached = true };
 
-    // Issue #273: registers a branch-advance ensure guarded by expected_head_commit (what a repository push sends) as
-    // its branch's latest, superseding the previous one when that one is still waiting for its turn and this one expects
-    // its commit as the head. Nothing about the newer ensure changes here: whether the previous one really coalesces is
-    // only known at its turn (it may attach an already-built identity and advance the branch instead), and only then
-    // does it record the handover. Any other ensure (no branch, branch_update none, a head-sequence guard, a rebuild)
-    // is never superseded and supersedes nothing. The caller holds _inFlightLock.
-    private AdvanceTicket? AdmitAdvanceLocked(EnsureSnapshotRequest request, string hash, bool expedited)
+    private AdvanceTicket? AdmitAdvanceLocked(
+        EnsureSnapshotRequest request, string hash, bool expedited)
     {
         if (!IsBranchAdvance(request))
             return null;
 
         var key = RemoteUrlIdentity.Normalize(request.RepositoryRemoteUrl) + "\n" + request.BranchName;
-        var ticket = new AdvanceTicket { BranchKey = key, Hash = hash, CommitSha = request.CommitSha, Expedited = expedited };
-        // Only a linked successor supersedes: one that expects exactly the waiting commit as the branch head (the push
-        // of Z after Y sends before=Y). Any other expectation (an out-of-order or unrelated push) leaves both to run in
-        // order, so the branch ends exactly where serial processing would leave it.
-        if (_latestAdvance.TryGetValue(key, out var previous) && !previous.Started
+        var ticket = new AdvanceTicket
+        {
+            BranchKey = key,
+            Hash = hash,
+            CommitSha = request.CommitSha,
+            ExpectedHeadCommit = request.ExpectedHeadCommit!,
+            Expedited = expedited
+        };
+        if (!NeedsBranchConvergence(request)
+            && _latestAdvance.TryGetValue(key, out var previous) && !previous.Started
             && !string.Equals(previous.Hash, hash, StringComparison.Ordinal)
-            && string.Equals(request.ExpectedHeadCommit, previous.CommitSha, StringComparison.OrdinalIgnoreCase))
+            && string.Equals(previous.CommitSha, ticket.ExpectedHeadCommit, StringComparison.OrdinalIgnoreCase))
             previous.SupersededBy = ticket;
         _latestAdvance[key] = ticket;
         return ticket;
+    }
+
+    private bool WillBuildFeatureBranchHead(AdvanceTicket predecessor, AdvanceTicket successor)
+    {
+        if (_lifetime.IsCancellationRequested || (successor.Ended && !successor.Produced))
+            return false;
+        return successor.Expedited || !predecessor.Expedited;
     }
 
     // An ensure that ended without a snapshot serving its branch head (it threw, was cancelled, or its job failed).
     private static bool IsUnbuiltOutcome(string status) =>
         status is SnapshotJobStatus.Failed or SnapshotJobStatus.Unsupported or SnapshotJobStatus.Cancelled;
 
-    // A queued ensure may stand down for its successor only while the successor will surely build the branch head: the
-    // service is not stopping (a successor queued at shutdown is cancelled at restart, never built), the successor has
-    // not already ended without a snapshot, and its turn is not behind the superseded ensure's (an expedited
-    // default-branch ensure must not hand over to a normal-lane ensure that waits behind feature-branch builds, which
-    // left a branch head unindexed for hours). Otherwise the ensure is built. The caller holds _inFlightLock.
-    private bool WillBuildBranchHead(AdvanceTicket superseded, AdvanceTicket successor)
+    private bool IsCatalogDefaultBranch(EnsureSnapshotRequest request, SnapshotStore snapshots)
     {
-        if (_lifetime.IsCancellationRequested)
+        if (request.SuppressesBranchUpdate || request.BranchName is not { Length: > 0 })
             return false;
-        if (successor.Ended && !successor.Produced)
+        var repositoryId = snapshots.GetRepositoryId(request.RepositoryRemoteUrl);
+        if (repositoryId is not long id || snapshots.GetDefaultBranchId(id) is not long defaultBranchId)
             return false;
-        return successor.Expedited || !superseded.Expedited;
+        return snapshots.GetBranchById(defaultBranchId) is { } branch
+            && string.Equals(branch.Name, request.BranchName, StringComparison.Ordinal);
     }
 
-    // Issue #273: an ensure that advances its named branch under an expected_head_commit compare-and-swap, the shape a
-    // repository push sends. Only these coalesce, supersede, or resolve a handover.
+    // An ensure that advances its named branch under an expected_head_commit compare-and-swap. Default-branch
+    // refreshes and feature-branch linked successors both begin with this request shape.
     private static bool IsBranchAdvance(EnsureSnapshotRequest request) =>
         request.BranchName is { Length: > 0 } && !request.SuppressesBranchUpdate && request.ExpectedHeadCommit is not null
         && request.BranchHeadSequence is null && request.RebuildGeneration is null;
 
-    // Issue #273: the most handovers one resolution follows, bounding a cycle (a branch reset back and forth).
     private const int MaxHandoverHops = 64;
 
-    // Issue #273, under the write gate: a branch advance expecting a commit that is not the branch head but was coalesced
-    // on this branch in its favour (so it never became the head, and the head has not moved since) expects what that
-    // commit's ensure expected instead. Durable, so a successor retried after a requeue, a restart or a crash still
-    // advances the branch where serial processing would have; consumed by the next head move, so nothing else can.
-    private EnsureSnapshotRequest ResolveHandedOverExpectation(EnsureSnapshotRequest request)
+    private EnsureSnapshotRequest ResolveLinkedSuccessor(EnsureSnapshotRequest request)
     {
         if (!IsBranchAdvance(request))
             return request;
         var snapshots = new SnapshotStore(_conn);
         var jobs = new SnapshotJobStore(_conn);
-        var repositoryKey = RemoteUrlIdentity.Normalize(request.RepositoryRemoteUrl);
         var repositoryId = snapshots.GetRepositoryId(request.RepositoryRemoteUrl);
         var branchId = repositoryId is long repoId ? snapshots.GetBranchId(repoId, request.BranchName!) : null;
+        var repositoryKey = RemoteUrlIdentity.Normalize(request.RepositoryRemoteUrl);
         var expected = request.ExpectedHeadCommit!;
         var successor = request.CommitSha;
         for (var hop = 0;
@@ -781,6 +1102,14 @@ public sealed partial class SnapshotService : IDisposable
         _jobIds.Release(hash);
     }
 
+    private void EndPendingDefaultEnsureLocked(string key)
+    {
+        if (_pendingDefaultEnsures.GetValueOrDefault(key) > 1)
+            _pendingDefaultEnsures[key]--;
+        else
+            _pendingDefaultEnsures.Remove(key);
+    }
+
     // Drops an identity's id reservation unless an ensure that may still register it is pending (issue #158).
     private void ReleaseUnlessPending(string hash)
     {
@@ -808,13 +1137,9 @@ public sealed partial class SnapshotService : IDisposable
         if (!ensureAdmission)
             Interlocked.Increment(ref _ensureAdmissionBarrier);
         admission = Interlocked.Increment(ref _writeAdmissions);
-        return _writeGate.WaitAsync(CancellationToken.None, priority, expedited);
-    }
-
-    private Task TakeWriteTurn()
-    {
-        lock (_inFlightLock)
-            return TakeWriteTurnLocked();
+        var turn = _writeGate.WaitAsync(CancellationToken.None, priority, expedited);
+        ProgressForTesting?.Invoke();
+        return turn;
     }
 
     private bool IsDefaultBranchWork(EnsureSnapshotRequest request) =>
@@ -841,6 +1166,60 @@ public sealed partial class SnapshotService : IDisposable
                         _writeGate.Release();
                 },
                 CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+    }
+
+    private async Task WaitForBranchIntentHeadAsync(
+        long repositoryId, string branch, long intentId, CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            var state = ReadCatalog(conn =>
+            {
+                var intents = new BranchIntentStore(conn);
+                var intent = intents.Get(intentId);
+                return (Intent: intent, Head: intent is null ? null : intents.Head(repositoryId, branch));
+            });
+            if (state.Intent is null || state.Intent.State == "settled")
+                return;
+            var now = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
+            if (state.Head?.Id == intentId)
+            {
+                if (!RetryPending(state.Intent.NextAttemptAt, now))
+                    return;
+                await Task.Delay(TimeSpan.FromMilliseconds(state.Intent.NextAttemptAt!.Value - now),
+                    _timeProvider, cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+
+            Task wakeup;
+            lock (_inFlightLock)
+            {
+                if (!_branchIntentWakeups.TryGetValue((repositoryId, branch), out var signal))
+                    _branchIntentWakeups[(repositoryId, branch)] = signal =
+                        new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                wakeup = signal.Task;
+            }
+
+            state = ReadCatalog(conn =>
+            {
+                var intents = new BranchIntentStore(conn);
+                var intent = intents.Get(intentId);
+                return (Intent: intent, Head: intent is null ? null : intents.Head(repositoryId, branch));
+            });
+            if (state.Intent is null || state.Intent.State == "settled")
+                return;
+            if (state.Head?.Id == intentId)
+                continue;
+            await wakeup.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private void WakeBranchIntent(long repositoryId, string branch)
+    {
+        TaskCompletionSource? signal;
+        lock (_inFlightLock)
+            _branchIntentWakeups.Remove((repositoryId, branch), out signal);
+        signal?.TrySetResult();
     }
 
     // Service shutdown refuses new work with an OperationCanceledException on the SERVICE lifetime token, which
@@ -893,6 +1272,11 @@ public sealed partial class SnapshotService : IDisposable
         activity?.SetTag("sextant.commit", request.CommitSha);
 
         var result = await EnsureSnapshotCoreAsync(request, hash, principal, accepted, turn, ticket, seq).ConfigureAwait(false);
+        if (NeedsBranchConvergence(request))
+        {
+            var admissionId = ReadCatalog(conn => new BranchIntentStore(conn).GetByQueuedEnsureId(seq)?.AdmissionId);
+            result = result with { AdmissionId = admissionId ?? result.AdmissionId };
+        }
 
         _metrics.RecordEnsure(result.Attached);
         activity?.SetTag("sextant.status", result.Status);
@@ -917,7 +1301,8 @@ public sealed partial class SnapshotService : IDisposable
             return unverified;
         try
         {
-            var branch = await lookup.ResolveAsync(request.RepositoryRemoteUrl, request.LookupTenant).WaitAsync(_lifetime.Token).ConfigureAwait(false);
+            var branch = await lookup.ResolveAsync(
+                request.RepositoryRemoteUrl, request.LookupTenant, _lifetime.Token).WaitAsync(_lifetime.Token).ConfigureAwait(false);
             return request with { VerifiedRemoteDefaultBranch = branch };
         }
         catch (Exception ex) when (ex is not OperationCanceledException || _lifetime.IsCancellationRequested)
@@ -931,8 +1316,8 @@ public sealed partial class SnapshotService : IDisposable
     /// remote's current <c>refs/heads/&lt;branch&gt;</c>, or <c>null</c> when it may proceed. The check is the
     /// service's own <c>git ls-remote</c> (never the request), so a user CAS cannot move a branch to an older commit or a
     /// <c>refs/pull/*</c> head. It applies only in clone mode (an <see cref="IRemoteBranchHeadResolver"/> exists) and
-    /// only to an ensure that may move a pointer; a failed or unavailable lookup fails closed, except that a full lookup
-    /// slot is the retryable <see cref="BranchGuardReason.LookupBusy"/>, never a verdict on the commit. Like the #199
+    /// only to an ensure that may move a pointer; an unavailable lookup or a full slot returns the retryable
+    /// <see cref="BranchGuardReason.LookupBusy"/>, never a verdict on the commit. Like the #199
     /// lookup, it can make the ensure wait up to the lookup timeout (30 s), a <c>wait=false</c> caller included; the
     /// <c>branch_update: none</c> reachability check (#209) can hold it up to 2 minutes, because it runs before the job is
     /// registered. Cancelling the caller's token stops the remote call.
@@ -940,6 +1325,8 @@ public sealed partial class SnapshotService : IDisposable
     public async Task<string?> UserAdvanceProblemAsync(EnsureSnapshotRequest request, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        if (request.Refresh == true && !request.SuppressesBranchUpdate)
+            return null;
         if (request.SuppressesBranchUpdate)
             return await UserPinnedCommitProblemAsync(request, cancellationToken).ConfigureAwait(false);
         if (_remoteDefaults is not { HasBranchHeadResolver: true } lookup)
@@ -948,8 +1335,10 @@ public sealed partial class SnapshotService : IDisposable
             return BranchGuardReason.CommitNotRemoteHead;
         try
         {
-            var head = await lookup.ResolveBranchHeadAsync(request.RepositoryRemoteUrl, request.BranchName, request.LookupTenant, cancellationToken)
+            var head = await lookup.ObserveBranchHeadForIntakeAsync(request.RepositoryRemoteUrl, request.BranchName, request.LookupTenant, cancellationToken)
                 .WaitAsync(cancellationToken).ConfigureAwait(false);
+            if (head is null)
+                return BranchGuardReason.LookupBusy;
             return string.Equals(head, request.CommitSha, StringComparison.OrdinalIgnoreCase)
                 ? null
                 : BranchGuardReason.CommitNotRemoteHead;
@@ -960,14 +1349,14 @@ public sealed partial class SnapshotService : IDisposable
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            return BranchGuardReason.CommitNotRemoteHead;
+            return BranchGuardReason.LookupBusy;
         }
     }
 
     // Issue #209: a user's `branch_update: none` ensure pins a caller-chosen commit that the worker fetches and
     // evaluates. On GitHub a base repository serves fork-network commits (refs/pull/*, shared objects), so the commit
     // must be reachable from a refs/heads/* branch as the service itself fetches the branches (clone mode only; in
-    // locate mode nothing is fetched). A blank commit or any failed/unavailable check is refused (fail closed).
+    // locate mode nothing is fetched). A blank commit is refused; an unavailable check is retryable.
     private async Task<string?> UserPinnedCommitProblemAsync(EnsureSnapshotRequest request, CancellationToken cancellationToken)
     {
         if (_remoteDefaults is not { HasCommitBranchChecker: true } lookup)
@@ -987,7 +1376,7 @@ public sealed partial class SnapshotService : IDisposable
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            return BranchGuardReason.CommitNotOnBranch;
+            return BranchGuardReason.LookupBusy;
         }
     }
 
@@ -1005,8 +1394,17 @@ public sealed partial class SnapshotService : IDisposable
         TaskCompletionSource<EnsureSnapshotResult> accepted, Task? turn, AdvanceTicket? ticket, long seq)
     {
         var granted = false;
-        var handedOff = false;
         try
+        {
+            return await ExecuteAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            if (turn is not null)
+                ReleaseTurn(turn, granted);
+        }
+
+        async Task<EnsureSnapshotResult> ExecuteAsync()
         {
             if (turn is null)
             {
@@ -1018,6 +1416,29 @@ public sealed partial class SnapshotService : IDisposable
                 }
             }
 
+            var ensureIntent = NeedsBranchConvergence(request)
+                ? ReadCatalog(conn => new BranchIntentStore(conn).GetByQueuedEnsureId(seq))
+                : null;
+            if (ensureIntent is not null)
+            {
+                var atHead = ReadCatalog(conn =>
+                {
+                    var intents = new BranchIntentStore(conn);
+                    return intents.Head(ensureIntent.RepositoryId, ensureIntent.Branch)?.Id == ensureIntent.Id
+                        && !RetryPending(intents.Get(ensureIntent.Id)?.NextAttemptAt,
+                            _timeProvider.GetUtcNow().ToUnixTimeMilliseconds());
+                });
+                if (!atHead)
+                {
+                    ReleaseTurn(turn, granted: false);
+                    turn = null;
+                    await WaitForBranchIntentHeadAsync(
+                        ensureIntent.RepositoryId, ensureIntent.Branch, ensureIntent.Id, _lifetime.Token).ConfigureAwait(false);
+                    lock (_inFlightLock)
+                        turn = TakeWriteTurnLocked(out _, expedited: IsDefaultBranchWork(request), ensureAdmission: true);
+                }
+            }
+
             // The identity is already producing: report its job at once, so a re-ensure — e.g. the retry of a
             // caller that timed out — returns its job id immediately and never starts a second worker. Shutdown
             // began: never attach to (or report as running) a production that is being cancelled.
@@ -1025,30 +1446,34 @@ public sealed partial class SnapshotService : IDisposable
             if (inFlight is not null)
             {
                 ThrowIfStopping();
-                accepted.TrySetResult(PendingResult(inFlight.JobId, hash));
+                accepted.TrySetResult(PendingResult(inFlight.JobId, hash, ensureIntent?.AdmissionId));
             }
 
             await turn.ConfigureAwait(false);
             granted = true;
+            using var owner = EnterWriterTurn(turn);
+            await _replayAdmissions.Task.ConfigureAwait(false);
+            _metrics.RecordQueuedEnsureStarted(seq);
             EnsureLeaseHeld();
 
-            // Issue #273: from its turn on this ensure can no longer be superseded. It coalesces only when a newer
-            // commit of the branch superseded it AND it is the only pending ensure of its identity (another branch's
-            // ensure of the same commit shares the job row and must see it produced). Then take over the
-            // compare-and-swap of any predecessor that was coalesced on this branch.
+            // From its turn on, this ensure can no longer be superseded. Locate mode retains linked handovers
+            // on every branch; remote mode converges through its durable refresh marker instead.
             AdvanceTicket? supersededBy = null;
             if (ticket is not null)
             {
                 lock (_inFlightLock)
                 {
                     ticket.Started = true;
-                    if (_pendingEnsures.GetValueOrDefault(hash) == 1 && ticket.SupersededBy is { } successor
-                        && WillBuildBranchHead(ticket, successor))
+                    if (_pendingEnsures.GetValueOrDefault(hash) == 1
+                        && ticket.SupersededBy is { } successor
+                        && WillBuildFeatureBranchHead(ticket, successor))
                         supersededBy = successor;
                 }
             }
-            request = ResolveHandedOverExpectation(request);
-
+            if (ticket is not null)
+                await ticket.Persisted.ConfigureAwait(false);
+            if (!NeedsBranchConvergence(request))
+                request = ResolveLinkedSuccessor(request);
             if (inFlight is not null)
             {
                 // A production holds the writer for its whole run and deregisters before releasing it, so it has
@@ -1072,22 +1497,32 @@ public sealed partial class SnapshotService : IDisposable
             // is attached — branch pointer advanced — in that SAME gate hold: releasing the gate between the check
             // and the advance would let a concurrent ensure supersede the snapshot in between, leaving the branch
             // head on a Superseded snapshot (issue #85).
-            var (job, existed, attached) = TryAttachTerminal(request, hash, IsAutomaticDefaultRepair(request, principal));
+            if (NeedsBranchConvergence(request) && ensureIntent is null)
+            {
+                var terminal = new SnapshotJobStore(_conn).GetJobByIdentity(hash);
+                if (terminal is null || terminal.SnapshotId is not null
+                    || !SnapshotJobStatus.IsTerminal(terminal.Status)
+                    || !TerminalResultUsable(terminal, hash, new SnapshotStore(_conn), new SnapshotJobStore(_conn)))
+                    throw new InvalidOperationException("An unadmitted remote ensure cannot attach a snapshot or produce.");
+            }
+            var (job, existed, attached) = TryAttachTerminal(request, hash);
             if (attached is not null)
             {
-                var (repaired, refusal) = await RepairVerifiedDefaultHeadAsync(request, attached).ConfigureAwait(false);
+                var (repaired, refusal) = ensureIntent is null
+                    ? (attached, null)
+                    : await RepairVerifiedDefaultHeadAsync(request, attached).ConfigureAwait(false);
                 attached = repaired;
                 RecordEnsureAuditLocked(request, attached, principal, refusal);
                 DeleteSettledQueuedEnsureLocked(seq, attached);
-                return attached;
+                return attached with { AdmissionId = ensureIntent?.AdmissionId };
             }
-            accepted.TrySetResult(PendingResult(job, existed));
 
-            // Issue #273: a newer commit of this branch was admitted while this one waited, so it builds the branch's
-            // snapshot; this commit is not produced. (An identity already terminal was attached above at no cost.)
-            if (supersededBy is not null && inFlight is null)
+            accepted.TrySetResult(PendingResult(job, existed, ensureIntent?.AdmissionId));
+
+            if (!NeedsBranchConvergence(request) && supersededBy is not null && inFlight is null
+                && string.Equals(supersededBy.ExpectedHeadCommit, request.CommitSha, StringComparison.OrdinalIgnoreCase))
             {
-                var coalesced = CoalesceLocked(request, job, existed, supersededBy, principal);
+                var coalesced = CoalesceFeatureBranchLocked(request, job, existed, supersededBy, principal);
                 DeleteSettledQueuedEnsureLocked(seq, coalesced);
                 return coalesced;
             }
@@ -1095,33 +1530,41 @@ public sealed partial class SnapshotService : IDisposable
             // Shutdown began: the job stays durably queued for the next instance to produce.
             ThrowIfStopping();
 
-            var production = StartProduction(request, hash, job.Id, existed, principal, seq);
-            handedOff = true;
+            var production = StartProduction(request, hash, job.Id, existed, principal, seq, isRefresh: false);
             return await production.ConfigureAwait(false);
-        }
-        finally
-        {
-            if (!handedOff && turn is not null)
-                ReleaseTurn(turn, granted);
         }
     }
 
-    // Settles a superseded ensure as coalesced (issue #273), under the write gate: the job records the commit that
-    // superseded it, the branch records the handover of its compare-and-swap (the successor resolves it at its turn),
-    // and the ensure is audited. A later ensure of the same identity produces it (coalesced is settled, not terminal).
-    private EnsureSnapshotResult CoalesceLocked(
-        EnsureSnapshotRequest request, SnapshotJobRow job, bool existed, AdvanceTicket supersededBy, AuditCaller principal)
+    // Terminal-attach step, run under the write gate: registers (or attaches to) the identity's durable job and,
+    // when its terminal result is still usable, advances/attaches this request's branch pointer and records the
+    // request's audit row in the SAME gate hold. Returns the attach result, or null when production is needed.
+    private (SnapshotJobRow Job, bool Existed, EnsureSnapshotResult? Attached) TryAttachTerminal(
+        EnsureSnapshotRequest request, string hash)
     {
         var jobs = new SnapshotJobStore(_conn);
-        // One transaction (raw BEGIN IMMEDIATE so the store commands enrol): the handover never outlives a failed settle.
-        BeginRaw("coalesce");
+        var (row, wasExisting) = RegisterJobLocked(jobs, hash, request.RepositoryRemoteUrl, request.CommitSha, request.BranchName);
+        // The row committed (this write is not inside a transaction), so a status read now finds it.
+        _jobIds.Release(hash);
+        if (!SnapshotJobStatus.IsTerminal(row.Status) || !TerminalResultUsable(row, hash, new SnapshotStore(_conn), jobs))
+            return (row, wasExisting, null);
+        var advanced = AdvanceOrAttachBranchPointer(request, row.SnapshotId);
+        var attached = Attach(row, wasExisting, CoverageFor(row.SnapshotId)) with { BranchAdvanced = advanced };
+        return (row, wasExisting, attached);
+    }
+
+    private EnsureSnapshotResult CoalesceFeatureBranchLocked(
+        EnsureSnapshotRequest request, SnapshotJobRow job, bool existed,
+        AdvanceTicket successor, AuditCaller principal)
+    {
+        var jobs = new SnapshotJobStore(_conn);
+        BeginRaw("coalesce-feature-branch");
         try
         {
-            jobs.RecordHandover(RemoteUrlIdentity.Normalize(request.RepositoryRemoteUrl), request.BranchName!,
-                request.CommitSha, request.ExpectedHeadCommit!, supersededBy.CommitSha);
+            jobs.RecordHandover(
+                RemoteUrlIdentity.Normalize(request.RepositoryRemoteUrl), request.BranchName!,
+                request.CommitSha, request.ExpectedHeadCommit!, successor.CommitSha);
             jobs.MarkResult(job.Id, SnapshotJobStatus.Coalesced, snapshotId: null,
-                $"superseded while queued by commit {supersededBy.CommitSha} of branch '{request.BranchName}' " +
-                $"(identity {supersededBy.Hash}), which builds the branch's snapshot instead");
+                $"superseded by linked feature-branch successor {successor.CommitSha}");
             ExecRaw("COMMIT;");
         }
         catch
@@ -1132,23 +1575,6 @@ public sealed partial class SnapshotService : IDisposable
         var result = Attach(jobs.GetJob(job.Id)!, existed);
         RecordEnsureAuditLocked(request, result, principal);
         return result;
-    }
-
-    // Terminal-attach step, run under the write gate: registers (or attaches to) the identity's durable job and,
-    // when its terminal result is still usable, advances/attaches this request's branch pointer and records the
-    // request's audit row in the SAME gate hold. Returns the attach result, or null when production is needed.
-    private (SnapshotJobRow Job, bool Existed, EnsureSnapshotResult? Attached) TryAttachTerminal(
-        EnsureSnapshotRequest request, string hash, bool repairOnly)
-    {
-        var jobs = new SnapshotJobStore(_conn);
-        var (row, wasExisting) = RegisterJobLocked(jobs, hash, request.RepositoryRemoteUrl, request.CommitSha, request.BranchName);
-        // The row committed (this write is not inside a transaction), so a status read now finds it.
-        _jobIds.Release(hash);
-        if (!SnapshotJobStatus.IsTerminal(row.Status) || !TerminalResultUsable(row, hash, new SnapshotStore(_conn), jobs))
-            return (row, wasExisting, null);
-        var advanced = repairOnly ? false : AdvanceOrAttachBranchPointer(request, row.SnapshotId);
-        var attached = Attach(row, wasExisting, CoverageFor(row.SnapshotId)) with { BranchAdvanced = advanced };
-        return (row, wasExisting, attached);
     }
 
     // Creates or returns the ONE job row for an identity, under the write gate. A new row takes its id from _jobIds
@@ -1169,12 +1595,13 @@ public sealed partial class SnapshotService : IDisposable
             return _inFlight.GetValueOrDefault(hash);
     }
 
-    // Starts (and registers) the identity's production on the write-gate turn the calling ensure holds, which the
-    // production takes over and releases. The starter is the OWNER: the production runs with its request (branch,
-    // sequence) and principal. Every production runs while holding the gate and deregisters before releasing it, so
+    // Starts (and registers) the identity's production on the write-gate turn the calling ensure holds. The
+    // starter is the OWNER: the production runs with its request (branch,
+    // sequence) and principal. Every production runs while holding the gate and deregisters before its release, so
     // none can be in flight while the caller holds the gate.
     private Task<EnsureSnapshotResult> StartProduction(
-        EnsureSnapshotRequest request, string hash, long jobId, bool existed, AuditCaller principal, long seq)
+        EnsureSnapshotRequest request, string hash, long jobId, bool existed, AuditCaller principal, long? seq,
+        bool isRefresh)
     {
         lock (_inFlightLock)
         {
@@ -1185,10 +1612,13 @@ public sealed partial class SnapshotService : IDisposable
             // Registered under the lock BEFORE the production can deregister itself (it takes the same lock).
             var entry = new InFlightProduction(jobId);
             entry.Production = Task.Run(
-                () => RunProductionAsync(request, hash, jobId, existed, principal, entry, seq), CancellationToken.None);
+                () => RunProductionAsync(request, hash, jobId, existed, principal, entry, seq, isRefresh), CancellationToken.None);
             _inFlight[hash] = entry;
-            // After the production Task completed (not from inside its frame, which still roots the job's state).
-            ScheduleJobMemoryReclaim(entry.Production, jobId);
+            // After the production Task completed (not from inside its frame, which still roots the job's state) and,
+            // issue #273, after the turn that started it released the writer: that ensure or refresh turn records its
+            // result and releases the gate only after the production, so an earlier look would always find it busy.
+            var startersHoldReleased = _writeGate.CurrentHoldReleased;
+            ScheduleJobMemoryReclaim(Task.WhenAll(entry.Production, startersHoldReleased), jobId);
             return entry.Production;
         }
     }
@@ -1196,40 +1626,49 @@ public sealed partial class SnapshotService : IDisposable
     // A non-terminal snapshot of a job whose production is pending or running (the wait=false response): queued
     // while the production waits for the writer, running once the worker holds it. A stale terminal row about
     // to be requeued is reported queued, never as its phantom terminal status.
-    private EnsureSnapshotResult PendingResult(SnapshotJobRow job, bool existed) => new()
+    private EnsureSnapshotResult PendingResult(SnapshotJobRow job, bool existed, string? admissionId = null) => new()
     {
         JobId = job.Id,
         IdentityHash = job.IdentityHash,
         Status = job.Status == SnapshotJobStatus.Running ? SnapshotJobStatus.Running : SnapshotJobStatus.Queued,
-        Attached = existed
+        Attached = existed,
+        AdmissionId = admissionId
     };
 
-    private EnsureSnapshotResult PendingResult(long jobId, string hash)
+    private EnsureSnapshotResult PendingResult(long jobId, string hash, string? admissionId = null)
     {
         var job = ReadCatalog(conn => new SnapshotJobStore(conn).GetJob(jobId));
         return job is not null
-            ? PendingResult(job, existed: true)
-            : new EnsureSnapshotResult { JobId = jobId, IdentityHash = hash, Status = SnapshotJobStatus.Queued, Attached = true };
+            ? PendingResult(job, existed: true, admissionId)
+            : new EnsureSnapshotResult
+            {
+                JobId = jobId, IdentityHash = hash, Status = SnapshotJobStatus.Queued,
+                Attached = true, AdmissionId = admissionId
+            };
     }
 
     // One identity's shared production: runs on the write-gate turn of the ensure that started it (never waiting for
     // the writer again, so it applies at that ensure's place in submission order, issue #158) and on the SERVICE
     // lifetime (never a caller's token). It runs the worker, records the result and the owner's audit row, then
-    // deregisters itself BEFORE releasing the gate — so any request that can observe the new durable state (which
+    // deregisters itself BEFORE the ensure releases the gate — so any request that can observe the new durable state (which
     // needs the gate) never attaches to this already-finished production.
     private async Task<EnsureSnapshotResult> RunProductionAsync(
-        EnsureSnapshotRequest request, string hash, long jobId, bool existed, AuditCaller principal, InFlightProduction entry, long seq)
+        EnsureSnapshotRequest request, string hash, long jobId, bool existed, AuditCaller principal, InFlightProduction entry,
+        long? seq, bool isRefresh)
     {
         try
         {
             EnsureLeaseHeld();
-            var workRequest = IsAutomaticDefaultRepair(request, principal)
+            var workRequest = IsAutomaticDefaultRepair(request, principal) || isRefresh
                 ? request with { BranchUpdate = "none" }
                 : request;
             var produced = await ProduceLockedAsync(workRequest, hash, jobId, existed).ConfigureAwait(false);
-            var (result, refusal) = await RepairVerifiedDefaultHeadAsync(request, produced).ConfigureAwait(false);
+            var (result, refusal) = isRefresh || !NeedsBranchConvergence(request)
+                ? (produced, null)
+                : await RepairVerifiedDefaultHeadAsync(request, produced).ConfigureAwait(false);
             RecordEnsureAuditLocked(request, result, principal, refusal);
-            DeleteSettledQueuedEnsureLocked(seq, result);
+            if (seq is long admissionSeq)
+                DeleteSettledQueuedEnsureLocked(admissionSeq, result);
             return result;
         }
         finally
@@ -1239,7 +1678,6 @@ public sealed partial class SnapshotService : IDisposable
                 if (_inFlight.TryGetValue(hash, out var current) && ReferenceEquals(current, entry))
                     _inFlight.Remove(hash);
             }
-            _writeGate.Release();
         }
     }
 
@@ -1291,14 +1729,19 @@ public sealed partial class SnapshotService : IDisposable
         // advance superseded it. When the request carries a branch guard (a head sequence, SVC-6's
         // expected_head_commit, or SVC-7's branch_update: none), re-select it WITHOUT running the worker —
         // mirroring the orchestrator's SelectExistingSnapshot — provided it is still intact; a
-        // data-less/unservable one is demoted so the worker below genuinely rebuilds it. An unguarded
-        // request (the local/legacy path) keeps today's worker path byte-for-byte (#84 criterion 2).
-        if (HasBranchGuard(request) && published is { Status: SnapshotStatus.Superseded })
+        // data-less/unservable one is demoted so the worker below genuinely rebuilds it. Issue #273: a remote
+        // branch-moving ensure (an ordered intent with its following refresh) re-selects it guarded or not, so the
+        // unguarded retry of a request whose snapshot a refresh has since superseded never runs the worker again;
+        // its own branch decision applies, and its refresh then converges the branch. An unguarded locate/local
+        // request keeps today's worker path byte-for-byte (#84 criterion 2).
+        if ((HasBranchGuard(request) || NeedsBranchConvergence(request)) && published is { Status: SnapshotStatus.Superseded })
         {
             var (reselected, reselectedCoverage, reselectedAdvanced) =
                 ReselectOrDemoteSupersededSnapshot(request, jobId, published.Id, jobs, snapshots);
             if (reselected)
+            {
                 return Attach(jobs.GetJob(jobId)!, existed, reselectedCoverage) with { BranchAdvanced = reselectedAdvanced };
+            }
         }
 
         // The requested branch's pointer before the worker runs, so the result can report whether the
@@ -1404,8 +1847,19 @@ public sealed partial class SnapshotService : IDisposable
         if (validated.Status == SnapshotJobStatus.Complete && producedCoverage is { IsPartial: true })
             validated = validated with { Status = SnapshotJobStatus.Partial, Error = PartialCoverageReason(producedCoverage) };
 
-        jobs.ReplaceDiagnostics(jobId, validated.Projects.Select(p => p.ToDiagnostic(jobId)));
-        jobs.MarkResult(jobId, validated.Status, validated.SnapshotId, validated.Error);
+        BeginRaw("production-result");
+        try
+        {
+            jobs.ReplaceDiagnostics(jobId, validated.Projects.Select(p => p.ToDiagnostic(jobId)));
+            jobs.MarkResult(jobId, validated.Status, validated.SnapshotId, validated.Error);
+            ExecRaw("COMMIT;");
+        }
+        catch
+        {
+            ExecRaw("ROLLBACK;");
+            throw;
+        }
+        AfterProductionResultCommitForTesting?.Invoke();
         // Issue #267: timings are telemetry, recorded after the result so they can never decide the job's outcome.
         if (validated.Timings is { } timings)
         {
@@ -1947,7 +2401,8 @@ public sealed partial class SnapshotService : IDisposable
             return;
         snapshots.MarkConsumerRepository(repoId);
         var branchName = request.BranchName ?? "main";
-        if (!snapshots.BranchHeadMatches(snapshots.GetBranchId(repoId, branchName), expectedHead, repoId, branchName))
+        var currentBranchId = snapshots.GetBranchId(repoId, branchName);
+        if (!snapshots.BranchHeadMatches(currentBranchId, expectedHead, repoId, branchName))
             return;
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var ownsDefault = snapshots.ShouldOwnDefault(
@@ -2099,17 +2554,26 @@ public sealed partial class SnapshotService : IDisposable
     /// handed out by a <c>wait=false</c> ensure whose registration is still waiting for the writer (issue #158)
     /// resolves as <c>queued</c>, with no diagnostics or coverage, until its row is written.
     /// </summary>
-    public JobStatusResult? GetStatus(long jobId)
+    public JobStatusResult? GetStatus(long? jobId)
     {
+        if (jobId is not long id)
+            return null;
         // Read the reservation BEFORE the catalog: it is released only after its row has committed, so one of the
         // two reads always sees the job.
-        var reserved = _jobIds.Find(jobId);
+        var reserved = _jobIds.Find(id);
         return ReadCatalog(conn =>
         {
             var jobs = new SnapshotJobStore(conn);
-            var job = jobs.GetJob(jobId);
+            var job = jobs.GetJob(id);
             return job is not null ? StatusOf(conn, jobs, job) : ReservedStatus(reserved);
         });
+    }
+
+    /// <summary>Returns the durable status of a default-branch refresh admission, or null when it is unknown.</summary>
+    public RefreshAdmissionStatus? GetRefreshAdmissionStatus(string admissionId)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(admissionId);
+        return ReadCatalog(conn => new PendingRefreshStore(conn).GetStatus(admissionId));
     }
 
     /// <summary>
@@ -2247,7 +2711,11 @@ public sealed partial class SnapshotService : IDisposable
             if (string.Equals(hash, row.IdentityHash, StringComparison.Ordinal))
                 return hash;
         }
-        return IdentityHashFor(new EnsureSnapshotRequest { RepositoryRemoteUrl = requestedUrl, CommitSha = commitSha });
+        // No spelling reproduces the snapshot (its identity changed): the hash the caller's ensure would build, under the
+        // spelling that ensure is pinned to.
+        var request = new EnsureSnapshotRequest { RepositoryRemoteUrl = requestedUrl, CommitSha = commitSha };
+        var (catalog, existing) = CatalogSpellings(conn, request, RemoteUrlIdentity.Normalize(requestedUrl));
+        return IdentityHashFor(request with { RepositoryRemoteUrl = existing ?? catalog ?? requestedUrl });
     }
 
     /// <summary>
@@ -2276,26 +2744,48 @@ public sealed partial class SnapshotService : IDisposable
 
     /// <summary>
     /// <see cref="RetireBranchAsync"/> with a bounded wait (issue #158, <c>POST /control/branches/retire</c>): the
-    /// retirement's result when it applies within <see cref="ServiceOptions.ControlWriteWait"/>, else null — the
-    /// retirement stays queued and applies once the writer frees (a running production holds it for its whole run),
-    /// with its guards evaluated and its audit row written then. <paramref name="cancellationToken"/> only bounds
-    /// this caller's wait; it never cancels the retirement.
+    /// retirement's result when it applies within <see cref="ServiceOptions.ControlWriteWait"/>, else a result with
+    /// <see cref="RetireBranchResult.Pending"/> set — the retirement stays queued and applies once the writer frees
+    /// (a running production holds it for its whole run), with its guards evaluated and its audit row written then.
+    /// <paramref name="cancellationToken"/> only bounds this caller's wait; it never cancels the retirement.
     /// </summary>
-    public async Task<RetireBranchResult?> BeginRetireBranchAsync(
+    public async Task<RetireBranchResult> BeginRetireBranchAsync(
         RetireBranchRequest request, AuditCaller principal = default, CancellationToken cancellationToken = default)
     {
-        var retire = StartRetire(request, principal);
+        var started = _timeProvider.GetTimestamp();
+        var entry = StartRetireEntry(request, principal);
+        if (!entry.IntentAdmission.IsCompleted)
+        {
+            var admissionWait = entry.IntentAdmission.WaitAsync(_options.ControlWriteWait, _timeProvider, cancellationToken);
+            RetireWaitStartedForTesting?.Invoke();
+            await ((Task)admissionWait).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+            if (!entry.IntentAdmission.IsCompleted)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                entry.CancelAdmission();
+                throw new RetireAdmissionUnavailableException(entry.AdmissionId);
+            }
+        }
+        await entry.IntentAdmission.ConfigureAwait(false);
+        if (entry.IntentId is long intentId)
+            entry.AdmissionId ??= ReadCatalog(conn => new BranchIntentStore(conn).Get(intentId)?.AdmissionId);
+        var retire = entry.Retire;
         if (!retire.IsCompleted)
         {
-            await ((Task)retire).WaitAsync(_options.ControlWriteWait, cancellationToken)
-                .ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+            var remaining = _options.ControlWriteWait - _timeProvider.GetElapsedTime(started);
+            if (remaining <= TimeSpan.Zero)
+                return new RetireBranchResult { Retired = false, Pending = true, AdmissionId = entry.AdmissionId };
+            var bounded = ((Task)retire).WaitAsync(remaining, _timeProvider, cancellationToken);
+            RetireWaitStartedForTesting?.Invoke();
+            await bounded.ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
             if (!retire.IsCompleted)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                return null;
+                return new RetireBranchResult { Retired = false, Pending = true, AdmissionId = entry.AdmissionId };
             }
         }
-        return await retire.ConfigureAwait(false);
+        var result = await retire.ConfigureAwait(false);
+        return result with { AdmissionId = result.AdmissionId ?? entry.AdmissionId };
     }
 
     // Admits one retirement as a service-owned operation on its own write-gate turn (issue #158), or coalesces it into
@@ -2304,28 +2794,69 @@ public sealed partial class SnapshotService : IDisposable
     // An idle-branch retirement (issue #299) passes the pointer it selected as `idle`, so the retirement applies only while
     // the pointer is unchanged and no work is pending against the branch.
     private Task<RetireBranchResult> StartRetire(
-        RetireBranchRequest request, AuditCaller principal, IdleRetireGuard? idle = null)
+        RetireBranchRequest request, AuditCaller principal, IdleRetireGuard? idle = null) =>
+        StartRetireEntry(request, principal, idle).Retire;
+
+    private bool NeedsBranchConvergenceForRetire() =>
+        _remoteDefaults is { HasBranchHeadResolver: true };
+
+    private PendingRetire StartRetireEntry(
+        RetireBranchRequest request, AuditCaller principal, IdleRetireGuard? idle = null, long? existingIntentId = null)
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentException.ThrowIfNullOrEmpty(request.Repository);
         ArgumentException.ThrowIfNullOrEmpty(request.Branch);
-        var key = new RetireKey(request.Repository, request.Branch, request.ExpectedHeadCommit, principal.Principal, idle);
+        var admissionId = existingIntentId is null && NeedsBranchConvergenceForRetire()
+            ? Guid.NewGuid().ToString("N")
+            : null;
         PendingRetire entry;
         lock (_inFlightLock)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             ThrowIfStopping();
-            if (_pendingRetire is { } pending && pending.Key == key && pending.Admission == Interlocked.Read(ref _writeAdmissions))
-                return pending.Retire;
-
             // An idle-branch retirement is maintenance (issue #333): it takes the priority lane, so it is the next turn
             // after the current holder instead of waiting behind every production admitted before it.
-            var turn = TakeWriteTurnLocked(out var admission, priority: idle is not null);
-            entry = new PendingRetire(key, admission);
+            entry = new PendingRetire(Task.FromResult(0L)) { AdmissionId = admissionId };
+            // An ensure with no branch intent never shares an identical ensure admitted before this retirement, even
+            // while the retirement still waits for its turn (intent-backed ensures decide from branch_intents ids).
+            Interlocked.Increment(ref _ensureAdmissionBarrier);
+            if (existingIntentId is long existing)
+            {
+                entry.IntentAdmission = Task.FromResult(existing);
+                _liveIntentRuns.Add(existing);
+            }
+            else if (NeedsBranchConvergenceForRetire())
+                entry.IntentAdmission = Task.Run(async () =>
+                {
+                    var intent = GrantWrite(conn =>
+                    {
+                        if (entry.AdmissionCancelled)
+                            throw new OperationCanceledException("Retirement admission was not durable before the response bound.");
+                        var now = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
+                        var snapshots = new SnapshotStore(conn);
+                        var repositoryId = snapshots.GetRepositoryId(request.Repository)
+                            ?? snapshots.EnsureRepository(request.Repository, now);
+                        var kind = idle is { Upstream: true } ? "delete" : "retire";
+                        var admitted = new BranchIntentStore(conn).Admit(repositoryId, request.Branch, kind, null, admissionId,
+                            System.Text.Json.JsonSerializer.Serialize(
+                                new RetireIntentPayload(request, principal, idle), ServiceJson.Options), now);
+                        // Live before it commits, so the rescan never starts a second executor for it (issue #273, B1).
+                        lock (_inFlightLock)
+                            _liveIntentRuns.Add(admitted.Id);
+                        entry.AdmittedIntentId = admitted.Id;
+                        entry.AdmissionId = admitted.AdmissionId;
+                        return admitted;
+                    });
+                    if (idle is { Upstream: true })
+                        AfterUpstreamDeleteIntentAdmissionForTesting?.Invoke();
+                    AfterRetireAdmissionCommitForTesting?.Invoke();
+                    WakeBranchIntent(intent.RepositoryId, intent.Branch);
+                    return intent.Id;
+                }, CancellationToken.None);
             var asked = System.Diagnostics.Stopwatch.GetTimestamp();
-            // Published under the lock BEFORE the retirement can clear it (it takes the same lock).
-            entry.Retire = Task.Run(() => ApplyRetireAsync(request, principal, entry, turn, idle, asked), CancellationToken.None);
-            _pendingRetire = entry;
+            entry.Retire = Task.Run(
+                () => ApplyRetireAsync(request, principal, entry, idle, asked),
+                CancellationToken.None);
             if (idle is not null)
                 _pendingIdleRetires.Add(IdleRetireKey(request.Repository, request.Branch));
             _operations.Add(entry.Retire);
@@ -2338,30 +2869,104 @@ public sealed partial class SnapshotService : IDisposable
                 _ = t.Exception;
             },
             CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-        return entry.Retire;
+        return entry;
     }
 
-    private async Task<RetireBranchResult> ApplyRetireAsync(
-        RetireBranchRequest request, AuditCaller principal, PendingRetire entry, Task turn, IdleRetireGuard? idle, long asked)
+    // Re-admits one unsettled retire/delete intent at startup (ReplayDurableAdmissions); it waits for its branch head, and
+    // a persisted retry deadline is honoured.
+    private void ReplayRetirement(BranchIntent intent)
     {
         try
         {
-            await turn.ConfigureAwait(false);
+            if (TryDropStaleRetireIntent(intent))
+                return;
+        }
+        catch (Exception ex) when (ex is not (ObjectDisposedException or OperationCanceledException))
+        {
+            // The rescan retries the decision.
+            Log($"branch_intent_drop_check_failed intent_id={intent.Id} error={ex.GetType().Name}");
+        }
+        if (RetryPending(intent.NextAttemptAt, _timeProvider.GetUtcNow().ToUnixTimeMilliseconds()))
+        {
+            ScheduleIntentRetryAt(intent.NextAttemptAt!.Value);
+            return;
+        }
+        try
+        {
+            var payload = intent.PayloadJson is null
+                ? null
+                : System.Text.Json.JsonSerializer.Deserialize<RetireIntentPayload>(intent.PayloadJson, ServiceJson.Options);
+            if (payload is null || payload.Request.Repository is null || payload.Request.Branch is null)
+                throw new InvalidOperationException($"Branch intent {intent.Id} has no usable retirement payload.");
+            _ = StartRetireEntry(
+                payload.Request, payload.Principal, payload.Idle, intent.Id);
+        }
+        catch (Exception ex)
+        {
+            Log($"branch_intent_replay_failed intent_id={intent.Id} error={ex.GetType().Name}");
+        }
+    }
+
+    private async Task<RetireBranchResult> ApplyRetireAsync(
+        RetireBranchRequest request, AuditCaller principal, PendingRetire entry, IdleRetireGuard? idle,
+        long asked)
+    {
+        Task turn;
+        try
+        {
+            entry.IntentId = await entry.IntentAdmission.ConfigureAwait(false);
+            while (true)
+            {
+                if (entry.IntentId is > 0
+                    && ReadCatalog(conn => new BranchIntentStore(conn).Get(entry.IntentId.Value)) is { } intent)
+                {
+                    entry.AdmissionId ??= intent.AdmissionId;
+                    await WaitForBranchIntentHeadAsync(
+                        intent.RepositoryId, intent.Branch, intent.Id, _lifetime.Token).ConfigureAwait(false);
+                }
+                lock (_inFlightLock)
+                {
+                    turn = TakeWriteTurnLocked(out _, priority: idle is not null);
+                }
+                await turn.ConfigureAwait(false);
+                bool deferred;
+                try
+                {
+                    deferred = entry.IntentId is > 0
+                        && ReadCatalog(conn => RetryPending(
+                            new BranchIntentStore(conn).Get(entry.IntentId.Value)?.NextAttemptAt,
+                            _timeProvider.GetUtcNow().ToUnixTimeMilliseconds()));
+                }
+                catch
+                {
+                    _writeGate.Release();
+                    throw;
+                }
+                if (!deferred)
+                    break;
+                _writeGate.Release();
+            }
         }
         catch
         {
+            lock (_inFlightLock)
+            {
+                _pendingIdleRetires.Remove(IdleRetireKey(request.Repository, request.Branch));
+            }
             ForgetPendingIdleRetire(request, idle);
+            // A durable intent whose executor stopped (shutdown, or a fault after its admission committed) is left to
+            // the rescan or the next start.
+            ForgetLiveIntentRun(entry.IntentId ?? entry.AdmittedIntentId);
             throw;
         }
         try
         {
+            using var owner = EnterWriterTurn(turn);
             if (idle is not null)
                 _metrics.RecordMaintenanceWriterWait(System.Diagnostics.Stopwatch.GetElapsedTime(asked).TotalMilliseconds);
             var advanceAdmitted = false;
             lock (_inFlightLock)
             {
-                if (ReferenceEquals(_pendingRetire, entry))
-                    _pendingRetire = null;
                 if (idle is not null)
                 {
                     _pendingIdleRetires.Remove(IdleRetireKey(request.Repository, request.Branch));
@@ -2372,42 +2977,91 @@ public sealed partial class SnapshotService : IDisposable
             }
             using var activity = ServiceTelemetry.Source.StartActivity("retire_branch");
             EnsureLeaseHeld();
-            var result = RetireBranchLocked(request, principal, idle, advanceAdmitted);
+            RetireBranchResult result;
+            try
+            {
+                result = RetireBranchLocked(request, principal, idle, advanceAdmitted, intentId: entry.IntentId);
+            }
+            catch (Exception ex) when (entry.IntentId is > 0)
+            {
+                // Issue #273 (B1): the turn ended without settling its intent, which stays the branch head. Record its
+                // retry time on this same turn; the rescan runs it again then, before any later intent of the branch.
+                DeferIntentAfterFailedTurn(entry.IntentId.Value, $"turn_{ex.GetType().Name}");
+                throw;
+            }
             // Counted when it applies, so a retirement the maintenance step stopped waiting for still shows (issue #333).
             if (idle is { Upstream: true })
                 _metrics.RecordUpstreamBranchRetireApplied(result.Retired);
             else if (idle is not null)
                 _metrics.RecordIdleBranchRetireApplied(result.Retired);
-            return result;
+            return result with { AdmissionId = entry.AdmissionId ?? result.AdmissionId };
         }
         finally
         {
             _writeGate.Release();
+            ForgetLiveIntentRun(entry.IntentId);
         }
     }
 
     private RetireBranchResult RetireBranchLocked(
-        RetireBranchRequest request, AuditCaller principal, IdleRetireGuard? idle, bool advanceAdmitted = false)
+        RetireBranchRequest request, AuditCaller principal, IdleRetireGuard? idle, bool advanceAdmitted = false,
+        long? intentId = null)
     {
         var snapshots = new SnapshotStore(_conn);
+        RetireBranchResult result;
+        string? intentAdmissionId = null;
         BeginRaw("retire-branch");
         try
         {
-            var repositoryId = snapshots.GetRepositoryId(request.Repository);
-            var branch = repositoryId is long repoId ? snapshots.GetBranch(repoId, request.Branch) : null;
-            RetireBranchResult result;
+            var admittedAt = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
+            var repositoryId = snapshots.GetRepositoryId(request.Repository)
+                ?? snapshots.EnsureRepository(request.Repository, admittedAt);
+            var intentKind = idle is { Upstream: true } ? "delete" : "retire";
+            var intents = new BranchIntentStore(_conn);
+            BranchIntent? intent = null;
+            if (intentId is > 0)
+            {
+                intent = intents.Get(intentId.Value)
+                    ?? throw new InvalidOperationException($"Retirement intent {intentId} is missing.");
+                intentAdmissionId = intent.AdmissionId;
+                if (intent.State == "settled")
+                {
+                    // A second executor of an intent that already ran (issue #273): it must change nothing.
+                    ExecRaw("ROLLBACK;");
+                    return new RetireBranchResult { Retired = intent.Outcome is "retired" or "deleted" };
+                }
+            }
+            else if (intentId is null && NeedsBranchConvergenceForRetire())
+            {
+                intent = intents.Admit(
+                    repositoryId, request.Branch, intentKind, null, null,
+                    System.Text.Json.JsonSerializer.Serialize(request, ServiceJson.Options), admittedAt);
+                intentAdmissionId = intent.AdmissionId;
+            }
+            BeforeIntentWriteForTesting?.Invoke("retire-branch:" + (intent?.Kind ?? intentKind));
+            var branch = snapshots.GetBranch(repositoryId, request.Branch);
             var detail = (string?)null;
+            // Rule 5 (#273): an upstream deletion yields to any push admitted after the listing that called the branch
+            // deleted (an intent admitted since, or a job), since that listing no longer speaks for the branch.
+            bool UpstreamActivitySince(IdleRetireGuard listed) =>
+                intents.HasAdmissionSince(repositoryId, request.Branch, listed.ListedAtUnixMs, intent?.Id)
+                || new SnapshotJobStore(_conn).HasBranchActivitySince(
+                    RemoteUrlIdentity.Normalize(request.Repository), request.Branch, listed.ListedAtUnixMs);
             if (branch is null)
             {
-                result = new RetireBranchResult { Retired = false };
+                result = new RetireBranchResult
+                {
+                    Retired = false,
+                    Reason = idle is { Upstream: true } absentListing && UpstreamActivitySince(absentListing)
+                        ? BranchGuardReason.UpstreamActivity : null
+                };
                 // Issue #299: a branch the idle rule retired is gone from the catalog but still in git. When it is then
                 // deleted upstream (a manual/delete-push retire whose CAS names the retired head, or no CAS), its
                 // retired head is cleared, so no later push expecting that head can resurrect it.
-                if (idle is null && repositoryId is long absentRepo
-                    && snapshots.GetRetiredHead(absentRepo, request.Branch) is { } retiredHead
+                if (idle is null && snapshots.GetRetiredHead(repositoryId, request.Branch) is { } retiredHead
                     && (request.ExpectedHeadCommit is null
                         || string.Equals(retiredHead, request.ExpectedHeadCommit, StringComparison.OrdinalIgnoreCase))
-                    && snapshots.ConsumeRetiredHead(absentRepo, request.Branch))
+                    && snapshots.ConsumeRetiredHead(repositoryId, request.Branch))
                     detail = "absent;retired_head_cleared";
             }
             else if (branch.IsDefault)
@@ -2415,9 +3069,7 @@ public sealed partial class SnapshotService : IDisposable
             else if (idle is { } selected && (branch.SnapshotId != selected.SnapshotId || branch.UpdatedAt != selected.UpdatedAt))
                 result = new RetireBranchResult { Retired = false, Reason = BranchGuardReason.PointerMoved };
             else if (idle is { Upstream: true } listed
-                     && (branch.UpdatedAt >= listed.ListedAtUnixMs
-                         || new SnapshotJobStore(_conn).HasBranchActivitySince(
-                             RemoteUrlIdentity.Normalize(request.Repository), branch.Name, listed.ListedAtUnixMs)))
+                     && (branch.UpdatedAt >= listed.ListedAtUnixMs || UpstreamActivitySince(listed)))
                 // Issue #338: the branch was touched after the listing that called it deleted (re-created upstream and
                 // ensured), so that listing no longer speaks for it.
                 result = new RetireBranchResult { Retired = false, Reason = BranchGuardReason.UpstreamActivity };
@@ -2446,6 +3098,13 @@ public sealed partial class SnapshotService : IDisposable
             else
                 result = new RetireBranchResult { Retired = snapshots.DeleteBranch(branch.Id) };
 
+            if (intent is not null)
+                intents.Settle(
+                    intent.Id,
+                    intentKind == "delete"
+                        ? result.Reason ?? (result.Retired || branch is null ? "deleted" : "already_gone")
+                        : result.Retired ? "retired" : branch is null ? "absent" : result.Reason ?? "already_gone",
+                    _timeProvider.GetUtcNow().ToUnixTimeMilliseconds());
             new AuditLogStore(_conn).Append(
                 AuditAction.Retire,
                 result.Reason is null ? AuditOutcome.Complete : AuditOutcome.Denied,
@@ -2453,13 +3112,16 @@ public sealed partial class SnapshotService : IDisposable
                 repositoryScope: request.Repository,
                 detail: principal.Detail(result.Reason ?? detail ?? (result.Retired ? "retired" : "absent")));
             ExecRaw("COMMIT;");
-            return result;
         }
         catch
         {
             ExecRaw("ROLLBACK;");
             throw;
         }
+        if (intentId is > 0 || NeedsBranchConvergenceForRetire())
+            WakeBranchIntent(snapshots.GetRepositoryId(request.Repository)!.Value, request.Branch);
+        SchedulePendingRefreshes();
+        return result with { AdmissionId = intentAdmissionId };
     }
 
     /// <summary>
@@ -2624,6 +3286,7 @@ public sealed partial class SnapshotService : IDisposable
 
         private readonly long _startedAt = System.Diagnostics.Stopwatch.GetTimestamp();
         private bool _holding;
+        private Task? _turn;
         private DateTimeOffset _holdStart;
         private TimeSpan _held;
 
@@ -2654,6 +3317,7 @@ public sealed partial class SnapshotService : IDisposable
                 return;
             _held += Time.GetUtcNow() - _holdStart;
             _holding = false;
+            _turn = null;
             service._writeGate.Release();
         }
 
@@ -2702,9 +3366,11 @@ public sealed partial class SnapshotService : IDisposable
                 var asked = System.Diagnostics.Stopwatch.GetTimestamp();
                 try
                 {
-                    await service._writeGate.WaitAsync(ct, priority: true).ConfigureAwait(false);
+                    var turn = service._writeGate.WaitAsync(ct, priority: true);
+                    await turn.ConfigureAwait(false);
                     // Set before anything that could throw, so EndTurn always releases a granted turn.
                     _holding = true;
+                    _turn = turn;
                     _holdStart = Time.GetUtcNow();
                 }
                 finally
@@ -2719,6 +3385,7 @@ public sealed partial class SnapshotService : IDisposable
             var completed = false;
             try
             {
+                using var owner = service.EnterWriterTurn(_turn!);
                 service.EnsureLeaseHeld();
                 var result = await work().ConfigureAwait(false);
                 completed = true;
@@ -3415,7 +4082,8 @@ public sealed partial class SnapshotService : IDisposable
         DefaultRepairRefusal? repairRefusal = null)
     {
         var jobs = new SnapshotJobStore(_conn);
-        var job = jobs.GetJob(result.JobId);
+        var jobId = result.JobId!.Value;
+        var job = jobs.GetJob(jobId);
         long? costMs = !result.Attached && job is { StartedAt: long s, CompletedAt: long c } && c >= s
             ? c - s
             : null;
@@ -3425,7 +4093,7 @@ public sealed partial class SnapshotService : IDisposable
             MapOutcome(result.Status),
             actor: principal.Actor,
             repositoryScope: request.RepositoryRemoteUrl,
-            detail: principal.Detail($"job_{result.JobId}{SdkPinAuditSuffix(jobs.GetDiagnostics(result.JobId))}{ForcedAuditSuffix(request)}"
+            detail: principal.Detail($"job_{jobId}{SdkPinAuditSuffix(jobs.GetDiagnostics(jobId))}{ForcedAuditSuffix(request)}"
                 + (request.RebuildGeneration is { } generation ? $";rebuild={generation};identity={result.IdentityHash}" : "")),
             costIndexMs: costMs);
         var refusal = BranchAdvanceRefusal(request, result);
@@ -3433,7 +4101,7 @@ public sealed partial class SnapshotService : IDisposable
         {
             audit.Append(AuditAction.BranchAdvanceRefused, AuditOutcome.Denied,
                 actor: principal.Actor, repositoryScope: request.RepositoryRemoteUrl,
-                detail: principal.Detail($"job_{result.JobId};branch_advance_refused={refusal}"));
+                detail: principal.Detail($"job_{jobId};branch_advance_refused={refusal}"));
             Log(System.Text.Json.JsonSerializer.Serialize(new
             {
                 @event = AuditAction.BranchAdvanceRefused,
@@ -3550,9 +4218,11 @@ public sealed partial class SnapshotService : IDisposable
         // use WithWriteAsync with their own token (issue #148), so this explicitly opts out of cancellation.
         Interlocked.Increment(ref _writeAdmissions);
         Interlocked.Increment(ref _ensureAdmissionBarrier);
-        _writeGate.Wait(CancellationToken.None);
+        var turn = _writeGate.WaitAsync(CancellationToken.None);
+        turn.GetAwaiter().GetResult();
         try
         {
+            using var owner = EnterWriterTurn(turn);
             EnsureLeaseHeld();
             return work();
         }
@@ -3569,11 +4239,13 @@ public sealed partial class SnapshotService : IDisposable
         Interlocked.Increment(ref _ensureAdmissionBarrier);
         // A maintenance write (issue #333) takes the priority lane and records how long it waited, so starvation shows.
         var asked = System.Diagnostics.Stopwatch.GetTimestamp();
-        await _writeGate.WaitAsync(cancellationToken, priority).ConfigureAwait(false);
+        var turn = _writeGate.WaitAsync(cancellationToken, priority);
+        await turn.ConfigureAwait(false);
         if (priority)
             _metrics.RecordMaintenanceWriterWait(System.Diagnostics.Stopwatch.GetElapsedTime(asked).TotalMilliseconds);
         try
         {
+            using var owner = EnterWriterTurn(turn);
             EnsureLeaseHeld();
             return await work().ConfigureAwait(false);
         }
@@ -3581,6 +4253,40 @@ public sealed partial class SnapshotService : IDisposable
         {
             _writeGate.Release();
         }
+    }
+
+    // Test-only diagnostic: a token identifies the actual granted turn, not merely a held gate.
+    // AsyncLocal follows the worker across awaits; an inherited token is rejected after its turn ends.
+    internal void EnableWriterTurnGuardForTesting()
+    {
+        _guardWriterAccess = true;
+        _db.SetWriterAccessGuard(AssertWriterTurn, () => Interlocked.Increment(ref _writerTraceViolations));
+    }
+
+    internal Action? ControlWaitStartedForTesting { get; set; }
+    internal Action? RetireWaitStartedForTesting { get; set; }
+    internal Action? AfterRetireAdmissionCommitForTesting { get; set; }
+    internal Action? AfterUpstreamDeleteIntentAdmissionForTesting { get; set; }
+    internal int WriterTraceViolationsForTesting => Volatile.Read(ref _writerTraceViolations);
+
+    private void AssertWriterTurn()
+    {
+        if (_guardWriterAccess && !_writeGate.Owns(_writerTurn.Value))
+            throw new InvalidOperationException("The shared writer connection requires the current writer turn.");
+    }
+
+    private IDisposable EnterWriterTurn(Task turn)
+    {
+        if (_guardWriterAccess && !_writeGate.Owns(turn))
+            throw new InvalidOperationException("Cannot enter a writer turn that is not currently granted.");
+        var previous = _writerTurn.Value;
+        _writerTurn.Value = turn;
+        return new WriterTurnScope(_writerTurn, previous);
+    }
+
+    private sealed class WriterTurnScope(AsyncLocal<Task?> current, Task? previous) : IDisposable
+    {
+        public void Dispose() => current.Value = previous;
     }
 
     // True once this instance may no longer write: the lease was stolen (issue #38) or released by Dispose.
@@ -3631,6 +4337,7 @@ public sealed partial class SnapshotService : IDisposable
         }
         _leaseReleased = true;
         _lease.Dispose();
+        _db.SetWriterAccessGuard(null);
         if (_ownsDatabase)
             _db.Dispose();
         _maintenanceTimer?.Dispose();
@@ -3666,22 +4373,28 @@ public sealed partial class SnapshotService : IDisposable
         public Task<EnsureSnapshotResult> Production { get; set; } = null!;
     }
 
-    // What makes two retirements identical (issue #158): same repository and branch spelling, same CAS guard, same
-    // audit actor. Spellings are compared exactly, so two spellings of one repository simply are not coalesced.
-    private readonly record struct RetireKey(
-        string Repository, string Branch, string? ExpectedHeadCommit, string? Actor, IdleRetireGuard? Idle);
-
     // The pointer an idle-branch retirement selected (issue #299): it applies only while the branch still has exactly it.
     private readonly record struct IdleRetireGuard(long? SnapshotId, long UpdatedAt, bool Upstream = false, long ListedAtUnixMs = 0);
+    private sealed record RetireIntentPayload(RetireBranchRequest Request, AuditCaller Principal, IdleRetireGuard? Idle);
 
-    // A retirement waiting for (or holding) its write-gate turn (issue #158). Admission is the write-admission count
-    // its own turn produced; Retire is assigned under _inFlightLock before the entry is published.
-    private sealed class PendingRetire(RetireKey key, long admission)
+    // A retirement waiting for (or holding) its write-gate turn.
+    private sealed class PendingRetire(Task<long> intentAdmission)
     {
-        public RetireKey Key { get; } = key;
-        public long Admission { get; } = admission;
+        public Task<long> IntentAdmission { get; set; } = intentAdmission;
+        public long? IntentId { get; set; }
+        public long? AdmittedIntentId { get; set; }
+        public string? AdmissionId { get; set; }
+        private int _admissionCancelled;
+        public bool AdmissionCancelled => Volatile.Read(ref _admissionCancelled) != 0;
+        public void CancelAdmission() => Volatile.Write(ref _admissionCancelled, 1);
         public Task<RetireBranchResult> Retire { get; set; } = null!;
     }
+}
+
+public sealed class RetireAdmissionUnavailableException(string? admissionId)
+    : Exception("The branch retirement was not durably admitted before the response bound.")
+{
+    public string? AdmissionId { get; } = admissionId;
 }
 
 /// <summary>
@@ -3700,20 +4413,21 @@ public sealed class UnavailableSnapshotWorker : ISnapshotWorker
 }
 
 /// <summary>
-/// One admitted branch-advance ensure (issue #273), tracked per (repository, branch) so a newer commit of the branch can
-/// supersede it while it still waits for its turn. Every field but the immutable ones is guarded by the service's
-/// in-flight lock.
+/// One admitted branch-advance ensure (issue #273), tracked per branch for default refresh deduplication and feature
+/// linked-successor handovers. Mutable fields are guarded by the service's in-flight lock.
 /// </summary>
 internal sealed class AdvanceTicket
 {
     public required string BranchKey { get; init; }
     public required string Hash { get; init; }
     public required string CommitSha { get; init; }
+    /// <summary>The compare-and-swap admitted with this request, before any earlier handover is applied.</summary>
+    public required string ExpectedHeadCommit { get; init; }
+
+    public Task Persisted { get; set; } = Task.CompletedTask;
 
     /// <summary>Set once its turn is granted: from then on it is produced (or attached), never superseded.</summary>
     public bool Started { get; set; }
-
-    /// <summary>The newer ensure of the same branch that superseded this one before its turn, if any.</summary>
     public AdvanceTicket? SupersededBy { get; set; }
 
     /// <summary>Whether its turn was taken in the expedited (default-branch) lane.</summary>

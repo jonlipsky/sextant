@@ -340,6 +340,9 @@ public class ImplicitDefaultBranchTests
 
     private sealed class FakeRemoteDefaults(Func<string, string?> answer) : IRemoteDefaultBranchResolver
     {
+        public string? ResolveDefaultBranch(string repositoryRemoteUrl, CancellationToken cancellationToken) =>
+            ResolveDefaultBranch(repositoryRemoteUrl);
+
         private int _calls;
 
         public FakeRemoteDefaults(string? branch) : this(_ => branch) { }

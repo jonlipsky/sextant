@@ -18,7 +18,7 @@ cross-tenant counts to a tenant (criterion-1 leakage guard).
 
 | Need | Where |
 | --- | --- |
-| Latency / queue delay / success / capacity / storage / cache / query latency | `GET /control/metrics` (JSON) or `?format=prometheus` |
+| Latency / queue delay / queued-ensure depth and age / success / capacity / storage / cache / query latency | `GET /control/metrics` (JSON) or `?format=prometheus` |
 | Who did what, to which repo, at what cost | `GET /control/audit` |
 | Is a workload safe to pilot? | `GET /control/pilot?workload=…` |
 | Distributed traces | `Sextant.Service` `ActivitySource` (wire OpenTelemetry) |
@@ -155,28 +155,87 @@ refused, or a project shape the indexer does not model).
 
 **Meaning.** Jobs are produced only when a client calls `ensure`, so a `queued` row from the previous run had lost
 its in-process turn (restart, crash, cancel, retention requeue). Startup settled it so it no longer looks like a
-backlog or blocks idle-branch retirement and repository reclaim. `coalesced` rows had a newer job of their branch
-that already ran; `cancelled` rows were never produced. Nothing is lost: the next `ensure` of the identity
-produces it. A large count on the first start after upgrading is the backfill of old stale rows. A count at
+backlog or blocks idle-branch retirement and repository reclaim. `coalesced` rows were superseded feature-branch
+jobs; `cancelled` rows were never produced. Default-branch refresh intent is stored separately in `pending_refreshes`
+and is replayed rather than represented as a job. Nothing is lost: the next refresh resolves the remote head and the
+next explicit ensure produces its identity. A large count on the first
+start after upgrading is the backfill of old stale rows. A count at
 every restart is the number of ensures that were still queued when the previous run stopped; frequent deploys
 during pushes make it larger. After startup, `sextant_jobs_queued` is only jobs admitted in this run.
 
 **Action.** None. If `sextant_jobs_queued` stays above 0 for long with `worker_in_flight` idle, see
 "stuck indexing" above.
 
-**Durable admissions (#406).** `queued_ensures` is separate from `snapshot_jobs`: it records admitted requests,
-not distinct builds. After the orphan-job settlement above, startup automatically re-admits these requests in
-admission order. Identical pending requests from the same actor share one turn even across traffic on other branches;
-a different request on that branch or an intervening non-ensure control write prevents sharing, preserving
-retire/re-create ordering. Linked pushes still coalesce into their newest successor. Shutdown and transient requeues
-keep their durable admission; a settled owner deletes it while holding the writer, before another index can contend
-with cleanup. A cleanup failure is logged, not silently ignored.
+**Durable admissions (#406) and watched-branch refreshes.** Refreshes seek the verified remote head.
+`queued_ensures` remains the durable request queue; migration 035 adds a `branch_intents` log that serializes
+remote branch-moving ensures, refreshes, explicit and maintenance retirements, and upstream deletions by global
+autoincrement id (the rules are `specs/20261007-indexing-performance/phase-7-rules.md`). Every intent is committed
+before acknowledgment. Only the lowest unsettled intent of a branch can execute; priority lanes select among
+branches, not among intents of one branch. Each branch is a strict FIFO queue: nothing supersedes or rotates; only a
+refresh admitted directly behind a pending, unclaimed refresh that is not waiting out a retry deadline is absorbed
+into it. A retrying head blocks only its own branch until it succeeds or expires at `QUEUED_ENSURE_MAX_AGE_HOURS`
+(an ensure is dropped; a retirement or refresh ends `expired`, logged `branch_intent_expired` / `refresh_expired`).
+Retries run on their own due times; nothing sweeps on a timer. Migration 035 clears requests queued before the
+upgrade (pushes are redelivered and callers retry). On restart each queued row is resumed by one decide-and-commit
+step (drop under the age/policy/grant rules, or start); a failing step logs `queued_row_retry` and retries on its own
+backoff. Retire retries retain their deadlines across restart.
+Replay applies the service's current mode: remote-head configuration enables convergence intent admission, while
+locate mode retains legacy behavior; no mode flag is stored with a queued ensure.
+Every branch-moving remote ensure atomically admits its `ensure` intent and following refresh marker with its
+`queued_ensures` row, including rebuilds, sequence guards and terminal attaches to an already-selected snapshot.
+Terminal failures with no snapshot may attach without an intent. This covers worker
+failure/unsupported results, CAS/sequence mismatch, superseded/coalesced intermediates, transient requeues,
+exceptions, caller cancellation, shutdown before/during a turn, and partial results. Admission persistence
+fails closed, so a crash cannot record an outcome while losing its convergence trigger.
+Refreshes use `pending_refreshes`: each admission has its own marker and `admission_id`, with retry state but no
+commit hint or job id. Each refresh responds `202 queued` (or `coalesced` into the pending refresh ahead of it); a later admission never supersedes an earlier unclaimed
+marker. At the turn, the service resolves the verified remote head and only then creates or attaches a job. Unknown, busy,
+timed-out, and failed turns preserve the marker and retry with exponential backoff from 30 seconds up to one
+hour. A push after claim creates a second marker. A pre-claim failure or failed claim retries after a bounded
+in-memory backoff with its own wake; inspect `pending_refresh_failed` or `pending_refresh_claim_failed` logs if
+progress stalls. A null or unusable default
+pointer is repaired only to a published snapshot of the verified head. Default and feature pointers follow verified
+remote truth, including rewinds and non-ancestor force-pushes.
+A branch whose head GitHub no longer reports keeps its refresh retrying until it expires; deleting it from a refresh
+and upstream default-branch renames are out of scope for #273 (follow-up issue).
 
+Refresh turns yield until earlier branch intents settle, then
+take a later turn behind it. This ensures a refresh admitted during the explicit ensure runs afterward, including
+when the earlier marker was retrying; a new push queues behind a retrying refresh and does not wake it. For an uncataloged branch, a
+refresh marker is admitted only after the verified head resolver confirms the branch exists. A successful
+observation of absence returns audited `409 refresh_default_unconfirmed`; an unavailable or busy lookup returns
+retryable `503 refresh_lookup_busy`. Neither is treated as a hint-based ensure. At its turn, the catalog default
+follows the final observation's remote default. For status, call `GET /control/refresh-status/{admission_id}` with the
+control token: `queued`, `claimed`, `retrying` (attempts, next attempt time, last error), `completed` (snapshot
+id and commit), `expired`, or `unknown`. Completed admissions remain queryable for seven days, then maintenance prunes
+them. A user caller must have visibility to the repository. Startup replays markers left claimed by a dead
+service in admission order. Explicit ensures retain their commit and guards, with convergence running afterward.
+`branch_update: none` creates no marker. Locate mode without a remote-head resolver retains legacy semantics.
+`job_id` remains null for refresh admissions.
+
+The request's commit and CAS fields are present only in its admission audit record. Never use a webhook hint to
+index or advance the branch. A refresh turn may index the verified head observed at that turn even if the remote
+moves further during indexing; it re-reads the head before completion and immediately processes a newer head,
+without needing another push. A freshly verified remote rewind can move the pointer backwards.
+
+Startup resumes queued ensures and pending retire/delete intents; their order on a branch is the intent queue's.
+An identical branch-moving ensure shares an earlier ensure only while that ensure is its branch's newest intent
+(only its own following refresh, recorded by id as `following_refresh_id`, may follow it). The decision is made once,
+in the live admission transaction, and a shared request answers with the shared `admission_id`. A share admits no
+intent, so every replayed queued ensure takes its own turn and nothing re-derives the decision from neighbouring rows.
+Settled intents are pruned after seven days, oldest first in bounded batches, even behind a head that keeps failing.
+A retry after a retire, delete, refresh or other ensure was admitted gets its own intent and runs after
+them, so a retired branch is recreated rather than silently left deleted. Intent-backed replayed ensures are never
+counted as shared at startup.
 Startup reports re-admitted, dropped and duplicate-shared counts. `queued_ensure_duplicate` names the retained
 admission; `queued_ensure_settled` reports the number removed and its durable job outcome. These are not counts of
-lost builds: duplicate callers share the outcome, and a coalesced job names its successor. Existing age/policy/grant
-replay exclusions remain logged. There is no automatic discard merely because a branch was merged or deleted:
-historical/pinned snapshot work may still be intentional. Do not purge this table to clear an alert.
+lost builds: duplicate callers share the outcome, and a coalesced default-branch push is represented by the waiting
+refresh marker, which contains no commit hint. Remote feature branches converge through refresh, without handovers. Existing
+age/policy/grant replay exclusions are decided by the row's replay step in the transaction that deletes it
+(`queued_ensure_dropped`); a row admissible again by then (a restored grant or policy) is admitted instead, and a failed
+step is retried on its own backoff (`queued_row_retry`). Only those rules drop a row: a start or catalog failure
+never does. There is no automatic discard merely because a branch was merged
+or deleted: historical/pinned snapshot work may still be intentional. Do not purge this table to clear an alert.
 
 ---
 
@@ -249,11 +308,10 @@ the job and `/control/audit` for action `branch_advance_refused` with detail `br
 never pointed to. An older publication can also be the correct target after a reset: do not advance solely to clear
 the gauge if the pointer already matches the remote.
 
-**Recover.** In clone mode the upstream maintenance pass repairs a default pointer after two successful listings
-confirm it is stale and unchanged, even if the remote moved between listings. It reuses the newest published,
-complete full snapshot on the remote's history, even if built under another URL spelling or behind the current tip.
-Both repair paths require `pointer.commit` to be a **strict ancestor** of the snapshot commit, and the snapshot
-commit to be an ancestor of (or equal to) the freshly read remote head. No automatic repair rolls back a pointer.
+**Recover.** In clone mode the upstream maintenance pass admits a refresh after two successful listings
+confirm a stale pointer. The refresh publishes or reuses the remote head and rechecks it after production and
+ownership checks, immediately before moving the pointer. The verified head is authoritative even for a rewind
+or force-push; freshness prevents an older observation from authorizing a stale move.
 Check `SEXTANT_SERVICE_MAINTENANCE_INTERVAL_MINUTES`, `SEXTANT_SERVICE_BRANCH_UPSTREAM_CHECK_MINUTES`, and
 `SEXTANT_SERVICE_BRANCH_UPSTREAM_HEAL_MAX_PER_TICK` if it is not running. For immediate manual recovery, independently
 verify the current remote head, then submit an application `POST /control/ensure` for that commit and branch with
@@ -263,9 +321,9 @@ migration 034 merges legacy URL aliases and retains their snapshots. It advances
 ensure may build a new identity on next use; the verified-head repair can still use the retained complete snapshot.
 Back up the catalog before applying the migration.
 
-**Recovery after the disconnected-handover fix (no further migration).**
+**Recovery after the default-branch refresh change (no further migration).**
 
-1. Deploy the fixed binary on the schema-34 catalog. Leave snapshots, handovers and durable admissions intact.
+1. Deploy the fixed binary on the schema-34 catalog. Leave snapshots, feature-branch handovers and durable admissions intact.
    Startup replays admitted work and reports duplicate-sharing/drop counts; it does not require hand SQL.
 2. In clone mode, enable `SEXTANT_SERVICE_MAINTENANCE_INTERVAL_MINUTES`,
    `SEXTANT_SERVICE_BRANCH_UPSTREAM_CHECK_MINUTES` and
@@ -274,31 +332,12 @@ Back up the catalog before applying the migration.
    listings occur on successive minute ticks; restore the normal intervals afterwards. Restarting resets
    confirmation state. Only a running job on the affected repository/branch, or its pending repair/retirement,
    makes a heal busy. Other repositories' running jobs and queued advances do not block eligibility.
-3. After two successful listings confirm the unchanged pointer is stale, an already-published full default
-   snapshot is repaired on the maintenance-priority writer lane, ahead of queued indexing. It must still wait
-   for the current writer to yield. A changed pointer fails the repair's CAS instead of overwriting newer work.
-   Watch for `default_pointer_repaired` and the `reconcile` audit row `default_pointer_repaired;snapshot=...`.
-   Maintenance repair and a newly built or reused default-head ensure each re-read the remote branch on their
-   writer turn, just before ancestry verification and the repair CAS. A moving tip is expected: a build several
-   commits behind it can still advance the pointer. The fresh read takes at most 30 seconds; git ancestry checks
-   share a further two-minute deadline under the writer, outside the SQLite transaction. Graph work itself runs
-   off the writer, bounded by `SEXTANT_SERVICE_ANCESTRY_BUILD_TIMEOUT_SECONDS` (default 900 seconds); a repair
-   reports `ancestry_unknown` while it runs and a later check reuses the result. Clone mode caches a
-   separate, full commit graph in the repository's `ancestry.git` object store and fetches missing commits/history
-   with the existing credential-safe git environment. It never deepens or modifies the indexing checkout.
-   The ancestry graph keeps one head ref and runs bounded `git gc --auto` after fetches; set
-   `SEXTANT_SERVICE_ANCESTRY_CACHE_MAX_MB` (default 1024) to tune its per-repository cap. An over-cap graph is
-   rotated and that check reports `ancestry_unknown`; the next check rebuilds it.
-   Exact snapshot/head equality skips only the second ancestry check, never the forward-only check.
-   If retained candidates are all older or off-history, a proven forward remote head without a complete snapshot
-   gets a default-priority ensure instead; its worker cannot advance the pointer before the post-build ancestry check.
-   Watch `branch_advance_refused`: `not_descendant` means no strict forward move, `not_on_remote_history` means
-   a force-push or an off-history snapshot, and `ancestry_unknown` means missing history, a failed/expired fetch,
-   an unknown remote head, or no ancestry checker. Its `detail` identifies the cause without credentials.
-   Unknown is never permission to advance.
-   Git and the local CAS cannot be atomic: a push after the fresh read returns but before the CAS commits can
-   still leave the pointer behind or change the remote history. Publication time and `forced` never substitute
-   for ancestry; sequence/rebuild guards and `branch_update: none` retain their existing semantics.
+3. After two successful listings confirm the pointer is stale, the marker runs on the writer lane after the
+   current writer yields. It builds or attaches the verified head, then rechecks it after all ownership lookups.
+   A changed head is processed immediately; an unknown head retries with backoff. Watch the refresh admission
+   status and the `refresh_pointer_repaired` audit detail.
+   Git and the local pointer transaction cannot be atomic: a push after the final read needs its own marker.
+   Sequence/rebuild guards and `branch_update: none` retain their existing semantics.
 4. For an explicit operator/application ensure, first read both heads. Use the existing owner-only curl config
    containing the control authorization header (do not put a token in the command, repository or report).
    For today's ProcessStack case, reuse the job's URL spelling to avoid an unnecessary identity change:
@@ -324,7 +363,9 @@ Back up the catalog before applying the migration.
    already knows the default branch. They run before feature-branch work, up to
    `SEXTANT_SERVICE_EXPEDITED_STREAK_LIMIT` consecutive turns while a feature waits (default 8), after which one
    feature turn runs; feature work stays queued, not dropped. Maintenance priority remains unchanged.
-   Coalescing remains enabled. Historical `branch_update: none` work stays in the normal lane.
+   Remote explicit CAS ensures have no linked-successor handover. Their durable admission includes a refresh
+   marker, so a failed intermediate immediately triggers convergence; the healer is only a backstop.
+   Historical `branch_update: none` work stays in the normal lane.
    The automatic published-snapshot repair uses maintenance priority.
    If `branch_advanced` is false and the pointer is not already current, inspect the single structured
    `branch_advance_refused` log line and its audit row, then refresh both observations before retrying.
@@ -352,7 +393,14 @@ restore, unsupported): fix the repository or its `sextant.json`; "Runbook: unsup
 job outlived it; raise the rule if `SEXTANT_SERVICE_SANDBOX_TIME_BUDGET_SECONDS` is larger), or
 `sextant_alert_active{id="worker_exhaustion"}` = 1, each on two consecutive polls.
 **Means.** Work waits too long for a worker, or a job is not finishing.
-**Confirm.** `GET /control/metrics` (`jobs.queued`, `jobs.running`, `worker_capacity`); the service log for the running job.
+**Confirm.** `GET /control/metrics` (`jobs.queued`, `jobs.running`, `jobs.queued_ensures.{total,expedited,normal}.{depth,oldest_age_seconds}`,
+`worker_capacity`); the service log for the running job.
+The Prometheus series `sextant_queued_ensures_depth` and `sextant_queued_ensures_oldest_age_seconds` use
+`lane="total"`, `"expedited"` or `"normal"`. Ensure depth counts admitted requests awaiting a writer turn
+(not distinct builds) across both live admissions and durable `queued_ensures` rows; a durable row replayed
+in memory is counted once. Oldest age runs from admission until the writer turn is granted. The same
+`queued_ensures` object appears on operator `/control/status/{job_id}` and `/control/report` responses;
+tenant-scoped status and reports omit this node-wide signal.
 **Do.** Backlog: "Runbook: worker exhaustion". Stuck: "Runbook: stuck indexing"; a restart requeues `running` jobs (see "Startup
 settles orphaned queued jobs").
 

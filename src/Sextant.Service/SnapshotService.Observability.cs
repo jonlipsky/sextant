@@ -58,6 +58,18 @@ public sealed partial class SnapshotService
         return task.WaitAsync(ct);
     }
 
+    /// <summary>
+    /// Collects only the live and durable queued-ensure depth/age using an independent read connection. This is safe to
+    /// include on operator status surfaces without triggering the full metrics or storage walk.
+    /// </summary>
+    public QueuedEnsureMetrics CollectQueuedEnsureMetrics()
+    {
+        using var conn = OpenReadConnection();
+        return new MetricsCollector(
+            conn, _paths, _options.CatalogDbPath, _metrics, HasWorkerCapacity, _timeProvider, _writeLocks,
+            _freshness, _sizeCache).CollectQueuedEnsureMetrics();
+    }
+
     private static string ReportScope(IReadOnlySet<string>? visibleKeys, IReadOnlyList<string> grantedUrls)
     {
         if (visibleKeys is null)
