@@ -46,12 +46,15 @@ may reference a `ProcessStack.*` package, and no `apps/processstack/` tree or `p
 ProcessStack types; the ProcessStack-flavoured defaults (the `CALLER_HEADER` name `X-ProcessStack-Caller`
 and the `CALLER_IDPS` value `processstack`) are configurable.
 
-**Specs:** in-flight initiative specs live in `specs/<YYYYMMDD>-<kebab-name>/`; `docs/` remains the durable
-reference.
+## Specs and current behaviour
+
+- The code and `docs/` describe how the system behaves now. Update the guide in the same change as the behaviour.
+- `specs/<date>-<name>/` is a proposal for a change that is not delivered yet. Never cite a spec for current
+  behaviour. A delivered spec is deleted; `git log --all -- specs/<name>` recovers it.
 
 ## Critical Rules
 
-**Remote branch order:** `specs/20261007-indexing-performance/phase-7-rules.md` is the contract for #273 (rules 1–7).
+**Remote branch order:** [`docs/branch-ordering-rules.md`](docs/branch-ordering-rules.md) is the contract for #273 (rules 1–7).
 Migration `035_branch_intents` is the durable per-branch log for branch-moving ensures, refreshes, retirements and
 upstream deletions. Each branch is a strict FIFO in admission (id) order; only its first unsettled intent runs, and
 nothing supersedes. A refresh admitted directly behind a pending, unclaimed refresh that is not waiting out a retry

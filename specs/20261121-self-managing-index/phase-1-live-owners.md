@@ -1,5 +1,7 @@
 # Phase 1 — every protection has a live owner
 
+> **Proposal.** This describes a change, not current behaviour.
+
 ## Goal
 Nothing in the catalog or on disk is protected without a current reason. Abandoned or orphaned work is failed and reclaimed automatically.
 

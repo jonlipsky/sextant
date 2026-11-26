@@ -1745,7 +1745,7 @@ decision; an admitted write itself never gives up.
     another one is queued is admitted as a separate branch intent and receives its own audit outcome.
 - **A caller's disconnect or timeout never drops a queued write.** The request token only bounds that
   caller's own wait.
-- **Branch ordering (issue #273; contract: `specs/20261007-indexing-performance/phase-7-rules.md`).** Remote
+- **Branch ordering (issue #273; contract: [`docs/branch-ordering-rules.md`](branch-ordering-rules.md)).** Remote
   branch-moving ensures, refreshes, explicit and maintenance retirements, and upstream deletions append a durable
   `branch_intents` row before acknowledgment. Its global autoincrement `id` is the branch's admission order: each
   branch's intents form a **strict FIFO queue**, and only its first unsettled intent can run; priority lanes select

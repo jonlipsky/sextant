@@ -1,5 +1,7 @@
 # Phase 6 — compact storage
 
+> **Proposal.** This describes a change, not current behaviour.
+
 **Status:** Approved, 2026-11-22.
 
 ## Goal

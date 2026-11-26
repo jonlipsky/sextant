@@ -1,5 +1,7 @@
 # Phase 2 — active set and per-branch retention
 
+> **Proposal.** This describes a change, not current behaviour.
+
 ## Goal
 The service keeps exactly the active set: the newest head plus one earlier snapshot (K = 1) earlier snapshots per active branch, and open-PR heads. Everything else expires, and expired targets rebuild when they're used again.
 

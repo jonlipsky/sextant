@@ -1,5 +1,7 @@
 # Phase 5 — storage alerts
 
+> **Proposal.** This describes a change, not current behaviour.
+
 ## Goal
 Growth and cleanup problems are caught by alerts, not by a full disk.
 

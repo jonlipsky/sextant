@@ -1,5 +1,7 @@
 # Phase 9 — Prepare the next job outside the writer
 
+> **Proposal.** This describes a change, not current behaviour.
+
 ## Goal
 
 One write gate spans the whole job, from checkout through publish, so while one job extracts, the next cannot even

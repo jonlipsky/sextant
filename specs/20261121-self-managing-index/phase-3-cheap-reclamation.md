@@ -1,5 +1,7 @@
 # Phase 3 — cheap reclamation
 
+> **Proposal.** This describes a change, not current behaviour.
+
 ## Goal
 Reclaiming a snapshot or project version is a unit drop that takes seconds, and freed space returns to the OS.
 

@@ -1,5 +1,7 @@
 # Self-managing index: active branches stay current, everything else cleans itself up
 
+> **Proposal.** This describes a change, not current behaviour.
+
 **Status:** Approved · **Date:** 2026-11-21 · **Owner:** Jon Lipsky
 
 Decisions 1–7 answered by the owner on 2026-11-21, decision 8 on 2026-11-22. Epic #418.

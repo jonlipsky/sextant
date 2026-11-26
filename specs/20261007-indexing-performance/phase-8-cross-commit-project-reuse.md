@@ -1,5 +1,7 @@
 # Phase 8 — Reuse unchanged projects across commits
 
+> **Proposal.** This describes a change, not current behaviour.
+
 ## Goal
 
 Every service snapshot today re-extracts every project, even when a push changed one file. Reuse the previous

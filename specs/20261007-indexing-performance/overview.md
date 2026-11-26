@@ -1,5 +1,7 @@
 # Indexing performance
 
+> **Proposal.** This describes a change, not current behaviour.
+
 **Status:** Draft · **Date:** 2026-10-07 · **Owner:** Jon Lipsky
 
 ## Why this exists

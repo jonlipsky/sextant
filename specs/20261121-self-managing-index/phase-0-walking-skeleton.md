@@ -1,5 +1,7 @@
 # Phase 0 — walking skeleton
 
+> **Proposal.** This describes a change, not current behaviour.
+
 ## Goal
 Bursts of default-branch pushes collapse to the newest head, the backlog is visible, and the service's recovery from an empty catalog is measured and recorded as a baseline.
 

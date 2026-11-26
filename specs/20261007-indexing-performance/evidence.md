@@ -1,5 +1,7 @@
 # Evidence (2026-10-07, cloudserver1)
 
+> **Proposal.** This describes a change, not current behaviour.
+
 Host: Debian 13 arm64 VM, 14 vCPUs, 31 GB RAM, ext4 on a virtio disk. Service container: no CPU limit, 7 GiB
 memory cap, catalog ~35 GB, Sextant `f3af0c2` (AnalyzerVersion 8), .NET 10.0.12. CPU steal ~4–6% throughout.
 

@@ -1,5 +1,7 @@
 # Epic #266 (filed)
 
+> **Proposal.** This describes a change, not current behaviour.
+
 **Filed 2026-10-07:** epic #266; sub-issues #267–#275 (phases 1–9, in order).
 
 Labels used: the epic carries `enhancement` + `epic`; every sub-issue carries `enhancement` (the canonical taxonomy

@@ -169,7 +169,7 @@ during pushes make it larger. After startup, `sextant_jobs_queued` is only jobs 
 **Durable admissions (#406) and watched-branch refreshes.** Refreshes seek the verified remote head.
 `queued_ensures` remains the durable request queue; migration 035 adds a `branch_intents` log that serializes
 remote branch-moving ensures, refreshes, explicit and maintenance retirements, and upstream deletions by global
-autoincrement id (the rules are `specs/20261007-indexing-performance/phase-7-rules.md`). Every intent is committed
+autoincrement id (the rules are [`docs/branch-ordering-rules.md`](branch-ordering-rules.md)). Every intent is committed
 before acknowledgment. Only the lowest unsettled intent of a branch can execute; priority lanes select among
 branches, not among intents of one branch. Each branch is a strict FIFO queue: nothing supersedes or rotates; only a
 refresh admitted directly behind a pending, unclaimed refresh that is not waiting out a retry deadline is absorbed

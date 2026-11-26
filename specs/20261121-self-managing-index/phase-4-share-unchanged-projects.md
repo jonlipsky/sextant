@@ -1,5 +1,7 @@
 # Phase 4 — storage proportional to change
 
+> **Proposal.** This describes a change, not current behaviour.
+
 ## Goal
 A commit stores only the project versions it changed. Unchanged project versions are shared with the parent snapshot. This is #274, phase 8 of the indexing-performance spec, carried here as the storage phase.
 

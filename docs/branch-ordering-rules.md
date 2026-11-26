@@ -1,10 +1,10 @@
-# Phase 7 — rules the implementation must hold
+# Branch ordering: rules the implementation must hold
 
-**Status:** Approved by the owner on 2026-11-24. This page is the contract for #273. Reviews judge the branch only
+**Status:** Approved by the owner on 2026-11-24 as the contract for #273 (delivered); it remains the contract for remote branch ordering. Reviews judge the branch only
 against it: a finding must name the rule it breaks. A case listed under "Not handled" becomes an issue, not a
 review round.
 
-Goal (from `phase-7-coalesce-and-prioritize-queue.md`): stop indexing commits a newer push has already replaced, and
+Goal (from the [retired spec indexing-performance, phase 7](https://github.com/jonlipsky/sextant/blob/4883ace1c3e9d1e26d91226051f1fcf013054431/specs/20261007-indexing-performance/phase-7-coalesce-and-prioritize-queue.md)): stop indexing commits a newer push has already replaced, and
 let default-branch and user requests go first.
 
 ## Rules

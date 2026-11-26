@@ -1,5 +1,7 @@
 # Epic: Self-managing index — active branches stay current, everything else cleans itself up
 
+> **Proposal.** This describes a change, not current behaviour.
+
 Spec: `specs/20261121-self-managing-index/` · Filed: epic #418, phases #419–#424 and #426. Builds on #273 (coalescing) and #274 (cross-commit project reuse), and is part of the production-readiness epic #356.
 
 ## Tracking body
