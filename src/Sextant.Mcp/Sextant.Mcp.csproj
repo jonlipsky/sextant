@@ -17,6 +17,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="Sextant.Mcp.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\Sextant.Store\Sextant.Store.csproj" />
     <ProjectReference Include="..\Sextant.Core\Sextant.Core.csproj" />
   </ItemGroup>

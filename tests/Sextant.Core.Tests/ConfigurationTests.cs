@@ -45,6 +45,36 @@ public class ConfigurationTests
     }
 
     [TestMethod]
+    public void ReadConcurrencySettings_LoadFromJsonAndEnvironment()
+    {
+        const string concurrency = "SEXTANT_READ_CONCURRENCY";
+        const string timeout = "SEXTANT_READ_ADMISSION_TIMEOUT_SECONDS";
+        var oldConcurrency = Environment.GetEnvironmentVariable(concurrency);
+        var oldTimeout = Environment.GetEnvironmentVariable(timeout);
+        try
+        {
+            Environment.SetEnvironmentVariable(concurrency, null);
+            Environment.SetEnvironmentVariable(timeout, null);
+            File.WriteAllText(Path.Combine(_tempDir, "sextant.json"),
+                """{ "read_concurrency": 3, "read_admission_timeout_seconds": 9 }""");
+            var config = SextantConfiguration.Load(_tempDir);
+            Assert.AreEqual(3, config.ReadConcurrency);
+            Assert.AreEqual(9, config.ReadAdmissionTimeoutSeconds);
+
+            Environment.SetEnvironmentVariable(concurrency, "6");
+            Environment.SetEnvironmentVariable(timeout, "12");
+            config = SextantConfiguration.Load(_tempDir);
+            Assert.AreEqual(6, config.ReadConcurrency);
+            Assert.AreEqual(12, config.ReadAdmissionTimeoutSeconds);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(concurrency, oldConcurrency);
+            Environment.SetEnvironmentVariable(timeout, oldTimeout);
+        }
+    }
+
+    [TestMethod]
     public void LogsPathFor_DerivesLogsDirNextToDb()
     {
         var dbPath = Path.Combine("some", "dir", "sextant.db");

@@ -52,6 +52,15 @@ live `sextant.json`. When a read rests on an overlay, MCP responses carry `overl
 provenance in `meta.snapshot`; a full local fallback that could not reuse a committed base records a
 `fallback_reason` (see [mcp-tools.md](mcp-tools.md#snapshot-provenance-phases-1112)).
 
+### Queries while indexing
+
+MCP queries read the last committed SQLite generation through independent WAL reader connections; they do not
+wait on the daemon's writer gate or queue. Concurrent calls use reserved read slots that indexing never acquires
+(default `max(4, cores / 2)`). Index extraction and compilation prefetch default to at most
+`min(max(1, cores - 1), 8)` workers. Configure these limits with `read_concurrency` and `max_parallelism`;
+the bounded read wait is `read_admission_timeout_seconds` (default 5). A read that cannot start within that
+bound receives a retryable `index_busy` error.
+
 ## Status Endpoint
 
 The daemon runs a lightweight HTTP status server on a random port. Connection details are written to `.sextant/daemon.pid`:

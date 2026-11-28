@@ -39,7 +39,10 @@ public static class McpServerSetup
                 services.AddSingleton(_ =>
                 {
                     var config = SextantConfiguration.Load();
-                    var provider = new DatabaseProvider(dbPath) { MaxResponseChars = config.MaxResponseChars };
+                    var provider = new DatabaseProvider(
+                        dbPath, readConcurrency: config.ReadConcurrency,
+                        readAdmissionTimeout: TimeSpan.FromSeconds(Math.Clamp(config.ReadAdmissionTimeoutSeconds, 1, 120)))
+                    { MaxResponseChars = config.MaxResponseChars };
                     provider.AttachRemoteFederation(RemoteBaseSnapshotFederation.Create(config));
                     return provider;
                 });
@@ -47,7 +50,9 @@ public static class McpServerSetup
                     .WithStdioServerTransport()
                     .WithToolsFromAssembly()
                     // A result with a structured meta.error is an MCP tool error (isError: true), issue #163.
-                    .WithRequestFilters(filters => filters.AddCallToolFilter(ToolErrorResults.CallToolFilter()));
+                    .WithRequestFilters(filters => filters
+                        .AddCallToolFilter(QueryReadAdmissionFilter.CallToolFilter())
+                        .AddCallToolFilter(ToolErrorResults.CallToolFilter()));
             });
     }
 
@@ -73,7 +78,10 @@ public static class McpServerSetup
         builder.Services.AddSingleton(_ =>
         {
             var config = SextantConfiguration.Load();
-            var provider = new DatabaseProvider(dbPath) { MaxResponseChars = config.MaxResponseChars };
+            var provider = new DatabaseProvider(
+                dbPath, readConcurrency: config.ReadConcurrency,
+                readAdmissionTimeout: TimeSpan.FromSeconds(Math.Clamp(config.ReadAdmissionTimeoutSeconds, 1, 120)))
+            { MaxResponseChars = config.MaxResponseChars };
             provider.AttachRemoteFederation(RemoteBaseSnapshotFederation.Create(config));
             return provider;
         });
@@ -83,7 +91,9 @@ public static class McpServerSetup
         builder.Services.AddMcpServer()
             .WithHttpTransport(transport => transport.Stateless = false)
             .WithToolsFromAssembly()
-            .WithRequestFilters(filters => filters.AddCallToolFilter(ToolErrorResults.CallToolFilter()));
+            .WithRequestFilters(filters => filters
+                .AddCallToolFilter(QueryReadAdmissionFilter.CallToolFilter())
+                .AddCallToolFilter(ToolErrorResults.CallToolFilter()));
 
         builder.WebHost.UseUrls($"http://localhost:{port}");
 

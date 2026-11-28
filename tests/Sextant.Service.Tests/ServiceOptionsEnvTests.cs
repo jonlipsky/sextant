@@ -28,6 +28,37 @@ public class ServiceOptionsEnvTests
     private static SextantConfiguration Config() => new() { DbPath = ServiceTestFixtures.NewDbPath() };
 
     [TestMethod]
+    public void ReadAdmissionSettings_UseConfigurationDefaultsAndServiceOverrides()
+    {
+        const string concurrency = "SEXTANT_SERVICE_READ_CONCURRENCY";
+        const string timeout = "SEXTANT_SERVICE_READ_ADMISSION_TIMEOUT_SECONDS";
+        var oldConcurrency = Environment.GetEnvironmentVariable(concurrency);
+        var oldTimeout = Environment.GetEnvironmentVariable(timeout);
+        try
+        {
+            Environment.SetEnvironmentVariable(concurrency, null);
+            Environment.SetEnvironmentVariable(timeout, null);
+            var config = Config();
+            config.ReadConcurrency = 3;
+            config.ReadAdmissionTimeoutSeconds = 9;
+            var options = ServiceOptions.FromEnvironment(config);
+            Assert.AreEqual(3, options.ReadConcurrency);
+            Assert.AreEqual(9, options.ReadAdmissionTimeoutSeconds);
+
+            Environment.SetEnvironmentVariable(concurrency, "6");
+            Environment.SetEnvironmentVariable(timeout, "12");
+            options = ServiceOptions.FromEnvironment(config);
+            Assert.AreEqual(6, options.ReadConcurrency);
+            Assert.AreEqual(12, options.ReadAdmissionTimeoutSeconds);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(concurrency, oldConcurrency);
+            Environment.SetEnvironmentVariable(timeout, oldTimeout);
+        }
+    }
+
+    [TestMethod]
     public void ServiceDefaults_ReachTheCatalogDatabase_WhileTheLibraryDefaultStaysOff()
     {
         Assert.AreEqual(TimeSpan.Zero, Sextant.Store.IndexWriteOptions.Default.MaxBatchHold);

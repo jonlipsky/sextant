@@ -212,6 +212,7 @@ the JSON envelope with `meta.error.code` and a top-level `message` saying what t
 | `invalid_cursor` | A `cursor` that was issued for another tool, other arguments or an older snapshot, or is malformed. Re-run without it | |
 | `repository_required` (service) | The call must name a repository; for a verified caller the message lists the repositories it can read, or, when several of them hold the call's symbol or path, only those (see [Repository inference](#repository-inference-service)) | |
 | `repository_not_found` (service) | The named repository or branch serves nothing to this caller: not indexed, no complete snapshot on that branch, or not readable by it. Under a read policy every such case gets the same bytes, so it never tells an existing repository from an absent one | |
+| `index_busy` | Reserved query capacity or a SQLite reader connection could not be obtained within the configured bound. Indexing does not use query slots, and reads normally continue against the last committed generation | `meta.error.retry_after_seconds`: recommended minimum delay before retrying |
 
 `find_symbol` is a search, so several equally good matches are an answer there: it lists them (best first) and its
 `message` says how to narrow. A valid query whose answer is empty (a type with no implementors, a method with no

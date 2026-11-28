@@ -9,16 +9,19 @@ public sealed class IndexDatabase : IDisposable
     private readonly string _connectionString;
     private readonly string _dbPath;
     private readonly IndexWriteOptions _writeOptions;
+    private readonly int _readBusyTimeoutMilliseconds;
     private SqliteConnection? _connection;
     private Func<bool>? _writerLostProbe;
     private Action? _writerAccessGuard;
     private Action? _writerTraceViolation;
     private bool _writerTraceInstalled;
 
-    public IndexDatabase(string dbPath, IndexWriteOptions? writeOptions = null)
+    public IndexDatabase(string dbPath, IndexWriteOptions? writeOptions = null, TimeSpan? readBusyTimeout = null)
     {
         _dbPath = Path.GetFullPath(dbPath);
         _writeOptions = writeOptions ?? IndexWriteOptions.Default;
+        _readBusyTimeoutMilliseconds = (int)Math.Clamp(
+            (readBusyTimeout ?? TimeSpan.FromSeconds(5)).TotalMilliseconds, 0, int.MaxValue);
 
         var dir = Path.GetDirectoryName(_dbPath);
         if (!string.IsNullOrEmpty(dir))
@@ -201,7 +204,7 @@ public sealed class IndexDatabase : IDisposable
         var conn = new SqliteConnection(csb.ToString());
         conn.Open();
         using var pragma = conn.CreateCommand();
-        pragma.CommandText = "PRAGMA busy_timeout = 5000;";
+        pragma.CommandText = $"PRAGMA busy_timeout = {_readBusyTimeoutMilliseconds};";
         pragma.ExecuteNonQuery();
         ReadInterrupt.Attach(conn);
         return conn;
@@ -337,8 +340,7 @@ public sealed class IndexDatabase : IDisposable
         // simultaneously on the single non-thread-safe shared connection (issue #57 residual / #15). A pooled
         // read connection gives each caller its own handle so readiness is concurrency-safe like the queries.
         using var conn = OpenReadConnection();
-        EnsureSchemaVersionTable(conn);
-        var current = GetSchemaVersion(conn);
+        var current = TableExists(conn, "schema_version") ? GetSchemaVersion(conn) : 0;
         var expected = LatestSchemaVersion;
 
         if (current < expected)
@@ -354,8 +356,8 @@ public sealed class IndexDatabase : IDisposable
         // Schema is current. Decide whether a complete generation is actually available.
         var hasRunLedger = TableExists(conn, "index_runs");
         var hasComplete = hasRunLedger && new IndexRunStore(conn).GetLastCompleteRun() != null;
-        var hasAnyRun = hasRunLedger && CountRows(conn, "index_runs") > 0;
-        var hasSymbols = TableExists(conn, "symbols") && CountRows(conn, "symbols") > 0;
+        var hasAnyRun = !hasComplete && hasRunLedger && HasRows(conn, "index_runs");
+        var hasSymbols = !hasComplete && !hasAnyRun && TableExists(conn, "symbols") && HasRows(conn, "symbols");
 
         // Ready when a complete generation is published, OR — for a directly-populated database with no
         // run-ledger entries at all (e.g. a seeded test) — when symbols are present. A database that has
@@ -370,11 +372,11 @@ public sealed class IndexDatabase : IDisposable
         return IndexReadiness.ReadyIndex;
     }
 
-    private static long CountRows(SqliteConnection conn, string table)
+    private static bool HasRows(SqliteConnection conn, string table)
     {
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = $"SELECT COUNT(*) FROM \"{table}\";";
-        return Convert.ToInt64(cmd.ExecuteScalar());
+        cmd.CommandText = $"SELECT 1 FROM \"{table}\" LIMIT 1;";
+        return cmd.ExecuteScalar() is not null;
     }
 
     /// <summary>

@@ -91,6 +91,8 @@ control token (or the explicit dev opt-out below) to start.
 | `SEXTANT_SERVICE_MAX_GRANTS_PER_TENANT` | Most repository grant rows a tenant may hold, tenant-wide grants included; creating one more is `409 grant_limit` | `5000` |
 | `SEXTANT_SERVICE_TENANT_GRANT_LEASE_HOURS` | Lease of a tenant-wide `'*'` grant, in whole hours: it authorizes reads only while its last `PUT /control/grants/tenant` (the app's reconcile re-PUTs it) is within this window (see [Repository grants](#repository-grants-and-visibility-svc-4)). `0` = never lapses; an invalid value **fails startup**. Keep it longer than the reconcile interval | `0` (disabled) |
 | `SEXTANT_SERVICE_MAX_RESPONSE_CHARS` | Character budget of one `/mcp` tool result, measured on the text the caller receives. A paged tool cuts its page at the last row that fits and returns `meta.next_cursor` with `meta.page_truncated_by: "size"`; an unpaged one keeps the leading rows and says to narrow the query (see [mcp-tools.md](mcp-tools.md#response-size-budget)). At least `1000`; a missing or non-positive value uses the default. | `20000` |
+| `SEXTANT_SERVICE_READ_CONCURRENCY` | Reserved concurrent `/mcp` read slots. Indexing never acquires these slots; `0` selects `max(4, cores / 2)` | `0` (automatic) |
+| `SEXTANT_SERVICE_READ_ADMISSION_TIMEOUT_SECONDS` | Maximum wait for a read slot or SQLite reader connection. Expiry returns retryable `index_busy`; clamped to 1–120 seconds | `5` |
 | `SEXTANT_SERVICE_BIND_ADDRESS` | Network interface the HTTP surface binds to | `localhost` |
 | `SEXTANT_SERVICE_CONTROL_PORT` | HTTP port | `3011` |
 | `SEXTANT_SERVICE_QUERY_PORT` | Optional dedicated query port (shares the control port when unset) | none (shared) |

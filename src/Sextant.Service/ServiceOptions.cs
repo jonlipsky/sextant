@@ -124,6 +124,12 @@ public sealed record ServiceOptions
     /// </summary>
     public int MaxResponseChars { get; init; } = Sextant.Mcp.ResponseBudget.DefaultMaxChars;
 
+    /// <summary>Maximum concurrent MCP reads; zero selects the CPU-based default.</summary>
+    public int ReadConcurrency { get; init; }
+
+    /// <summary>Maximum seconds an MCP read waits for reserved capacity or a reader connection.</summary>
+    public int ReadAdmissionTimeoutSeconds { get; init; } = 5;
+
     /// <summary>
     /// Throws when the caller-identity settings are inconsistent (fail closed): invalid <see cref="CallerAssertion"/>
     /// options, delegate tokens without caller keys, or a delegate token that is blank or equal to the control,
@@ -616,6 +622,10 @@ public sealed record ServiceOptions
                 ? perTenant : DefaultMaxGrantsPerTenant,
             TenantGrantLease = ParseTenantGrantLeaseHours(Env("TENANT_GRANT_LEASE_HOURS")),
             MaxResponseChars = Sextant.Mcp.ResponseBudget.Clamp(EnvInt("MAX_RESPONSE_CHARS")),
+            ReadConcurrency = EnvInt("READ_CONCURRENCY") is int readConcurrency and >= 0
+                ? readConcurrency : config.ReadConcurrency,
+            ReadAdmissionTimeoutSeconds = EnvInt("READ_ADMISSION_TIMEOUT_SECONDS") is int readTimeout and > 0
+                ? Math.Min(readTimeout, 120) : Math.Clamp(config.ReadAdmissionTimeoutSeconds, 1, 120),
             BindAddress = EnvHost("BIND_ADDRESS") ?? "localhost",
             ControlPort = EnvInt("CONTROL_PORT") ?? 3011,
             QueryPort = EnvInt("QUERY_PORT"),

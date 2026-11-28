@@ -164,4 +164,30 @@ public class RebuildGateTests
         Assert.IsFalse(readiness.Ready);
         StringAssert.Contains(readiness.Message!, "older Sextant schema", StringComparison.OrdinalIgnoreCase);
     }
+
+    [TestMethod]
+    public async Task MissingSchemaVersion_ReadinessDoesNotWaitForWriter()
+    {
+        var writer = _db.GetConnection();
+        using (var command = writer.CreateCommand())
+        {
+            command.CommandText = "DROP TABLE schema_version; BEGIN IMMEDIATE;";
+            command.ExecuteNonQuery();
+        }
+
+        var check = Task.Run(() => _db.CheckReadiness());
+        try
+        {
+            var readiness = await check.WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.IsFalse(readiness.Ready);
+            StringAssert.Contains(readiness.Message!, "older Sextant schema", StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            using var command = writer.CreateCommand();
+            command.CommandText = "ROLLBACK;";
+            command.ExecuteNonQuery();
+            await check;
+        }
+    }
 }

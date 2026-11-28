@@ -113,6 +113,21 @@ public sealed class SextantConfiguration
     public int ExtractionProjectsInFlight { get; set; }
 
     /// <summary>
+    /// Maximum number of concurrent MCP reads. 0 (the default) resolves to
+    /// <c>max(4, processorCount / 2)</c>. Reads reserve this capacity independently of indexing.
+    /// Overridable via <c>read_concurrency</c> in <c>sextant.json</c> or
+    /// <c>SEXTANT_READ_CONCURRENCY</c>.
+    /// </summary>
+    public int ReadConcurrency { get; set; }
+
+    /// <summary>
+    /// Maximum time an MCP read waits to reserve a read slot or open a reader connection. Defaults to five
+    /// seconds. Overridable via <c>read_admission_timeout_seconds</c> in <c>sextant.json</c> or
+    /// <c>SEXTANT_READ_ADMISSION_TIMEOUT_SECONDS</c>.
+    /// </summary>
+    public int ReadAdmissionTimeoutSeconds { get; set; } = 5;
+
+    /// <summary>
     /// How often (seconds) the daemon runs an AUTHORITATIVE Git reconciliation pass that reconstructs
     /// the working-tree state from git (independent of file-watcher events) and refreshes it as a
     /// local overlay (Phase 10). The file watcher supplies only hints; this periodic pass is the
@@ -335,6 +350,10 @@ public sealed class SextantConfiguration
                             config.ExtractionQueueCapacity = fileConfig.ExtractionQueueCapacity.Value;
                         if (fileConfig.ExtractionProjectsInFlight.HasValue)
                             config.ExtractionProjectsInFlight = fileConfig.ExtractionProjectsInFlight.Value;
+                        if (fileConfig.ReadConcurrency.HasValue)
+                            config.ReadConcurrency = fileConfig.ReadConcurrency.Value;
+                        if (fileConfig.ReadAdmissionTimeoutSeconds.HasValue)
+                            config.ReadAdmissionTimeoutSeconds = fileConfig.ReadAdmissionTimeoutSeconds.Value;
                         if (fileConfig.ReconcileIntervalSeconds.HasValue)
                             config.ReconcileIntervalSeconds = fileConfig.ReconcileIntervalSeconds.Value;
                         if (fileConfig.PlatformRouting != null)
@@ -452,6 +471,14 @@ public sealed class SextantConfiguration
         var projectsInFlight = Environment.GetEnvironmentVariable("SEXTANT_EXTRACTION_PROJECTS_IN_FLIGHT");
         if (int.TryParse(projectsInFlight, out var inFlight))
             config.ExtractionProjectsInFlight = inFlight;
+
+        var readConcurrency = Environment.GetEnvironmentVariable("SEXTANT_READ_CONCURRENCY");
+        if (int.TryParse(readConcurrency, out var readSlots) && readSlots >= 0)
+            config.ReadConcurrency = readSlots;
+
+        var readAdmissionTimeout = Environment.GetEnvironmentVariable("SEXTANT_READ_ADMISSION_TIMEOUT_SECONDS");
+        if (int.TryParse(readAdmissionTimeout, out var readTimeout) && readTimeout > 0)
+            config.ReadAdmissionTimeoutSeconds = Math.Min(readTimeout, 120);
 
         var reconcileInterval = Environment.GetEnvironmentVariable("SEXTANT_RECONCILE_INTERVAL");
         if (int.TryParse(reconcileInterval, out var interval))
@@ -571,6 +598,12 @@ public sealed class SextantConfiguration
 
         [JsonPropertyName("extraction_projects_in_flight")]
         public int? ExtractionProjectsInFlight { get; set; }
+
+        [JsonPropertyName("read_concurrency")]
+        public int? ReadConcurrency { get; set; }
+
+        [JsonPropertyName("read_admission_timeout_seconds")]
+        public int? ReadAdmissionTimeoutSeconds { get; set; }
 
         [JsonPropertyName("reconcile_interval_seconds")]
         public int? ReconcileIntervalSeconds { get; set; }

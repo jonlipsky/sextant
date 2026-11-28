@@ -48,8 +48,11 @@ Sextant.Core        -- shared models, project identity, configuration
 ### Query Path
 
 1. An AI agent invokes an MCP tool (e.g., `find_references`).
-2. The MCP server queries the SQLite store directly.
-3. A structured JSON response is returned, including results and a `meta` object with freshness information.
+2. The MCP server reads the last committed generation through its own WAL reader connection. It never waits for the daemon or indexer's writer gate, and it caches readiness per published generation.
+3. MCP calls execute concurrently within reserved read slots that indexing does not consume. The default is `max(4, cores / 2)`; a read that cannot get a slot or reader connection within the configured bound returns the retryable `index_busy` tool error.
+4. A structured JSON response is returned, including results and a `meta` object with freshness information.
+
+Indexing uses bounded extraction and compilation prefetch parallelism, defaulting to at most `min(max(1, cores - 1), 8)` workers, leaving a core available for query work on ordinary multi-core hosts. The writer remains single-threaded; read admission is separate from write coordination.
 
 ## Technology Stack
 

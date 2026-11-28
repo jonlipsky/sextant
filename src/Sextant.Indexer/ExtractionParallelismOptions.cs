@@ -71,7 +71,7 @@ public sealed record ExtractionParallelismOptions
     /// <summary>
     /// Resolves raw (possibly 0/auto) configuration values against the current machine. A
     /// non-positive <paramref name="configuredParallelism"/> auto-resolves to
-    /// <c>min(ProcessorCount, <see cref="DefaultParallelismCap"/>)</c>; a positive value is honored
+    /// <c>min(max(1, ProcessorCount - 1), <see cref="DefaultParallelismCap"/>)</c>; a positive value is honored
     /// but still clamped to the processor count so a misconfiguration cannot oversubscribe the CPU. A
     /// non-positive <paramref name="configuredQueueCapacity"/> auto-resolves to a small multiple of
     /// the parallelism so the writer stays fed without buffering an unbounded backlog. A non-positive
@@ -85,7 +85,7 @@ public sealed record ExtractionParallelismOptions
         var processors = Math.Max(1, Environment.ProcessorCount);
         var parallelism = configuredParallelism > 0
             ? Math.Min(configuredParallelism, processors)
-            : Math.Min(processors, DefaultParallelismCap);
+            : Math.Min(Math.Max(1, processors - 1), DefaultParallelismCap);
 
         var capacity = configuredQueueCapacity > 0
             ? configuredQueueCapacity

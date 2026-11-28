@@ -6,13 +6,25 @@ namespace Sextant.Mcp;
 public sealed class DatabaseProvider : IDisposable
 {
     private readonly string _dbPath;
+    private readonly object _readinessLock = new();
+    private readonly SemaphoreSlim _readSlots;
+    private readonly TimeProvider _timeProvider;
+    private readonly HashSet<long> _readinessGenerations = [];
+    private bool _readyCached;
+    private long? _readinessGeneration;
     private IndexDatabase? _db;
     private RemoteBaseSnapshotFederation? _remoteFederation;
 
-    public DatabaseProvider(string? dbPath = null, IReadAuthorizer? authorizer = null)
+    public DatabaseProvider(
+        string? dbPath = null, IReadAuthorizer? authorizer = null, int readConcurrency = 0,
+        TimeSpan? readAdmissionTimeout = null, TimeProvider? timeProvider = null)
     {
         _dbPath = dbPath ?? SextantConfiguration.FromEnvironment().DbPath;
         Authorizer = authorizer ?? AllowAllReadAuthorizer.Instance;
+        ReadConcurrency = ResolveReadConcurrency(readConcurrency);
+        ReadAdmissionTimeout = ClampReadAdmissionTimeout(readAdmissionTimeout ?? TimeSpan.FromSeconds(5));
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _readSlots = new SemaphoreSlim(ReadConcurrency, ReadConcurrency);
     }
 
     /// <summary>
@@ -41,6 +53,48 @@ public sealed class DatabaseProvider : IDisposable
     /// enforced authorizer that fails closed when a policy is configured.
     /// </summary>
     public IReadAuthorizer Authorizer { get; }
+
+    /// <summary>Maximum number of concurrent MCP reads reserved independently of indexing.</summary>
+    public int ReadConcurrency { get; }
+
+    /// <summary>Maximum time a query waits for its reserved read slot or SQLite reader connection.</summary>
+    public TimeSpan ReadAdmissionTimeout { get; }
+
+    internal Func<IndexDatabase, IndexReadiness> ReadinessCheckForTesting { get; set; } =
+        static database => database.CheckReadiness();
+
+    /// <summary>
+    /// Reserves query capacity, which indexing never acquires. A null result means the bounded wait expired.
+    /// The caller must dispose the returned lease after the whole tool call completes.
+    /// </summary>
+    internal async ValueTask<IDisposable?> TryAcquireReadSlotAsync(CancellationToken cancellationToken = default)
+    {
+        using var timeout = new CancellationTokenSource(ReadAdmissionTimeout, _timeProvider);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
+        try
+        {
+            await _readSlots.WaitAsync(linked.Token).ConfigureAwait(false);
+            return new ReadSlotLease(_readSlots);
+        }
+        catch (OperationCanceledException) when (timeout.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            return null;
+        }
+    }
+
+    private static int ResolveReadConcurrency(int configured) => configured > 0
+        ? Math.Clamp(configured, 1, 256)
+        : Math.Max(4, Math.Max(1, Environment.ProcessorCount) / 2);
+
+    private static TimeSpan ClampReadAdmissionTimeout(TimeSpan timeout) =>
+        TimeSpan.FromSeconds(Math.Clamp(timeout.TotalSeconds, 1, 120));
+
+    private sealed class ReadSlotLease(SemaphoreSlim semaphore) : IDisposable
+    {
+        private SemaphoreSlim? _semaphore = semaphore;
+
+        public void Dispose() => Interlocked.Exchange(ref _semaphore, null)?.Release();
+    }
 
     /// <summary>
     /// The Phase-17 request-level repository selector (criterion 1): yields the remote URL of the
@@ -142,8 +196,8 @@ public sealed class DatabaseProvider : IDisposable
         if (!DatabaseExists)
             return null;
 
-        _db ??= new IndexDatabase(_dbPath);
-        return _db;
+        lock (_readinessLock)
+            return _db ??= new IndexDatabase(_dbPath, readBusyTimeout: ReadAdmissionTimeout);
     }
 
     /// <summary>
@@ -162,11 +216,18 @@ public sealed class DatabaseProvider : IDisposable
             return null;
         }
 
-        var readiness = db.CheckReadiness();
-        if (!readiness.Ready)
+        lock (_readinessLock)
         {
-            notReadyMessage = readiness.Message!;
-            return null;
+            if (!_readyCached)
+            {
+                var readiness = ReadinessCheckForTesting(db);
+                if (!readiness.Ready)
+                {
+                    notReadyMessage = readiness.Message!;
+                    return null;
+                }
+                _readyCached = true;
+            }
         }
 
         notReadyMessage = string.Empty;
@@ -232,6 +293,7 @@ public sealed class DatabaseProvider : IDisposable
 
             database = ready;
             context = StampImplicitSelection(context);
+            ObserveReadGeneration(context.SelectedSnapshotId);
             context.MaxResponseChars = MaxResponseChars;
             failureResponse = string.Empty;
             ReadAdmitted?.Invoke(context);
@@ -253,10 +315,25 @@ public sealed class DatabaseProvider : IDisposable
             return false;
 
         context = StampImplicitSelection(context);
+        ObserveReadGeneration(context.SelectedSnapshotId);
         context.MaxResponseChars = MaxResponseChars;
         failureResponse = string.Empty;
         ReadAdmitted?.Invoke(context);
         return true;
+    }
+
+    internal void ObserveReadGeneration(long? selectedSnapshotId)
+    {
+        if (selectedSnapshotId is not long generation)
+            return;
+
+        lock (_readinessLock)
+        {
+            if (_readinessGenerations.Add(generation)
+                && _readinessGeneration is long previous && previous != generation)
+                _readyCached = false;
+            _readinessGeneration = generation;
+        }
     }
 
     // Says which repository answered a read the host selected for the caller. Only a READ THAT SUCCEEDED is stamped,

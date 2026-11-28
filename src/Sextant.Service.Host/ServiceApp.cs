@@ -96,7 +96,9 @@ public static class ServiceApp
             // accessors read the ambient request at call time, so the singleton provider stays correct under
             // concurrent requests. A request with no selector reads the unselected default unless
             // RequireRepositorySelection says it must name one.
-            return new DatabaseProvider(options.CatalogDbPath, authorizer)
+            return new DatabaseProvider(
+                options.CatalogDbPath, authorizer, options.ReadConcurrency,
+                TimeSpan.FromSeconds(options.ReadAdmissionTimeoutSeconds))
             {
                 RequestedRepository = RequestedRepositoryAccessor(http, service),
                 RepositorySelectedImplicitly = RepositorySelectedImplicitlyAccessor(http, service),

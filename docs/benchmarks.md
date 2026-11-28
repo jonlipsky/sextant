@@ -47,7 +47,7 @@ inside the Sextant source tree. Generation is byte-for-byte deterministic.
 | `--large-types <n>` | `8` | Types per project for the `large` corpus. |
 | `--large-methods <n>` | `6` | Methods per type for the `large` corpus. |
 | `--document-extractor` | off | Use the Phase 5 document-oriented extractor (required to exercise the Phase 6 parallel pipeline). |
-| `--max-parallelism <n>` | `0` | Document-extractor analysis worker cap (`0` = auto: `min(cores, 8)`). Drive the parallelism sweep with `1`/`2`/`4`/`8`/`0`. |
+| `--max-parallelism <n>` | `0` | Document-extractor analysis worker cap (`0` = auto: `min(max(1, cores - 1), 8)`). Drive the parallelism sweep with `1`/`2`/`4`/`8`/`0`. |
 | `--machine <label>` | machine name | Machine label recorded in the report (cleared when redacted). |
 | `--service-path` | off | Load like the service (issue #267): `--path` is a checkout directory whose solutions are selected by `SolutionSelector`, restored by the service's `PackageRestoreRunner`, and loaded by `MultiSolutionLoader`, so several solutions take the union path. The report gains a `load` section (restore time, load mode, individual opens, BuildHost processes observed, slowest opens). |
 | `--catalog <db>` | — | Index into a copy of this existing catalog (SQLite online backup; the source is only read), so write cost against a large catalog is measurable. |

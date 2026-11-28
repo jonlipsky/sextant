@@ -266,6 +266,7 @@ public static class ResponseBuilder
 
     /// <summary>The <c>meta.error.code</c> when an argument is malformed or names nothing the tool accepts.</summary>
     public const string InvalidArgumentCode = "invalid_argument";
+    public const string IndexBusyCode = "index_busy";
 
     /// <summary>
     /// A repository-relative path under a populated submodule of the selected snapshot, which has no rows for it: the
@@ -345,7 +346,8 @@ public static class ResponseBuilder
     /// importantly a fail-closed authorization denial, which must never be presented as an empty
     /// successful result.
     /// </summary>
-    public static string BuildError(string code, string message, SnapshotProvenance? provenance = null)
+    public static string BuildError(
+        string code, string message, SnapshotProvenance? provenance = null, int? retryAfterSeconds = null)
     {
         var response = new
         {
@@ -355,7 +357,7 @@ public static class ResponseBuilder
                 IndexFreshness = 0L,
                 ResultCount = 0,
                 Snapshot = SnapshotMeta.From(provenance),
-                Error = new ErrorInfo { Code = code, Message = message }
+                Error = new ErrorInfo { Code = code, Message = message, RetryAfterSeconds = retryAfterSeconds }
             },
             Results = Array.Empty<object>(),
             Message = message
@@ -363,6 +365,10 @@ public static class ResponseBuilder
 
         return JsonSerializer.Serialize(response, JsonOptions);
     }
+
+    /// <summary>A retryable response when reserved query capacity or a reader connection is temporarily busy.</summary>
+    public static string BuildIndexBusy(int retryAfterSeconds = 1) =>
+        BuildError(IndexBusyCode, "The index is busy. Retry this query shortly.", retryAfterSeconds: retryAfterSeconds);
 
     /// <summary>
     /// A structured error for a symbol argument the tool could not bind to exactly one symbol: <paramref name="code"/>
@@ -451,6 +457,9 @@ public sealed class ErrorInfo
 
     [JsonPropertyName("message")]
     public required string Message { get; set; }
+
+    [JsonPropertyName("retry_after_seconds")]
+    public int? RetryAfterSeconds { get; set; }
 }
 
 /// <summary>One incompatibility dimension serialized under <see cref="SnapshotMeta.Incompatibilities"/>.</summary>

@@ -25,6 +25,16 @@ public sealed class ExtractionParallelismOptionsTests
     }
 
     [TestMethod]
+    public void Parallelism_AutoLeavesOneCoreFree_WhileExplicitValueCanUseAllCores()
+    {
+        var processors = Math.Max(1, Environment.ProcessorCount);
+        Assert.AreEqual(Math.Min(Math.Max(1, processors - 1), ExtractionParallelismOptions.DefaultParallelismCap),
+            ExtractionParallelismOptions.Resolve(0, 0).MaxParallelism);
+        Assert.AreEqual(processors, ExtractionParallelismOptions.Resolve(processors, 0).MaxParallelism);
+        Assert.AreEqual(processors, ExtractionParallelismOptions.Resolve(int.MaxValue, 0).MaxParallelism);
+    }
+
+    [TestMethod]
     public void ProjectsInFlight_AutoResolvesToTheParallelism_CappedAtTheDefault()
     {
         var parallelism = Math.Min(2, Environment.ProcessorCount);
